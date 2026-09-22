@@ -50,7 +50,16 @@ fi
 # --without-netapi mirror Debian's choices: OSSv4 is not present on Debian and
 # libnetapi is not packaged at all. Unlike Debian we keep sane, because S3
 # (TWAIN imaging) needs it.
+# A previously configured object tree is reused as-is -- that is what makes
+# rebuilds and CI caches cheap. But configure bakes absolute paths into the
+# generated Makefile, so a tree restored at a different path (a CI cache moved
+# between repos, a renamed checkout) would fail in confusing ways. Detect that
+# and reconfigure rather than letting it fail later.
 mkdir -p "$OBJ_DIR"
+if [[ -f "$OBJ_DIR/Makefile" ]] && ! grep -qF "$SRC_DIR" "$OBJ_DIR/Makefile"; then
+    log "object tree was configured for a different path; reconfiguring"
+    rm -f "$OBJ_DIR/Makefile"
+fi
 if [[ ! -f "$OBJ_DIR/Makefile" ]]; then
     log "configuring (archs: i386,x86_64)"
     (cd "$OBJ_DIR" && "$SRC_DIR/configure" \
