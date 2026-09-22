@@ -124,6 +124,34 @@ arrangement that works is the one Windows uses for HKLM: system and
 administrators write, everyone else reads. Per-user privacy comes from HKCU
 being a separate hive.
 
+## `patches/sg/0003-check-create-access-on-the-container.patch`
+
+Moves the create-permission check from `registry.c` into
+`create_named_object()`, which is the only place that knows which container an
+object actually lands in. Patch 0002 checked the *handle's* parent, so with a
+path like `Policies\Foo\Bar` from an HKLM handle everything below the first
+component went unchecked.
+
+**Registry security in Wine is in-memory only.** `save_subkeys()` writes a key's
+name, timestamp, class, symlink flag and values — and no security descriptor.
+The `.reg` format has no field for one. So every descriptor is lost when the
+server restarts and reloads `system.reg`, and any protection applied by an
+earlier session evaporates.
+
+That is why the S2 gate's clause 3 still fails while the mechanism demonstrably
+works. Within a single live server session:
+
+```
+admin:     reg add HKLM\Software\LiveTest /v A   -> success
+non-admin: reg add HKLM\Software\LiveTest /v B   -> Unable to access or create
+                                                     the specified registry key
+```
+
+Restart the server and the denial is gone with the descriptor. Making clause 3
+pass needs a decision about **persisting descriptors** — extending the `.reg`
+format, storing them beside it, or reapplying a policy at every server start.
+That is design work, not a patch, and is tracked on issue #2.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
