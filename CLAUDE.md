@@ -16,10 +16,17 @@ run a 32-bit Windows binary. See
 and
 [ADR 0005](https://github.com/Stained-Glass-OS/stained-glass/blob/main/docs/decisions/0005-building-wine-ourselves.md).
 
-**This is not yet a fork.** Every patch here is carried from Debian's packaging
-and keeps its original author attribution. When we write Wine patches of our
-own — S2 will — they go in `patches/sg/`, so "carried from elsewhere" and "ours
-to upstream" stay distinguishable at a glance.
+**This is not a fork.** It is upstream plus a patch series, rebased on upstream
+releases. `patches/fixes/` is carried from Debian's packaging with original
+authorship intact; `patches/sg/` is ours.
+
+**We do not submit anything upstream** — Wine prohibits LLM-generated code and
+David's decision is that we simply do not upstream
+([ADR 0006](https://github.com/Stained-Glass-OS/stained-glass/blob/main/docs/decisions/0006-wine-llm-contribution-policy.md)).
+Patches are still kept small and one-concern, because that is what makes a
+downstream series survive rebasing. Two consequences: we own these forever, and
+`sg-testlab`'s winetest baseline is the only safety net left, since upstream
+review is not coming.
 
 ## Build and gate
 
@@ -52,6 +59,36 @@ what we ship is what matters. Install before testing.
 
 It runs under `env -i` with the system Wine off `PATH`, so nothing can satisfy
 the test using the distribution's build by accident.
+
+## `patches/sg/0001-shared-system-prefix.patch`
+
+Lets one prefix be shared by several Unix users — the first half of S2. Opt-in,
+marked by a `.sg-system-prefix` file in the prefix; without it every path
+behaves exactly as before.
+
+What made this more work than the source analysis suggested:
+
+- **The ownership assumption is not one check, it is four.** The prefix
+  directory, the server directory, the socket *and* the lock file are all
+  owner-only, and each has to be handled. Fixing three of them and leaving the
+  lock gives the second user
+  `error creating .../lock: Permission denied` from a directory they
+  demonstrably can write to — because it is the existing file's mode refusing
+  them, not the directory's.
+- **Anything created in shared mode needs the prefix's group**, not the primary
+  group of whoever started the server first. Otherwise the first login silently
+  locks everyone else out.
+- **The rule is implemented twice**, in `server/request.c` and in
+  `dlls/ntdll/unix/server.c`, because the client works out where the server
+  lives on its own — it may be the process that starts it. Patch one side only
+  and you get `chdir to /tmp/.wine-<uid>/server-<dev>-<ino>: No such file or
+  directory`, which names neither the cause nor the file to fix.
+
+The `SO_PEERCRED` check is not separable from the relaxations: alone it is dead
+code, and without it the relaxations remove a security control and put nothing
+in its place. Admitted are root, the server directory's owner, and members of
+its group — so **who may use a shared prefix is decided by group membership**,
+with ordinary Unix tools rather than a policy file of ours.
 
 ## Things that will bite you
 

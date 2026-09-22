@@ -1,0 +1,402 @@
+description: allow a Wine prefix to be shared by several Unix users
+ Wine assumes a prefix belongs to exactly one Unix user, and enforces that in
+ several independent places: the prefix directory and the server directory must
+ be owned by the caller and unreadable by anyone else, the server directory path
+ itself contains the caller's uid, and the socket and lock file are created
+ mode 0600. Those checks together are the entire access control -- the server
+ authenticates nobody, because with a 0700 directory the question of who is
+ connecting has a constant answer.
+ .
+ This adds an opt-in "system prefix" mode, marked by a .sg-system-prefix file in
+ the prefix, in which:
+ .
+   * the server directory is derived from the prefix rather than the uid, so
+     every user of it computes the same path;
+   * the prefix, server directory, socket and lock file are group-accessible,
+     and are given the prefix's group rather than the primary group of whoever
+     happened to start the server first;
+   * the ownership assertions are replaced by access checks;
+   * and -- the part that makes the rest safe -- the server authenticates each
+     connecting process with SO_PEERCRED, admitting root, the owner of the
+     server directory, and members of the group that owns it.
+ .
+ The credential check is not separable from the relaxations: on its own it is
+ dead code, and without it the relaxations remove a security control and put
+ nothing in its place. They are one change.
+ .
+ Ordinary prefixes are untouched: without the marker every path behaves exactly
+ as before.
+ .
+ Note the rule is implemented twice, in the server and in ntdll, because the
+ client works out where the server lives on its own -- it may be the process
+ that starts it. The two must agree exactly; patching one side alone fails with
+ "chdir to /tmp/.wine-<uid>/server-<dev>-<ino>: No such file or directory",
+ which names neither the cause nor the file to fix.
+origin: Stained Glass OS
+bug: https://github.com/Stained-Glass-OS/stained-glass/issues/2
+forwarded: not-needed
+ Stained Glass OS does not submit patches upstream; see ADR 0006 in the
+ stained-glass repo. This changes Wine's security model for a deployment
+ scenario upstream does not target, and is unlikely to be wanted there.
+last-update: 2026-09-21
+
+--- a/server/request.c
++++ b/server/request.c
+@@ -24,6 +24,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #ifdef HAVE_PWD_H
++#include <grp.h>
+ #include <pwd.h>
+ #endif
+ #include <signal.h>
+@@ -125,6 +126,29 @@
+ int config_dir_fd = -1;    /* file descriptor for the config dir */
+ 
+ static struct master_socket *master_socket;  /* the master socket object */
++
++/* Stained Glass OS: a "system prefix" is one shared by several Unix users on
++ * the same machine, rather than belonging to whoever created it.
++ *
++ * Wine's default is the opposite, and deliberately so: the prefix and the
++ * server directory must be owned by the calling user and unreadable by anyone
++ * else, and the socket is chmod 0600. Those three checks together are what
++ * stops one user reaching another's wineserver, and nothing else in the server
++ * does that job -- there is no authentication anywhere, because none has been
++ * needed.
++ *
++ * Shared mode is opt-in, marked by a file in the prefix, so ordinary Wine
++ * prefixes keep the stricter behaviour untouched. Where this relaxes a check,
++ * the peer-credential check in master_socket_poll_event() takes over; the two
++ * belong together and neither is safe alone.
++ */
++static int system_prefix;        /* nonzero if the prefix is marked shared */
++static gid_t config_dir_gid;     /* group owning the shared prefix */
++static uid_t server_dir_uid;     /* owner of the shared server directory */
++static gid_t server_dir_gid;     /* group allowed to use the shared prefix */
++
++/* name of the marker file that opts a prefix into shared mode */
++static const char * const system_prefix_marker = ".sg-system-prefix";
+ static struct timeout_user *master_timeout;
+ 
+ /* complain about a protocol error and terminate the client connection */
+@@ -539,6 +563,64 @@
+ }
+ 
+ /* handle a socket event */
++/* Is this uid a member of the group that owns the shared server directory?
++ *
++ * SO_PEERCRED reports only the peer's primary group, and in practice a user is
++ * admitted to a shared prefix through a supplementary group, so ask the system
++ * for the full list rather than trusting cred.gid. */
++static int uid_in_group( uid_t uid, gid_t gid )
++{
++    struct passwd *pw = getpwuid( uid );
++    gid_t stack[32], *groups = stack;
++    int i, count = ARRAY_SIZE(stack), ret = 0;
++
++    if (!pw) return 0;
++    if (pw->pw_gid == gid) return 1;
++
++    if (getgrouplist( pw->pw_name, pw->pw_gid, groups, &count ) == -1)
++    {
++        /* count now holds the number actually needed */
++        if (!(groups = malloc( count * sizeof(*groups) ))) return 0;
++        if (getgrouplist( pw->pw_name, pw->pw_gid, groups, &count ) == -1) count = 0;
++    }
++    for (i = 0; i < count; i++) if (groups[i] == gid) { ret = 1; break; }
++
++    if (groups != stack) free( groups );
++    return ret;
++}
++
++/* Decide whether a connecting process may use this server.
++ *
++ * On an ordinary prefix this is not reached as a decision: the 0700 directory
++ * and the 0600 socket already make the answer constant, so the peer is
++ * necessarily the owner. On a shared prefix those checks have been relaxed and
++ * this is what replaces them -- it is the whole access control for the machine,
++ * and should be read as such.
++ *
++ * Admitted: root, the owner of the server directory, and members of the group
++ * owning it. Which users that group contains is an administrative decision,
++ * expressed with ordinary Unix tools rather than a policy file of our own. */
++static int check_peer_credentials( int client )
++{
++    struct ucred cred;
++    socklen_t len = sizeof(cred);
++
++    if (!system_prefix) return 1;
++
++    if (getsockopt( client, SOL_SOCKET, SO_PEERCRED, &cred, &len ) == -1)
++    {
++        /* Without credentials there is no basis on which to admit anyone. */
++        fprintf( stderr, "wineserver: cannot read peer credentials, refusing connection\n" );
++        return 0;
++    }
++    if (cred.uid == 0 || cred.uid == server_dir_uid) return 1;
++    if (uid_in_group( cred.uid, server_dir_gid )) return 1;
++
++    fprintf( stderr, "wineserver: refusing connection from uid %u: not a member of gid %u\n",
++             (unsigned int)cred.uid, (unsigned int)server_dir_gid );
++    return 0;
++}
++
+ static void master_socket_poll_event( struct fd *fd, int event )
+ {
+     struct master_socket *sock = get_fd_user( fd );
+@@ -559,6 +641,11 @@
+         socklen_t len = sizeof(dummy);
+         int client = accept( get_unix_fd( master_socket->fd ), (struct sockaddr *) &dummy, &len );
+         if (client == -1) return;
++        if (!check_peer_credentials( client ))
++        {
++            close( client );
++            return;
++        }
+         fcntl( client, F_SETFL, O_NONBLOCK );
+         if ((process = create_process( client, NULL, 0, NULL, NULL, NULL, 0, NULL )))
+         {
+@@ -582,14 +669,46 @@
+     {
+         if (errno != ENOENT)
+             fatal_error( "lstat %s: %s\n", name, strerror( errno ));
+-        if (mkdir( name, 0700 ) == -1 && errno != EEXIST)
++        if (mkdir( name, system_prefix ? 0770 : 0700 ) == -1 && errno != EEXIST)
+             fatal_error( "mkdir %s: %s\n", name, strerror( errno ));
++        if (system_prefix)
++        {
++            /* Whoever gets here first creates these directories, so left alone
++             * they would carry that user's primary group and lock everyone
++             * else out. Give them the prefix's group instead -- that is the
++             * machine's statement of who may use it, and the only group all
++             * users of this prefix are known to share.
++             *
++             * Also set the mode explicitly: mkdir's is masked by umask, and
++             * the group bits are the entire point. */
++            if (chown( name, (uid_t)-1, config_dir_gid ) == -1)
++                fatal_error( "chgrp %s to gid %u: %s\n", name,
++                             (unsigned int)config_dir_gid, strerror( errno ));
++            if (chmod( name, 0770 ) == -1)
++                fatal_error( "chmod %s: %s\n", name, strerror( errno ));
++        }
+         if (lstat( name, st ) == -1)
+             fatal_error( "lstat %s: %s\n", name, strerror( errno ));
+     }
+     if (!S_ISDIR(st->st_mode)) fatal_error( "%s is not a directory\n", name );
+-    if (st->st_uid != getuid()) fatal_error( "%s is not owned by you\n", name );
+-    if (st->st_mode & 077) fatal_error( "%s must not be accessible by other users\n", name );
++
++    if (system_prefix)
++    {
++        /* Who owns a shared directory is the machine's business, not ours --
++         * requiring the caller to own it is exactly what makes sharing
++         * impossible. Require instead that we can use it, and that it is not
++         * open to the world; which users the group admits is an administrative
++         * decision, enforced on connect by the peer-credential check. */
++        if (st->st_mode & 007)
++            fatal_error( "%s must not be accessible by other users\n", name );
++        if (access( name, R_OK | W_OK | X_OK ) == -1)
++            fatal_error( "%s: no access for uid %u\n", name, getuid() );
++    }
++    else
++    {
++        if (st->st_uid != getuid()) fatal_error( "%s is not owned by you\n", name );
++        if (st->st_mode & 077) fatal_error( "%s must not be accessible by other users\n", name );
++    }
+ }
+ 
+ /* create the server directory and chdir to it */
+@@ -634,7 +753,18 @@
+         fatal_error( "open %s: %s\n", config_dir, strerror( errno ));
+     if (fstat( config_dir_fd, &st ) == -1)
+         fatal_error( "stat %s: %s\n", config_dir, strerror( errno ));
+-    if (st.st_uid != getuid())
++
++    /* A prefix marked as a system prefix is shared between users, so the
++     * caller will usually not own it. */
++    system_prefix = (faccessat( config_dir_fd, system_prefix_marker, F_OK, 0 ) == 0);
++
++    if (system_prefix)
++    {
++        config_dir_gid = st.st_gid;
++        if (access( ".", R_OK | W_OK | X_OK ) == -1)
++            fatal_error( "%s: no access to the system prefix for uid %u\n", config_dir, getuid() );
++    }
++    else if (st.st_uid != getuid())
+         fatal_error( "%s is not owned by you\n", config_dir );
+ 
+     /* create the base directory if needed */
+@@ -643,7 +773,16 @@
+     if (asprintf( &base_dir, "%s/.wineserver", config_dir ) == -1)
+         fatal_error( "out of memory\n" );
+ #else
+-    if (asprintf( &base_dir, "/tmp/.wine-%u", getuid() ) == -1)
++    /* The per-uid base directory is what makes two users unable to find the
++     * same server. A shared prefix gets one path derived from the prefix
++     * itself, so every user of it computes the same answer. */
++    if (system_prefix)
++    {
++        if (asprintf( &base_dir, "/tmp/.wine-sg-%llx-%llx",
++                      (unsigned long long)st.st_dev, (unsigned long long)st.st_ino ) == -1)
++            fatal_error( "out of memory\n" );
++    }
++    else if (asprintf( &base_dir, "/tmp/.wine-%u", getuid() ) == -1)
+         fatal_error( "out of memory\n" );
+ #endif
+     create_dir( base_dir, &st2 );
+@@ -656,6 +795,11 @@
+ 
+     create_dir( server_dir, &st );
+ 
++    /* The group owning the server directory is the machine's statement of who
++     * may use this prefix. Remember it for the peer-credential check. */
++    server_dir_uid = st.st_uid;
++    server_dir_gid = st.st_gid;
++
+     if (chdir( server_dir ) == -1)
+         fatal_error( "chdir %s: %s\n", server_dir, strerror( errno ));
+     if ((server_dir_fd = open( ".", O_RDONLY )) == -1)
+@@ -687,8 +831,25 @@
+             fatal_error( "%s/%s is not a regular file\n", server_dir, server_lock_name );
+     }
+ 
+-    if ((fd = open( server_lock_name, O_CREAT|O_TRUNC|O_WRONLY, 0600 )) == -1)
++    /* The lock is the third thing here that is owner-only by default, after
++     * the directories and the socket. Every user of a shared prefix has to be
++     * able to take it -- whoever starts the server is whoever logged in first,
++     * and the next user must not be locked out by that accident.
++     *
++     * Note the failure this avoids is not obvious from the outside: the second
++     * user gets "error creating .../lock: Permission denied" from a directory
++     * they demonstrably can write to, because it is the existing file's mode
++     * that refuses them, not the directory's. */
++    if ((fd = open( server_lock_name, O_CREAT|O_TRUNC|O_WRONLY,
++                    system_prefix ? 0660 : 0600 )) == -1)
+         fatal_error( "error creating %s/%s: %s\n", server_dir, server_lock_name, strerror( errno ));
++    if (system_prefix)
++    {
++        /* Only the owner may chgrp, so tolerate failure: another user of the
++         * prefix reaching an already-correct file is the normal case. */
++        fchown( fd, (uid_t)-1, config_dir_gid );
++        fchmod( fd, 0660 );
++    }
+     return fd;
+ }
+ 
+@@ -827,7 +988,19 @@
+         fatal_error( "bind: %s\n", strerror( errno ));
+     }
+     atexit( socket_cleanup );
+-    chmod( server_socket_name, 0600 );  /* make sure no other user can connect */
++    /* Not 0600 on a shared prefix: the group has to be able to connect. What
++     * stops the wrong user connecting there is the peer-credential check, not
++     * the file mode. */
++    chmod( server_socket_name, system_prefix ? 0660 : 0600 );
++    /* The socket needs the prefix's group too, for the same reason the
++     * directories did: created untouched it carries the primary group of
++     * whoever started the server, which is generally not the group that
++     * defines who may use this prefix. Getting the directories right and
++     * leaving the socket wrong looks correct in a directory listing and still
++     * locks every other user out. */
++    if (system_prefix && chown( server_socket_name, (uid_t)-1, config_dir_gid ) == -1)
++        fatal_error( "chgrp %s to gid %u: %s\n", server_socket_name,
++                     (unsigned int)config_dir_gid, strerror( errno ));
+     if (listen( fd, 5 ) == -1) fatal_error( "listen: %s\n", strerror( errno ));
+ 
+     if (!(master_socket = alloc_object( &master_socket_ops )) ||
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1245,6 +1245,20 @@
+ }
+ 
+ 
++/* Stained Glass OS: nonzero when this prefix is shared between Unix users.
++ *
++ * The client works out where the server lives on its own, with its own copy of
++ * the rule, rather than asking the server -- it has to, since it may be the
++ * process that starts it. So this detection has to agree exactly with
++ * server/request.c's. Patching one side only produces a mismatch that reads as
++ * "chdir to /tmp/.wine-<uid>/server-<dev>-<ino>: No such file or directory",
++ * which points at neither the cause nor the file to fix. */
++static int system_prefix;
++
++/* name of the marker file that opts a prefix into shared mode; must match
++ * system_prefix_marker in server/request.c */
++static const char * const system_prefix_marker = ".sg-system-prefix";
++
+ /***********************************************************************
+  *           init_server_dir
+  */
+@@ -1255,7 +1269,15 @@
+ #ifdef __ANDROID__  /* there's no /tmp dir on Android */
+     asprintf( &dir, "%s/.wineserver/server-%llx-%llx", config_dir, (unsigned long long)dev, (unsigned long long)ino );
+ #else
+-    asprintf( &dir, "/tmp/.wine-%u/server-%llx-%llx", getuid(), (unsigned long long)dev, (unsigned long long)ino );
++    /* A shared prefix gets one path derived from the prefix itself, so every
++     * user of it computes the same answer; the per-uid path is what otherwise
++     * makes two users unable to find the same server. */
++    if (system_prefix)
++        asprintf( &dir, "/tmp/.wine-sg-%llx-%llx/server-%llx-%llx",
++                  (unsigned long long)dev, (unsigned long long)ino,
++                  (unsigned long long)dev, (unsigned long long)ino );
++    else
++        asprintf( &dir, "/tmp/.wine-%u/server-%llx-%llx", getuid(), (unsigned long long)dev, (unsigned long long)ino );
+ #endif
+     return dir;
+ }
+@@ -1290,7 +1312,18 @@
+     }
+ 
+     if (stat( ".", &st ) == -1) fatal_perror( "stat %s", config_dir );
+-    if (st.st_uid != getuid()) fatal_error( "'%s' is not owned by you\n", config_dir );
++
++    /* A prefix marked as a system prefix is shared between users, so the
++     * caller will usually not own it. Require instead that we can use it. */
++    system_prefix = (access( system_prefix_marker, F_OK ) == 0);
++    if (system_prefix)
++    {
++        if (access( ".", R_OK | W_OK | X_OK ) == -1)
++            fatal_error( "'%s': no access to the system prefix for uid %u\n",
++                         config_dir, getuid() );
++    }
++    else if (st.st_uid != getuid())
++        fatal_error( "'%s' is not owned by you\n", config_dir );
+ 
+     server_dir = init_server_dir( st.st_dev, st.st_ino );
+ 
+@@ -1364,8 +1397,20 @@
+ 
+     /* make sure we are at the right place */
+     if (stat( ".", &st ) == -1) fatal_perror( "stat %s", server_dir );
+-    if (st.st_uid != getuid()) fatal_error( "'%s' is not owned by you\n", server_dir );
+-    if (st.st_mode & 077) fatal_error( "'%s' must not be accessible by other users\n", server_dir );
++    if (system_prefix)
++    {
++        /* Shared: the directory belongs to the machine, not to whoever got
++         * here first, and the group has to be able to reach it. */
++        if (st.st_mode & 007)
++            fatal_error( "'%s' must not be accessible by other users\n", server_dir );
++        if (access( ".", R_OK | W_OK | X_OK ) == -1)
++            fatal_error( "'%s': no access for uid %u\n", server_dir, getuid() );
++    }
++    else
++    {
++        if (st.st_uid != getuid()) fatal_error( "'%s' is not owned by you\n", server_dir );
++        if (st.st_mode & 077) fatal_error( "'%s' must not be accessible by other users\n", server_dir );
++    }
+ 
+     for (retry = 0; retry < 6; retry++)
+     {
+@@ -1386,7 +1431,10 @@
+         /* make sure the socket is sane (ISFIFO needed for Solaris) */
+         if (!S_ISSOCK(st.st_mode) && !S_ISFIFO(st.st_mode))
+             fatal_error( "'%s/%s' is not a socket\n", server_dir, SOCKETNAME );
+-        if (st.st_uid != getuid())
++        /* On a shared prefix the socket belongs to whichever user's process
++         * started the server, which is not necessarily us. Whether we may use
++         * it is decided by the server, from our credentials, on connect. */
++        if (!system_prefix && st.st_uid != getuid())
+             fatal_error( "'%s/%s' is not owned by you\n", server_dir, SOCKETNAME );
+ 
+         /* try to connect to it */
