@@ -152,17 +152,31 @@ pass needs a decision about **persisting descriptors** — extending the `.reg`
 format, storing them beside it, or reapplying a policy at every server start.
 That is design work, not a patch, and is tracked on issue #2.
 
-## `patches/sg/0004-root-is-system.patch`
+## `patches/sg/0004` and `0005`: SYSTEM, and who gets to be it
 
-Maps root to the SYSTEM SID on a shared prefix. The machine-level wineserver
-runs as root — it has to exist before anyone logs in and outlive every logout,
-which a session-scoped server cannot — and on Windows the services it hosts run
-as SYSTEM. So root has to *be* SYSTEM rather than merely be an administrator,
-or a boot-time service looks wrong to the SCM and to every default DACL, which
-name Local System.
+The machine-level wineserver has to exist before anyone logs in and outlive
+every logout, and the services it hosts must be SYSTEM's — so whoever runs it
+has to *be* SYSTEM, not merely be an administrator, or a boot-time service looks
+wrong to the SCM and to every default DACL, all of which name Local System.
 
-Completes clause 5: one wineserver owned by root, `services.exe` inside it, and
-both logged-in users seeing the same service through the same SCM.
+`0004` made that root. `0005` makes it **the prefix's owner**, which is the
+right answer: an ordinary unprivileged account.
+
+**Hosting the Windows system needs no Unix root**, and it is worth being precise
+about why, because the opposite is an easy assumption:
+
+- `winebus.sys` reaches devices through **udev**, not privileged syscalls.
+- `winedevice` has no uid or capability checks at all.
+- Printing goes through **CUPS**, which is a socket and a group.
+- There is no `getuid() == 0` anywhere in `winspool`, `wineps` or `winebus`.
+
+Driver work needs two things and neither is root: permission to touch the device
+(udev rules plus group membership — `sg-session` ships both) and **NT
+administrator** to install into HKLM, which this code decides from prefix
+ownership rather than from the kernel.
+
+Running it as root would put a root process on a socket every desktop user can
+reach and buy no capability an ordinary account lacks.
 
 ## Things that will bite you
 
