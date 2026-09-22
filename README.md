@@ -33,6 +33,19 @@ make deps && make build && sudo make install && make test
 
 Installs to `/opt/wine-sg`, alongside a distribution Wine rather than over it.
 
+## It is also smaller than the Wine it replaces
+
+| | installed |
+|---|---|
+| Debian `wine`, amd64 tree | 717 MB |
+| Debian `wine`, i386 tree (needed for 32-bit) | 601 MB |
+| **`wine-sg`, both architectures** | **454 MB** |
+
+Debian does not strip its Wine; `build.sh` does, using the matching mingw
+`strip` per architecture. Unstripped this is 1.5 GB, roughly 1.1 GB of it DWARF.
+The cost is symbolised `winedbg` backtraces — build with `STRIP=0` when chasing
+a crash inside Wine.
+
 ## Not a fork
 
 Every patch here is carried from Debian's Wine packaging with its original

@@ -68,7 +68,36 @@ log "building with $JOBS jobs (this takes roughly 12 minutes on 12 cores)"
 make -C "$OBJ_DIR" -j"$JOBS"
 
 log "build complete"
+
 if [[ -n "${DO_INSTALL:-}" ]]; then
     log "installing to ${DESTDIR}${PREFIX}"
     make -C "$OBJ_DIR" install ${DESTDIR:+DESTDIR="$DESTDIR"}
+
+    # Strip debug info unless asked not to. Wine builds with -g by default and
+    # the result is enormous: 1.5G installed, of which about 1.1G is DWARF.
+    # Stripped it is 454M -- for *both* architectures, where Debian's Wine
+    # needs 717M (amd64) plus 601M (i386) to cover the same ground.
+    #
+    # Debian does not strip its Wine, so this is a deliberate divergence. It
+    # costs symbolised winedbg backtraces. If you are chasing a crash inside
+    # Wine, rebuild with STRIP=0 rather than guessing.
+    #
+    # PE files need the matching mingw strip, not the host one; the Unix side
+    # is ordinary ELF. Only --strip-debug there, so Wine's own exported
+    # symbols survive.
+    if [[ "${STRIP:-1}" != "0" ]]; then
+        local_root="${DESTDIR}${PREFIX}"
+        log "stripping debug info"
+        pe_names=( -name '*.dll' -o -name '*.exe' -o -name '*.drv' -o -name '*.sys'
+                   -o -name '*.ocx' -o -name '*.acm' -o -name '*.cpl' -o -name '*.tlb' )
+        find "$local_root/lib/wine/x86_64-windows" -type f \( "${pe_names[@]}" \) \
+            -exec x86_64-w64-mingw32-strip {} + 2>/dev/null || true
+        find "$local_root/lib/wine/i386-windows" -type f \( "${pe_names[@]}" \) \
+            -exec i686-w64-mingw32-strip {} + 2>/dev/null || true
+        find "$local_root/lib/wine/x86_64-unix" -name '*.so' \
+            -exec strip --strip-debug {} + 2>/dev/null || true
+        log "installed size: $(du -sh "$local_root" | cut -f1)"
+    else
+        log "STRIP=0: keeping debug info (installed size will be around 1.5G)"
+    fi
 fi
