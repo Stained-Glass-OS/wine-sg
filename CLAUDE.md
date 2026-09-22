@@ -209,6 +209,42 @@ falsify, it is not yet a hypothesis.
 The tell, once you know it: `user-<uid>.reg` was ~134 bytes. A seeded hive is
 ~36KB and around 55 keys. `wc -c` on the hive would have found this immediately.
 
+## `patches/sg/0007-session-0-has-no-interactive-shell.patch`
+
+A shared system prefix runs a machine-level wineserver before anyone logs in.
+On Windows that is session 0: a non-interactive window station, and no shell.
+Wine already implements the rule — `get_desktop_window()` checks for
+`__wineservice_winstation` and has the server create the desktop window instead
+of starting `explorer`.
+
+**It was unreachable from here.** A process's station comes from
+`STARTUPINFO.lpDesktop`, set by its parent, and our Windows system is started by
+a shell script. `services.exe` sets it for the services it launches but never
+for itself, because on Windows its parent does that. So every session-0 process
+landed on the interactive `WinSta0` and Wine started an explorer for it — and
+the logged-in user's explorer then shared one wineserver with it. Two shells in
+one prefix, and the taskbar laid out for whichever screen size arrived first.
+
+`SG_WINSTATION` supplies the string `lpDesktop` would. It is consulted only
+when the process parameter is absent, so anything started by a Windows parent
+is unaffected. `sg-session` sets it in `sg-wineserver` and `sg-services-start`,
+and **explicitly unsets it in `sg-run-explorer`** — the interactive shell must
+be on `WinSta0`, and must not inherit session 0 from whatever started it.
+
+**The second hunk is a safety property.** Upstream reaches the explorer path
+only when the server declined to create the desktop window, which for a service
+means the station or desktop name is wrong — and starting explorer then is
+actively harmful, because that explorer inherits the same environment, hits the
+same failure, and starts another. This is not hypothetical: `\\` inside POSIX
+single quotes is *two* backslashes, so `__wineservice_winstation\\Default`
+became a desktop named `\Default`, which cannot be created. The box went to
+load 72 in seconds. A service has no shell to lose, so declining is both
+correct and safe.
+
+**Two explorers is the tell.** `pgrep -a explorer.exe` should show exactly one,
+the session's `/desktop=shell,WxH`. A bare `/desktop` beside it is session 0
+growing a shell, and it will fight the real one for the display mode.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
