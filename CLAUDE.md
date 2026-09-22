@@ -152,6 +152,18 @@ pass needs a decision about **persisting descriptors** — extending the `.reg`
 format, storing them beside it, or reapplying a policy at every server start.
 That is design work, not a patch, and is tracked on issue #2.
 
+## `patches/sg/0004-root-is-system.patch`
+
+Maps root to the SYSTEM SID on a shared prefix. The machine-level wineserver
+runs as root — it has to exist before anyone logs in and outlive every logout,
+which a session-scoped server cannot — and on Windows the services it hosts run
+as SYSTEM. So root has to *be* SYSTEM rather than merely be an administrator,
+or a boot-time service looks wrong to the SCM and to every default DACL, which
+name Local System.
+
+Completes clause 5: one wineserver owned by root, `services.exe` inside it, and
+both logged-in users seeing the same service through the same SCM.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
