@@ -198,6 +198,13 @@ reach and buy no capability an ordinary account lacks.
 
 **LGPL-2.1+ — Wine's license, not ours to choose.**
 
+`debian/copyright` lists **every patch separately with its own author**, because
+they do not share one: some are ours, some come from Debian's wine packaging,
+and one is Wine's maintainer's. A blanket "everything here is ours" would be
+wrong about most of `patches/`. **When you add a patch, add its stanza** — the
+`.deb` is what carries this downstream, and it is the only place a recipient
+sees who wrote what.
+
 This matters beyond bookkeeping. Per
 [ADR 0004](https://github.com/Stained-Glass-OS/stained-glass/blob/main/docs/decisions/0004-licensing.md),
 the rest of Stained Glass is AGPL-3.0-or-later, and **AGPL-3.0 code cannot be
