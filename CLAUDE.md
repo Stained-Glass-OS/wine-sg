@@ -178,6 +178,37 @@ ownership rather than from the kernel.
 Running it as root would put a root process on a socket every desktop user can
 reach and buy no capability an ordinary account lacks.
 
+## `patches/sg/0006-seed-new-user-hives-from-userdef.patch`
+
+Patch 0002 creates a per-user HKCU hive on demand and creates it **empty**.
+Windows does not: a new profile's hive is seeded from Default User. This patch
+seeds ours from `userdef.reg`, which Wine already loads as
+`\Registry\User\.Default` and which exists in every prefix.
+
+**The empty hive is the most expensive bug this project has hit so far**, and
+worth understanding, because nothing about the symptom points at the registry.
+HKCU is where Wine keeps its *own* per-user defaults, including the display and
+desktop settings under `Software\Wine\Explorer`. A user with an empty hive
+gets none of them, so the shell starts believing the screen is Wine's built-in
+1024x768 and lays itself out for that. On a 1280x800 desktop the visible result
+is a 1024-wide, 4-pixel-high taskbar at y=764 — which reads as a rendering or
+theming bug, in a component a long way from where the fault is.
+
+Nothing errors. The session comes up, `explorer` runs, the desktop window is
+the right size, and only the taskbar is wrong.
+
+**The lesson is about method, not about Wine.** Five image rebuilds went on
+guesses — the machine-level wineserver, token DACLs, startup ordering, stray
+shells — each plausible, each about 25 minutes, none of them tested against
+anything that could have said *no*. What settled it in one run was the control
+that should have come first: `make test` in `sg-session` reproduces this gate on
+the dev box in about two minutes. **Reproduce on the dev box before rebuilding
+an image.** If a hypothesis cannot be stated as something `make test` would
+falsify, it is not yet a hypothesis.
+
+The tell, once you know it: `user-<uid>.reg` was ~134 bytes. A seeded hive is
+~36KB and around 55 keys. `wc -c` on the hive would have found this immediately.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
@@ -190,6 +221,10 @@ reach and buy no capability an ordinary account lacks.
   when `build/obj/Makefile` exists. If you change configure flags, `make clean`.
 - **Bumping `wine-version` is a deliberate act.** It invalidates `sg-testlab`'s
   winetest baseline and every patch has to be re-checked against the new tree.
+- **An empty HKCU is silent.** Wine keeps its own per-user defaults there, so a
+  user with an empty hive gets a working session laid out for the wrong screen
+  rather than an error. Check `wc -c` on `user-<uid>.reg`: ~134 bytes means
+  empty, ~36KB means seeded. See patch 0006.
 - **The gate needs `/proc` and the ability to `pgrep` your own processes.**
   A container with a hidden `/proc` will fail step 5 with "could not find the
   running process", which is a false negative rather than a real failure.
