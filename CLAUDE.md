@@ -273,6 +273,26 @@ anywhere. Four plausible theories died before a `WINEDEBUG=+relay` trace showed
 and names the loop in one run. `/proc/<pid>/syscall` reading `running` is the
 tell that it is a userspace loop and that no kernel-level tool will help.
 
+## `patches/sg/0009-machine-wide-dll-overrides.patch`
+
+Upstream reads DLL overrides from **HKCU only**. For a single-user prefix that
+is the whole story; for a system-wide installation it leaves machine policy
+with nowhere to live. In a shared prefix HKCU is per user, so an administrator
+installing DXVK and VKD3D-Proton would have to write the overrides into every
+existing user's hive *and* every hive created afterwards.
+
+The failure is silent, which is what makes it worth knowing: the DLLs sit in
+`system32` and `syswow64` looking installed, Wine loads its own builtins, and
+Direct3D works — just not through the translation layer that was installed for
+it. Nothing errors. You find out from frame rates, or from a probe that asks
+which implementation answered.
+
+HKLM is consulted **last**, after the environment variable, the per-application
+key and the user's own key, so anything a user sets still wins. It is opened
+**read-only**: HKLM is machine state an ordinary user must not rewrite, and
+asking for `KEY_ALL_ACCESS` would fail for every non-admin — which, since patch
+0002, is every interactive user.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
