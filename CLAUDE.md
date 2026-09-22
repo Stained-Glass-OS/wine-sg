@@ -90,6 +90,40 @@ in its place. Admitted are root, the server directory's owner, and members of
 its group — so **who may use a shared prefix is decided by group membership**,
 with ordinary Unix tools rather than a policy file of ours.
 
+## `patches/sg/0002-per-user-identity.patch`
+
+Gives each user of a shared prefix its own SID, its own token and its own HKCU
+hive — the second half of S2's identity work. Takes the gate from 2 of 5 clauses
+to **3 of 5**.
+
+Four things that are not independent, and break each other if done alone:
+
+- **A SID per uid**, keeping `local_user_sid`'s shape
+  (`S-1-5-21-0-0-0-<1000+uid>`). Upstream's mapping is binary — you, or
+  Anonymous Logon.
+- **Per-user tokens.** `token_create_admin()` is upstream's only path for a new
+  process, which is why "non-admin cannot write `HKLM\Software\Policies`"
+  cannot be satisfied by any descriptor: there is no non-admin. Administrators
+  are root and the prefix's owner.
+- **Per-user HKCU hives, loaded on demand.** *Required* by the SID change, not
+  optional: with a SID per uid, every user but the first finds
+  `\Registry\User\<their SID>` missing and every HKCU operation fails with
+  `OBJECT_NAME_NOT_FOUND`. `MAX_SAVE_BRANCH_INFO` was exactly 3 — system,
+  userdef, user — so there was no room for even one more hive.
+- **Security descriptors on new keys.** `check_object_access()` returns TRUE for
+  any object *without* a descriptor, and objects get none unless a caller
+  supplies one. The registry is therefore not under-checked so much as
+  un-checkable — no descriptor written to a key protects it while the check that
+  would read it is never reached.
+
+**The default DACL is the trap.** Naming the creating user is the obvious first
+guess and is wrong: it protects HKLM keys by making them invisible to everyone
+else, which breaks HKLM as shared machine state. The gate caught it precisely —
+clause 3 started passing and clause 2 started failing in the same run. The
+arrangement that works is the one Windows uses for HKLM: system and
+administrators write, everyone else reads. Per-user privacy comes from HKCU
+being a separate hive.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

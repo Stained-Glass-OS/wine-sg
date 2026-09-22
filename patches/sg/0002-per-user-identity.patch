@@ -1,0 +1,564 @@
+description: give each Unix user of a shared prefix its own identity
+ Builds on the shared system prefix: with several users on one wineserver, they
+ need to be distinguishable. Upstream has no notion of a second user, in four
+ connected ways, and fixing any one alone leaves the others broken.
+ .
+   * security_unix_uid_to_sid() is binary -- you, or Anonymous Logon -- so every
+     user maps to the same SID. Now a SID per uid, keeping local_user_sid's
+     shape (S-1-5-21-0-0-0-<1000+uid>), the convention Windows and Samba use.
+   * Every process token comes from token_create_admin(), so there is no such
+     thing as a non-admin to deny. token_create_for_uid() builds a token for the
+     connecting user, dropping the Administrators group, the administrative
+     privileges and the high integrity label for ordinary users. Administrators
+     are root and the prefix's owner -- a placeholder for group mapping via
+     winbind, but a real rule an admin can read off ls -l.
+   * init_registry() loads one HKCU, for one SID, at startup -- upstream's own
+     FIXME says it should come from the process token. With a SID per uid, every
+     user but the first then finds their hive missing and every HKCU operation
+     fails with OBJECT_NAME_NOT_FOUND. Hives are now loaded on demand, per user,
+     from user-<uid>.reg. MAX_SAVE_BRANCH_INFO was exactly 3 (system, userdef,
+     user), so there was no room for even one more.
+   * check_object_access() returns TRUE for any object with no security
+     descriptor, and objects are created without one unless a caller supplies
+     it. So the registry is not under-checked so much as un-checkable: no
+     descriptor written to a key can protect it. New keys now get a descriptor
+     from the creating process's token, and creating a subkey checks the parent
+     for KEY_CREATE_SUB_KEY -- falling back to an open, since a refusal may just
+     mean the key already exists and is governed by its own descriptor.
+ .
+ The default DACL is the arrangement Windows uses for HKLM: system and
+ administrators may write, everyone else may read. Naming the creating user
+ instead is the obvious first guess and is wrong -- it protects HKLM keys by
+ making them invisible to every other user, which breaks HKLM as shared machine
+ state. Per-user privacy comes from HKCU being a separate hive, not from this.
+ .
+ S2 gate: 3 of 5 clauses (two users on one prefix, shared HKLM, isolated HKCU).
+ Ordinary prefixes are untouched; without the system-prefix marker every path
+ behaves as before.
+origin: Stained Glass OS
+bug: https://github.com/Stained-Glass-OS/stained-glass/issues/2
+forwarded: not-needed
+ Stained Glass OS does not submit patches upstream; see ADR 0006.
+last-update: 2026-09-22
+
+--- a/server/security.h
++++ b/server/security.h
+@@ -46,6 +46,14 @@
+ 
+ extern const struct sid world_sid;
+ extern const struct sid local_user_sid;
++
++/* Stained Glass OS: identity of the user a connection belongs to.
++ * sg_system_prefix_uid is the owner of a shared prefix -- see request.c. */
++extern int sg_system_prefix;
++extern uid_t sg_system_prefix_uid;
++extern struct token *token_create_for_uid( unsigned primary, int impersonation_level,
++                                           int elevation, unsigned int session_id, uid_t uid );
++extern void sg_ensure_user_hive( uid_t uid );
+ extern const struct sid local_system_sid;
+ extern const struct sid builtin_users_sid;
+ extern const struct sid builtin_admins_sid;
+--- a/server/request.c
++++ b/server/request.c
+@@ -144,6 +144,11 @@
+  */
+ static int system_prefix;        /* nonzero if the prefix is marked shared */
+ static gid_t config_dir_gid;     /* group owning the shared prefix */
++
++/* Exported for token.c and process.c, which need to know whether identity is
++ * per-connection and who administers this prefix. */
++int sg_system_prefix;
++uid_t sg_system_prefix_uid;
+ static uid_t server_dir_uid;     /* owner of the shared server directory */
+ static gid_t server_dir_gid;     /* group allowed to use the shared prefix */
+ 
+@@ -600,11 +605,12 @@
+  * Admitted: root, the owner of the server directory, and members of the group
+  * owning it. Which users that group contains is an administrative decision,
+  * expressed with ordinary Unix tools rather than a policy file of our own. */
+-static int check_peer_credentials( int client )
++static int check_peer_credentials( int client, uid_t *peer_uid )
+ {
+     struct ucred cred;
+     socklen_t len = sizeof(cred);
+ 
++    *peer_uid = getuid();
+     if (!system_prefix) return 1;
+ 
+     if (getsockopt( client, SOL_SOCKET, SO_PEERCRED, &cred, &len ) == -1)
+@@ -613,6 +619,7 @@
+         fprintf( stderr, "wineserver: cannot read peer credentials, refusing connection\n" );
+         return 0;
+     }
++    *peer_uid = cred.uid;
+     if (cred.uid == 0 || cred.uid == server_dir_uid) return 1;
+     if (uid_in_group( cred.uid, server_dir_gid )) return 1;
+ 
+@@ -639,15 +646,16 @@
+         struct process *process;
+         struct sockaddr_un dummy;
+         socklen_t len = sizeof(dummy);
++        uid_t peer_uid;
+         int client = accept( get_unix_fd( master_socket->fd ), (struct sockaddr *) &dummy, &len );
+         if (client == -1) return;
+-        if (!check_peer_credentials( client ))
++        if (!check_peer_credentials( client, &peer_uid ))
+         {
+             close( client );
+             return;
+         }
+         fcntl( client, F_SETFL, O_NONBLOCK );
+-        if ((process = create_process( client, NULL, 0, NULL, NULL, NULL, 0, NULL )))
++        if ((process = create_process( client, NULL, 0, NULL, NULL, NULL, 0, NULL, peer_uid )))
+         {
+             create_thread( -1, process, NULL );
+             release_object( process );
+@@ -761,6 +769,11 @@
+     if (system_prefix)
+     {
+         config_dir_gid = st.st_gid;
++        sg_system_prefix = 1;
++        /* The prefix's owner administers it. A placeholder for proper group
++         * mapping once winbind is in play, but a real rule in the meantime,
++         * and one an administrator can see with ls. */
++        sg_system_prefix_uid = st.st_uid;
+         if (access( ".", R_OK | W_OK | X_OK ) == -1)
+             fatal_error( "%s: no access to the system prefix for uid %u\n", config_dir, getuid() );
+     }
+--- a/server/token.c
++++ b/server/token.c
+@@ -82,6 +82,10 @@
+ static const struct sid anonymous_logon_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_ANONYMOUS_LOGON_RID } };
+ static const struct sid authenticated_user_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_AUTHENTICATED_USER_RID } };
+ static const struct sid high_label_sid = { SID_REVISION, 1, SECURITY_MANDATORY_LABEL_AUTHORITY, { SECURITY_MANDATORY_HIGH_RID } };
++/* Stained Glass OS: ordinary users run at medium integrity, as on Windows.
++ * Upstream only ever needs the high label, because every token it makes is an
++ * administrator's. */
++static const struct sid medium_label_sid = { SID_REVISION, 1, SECURITY_MANDATORY_LABEL_AUTHORITY, { SECURITY_MANDATORY_MEDIUM_RID } };
+ 
+ static struct luid prev_luid_value = { 1000, 0 };
+ 
+@@ -198,8 +202,49 @@
+     }
+ }
+ 
++/* Stained Glass OS: a SID per Unix uid, for shared prefixes.
++ *
++ * Upstream's mapping below is binary -- you, or Anonymous Logon -- which is
++ * correct when a prefix has exactly one user and useless when it has several:
++ * every user would land on the same SID, so HKCU could not be separated and no
++ * security descriptor could tell them apart.
++ *
++ * local_user_sid is S-1-5-21-0-0-0-1000. We keep that shape and vary the RID
++ * with the uid, which is the same convention Windows and Samba use for local
++ * accounts. The returned pointer must outlive the call, so entries are cached
++ * rather than returned from the stack.
++ *
++ * Note this deliberately does NOT consult /etc/passwd or winbind. Mapping to
++ * *domain* SIDs is a separate job with a separate failure mode (the lookup can
++ * block or fail), and belongs outside the server.
++ */
++struct sg_uid_sid
++{
++    struct list entry;
++    uid_t       uid;
++    struct sid  sid;
++};
++static struct list sg_uid_sids = LIST_INIT( sg_uid_sids );
++
++static const struct sid *sg_sid_for_uid( uid_t uid )
++{
++    struct sg_uid_sid *entry;
++
++    LIST_FOR_EACH_ENTRY( entry, &sg_uid_sids, struct sg_uid_sid, entry )
++        if (entry->uid == uid) return &entry->sid;
++
++    if (!(entry = mem_alloc( sizeof(*entry) ))) return &anonymous_logon_sid;
++    entry->uid = uid;
++    entry->sid = local_user_sid;
++    entry->sid.sub_auth[4] = 1000 + uid;
++    list_add_tail( &sg_uid_sids, &entry->entry );
++    return &entry->sid;
++}
++
+ const struct sid *security_unix_uid_to_sid( uid_t uid )
+ {
++    if (sg_system_prefix) return sg_sid_for_uid( uid );
++
+     /* very simple mapping: either the current user or not the current user */
+     if (uid == getuid())
+         return &local_user_sid;
+@@ -739,6 +784,46 @@
+     return (struct token *)get_handle_obj( process, handle, access, &token_ops );
+ }
+ 
++/* Stained Glass OS: the default DACL for a shared prefix.
++ *
++ * Upstream's create_default_dacl() grants its argument GENERIC_ALL, and
++ * token_create_admin() passes Domain Users -- so by default every object is
++ * writable by everyone, which is why nothing in the registry is protected
++ * today.
++ *
++ * Naming the creating user instead protects HKLM keys and breaks it: a key
++ * written by one user becomes invisible to the next, and HKLM is meant to be
++ * the machine's shared state. Neither extreme is right, and the first attempt
++ * here made exactly that mistake -- clause 3 of the S2 gate started passing
++ * and clause 2 started failing.
++ *
++ * This is the arrangement Windows uses for HKLM: administrators and the system
++ * may write, everyone else may read. Per-user privacy is not this descriptor's
++ * job -- HKCU gets that from being a separate hive per user.
++ */
++static struct acl *sg_create_system_dacl(void)
++{
++    struct sid alias_admins_sid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS }};
++    struct ace *ace;
++    struct acl *dacl;
++    size_t size = sizeof(*dacl) + 3 * sizeof(*ace) +
++                  sid_len( &local_system_sid ) + sid_len( &alias_admins_sid ) +
++                  sid_len( &domain_users_sid );
++
++    if (!(dacl = mem_alloc( size ))) return NULL;
++
++    dacl->revision = ACL_REVISION;
++    dacl->pad1     = 0;
++    dacl->size     = size;
++    dacl->count    = 3;
++    dacl->pad2     = 0;
++
++    ace = set_ace( ace_first( dacl ), &local_system_sid, ACCESS_ALLOWED_ACE_TYPE, 0, GENERIC_ALL );
++    ace = set_ace( ace_next( ace ), &alias_admins_sid, ACCESS_ALLOWED_ACE_TYPE, 0, GENERIC_ALL );
++    set_ace( ace_next( ace ), &domain_users_sid, ACCESS_ALLOWED_ACE_TYPE, 0, GENERIC_READ );
++    return dacl;
++}
++
+ struct token *token_create_admin( unsigned primary, int impersonation_level, int elevation, unsigned int session_id )
+ {
+     struct token *token = NULL;
+@@ -805,6 +890,100 @@
+     return token;
+ }
+ 
++/* Stained Glass OS: a token for a particular Unix user.
++ *
++ * token_create_admin() above is the only token path upstream has for a new
++ * process, which is why "non-admin cannot write HKLM\\Software\\Policies"
++ * cannot be satisfied by tuning a security descriptor: there is no non-admin
++ * to deny. This is that missing case.
++ *
++ * Administrators here are root and the owner of the prefix. That is a
++ * placeholder for real group mapping once winbind is in play, but it is a
++ * genuine rule rather than a stub, and an administrator can see who qualifies
++ * with ls -l on the prefix.
++ *
++ * A non-admin differs in three ways that all matter: the Administrators group
++ * is absent from the token, the privilege set shrinks to what an ordinary user
++ * has, and the integrity label drops from high to medium. Leaving any one of
++ * them at the admin value leaves a token that is non-admin in name only.
++ */
++struct token *token_create_for_uid( unsigned primary, int impersonation_level,
++                                    int elevation, unsigned int session_id, uid_t uid )
++{
++    struct token *token = NULL;
++    struct sid alias_admins_sid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS }};
++    struct sid alias_users_sid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_USERS }};
++    struct sid logon_sid = { SID_REVISION, 3, SECURITY_NT_AUTHORITY, { SECURITY_LOGON_IDS_RID, 0, 0 }};
++    const struct sid *user_sid = security_unix_uid_to_sid( uid );
++    struct acl *default_dacl = sg_create_system_dacl();
++    int is_admin = (uid == 0 || uid == sg_system_prefix_uid);
++
++    static const struct luid_attr user_privs[] =
++    {
++        /* What an ordinary user gets. Deliberately short: the point of this
++         * token is that it cannot do what an administrator's can, and every
++         * privilege left in is one fewer difference between them. */
++        { SeChangeNotifyPrivilege, SE_PRIVILEGE_ENABLED },
++        { SeShutdownPrivilege, 0 },
++        { SeUndockPrivilege, 0 },
++    };
++    const struct luid_attr admin_privs[] =
++    {
++        { SeChangeNotifyPrivilege, SE_PRIVILEGE_ENABLED },
++        { SeTcbPrivilege, 0 },
++        { SeSecurityPrivilege, 0 },
++        { SeBackupPrivilege, 0 },
++        { SeRestorePrivilege, 0 },
++        { SeSystemtimePrivilege, 0 },
++        { SeShutdownPrivilege, 0 },
++        { SeRemoteShutdownPrivilege, 0 },
++        { SeTakeOwnershipPrivilege, 0 },
++        { SeDebugPrivilege, 0 },
++        { SeSystemEnvironmentPrivilege, 0 },
++        { SeSystemProfilePrivilege, 0 },
++        { SeProfileSingleProcessPrivilege, 0 },
++        { SeIncreaseBasePriorityPrivilege, 0 },
++        { SeLoadDriverPrivilege, SE_PRIVILEGE_ENABLED },
++        { SeCreatePagefilePrivilege, 0 },
++        { SeIncreaseQuotaPrivilege, 0 },
++        { SeUndockPrivilege, 0 },
++        { SeManageVolumePrivilege, 0 },
++        { SeImpersonatePrivilege, SE_PRIVILEGE_ENABLED },
++        { SeCreateGlobalPrivilege, SE_PRIVILEGE_ENABLED },
++    };
++    const struct sid_attrs groups[] =
++    {
++        { &world_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY },
++        { &local_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY },
++        { &interactive_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY },
++        { &authenticated_user_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY },
++        { &domain_users_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY|SE_GROUP_OWNER },
++        { &alias_users_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY },
++        { &logon_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY|SE_GROUP_LOGON_ID },
++        /* admins last, so it can be dropped by shortening the count */
++        { &alias_admins_sid, SE_GROUP_ENABLED|SE_GROUP_ENABLED_BY_DEFAULT|SE_GROUP_MANDATORY|SE_GROUP_OWNER },
++    };
++    unsigned int group_count = ARRAY_SIZE( groups ) - (is_admin ? 0 : 1);
++
++    if (!default_dacl) return NULL;
++
++    token = create_token( primary, session_id, user_sid, groups, group_count,
++                          is_admin ? admin_privs : user_privs,
++                          is_admin ? ARRAY_SIZE( admin_privs ) : ARRAY_SIZE( user_privs ),
++                          default_dacl, NULL, 4 /* domain_users */,
++                          impersonation_level, elevation );
++    free( default_dacl );
++    if (!token) return NULL;
++    assert( token->primary_group );
++
++    if (!token_assign_label( token, is_admin ? &high_label_sid : &medium_label_sid ))
++    {
++        release_object( token );
++        return NULL;
++    }
++    return token;
++}
++
+ static struct privilege *token_find_privilege( struct token *token, struct luid luid, int enabled_only )
+ {
+     struct privilege *privilege;
+--- a/server/process.h
++++ b/server/process.h
+@@ -50,6 +50,7 @@
+     timeout_t            sigkill_delay;   /* delay before final SIGKILL */
+     unsigned short       machine;         /* client machine type */
+     int                  unix_pid;        /* Unix pid for final SIGKILL */
++    uid_t                peer_uid;        /* Unix uid this process belongs to (Stained Glass) */
+     int                  exit_code;       /* process exit code */
+     int                  running_threads; /* number of threads running in this process */
+     timeout_t            start_time;      /* absolute time at process start */
+@@ -96,7 +97,8 @@
+ extern struct process *create_process( int fd, struct process *parent, unsigned int flags,
+                                        const struct startup_info_data *info,
+                                        const struct security_descriptor *sd, const obj_handle_t *handles,
+-                                       unsigned int handle_count, struct token *token );
++                                       unsigned int handle_count, struct token *token,
++                                       uid_t peer_uid );
+ extern data_size_t get_process_startup_info_size( struct process *process );
+ extern struct thread *get_process_first_thread( struct process *process );
+ extern struct process *get_process_from_id( process_id_t id );
+--- a/server/process.c
++++ b/server/process.c
+@@ -641,7 +641,7 @@
+ struct process *create_process( int fd, struct process *parent, unsigned int flags,
+                                 const struct startup_info_data *info,
+                                 const struct security_descriptor *sd, const obj_handle_t *handles,
+-                                unsigned int handle_count, struct token *token )
++                                unsigned int handle_count, struct token *token, uid_t peer_uid )
+ {
+     struct process *process;
+ 
+@@ -709,10 +709,24 @@
+     if (!(process->msg_fd = create_anonymous_fd( &process_fd_ops, fd, &process->obj, 0 ))) goto error;
+ 
+     /* create the handle table */
++    process->peer_uid = parent ? parent->peer_uid : peer_uid;
++
+     if (!parent)
+     {
+         process->handles = alloc_handle_table( process, 0 );
+-        process->token = token_create_admin( TRUE, -1, TokenElevationTypeLimited, default_session_id );
++        /* On a shared prefix the token says who actually connected; otherwise
++         * keep upstream's behaviour of giving every process an administrator's
++         * token, so ordinary prefixes are unaffected. */
++        if (sg_system_prefix)
++        {
++            /* The user's hive has to exist before anything touches HKCU, and
++             * this is the first moment we know which user that is. */
++            sg_ensure_user_hive( process->peer_uid );
++            process->token = token_create_for_uid( TRUE, -1, TokenElevationTypeLimited,
++                                                   default_session_id, process->peer_uid );
++        }
++        else
++            process->token = token_create_admin( TRUE, -1, TokenElevationTypeLimited, default_session_id );
+         process->affinity = ~0;
+     }
+     else
+@@ -1295,7 +1309,8 @@
+     }
+ 
+     if (!(process = create_process( socket_fd, parent, req->flags, info->data, sd,
+-                                    handles, req->handles_size / sizeof(*handles), token )))
++                                    handles, req->handles_size / sizeof(*handles), token,
++                                    parent->peer_uid )))
+         goto done;
+ 
+     process->machine = req->machine;
+--- a/server/registry.c
++++ b/server/registry.c
+@@ -140,7 +140,13 @@
+     const char  *filename;
+ };
+ 
+-#define MAX_SAVE_BRANCH_INFO 3
++/* Stained Glass OS: upstream needs exactly three save branches -- system.reg,
++ * userdef.reg and the single user.reg -- so the limit is 3. A shared prefix
++ * adds one per user who logs in, and with the original limit there is no room
++ * for even one: the assertion in load_init_registry_from_file() fires on the
++ * first user hive rather than on some later edge case. */
++#define MAX_SAVE_BRANCH_INFO (3 + SG_MAX_USER_HIVES)
++#define SG_MAX_USER_HIVES 64
+ static int save_branch_count;
+ static struct save_branch_info save_branch_info[MAX_SAVE_BRANCH_INFO];
+ 
+@@ -855,6 +861,29 @@
+ 
+     if (!(access & KEY_WOW64_64KEY)) attributes |= OBJ_KEY_WOW64;
+ 
++    /* Stained Glass OS: creating a subkey must be permitted by the *parent*.
++     *
++     * Upstream never checks this, and does not need to: with one all-powerful
++     * user, the answer is always yes. It is also why a restrictive descriptor
++     * on a key does not protect it -- the check that would consult it is not
++     * reached, and the handle for a freshly created key is then allocated with
++     * alloc_handle_no_access_check(). Without this, "non-admin cannot write
++     * HKLM\Software\Policies" cannot hold however the descriptor is written.
++     *
++     * A refusal here is not necessarily an error: the caller may be opening a
++     * key that already exists, which is governed by that key's own descriptor
++     * rather than the parent's. So fall through to an open rather than
++     * failing, and let the child's descriptor decide. */
++    if (parent && sg_system_prefix)
++    {
++        unsigned int parent_access = KEY_CREATE_SUB_KEY;
++        if (!check_object_access( NULL, &parent->obj, &parent_access ))
++        {
++            clear_error();
++            return open_key( parent, name, access, attributes );
++        }
++    }
++
+     if (!(key = create_key_object( &parent->obj, name, attributes, options, current_time, sd )))
+         return NULL;
+ 
+@@ -865,6 +894,30 @@
+     }
+     else
+     {
++        /* Stained Glass OS: give the new key a security descriptor.
++         *
++         * Wine leaves obj->sd NULL when none is supplied, and
++         * check_object_access() returns TRUE unconditionally for an object
++         * with no descriptor. So the registry is not merely under-checked --
++         * there is nothing to check against, and no descriptor written to a
++         * key can protect it while its neighbours have none.
++         *
++         * The descriptor comes from the creating process's token, so a key
++         * belongs to whoever made it: owner, primary group and the token's
++         * default DACL. For an ordinary user that DACL names Local System and
++         * the user, which is what makes another user's write fail.
++         *
++         * Only when there is a current thread: the registry is also built
++         * during server startup, while system.reg is loaded, and there is no
++         * token to derive anything from then. */
++        if (sg_system_prefix && !sd && current && current->process->token && !key->obj.sd)
++        {
++            static const struct security_descriptor empty_sd;
++            set_sd_defaults_from_token( &key->obj, &empty_sd,
++                                        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
++                                        DACL_SECURITY_INFORMATION,
++                                        current->process->token );
++        }
+         if (parent) touch_key( get_parent( key ), REG_NOTIFY_CHANGE_NAME );
+         if (debug_level > 1) dump_operation( key, NULL, "Create" );
+     }
+@@ -1868,6 +1921,80 @@
+     native_machine = supported_machines[0];
+ }
+ 
++/* Stained Glass OS: make sure a user's HKEY_CURRENT_USER hive exists.
++ *
++ * init_registry() below loads exactly one user hive, for one SID, at server
++ * startup -- upstream's own FIXME there says as much. That is fine when a
++ * prefix has one user and wrong as soon as it has two: with a SID per uid,
++ * every user but the first finds \\Registry\\User\\<their SID> missing and
++ * every HKCU operation fails with OBJECT_NAME_NOT_FOUND.
++ *
++ * So per-uid SIDs and per-user hives are not independent changes: doing the
++ * first without the second breaks HKCU for everyone.
++ *
++ * Hives are created on demand, when a process belonging to that user first
++ * appears, and saved to user-<uid>.reg beside system.reg.
++ */
++static uid_t sg_loaded_uids[SG_MAX_USER_HIVES];
++static unsigned int sg_loaded_uid_count;
++
++void sg_ensure_user_hive( uid_t uid )
++{
++    const struct sid *sid;
++    struct unicode_str path;
++    WCHAR *path_str;
++    struct key *key;
++    char *filename;
++    unsigned int i;
++
++    if (!sg_system_prefix || !root_key) return;
++
++    /* Track what we have loaded explicitly rather than probing the registry.
++     * Each load registers a save branch, and there is a hard limit on those --
++     * getting the "already loaded" test wrong does not merely reload, it
++     * trips an assertion in load_init_registry_from_file() once enough
++     * processes have started. */
++    for (i = 0; i < sg_loaded_uid_count; i++)
++        if (sg_loaded_uids[i] == uid) return;
++    if (sg_loaded_uid_count >= ARRAY_SIZE(sg_loaded_uids)) return;
++
++    sid = security_unix_uid_to_sid( uid );
++    if (!(path_str = format_user_registry_path( sid, &path ))) return;
++
++    if ((key = open_key( root_key, &path, 0, 0 )))   /* already there */
++    {
++        release_object( key );
++        free( path_str );
++        sg_loaded_uids[sg_loaded_uid_count++] = uid;
++        return;
++    }
++    clear_error();
++
++    /* the hive files live in the config dir, which is not where we are */
++    if (fchdir( config_dir_fd ) == -1)
++    {
++        free( path_str );
++        return;
++    }
++
++    if (!(key = create_key_recursive( root_key, &path, current_time )))
++    {
++        free( path_str );
++        return;
++    }
++
++    /* load_init_registry_from_file() keeps the pointer for saving, so this
++     * string has to outlive the call. */
++    if (asprintf( &filename, "user-%u.reg", (unsigned int)uid ) != -1)
++    {
++        load_init_registry_from_file( filename, key );
++        sg_loaded_uids[sg_loaded_uid_count++] = uid;
++    }
++
++    release_object( key );
++    free( path_str );
++}
++
+ /* registry initialisation */
+ void init_registry(void)
+ {
