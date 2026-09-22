@@ -245,6 +245,34 @@ correct and safe.
 the session's `/desktop=shell,WxH`. A bare `/desktop` beside it is session 0
 growing a shell, and it will fight the real one for the display mode.
 
+## `patches/sg/0008-default-dacl-names-the-token-s-own-user.patch`
+
+Patch 0002 gave every token the HKLM arrangement as its default DACL — Local
+System and Administrators full control, Domain Users read — and left the
+token's own user out. That is the right shape for HKLM and the wrong shape for
+a token default, because it names everyone except the identity that matters.
+
+**An object created by an ordinary user got a descriptor its own creator could
+read and not write.** The user then could not create a subkey inside a key it
+had just created. That is not a strict permission model, it is a contradiction:
+no ordering of operations satisfies it. Windows names Local System *and* the
+user for exactly this reason. Adding the user back keeps what patch 0002
+needed — users at large still only read, administrators still write.
+
+**The symptom was nowhere near the cause,** and it is the best example in this
+repo of why a trace beats a guess. Wine's display setup creates
+`HKLM\System\CurrentControlSet\Control\Video\{guid}\0000` from the session
+process. Refused at the last component, it generates a *fresh guid* and tries
+again — forever. What you see is `explorer.exe` at 100% of one core, a black
+screen, a desktop window created but never named, and no error message
+anywhere. Four plausible theories died before a `WINEDEBUG=+relay` trace showed
+`RegCreateKeyExW` returning 5 in a loop over changing guids.
+
+**If a Wine process spins at 100% with no syscalls, take a relay trace.**
+`WINEDEBUG=+relay wine <prog> 2>&1 | tail -40` shows the repeating call pattern
+and names the loop in one run. `/proc/<pid>/syscall` reading `running` is the
+tell that it is a userspace loop and that no kernel-level tool will help.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
