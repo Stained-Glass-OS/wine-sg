@@ -293,6 +293,23 @@ key and the user's own key, so anything a user sets still wins. It is opened
 asking for `KEY_ALL_ACCESS` would fail for every non-admin — which, since patch
 0002, is every interactive user.
 
+## `patches/sg/0010-lockworkstation-asks-the-compositor.patch`
+
+`LockWorkStation()` was a stub, so every Windows program and RMM tool that
+locks the workstation silently did nothing. It now starts the native helper
+`/usr/libexec/stained-glass/sg-lockctl LOCK` (from `sg-session`), which asks
+`sg-compositor` over its control socket — Windows code cannot open that socket
+itself, since Wine has no `AF_UNIX`. The helper has no authority; the
+compositor checks peer credentials.
+
+- **`\\?\unix\` path, not `Z:`.** Administrators often remove the drive mapped
+  to `/`; locking must survive that.
+- **It returns TRUE once the request is launched**, which is exactly Windows'
+  documented contract ("initiated", not "succeeded"). It is also all it can
+  know: Wine gives a native child a process handle that `WaitForSingleObject`
+  rejects and that has no exit code. The outcome is in the compositor's audit
+  log.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
