@@ -335,6 +335,25 @@ this patch gives them the writable DACL.
 app launch fails with "no driver could be loaded", only in the multi-user
 image. `Failed to read display config` in the journal is the smoking gun.
 
+## `patches/sg/0012-windows-10-taskbar.patch`
+
+Explorer's taskbar (`Shell_TrayWnd`, `systray.c`) given a Windows 10 look **in
+place** -- 40px dark bar, flat task buttons with the app icon and a purple
+active-underline, the project's stained-glass diamond as the Start button, and
+a clock. No protocol path changes: the tray, the taskbar buttons, the position
+and `ITaskbarList` are exactly as upstream, so applications see the same shell.
+This is ADR 0007's "upgrade the bar, don't overlay or hide it".
+
+- **The Windows-10 metrics/colours are `#define SG_*` at the top of the file**,
+  before `do_show_systray`. When one referenced `SG_CLOCK_TIMER` defined lower
+  down, `systray.o` failed to compile and `make` fell back to linking the
+  previous explorer -- so the taskbar looked unchanged and nothing said why.
+  If a taskbar change does not show, check that `systray.o` actually rebuilt.
+- The height is a one-line change to `tray_height`; the window repositions
+  itself and winex11 follows with the work-area reservation.
+- New UI that explorer does *not* have -- a Start menu, a notification centre --
+  is not this patch; it is separate AGPL programs in `sg-shell`.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
