@@ -1,0 +1,308 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: Delegate cross-uid process operations to a per-user agent
+
+Stained Glass ADR 0014 (multi-user debt D16, D19). The machine-level server
+runs as the SYSTEM account, so the kernel refuses it ptrace/tgkill on an
+ordinary user's processes: ReadProcessMemory/WriteProcessMemory across
+processes, DebugActiveProcess (which writes the debuggee's PEB), thread signals
+for asynchronous procedure calls, and sched_setaffinity all failed with
+ERROR_ACCESS_DENIED for ordinary users, while working for the server's own
+account.
+
+The server now delegates each of those to a small unprivileged agent
+(sg-session's sg-procagent) that runs as the target's user and performs the
+operation on that user's own processes, where the kernel allows it. Nothing
+gains a capability -- the agent can only touch its own user's processes, as
+that user already could. Same-uid operations (the server's own account, e.g. a
+program elevated to SYSTEM through the broker) are still done directly, and the
+whole mechanism is inert on an ordinary, non-system prefix.
+
+  - read_process_memory / write_process_memory / send_thread_signal
+    (server/ptrace.c) and set_thread_affinity (server/thread.c) delegate when
+    the target's peer_uid is not the server's uid.
+  - The server connects to <prefix>/.sg-procagent.<uid>, requires the path to
+    be a socket owned by that uid, and verifies SO_PEERCRED -- so a member of
+    the prefix group cannot impersonate another user's agent. The fd is cached
+    per uid; a dead or absent agent means the operation fails exactly as it
+    does today (no regression when no agent is running).
+  - request.c keeps the prefix path (get_config_dir) so the server can form the
+    socket path; it is otherwise unused there.
+
+Wire protocol (must match sg-procagent): a fixed request {op, sig, pid, tid,
+addr, len} then len payload bytes for a write; a reply {status, len} then len
+bytes for a read.
+
+Tested as a second Unix user against a shared server with the agent running:
+ntdll:file and ntdll:info go from 6 and 54 failures to 0 (matching the
+server's-own-user baseline), the loader suite's cross-process ReadProcessMemory
+failures are gone, and kernel32:process/loader match the baseline exactly. No
+change for the server's own user. Debug registers (hardware breakpoints) are
+not yet delegated; software breakpoints, which go through WriteProcessMemory,
+work.
+--- a/server/ptrace.c
++++ b/server/ptrace.c
+@@ -27,6 +27,7 @@
+ #include <signal.h>
+ #include <stdarg.h>
+ #include <sys/types.h>
++#include <sys/stat.h>
+ #include <sys/wait.h>
+ #ifdef HAVE_SYS_PTRACE_H
+ # include <sys/ptrace.h>
+@@ -52,6 +53,10 @@
+ #include "file.h"
+ #include "process.h"
+ #include "thread.h"
++#include "request.h"
++#include "security.h"
++#include <sys/socket.h>
++#include <sys/un.h>
+ 
+ #ifdef USE_PTRACE
+ 
+@@ -175,6 +180,146 @@
+     }
+ }
+ 
++/* Stained Glass OS (ADR 0014): cross-uid ptrace/signal via a per-user agent.
++ *
++ * The shared machine-level server runs as sgsystem; the kernel refuses it
++ * ptrace/tgkill on an ordinary user's processes (different uid). A small
++ * unprivileged agent (sg-procagent) runs as each session user and performs the
++ * operation on that user's own processes, where the kernel allows it. The
++ * server connects to <prefix>/.sg-procagent.<uid>, checks the peer really is
++ * that uid, and delegates. Nothing here gains a capability: the agent can only
++ * touch its own user's processes, exactly as that user could. Same-uid
++ * operations are still done directly below (this is bypassed entirely on an
++ * ordinary, non-system prefix). */
++
++enum sg_proc_op { SG_PROC_READ = 1, SG_PROC_WRITE, SG_PROC_SIGNAL, SG_PROC_GETDR, SG_PROC_SETDR, SG_PROC_SETAFF };
++
++struct sg_proc_req
++{
++    int              op;
++    int              sig;
++    unsigned int     pid;
++    unsigned int     tid;
++    unsigned __int64 addr;
++    unsigned int     len;   /* payload bytes that follow the request / are expected back */
++};
++
++struct sg_proc_reply
++{
++    int          status;    /* 1 = ok, 0 = failed */
++    unsigned int len;       /* payload bytes that follow the reply */
++};
++
++#define SG_AGENT_MAX 64
++static struct { uid_t uid; int fd; } sg_agents[SG_AGENT_MAX];  /* fd 0 means empty */
++
++static int sg_io_all( int fd, void *buf, size_t len, int writing )
++{
++    char *p = buf;
++    while (len)
++    {
++        ssize_t r = writing ? write( fd, p, len ) : read( fd, p, len );
++        if (r > 0) { p += r; len -= r; continue; }
++        if (r == -1 && errno == EINTR) continue;
++        return 0;
++    }
++    return 1;
++}
++
++static void sg_agent_drop( uid_t uid )
++{
++    int i;
++    for (i = 0; i < SG_AGENT_MAX; i++)
++        if (sg_agents[i].fd && sg_agents[i].uid == uid)
++        {
++            close( sg_agents[i].fd );
++            sg_agents[i].fd = 0;
++            return;
++        }
++}
++
++static int sg_agent_fd( uid_t uid )
++{
++    struct sockaddr_un addr;
++    struct ucred cred;
++    socklen_t clen = sizeof(cred);
++    struct timeval tv = { 10, 0 };
++    int fd, i, slot = -1, n;
++
++    for (i = 0; i < SG_AGENT_MAX; i++)
++    {
++        if (sg_agents[i].fd && sg_agents[i].uid == uid) return sg_agents[i].fd;
++        if (!sg_agents[i].fd && slot == -1) slot = i;
++    }
++    if (slot == -1 || !get_config_dir()) return -1;
++
++    memset( &addr, 0, sizeof(addr) );
++    addr.sun_family = AF_UNIX;
++    n = snprintf( addr.sun_path, sizeof(addr.sun_path), "%s/.sg-procagent.%u", get_config_dir(), (unsigned)uid );
++    if (n < 0 || n >= (int)sizeof(addr.sun_path)) return -1;
++    /* the socket must be a socket owned by that very user -- so another member
++     * of the prefix group cannot squat the path and impersonate the agent
++     * (SO_PEERCRED below is the second, decisive check) */
++    {
++        struct stat st;
++        if (stat( addr.sun_path, &st ) == -1 || !S_ISSOCK(st.st_mode) || st.st_uid != uid) return -1;
++    }
++    if ((fd = socket( AF_UNIX, SOCK_STREAM, 0 )) == -1) return -1;
++    if (connect( fd, (struct sockaddr *)&addr, sizeof(addr) ) == -1 ||
++        getsockopt( fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen ) == -1 ||
++        cred.uid != uid)
++    {
++        close( fd );
++        return -1;
++    }
++    setsockopt( fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv) );
++    setsockopt( fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv) );
++    sg_agents[slot].uid = uid;
++    sg_agents[slot].fd = fd;
++    return fd;
++}
++
++/* returns 1 on success; fills rbuf (up to rlen bytes) for READ/GETDR */
++static int sg_agent_call( uid_t uid, struct sg_proc_req *req, const void *wbuf,
++                          void *rbuf, unsigned int rlen )
++{
++    struct sg_proc_reply rep;
++    int fd = sg_agent_fd( uid );
++
++    if (fd == -1) return 0;
++    if (!sg_io_all( fd, req, sizeof(*req), 1 )) goto fail;
++    if (req->len && wbuf && !sg_io_all( fd, (void *)wbuf, req->len, 1 )) goto fail;
++    if (!sg_io_all( fd, &rep, sizeof(rep), 0 )) goto fail;
++    if (rep.len)
++    {
++        if (rep.len != rlen || !rbuf || !sg_io_all( fd, rbuf, rep.len, 0 )) goto fail;
++    }
++    return rep.status;
++fail:
++    sg_agent_drop( uid );
++    return 0;
++}
++
++static inline int sg_delegate_process( struct process *process )
++{
++    return sg_system_prefix && process->peer_uid != getuid();
++}
++
++/* Stained Glass OS (ADR 0014): set a thread's affinity via its user's agent.
++ * Returns 1 done-ok, 0 done-failed, -1 not delegated (caller does it). */
++int sg_agent_set_affinity( struct thread *thread, unsigned __int64 affinity )
++{
++    struct sg_proc_req req;
++
++    if (!sg_delegate_process( thread->process ) || thread->unix_tid == -1) return -1;
++    memset( &req, 0, sizeof(req) );
++    req.op = SG_PROC_SETAFF;
++    req.pid = thread->unix_pid;
++    req.tid = thread->unix_tid;
++    req.addr = affinity;
++    return sg_agent_call( thread->process->peer_uid, &req, NULL, NULL, 0 ) ? 1 : 0;
++}
++
+ /* return the Unix pid to use in ptrace calls for a given process */
+ static int get_ptrace_pid( struct thread *thread )
+ {
+@@ -259,6 +404,18 @@
+ {
+     int ret = -1;
+ 
++    if (thread->unix_pid != -1 && sg_delegate_process( thread->process ))
++    {
++        struct sg_proc_req req = { .op = SG_PROC_SIGNAL, .sig = sig,
++                                   .pid = thread->unix_pid, .tid = thread->unix_tid };
++        if (sg_agent_call( thread->process->peer_uid, &req, NULL, NULL, 0 ))
++        {
++            if (debug_level) fprintf( stderr, "%04x: *sent signal (agent)* %s\n", thread->id, get_signal_name( sig ));
++            return 1;
++        }
++        return 0;
++    }
++
+     if (thread->unix_pid != -1)
+     {
+         if (thread->unix_tid != -1)
+@@ -376,6 +533,15 @@
+         return 0;
+     }
+ 
++    if (sg_delegate_process( process ))
++    {
++        struct sg_proc_req req = { .op = SG_PROC_READ, .pid = process->unix_pid,
++                                   .addr = ptr, .len = size };
++        if (sg_agent_call( process->peer_uid, &req, NULL, dest, size )) return 1;
++        set_error( STATUS_ACCESS_DENIED );
++        return 0;
++    }
++
+     first_offset = ptr % sizeof(long);
+     last_offset = (size + first_offset) % sizeof(long);
+     if (!last_offset) last_offset = sizeof(long);
+@@ -461,6 +627,15 @@
+         set_error( STATUS_ACCESS_DENIED );
+         return 0;
+     }
++
++    if (sg_delegate_process( process ))
++    {
++        struct sg_proc_req req = { .op = SG_PROC_WRITE, .pid = process->unix_pid,
++                                   .addr = ptr, .len = size };
++        if (sg_agent_call( process->peer_uid, &req, src, NULL, 0 )) return 1;
++        set_error( STATUS_ACCESS_DENIED );
++        return 0;
++    }
+ 
+     /* compute the mask for the first long */
+     first_mask = ~0;
+--- a/server/request.c
++++ b/server/request.c
+@@ -122,6 +122,9 @@
+ unsigned int global_error = 0;  /* global error code for when no thread is current */
+ timeout_t server_start_time = 0;  /* server startup time */
+ char *server_dir = NULL;   /* server directory */
++char *server_config_dir = NULL;  /* the prefix directory (Stained Glass, ADR 0014) */
++
++const char *get_config_dir(void) { return server_config_dir; }
+ int server_dir_fd = -1;    /* file descriptor for the server dir */
+ int config_dir_fd = -1;    /* file descriptor for the config dir */
+ 
+@@ -823,7 +826,7 @@
+         fatal_error( "chdir did not end up in %s\n", server_dir );
+ 
+     free( base_dir );
+-    free( config_dir );
++    server_config_dir = config_dir;  /* kept for get_config_dir() (Stained Glass) */
+     return server_dir;
+ }
+ 
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -574,6 +574,14 @@
+ int set_thread_affinity( struct thread *thread, affinity_t affinity )
+ {
+     int ret = 0;
++    int delegated = sg_agent_set_affinity( thread, affinity );  /* Stained Glass, ADR 0014 */
++
++    if (delegated >= 0)
++    {
++        if (delegated) { thread->affinity = affinity; return 0; }
++        errno = EPERM;
++        return -1;
++    }
+ #ifdef HAVE_SCHED_SETAFFINITY
+     if (thread->unix_tid != -1)
+     {
+--- a/server/thread.h
++++ b/server/thread.h
+@@ -110,6 +110,7 @@
+ extern client_ptr_t get_wait_queue_key( struct wait_queue_entry *entry );
+ extern void make_wait_abandoned( struct wait_queue_entry *entry );
+ extern void set_wait_status( struct wait_queue_entry *entry, int status );
++extern int sg_agent_set_affinity( struct thread *thread, unsigned __int64 affinity );
+ extern void stop_thread( struct thread *thread );
+ extern int wake_thread( struct thread *thread );
+ extern int wake_thread_queue_entry( struct wait_queue_entry *entry );

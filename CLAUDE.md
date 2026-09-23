@@ -480,6 +480,37 @@ Local System and Administrators, full access -- in a shared prefix only.
   still fails for a non-server user -- a further debug-object gap, tracked in
   the debt list.
 
+## `patches/sg/0021-delegate-cross-uid-process-operations.patch`
+
+Debt D16/D19 (ADR 0014). The shared server runs as SYSTEM, so the kernel
+refuses it `ptrace`/`tgkill`/`sched_setaffinity` on an **ordinary user's**
+processes — `ReadProcessMemory`/`WriteProcessMemory` across processes,
+`DebugActiveProcess` (PEB write), async-APC thread signals, and thread
+affinity all failed with `ERROR_ACCESS_DENIED`. The server now delegates each
+to a per-user agent (`sg-procagent`, in sg-session) that runs as the target's
+user and does the operation on that user's own processes. Same-uid operations
+(the server's own account — including programs elevated to SYSTEM) are still
+done directly; the whole thing is inert on a non-system prefix.
+
+- **Delegation points**, all guarded by `sg_delegate_process()` (system prefix
+  and `peer_uid != getuid()`): `read_process_memory`, `write_process_memory`,
+  `send_thread_signal` (server/ptrace.c) and `set_thread_affinity`
+  (server/thread.c, via `sg_agent_set_affinity`).
+- **Rendezvous:** the server connects to `<prefix>/.sg-procagent.<uid>`,
+  requires it to be a socket owned by that uid, and verifies `SO_PEERCRED`.
+  `request.c` keeps the prefix path for `get_config_dir()`.
+- **Wire protocol (must match sg-procagent):** request `{int op; int sig;
+  uint pid; uint tid; uint64 addr; uint len;}` then `len` bytes for a write;
+  reply `{int status; uint len;}` then `len` bytes for a read. Ops:
+  READ=1, WRITE=2, SIGNAL=3, GETDR=4, SETDR=5, SETAFF=6. GETDR/SETDR (debug
+  registers / hardware breakpoints) are reserved, not yet delegated —
+  software breakpoints go through WRITE and work.
+- **No new privilege anywhere:** the agent can only touch its own user's
+  processes, exactly as that user could; a dead/absent agent means the op
+  fails as it does today. Any new cross-uid ptrace/signal the server grows
+  must delegate the same way.
+- Gate: sg-session's `sg-procagent-check` (image: `make procagent-test`).
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
