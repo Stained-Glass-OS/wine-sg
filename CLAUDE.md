@@ -511,6 +511,19 @@ done directly; the whole thing is inert on a non-system prefix.
   must delegate the same way.
 - Gate: sg-session's `sg-procagent-check` (image: `make procagent-test`).
 
+## `patches/sg/0022-route-runas-to-the-elevation-broker.patch`
+
+ADR 0012. Since patch 0019 a standard user has no administrator token, so
+ShellExecute's `runas` verb ("Run as administrator") ran the program
+unelevated. Now, when `runas` has no token to elevate with, `SHELL_ExecuteW`
+launches `sg-elevate` (the broker's client, in sg-session) through
+`\\?\unix\`, with `--wine` so the broker runs the command under Wine as the
+SYSTEM account after consent on the secure surface. Guarded: only the `runas`
+verb with no usable token, only when `sg-elevate` is installed, and never
+inside a program the broker started (`SG_IN_BROKER`, so no loop). Absent the
+client, the old path runs unchanged. The broker itself is sg-session's
+`sg-brokerd`; see ADR 0012.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
