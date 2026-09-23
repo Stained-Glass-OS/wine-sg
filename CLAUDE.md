@@ -466,6 +466,20 @@ or root (`sg_requester_is_admin()`).
   declined.
 - Gate: sg-session's `sg-token-check` (image: `make token-test`).
 
+## `patches/sg/0020-owner-can-open-own-processes-and-threads.patch`
+
+Debt D18. A process's default SD (`process_get_sd`) named Administrators only,
+and threads had none -- so in a shared prefix a standard user could not open,
+suspend, read the context of or debug **their own** processes. Each process
+and thread now gets `sg_create_owner_sd(user)` -- the owning token's user,
+Local System and Administrators, full access -- in a shared prefix only.
+
+- **Any new server object a user should reach across processes** may need the
+  same. The pattern is `sg_create_owner_sd()` on the object at creation.
+- Not covered: attaching a debugger to your own process (`DebugActiveProcess`)
+  still fails for a non-server user -- a further debug-object gap, tracked in
+  the debt list.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
