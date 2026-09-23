@@ -33,16 +33,72 @@ log "verifying tarball checksum"
 echo "$WINE_SHA256  $TARBALL" | sha256sum -c - >/dev/null
 
 # --- unpack and patch ------------------------------------------------------
-if [[ ! -d "$SRC_DIR" ]]; then
-    log "unpacking"
-    tar -C "$BUILD_DIR" -xf "$TARBALL"
+# The source tree must always be exactly the tarball plus the *current* series.
+# It used to be patched only when first unpacked, so a patch added or changed
+# later never reached an existing tree -- and a local build quietly shipped
+# without it. The series is fingerprinted; when the fingerprint changes, the
+# patched tree is rebuilt in a scratch directory and only files whose content
+# differs are copied over. That keeps the object tree incremental and correct:
+# a file a removed patch reverts gets a fresh mtime and is recompiled, which a
+# plain re-extract (restoring the tarball's old mtimes) would not do.
+series_fingerprint() {
+    {
+        cat "$HERE/wine-version"
+        while read -r p; do
+            [[ -z "$p" || "$p" == \#* ]] && continue
+            echo "== $p"
+            cat "$HERE/patches/$p"
+        done < "$HERE/patches/series"
+    } | sha256sum | cut -d' ' -f1
+}
 
-    log "applying patches"
+# Unpack the tarball and apply the series into directory $1.
+prepare_tree() {
+    local dest=$1 tmp
+    tmp=$(mktemp -d "$BUILD_DIR/unpack.XXXXXX")
+    tar -C "$tmp" -xf "$TARBALL"
     while read -r p; do
         [[ -z "$p" || "$p" == \#* ]] && continue
         log "  $p"
-        patch -d "$SRC_DIR" -p1 -s -i "$HERE/patches/$p"
+        patch -d "$tmp/wine-$WINE_VERSION" -p1 -s -i "$HERE/patches/$p"
     done < "$HERE/patches/series"
+    mv "$tmp/wine-$WINE_VERSION" "$dest"
+    rmdir "$tmp"
+}
+
+FINGERPRINT=$(series_fingerprint)
+if [[ ! -d "$SRC_DIR" ]]; then
+    log "unpacking and applying patches"
+    prepare_tree "$SRC_DIR"
+    echo "$FINGERPRINT" > "$SRC_DIR/.sg-series"
+elif [[ "$(cat "$SRC_DIR/.sg-series" 2>/dev/null)" != "$FINGERPRINT" ]]; then
+    log "patch series changed; refreshing the source tree"
+    NEW_DIR="$BUILD_DIR/wine-$WINE_VERSION.new"
+    rm -rf "$NEW_DIR"
+    prepare_tree "$NEW_DIR"
+    # diff -rq names every file that differs or exists on one side only; Wine's
+    # tree has no spaces in its paths, so its output parses cleanly. It exits 1
+    # when it finds differences -- the very case this is for -- which under
+    # `set -e -o pipefail` would abort the script mid-refresh, so collect its
+    # list first and tolerate that status.
+    CHANGES="$BUILD_DIR/series-changes.txt"
+    diff -rq -x .sg-series "$NEW_DIR" "$SRC_DIR" > "$CHANGES" || true
+    while read -r line; do
+        case $line in
+            "Files $NEW_DIR/"*" differ")
+                rel=${line#"Files $NEW_DIR/"}; rel=${rel%% and *}
+                cp "$NEW_DIR/$rel" "$SRC_DIR/$rel"; log "  updated $rel" ;;
+            "Only in $NEW_DIR"*)
+                rel=${line#"Only in $NEW_DIR"}; rel=${rel#/}; rel=${rel/: //}; rel=${rel#/}
+                mkdir -p "$(dirname "$SRC_DIR/$rel")"
+                cp -r "$NEW_DIR/$rel" "$SRC_DIR/$rel"; log "  added $rel" ;;
+            "Only in $SRC_DIR"*)
+                rel=${line#"Only in $SRC_DIR"}; rel=${rel#/}; rel=${rel/: //}; rel=${rel#/}
+                rm -rf "${SRC_DIR:?}/$rel"; log "  removed $rel" ;;
+        esac
+    done < "$CHANGES"
+    rm -rf "$NEW_DIR" "$CHANGES"
+    echo "$FINGERPRINT" > "$SRC_DIR/.sg-series"
 fi
 
 # --- configure -------------------------------------------------------------

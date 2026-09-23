@@ -377,6 +377,17 @@ the title bar, so no `.msstyles` could do this; the caption *colours* come from
   inside `ntdll`'s `.text`. Upstream Wine 10.0 built on trixie without this
   patch produces a Wine that cannot start `cmd`. Debian carries it; upstream
   tarballs do not. WineHQ bug 57819.
+- **The source tree follows the patch series automatically.** `build.sh`
+  fingerprints `wine-version` plus every patch in `series` into
+  `build/wine-<ver>/.sg-series`; when that changes it re-patches in a scratch
+  tree and copies over only files whose content differs, so the object tree
+  rebuilds exactly what changed. Before this, the series was applied only on
+  first unpack, and a new patch silently never reached an existing tree. Hand
+  edits to `build/wine-<ver>/` are overwritten on the next series change --
+  put changes in a patch.
+- **Package builds keep the object tree.** `debian/rules` overrides
+  `dh_auto_clean`, which used to `rm -rf build/obj` and recompile all of Wine
+  on every `.deb`. `make distclean` for a from-scratch build.
 - **Don't reconfigure into a dirty object tree.** `build.sh` skips `configure`
   when `build/obj/Makefile` exists. If you change configure flags, `make clean`.
 - **Bumping `wine-version` is a deliberate act.** It invalidates `sg-testlab`'s
