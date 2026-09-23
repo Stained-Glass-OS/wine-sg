@@ -446,6 +446,26 @@ template can say `TEMP=%USERPROFILE%\AppData\Local\Temp`. sg-session's
 `sg-prefix-init` writes the template that way; without this patch that TEMP is
 left unexpanded.
 
+## `patches/sg/0019-only-system-mints-administrators-tokens.patch`
+
+Debt D17. **The server's token requests are a privilege boundary in a shared
+prefix**, and upstream checks nothing: `create_token` (no
+SeCreateTokenPrivilege check), `grant_process_admin_token`,
+`create_linked_token` (returns `token_create_admin()` -- whose user, here, is
+SYSTEM) and assigning a primary token. Each let a standard user become SYSTEM;
+a `requireAdministrator` manifest alone did it, through the loader's
+`elevate_token()`. Now a standard user's token is elevation type Default with
+no linked token, and minting/assigning others' tokens is for the prefix owner
+or root (`sg_requester_is_admin()`).
+
+- **Any new request that creates or swaps a token must check
+  `sg_requester_is_admin()`.** Review upstream rebases for new ones.
+- `requireAdministrator` programs now run unelevated as the user. The real
+  path is the elevation broker (ADR 0012); until then installers that need
+  HKLM or Program Files fail as a standard user would on Windows with UAC
+  declined.
+- Gate: sg-session's `sg-token-check` (image: `make token-test`).
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
