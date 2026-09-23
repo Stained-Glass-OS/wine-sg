@@ -1,0 +1,208 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: Clients apply their files' new permissions themselves
+
+Part of Stained Glass ADR 0013 (multi-user debt D14). Setting a file's or
+directory's DACL (SetFileSecurity, SetSecurityInfo, NtSetSecurityObject) maps
+it to a Unix mode, which the server applied with fchmod() on its own
+descriptor -- with the shared machine-level server's rights, which are
+SYSTEM's. For another user that either failed (the user's own files are not
+the server's to chmod, so standard users could not change their own files'
+permissions) or, worse, could succeed on a file the server's account owns.
+
+Now, for a client that is not the server's own Unix account, the server
+computes the mode as before but returns it in set_security_object's reply
+(unix_mode; -1 when there is nothing to apply) and the client applies it to
+its own descriptor with fchmod(): the kernel then allows it only to the
+file's owner. EPERM/EACCES/EROFS are reported as STATUS_ACCESS_DENIED.
+
+Tested: advapi32:security and advapi32:lsa as the server's own user in an
+ordinary prefix, no failures. As a second Unix user on a shared server,
+advapi32:security's 13 SetNamedSecurityInfo/NtSetSecurityObject/
+SetFileSecurity failures on the user's own files are gone; the 4 left are
+token-model differences for a standard user (not an administrator), outside
+file access.
+
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -3506,6 +3506,8 @@
+     obj_handle_t    handle;       /* handle to the object */
+     unsigned int    security_info; /* which parts of security descriptor to set */
+     VARARG(sd,security_descriptor); /* security descriptor to set */
++@REPLY
++    int             unix_mode;    /* a file's new Unix mode, for the client to apply; -1 if none */
+ @END
+ 
+ @REQ(get_security_object)
+--- a/dlls/ntdll/unix/security.c
++++ b/dlls/ntdll/unix/security.c
+@@ -23,9 +23,12 @@
+ #pragma makedep unix
+ #endif
+ 
++#include <errno.h>
+ #include <stdarg.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
++#include <sys/stat.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -966,6 +969,7 @@
+     data_size_t len;
+     OBJECT_ATTRIBUTES attr;
+     unsigned int status;
++    int unix_mode = -1;
+ 
+     TRACE( "%p 0x%08x %p\n", handle, (int)info, descr );
+ 
+@@ -994,9 +998,25 @@
+         req->security_info = info;
+         wine_server_add_data( req, sd, objattr->sd_len );
+         status = wine_server_call( req );
++        unix_mode = reply->unix_mode;
+     }
+     SERVER_END_REQ;
+     free( objattr );
++
++    /* Stained Glass OS (ADR 0013): a file's new permissions, which the server
++     * leaves to this process to apply with its own rights */
++    if (!status && unix_mode != -1)
++    {
++        int fd, needs_close;
++
++        if (!(status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
++        {
++            if (fchmod( fd, unix_mode ) == -1)
++                status = (errno == EPERM || errno == EACCES || errno == EROFS) ? STATUS_ACCESS_DENIED
++                                                                                 : errno_to_status( errno );
++            if (needs_close) close( fd );
++        }
++    }
+     return status;
+ }
+ 
+--- a/server/change.c
++++ b/server/change.c
+@@ -399,7 +399,7 @@
+         mode = st.st_mode & (S_ISUID|S_ISGID|S_ISVTX);
+         mode |= sd_to_mode( sd, owner );
+ 
+-        if (((st.st_mode ^ mode) & (S_IRWXU|S_IRWXG|S_IRWXO)) && fchmod( unix_fd, mode ) == -1)
++        if (((st.st_mode ^ mode) & (S_IRWXU|S_IRWXG|S_IRWXO)) && sg_set_unix_mode( unix_fd, mode ) == -1)
+         {
+             file_set_error();
+             return 0;
+--- a/server/file.c
++++ b/server/file.c
+@@ -505,6 +505,23 @@
+     return new_mode;
+ }
+ 
++/* Stained Glass OS (ADR 0013): the mode a new DACL maps to is applied by the
++ * server only for its own account. For another user it is handed back to
++ * that user's client (set_security_object's reply), which applies it with its
++ * own rights -- so only a file's owner can change its permissions, as the
++ * kernel intends, and never through the server's ownership of system files. */
++int sg_client_chmod = -1;
++
++int sg_set_unix_mode( int unix_fd, mode_t mode )
++{
++    if (current && current->process->peer_uid != getuid())
++    {
++        sg_client_chmod = mode & 07777;
++        return 0;
++    }
++    return fchmod( unix_fd, mode );
++}
++
+ static int file_set_sd( struct object *obj, const struct security_descriptor *sd,
+                         unsigned int set_info )
+ {
+@@ -546,7 +563,7 @@
+         mode = st.st_mode & (S_ISUID|S_ISGID|S_ISVTX);
+         mode |= sd_to_mode( sd, owner );
+ 
+-        if (((st.st_mode ^ mode) & (S_IRWXU|S_IRWXG|S_IRWXO)) && fchmod( unix_fd, mode ) == -1)
++        if (((st.st_mode ^ mode) & (S_IRWXU|S_IRWXG|S_IRWXO)) && sg_set_unix_mode( unix_fd, mode ) == -1)
+         {
+             file_set_error();
+             return 0;
+--- a/server/handle.c
++++ b/server/handle.c
+@@ -750,7 +750,10 @@
+ 
+     if (!(obj = get_handle_obj( current->process, req->handle, access, NULL ))) return;
+ 
++    sg_client_chmod = -1;
+     obj->ops->set_sd( obj, sd, req->security_info );
++    reply->unix_mode = get_error() ? -1 : sg_client_chmod;
++    sg_client_chmod = -1;
+     release_object( obj );
+ }
+ 
+--- a/server/handle.h
++++ b/server/handle.h
+@@ -42,6 +42,9 @@
+ /* Stained Glass OS (ADR 0013): deletions the closing client performs, in fd.c */
+ extern void sg_discard_client_unlinks(void);
+ extern void sg_reply_client_unlinks(void);
++/* a file's Unix mode the client applies itself (set_security_object), in file.c */
++extern int sg_client_chmod;
++extern int sg_set_unix_mode( int unix_fd, mode_t mode );
+ extern struct object *get_handle_obj( struct process *process, obj_handle_t handle,
+                                       unsigned int access, const struct object_ops *ops );
+ extern unsigned int get_handle_access( struct process *process, obj_handle_t handle );
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -4914,6 +4914,8 @@
+ struct set_security_object_reply
+ {
+     struct reply_header __header;
++    int             unix_mode;
++    char __pad_12[4];
+ };
+ 
+ struct get_security_object_request
+@@ -6794,6 +6796,6 @@
+     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 859
++#define SERVER_PROTOCOL_VERSION 860
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -1974,6 +1974,8 @@
+ C_ASSERT( offsetof(struct set_security_object_request, handle) == 12 );
+ C_ASSERT( offsetof(struct set_security_object_request, security_info) == 16 );
+ C_ASSERT( sizeof(struct set_security_object_request) == 24 );
++C_ASSERT( offsetof(struct set_security_object_reply, unix_mode) == 8 );
++C_ASSERT( sizeof(struct set_security_object_reply) == 16 );
+ C_ASSERT( offsetof(struct get_security_object_request, handle) == 12 );
+ C_ASSERT( offsetof(struct get_security_object_request, security_info) == 16 );
+ C_ASSERT( sizeof(struct get_security_object_request) == 24 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -2721,6 +2721,11 @@
+     dump_varargs_security_descriptor( ", sd=", cur_size );
+ }
+ 
++static void dump_set_security_object_reply( const struct set_security_object_reply *req )
++{
++    fprintf( stderr, " unix_mode=%d", req->unix_mode );
++}
++
+ static void dump_get_security_object_request( const struct get_security_object_request *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+@@ -3887,7 +3892,7 @@
+     (dump_func)dump_get_token_groups_reply,
+     (dump_func)dump_get_token_default_dacl_reply,
+     NULL,
+-    NULL,
++    (dump_func)dump_set_security_object_reply,
+     (dump_func)dump_get_security_object_reply,
+     (dump_func)dump_get_system_handles_reply,
+     (dump_func)dump_get_tcp_connections_reply,

@@ -1,0 +1,880 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: Clients delete, rename and reopen their own files
+
+Stage 2 of Stained Glass ADR 0013 (multi-user debt D14). Patch 0014 moved
+open() into the client, so the kernel checks the real user's rights; but the
+shared machine-level server, running as SYSTEM, still performed every
+deletion, rename and hard link by path -- and refused reopening outright for
+other users. With this patch the server does none of those with its own
+rights for anyone but its own Unix account.
+
+  - Deletion (delete-on-close, FileDispositionInformation, DeleteFile). The
+    server still decides *when*: the last handle to the file closing. It
+    records which Unix user asked for the deletion; if that is not its own
+    account, it does not unlink, and when a close_handle request makes the
+    deletion due and the closing client runs as the user who asked, the reply
+    lists the file (device, inode, path) and the client unlinks it itself,
+    after checking device and inode as the server does. If the last handle is
+    closed by anyone else -- another user, SYSTEM, or process exit -- the file
+    stays: nobody else's rights may be used.
+  - Rename and hard link (FileRenameInformation, FileLinkInformation). A new
+    stage field on set_fd_name_info: stage 1 runs all the server's checks
+    (sharing, replace, directories) and performs it only for the server's own
+    account; for anyone else it answers client_performs, the client renames or
+    links with its own rights -- mirroring set_fd_name(): target removal for
+    links and directories, RENAME_NOREPLACE where replacing is not allowed,
+    and the .exe/.com executable bits -- and stage 2 commits the fd's new
+    names (the Unix name read back from the fd). The old one-shot request
+    (stage 0) is refused to other users' clients.
+  - Reopening (ReOpenFile, NtCreateFile with an empty name relative to a file
+    handle). The client reopens the file through /proc/self/fd, so the kernel
+    checks its rights on that inode, and sends the fd with open_file_object;
+    the server checks it is the same file and adopts it.
+
+Protocol: close_handle gains reply data, open_file_object an fd, and
+set_fd_name_info a stage and a reply.
+
+Tested: Wine's kernel32 file/directory/path/module and ntdll
+file/directory/om/info conformance tests, as the server's own user, match the
+unpatched baseline (the 4 todo_wine checks for STATUS_CANNOT_DELETE that 0014
+made pass still pass). Run as a second Unix user against a shared server,
+where every new path executes: kernel32:directory and ntdll:directory pass;
+kernel32:file fails only the SE_MANAGE_VOLUME_NAME privilege check (that user
+is not an administrator); kernel32:path fails only copying into a directory
+the user cannot write; ntdll:file fails only two I/O completion tests, because
+the server cannot signal another user's threads (tgkill EPERM) -- a separate,
+pre-existing limitation of the shared server, not of this patch.
+
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -428,6 +428,16 @@
+     /* VARARG(dacl,acl); */
+ };
+ 
++/* Stained Glass OS (ADR 0013): a file the closing client must unlink itself,
++ * followed by its Unix path (namelen bytes), padded to 8 bytes */
++struct sg_client_unlink
++{
++    unsigned __int64 dev;
++    unsigned __int64 ino;
++    unsigned int     namelen;
++    unsigned int     __pad;
++};
++
+ struct object_attributes
+ {
+     obj_handle_t rootdir;       /* root directory */
+@@ -1296,6 +1306,8 @@
+ /* Close a handle for the current process */
+ @REQ(close_handle)
+     obj_handle_t handle;       /* handle to close */
++@REPLY
++    VARARG(unlinks,bytes);     /* deletions this close leaves to the client (struct sg_client_unlink) */
+ @END
+ 
+ 
+@@ -1540,6 +1552,7 @@
+     obj_handle_t rootdir;       /* root directory */
+     unsigned int sharing;       /* sharing flags */
+     unsigned int options;       /* file options */
++    int          unix_fd;       /* reopening a file: fd the client opened itself, or -1 */
+     VARARG(filename,unicode_str); /* file name */
+ @REPLY
+     obj_handle_t handle;        /* handle to the file */
+@@ -3891,8 +3904,11 @@
+     data_size_t  namelen;         /* length of NT name in bytes */
+     int          link;            /* link instead of renaming */
+     unsigned int flags;           /* FILE_RENAME_* flags */
++    int          stage;           /* 0: do it; 1: check, and do it only for the server's own account; 2: commit a client's */
+     VARARG(name,unicode_str,namelen); /* NT name */
+     VARARG(filename,string);      /* new file name */
++@REPLY
++    int          client_performs; /* stage 1: checks passed, the client renames or links, then commits */
+ @END
+ 
+ 
+--- a/server/handle.h
++++ b/server/handle.h
+@@ -39,6 +39,9 @@
+ extern obj_handle_t alloc_handle_no_access_check( struct process *process, void *ptr,
+                                                   unsigned int access, unsigned int attr );
+ extern unsigned int close_handle( struct process *process, obj_handle_t handle );
++/* Stained Glass OS (ADR 0013): deletions the closing client performs, in fd.c */
++extern void sg_discard_client_unlinks(void);
++extern void sg_reply_client_unlinks(void);
+ extern struct object *get_handle_obj( struct process *process, obj_handle_t handle,
+                                       unsigned int access, const struct object_ops *ops );
+ extern unsigned int get_handle_access( struct process *process, obj_handle_t handle );
+--- a/server/handle.c
++++ b/server/handle.c
+@@ -662,8 +662,12 @@
+ /* close a handle */
+ DECL_HANDLER(close_handle)
+ {
+-    unsigned int err = close_handle( current->process, req->handle );
++    unsigned int err;
++
++    sg_discard_client_unlinks();
++    err = close_handle( current->process, req->handle );
+     set_error( err );
++    sg_reply_client_unlinks();
+ }
+ 
+ /* set a handle information */
+--- a/server/file.h
++++ b/server/file.h
+@@ -81,6 +81,8 @@
+ 
+ extern struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *user,
+                                    unsigned int options );
++extern int sg_reopen_client_fd;
++extern int sg_fd_is_same_file( struct fd *fd, int unix_fd );
+ extern struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
+                            int flags, mode_t *mode, unsigned int access,
+                            unsigned int sharing, unsigned int options, int client_fd );
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -122,6 +122,7 @@
+     struct list     entry;      /* entry in inode closed list */
+     int             unix_fd;    /* the unix file descriptor */
+     unsigned int    disp_flags; /* the disposition flags */
++    uid_t           disp_uid;   /* Unix user who asked for the deletion (Stained Glass) */
+     char           *unix_name;  /* name to unlink on close, points to parent fd unix_name */
+ };
+ 
+@@ -1067,10 +1068,83 @@
+ /****************************************************************/
+ /* inode functions */
+ 
++/* Stained Glass OS (ADR 0013): the Unix user a request comes from. The server
++ * performs file operations only for its own account; for anyone else the
++ * client does them, so the kernel checks that user's rights. */
++static uid_t sg_requester_uid(void)
++{
++    return current ? current->process->peer_uid : getuid();
++}
++
++/* Stained Glass OS (ADR 0013): during an open_file_object request, the fd a
++ * client opened itself to reopen a file (see file_open_file), or -1 */
++int sg_reopen_client_fd = -1;
++
++/* Deletions due when a close_handle request ends, which the closing client
++ * performs (see unlink_closed_fd). */
++static char *sg_unlinks;
++static data_size_t sg_unlinks_size;
++
++static void sg_queue_client_unlink( struct inode *inode, const char *name )
++{
++    struct sg_client_unlink rec;
++    data_size_t len = strlen( name ), size = (sizeof(rec) + len + 7) & ~7;
++    char *buf;
++
++    if (!(buf = realloc( sg_unlinks, sg_unlinks_size + size ))) return;
++    memset( &rec, 0, sizeof(rec) );
++    rec.dev     = inode->device->dev;
++    rec.ino     = inode->ino;
++    rec.namelen = len;
++    memset( buf + sg_unlinks_size, 0, size );
++    memcpy( buf + sg_unlinks_size, &rec, sizeof(rec) );
++    memcpy( buf + sg_unlinks_size + sizeof(rec), name, len );
++    sg_unlinks = buf;
++    sg_unlinks_size += size;
++}
++
++/* drop anything queued outside a close_handle request */
++void sg_discard_client_unlinks(void)
++{
++    free( sg_unlinks );
++    sg_unlinks = NULL;
++    sg_unlinks_size = 0;
++}
++
++/* is unix_fd the same file as fd? */
++int sg_fd_is_same_file( struct fd *fd, int unix_fd )
++{
++    struct stat st;
++
++    if (!fd->inode || fstat( unix_fd, &st ) == -1) return 0;
++    return st.st_dev == fd->inode->device->dev && st.st_ino == fd->inode->ino;
++}
++
++/* hand the queued deletions to the client as close_handle's reply data */
++void sg_reply_client_unlinks(void)
++{
++    if (sg_unlinks_size && sg_unlinks_size <= get_reply_max_size())
++        set_reply_data( sg_unlinks, sg_unlinks_size );
++    sg_discard_client_unlinks();
++}
++
+ static void unlink_closed_fd( struct inode *inode, struct closed_fd *fd )
+ {
+     /* make sure it is still the same file */
+     struct stat st;
++
++    /* Stained Glass OS (ADR 0013): unlinking here would use the server's
++     * rights. A deletion asked for by another user is performed by the client
++     * whose close makes it due -- if that client runs as the same user who
++     * asked. Otherwise the file stays: nobody else's rights may be used. */
++    if (fd->disp_uid != getuid())
++    {
++        if (current && current->req.request_header.req == REQ_close_handle &&
++            current->process->peer_uid == fd->disp_uid)
++            sg_queue_client_unlink( inode, fd->unix_name );
++        return;
++    }
++
+     if (!stat( fd->unix_name, &st ) && st.st_dev == inode->device->dev && st.st_ino == inode->ino)
+     {
+         if (S_ISDIR(st.st_mode)) rmdir( fd->unix_name );
+@@ -1659,6 +1733,7 @@
+     fd->no_fd_status = STATUS_VOLUME_DISMOUNTED;
+     fd->closed->unix_fd = -1;
+     fd->closed->disp_flags = 0;
++    fd->closed->disp_uid = getuid();
+ 
+     /* stop using Unix locks on this fd (existing locks have been removed by close) */
+     fd->fs_locks = 0;
+@@ -1773,6 +1848,7 @@
+         }
+         closed->unix_fd = fd->unix_fd;
+         closed->disp_flags = 0;
++        closed->disp_uid = getuid();
+         closed->unix_name = fd->unix_name;
+         fd->closed = closed;
+         fd->inode = (struct inode *)grab_object( orig->inode );
+@@ -2023,6 +2099,7 @@
+         closed_fd->unix_fd = fd->unix_fd;
+         closed_fd->unix_name = fd->unix_name;
+         closed_fd->disp_flags = 0;
++        closed_fd->disp_uid = getuid();
+         fd->inode = inode;
+         fd->closed = closed_fd;
+         fd->cacheable = !inode->device->removable;
+@@ -2056,6 +2133,7 @@
+ 
+         fd->closed->disp_flags = (options & FILE_DELETE_ON_CLOSE) ?
+             FILE_DISPOSITION_DELETE : 0;
++        fd->closed->disp_uid = sg_requester_uid();
+         if (flags & O_TRUNC)
+         {
+             if (S_ISDIR(st.st_mode))
+@@ -2574,16 +2652,31 @@
+     fd->closed->disp_flags =
+         (flags & (FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS)) |
+         ((fd->options & FILE_DELETE_ON_CLOSE) ? FILE_DISPOSITION_DELETE : 0);
++    fd->closed->disp_uid = sg_requester_uid();
+ }
+ 
+ /* set new name for the fd */
++/* Stained Glass OS (ADR 0013): stage 0 does it all; stage 1 runs the checks and
++ * does it only for the server's own account, otherwise returning with
++ * *client_performs set so the client renames or links with its own rights;
++ * stage 2 commits the client's rename to the fd's names. Stage 0 is refused to
++ * other users' clients, like opening by name. */
+ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, data_size_t len,
+-                         struct unicode_str nt_name, int create_link, unsigned int flags )
++                         struct unicode_str nt_name, int create_link, unsigned int flags,
++                         int stage, int *client_performs )
+ {
+     struct inode *inode;
+     struct stat st, st2;
+     char *name;
+     const unsigned int replace = flags & FILE_RENAME_REPLACE_IF_EXISTS;
++    const int foreign = sg_requester_uid() != getuid();
++
++    *client_performs = 0;
++    if (foreign && stage == 0)
++    {
++        set_error( STATUS_ACCESS_DENIED );
++        return;
++    }
+ 
+     if (!fd->inode || !fd->unix_name)
+     {
+@@ -2601,6 +2694,23 @@
+         set_error( STATUS_OBJECT_PATH_SYNTAX_BAD );
+         return;
+     }
++
++    if (stage == 2)  /* the client has renamed or linked it */
++    {
++        char *path;
++        if (!foreign || create_link) return;  /* a link leaves this fd's names alone */
++        if (!(path = sg_fd_path( fd->unix_fd )))
++        {
++            set_error( STATUS_NO_MEMORY );
++            return;
++        }
++        free( fd->nt_name );
++        fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
++        free( fd->unix_name );
++        fd->closed->unix_name = fd->unix_name = path;
++        return;
++    }
++
+     if (!(name = mem_alloc( len + 1 ))) return;
+     memcpy( name, nameptr, len );
+     name[len] = 0;
+@@ -2666,6 +2776,12 @@
+             }
+         }
+ 
++        if (foreign)
++        {
++            *client_performs = 1;
++            goto failed;  /* nothing failed: the client takes it from here */
++        }
++
+         /* link() expects that the target doesn't exist */
+         /* rename() cannot replace files with directories */
+         if (create_link || S_ISDIR( st2.st_mode ))
+@@ -2678,6 +2794,12 @@
+         }
+     }
+ 
++    if (foreign)
++    {
++        *client_performs = 1;
++        goto failed;  /* nothing failed: the client takes it from here */
++    }
++
+     if (create_link)
+     {
+         if (link( fd->unix_name, name ))
+@@ -2816,11 +2938,17 @@
+     struct unicode_str name = get_req_unicode_str();
+     struct object *obj, *result, *root = NULL;
+ 
+-    if (req->rootdir && !(root = get_handle_obj( current->process, req->rootdir, 0, NULL ))) return;
++    if (req->unix_fd != -1 &&
++        (sg_reopen_client_fd = thread_get_inflight_fd( current, req->unix_fd )) == -1)
++    {
++        set_error( STATUS_INVALID_HANDLE );
++        return;
++    }
++    if (req->rootdir && !(root = get_handle_obj( current->process, req->rootdir, 0, NULL ))) goto done;
+ 
+     obj = open_named_object( root, NULL, &name, req->attributes );
+     if (root) release_object( root );
+-    if (!obj) return;
++    if (!obj) goto done;
+ 
+     if ((result = obj->ops->open_file( obj, req->access, req->sharing, req->options )))
+     {
+@@ -2828,6 +2956,10 @@
+         release_object( result );
+     }
+     release_object( obj );
++done:
++    /* not taken by file_open_file */
++    if (sg_reopen_client_fd != -1) close( sg_reopen_client_fd );
++    sg_reopen_client_fd = -1;
+ }
+ 
+ /* get the Unix name from a file handle */
+@@ -3043,8 +3175,11 @@
+ 
+     if ((fd = get_handle_fd_obj( current->process, req->handle, 0 )))
+     {
++        int client_performs;
+         set_fd_name( fd, root_fd, (const char *)get_req_data() + req->namelen,
+-                     get_req_data_size() - req->namelen, nt_name, req->link, req->flags );
++                     get_req_data_size() - req->namelen, nt_name, req->link, req->flags,
++                     req->stage, &client_performs );
++        reply->client_performs = client_performs;
+         release_object( fd );
+     }
+     if (root_fd) release_object( root_fd );
+--- a/server/file.c
++++ b/server/file.c
+@@ -571,14 +571,23 @@
+     struct object *new_file = NULL;
+     struct unicode_str nt_name;
+     char *unix_name;
++    int client_fd = sg_reopen_client_fd;
+ 
+     assert( obj->ops == &file_ops );
+ 
+     /* Stained Glass OS (ADR 0013): reopening by name would be done with the
+      * server's rights, so a user holding a read-only handle to a SYSTEM file
+-     * could reopen it for writing. Refuse it for clients that are not the
+-     * server's own account until reopening is done client-side. */
+-    if (current && current->process->peer_uid != getuid())
++     * could reopen it for writing. The client reopens it itself (through
++     * /proc/self/fd, so the kernel checks the user's rights on that inode) and
++     * sends the fd; by name, only for the server's own account. */
++    sg_reopen_client_fd = -1;
++    if (client_fd != -1 && !sg_fd_is_same_file( file->fd, client_fd ))
++    {
++        close( client_fd );
++        set_error( STATUS_INVALID_PARAMETER );
++        return NULL;
++    }
++    if (client_fd == -1 && current && current->process->peer_uid != getuid())
+     {
+         set_error( STATUS_ACCESS_DENIED );
+         return NULL;
+@@ -589,9 +598,10 @@
+         mode_t mode;
+         get_nt_name( file->fd, &nt_name );
+         new_file = create_file( NULL, unix_name, strlen(unix_name), nt_name, access,
+-                                sharing, FILE_OPEN, options, 0, NULL, -1, &mode );
++                                sharing, FILE_OPEN, options, 0, NULL, client_fd, &mode );
+         free( unix_name );
+     }
++    else if (client_fd != -1) close( client_fd );
+     else set_error( STATUS_OBJECT_TYPE_MISMATCH );
+     return new_file;
+ }
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -353,6 +353,7 @@
+ extern NTSTATUS nt_to_unix_file_name( const OBJECT_ATTRIBUTES *attr, char **name_ret, UINT disposition );
+ extern NTSTATUS unix_to_nt_file_name( const char *name, WCHAR **nt );
+ extern NTSTATUS get_full_path( const WCHAR *name, const WCHAR *curdir, WCHAR **path );
++extern void sg_client_unlinks( const void *data, unsigned int size );
+ extern NTSTATUS open_unix_file( HANDLE *handle, const char *unix_name, ACCESS_MASK access,
+                                 OBJECT_ATTRIBUTES *attr, ULONG attributes, ULONG sharing, ULONG disposition,
+                                 ULONG options, void *ea_buffer, ULONG ea_length );
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1908,6 +1908,8 @@
+     HANDLE port;
+     unsigned int ret;
+     int fd;
++    char unlinks[4096 + sizeof(struct sg_client_unlink)];  /* see sg_client_unlinks */
++    data_size_t unlinks_size = 0;
+ 
+     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
+         return STATUS_SUCCESS;
+@@ -1921,7 +1923,9 @@
+     SERVER_START_REQ( close_handle )
+     {
+         req->handle = wine_server_obj_handle( handle );
++        wine_server_set_reply( req, unlinks, sizeof(unlinks) );
+         ret = wine_server_call( req );
++        unlinks_size = wine_server_reply_size( reply );
+     }
+     SERVER_END_REQ;
+ 
+@@ -1929,6 +1933,9 @@
+ 
+     if (fd != -1) close( fd );
+ 
++    /* Stained Glass OS: deletions the server left to this process (ADR 0013) */
++    if (!ret && unlinks_size) sg_client_unlinks( unlinks, unlinks_size );
++
+     if (ret != STATUS_INVALID_HANDLE || !handle) return ret;
+     if (!peb->BeingDebugged) return ret;
+     if (!NtQueryInformationProcess( NtCurrentProcess(), ProcessDebugPort, &port, sizeof(port), NULL) && port)
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -2142,11 +2142,44 @@
+ }
+ 
+ 
++static int sg_client_open( int root_fd, const char *unix_name, ACCESS_MASK access,
++                           ULONG disposition, ULONG options, BOOL *created, NTSTATUS *status );
++
+ static unsigned int server_open_file_object( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
+                                              ULONG sharing, ULONG options )
+ {
+     unsigned int status;
++    int unix_fd = -1;
++
++    /* Stained Glass OS (ADR 0013): reopening a file or directory (an empty
++     * name relative to its handle) is done here, through /proc/self/fd, so the
++     * kernel checks this process's rights on the file; the server adopts the
++     * fd rather than opening the file by name with its own rights. */
++    if (attr->RootDirectory && !attr->ObjectName->Length)
++    {
++        int root_fd, needs_close;
++        enum server_fd_type type;
++        char path[32];
++        NTSTATUS open_status;
++        BOOL created;
++
++        if (!server_get_unix_fd( attr->RootDirectory, 0, &root_fd, &needs_close, &type, NULL ))
++        {
++            if (type == FD_TYPE_FILE || type == FD_TYPE_DIR)
++            {
++                snprintf( path, sizeof(path), "/proc/self/fd/%d", root_fd );
++                unix_fd = sg_client_open( AT_FDCWD, path, access, FILE_OPEN, options, &created, &open_status );
++                if (unix_fd == -1)
++                {
++                    if (needs_close) close( root_fd );
++                    return open_status;
++                }
++            }
++            if (needs_close) close( root_fd );
++        }
++    }
+ 
++    if (unix_fd != -1) wine_server_send_fd( unix_fd );
+     SERVER_START_REQ( open_file_object )
+     {
+         req->access     = access;
+@@ -2154,11 +2187,13 @@
+         req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
+         req->sharing    = sharing;
+         req->options    = options;
++        req->unix_fd    = unix_fd;
+         wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
+         status = wine_server_call( req );
+         *handle = wine_server_ptr_handle( reply->handle );
+     }
+     SERVER_END_REQ;
++    if (unix_fd != -1) close( unix_fd );
+     return status;
+ }
+ 
+@@ -4019,6 +4054,35 @@
+  * server's computed mode once the server has answered, so it is never briefly
+  * readable by others. */
+ 
++/* Deletions the server leaves to us (ADR 0013, stage 2). A delete-on-close or
++ * delete disposition asked for by a user other than the server's own account
++ * is not unlinked by the server -- that would use its rights. When a close
++ * makes such a deletion due (the last handle to the file is gone), and this
++ * process runs as the user who asked, close_handle's reply lists the file and
++ * this process unlinks it with its own rights. The device and inode are
++ * checked first, as the server does, so only the same file is ever removed. */
++void sg_client_unlinks( const void *data, unsigned int size )
++{
++    const char *p = data, *end = p + size;
++    struct sg_client_unlink rec;
++    char path[PATH_MAX];
++    struct stat st;
++
++    while (end - p >= sizeof(rec))
++    {
++        memcpy( &rec, p, sizeof(rec) );
++        if (rec.namelen >= sizeof(path) || rec.namelen > end - p - sizeof(rec)) break;
++        memcpy( path, p + sizeof(rec), rec.namelen );
++        path[rec.namelen] = 0;
++        p += (sizeof(rec) + rec.namelen + 7) & ~7;
++
++        if (path[0] != '/' || lstat( path, &st )) continue;
++        if (st.st_dev != rec.dev || st.st_ino != rec.ino) continue;
++        if (S_ISDIR( st.st_mode )) rmdir( path );
++        else unlink( path );
++    }
++}
++
+ /* the server's file_set_error() mapping, which callers of NtCreateFile see */
+ static NTSTATUS sg_open_errno_to_status( int err )
+ {
+@@ -4813,6 +4877,78 @@
+ }
+ 
+ 
++static int sg_is_executable_name( const char *name )
++{
++    size_t len = strlen( name );
++    return len >= 4 && (!strcasecmp( name + len - 4, ".exe" ) || !strcasecmp( name + len - 4, ".com" ));
++}
++
++/* Stained Glass OS (ADR 0013, stage 2): rename or link the file behind handle
++ * to unix_name (relative to root when given) with this process's own rights,
++ * after the server has checked it (set_fd_name_info stage 1) and before it
++ * commits the new names (stage 2). Mirrors the server's set_fd_name(): a hard
++ * link or a directory replacing a file needs the target removed first; the
++ * executable bits follow the .exe/.com name. Where replacing is not allowed,
++ * RENAME_NOREPLACE makes the kernel refuse it even if the server could not see
++ * the target. */
++static NTSTATUS sg_client_rename( HANDLE handle, HANDLE root, const char *unix_name,
++                                  BOOL create_link, BOOL replace )
++{
++    int unix_fd, needs_close, root_fd = AT_FDCWD, root_needs_close = 0;
++    char link[64], src[PATH_MAX];
++    struct stat st;
++    ssize_t len;
++    NTSTATUS status = STATUS_SUCCESS;
++
++    if ((status = server_get_unix_fd( handle, 0, &unix_fd, &needs_close, NULL, NULL ))) return status;
++    snprintf( link, sizeof(link), "/proc/self/fd/%d", unix_fd );
++    if ((len = readlink( link, src, sizeof(src) - 1 )) <= 0 || src[0] != '/' || fstat( unix_fd, &st ) == -1)
++    {
++        status = STATUS_OBJECT_TYPE_MISMATCH;
++        goto done;
++    }
++    src[len] = 0;
++    if (root && (status = server_get_unix_fd( root, 0, &root_fd, &root_needs_close, NULL, NULL ))) goto done;
++
++    if (replace && (create_link || S_ISDIR( st.st_mode )) &&
++        unlinkat( root_fd, unix_name, 0 ) == -1 && errno != ENOENT)
++    {
++        status = sg_open_errno_to_status( errno );
++        goto done;
++    }
++
++    if (create_link)
++    {
++        if (linkat( AT_FDCWD, src, root_fd, unix_name, 0 ) == -1) status = sg_open_errno_to_status( errno );
++        goto done;
++    }
++
++    if (replace ? renameat( AT_FDCWD, src, root_fd, unix_name )
++                : renameat2( AT_FDCWD, src, root_fd, unix_name, RENAME_NOREPLACE ))
++    {
++        if (!replace && errno == EINVAL)  /* no RENAME_NOREPLACE on this filesystem */
++        {
++            struct stat target;
++            if (!fstatat( root_fd, unix_name, &target, AT_SYMLINK_NOFOLLOW )) errno = EEXIST;
++            else if (!renameat( AT_FDCWD, src, root_fd, unix_name )) goto renamed;
++        }
++        status = sg_open_errno_to_status( errno );
++        goto done;
++    }
++renamed:
++    if (sg_is_executable_name( src ) != sg_is_executable_name( unix_name ))
++    {
++        mode_t mode = st.st_mode;
++        if (sg_is_executable_name( unix_name )) mode |= (mode & 0444) >> 2;
++        else mode &= ~0111;
++        fchmod( unix_fd, mode & 07777 );
++    }
++done:
++    if (root_needs_close) close( root_fd );
++    if (needs_close) close( unix_fd );
++    return status;
++}
++
+ /******************************************************************************
+  *              NtSetInformationFile   (NTDLL.@)
+  */
+@@ -5068,18 +5204,31 @@
+             status = nt_to_unix_file_name( &attr, &unix_name, FILE_OPEN_IF );
+             if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
+             {
+-                SERVER_START_REQ( set_fd_name_info )
++                int stage, client_performs = 0;
++
++                /* stage 1: the server checks, and renames only for its own
++                 * account; for anyone else this process does it and stage 2
++                 * commits the new names (ADR 0013) */
++                for (stage = 1; stage <= 2; stage++)
+                 {
+-                    req->handle   = wine_server_obj_handle( handle );
+-                    req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
+-                    req->namelen  = attr.ObjectName->Length;
+-                    req->link     = FALSE;
+-                    req->flags    = flags;
+-                    wine_server_add_data( req, attr.ObjectName->Buffer, attr.ObjectName->Length );
+-                    wine_server_add_data( req, unix_name, strlen(unix_name) );
+-                    status = wine_server_call( req );
++                    SERVER_START_REQ( set_fd_name_info )
++                    {
++                        req->handle   = wine_server_obj_handle( handle );
++                        req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
++                        req->namelen  = attr.ObjectName->Length;
++                        req->link     = FALSE;
++                        req->flags    = flags;
++                        req->stage    = stage;
++                        wine_server_add_data( req, attr.ObjectName->Buffer, attr.ObjectName->Length );
++                        wine_server_add_data( req, unix_name, strlen(unix_name) );
++                        status = wine_server_call( req );
++                        if (stage == 1) client_performs = reply->client_performs;
++                    }
++                    SERVER_END_REQ;
++                    if (status || stage == 2 || !client_performs) break;
++                    if ((status = sg_client_rename( handle, attr.RootDirectory, unix_name, FALSE,
++                                                    (flags & FILE_RENAME_REPLACE_IF_EXISTS) != 0 ))) break;
+                 }
+-                SERVER_END_REQ;
+ 
+                 free( unix_name );
+             }
+@@ -5115,18 +5264,31 @@
+             status = nt_to_unix_file_name( &attr, &unix_name, FILE_OPEN_IF );
+             if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
+             {
+-                SERVER_START_REQ( set_fd_name_info )
++                int stage, client_performs = 0;
++
++                /* stage 1: the server checks, and renames only for its own
++                 * account; for anyone else this process does it and stage 2
++                 * commits the new names (ADR 0013) */
++                for (stage = 1; stage <= 2; stage++)
+                 {
+-                    req->handle   = wine_server_obj_handle( handle );
+-                    req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
+-                    req->namelen  = attr.ObjectName->Length;
+-                    req->link     = TRUE;
+-                    req->flags    = flags;
+-                    wine_server_add_data( req, attr.ObjectName->Buffer, attr.ObjectName->Length );
+-                    wine_server_add_data( req, unix_name, strlen(unix_name) );
+-                    status  = wine_server_call( req );
++                    SERVER_START_REQ( set_fd_name_info )
++                    {
++                        req->handle   = wine_server_obj_handle( handle );
++                        req->rootdir  = wine_server_obj_handle( attr.RootDirectory );
++                        req->namelen  = attr.ObjectName->Length;
++                        req->link     = TRUE;
++                        req->flags    = flags;
++                        req->stage    = stage;
++                        wine_server_add_data( req, attr.ObjectName->Buffer, attr.ObjectName->Length );
++                        wine_server_add_data( req, unix_name, strlen(unix_name) );
++                        status = wine_server_call( req );
++                        if (stage == 1) client_performs = reply->client_performs;
++                    }
++                    SERVER_END_REQ;
++                    if (status || stage == 2 || !client_performs) break;
++                    if ((status = sg_client_rename( handle, attr.RootDirectory, unix_name, TRUE,
++                                                    (flags & FILE_LINK_REPLACE_IF_EXISTS) != 0 ))) break;
+                 }
+-                SERVER_END_REQ;
+ 
+                 free( unix_name );
+             }
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -412,6 +412,16 @@
+ 
+ };
+ 
++/* Stained Glass OS (ADR 0013): a file the closing client must unlink itself,
++ * followed by its Unix path (namelen bytes), padded to 8 bytes */
++struct sg_client_unlink
++{
++    unsigned __int64 dev;
++    unsigned __int64 ino;
++    unsigned int     namelen;
++    unsigned int     __pad;
++};
++
+ struct object_attributes
+ {
+     obj_handle_t rootdir;
+@@ -1413,6 +1423,7 @@
+ struct close_handle_reply
+ {
+     struct reply_header __header;
++    /* VARARG(unlinks,bytes); */
+ };
+ 
+ 
+@@ -1800,7 +1811,9 @@
+     obj_handle_t rootdir;
+     unsigned int sharing;
+     unsigned int options;
++    int          unix_fd;
+     /* VARARG(filename,unicode_str); */
++    char __pad_36[4];
+ };
+ struct open_file_object_reply
+ {
+@@ -5555,12 +5568,16 @@
+     data_size_t  namelen;
+     int          link;
+     unsigned int flags;
++    int          stage;
+     /* VARARG(name,unicode_str,namelen); */
+     /* VARARG(filename,string); */
++    char __pad_36[4];
+ };
+ struct set_fd_name_info_reply
+ {
+     struct reply_header __header;
++    int          client_performs;
++    char __pad_12[4];
+ };
+ 
+ 
+@@ -6777,6 +6794,6 @@
+     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 856
++#define SERVER_PROTOCOL_VERSION 859
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -804,6 +804,7 @@
+ C_ASSERT( sizeof(struct get_apc_result_reply) == 48 );
+ C_ASSERT( offsetof(struct close_handle_request, handle) == 12 );
+ C_ASSERT( sizeof(struct close_handle_request) == 16 );
++C_ASSERT( sizeof(struct close_handle_reply) == 8 );
+ C_ASSERT( offsetof(struct set_handle_info_request, handle) == 12 );
+ C_ASSERT( offsetof(struct set_handle_info_request, flags) == 16 );
+ C_ASSERT( offsetof(struct set_handle_info_request, mask) == 20 );
+@@ -940,7 +941,8 @@
+ C_ASSERT( offsetof(struct open_file_object_request, rootdir) == 20 );
+ C_ASSERT( offsetof(struct open_file_object_request, sharing) == 24 );
+ C_ASSERT( offsetof(struct open_file_object_request, options) == 28 );
+-C_ASSERT( sizeof(struct open_file_object_request) == 32 );
++C_ASSERT( offsetof(struct open_file_object_request, unix_fd) == 32 );
++C_ASSERT( sizeof(struct open_file_object_request) == 40 );
+ C_ASSERT( offsetof(struct open_file_object_reply, handle) == 8 );
+ C_ASSERT( sizeof(struct open_file_object_reply) == 16 );
+ C_ASSERT( offsetof(struct alloc_file_handle_request, access) == 12 );
+@@ -2177,7 +2179,10 @@
+ C_ASSERT( offsetof(struct set_fd_name_info_request, namelen) == 20 );
+ C_ASSERT( offsetof(struct set_fd_name_info_request, link) == 24 );
+ C_ASSERT( offsetof(struct set_fd_name_info_request, flags) == 28 );
+-C_ASSERT( sizeof(struct set_fd_name_info_request) == 32 );
++C_ASSERT( offsetof(struct set_fd_name_info_request, stage) == 32 );
++C_ASSERT( sizeof(struct set_fd_name_info_request) == 40 );
++C_ASSERT( offsetof(struct set_fd_name_info_reply, client_performs) == 8 );
++C_ASSERT( sizeof(struct set_fd_name_info_reply) == 16 );
+ C_ASSERT( offsetof(struct set_fd_eof_info_request, handle) == 12 );
+ C_ASSERT( offsetof(struct set_fd_eof_info_request, eof) == 16 );
+ C_ASSERT( sizeof(struct set_fd_eof_info_request) == 24 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -350,6 +350,11 @@
+     fprintf( stderr, " handle=%04x", req->handle );
+ }
+ 
++static void dump_close_handle_reply( const struct close_handle_reply *req )
++{
++    dump_varargs_bytes( " unlinks=", cur_size );
++}
++
+ static void dump_set_handle_info_request( const struct set_handle_info_request *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+@@ -636,6 +641,7 @@
+     fprintf( stderr, ", rootdir=%04x", req->rootdir );
+     fprintf( stderr, ", sharing=%08x", req->sharing );
+     fprintf( stderr, ", options=%08x", req->options );
++    fprintf( stderr, ", unix_fd=%d", req->unix_fd );
+     dump_varargs_unicode_str( ", filename=", cur_size );
+ }
+ 
+@@ -3149,10 +3155,16 @@
+     fprintf( stderr, ", namelen=%u", req->namelen );
+     fprintf( stderr, ", link=%d", req->link );
+     fprintf( stderr, ", flags=%08x", req->flags );
++    fprintf( stderr, ", stage=%d", req->stage );
+     dump_varargs_unicode_str( ", name=", min( cur_size, req->namelen ));
+     dump_varargs_string( ", filename=", cur_size );
+ }
+ 
++static void dump_set_fd_name_info_reply( const struct set_fd_name_info_reply *req )
++{
++    fprintf( stderr, " client_performs=%d", req->client_performs );
++}
++
+ static void dump_set_fd_eof_info_request( const struct set_fd_eof_info_request *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
+@@ -3667,7 +3679,7 @@
+     (dump_func)dump_resume_thread_reply,
+     (dump_func)dump_queue_apc_reply,
+     (dump_func)dump_get_apc_result_reply,
+-    NULL,
++    (dump_func)dump_close_handle_reply,
+     (dump_func)dump_set_handle_info_reply,
+     (dump_func)dump_dup_handle_reply,
+     (dump_func)dump_allocate_reserve_object_reply,
+@@ -3916,7 +3928,7 @@
+     NULL,
+     NULL,
+     NULL,
+-    NULL,
++    (dump_func)dump_set_fd_name_info_reply,
+     NULL,
+     (dump_func)dump_get_window_layered_info_reply,
+     NULL,

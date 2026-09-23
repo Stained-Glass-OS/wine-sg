@@ -388,15 +388,63 @@ open by name for any client that is not its own Unix account.
 - **The server takes the fd's path from `/proc/self/fd`**, never from the
   request: it may be unable to traverse the path, and must not trust it, since
   delete-on-close and rename act on that name.
-- **Not yet covered**: unlink for delete-on-close, rename, and device nodes
-  still run with the server's rights. `sg-file-access-check`'s delete clause
-  stays red until they move.
+- **Deletes, renames, reopening and permissions** followed in 0015 and 0016.
+  Device nodes (`server/device.c`) still open as the server.
 - **Conformance**: kernel32 file/directory/path/loader/module/process and ntdll
   file/directory/om/info -- 810,000+ tests -- show no regressions, and four
   `todo_wine` tests in kernel32:file now pass (delete-on-close on a read-only
   file under FILE_OPEN_IF returns STATUS_CANNOT_DELETE, as on Windows).
   Reproduce with a second object tree configured with tests
   (`build/obj-tests`) and compare against the previous package.
+
+## `patches/sg/0015` and `0016`: the rest of a user's file operations
+
+ADR 0013 stage 2. **Nothing path-based runs with the server's rights for a
+client that is not the server's own Unix account** -- the server still makes
+every decision, the client performs it.
+
+- **Deletion**: the server still decides *when* (the last handle closing) and
+  records *who asked* (`closed_fd.disp_uid`). For another user, the
+  `close_handle` reply that makes it due lists the file (dev, ino, path) and
+  that client unlinks it -- only if it runs as the user who asked. Anyone
+  else's last close (SYSTEM, another user, process exit) leaves the file: no
+  one's rights are borrowed. The list is built in `unlink_closed_fd` only
+  during a `close_handle` request; anything queued elsewhere is discarded.
+- **Rename and link**: `set_fd_name_info` has stages. 1 runs all the server's
+  checks and performs it only for the server's own account, otherwise replies
+  `client_performs`; the client (`sg_client_rename`) does it, mirroring
+  `set_fd_name()` (target removal, `RENAME_NOREPLACE`, .exe/.com bits); 2
+  commits the new names, read back from the fd. Stage 0 (one-shot) is refused
+  to other users.
+- **Reopening** (ReOpenFile; an empty name relative to a file handle): the
+  client opens `/proc/self/fd/N` -- the kernel checks its rights on the inode
+  -- and sends the fd with `open_file_object`; the server checks dev/ino match
+  and adopts it.
+- **Permissions** (0016): `set_security_object` returns the mode a DACL maps
+  to (`unix_mode`) instead of applying it; the client `fchmod`s its own fd.
+- **The server's view of paths must be the client's**: the unlink list carries
+  the server's `/proc/self/fd` path. `sg-wineserver.service` must not get a
+  private mount namespace (`PrivateTmp=`, `ProtectHome=`, ...).
+- **Testing needs a second Unix user**, or none of this code runs: the same
+  suites as a different user against a shared persistent server (`wineserver
+  -p` as the prefix owner, group-shared prefix). What still fails there and
+  why is recorded in ADR 0013; the only non-file item is that the server
+  cannot signal another user's threads (debt D16).
+
+## `patches/sg/0017-name-the-accounts-behind-per-user-sids.patch`
+
+Debt D12. `sg_lookup_account` maps RID (1000 + uid) to the passwd name and
+back, in the server, which assigned the SIDs. advapi32 asks for local SIDs with
+a RID above 1000 it does not know, and for names it cannot otherwise resolve.
+SYSTEM (prefix owner, root) is never answered -- it has its well-known name.
+
+## `patches/sg/0018-define-userprofile-before-the-user-environment.patch`
+
+Debt D15. ntdll now sets `USERPROFILE` (ProfilesDirectory + user name) before
+reading `HKCU\Environment`, as Windows does, so the shared Default User
+template can say `TEMP=%USERPROFILE%\AppData\Local\Temp`. sg-session's
+`sg-prefix-init` writes the template that way; without this patch that TEMP is
+left unexpanded.
 
 ## Things that will bite you
 
