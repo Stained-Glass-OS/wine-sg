@@ -354,6 +354,21 @@ This is ADR 0007's "upgrade the bar, don't overlay or hide it".
 - New UI that explorer does *not* have -- a Start menu, a notification centre --
   is not this patch; it is separate AGPL programs in `sg-shell`.
 
+## `patches/sg/0013-flat-caption-buttons.patch`
+
+The minimize, maximize/restore and close buttons drawn flat, Windows 10 style,
+in `dlls/win32u/defwnd.c`: the caption colour behind a thin line glyph, a solid
+fill while pressed (red for Close). Wine's visual-style support never reaches
+the title bar, so no `.msstyles` could do this; the caption *colours* come from
+`HKCU\Control Panel\Colors`, which sg-shell ships (`theme/50-sg-colors.reg`).
+
+- **Only the window's own caption buttons change.** win32u's
+  `draw_frame_caption` is used solely by the non-client painters; the public
+  `DrawFrameControl(DFC_CAPTION)` is a separate copy in `user32/uitools.c` and
+  stays classic for applications that call it.
+- `defwnd.c` is on win32u's **Unix** side: the change lands in `win32u.so`, not
+  in the PE `win32u.dll`s. Copying only the DLLs to test it shows no change.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
