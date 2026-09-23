@@ -524,6 +524,23 @@ inside a program the broker started (`SG_IN_BROKER`, so no loop). Absent the
 client, the old path runs unchanged. The broker itself is sg-session's
 `sg-brokerd`; see ADR 0012.
 
+## `patches/sg/0023-explorer-reads-the-graphics-driver-from-hklm.patch`
+
+Debt D4. explorer read `HKCU\Software\Wine\Drivers\Graphics` only, so a
+machine-level setting was written per user. It now reads HKLM first (SYSTEM
+sets it in sg-prefix-init), HKCU still overrides -- same layering as
+DllOverrides (0009).
+
+## `patches/sg/0024-enforce-a-keys-dacl-when-creating-subkeys.patch`
+
+S2 clause 3. Wine checked a key's DACL only on open; the recursive create path
+never checked `KEY_CREATE_SUB_KEY` on the parent, so any user could create a
+subkey under an admin-owned key (HKLM\Software\Policies). Now, in a system
+prefix, creating a key checks the immediate parent's descriptor, and the SYSTEM
+account may stamp the default descriptor onto an existing descriptor-less key
+(system.reg carries none). Any new registry request that creates keys must keep
+this property.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
