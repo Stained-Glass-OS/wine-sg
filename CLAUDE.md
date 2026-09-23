@@ -310,6 +310,31 @@ compositor checks peer credentials.
   rejects and that has no exit code. The outcome is in the compositor's audit
   log.
 
+## `patches/sg/0011-display-config-keys-are-user-writable.patch`
+
+`HKLM\...\Control\Video` and `\Control\GraphicsDrivers` hold the adapters,
+monitors and modes Wine's display setup finds. On Windows the per-session
+display driver owns this scratch; here every interactive user's win32u writes
+it during display init and every app reads it back to find a graphics driver.
+
+Under the shared-prefix HKLM policy (admins write, users read) a **non-admin
+session** comes up with a working shell -- the driver host needs no registry --
+and then **no app can launch**: `update_display_cache` reads an empty display
+config, logs `Failed to read display config`, and the app dies with
+`no driver could be loaded`. It hides completely on a developer box, where the
+interactive user owns the prefix and so is an administrator.
+
+Keys under those two paths get a DACL granting Local System, administrators
+**and ordinary users** full access; the rest of HKLM is unchanged. The
+containers must also exist for a user to create beneath them, and a non-admin
+cannot create them under the admin-owned `Control` key -- so `sg-prefix-init`
+creates `Control\Video` and `Control\GraphicsDrivers` once, as the owner, and
+this patch gives them the writable DACL.
+
+**The tell:** a session whose desktop and taskbar are correct but where every
+app launch fails with "no driver could be loaded", only in the multi-user
+image. `Failed to read display config` in the journal is the smoking gun.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
