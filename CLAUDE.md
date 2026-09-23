@@ -369,6 +369,35 @@ the title bar, so no `.msstyles` could do this; the caption *colours* come from
 - `defwnd.c` is on win32u's **Unix** side: the change lands in `win32u.so`, not
   in the PE `win32u.dll`s. Copying only the DLLs to test it shows no change.
 
+## `patches/sg/0014-clients-open-their-own-files.patch`
+
+**Clients open their own files** (Stained Glass ADR 0013). Upstream Wine's
+server open()s files for its clients; with the shared machine-level server
+running as SYSTEM that gave every user SYSTEM's file rights (debt D14). Now
+`open_unix_file()` in ntdll opens -- and creates -- the file as the client's own
+user and sends the fd with `create_file`; the server adopts it, and refuses to
+open by name for any client that is not its own Unix account.
+
+- **The client mirrors the server's pre-open logic exactly**: flags per
+  disposition, access to O_RDWR/O_WRONLY/O_RDONLY, the read-only retry for
+  directories, and the *server's* errno-to-status table (ntdll's differs, and
+  NtCreateFile's callers see these statuses). Change one side, change both.
+- **New files start 0600** and get the server's computed mode (security
+  descriptor or default) under the process umask after the reply, so they are
+  never briefly readable by others.
+- **The server takes the fd's path from `/proc/self/fd`**, never from the
+  request: it may be unable to traverse the path, and must not trust it, since
+  delete-on-close and rename act on that name.
+- **Not yet covered**: unlink for delete-on-close, rename, and device nodes
+  still run with the server's rights. `sg-file-access-check`'s delete clause
+  stays red until they move.
+- **Conformance**: kernel32 file/directory/path/loader/module/process and ntdll
+  file/directory/om/info -- 810,000+ tests -- show no regressions, and four
+  `todo_wine` tests in kernel32:file now pass (delete-on-close on a read-only
+  file under FILE_OPEN_IF returns STATUS_CANNOT_DELETE, as on Windows).
+  Reproduce with a second object tree configured with tests
+  (`build/obj-tests`) and compare against the previous package.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

@@ -1,0 +1,589 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: Clients open their own files; the server stops opening them for others
+
+Wine's server opened files on its clients' behalf: NtCreateFile sent a name,
+and open_fd() called open() in the server. With the shared machine-level
+wineserver (patches 0001, 0004, 0005) running as SYSTEM for every user, the
+kernel therefore checked SYSTEM's rights for every user's every open. Measured
+in the Stained Glass image as an ordinary user: a Windows program created a file
+in C:\windows\system32 and read a SYSTEM-only (0600) file -- both refused to the
+same user by Unix -- and could not write the user's own 0700 directory. A
+privilege escalation (Stained Glass ADR 0013, multi-user debt D14).
+
+Now the client opens -- and creates -- the file itself, as its own Unix user,
+and sends the fd with the create_file request; the server adopts it and opens
+nothing, so the kernel has checked the real user's rights. The server opens by
+name only for clients running as its own Unix account, and refuses everyone
+else (STATUS_ACCESS_DENIED): without that refusal a client could simply omit
+the fd.
+
+  - ntdll: open_unix_file() opens with the flags the server used for each
+    disposition, the same access-to-O_RDWR/O_WRONLY/O_RDONLY mapping, the same
+    read-only retry for directories, and the server's errno-to-status mapping
+    (ntdll's own differs, and NtCreateFile's callers see these statuses). A
+    file it creates starts 0600 and gets the server's computed mode (from the
+    security descriptor or the default) under the process umask once the
+    server answers, so it is never briefly readable by others.
+  - server: open_fd() takes the client's fd and skips mkdir()/open(); the
+    sharing check, truncation and inode bookkeeping are unchanged. The fd's
+    Unix name comes from /proc/self/fd, not from the requested path: the server
+    may be unable to traverse the path, and must not take it on the client's
+    word, since the name is what delete-on-close and rename act on.
+  - server: reopening a file object by name (ReOpenFile) would also run with
+    the server's rights, so it is refused for other users' clients until it is
+    done client-side.
+  - protocol: create_file carries unix_fd; its reply carries the mode.
+
+Not covered here, and still performed with the server's rights: unlinking a
+delete-on-close file and renaming (fd.c close path and set_fd_name), and
+device nodes opened by the server (device.c). Those follow in later patches.
+
+Forwarded: not-needed
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1524,10 +1524,12 @@
+     int          create;        /* file create action */
+     unsigned int options;       /* file options */
+     unsigned int attrs;         /* file attributes for creation */
++    int          unix_fd;       /* fd the client opened itself (sent with wine_server_send_fd), or -1 */
+     VARARG(objattr,object_attributes); /* object attributes */
+     VARARG(filename,string);    /* file name */
+ @REPLY
+     obj_handle_t handle;        /* handle to the file */
++    unsigned int mode;          /* mode for a file the client created (before its umask) */
+ @END
+ 
+ 
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1778,14 +1778,16 @@
+     int          create;
+     unsigned int options;
+     unsigned int attrs;
++    int          unix_fd;
+     /* VARARG(objattr,object_attributes); */
+     /* VARARG(filename,string); */
++    char __pad_36[4];
+ };
+ struct create_file_reply
+ {
+     struct reply_header __header;
+     obj_handle_t handle;
+-    char __pad_12[4];
++    unsigned int mode;
+ };
+ 
+ 
+@@ -6775,6 +6777,6 @@
+     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 855
++#define SERVER_PROTOCOL_VERSION 856
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -930,8 +930,10 @@
+ C_ASSERT( offsetof(struct create_file_request, create) == 20 );
+ C_ASSERT( offsetof(struct create_file_request, options) == 24 );
+ C_ASSERT( offsetof(struct create_file_request, attrs) == 28 );
+-C_ASSERT( sizeof(struct create_file_request) == 32 );
++C_ASSERT( offsetof(struct create_file_request, unix_fd) == 32 );
++C_ASSERT( sizeof(struct create_file_request) == 40 );
+ C_ASSERT( offsetof(struct create_file_reply, handle) == 8 );
++C_ASSERT( offsetof(struct create_file_reply, mode) == 12 );
+ C_ASSERT( sizeof(struct create_file_reply) == 16 );
+ C_ASSERT( offsetof(struct open_file_object_request, access) == 12 );
+ C_ASSERT( offsetof(struct open_file_object_request, attributes) == 16 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -618,6 +618,7 @@
+     fprintf( stderr, ", create=%d", req->create );
+     fprintf( stderr, ", options=%08x", req->options );
+     fprintf( stderr, ", attrs=%08x", req->attrs );
++    fprintf( stderr, ", unix_fd=%d", req->unix_fd );
+     dump_varargs_object_attributes( ", objattr=", cur_size );
+     dump_varargs_string( ", filename=", cur_size );
+ }
+@@ -625,6 +626,7 @@
+ static void dump_create_file_reply( const struct create_file_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", mode=%08x", req->mode );
+ }
+ 
+ static void dump_open_file_object_request( const struct open_file_object_request *req )
+--- a/server/file.h
++++ b/server/file.h
+@@ -83,7 +83,7 @@
+                                    unsigned int options );
+ extern struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
+                            int flags, mode_t *mode, unsigned int access,
+-                           unsigned int sharing, unsigned int options );
++                           unsigned int sharing, unsigned int options, int client_fd );
+ extern struct fd *create_anonymous_fd( const struct fd_ops *fd_user_ops,
+                                        int unix_fd, struct object *user, unsigned int options );
+ extern struct fd *dup_fd_object( struct fd *orig, unsigned int access, unsigned int sharing,
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -1870,10 +1870,37 @@
+     name->len = fd->nt_namelen;
+ }
+ 
+-/* open() wrapper that returns a struct fd with no fd user set */
++/* Stained Glass OS: the Unix path of an fd, as the kernel reports it. Used for
++ * an fd the client opened: the server may be unable to traverse the path the
++ * client named (a user's private directory), and must not take that path on
++ * the client's word -- a client could name one file and send another, and the
++ * name is what delete-on-close and rename act on. */
++static char *sg_fd_path( int unix_fd )
++{
++    char link[64], *buf;
++    ssize_t len;
++
++    snprintf( link, sizeof(link), "/proc/self/fd/%d", unix_fd );
++    if (!(buf = malloc( PATH_MAX ))) return NULL;
++    if ((len = readlink( link, buf, PATH_MAX - 1 )) <= 0 || buf[0] != '/')
++    {
++        free( buf );
++        return NULL;
++    }
++    buf[len] = 0;
++    return buf;
++}
++
++/* open() wrapper that returns a struct fd with no fd user set.
++ *
++ * Stained Glass OS: client_fd, when not -1, is an fd the client opened itself,
++ * as its own Unix user, and sent with the request (ADR 0013). The server then
++ * opens nothing: it adopts that fd, so the kernel has already checked the real
++ * user's rights. With a shared machine-level server running as SYSTEM, an open
++ * by the server would be checked against SYSTEM's rights instead. */
+ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
+                     int flags, mode_t *mode, unsigned int access,
+-                    unsigned int sharing, unsigned int options )
++                    unsigned int sharing, unsigned int options, int client_fd )
+ {
+     struct stat st;
+     struct closed_fd *closed_fd;
+@@ -1885,11 +1912,18 @@
+     if (((options & FILE_DELETE_ON_CLOSE) && !(access & DELETE)) ||
+         ((options & FILE_DIRECTORY_FILE) && (flags & O_TRUNC)))
+     {
++        if (client_fd != -1) close( client_fd );
+         set_error( STATUS_INVALID_PARAMETER );
+         return NULL;
+     }
+ 
+-    if (!(fd = alloc_fd_object())) return NULL;
++    if (!(fd = alloc_fd_object()))
++    {
++        if (client_fd != -1) close( client_fd );
++        return NULL;
++    }
++    /* owned by the fd object from here on: released with it on any error */
++    if (client_fd != -1) fd->unix_fd = client_fd;
+ 
+     fd->options = options;
+     if (!(closed_fd = mem_alloc( sizeof(*closed_fd) )))
+@@ -1898,6 +1932,14 @@
+         return NULL;
+     }
+ 
++    if (client_fd != -1)
++    {
++        /* the client created and opened it; only the truncation, which must
++         * wait for the sharing check, is still ours to do */
++        flags &= ~(O_CREAT | O_EXCL);
++        goto opened;
++    }
++
+     if (root)
+     {
+         if ((root_fd = get_unix_fd( root )) == -1) goto error;
+@@ -1950,6 +1992,7 @@
+         }
+     }
+ 
++opened:
+     fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
+     fd->unix_name = NULL;
+     fstat( fd->unix_fd, &st );
+@@ -1969,7 +2012,9 @@
+             goto error;
+         }
+ 
+-        if ((path = dup_fd_name( root, name )))
++        if (client_fd != -1)
++            fd->unix_name = sg_fd_path( fd->unix_fd );
++        else if ((path = dup_fd_name( root, name )))
+         {
+             fd->unix_name = realpath( path, NULL );
+             free( path );
+--- a/server/file.c
++++ b/server/file.c
+@@ -211,7 +211,8 @@
+                                    struct unicode_str nt_name,
+                                    unsigned int access, unsigned int sharing, int create,
+                                    unsigned int options, unsigned int attrs,
+-                                   const struct security_descriptor *sd )
++                                   const struct security_descriptor *sd,
++                                   int client_fd, mode_t *create_mode )
+ {
+     struct object *obj = NULL;
+     struct fd *fd;
+@@ -221,10 +222,15 @@
+ 
+     if (!len || ((nameptr[0] == '/') ^ !root) || (nt_name.len && ((nt_name.str[0] == '\\') ^ !root)))
+     {
++        if (client_fd != -1) close( client_fd );
+         set_error( STATUS_OBJECT_PATH_SYNTAX_BAD );
+         return NULL;
+     }
+-    if (!(name = mem_alloc( len + 1 ))) return NULL;
++    if (!(name = mem_alloc( len + 1 )))
++    {
++        if (client_fd != -1) close( client_fd );
++        return NULL;
++    }
+     memcpy( name, nameptr, len );
+     name[len] = 0;
+ 
+@@ -238,7 +244,8 @@
+     case FILE_OPEN_IF:      flags = O_CREAT; break;
+     case FILE_OVERWRITE:    flags = O_TRUNC;
+                             access |= FILE_WRITE_ATTRIBUTES; break;
+-    default:                set_error( STATUS_INVALID_PARAMETER ); goto done;
++    default:                if (client_fd != -1) close( client_fd );
++                            set_error( STATUS_INVALID_PARAMETER ); goto done;
+     }
+ 
+     if (sd)
+@@ -263,10 +270,14 @@
+             mode |= S_IXOTH;
+     }
+ 
++    /* Stained Glass OS: a client that created the file itself applies this
++     * mode to it (ADR 0013), as open() would have applied it here. */
++    *create_mode = mode;
++
+     access = map_access( access, &file_type.mapping );
+ 
+     /* FIXME: should set error to STATUS_OBJECT_NAME_COLLISION if file existed before */
+-    fd = open_fd( root, name, nt_name, flags | O_NONBLOCK, &mode, access, sharing, options );
++    fd = open_fd( root, name, nt_name, flags | O_NONBLOCK, &mode, access, sharing, options, client_fd );
+     if (!fd) goto done;
+ 
+     if (S_ISDIR(mode))
+@@ -563,11 +574,22 @@
+ 
+     assert( obj->ops == &file_ops );
+ 
++    /* Stained Glass OS (ADR 0013): reopening by name would be done with the
++     * server's rights, so a user holding a read-only handle to a SYSTEM file
++     * could reopen it for writing. Refuse it for clients that are not the
++     * server's own account until reopening is done client-side. */
++    if (current && current->process->peer_uid != getuid())
++    {
++        set_error( STATUS_ACCESS_DENIED );
++        return NULL;
++    }
++
+     if ((unix_name = dup_fd_name( file->fd, "" )))
+     {
++        mode_t mode;
+         get_nt_name( file->fd, &nt_name );
+         new_file = create_file( NULL, unix_name, strlen(unix_name), nt_name, access,
+-                                sharing, FILE_OPEN, options, 0, NULL );
++                                sharing, FILE_OPEN, options, 0, NULL, -1, &mode );
+         free( unix_name );
+     }
+     else set_error( STATUS_OBJECT_TYPE_MISMATCH );
+@@ -647,6 +669,8 @@
+     const struct object_attributes *objattr = get_req_object_attributes( &sd, &nt_name, NULL );
+     const char *name;
+     data_size_t name_len;
++    int client_fd = -1;
++    mode_t create_mode = 0;
+ 
+     if (!objattr) return;
+ 
+@@ -663,12 +687,36 @@
+     name = get_req_data_after_objattr( objattr, &name_len );
+ 
+     reply->handle = 0;
++
++    /* Stained Glass OS (ADR 0013): the kernel must check file access against
++     * the user who asked, not against the server. So a client sends an fd it
++     * opened itself, and the server opens by name only for clients running as
++     * the server's own Unix account. A shared machine-level server runs as
++     * SYSTEM; opening by name for anyone else would give every user SYSTEM's
++     * file rights -- the flaw this closes. */
++    if (req->unix_fd != -1)
++    {
++        if ((client_fd = thread_get_inflight_fd( current, req->unix_fd )) == -1)
++        {
++            if (root_fd) release_object( root_fd );
++            set_error( STATUS_INVALID_HANDLE );
++            return;
++        }
++    }
++    else if (current->process->peer_uid != getuid())
++    {
++        if (root_fd) release_object( root_fd );
++        set_error( STATUS_ACCESS_DENIED );
++        return;
++    }
++
+     if ((file = create_file( root_fd, name, name_len, nt_name, req->access, req->sharing,
+-                             req->create, req->options, req->attrs, sd )))
++                             req->create, req->options, req->attrs, sd, client_fd, &create_mode )))
+     {
+         reply->handle = alloc_handle( current->process, file, req->access, objattr->attributes );
+         release_object( file );
+     }
++    reply->mode = create_mode;
+     if (root_fd) release_object( root_fd );
+ }
+ 
+--- a/server/device.c
++++ b/server/device.c
+@@ -440,7 +440,7 @@
+         mode_t mode = 0666;
+         access = file->obj.ops->map_access( &file->obj, access );
+         nt_name.str = device->obj.ops->get_full_name( &device->obj, &nt_name.len );
+-        file->fd = open_fd( NULL, device->unix_path, nt_name, O_NONBLOCK, &mode, access, sharing, options );
++        file->fd = open_fd( NULL, device->unix_path, nt_name, O_NONBLOCK, &mode, access, sharing, options, -1 );
+         if (file->fd) set_fd_user( file->fd, &device_file_fd_ops, &file->obj );
+     }
+     else file->fd = alloc_pseudo_fd( &device_file_fd_ops, &file->obj, options );
+--- a/server/unicode.c
++++ b/server/unicode.c
+@@ -331,7 +331,7 @@
+         if (asprintf( &path, "%s/l_intl.nls", nls_dirs[i] ) == -1) continue;
+         if ((fd = open_fd( NULL, path, nt_name, O_RDONLY, &mode, FILE_READ_DATA,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+-                           FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT ))) break;
++                           FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, -1 ))) break;
+         free( path );
+     }
+     if (!fd) fatal_error( "failed to load l_intl.nls\n" );
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -4001,6 +4001,165 @@
+ }
+ 
+ 
++/* Stained Glass OS (ADR 0013): open files here, not in the server.
++ *
++ * Wine's server used to open() files on its clients' behalf. With one
++ * machine-level server shared by every user and running as SYSTEM, the kernel
++ * then checked SYSTEM's rights for every user's every open: an ordinary user's
++ * program could write System32 and read SYSTEM-only files. The client now
++ * opens -- and creates -- the file as its own Unix user and sends the fd with
++ * the request; the server adopts it and opens nothing, and refuses to open by
++ * name for anyone who is not its own account.
++ *
++ * This mirrors what the server's create_file()/open_fd() did before calling
++ * open(): the same flags for each disposition, the same access-to-mode
++ * mapping, the same retry for directories, and the same errno-to-status
++ * mapping (the server's, not ntdll's -- they differ, and callers see these
++ * statuses). A file this function creates starts owner-only and is given the
++ * server's computed mode once the server has answered, so it is never briefly
++ * readable by others. */
++
++/* the server's file_set_error() mapping, which callers of NtCreateFile see */
++static NTSTATUS sg_open_errno_to_status( int err )
++{
++    switch (err)
++    {
++    case ETXTBSY:
++    case EAGAIN:    return STATUS_SHARING_VIOLATION;
++    case EBADF:     return STATUS_INVALID_HANDLE;
++    case ENOSPC:    return STATUS_DISK_FULL;
++    case EACCES:
++    case ESRCH:
++    case EROFS:
++    case EPERM:     return STATUS_ACCESS_DENIED;
++    case EBUSY:     return STATUS_FILE_LOCK_CONFLICT;
++    case ENOENT:    return STATUS_NO_SUCH_FILE;
++    case EISDIR:    return STATUS_FILE_IS_A_DIRECTORY;
++    case ENFILE:
++    case EMFILE:    return STATUS_TOO_MANY_OPENED_FILES;
++    case EEXIST:    return STATUS_OBJECT_NAME_COLLISION;
++    case EINVAL:    return STATUS_INVALID_PARAMETER;
++    case ESPIPE:    return STATUS_ILLEGAL_FUNCTION;
++    case ENOTEMPTY: return STATUS_DIRECTORY_NOT_EMPTY;
++    case EIO:       return STATUS_ACCESS_VIOLATION;
++    case ENOTDIR:   return STATUS_NOT_A_DIRECTORY;
++    case EFBIG:     return STATUS_SECTION_TOO_BIG;
++    case ENODEV:
++    case ENXIO:     return STATUS_NO_SUCH_DEVICE;
++    case EXDEV:     return STATUS_NOT_SAME_DEVICE;
++    case ELOOP:     return STATUS_REPARSE_POINT_NOT_RESOLVED;
++    case EOVERFLOW: return STATUS_INVALID_PARAMETER;
++    default:        return STATUS_UNSUCCESSFUL;
++    }
++}
++
++/* the process umask, read without changing it (umask() would race other
++ * threads creating files) */
++static mode_t sg_umask(void)
++{
++    static mode_t cached = (mode_t)-1;
++    char line[64];
++    FILE *f;
++
++    if (cached != (mode_t)-1) return cached;
++    cached = 022;
++    if ((f = fopen( "/proc/self/status", "r" )))
++    {
++        while (fgets( line, sizeof(line), f ))
++            if (!strncmp( line, "Umask:", 6 )) { cached = strtoul( line + 6, NULL, 8 ) & 0777; break; }
++        fclose( f );
++    }
++    return cached;
++}
++
++#define SG_UNIX_READ_ACCESS  (FILE_READ_DATA|FILE_READ_ATTRIBUTES|FILE_READ_EA)
++#define SG_UNIX_WRITE_ACCESS (FILE_WRITE_DATA|FILE_APPEND_DATA|FILE_WRITE_ATTRIBUTES|FILE_WRITE_EA)
++
++/* Open unix_name (relative to root_fd when it is not AT_FDCWD) as this process's
++ * user. Returns the fd, or -1 with *status set; *created says whether this call
++ * created it. */
++static int sg_client_open( int root_fd, const char *unix_name, ACCESS_MASK access,
++                           ULONG disposition, ULONG options, BOOL *created, NTSTATUS *status )
++{
++    int flags, rw_mode, fd;
++
++    *created = FALSE;
++    switch (disposition)
++    {
++    case FILE_CREATE:       flags = O_CREAT | O_EXCL; break;
++    case FILE_OVERWRITE_IF: access |= FILE_WRITE_ATTRIBUTES; /* fall through */
++    case FILE_SUPERSEDE:    flags = O_CREAT | O_TRUNC; break;
++    case FILE_OPEN:         flags = 0; break;
++    case FILE_OPEN_IF:      flags = O_CREAT; break;
++    case FILE_OVERWRITE:    flags = O_TRUNC; access |= FILE_WRITE_ATTRIBUTES; break;
++    default:                *status = STATUS_INVALID_PARAMETER; return -1;
++    }
++    /* rejected by the server before it touched the disk; reject them first
++     * here too, so nothing is created for a request that is going to fail */
++    if (((options & FILE_DELETE_ON_CLOSE) && !(access & (DELETE | GENERIC_ALL))) ||
++        ((options & FILE_DIRECTORY_FILE) && (flags & O_TRUNC)))
++    {
++        *status = STATUS_INVALID_PARAMETER;
++        return -1;
++    }
++
++    if (access & GENERIC_READ)    access |= FILE_GENERIC_READ;
++    if (access & GENERIC_WRITE)   access |= FILE_GENERIC_WRITE;
++    if (access & GENERIC_EXECUTE) access |= FILE_GENERIC_EXECUTE;
++    if (access & GENERIC_ALL)     access |= FILE_ALL_ACCESS;
++
++    if ((options & FILE_DIRECTORY_FILE) && (flags & O_CREAT))
++    {
++        if (mkdirat( root_fd, unix_name, 0700 ) == 0) *created = TRUE;
++        else if (errno != EEXIST || (flags & O_EXCL))
++        {
++            *status = sg_open_errno_to_status( errno );
++            return -1;
++        }
++        flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
++    }
++
++    if ((access & SG_UNIX_WRITE_ACCESS) && !(options & FILE_DIRECTORY_FILE))
++        rw_mode = (access & SG_UNIX_READ_ACCESS) ? O_RDWR : O_WRONLY;
++    else
++        rw_mode = O_RDONLY;
++    rw_mode |= O_NONBLOCK | O_CLOEXEC;
++
++    /* O_TRUNC waits for the server's sharing check. Creating with O_EXCL first
++     * is how we learn whether this call created the file. */
++    if ((flags & O_CREAT) && !(flags & O_EXCL))
++    {
++        fd = openat( root_fd, unix_name, rw_mode | O_CREAT | O_EXCL, 0600 );
++        if (fd != -1) *created = TRUE;
++        else if (errno == EEXIST) fd = openat( root_fd, unix_name, rw_mode );
++    }
++    else
++    {
++        fd = openat( root_fd, unix_name, rw_mode | (flags & (O_CREAT | O_EXCL)), 0600 );
++        if (fd != -1 && (flags & O_CREAT)) *created = TRUE;
++    }
++
++    /* if we tried to open a directory for write access, retry read-only */
++    if (fd == -1 && errno == EISDIR && ((access & SG_UNIX_WRITE_ACCESS) || (flags & O_CREAT)))
++        fd = openat( root_fd, unix_name, O_RDONLY | O_NONBLOCK | O_CLOEXEC );
++
++    if (fd == -1)
++    {
++        size_t len = strlen( unix_name );
++        /* check for trailing slash on file path */
++        if ((errno == ENOENT || (errno == ENOTDIR && !(options & FILE_DIRECTORY_FILE))) &&
++            len && unix_name[len - 1] == '/')
++            *status = STATUS_OBJECT_NAME_INVALID;
++        else
++            *status = sg_open_errno_to_status( errno );
++        if (*created && (options & FILE_DIRECTORY_FILE)) unlinkat( root_fd, unix_name, AT_REMOVEDIR );
++        *created = FALSE;
++        return -1;
++    }
++    return fd;
++}
++
++
+ /******************************************************************************
+  *              open_unix_file
+  *
+@@ -4013,9 +4172,28 @@
+     struct object_attributes *objattr;
+     unsigned int status;
+     data_size_t len;
++    int root_fd = AT_FDCWD, root_needs_close = 0, fd;
++    NTSTATUS open_status;
++    BOOL created;
++    unsigned int mode = 0;
+ 
+     if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
+ 
++    if (attr->RootDirectory &&
++        (status = server_get_unix_fd( attr->RootDirectory, 0, &root_fd, &root_needs_close, NULL, NULL )))
++    {
++        free( objattr );
++        return status;
++    }
++    fd = sg_client_open( root_fd, unix_name, access, disposition, options, &created, &open_status );
++    if (root_needs_close) close( root_fd );
++    if (fd == -1)
++    {
++        free( objattr );
++        return open_status;
++    }
++
++    wine_server_send_fd( fd );
+     SERVER_START_REQ( create_file )
+     {
+         req->access     = access;
+@@ -4023,12 +4201,20 @@
+         req->create     = disposition;
+         req->options    = options;
+         req->attrs      = attributes;
++        req->unix_fd    = fd;
+         wine_server_add_data( req, objattr, len );
+         wine_server_add_data( req, unix_name, strlen(unix_name) );
+         status = wine_server_call( req );
+         *handle = wine_server_ptr_handle( reply->handle );
++        mode = reply->mode;
+     }
+     SERVER_END_REQ;
++
++    /* a file this call created gets the mode the server chose for it -- from
++     * the security descriptor, or the default -- under this process's umask,
++     * as open() would have applied it */
++    if (created && !status) fchmod( fd, mode & 07777 & ~sg_umask() );
++    close( fd );
+     free( objattr );
+     return status;
+ }
