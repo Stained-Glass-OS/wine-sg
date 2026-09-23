@@ -541,6 +541,16 @@ account may stamp the default descriptor onto an existing descriptor-less key
 (system.reg carries none). Any new registry request that creates keys must keep
 this property.
 
+## `patches/sg/0025-shrestricted-reads-machine-policy-from-hklm.patch`
+
+"Apply policies" (Group Policy). Windows evaluates a shell restriction from HKLM
+(machine policy) as well as HKCU, machine winning. shell32's `SHRestricted` read
+only HKCU, so a machine-wide policy could not be expressed. It now reads HKLM
+first; with the HKLM policy branch administrator-owned (0024), an admin's policy
+binds every user and a user cannot plant or override one. sg-session applies
+`/etc/stained-glass/policy.d/*.reg` at boot; sg-shell's sg-start honours
+NoClose/StartMenuLogOff.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
