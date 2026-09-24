@@ -11,6 +11,8 @@
 #   nomanifest     no AppxManifest.xml (what a bundle looks like to a package reader)
 #   blocktamper    one byte of the payload changed, CRC-32 recomputed to match,
 #                  so only the block map can tell
+#   bundle         an .msixbundle holding the package for x86 and for x64
+#                  (deployment must choose x64 on an x64 machine)
 #
 # SPDX-License-Identifier: LGPL-2.1-or-later
 import base64
@@ -79,16 +81,18 @@ def blockmap(files):
     return ''.join(parts).encode()
 
 
-def main():
-    out, variant = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else 'good'
+def package(variant='good', arch='x64'):
+    import io
     data = payload()
+    manifest = MANIFEST.replace(b'ProcessorArchitecture="x64"', f'ProcessorArchitecture="{arch}"'.encode())
     files = [
         ('Public\\data.bin', data, zipfile.ZIP_DEFLATED),
         ('Assets\\logo.png', b'\x89PNG\r\n\x1a\n' + bytes(range(64)), zipfile.ZIP_STORED),
-        ('AppxManifest.xml', MANIFEST, zipfile.ZIP_DEFLATED),
+        ('AppxManifest.xml', manifest, zipfile.ZIP_DEFLATED),
     ]
     bm = blockmap(files)
-    with zipfile.ZipFile(out, 'w') as z:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as z:
         for name, content, method in files:
             if variant == 'nomanifest' and name == 'AppxManifest.xml':
                 continue
@@ -100,6 +104,44 @@ def main():
         z.writestr(zipfile.ZipInfo('AppxBlockMap.xml', (2026, 1, 1, 0, 0, 0)), bm, compress_type=zipfile.ZIP_DEFLATED)
         z.writestr(zipfile.ZipInfo('[Content_Types].xml', (2026, 1, 1, 0, 0, 0)), CONTENT_TYPES,
                    compress_type=zipfile.ZIP_DEFLATED)
+    return buf.getvalue()
+
+
+BUNDLE_TYPES = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                b'<Default Extension="msix" ContentType="application/vnd.ms-appx"/>'
+                b'<Default Extension="xml" ContentType="application/vnd.ms-appx.bundlemanifest+xml"/>'
+                b'<Override PartName="/AppxBlockMap.xml" ContentType="application/vnd.ms-appx.blockmap+xml"/>'
+                b'<Override PartName="/AppxSignature.p7x" ContentType="application/vnd.ms-appx.signature"/>'
+                b'</Types>')
+
+
+def bundle(out):
+    inner = [(f'AppxTest_{arch}.msix', package('good', arch), arch) for arch in ('x86', 'x64')]
+    pkgs = ''.join(f'<Package Type="application" Version="1.2.3.4" Architecture="{arch}" FileName="{name}" '
+                   f'Offset="0" Size="{len(data)}"/>' for name, data, arch in inner)
+    manifest = (f'<?xml version="1.0" encoding="utf-8"?>'
+                f'<Bundle xmlns="http://schemas.microsoft.com/appx/2013/bundle" SchemaVersion="5.0">'
+                f'<Identity Name="StainedGlass.AppxTest" Publisher="{PUBLISHER}" Version="1.2.3.4"/>'
+                f'<Packages>{pkgs}</Packages></Bundle>').encode()
+    files = [(name, data, zipfile.ZIP_STORED) for name, data, _ in inner]
+    files.append(('AppxMetadata\\AppxBundleManifest.xml', manifest, zipfile.ZIP_DEFLATED))
+    bm = blockmap(files)
+    with zipfile.ZipFile(out, 'w') as z:
+        for name, content, method in files:
+            z.writestr(zipfile.ZipInfo(name.replace('\\', '/'), (2026, 1, 1, 0, 0, 0)), content, compress_type=method)
+        z.writestr(zipfile.ZipInfo('AppxBlockMap.xml', (2026, 1, 1, 0, 0, 0)), bm, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr(zipfile.ZipInfo('[Content_Types].xml', (2026, 1, 1, 0, 0, 0)), BUNDLE_TYPES,
+                   compress_type=zipfile.ZIP_DEFLATED)
+
+
+def main():
+    out, variant = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else 'good'
+    if variant == 'bundle':
+        bundle(out)
+        return
+    with open(out, 'wb') as f:
+        f.write(package(variant))
 
 
 if __name__ == '__main__':

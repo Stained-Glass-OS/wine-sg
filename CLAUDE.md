@@ -871,6 +871,49 @@ server checks each one. Wine only finds the results.
   they are missing, so sg-domain-logon's values (imported by the session)
   survive any later wineboot.
 
+## `patches/sg/0060`-`0062`: MSIX deployment
+
+- **0060 appxdeploymentclient**: AddPackageAsync/UpdatePackageAsync (file:
+  URIs), RegisterPackageAsync (a loose manifest, in development mode) and
+  RemovePackageAsync, as `IAsyncOperationWithProgress<DeploymentResult,
+  DeploymentProgress>` on the thread pool (`async.c`). `deploy.c` does the
+  work. **The signature must be trusted**: WinVerifyTrust through the AppX
+  SIP (0037), and a refusal becomes the DeploymentResult's
+  ExtendedErrorCode. The package is read with appxpackaging, which checks
+  every file against the signed block map, and extracted to
+  `%ProgramFiles%\WindowsApps\<full name>`, or
+  `%LOCALAPPDATA%\Programs\WindowsApps\...` for a user who may not write
+  there. Names that are absolute or contain `..` are refused. The
+  registration is `HKCU\Software\Wine\AppModel\Packages\<full name>`
+  (identity, InstallLocation, display properties, the Start menu shortcuts
+  it made). **That key is an interface**: kernelbase (0061) reads it, so
+  change both together. Package objects (`package_obj.c`, `applist.c`):
+  IPackage, 2 and 3, IPackageId, a StorageFolder that knows its path, and
+  AppListEntry.LaunchAsync.
+- **0061 kernelbase**: a process has a package's identity when its
+  executable is inside that package's InstallLocation, however it was
+  started (GetCurrentPackageFullName/FamilyName/Id/Path;
+  GetPackagePathByFullName; GetPackagesByPackageFamily).
+- **0062**: ApplicationData.Current is one per process.
+- **Conformance**: windows.applicationmodel:model registers, finds,
+  launches and removes its package, with 0 failures (174 tests, plus 44 in
+  the launched packaged app). The test assumed a system already has
+  packages; it now accepts an empty list.
+- **Gate:** `make test-appx`. `test/deploy-probe.c` checks that unsigned,
+  untrusted and tampered packages are refused, and that a trusted one is
+  extracted byte for byte, found, given a shortcut, and removed.
+- **0063 bundles**: appxpackaging's bundle reader (the package reader's
+  checks via `package_open`; the bundle manifest; payload package info). The
+  interface IIDs come from Microsoft's published win32metadata, via the
+  MIT-licensed `windows` crate. A bundle's signature names the **bundle
+  SIP** `{0f5f58b3-aade-4b9a-a434-95742d92eceb}` over the same digest
+  record. wintrust accepts it only for a file with
+  `AppxMetadata/AppxBundleManifest.xml`, and the package SIP only for a file
+  with `AppxManifest.xml`. Deployment installs the application package for
+  this machine's architecture; resource packages are not installed yet.
+- Not yet: resource and dependency packages, app execution aliases,
+  GetCurrentPackageInfo, deployment for another user.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

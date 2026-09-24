@@ -9,6 +9,10 @@
 #            unknown issuer is refused; once an administrator adds the root
 #            it is trusted -- in every later process too; a tampered package
 #            fails its digest
+#   deploy   PackageManager.AddPackageAsync (patch 0060): an unsigned or
+#            tampered package is refused; a trusted one is extracted,
+#            registered (found by name and publisher, at its location) and
+#            given a Start menu shortcut; RemovePackageAsync takes it all away
 #
 # The fixtures are made here: test/mkappx.py writes the packages and they are
 # signed with osslsigncode by a certificate generated for this run and thrown
@@ -40,12 +44,14 @@ mkdir -p "$WINEPREFIX"
 "$MINGW" -O2 -o "$T/trust-probe.exe" "$HERE/trust-probe.c" -lwintrust -lcrypt32 || { fail "trust-probe did not build"; exit 1; }
 "$MINGW" -O2 -o "$T/pkgname-probe.exe" "$HERE/pkgname-probe.c" || { fail "pkgname-probe did not build"; exit 1; }
 "$MINGW" -O2 -o "$T/appmodel-probe.exe" "$HERE/appmodel-probe.c" -lruntimeobject || { fail "appmodel-probe did not build"; exit 1; }
+"$MINGW" -O2 -o "$T/deploy-probe.exe" "$HERE/deploy-probe.c" -lruntimeobject -lshlwapi || { fail "deploy-probe did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 C="$WINEPREFIX/drive_c"
 cp "$T"/*.exe "$C/"
 
 # fixtures
 for v in good extra nomanifest blocktamper; do python3 "$HERE/mkappx.py" "$C/$v.msix" "$v"; done
+python3 "$HERE/mkappx.py" "$C/unsigned.msixbundle" bundle
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$T/ca.key" -out "$T/ca.pem" -days 2 \
     -subj "/CN=Stained Glass Gate Root" -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
@@ -57,6 +63,8 @@ openssl x509 -req -in "$T/signer.csr" -CA "$T/ca.pem" -CAkey "$T/ca.key" -CAcrea
 openssl x509 -in "$T/ca.pem" -outform DER -out "$C/ca.der"
 osslsigncode sign -certs "$T/signer.pem" -key "$T/signer.key" -h sha256 -in "$C/good.msix" -out "$C/signed.msix" >/dev/null 2>&1 \
     || { fail "osslsigncode could not sign the fixture"; exit 1; }
+osslsigncode sign -certs "$T/signer.pem" -key "$T/signer.key" -h sha256 -in "$C/unsigned.msixbundle" \
+    -out "$C/signed.msixbundle" >/dev/null 2>&1 || { fail "osslsigncode could not sign the bundle"; exit 1; }
 python3 - "$C/signed.msix" "$C/signed-tampered.msix" <<'EOF'
 import sys, zipfile
 src, dst = sys.argv[1], sys.argv[2]
@@ -109,6 +117,8 @@ out=$(run appx-probe.exe info 'C:\nomanifest.msix')
 expect "$out" CreatePackageReader 0x80080203 "no manifest: APPX_E_MISSING_REQUIRED_FILE"
 out=$(run appx-probe.exe bundle 'C:\good.msix')
 expect "$out" CreateBundleReader 0x80080203 "a package is not a bundle"
+out=$(run appx-probe.exe bundle 'C:\unsigned.msixbundle')
+expect "$out" CreateBundleReader 0 "a bundle opens with the bundle reader"
 
 out=$(run pkgname-probe.exe)
 expect "$out" FamilyFromFull "Microsoft.Winget.Source_8wekyb3d8bbwe" "PackageFamilyNameFromFullName"
@@ -137,6 +147,13 @@ out=$(run trust-probe.exe 'C:\good.msix')
 expect "$out" WinVerifyTrust 0x800b0100 "an unsigned package: TRUST_E_NOSIGNATURE"
 out=$(run trust-probe.exe 'C:\signed.msix')
 expect "$out" WinVerifyTrust 0x800b010a "signed by an unknown issuer: refused (CERT_E_CHAINING)"
+# ---- deployment, before the root is trusted --------------------------------
+out=$(run deploy-probe.exe add 'C:\good.msix')
+expect "$out" AddStatus 3 "an unsigned package is not deployed (the operation ends in Error)"
+expect "$out" AddExtended 0x800b0100 "TRUST_E_NOSIGNATURE"
+out=$(run deploy-probe.exe add 'C:\signed.msix')
+expect "$out" AddExtended 0x800b010a "a package from an unknown issuer is not deployed"
+
 out=$(run trust-probe.exe --root 'C:\ca.der')
 expect "$out" root added "an administrator adds the issuing root to the machine"
 out=$(run trust-probe.exe 'C:\signed.msix')
@@ -145,6 +162,44 @@ out=$(run trust-probe.exe 'C:\signed.msix')
 expect "$out" WinVerifyTrust 0 "still trusted in a later process (the root was kept)"
 out=$(run trust-probe.exe 'C:\signed-tampered.msix')
 expect "$out" WinVerifyTrust 0x80096010 "one bit changed in the payload: TRUST_E_BAD_DIGEST"
+
+# ---- deployment, trusted ------------------------------------------------------
+FULL="StainedGlass.AppxTest_1.2.3.4_x64__$PUBID"
+out=$(run deploy-probe.exe add 'C:\signed-tampered.msix')
+expect "$out" AddExtended 0x80096010 "a tampered package is not deployed"
+out=$(run deploy-probe.exe add 'C:\signed.msix')
+expect "$out" AddStatus 1 "a trusted package is deployed (the operation completes)"
+expect "$out" AddExtended 0x00000000 "with no error"
+out=$(run deploy-probe.exe find StainedGlass.AppxTest 'CN=Stained Glass Test Publisher')
+expect "$out" Count 1 "FindPackagesByNamePublisher finds it"
+expect "$out" FullName "$FULL" "by its full name"
+loc=$(printf '%s\n' "$out" | sed -n 's/^Location=//p')
+uloc=$(printf '%s' "$loc" | sed 's|^[Cc]:||; s|\\|/|g')
+if [ -n "$loc" ] && python3 - "$C/good.msix" "$C$uloc/Public/data.bin" <<'PY'
+import sys, zipfile
+sys.exit(0 if zipfile.ZipFile(sys.argv[1]).read('Public/data.bin') == open(sys.argv[2], 'rb').read() else 1)
+PY
+then pass "its files are installed at its location ($loc), byte for byte"
+else fail "installed files: location '$loc'"; fi
+[ -f "$C$uloc/AppxManifest.xml" ] && pass "with its manifest beside them" || fail "no AppxManifest.xml at $loc"
+lnk=$(find "$C/users" -path '*Start Menu/Programs/AppX test app.lnk' 2>/dev/null | head -1)
+[ -n "$lnk" ] && pass "a Start menu shortcut for its application" || fail "no Start menu shortcut"
+out=$(run deploy-probe.exe remove "$FULL")
+expect "$out" RemoveStatus 1 "RemovePackageAsync completes"
+out=$(run deploy-probe.exe find StainedGlass.AppxTest 'CN=Stained Glass Test Publisher')
+expect "$out" Count 0 "and the package is gone"
+if [ ! -e "$C$uloc" ] && [ ! -e "$lnk" ]; then pass "with its files and its shortcut"
+else fail "left behind: $(ls -d "$C$uloc" "$lnk" 2>/dev/null)"; fi
+
+# ---- a bundle ----------------------------------------------------------------------
+out=$(run trust-probe.exe 'C:\signed.msixbundle')
+expect "$out" WinVerifyTrust 0 "a signed bundle verifies (the AppX SIP for .msixbundle)"
+out=$(run deploy-probe.exe add 'C:\signed.msixbundle')
+expect "$out" AddStatus 1 "a trusted bundle is deployed"
+out=$(run deploy-probe.exe find StainedGlass.AppxTest 'CN=Stained Glass Test Publisher')
+expect "$out" FullName "$FULL" "with the bundle's x64 package, of its x86 and x64 ones"
+out=$(run deploy-probe.exe remove "$FULL")
+expect "$out" RemoveStatus 1 "and removed"
 
 if [ "${NETWORK:-0}" = 1 ]; then
     if curl -fsSL -o "$C/source2.msix" https://cdn.winget.microsoft.com/cache/source2.msix; then
