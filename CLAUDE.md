@@ -729,6 +729,54 @@ is admitted who could not already open the prefix. (Found building D1; the
 domain join itself writes the membership into the group file, because greetd's
 `initgroups()` drops pam_group's additions.)
 
+## `patches/sg/0048-server-display-config-keys-stay-writable-when-stamped.patch`
+
+0011 gives the display-config keys (`Control\Video`, `Control\GraphicsDrivers`)
+a user-writable DACL only when a key is **created**; 0024's path that lets
+SYSTEM stamp the default descriptor onto an existing descriptor-less key did
+not make the exception. Security descriptors are not saved, so a container
+re-stamped by SYSTEM after the server started came out "users read", no
+session could record its display, and win32u's display setup asserted
+(`add_monitor: !list_empty(&sources)`) -- the login screen crashed at every
+boot. Seen on a machine with Microsoft Edge installed; it depends on which
+process touches the key first. **The tell:** `reg add` under
+`HKLM\System\CurrentControlSet\Control\Video` fails for sggreet or a user.
+
+## `patches/sg/0049`-`0054`: what Microsoft Edge needed
+
+Edge is user-installed (never shipped). These are the exports it calls that
+Wine lacked; each missing one was a crash, because Chromium's delay-load
+failure hook crashes on purpose (the minidump shows the DLL name and 127,
+`ERROR_PROC_NOT_FOUND`, on the stack).
+
+- **0049 wofutil `WofSetFileDataLocation`**: Edge's setup compresses what it
+  installs through the Windows Overlay Filter. Implemented as Windows does it
+  (`FSCTL_SET_EXTERNAL_BACKING`); our file systems decline, nothing crashes.
+- **0050 user32** `IsWindowArranged` (FALSE), `GetPointerDevice` and
+  `GetPointerPenInfo` (no devices, no pen pointers: `ERROR_INVALID_PARAMETER`).
+- **0051 powrprof** `PowerReadACValue` (no schemes: `ERROR_FILE_NOT_FOUND`) and
+  the effective-power-mode notifications (always Balanced, callback right after
+  registering, on a pool thread).
+- **0052 wininet** `InternetGetCookieEx2` / `InternetFreeCookies`.
+- **0053 userenv** `DeriveAppContainerSidFromAppContainerName` -- SHA-256 of
+  the lower-cased UTF-16LE name; reproduces the published SID of
+  `Microsoft.MicrosoftEdge_8wekyb3d8bbwe`.
+- **0054 advapi32** `AddConditionalAce` refuses (`ERROR_NOT_SUPPORTED`):
+  nothing evaluates conditional ACEs, and an ACE without its condition would be
+  wrong.
+
+**Gate:** `make test-edge` (`test/edge-e2e.sh`, `test/edgeapi-probe.c`); with
+`EDGE_MSI` set it installs Edge silently and checks a page loads, runs its
+script and paints. **Edge's sandbox does not work yet** -- it runs with
+`--no-sandbox`. Findings so far: renderers are never launched with the sandbox
+on; `NtFilterToken` ignores restricting SIDs and flag 0x1; `TokenIntegrityLevel`
+is a stub; token information class 39 (TokenSecurityAttributes) is unhandled;
+job UI restrictions are a stub; and every Wine process reads the display state
+from the registry, which a lockdown token (all groups deny-only) cannot -- on
+Windows the kernel hands it out without a check. Also: a prefix owner is an
+administrator, so on a dev box Edge says "running elevated" and relaunches
+itself de-elevated through the shell (`--do-not-de-elevate` avoids it).
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

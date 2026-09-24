@@ -45,6 +45,11 @@ test-winget:
 test-compress:
 	WINE=$(PREFIX)/bin/wine test/compress-gate.sh
 
+# What Microsoft Edge needed (0049-0054); EDGE_MSI=<a user-supplied Edge
+# enterprise MSI> also installs and runs Edge itself.
+test-edge:
+	WINE=$(PREFIX)/bin/wine test/edge-e2e.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
