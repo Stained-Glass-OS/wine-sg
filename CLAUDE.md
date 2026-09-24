@@ -716,6 +716,19 @@ registry with `wine reg` perturbs it**, because reg.exe runs its own display
 update on the non-virtual desktop. Trust traces from the process under test
 more than a dump taken afterwards.
 
+## `patches/sg/0047-server-admit-a-peer-holding-the-prefix-group.patch`
+
+Patch 0001 admits members of the prefix's group by asking NSS
+(`getgrouplist`). A process can hold the group with no group file saying so
+(pam_group, `sg`/`newgrp`, a unit's `SupplementaryGroups=`), and the kernel
+then let it open every file in the prefix while the server refused the
+connection. The server now also admits a peer whose **own** supplementary
+groups, as the kernel reports them for the connection (`SO_PEERGROUPS`),
+include it -- the same membership file access is checked against, so nobody
+is admitted who could not already open the prefix. (Found building D1; the
+domain join itself writes the membership into the group file, because greetd's
+`initgroups()` drops pam_group's additions.)
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
