@@ -572,6 +572,44 @@ binds every user and a user cannot plant or override one. sg-session applies
 `/etc/stained-glass/policy.d/*.reg` at boot; sg-shell's sg-start honours
 NoClose/StartMenuLogOff.
 
+## `patches/sg/0032-windows-applicationmodel-resourceloader-and-pri-reader.patch`
+
+MRT string resources. `Windows.ApplicationModel.Resources.ResourceLoader`
+(in windows.applicationmodel.dll) is built on `pri.c`, a reader for the
+Package Resource Index format (`resources.pri`). Without it, every MRT-localised
+program printed resource keys: winget's help read "ToolDescription".
+
+- **The index is `resources.pri` beside the executable**, else `<exe>.pri`.
+  That is the package root of an unpacked package, which is how packaged apps
+  run here. A loader names a map below the root: `Resources` by default, or its
+  name (`winget`). A key that starts with `/` is taken from the root. A missing
+  resource is an empty string, not an error, as on Windows.
+- **The format is undocumented.** pri.c is written from the description in
+  independent readers (chausner/PriTools, Apache-2.0), not from any Microsoft
+  code. It is **bounds-checked throughout** because an application ships the
+  file. It was fuzzed with 20000 mutated indexes under ASan with no findings;
+  redo that if you change the parser (build pri.c on the host with
+  `-DPRI_HOST_TEST`).
+- **Language choice**: the user's preferred UI languages
+  (`GetUserPreferredUILanguages`), then the index's own fallback language.
+  Other qualifiers (scale, contrast) prefer the default.
+- **Gate:** `make test-resources` (`test/resources-gate.sh`). It uses a
+  generated fixture (`test/mkpri.py`, so no Microsoft tool is needed) and
+  checks default and named maps, a root path, data items, UTF-8, a missing
+  key, `ms-resource:` URIs and German versus English candidates. With
+  `WINGET_DIR` set it also reads winget's real, makepri-written index. The
+  installed 10.0-7 fails it, because the class is not there.
+
+## `patches/sg/0033-iertutil-parse-windows-foundation-uri-with-urlmon.patch`
+
+`Windows.Foundation.Uri` used to store the raw string and nothing else.
+Every property except RawUri was `E_NOTIMPL`, and AbsoluteUri echoed its input.
+It now parses with urlmon's RFC 3986 `IUri` and answers each property from the
+matching `Uri_PROPERTY`. Equals compares canonical forms, and
+CombineUri/CreateWithRelativeUri use `CoInternetCombineUrlEx`. A non-absolute
+string is `E_INVALIDARG`. QueryParsed is still unimplemented. The gate is the
+Uri half of `make test-resources`.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

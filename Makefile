@@ -27,6 +27,11 @@ install:
 test:
 	PREFIX=$(PREFIX) test/wow64-gate.sh
 
+# ResourceLoader/PRI and Windows.Foundation.Uri (patches 0032, 0033), against
+# the installed tree. WINGET_DIR=<unpacked winget> adds a makepri-written index.
+test-resources:
+	WINE=$(PREFIX)/bin/wine test/resources-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
