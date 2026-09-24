@@ -354,6 +354,27 @@ This is ADR 0007's "upgrade the bar, don't overlay or hide it".
 - New UI that explorer does *not* have -- a Start menu, a notification centre --
   is not this patch; it is separate AGPL programs in `sg-shell`.
 
+## `patches/sg/0031-recolour-light-theme-to-stained-glass-purple.patch`
+
+Wine's Light visual style accents themed controls, selection and window buttons
+in Windows-10 blue; this recolours its source SVGs to the project's purple
+(#3096fa->#7b2fbe, #2979ff->#5f2496, #e3f2fd->#f0e9fa). Greys, the red Close and
+all non-accent colours are untouched.
+
+**The theme packs .bmp/.cur/.ico, not the SVGs.** A normal (non maintainer-mode)
+build uses the pre-rendered images shipped in the tarball, so editing the SVGs
+alone builds blue. `build.sh`'s `regenerate_theme_images` re-renders them from
+the patched SVGs after applying the series, exactly as `tools/buildimage` does
+in maintainer mode -- it needs `rsvg-convert`, `icotool` and ImageMagick
+(`make deps`, and Build-Depends for the .deb). If those are missing the build
+warns and stays blue.
+
+**tools/buildimage only adds rsvg-convert's `-o` when RSVG is exactly
+`rsvg-convert`.** Pass the bare name, never a full path, or every render fails
+with "Multiple SVG files are only allowed for PDF" and the theme silently stays
+blue. Verify with `grep -c 7b2fbe` on a built `light.msstyles` (should be
+non-zero) or on a rendered `.bmp`.
+
 ## `patches/sg/0013-flat-caption-buttons.patch`
 
 The minimize, maximize/restore and close buttons drawn flat, Windows 10 style,

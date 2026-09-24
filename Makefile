@@ -33,7 +33,8 @@ deb:
 deps:
 	sudo apt-get build-dep -y wine
 	sudo apt-get install -y gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 \
-	                        mingw-w64-tools libsane-dev
+	                        mingw-w64-tools libsane-dev \
+	                        librsvg2-bin icoutils imagemagick
 
 clean:
 	rm -rf build/obj

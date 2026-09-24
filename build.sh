@@ -62,8 +62,35 @@ prepare_tree() {
         log "  $p"
         patch -d "$tmp/wine-$WINE_VERSION" -p1 -s -i "$HERE/patches/$p"
     done < "$HERE/patches/series"
+    regenerate_theme_images "$tmp/wine-$WINE_VERSION"
     mv "$tmp/wine-$WINE_VERSION" "$dest"
     rmdir "$tmp"
+}
+
+# The Light visual style ships pre-rendered .bmp/.cur/.ico, and a normal (non
+# maintainer-mode) build packs those rather than re-rendering from the SVGs. Our
+# purple recolour (patches/sg/0031) edits the SVGs, so those images must be
+# regenerated from them, exactly as tools/buildimage does in maintainer mode --
+# otherwise the theme would build blue. RSVG is passed as the bare name because
+# tools/buildimage only adds rsvg-convert's -o flag when RSVG equals
+# "rsvg-convert" (a full path silently drops it and every render fails).
+regenerate_theme_images() {
+    local tree=$1 dir="$1/dlls/light.msstyles" svg base ext
+    [[ -d "$dir" ]] || return 0
+    if ! command -v rsvg-convert >/dev/null || ! command -v icotool >/dev/null || ! command -v convert >/dev/null; then
+        log "  WARNING: rsvg-convert/icotool/convert missing; Light theme stays blue (see make deps)"
+        return 0
+    fi
+    log "  rendering the purple Light theme images"
+    for svg in "$dir"/*.svg; do
+        base=${svg%.svg}
+        for ext in bmp cur ico; do
+            [[ -f "$base.$ext" ]] || continue
+            CONVERT=convert ICOTOOL=icotool RSVG=rsvg-convert \
+                perl "$tree/tools/buildimage" "$svg" "$base.$ext" >/dev/null 2>&1 \
+                || log "    WARNING: could not render $(basename "$base.$ext")"
+        done
+    done
 }
 
 FINGERPRINT=$(series_fingerprint)
