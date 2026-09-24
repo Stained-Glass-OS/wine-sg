@@ -695,6 +695,27 @@ an MSI and an NSIS package, list and uninstall, in a fresh prefix. **GUI tests
 run under `xvfb-run`, never on `$DISPLAY`**: an installer's window must not
 land on the developer's desktop.
 
+## `patches/sg/0046-win32u-reg-option-open-link-is-an-attribute.patch`
+
+win32u's own `reg_create_key()` passed `REG_OPTION_OPEN_LINK` to `NtCreateKey`
+as an option. The server ignores that; `RegCreateKeyEx` turns it into the
+`OBJ_OPENLINK` attribute. As a result, retargeting the display-source links
+(`Control\Video\{gpu}\NNNN`) followed each link and wrote into its old target.
+With a virtual desktop, whenever the first display update ran before the
+virtual source existed, two indices named one source and a monitor was left
+with no source. That monitor reported win32u's **1024x768 default** as the
+primary screen, and the taskbar was laid out for it (`1024x40+0+728` on a
+1280x720 desktop). This is timing-dependent: the session gate passed for a
+long time and then failed on every run.
+
+How it was found, for next time: a clean dump of the live registry
+(`SG_TEST_HOLD` in sg-session's harness) showed `SymbolicLinkValue` values
+written *inside* source keys. A 30-line standalone test then showed that
+retargeting works only through an `OBJ_OPENLINK` handle. **Dumping the
+registry with `wine reg` perturbs it**, because reg.exe runs its own display
+update on the non-virtual desktop. Trust traces from the process under test
+more than a dump taken afterwards.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
