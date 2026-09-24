@@ -37,6 +37,10 @@ test-resources:
 test-appx:
 	WINE=$(PREFIX)/bin/wine test/appx-gate.sh
 
+# The real winget end to end (WINGET_DIR=<a user-supplied winget>; network).
+test-winget:
+	WINE=$(PREFIX)/bin/wine test/winget-e2e.sh
+
 # The Compression API (0036).
 test-compress:
 	WINE=$(PREFIX)/bin/wine test/compress-gate.sh

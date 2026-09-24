@@ -39,6 +39,7 @@ mkdir -p "$WINEPREFIX"
 "$MINGW" -O2 -o "$T/appx-probe.exe" "$HERE/appx-probe.c" -lole32 -lshlwapi || { fail "appx-probe did not build"; exit 1; }
 "$MINGW" -O2 -o "$T/trust-probe.exe" "$HERE/trust-probe.c" -lwintrust -lcrypt32 || { fail "trust-probe did not build"; exit 1; }
 "$MINGW" -O2 -o "$T/pkgname-probe.exe" "$HERE/pkgname-probe.c" || { fail "pkgname-probe did not build"; exit 1; }
+"$MINGW" -O2 -o "$T/appmodel-probe.exe" "$HERE/appmodel-probe.c" -lruntimeobject || { fail "appmodel-probe did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 C="$WINEPREFIX/drive_c"
 cp "$T"/*.exe "$C/"
@@ -115,6 +116,21 @@ expect "$out" FullFromId "Microsoft.Winget.Source_2026.924.610.8_neutral__8wekyb
     "PackageFullNameFromId computes the publisher ID (known answer 8wekyb3d8bbwe)"
 expect "$out" NameAndPublisherId "Microsoft.Winget.Source|8wekyb3d8bbwe" "PackageNameAndPublisherIdFromFamilyName"
 expect "$out" VerifyBad 87 "VerifyPackageFullName refuses a malformed name"
+
+# ---- the package catalog, deployment queries, the .msi association -------
+out=$(run appmodel-probe.exe)
+expect "$out" OpenForCurrentUser 0 "PackageCatalog.OpenForCurrentUser"
+expect "$out" OpenForCurrentPackage 0x80073d54 "OpenForCurrentPackage outside a package: APPMODEL_ERROR_NO_PACKAGE"
+expect "$out" addStatusChanged "0 token=nonzero" "a catalog event can be subscribed"
+expect "$out" removeStatusChanged 0 "and unsubscribed"
+expect "$out" IWeakReferenceSource 0 "the catalog gives weak references (C++/WinRT auto-revoke)"
+expect "$out" ResolveAlive object "a weak reference resolves while the catalog lives"
+expect "$out" ResolveDead null "and to null once it is gone"
+expect "$out" FindPackages 0 "PackageManager.FindPackages answers"
+expect "$out" FindPackagesEmpty 1 "with no packages, since none has been deployed"
+out=$(cd "$C" && timeout -s KILL 60 "$WINE" reg query 'HKCR\Msi.Package\shell\Open\command' 2>/dev/null | tr -d '\r')
+case "$out" in *'"%1" %*'*) pass "opening a .msi passes the caller's parameters to msiexec (%*)" ;;
+    *) fail "the .msi open command drops parameters: $out" ;; esac
 
 # ---- trust -----------------------------------------------------------------
 out=$(run trust-probe.exe 'C:\good.msix')

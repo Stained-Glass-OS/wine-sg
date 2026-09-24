@@ -671,6 +671,30 @@ the chain is really consulted. Keep it.
 object tree when `configure` is newer than `config.status`. Without that, an
 incremental build silently drops the new DLL.
 
+## `patches/sg/0043`-`0045`: winget install, list and uninstall
+
+- **0043 PackageCatalog** (windows.applicationmodel). winget's installed
+  source opens it and subscribes with C++/WinRT **auto-revoke**, which QIs
+  for `IWeakReferenceSource`. Without it winget crashed on a null deref. The
+  weak reference resolves only while strong references remain; it takes one
+  by compare-and-swap, never from zero. **Any WinRT object whose events
+  C++/WinRT code subscribes to needs this**, so copy the pattern.
+- **0044 PackageManager queries** return a real, empty `IIterable<Package>`
+  rather than `E_NOTIMPL`. Nothing deploys MSIX yet, so empty is the truth.
+  **MSIX deployment (AddPackageAsync) is the open item**: Store apps and MSIX
+  packages from winget.
+- **0045 `.msi` verbs pass `%*`.** Without it, ShellExecute of a .msi dropped
+  winget's `/passive /log` and msiexec waited on its full UI forever. The
+  entries have no `FLG_ADDREG_NOCLOBBER`, so `wineboot -u` repairs existing
+  prefixes. **A wine.inf fix meant for existing machines must not use flag
+  2.**
+
+**Acceptance: `test/winget-e2e.sh`**, with `WINGET_DIR` set to a user-supplied
+winget (never shipped) and network access. It runs search, show, install of
+an MSI and an NSIS package, list and uninstall, in a fresh prefix. **GUI tests
+run under `xvfb-run`, never on `$DISPLAY`**: an installer's window must not
+land on the developer's desktop.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
