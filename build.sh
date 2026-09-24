@@ -143,6 +143,12 @@ if [[ -f "$OBJ_DIR/Makefile" ]] && ! grep -qF "$SRC_DIR" "$OBJ_DIR/Makefile"; th
     log "object tree was configured for a different path; reconfiguring"
     rm -f "$OBJ_DIR/Makefile"
 fi
+# A patch that adds a module changes configure; an object tree configured
+# before it would build on without the module, and nothing would say so.
+if [[ -f "$OBJ_DIR/config.status" && "$SRC_DIR/configure" -nt "$OBJ_DIR/config.status" ]]; then
+    log "configure changed; rechecking the object tree"
+    (cd "$OBJ_DIR" && ./config.status --recheck >/dev/null && ./config.status >/dev/null)
+fi
 if [[ ! -f "$OBJ_DIR/Makefile" ]]; then
     log "configuring (archs: i386,x86_64)"
     (cd "$OBJ_DIR" && "$SRC_DIR/configure" \

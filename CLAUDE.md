@@ -610,6 +610,67 @@ CombineUri/CreateWithRelativeUri use `CoInternetCombineUrlEx`. A non-absolute
 string is `E_INVALIDARG`. QueryParsed is still unimplemented. The gate is the
 Uri half of `make test-resources`.
 
+## `patches/sg/0034`-`0042`: AppX/MSIX packages, and signature trust
+
+This is what winget's community source needs, a signed MSIX. The work
+exposed real trust bugs in Wine along the way. `make test-appx` and
+`make test-compress` are the gates. `NETWORK=1` adds Microsoft's real
+source package.
+
+- **0034 kernelbase**: the package name functions
+  (`PackageFamilyNameFromFullName` and the rest). The publisher ID is the
+  first 64 bits of the SHA-256 of the UTF-16LE publisher, with a zero bit
+  appended, as 13 Crockford base-32 digits. The known answer is
+  `8wekyb3d8bbwe`.
+- **0035 appxpackaging.dll** (new DLL): a ZIP/ZIP64 reader, the manifest
+  reader (xmllite with DTDs prohibited) and package identity. **The block map
+  is enforced**, because the signature covers only the block map. The archive
+  and block map must agree when the package is opened, and every file is
+  checked block by block when it is read. Bundles are detected
+  (`APPX_E_MISSING_REQUIRED_FILE` for a package) but not yet read.
+- **0036 cabinet: Compression API** (MSZIP, buffer mode and `COMPRESS_RAW`).
+  The header is 24 bytes: `0a 51 e5 c0`, size `0x18`, 0, **checksum = low
+  byte of the CRC-32 of the other 23 bytes** (found against real buffers),
+  algorithm, uncompressed size, chunk size. Then come length-prefixed chunks
+  of `CK` blocks: raw deflate, at most 32 KiB each, with the previous block's
+  window as dictionary. XPRESS and LZMS are not implemented yet.
+- **0037 the AppX SIP** `{0ac5df4b-ce07-4de2-b76e-23c839a09fd1}`. The digest
+  is a record: `APPX`, then `AXPC`, `AXCD`, `AXCT`, `AXBM` and optionally
+  `AXCI`. AXPC is the archive up to the signature's local header. AXCD is the
+  central directory without the signature's record, plus the ZIP64 end record
+  and locator rewritten without it, plus the end record. **This layout was
+  established against Microsoft's own signed package and cross-checked against
+  osslsigncode, an independent signer.** The signature must be the last entry.
+- **0038**: wintrust opens verified files with share delete. winget never
+  closes its `WTD_STATEACTION_VERIFY` state and then renames the file.
+- **0039 SECURITY**: `SoftpubAuthenticode` fetched the signature hash into
+  a 20-byte buffer and shared the result with the chain check. For every
+  SHA-256 certificate the fetch failed, the chain policy was **skipped**, and
+  WinVerifyTrust said trusted, **whatever signed it**. Now the chain policy
+  always runs.
+- **0040 SECURITY**: the base policy ignored `CERT_TRUST_IS_PARTIAL_CHAIN`, so
+  a signer from an unknown issuer passed. It now fails with
+  `CERT_E_CHAINING`.
+- **0041**: Microsoft's Marketplace CAs mark application policies
+  (`1.3.6.1.4.1.311.21.10`) critical. Once chains were really checked, Wine
+  failed every such chain with `CERT_E_CRITICAL`. It is now supported, and
+  enforced like an extended key usage.
+- **0042**: crypt32 treated `HKLM\...\Root` as a cache of the host's CA
+  bundle and **wiped any root an administrator or Group Policy added** at
+  the next program start. It now records its own imports under
+  `HKLM\Software\Wine\Crypt32\ImportedRootCerts` and keeps everything
+  else.
+
+**How the trust bugs hid:** 0039 made every verification "succeed", so the
+real Microsoft package seemed to verify before its chain had ever been
+checked. The gate's test certificates come from a CA generated at run time.
+"Refused before the root is added, trusted after" is the case that proves
+the chain is really consulted. Keep it.
+
+**Adding a module changes `configure`.** `build.sh` now rechecks an existing
+object tree when `configure` is newer than `config.status`. Without that, an
+incremental build silently drops the new DLL.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

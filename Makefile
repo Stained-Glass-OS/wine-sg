@@ -32,6 +32,15 @@ test:
 test-resources:
 	WINE=$(PREFIX)/bin/wine test/resources-gate.sh
 
+# AppX/MSIX reading and signature trust (0034-0042); NETWORK=1 adds winget's
+# real, Microsoft-signed source package.
+test-appx:
+	WINE=$(PREFIX)/bin/wine test/appx-gate.sh
+
+# The Compression API (0036).
+test-compress:
+	WINE=$(PREFIX)/bin/wine test/compress-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
