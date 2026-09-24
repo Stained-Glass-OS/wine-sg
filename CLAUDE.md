@@ -816,6 +816,61 @@ trace of the launch thread then showed the failed `GetProcAddress`.
   tests, 0 failures (same as 10.0-13). `test/token-probe.c` checks each
   rule with AccessCheck.
 
+## `patches/sg/0056`-`0057`: network drives, UNC paths, `net use`
+
+A domain user's home drive, a logon script's `NET USE`, and any program that
+opens `\\server\share\...`. The mounting is sg-session's `sg-netmountd` (root,
+socket-activated): kernel CIFS, `multiuser,sec=krb5,cruid=<requester>`, so
+every user reaches a share with their **own** Kerberos ticket and the file
+server checks each one. Wine only finds the results.
+
+- **0056 ntdll/kernelbase.** Drive letters are looked up first in
+  `/run/stained-glass-net/drives/<uid>/` (root-owned symlinks), then in the
+  prefix's `dosdevices`. This is a logon session's own DosDevices, searched
+  before Global. `\??\UNC\server\share` resolves under
+  `/run/stained-glass-net/unc/` when that path is a real mount point (checked
+  with `st_dev`, so an empty directory a failed mount left does not count).
+  Otherwise ntdll asks `/run/stained-glass-net/netmount.sock` to mount it and
+  caches a failure for 10s. The per-user letter list is rescanned once a
+  second, and at once on a miss for a letter the prefix lacks too.
+  `GetLogicalDrives` probes the letters missing from `\DosDevices`.
+  **ntdll's lookup appends the prefix component ("unc", "h:") to the base
+  directory it chose**, so the UNC base is `/run/stained-glass-net/`, not
+  `.../unc/`. Getting that wrong gives `.../unc/unc` and "path not found".
+- **0057 ntlanman.dll**: the Microsoft Windows Network provider, registered
+  in wine.inf (`NetworkProvider\Order` = LanmanWorkstation). mpr already
+  dispatches WNetAddConnection2/3 and WNetCancelConnection2 to providers.
+  Its Unix side (`ntlanman.so`) talks to sg-netmountd; the params are
+  pointer-free, so the same functions serve WoW64. mpr's WNetGetConnection
+  asks the providers when the mount manager does not know a remote drive.
+  net.exe gained `NET USE X: \\server\share` and `/DELETE`. Explicit
+  credentials are not supported: the connection is always the signed-in
+  user's.
+- **Wire format** (must match sg-session `domain/sg-netmountd.c`): one line,
+  fields separated by **tabs** (a share may contain spaces):
+  `MOUNT<TAB>server<TAB>share`, `MAP<TAB>letter<TAB>server<TAB>share[<TAB>dir...]`,
+  `UNMAP<TAB>letter`. The reply is `OK <path>` or `ERR <errno> <why>`.
+- **Gate:** sg-image's `make domain-test`. alice's H: comes from
+  homeDirectory; her NETLOGON logon script writes to H: and runs
+  `net use S: \\dc1\shared`; a Windows program reads H: and a UNC path; dave
+  does not get her letters.
+
+## `patches/sg/0058`, `0059`: what domain logon scripts needed
+
+- **0058 ntdll path.c**: `skip_unc_prefix` counted every separator after
+  `\\server\share` as part of the root, which is never collapsed, so
+  `\\server\share\\file` stayed as it was and failed with
+  `ERROR_INVALID_NAME`. cmd's command search appends `\` + name to a
+  directory that already ends in `\`, so every script at a share root
+  (`\\DOMAIN\NETLOGON\logon.bat`) was "not recognized". Deeper paths
+  worked, which is why a test script in a subdirectory passed. (Still open:
+  `dir \\server\share` in cmd prints "Directory of Z:\server".)
+- **0059**: `USERNAME` comes from the user's Volatile Environment, which only
+  wineboot's own user ever had in a shared prefix. ntdll now sets it from the
+  signed-in user. wineboot only fills USERDOMAIN, LOGONSERVER and HOME* when
+  they are missing, so sg-domain-logon's values (imported by the session)
+  survive any later wineboot.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
