@@ -765,17 +765,56 @@ failure hook crashes on purpose (the minidump shows the DLL name and 127,
   nothing evaluates conditional ACEs, and an ACE without its condition would be
   wrong.
 
-**Gate:** `make test-edge` (`test/edge-e2e.sh`, `test/edgeapi-probe.c`); with
-`EDGE_MSI` set it installs Edge silently and checks a page loads, runs its
-script and paints. **Edge's sandbox does not work yet** -- it runs with
-`--no-sandbox`. Findings so far: renderers are never launched with the sandbox
-on; `NtFilterToken` ignores restricting SIDs and flag 0x1; `TokenIntegrityLevel`
-is a stub; token information class 39 (TokenSecurityAttributes) is unhandled;
-job UI restrictions are a stub; and every Wine process reads the display state
-from the registry, which a lockdown token (all groups deny-only) cannot -- on
-Windows the kernel hands it out without a check. Also: a prefix owner is an
-administrator, so on a dev box Edge says "running elevated" and relaunches
-itself de-elevated through the shell (`--do-not-de-elevate` avoids it).
+**Gate:** `make test-edge` (`test/edge-e2e.sh`, `test/edgeapi-probe.c`,
+`test/token-probe.c`); with `EDGE_MSI` set it installs Edge silently and checks
+a page loads, runs its script and paints -- **with its sandbox off and on**.
+A prefix owner is an administrator, so on a dev box Edge says "running
+elevated" and relaunches itself de-elevated through the shell
+(`--do-not-de-elevate` avoids it).
+
+## `patches/sg/0055-sandbox-restricted-and-appcontainer-tokens-integrity-levels.patch`
+
+Chromium's sandbox, which Edge runs by default. It needs restricted tokens,
+integrity levels and, for Edge's renderers, **AppContainer (lowbox)
+tokens**. Before this patch the sandboxed tab stayed blank and nothing
+logged why. Edge looks up `kernelbase!CreateAppContainerToken`, finds
+nothing, and never starts a renderer: no error and no child process.
+DevTools shows the tab with `pid 0`. The way in was bisecting Edge features
+(`--disable-features=RendererAppContainer` made the page load). A relay
+trace of the launch thread then showed the failed `GetProcAddress`.
+
+- **Restricted tokens**: the token keeps its restricting SIDs. An access
+  must be granted by the token's own SIDs **and** by the restricting SIDs.
+  A write-restricted token is checked twice only for writes, where "writes"
+  means the generic write mapping minus `READ_CONTROL|SYNCHRONIZE`: the file
+  mapping names both, and without excluding them a write-restricted token
+  could not even read. A disabled user SID is deny-only.
+  `DISABLE_MAX_PRIVILEGE` keeps only SeChangeNotifyPrivilege.
+- **Integrity**: read from the mandatory label; lowering is allowed and
+  raising is refused. Wine still does not *enforce* no-write-up.
+- **AppContainer**: `NtCreateLowBoxToken`, `CreateAppContainerToken`, and
+  `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` in CreateProcess. The token
+  is Low integrity, and its default DACL also grants the package. An access
+  must additionally be granted by the package SID, a capability, or ALL
+  APPLICATION PACKAGES (S-1-15-2-1). Not done: a per-package named-object
+  directory. LPAC is not distinguished, so ALL APPLICATION PACKAGES grants
+  it too.
+- The access check's owner+DACL walk is `dacl_access()`, run once per SID
+  set (own / restricting / package). **Any new kind of token restriction
+  should be another SID set there**, not another copy of the walk.
+- Also: TokenSecurityAttributes (class 39) answers an empty list, and
+  UpdateProcThreadAttribute accepts the documented policy attributes.
+  CreateProcess still ignores the mitigation and child-process policies,
+  and logs them as `Unsupported attribute 0x2000e/0x2001a`.
+- **This patch adds server requests, so every later request number moves.**
+  After changing `protocol.def`, rebuild and install the *whole* tree
+  (`make` in `build/obj`, then `sudo make install` there). Installing only
+  ntdll.so and wineserver leaves win32u.so and the rest on the old numbers.
+  Nothing reports that; things break at random. Here conhost found no font
+  and divided by zero, and kernel32:process hung in a winedbg/conhost storm.
+- **Conformance**: advapi32:security 3554 tests and kernel32:process 3099
+  tests, 0 failures (same as 10.0-13). `test/token-probe.c` checks each
+  rule with AccessCheck.
 
 ## Things that will bite you
 

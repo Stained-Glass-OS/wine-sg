@@ -12,10 +12,12 @@
 # page, and check the page loaded and its script ran (the window title is set
 # by the page's JavaScript) and it painted (a pixel of its colour).
 #
-# Edge runs here with --no-sandbox: its sandbox does not work on Wine yet
-# (restricted tokens, integrity levels, job limits, and Wine's display state
-# in the registry, which a lockdown token cannot read). The gate reports the
-# sandboxed run as info so the day it starts working is visible.
+# test/token-probe.c asks what Chromium's sandbox needs of tokens (patch
+# 0055): restricting SIDs, write-restricted tokens, integrity levels and
+# AppContainer tokens, each answered by AccessCheck.
+#
+# Edge runs twice: with --no-sandbox, and with its sandbox on (restricted,
+# low-integrity renderers in an AppContainer). Both must show the page.
 #
 #   EDGE_MSI=/path/to/MicrosoftEdgeEnterpriseX64.msi test/edge-e2e.sh
 set -u
@@ -51,6 +53,28 @@ expect "Cookie=sgcookie=stained domain=sgtest.example path=/ expires=1" "with it
 expect "AddConditionalAce=0,50" "AddConditionalAce refuses (ERROR_NOT_SUPPORTED) rather than drop the condition"
 expect "WofSetFileDataLocation=0x80070032" "WofSetFileDataLocation: the file system declines, nothing crashes"
 
+"$MINGW" -O2 -o "$T/token-probe.exe" "$HERE/token-probe.c" -ladvapi32 || { fail "the token probe did not build"; exit 1; }
+out=$(timeout 120 "$WINE" "$T/token-probe.exe" 2>/dev/null | tr -d '\r')
+expect "Plain=1" "an ordinary token is granted by its user's ACE"
+expect "Restricted=0" "a token restricted to Everyone is not granted by the user's ACE alone"
+expect "RestrictedWithWorld=1" "and is granted once Everyone is named too"
+expect "HasRestrictions=1" "TokenHasRestrictions reports it"
+expect "WriteRestrictedRead=1" "a write-restricted token still reads"
+expect "WriteRestrictedWrite=0" "but may not write without its restricting SIDs"
+expect "Integrity=S-1-16-4096" "a token lowers its own integrity to Low"
+expect "CreateAppContainerToken=1" "CreateAppContainerToken makes an AppContainer token"
+expect "IsAppContainer=1" "TokenIsAppContainer: the new token is one"
+expect "ParentIsAppContainer=0" "and the token it came from is not"
+expect "Package=S-1-15-2-1111-2222-3333-4444-5555-6666-7777" "TokenAppContainerSid names the package"
+expect "Capabilities=1,S-1-15-3-1" "TokenCapabilities names its capability"
+expect "AppContainerIntegrity=S-1-16-4096" "an AppContainer runs at Low integrity"
+expect "AppContainerUserOnly=0" "an AppContainer is not granted by its user's ACE alone"
+expect "AppContainerAllPackages=1" "ALL APPLICATION PACKAGES grants it"
+expect "AppContainerPackage=1" "its package SID grants it"
+expect "AppContainerPackageNoWrite=0" "only what the package's ACE grants"
+expect "AppContainerCapability=1" "a capability SID grants it"
+expect "AppContainerPackageOnly=0" "the package's ACE alone does not: the user must be granted too"
+
 if [ -z "${EDGE_MSI:-}" ]; then
     echo "info  EDGE_MSI not set: Edge itself not installed or run"
 else
@@ -77,6 +101,7 @@ edge_title --no-sandbox --disable-gpu > "$T/unsandboxed"
 import -window root "$T/unsandboxed.png" 2>/dev/null
 "$(dirname "$WINE")/wineserver" -k; sleep 2
 edge_title --disable-gpu > "$T/sandboxed"
+import -window root "$T/sandboxed.png" 2>/dev/null
 "$(dirname "$WINE")/wineserver" -k
 EOF
     chmod +x "$T/run.sh"
@@ -88,7 +113,10 @@ EOF
     else fail "Edge never showed the page"; fi
     px=$(convert "$T/unsandboxed.png" -crop 1x1+500+500 -depth 8 txt:- 2>/dev/null | sed -n 's/.*#\([0-9A-F]\{6\}\).*/\1/p')
     if [ "$px" = 129A3C ]; then pass "and paints it (#129A3C)"; else fail "the page's colour is not on screen (#$px)"; fi
-    echo "info  with its sandbox on, Edge shows the page: $(cat "$T/sandboxed" 2>/dev/null) (not working on Wine yet)"
+    if [ "$(cat "$T/sandboxed" 2>/dev/null)" = yes ]; then pass "with its sandbox on (AppContainer renderers), Edge shows the page"
+    else fail "with its sandbox on, Edge never showed the page"; fi
+    px=$(convert "$T/sandboxed.png" -crop 1x1+500+500 -depth 8 txt:- 2>/dev/null | sed -n 's/.*#\([0-9A-F]\{6\}\).*/\1/p')
+    if [ "$px" = 129A3C ]; then pass "and its sandboxed renderer paints it (#129A3C)"; else fail "sandboxed: the page's colour is not on screen (#$px)"; fi
 fi
 
 echo
