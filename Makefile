@@ -50,6 +50,10 @@ test-compress:
 test-edge:
 	WINE=$(PREFIX)/bin/wine test/edge-e2e.sh
 
+# ClearType text and the Stained Glass scroll bars (0064-0066), by pixels.
+test-theme:
+	WINE=$(PREFIX)/bin/wine test/theme-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 

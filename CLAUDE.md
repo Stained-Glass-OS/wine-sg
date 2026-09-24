@@ -914,6 +914,46 @@ server checks each one. Wine only finds the results.
 - Not yet: resource and dependency packages, app execution aliases,
   GetCurrentPackageInfo, deployment for another user.
 
+## `patches/sg/0064`-`0066`: text and scroll bars
+
+David: the fonts looked crappy and the scroll bars too. Two causes, two fixes.
+
+- **0064: the Windows font smoothing setting decides.** win32u took each
+  font's anti-aliasing from the host's fontconfig first and only then from
+  `HKCU\Control Panel\Desktop` (`FontSmoothing`, `FontSmoothingType`,
+  `FontSmoothingOrientation`). Debian's fontconfig says `rgba none` for every
+  font, so text could never be ClearType, and neither the Control Panel nor
+  `SPI_SETFONTSMOOTHING*` could change it. Now, when the setting exists, it
+  wins; a LOGFONT quality still overrides it, as on Windows.
+  **winex11 has a second override of its own** (`Xft.antialias`/`Xft.rgba` X
+  resources, `get_xft_aa_flags`), used only on its XRender path and only when
+  those resources are set; our sessions draw through window surfaces (the DIB
+  engine) and set none.
+- **0065: Stained Glass scroll bars**, drawn flat -- track `#f0f0f0`, a
+  borderless inset thumb `#cdcdcd`/`#a6a6a6` hot/`#606060` pressed, solid
+  triangle arrows, no gripper. The SVGs are **generated** by
+  `theme/scrollbar.py`; change the script and regenerate, never hand-edit
+  them. The grids are Light's: arrows 20 cells (4 directions x
+  normal/hot/pressed/disabled, then the 4 hover cells), thumbs and tracks 5.
+  Removing the gripper *sections* is what stops the gripper being drawn:
+  uxtheme draws it only when `GetThemePartSize` succeeds.
+- **0066:** the colours Light's INI names itself (progress bar, Highlight,
+  command links, task dialog instructions) were still blue after 0031.
+
+The interface *font* is not here: it is sg-shell's defaults
+(`theme/52-sg-fonts.reg`: Segoe UI 9 pt in the window metrics, Segoe UI / MS
+Shell Dlg / Tahoma substituted by Inter, metric-compatible Replacements for
+Arial, Times New Roman, Courier New, Calibri, Cambria, Consolas).
+
+**Gate: `make test-theme`** (`test/theme-gate.sh`). `theme-gallery --render`
+draws text and the scroll bar's parts into a DIB in-process -- pixels that do
+not depend on window placement -- under a fontconfig that forces greyscale;
+it requires colour fringes for ClearType, grey only for standard smoothing,
+two colours for off, and the scroll bar's colours, and that Light's border
+grey is gone. Against a Wine without these patches it fails 9 of 11 checks.
+`theme-gallery` with no arguments is a window of the common controls to look
+at; screenshot it under xvfb when judging the theme.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
