@@ -113,6 +113,10 @@ test-stackgrow:
 test-objowner:
 	WINE=$(PREFIX)/bin/wine test/objowner-gate.sh
 
+# Notepad, our editor, for everything that runs notepad.exe (0100, 0101).
+test-notepad:
+	WINE=$(PREFIX)/bin/wine test/notepad-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 

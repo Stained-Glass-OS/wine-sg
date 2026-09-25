@@ -1316,6 +1316,61 @@ Print Screen and Ctrl+Shift+Esc typed on the X keyboard, the loop refusal,
 and Wine's Task Manager without App Paths. 22 checks; stock wine-sg fails
 all of them; mutants (no loop guards; 0122 without 0123) turn it red.
 
+## `patches/sg/0100`-`0101`: Notepad is a real editor
+
+David: "the wine notepad kinda sucks ... something a lot more like Kate."
+`programs/notepad` is replaced wholesale (0100) and stays `notepad.exe` in
+system32 **and** syswow64 -- which is why it is a Wine patch and not an
+sg-shell program: CreateProcess("notepad.exe") searches system32 first and
+never App Paths, a 32-bit caller gets syswow64's, and wineboot keeps both
+current in every prefix with nothing to install.
+
+- **Files:** `textbuf.c` (gap buffer + line index; line ends are kept in the
+  text exactly -- CRLF, LF, CR, mixed -- and the starts around an edit are
+  re-scanned, since an edit can join or split a CRLF), `editor.c` (the
+  control, class `SgNotepadEditor`), `syntax.c` (per-line lexers with a
+  carried state; add a language to `langs[]`), `regex.c` (backtracking VM,
+  explicit stack, 50M-step budget), `find.c`, `fileio.c` (detection and
+  exact save), `print.c`, `main.c` (tabs, find bar, status bar, commands,
+  settings, command line).
+- **Layout never asks GDI where a character landed:** advances come from a
+  per-font cache and are passed to `ExtTextOutW` as `lpDx`, so caret and
+  pixels agree. Glyphs the font lacks are drawn from installed fallback
+  fonts (`fallback_faces[]`) -- Wine links fonts only for a few UI faces, so
+  a monospace font showed boxes for CJK. Non-BMP characters (emoji) still use
+  the main font: **the image ships no CJK or emoji font** (sg-image's
+  `fonts-*` list), so those are boxes there whatever the editor does.
+- **Compatibility is deliberate** (see main.c's header): one process per
+  invocation living until its window closes (git's `core.editor`), Windows
+  Notepad's command line (`/p` prints and exits without a window, `/pt`,
+  `/a`, `/w`, unquoted paths with spaces, `.txt` tried, "create it?"), window
+  class `Notepad`, title `<name> - Notepad`, settings in
+  `HKCU\Software\Microsoft\Notepad`, `.LOG`. Several *quoted* paths open as
+  tabs (our extension). No file ever goes to another process's window.
+- **The EDIT messages are answered** (WM_GETTEXT/SETTEXT, EM_GETSEL/SETSEL,
+  EM_REPLACESEL, EM_LINEINDEX, ...), for programs that drive Notepad's text,
+  but the class is not `Edit` -- as on Windows 11.
+- The menu bar stays light in the dark theme (Wine draws it); the tab strip,
+  find bar, status bar and editor follow `HKCU\...\Themes\Personalize
+  AppsUseLightTheme` or View > Theme.
+- **0101 (wine.inf):** Wine had `txtfile` but no `.txt` -> `txtfile`, so
+  ShellExecute of any .txt failed ("no application associated"). `.txt`,
+  `.text`, `.log` now map to it (plus content type and ShellNew), `.inf`
+  opens in Notepad. Flag 2 (no-clobber) on purpose here: it creates the key
+  on `wineboot -u` when missing and never overrides a user's choice.
+- New strings are English only; the `.po` translations still cover the
+  strings Wine's Notepad had.
+
+**Gate: `make test-notepad`** (`test/notepad-gate.sh`, `test/notepad-probe.c`),
+28 checks in a shell session under xvfb: cmd, a 64-bit and a 32-bit
+CreateProcess and ShellExecute of a .txt all start ours; UTF-8 / UTF-16 LE /
+UTF-16 BE (CR, no final line end) show exactly and save back byte for byte;
+find as you type, replace all plain and regex with a group; tabs (Ctrl+O,
+command line, Ctrl+N, Ctrl+Tab, Ctrl+W); the lexer's styles and the keyword's
+purple pixels. Stock Wine's Notepad fails 25 (3 vacuous); a build that swaps
+UTF-16 BE bytes or loses keywords fails those checks. To run it against a
+build tree: `WINE=build/<tree>/obj/wine WINESERVER=build/<tree>/obj/server/wineserver`.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
