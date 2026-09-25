@@ -1047,6 +1047,22 @@ server's pixels; a window and the taskbar intact after a change (a build
 without the repaint fails those two). The desktop is only drawn once
 something is on it: the gate opens a window first, away from the checks.
 
+## `patches/sg/0070`: a standard user's shell folders
+
+Found by the installer work: each user's `Shell Folders\Desktop` was written
+**empty** at login, so ShellExecute of any `.lnk` failed ("file not found")
+and explorer showed no desktop icons. shell32 opened
+`HKLM\...\ProfileList` with `KEY_ALL_ACCESS` just to read it; standard users
+cannot write HKLM on the system prefix, the open failed, nothing expanded,
+and the empty result was cached. Now read-only fallback, defaults if even
+that fails, and an unexpanded path is never cached.
+
+**Gate: `make test-shellfolders`.** A plain prefix lets everyone write HKLM,
+so the gate gives ProfileList an explicit DACL (administrators write,
+everyone read) and runs the lookup with Administrators disabled
+(`CreateRestrictedToken`, patch 0055) -- and first checks that the child
+really is denied, or the gate proves nothing. Stock: empty path, empty cache.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

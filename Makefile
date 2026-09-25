@@ -66,6 +66,10 @@ test-vdesk:
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
 
+# A standard user's shell folders (0070).
+test-shellfolders:
+	WINE=$(PREFIX)/bin/wine test/shellfolders-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
