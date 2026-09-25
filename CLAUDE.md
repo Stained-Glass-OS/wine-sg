@@ -1025,6 +1025,28 @@ hotkeys (SendInput; Alt+Tab with xdotool), the probe's view of cloaking and prop
 `IVirtualDesktopManager`, the taskbar's buttons, the registry and the X
 server's pixels. 23 fail on a Wine without the patch.
 
+## `patches/sg/0069`: wallpaper in any format, Windows' styles
+
+`user32/desktop.c` read the wallpaper with `LoadImage(IMAGE_BITMAP)`: BMP
+only, centre or tile. Now WIC (JPEG, PNG, BMP, GIF, TIFF) -- windowscodecs is
+loaded on demand, **both `WICCreateImagingFactory_Proxy` and
+`WICConvertBitmapSource` by `GetProcAddress`** (user32 must not import it; a
+direct call links nowhere and the old user32 silently stays in the build
+tree -- check the link, not just the compile), with COM initialised for
+WIC's decoders. `WallpaperStyle` 10 Fill, 6 Fit, 2 Stretch, 22 Span, 0 Center
+/ Tile; the picture is laid out once per desktop size.
+
+**Setting a wallpaper painted over every window and the taskbar** (stock
+Wine too): surfaces are flushed with `IncludeInferiors`, so the desktop's
+new picture lands on the windows. Explorer now asks every visible window to
+repaint 250 ms after a wallpaper change. Proper fix (desktop flush clipped
+by children) is still open.
+
+**Gate: `make test-wallpaper`** -- every style from a PNG and a JPEG on the X
+server's pixels; a window and the taskbar intact after a change (a build
+without the repaint fails those two). The desktop is only drawn once
+something is on it: the gate opens a window first, away from the checks.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

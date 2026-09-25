@@ -62,6 +62,10 @@ test-cloak:
 test-vdesk:
 	WINE=$(PREFIX)/bin/wine test/vdesk-gate.sh
 
+# Wallpaper in any format, Windows' styles (0069).
+test-wallpaper:
+	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
