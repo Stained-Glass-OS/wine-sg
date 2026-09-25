@@ -55,6 +55,9 @@ WINEDEBUG="${EXPLORER_DEBUG:-err+all},trace+explorer" "$WINE" explorer /desktop=
 # start an explorer of its own for it (and this one would exit)
 i=0; while ! grep -q 'desktop message loop starting' "$T/explorer.out" 2>/dev/null && [ \$i -lt 60 ]; do sleep 0.5; i=\$((i + 1)); done
 sleep 3
+# a tool window (as Start and flyouts are): no taskbar button
+"$WINE" vdesk-probe.exe toolwindow Tool 700 400 >/dev/null 2>&1 &
+sleep 2
 "$WINE" vdesk-probe.exe window Alpha 60 60 >/dev/null 2>&1 &
 sleep 2
 "$WINE" vdesk-probe.exe window Beta 520 200 >/dev/null 2>&1 &
@@ -92,7 +95,7 @@ after() { awk -v c="$1" -v n="${2:-1}" '$0 == c { k++; if (k == n) { getline; pr
 px() { convert "$T/$1.png" -format "%[fx:int(255*p{$2,$3}.r)],%[fx:int(255*p{$2,$3}.g)],%[fx:int(255*p{$2,$3}.b)]" info: 2>/dev/null; }
 
 [ "$(after query 1)" = "desktops=1 current=0" ] && pass "one desktop to start with" || fail "start: $(after query 1)"
-[ "$(after taskbar 1)" = "buttons=2" ] && pass "both windows on the taskbar" || fail "taskbar: $(after taskbar 1)"
+[ "$(after taskbar 1)" = "buttons=2" ] && pass "both windows on the taskbar, and not the tool window" || fail "taskbar: $(after taskbar 1)"
 [ "$(px one 200 200)" = "255,255,255" ] && pass "Alpha is on the screen" || fail "Alpha not drawn: $(px one 200 200)"
 [ "$(after foreground 1)" = "foreground=Beta" ] || fail "Beta should be in front: $(after foreground 1)"
 [ "$(after 'exists SgTaskSwitcher' 1)" = "exists=1" ] && pass "Alt+Tab shows the switcher while Alt is held" || fail "no switcher on Alt+Tab"

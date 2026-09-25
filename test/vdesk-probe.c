@@ -2,6 +2,7 @@
  * test/vdesk-gate.sh.
  *
  *   vdesk-probe window TITLE X Y   a window of this program's, until killed
+ *   vdesk-probe toolwindow TITLE X Y   the same with WS_EX_TOOLWINDOW (no taskbar button)
  *   vdesk-probe query              desktops=N current=I
  *   vdesk-probe new | switch I | close I | taskview
  *   vdesk-probe move TITLE I       move the window with that title to desktop I
@@ -84,7 +85,7 @@ int main( int argc, char **argv )
 {
     WCHAR wtitle[64];
 
-    if (argc >= 5 && !strcmp( argv[1], "window" ))
+    if (argc >= 5 && (!strcmp( argv[1], "window" ) || !strcmp( argv[1], "toolwindow" )))
     {
         WNDCLASSW wc = { 0 };
         MSG msg;
@@ -95,8 +96,8 @@ int main( int argc, char **argv )
         wc.hIcon = LoadIconW( NULL, (const WCHAR *)IDI_APPLICATION );
         wc.lpszClassName = L"SgVdeskProbe";
         RegisterClassW( &wc );
-        CreateWindowW( wc.lpszClassName, wtitle, WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                       atoi( argv[3] ), atoi( argv[4] ), 360, 260, NULL, NULL, NULL, NULL );
+        CreateWindowExW( !strcmp( argv[1], "toolwindow" ) ? WS_EX_TOOLWINDOW : 0, wc.lpszClassName, wtitle,
+                         WS_OVERLAPPEDWINDOW | WS_VISIBLE, atoi( argv[3] ), atoi( argv[4] ), 360, 260, NULL, NULL, NULL, NULL );
         while (GetMessageW( &msg, NULL, 0, 0 )) { TranslateMessage( &msg ); DispatchMessageW( &msg ); }
         return 0;
     }
