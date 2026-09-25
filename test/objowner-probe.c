@@ -67,6 +67,19 @@ int main( int argc, char **argv )
     check( "semaphore", CreateSemaphoreW( NULL, 0, 1, NULL ) );
     check( "named-section", CreateFileMappingW( INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096, L"sg-objowner-section" ) );
 
+    /* other kinds keep their own defaults: a registry key created without a
+     * descriptor still has one with a DACL (Wine's key defaults), not an
+     * owner-only one open to everyone */
+    {
+        HKEY key;
+        if (!RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\SgObjownerTest", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL ))
+        {
+            check( "registry-key", key );
+            RegCloseKey( key );
+            RegDeleteKeyW( HKEY_CURRENT_USER, L"Software\\SgObjownerTest" );
+        }
+    }
+
     /* access is unchanged: a process without Administrators still opens them fully */
     {
         SID_IDENTIFIER_AUTHORITY nt = { SECURITY_NT_AUTHORITY };

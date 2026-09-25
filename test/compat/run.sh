@@ -38,7 +38,7 @@ FAILED=0
 
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9.' '-' | tr -s '-' | sed 's/-$//'; }
 
-grep -v '^#' "$HERE/apps.list" | grep -v '^$' | while IFS='|' read -r name file sha url kind iargs prog largs smoke expect; do
+grep -v '^#' "$HERE/apps.list" | grep -v '^$' | while IFS='|' read -r name file sha url kind iargs prog largs smoke expect prep; do
     if [ $# -gt 0 ]; then
         hit=0; for f in "$@"; do case "$name" in *"$f"*) hit=1 ;; esac; done
         [ $hit = 1 ] || continue
@@ -62,6 +62,10 @@ grep -v '^#' "$HERE/apps.list" | grep -v '^$' | while IFS='|' read -r name file 
         # session has them: SG_DEFAULTS=DIR of .reg files (sg-shell's theme/)
         for r in ${SG_DEFAULTS:+"$SG_DEFAULTS"/*.reg}; do
             [ -f "$r" ] && "$WINE" regedit /S "$("$WINE" winepath -w "$r" 2>/dev/null | tr -d '\r')" >/dev/null 2>&1
+        done
+        # registry values the application needs before installing (prep)
+        printf '%s' "$prep" | tr ';' '\n' | while IFS='!' read -r rk rn rt rd; do
+            [ -n "$rk" ] && "$WINE" reg add "$rk" /v "$rn" /t "$rt" /d "$rd" /f >/dev/null 2>&1
         done
         "$WINESERVER" -w
         cp "$T/compat-probe.exe" "$P/drive_c/"

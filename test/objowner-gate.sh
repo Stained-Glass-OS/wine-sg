@@ -7,6 +7,9 @@
 # Wine reported none. The Cygwin/MSYS runtime (Git Bash's terminal) takes a
 # pty's owner from its pipes and crashed on the NULL. Access must not change:
 # no DACL is added, and a process without Administrators still opens them.
+# And only those kinds: a registry key (a first version of the patch gave
+# keys owner-only descriptors -- open to everyone, inherited into the saved
+# registry, and it broke the session's display links) keeps its defaults.
 #
 #   WINE=/opt/wine-sg/bin/wine test/objowner-gate.sh
 set -u
@@ -36,6 +39,11 @@ for kind in anonymous-pipe named-pipe-server named-pipe-client event named-event
         *) fail "$kind: $line" ;;
     esac
 done
+line=$(printf '%s\n' "$out" | grep '^registry-key ')
+case "$line" in
+    *"dacl=present") pass "a registry key created without a descriptor keeps Wine's key defaults (a DACL), not an owner-only one" ;;
+    *) fail "registry key defaults changed: $line" ;;
+esac
 case "$out" in *"restricted-open event=1 section=1"*) pass "a process without Administrators still opens them with full access" ;;
     *) fail "access changed: $(printf '%s\n' "$out" | grep restricted)" ;; esac
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"

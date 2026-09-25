@@ -1232,10 +1232,17 @@ Cygwin/MSYS runtime does exactly as Windows allows:
   `NtQuerySecurityObject` returned an empty descriptor for pipes, events,
   mutexes, semaphores, sections created without one; Cygwin's
   `cygpsid::get_id` read the pty pipe's NULL owner. `create_object` /
-  `create_named_object` now record the effective token's owner and primary
-  group -- **no DACL**, so access is unchanged (`token_access_check` grants
-  everything when no DACL is present, as it did for no descriptor). Threads
-  and files (their own paths) are untouched. Gate: `make test-objowner`.
+  the creators of pipes, events, mutexes, semaphores, timers and sections now
+  record the effective token's owner and primary group -- **no DACL**, so
+  access is unchanged (`token_access_check` grants everything when no DACL
+  is present, as it did for no descriptor). **Only those kinds:** 10.0-33 did
+  it in `create_named_object` for everything, and registry keys, window
+  stations, desktops, directories and links have defaults of their own that
+  an owner-only descriptor overrode -- keys became open to everyone (saved in
+  the registry) and the session's display links broke: the VM boot gate's
+  taskbar came up 1024x40 (proven by an A/B image with only 0082 removed).
+  10.0-34 narrows it; the gate checks a key keeps its DACL. Gate:
+  `make test-objowner`.
 
 Still open: output from programs inside mintty does not reach its window
 (bash runs, alive, no fault) -- the Cygwin pty's data path under Wine.
