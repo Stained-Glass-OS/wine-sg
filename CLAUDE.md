@@ -1086,6 +1086,25 @@ starts the Control Panel `HKLM\...\App Paths\control.exe` names
 its environment means "do not hand off again", so sg-control can run
 control.exe for Wine's own applets. Gate: `make test-control`.
 
+## `patches/sg/0073`-`0075`: snapping by dragging, and the work area
+
+- **0073:** win32u sends `EVENT_SYSTEM_MOVESIZESTART` (after
+  `WM_ENTERSIZEMOVE`) and `EVENT_SYSTEM_MOVESIZEEND` (window placed).
+- **0074: `SPI_SETWORKAREA` is global.** Stock Wine kept it per process and
+  took `rcWork` from the driver (a virtual desktop's whole screen), so
+  maximized windows covered the taskbar. Now it writes the monitor's
+  registry record, bumps the monitor serial (`set_winstation_monitors`) and
+  the video key; and saves **insets** in `HKCU\Software\Wine\WorkArea`,
+  re-applied in `add_monitor` -- because explorer sets the desktop size
+  (a display change, re-enumerating monitors from the driver) *after* the
+  taskbar is up, which silently threw the first attempt away. The taskbar
+  sets it when placed.
+- **0075:** explorer snaps a dragged window at the left/right edge (half),
+  top (maximize), with a region-frame preview `SgSnapPreview` beneath it.
+
+Gate: `make test-shellkeys` (now 16 checks: work area 0,0,1024,660, maximize
+above the taskbar, drag preview/snap/top).
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

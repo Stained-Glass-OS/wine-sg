@@ -3,7 +3,9 @@
 #
 # Win+Left/Right snap the active window to half the work area and back,
 # Win+Up maximizes, Win+Down restores then minimizes, Win+D shows the
-# desktop and puts the windows back, the Windows key alone opens Start,
+# desktop and puts the windows back, dragging a window to the left/right
+# edge snaps it (with a preview) and to the top maximizes it (the move/size
+# WinEvents, 0073), the Windows key alone opens Start,
 # Win+R the Run dialog, Win+E File Explorer.
 #
 #   WINE=/opt/wine-sg/bin/wine test/shellkeys-gate.sh     (ARTIFACTS=DIR keeps logs)
@@ -62,6 +64,12 @@ P foreground; xdotool key super+d; sleep 0.3; xdotool key super+d; sleep 1.5
 P rect Alpha
 K super+d; P rect Alpha; P rect Beta
 K super+d; P rect Alpha
+# drag Alpha by its title bar to the left edge, then to the top edge
+xdotool mousemove 240 75 mousedown 1; sleep 0.3; xdotool mousemove 120 200; sleep 0.3; xdotool mousemove 0 300; sleep 1
+P find SgSnapPreview; xdotool mouseup 1; sleep 1.2; P rect Alpha
+P rect Alpha
+xdotool mousemove 200 "\$(( \$(sed -n 's/^rect=[0-9-]*,\([0-9-]*\),.*/\1/p' "$T/log.out" | tail -1) + 12 ))" mousedown 1; sleep 0.3
+xdotool mousemove 400 150; sleep 0.3; xdotool mousemove 500 0; sleep 1; xdotool mouseup 1; sleep 1.5; P rect Alpha
 K super; P find '#32768'
 K Escape
 K super+r; P find '#32770' Run
@@ -77,16 +85,20 @@ work=$(after workarea | sed 's/work=//'); IFS=, read -r wl wt wr wb <<W
 $work
 W
 mid=$(( (wl + wr) / 2 ))
+[ "$work" = "0,0,1024,660" ] && pass "the work area stops at the 40 px taskbar (SPI_SETWORKAREA reaches every program)" || fail "work area $work, not 0,0,1024,660"
 orig=$(after 'rect Beta' 1)
 [ "$(after 'rect Beta' 2)" = "rect=$wl,$wt,$mid,$wb zoomed=0 iconic=0" ] && pass "Win+Left snaps the window to the left half" || fail "Win+Left: $(after 'rect Beta' 2) (work $work)"
 [ "$(after 'rect Beta' 3)" = "$orig" ] && pass "Win+Right from the left brings it back where it was" || fail "Win+Right back: $(after 'rect Beta' 3), was $orig"
 [ "$(after 'rect Beta' 4)" = "rect=$mid,$wt,$wr,$wb zoomed=0 iconic=0" ] && pass "Win+Right snaps it to the right half" || fail "Win+Right: $(after 'rect Beta' 4)"
 [ "$(after 'rect Beta' 5)" = "$orig" ] && pass "Win+Down restores a snapped window" || fail "Win+Down from snapped: $(after 'rect Beta' 5)"
-case "$(after 'rect Beta' 6)" in *"zoomed=1 iconic=0") pass "Win+Up maximizes" ;; *) fail "Win+Up: $(after 'rect Beta' 6)" ;; esac
+case "$(after 'rect Beta' 6)" in *",$(( wb + 4 )) zoomed=1 iconic=0") pass "Win+Up maximizes, above the taskbar" ;; *) fail "Win+Up: $(after 'rect Beta' 6)" ;; esac
 case "$(after 'rect Beta' 7)" in *"zoomed=0 iconic=0") pass "Win+Down restores a maximized window" ;; *) fail "Win+Down from maximized: $(after 'rect Beta' 7)" ;; esac
 case "$(after 'rect Beta' 8)" in *"iconic=1") pass "Win+Down again minimizes it" ;; *) fail "Win+Down minimize: $(after 'rect Beta' 8)" ;; esac
 case "$(after 'rect Alpha' 2)" in *"iconic=1") pass "Win+D minimizes the windows to show the desktop" ;; *) fail "Win+D: $(after 'rect Alpha' 2)" ;; esac
 case "$(after 'rect Alpha' 3)" in *"iconic=0") pass "and Win+D again puts them back" ;; *) fail "Win+D back: $(after 'rect Alpha' 3)" ;; esac
+[ "$(after 'find SgSnapPreview')" = "found=1" ] && pass "dragging a window to the screen's edge shows where it will snap" || fail "no snap preview: $(after 'find SgSnapPreview')"
+[ "$(after 'rect Alpha' 4)" = "rect=$wl,$wt,$mid,$wb zoomed=0 iconic=0" ] && pass "and letting go snaps it to that half" || fail "drag snap: $(after 'rect Alpha' 4)"
+case "$(after 'rect Alpha' 6)" in *"zoomed=1 iconic=0") pass "dragging it to the top edge maximizes it" ;; *) fail "drag to top: $(after 'rect Alpha' 6)" ;; esac
 [ "$(after "find #32768")" = "found=1" ] && pass "the Windows key alone opens Start" || fail "Start did not open: $(after "find #32768")"
 [ "$(after "find #32770 Run")" = "found=1" ] && pass "Win+R opens Run" || fail "Run: $(after "find #32770 Run")"
 [ "$(after 'find ExplorerWClass')" = "found=1" ] && pass "Win+E opens File Explorer" || fail "File Explorer: $(after 'find ExplorerWClass')"
