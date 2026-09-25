@@ -1153,6 +1153,23 @@ applications with a failing stage.
 - **Keep the probe's output in a file, not a pipe:** a launched program
   inherits the pipe and holds it open -- the runner hung on 7-Zip that way.
 - A tray program (`tray:` prefix) has no window; it must still be running.
+- **The main window** is the largest *captioned* new window that stays 4 s
+  and is at least 400x300 (a splash has no caption; a first-run "please
+  wait" dialog comes and goes); smaller ones are taken only at the 240 s
+  timeout. Closing dismisses any application dialog in front first (updaters
+  are other processes). `compat-probe list` dumps every top-level window,
+  `LAUNCH_DEBUG=` traces just the launch, `KEEP_PREFIX=1` keeps prefixes in
+  ARTIFACTS for poking at.
+- **Results (2026-09-24, 10.0-25 + 0080, with sg-shell's defaults):** 13 of
+  14 launch and show their main window; 12 of 13 close. Open: Git for
+  Windows' **mintty** dies silently inside `EnumFontFamiliesExW`'s callback
+  when Lucida Console resolves (our font Replacements) -- the MSYS runtime
+  runs out of stack there (gdi32's 32-entry, 14.5 KB stack buffer overflowed
+  first; moving it to the heap removed that fault but not the death, so it
+  was not shipped); git.exe itself works. **Firefox** closes its window only
+  after >30 s and leaves its processes running (content processes fail
+  `CreateWindow` for their OLE apartment window, error 1411 -- the sandbox's
+  alternate desktop).
 
 ## `patches/sg/0078`-`0079`: native stdio; ipconfig and netsh on sg-netctl
 

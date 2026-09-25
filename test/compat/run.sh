@@ -10,8 +10,9 @@
 #   WINE=/opt/wine-sg/bin/wine test/compat/run.sh [NAME-SUBSTRING...]
 #   ARTIFACTS=DIR (default build/compat-results)  CACHE=DIR (~/.cache/sg-compat)
 #   OFFLINE=1: use only what is cached
+#   LAUNCH_DEBUG=channels: WINEDEBUG for the launch only (into the log)
 #   SG_DEFAULTS=DIR: import these .reg defaults first (sg-shell's theme/), as
-#   an installed system has them; KEEP_PREFIX=1 keeps each prefix
+#   an installed system has them; KEEP_PREFIX=1 keeps each prefix in ARTIFACTS
 #
 # Not part of `make test`: it needs the network and takes a while. Exit
 # status is the number of applications with a failing stage.
@@ -51,7 +52,8 @@ grep -v '^#' "$HERE/apps.list" | grep -v '^$' | while IFS='|' read -r name file 
     if [ -s "$CACHE/$file" ] && [ "$(sha256sum "$CACHE/$file" | cut -d' ' -f1)" = "$sha" ]; then dl=PASS; else dl=FAIL; notes="hash/download"; fi
 
     if [ $dl = PASS ]; then
-        P="$T/$s"; rm -rf "$P"; mkdir -p "$P"
+        P="$T/$s"; [ "${KEEP_PREFIX:-0}" = 1 ] && P="$ARTIFACTS/prefix-$s"
+        rm -rf "$P"; mkdir -p "$P"
         export WINEPREFIX="$P" WINEDEBUG="${COMPAT_DEBUG:--all}"
         timeout -s KILL 600 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
         "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
@@ -91,9 +93,10 @@ if [ $tray = 1 ]; then
     W compat-probe.exe alive "\$(basename "\$prog_unix")"
     import -window root "$ARTIFACTS/$s.png"
 else
-    W compat-probe.exe launch 90 "$prog" $largs
+    WINEDEBUG="${LAUNCH_DEBUG:-\$WINEDEBUG}" W compat-probe.exe launch 240 "$prog" $largs
     import -window root "$ARTIFACTS/$s.png"
     hw=\$(sed -n 's/^window=\(0x[0-9a-f]*\).*/\1/p' "$T/r")
+    [ -n "\$hw" ] || W compat-probe.exe list
     [ -n "\$hw" ] && W compat-probe.exe close \$hw
 fi
 EOF
