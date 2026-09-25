@@ -1003,6 +1003,34 @@ share without volume information is listed without a header. Gate: `make
 test-uncdir` (a tmpfs share mounted where sg-netmountd mounts shares; stock
 fails 6 of 6).
 
+## `patches/sg/0207`-`0208`: winex11's BadWindow and the desktop painting over windows
+
+- **0207: "a second program's overlapped window dies on an X BadWindow"**
+  (the GUI gates' old note) was a cross-display bug. The cursor clip window
+  is made by the desktop's owner on *its* display and every process takes
+  its id from the desktop window's property. The gates ran `wineboot` with
+  the developer's `DISPLAY` (:0) and then programs under Xvfb: explorer was
+  still up on :0, the Xvfb programs used a :0 window id, and the X error on
+  the first `XUnmapWindow` (cursor clip or its release on a focus change)
+  was fatal. `init_clip_window` now checks the id on its own display (an
+  override-redirect InputOnly window, error trapped) and makes its own clip
+  window when it is not there. **Gates: still run `wineboot` without a real
+  `DISPLAY`** -- it puts an explorer on the developer's desktop.
+- **0208: the desktop painted over every window** (0069's note: a new
+  wallpaper covered the windows and the taskbar). Not the surface flush --
+  in a virtual desktop the desktop draws directly (`whole_window ==
+  root_window`) and `X11DRV_GetDC` already gives its GC `ClipByChildren` --
+  but **XRender's destination picture was always `IncludeInferiors`**, and
+  the wallpaper is blitted through XRender. The picture now takes the DC's
+  mode (`X11DRV_PDEVICE.subwindow_mode`). Explorer's 250 ms repaint (0069)
+  stays, harmless.
+- **Gate: `make test-display`** (`test/display-gate.sh`,
+  `display-probe.c`): two Xvfb servers -- the desktop on A, a program on B
+  that starts a second one which clips and releases the cursor; then the
+  shell's virtual desktop with windows painted once (so a repaint cannot
+  hide anything), a desktop repaint and a new tiled wallpaper, checked on
+  the X server's pixels. 10 checks; 10.0-48 fails 5.
+
 ## `patches/sg/0064`-`0066`: text and scroll bars
 
 David: the fonts looked crappy and the scroll bars too. Two causes, two fixes.

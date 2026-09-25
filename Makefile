@@ -52,6 +52,11 @@ test-domainsid:
 test-uncdir:
 	WINE=$(PREFIX)/bin/wine test/uncdir-gate.sh
 
+# winex11: a program on another X display than the desktop's (0207), and the
+# desktop's XRender drawing clipped by its windows (0208). Two Xvfb servers.
+test-display:
+	WINE=$(PREFIX)/bin/wine test/display-gate.sh
+
 # The real winget end to end (WINGET_DIR=<a user-supplied winget>; network).
 test-winget:
 	WINE=$(PREFIX)/bin/wine test/winget-e2e.sh
