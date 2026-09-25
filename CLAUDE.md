@@ -1559,6 +1559,20 @@ Gates: `make test-dispatcherq` (12 checks; stock fails all; a
 priority-order mutant fails 1), `make test-winver` (6; stock fails all,
 including the `wineboot -u` upgrade of a 19043 prefix).
 
+## `patches/sg/0177`: DirectWrite finds the font GDI uses for a substituted name
+
+`IDWriteGdiInterop::CreateFontFromLOGFONT` looked the face name up only as
+a family, so "Segoe UI" / "MS Shell Dlg" (FontSubstitutes -> Inter on our
+machines) were `DWRITE_E_NOFONT`: DirectWrite shapers (WPF, Chromium,
+Pango in GTK 4 apps like Pinta) lost the UI font. Now, if GDI knows the
+name (its selected face is that name, not its default), the collection's
+font for GDI's file -- else same family/weight/stretch/style -- is used.
+Gate: `make test-dwlogfont` (stock fails 2 of 4). dwrite:font/layout/
+analyzer unchanged (layout's 3 failures are stock's too).
+
+Pinta 3.1 (GTK 4) runs, but its text is still drawn misshapen (glyph
+parts missing) -- the GTK/cairo text path on Wine, not investigated yet.
+
 ## `patches/sg/0125`: startup items disabled in Task Manager do not start
 
 sg-taskmgr's Startup tab writes Windows' `Explorer\StartupApproved\{Run,

@@ -236,6 +236,10 @@ test-dispatcherq:
 test-winver:
 	WINE=$(PREFIX)/bin/wine test/winver-gate.sh
 
+# DirectWrite finds the font GDI uses for a substituted name (0177).
+test-dwlogfont:
+	WINE=$(PREFIX)/bin/wine test/dwlogfont-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
