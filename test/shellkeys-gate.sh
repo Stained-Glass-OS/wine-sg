@@ -5,7 +5,7 @@
 # Win+Up maximizes, Win+Down restores then minimizes, Win+D shows the
 # desktop and puts the windows back, dragging a window to the left/right
 # edge snaps it (with a preview) and to the top maximizes it (the move/size
-# WinEvents, 0073), the Windows key alone opens Start,
+# WinEvents, 0073), the Windows key alone opens Start, Win+H voice typing,
 # Win+R the Run dialog, Win+E File Explorer.
 #
 #   WINE=/opt/wine-sg/bin/wine test/shellkeys-gate.sh     (ARTIFACTS=DIR keeps logs)
@@ -31,11 +31,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$MINGW" -O2 -o "$T/vdesk-probe.exe" "$HERE/vdesk-probe.c" -ldwmapi -lgdi32 -lole32 || { fail "probe did not build"; exit 1; }
+"$MINGW" -O2 -o "$T/vdesk-probe.exe" "$HERE/vdesk-probe.c" -ldwmapi -lgdi32 -lole32 &&
+"$MINGW" -municode -O2 -o "$T/control-probe.exe" "$HERE/control-probe.c" || { fail "probe did not build"; exit 1; }
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
-cp "$T/vdesk-probe.exe" "$WINEPREFIX/drive_c/"
+cp "$T/vdesk-probe.exe" "$T/control-probe.exe" "$WINEPREFIX/drive_c/"
+# voice typing: a stand-in for sg-dictate.exe that records how it was started
+"$WINE" reg add 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\sg-dictate.exe' /ve /d 'C:\control-probe.exe' /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer\Desktops' /v shell /d 1024x700 /f >/dev/null 2>&1
 "$WINESERVER" -w
@@ -75,6 +78,7 @@ K Escape
 K super+r; P find '#32770' Run
 K Escape
 K super+e; P find ExplorerWClass
+K super+h; sleep 1
 EOF
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s '-screen 0 1024x700x24' "$T/session.sh"
@@ -102,6 +106,8 @@ case "$(after 'rect Alpha' 6)" in *"zoomed=1 iconic=0") pass "dragging it to the
 [ "$(after "find #32768")" = "found=1" ] && pass "the Windows key alone opens Start" || fail "Start did not open: $(after "find #32768")"
 [ "$(after "find #32770 Run")" = "found=1" ] && pass "Win+R opens Run" || fail "Run: $(after "find #32770 Run")"
 [ "$(after 'find ExplorerWClass')" = "found=1" ] && pass "Win+E opens File Explorer" || fail "File Explorer: $(after 'find ExplorerWClass')"
+
+grep -q '/toggle' "$WINEPREFIX/drive_c/standin.log" 2>/dev/null && pass "Win+H starts voice typing (sg-dictate.exe /toggle)" || fail "Win+H: $(cat "$WINEPREFIX/drive_c/standin.log" 2>/dev/null)"
 
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
