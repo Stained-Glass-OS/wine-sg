@@ -1078,6 +1078,17 @@ the virtual desktops' (0x5600..).
 0068 on SendInput). On stock, 4 "put back"/"restore" checks pass vacuously
 (nothing moved), after the step before them failed.
 
+## `patches/sg/0130`: Win+I and the Win+X menu open Settings
+
+`shellkeys.c`'s `run_settings()`: Win+I and Win+X > Settings run
+`ms-settings:`, Win+X > Apps and Features `ms-settings:appsfeatures` and
+Win+X > System `ms-settings:about`, through ShellExecute (sg-shell's
+Settings registers the protocol, `defaults/65-sg-settings.reg`). With no
+ms-settings: handler they fall back to what 0071 opened (the Control Panel
+and its pages). Win+X > Control Panel stays the Control Panel. Gates:
+`make test-shellkeys` (a stand-in registered for ms-settings: records Win+I;
+stock fails it) and sg-shell's `test/settings-check.sh` with `WINI=1`.
+
 ## `patches/sg/0072`: control.exe follows App Paths
 
 `system32\control.exe` run directly (CreateProcess, not ShellExecute) now
