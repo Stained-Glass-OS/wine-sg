@@ -1762,6 +1762,41 @@ LANG=C.UTF-8): en-GB chosen gives dd/MM/yyyy for the next two programs and in
 the registry; de-DE with country 94 keeps 94 and a decimal comma; a bogus
 LocaleName is ignored. Stock Wine fails 5 of 6 (the unchosen check passes).
 
+## `patches/sg/0181`-`0182`: Magnifier, the On-Screen Keyboard, appbars
+
+- **0181**: `magnify.exe` and `osk.exe` in system32/syswow64 are launchers
+  (calc's `handoff.c`, 0120; new modules, so configure and configure.ac are
+  patched) for what App Paths registers -- sg-shell's Magnifier and
+  On-Screen Keyboard. Explorer's keys (`shellkeys.c`): Win+Plus (`=` or the
+  keypad's +) runs `magnify.exe`, or, when a window of class `SgMagnifier`
+  is open, posts it `WM_COMMAND` 0x101 (zoom in); Win+Minus 0x102; Win+Esc
+  `WM_CLOSE`; with no Magnifier open those two do nothing. Win+Ctrl+O runs
+  `osk.exe`, or closes `OSKMainClass` when it is open. **That window class
+  and those command ids are the interface** with sg-shell's `src/magnify`
+  -- change both together.
+- **0182: an appbar's space comes off the work area.** Explorer's appbar
+  code kept the rectangles and never touched the work area; now every
+  ABM_SETPOS/ABM_REMOVE sets it (0074's global SPI_SETWORKAREA) to the
+  screen less the taskbar (`Shell_TrayWnd` at the bottom edge) and every
+  appbar's space, dropping appbars whose window is gone. The docked
+  Magnifier (top) and docked keyboard (bottom) are appbars. **win32u cached
+  SPI_GETWORKAREA for the life of a process** (upstream's `spi_loaded`), so
+  after 0074 made the work area global a running program still saw its
+  first answer forever -- found when a program's own appbar removal never
+  showed. It now asks the monitors each time (re-read only on a new serial).
+- **Gate: `make test-a11y`** (`test/a11y-gate.sh`, `test/a11y-probe.c` as
+  probe and as stand-ins that log their command lines and messages): the
+  four files; 64-bit `magnify.exe /lens /zoom:300` and 32-bit `osk.exe`
+  reaching App Paths with their arguments; Win+Minus/Win+Esc starting
+  nothing, Win+Plus starting Magnifier, Win+Plus / Win+keypad-Plus /
+  Win+Minus / Win+Esc as 0x101 / 0x101 / 0x102 / WM_CLOSE to the open one,
+  Win+Ctrl+O on and off (all typed with xdotool); the work area with a top
+  appbar and back after ABM_REMOVE in the same process, a 32-bit program's
+  left appbar, and an appbar whose program exited giving its space back.
+  19 checks; a wine-sg without them fails 18 (1 vacuous); 0182 without the
+  win32u change fails "removing it gives the space back". sg-shell's
+  `magnify-check.sh` and `osk-check.sh` drive the real programs on it.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

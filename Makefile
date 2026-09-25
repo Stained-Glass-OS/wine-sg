@@ -115,6 +115,11 @@ test-audit:
 test-admintools:
 	WINE=$(PREFIX)/bin/wine test/admintools-gate.sh
 
+# Magnifier and the On-Screen Keyboard: magnify.exe/osk.exe launchers, explorer's
+# Win+Plus/Win+Minus/Win+Esc/Win+Ctrl+O (0181), appbars and the work area (0182).
+test-a11y:
+	WINE=$(PREFIX)/bin/wine test/a11y-gate.sh
+
 # The event log (0143, 0144): the service, the API, who may read Security;
 # needs a second Unix user (SG_OTHER, default sgconf) and sudo -u to it.
 test-eventlog:
