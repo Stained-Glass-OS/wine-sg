@@ -16,8 +16,12 @@
 #               an older one is refused (ERROR_INSTALL_PACKAGE_DOWNGRADE)
 #   bundles     the resource packages for the user's language are installed
 #               with the application, other languages' are not, and they go
-#               with it
+#               with it; a bundle whose block map leaves its packages out (as
+#               the Store's do) needs each signed, trusted and the bundle's
 #   start menu  the application's Start menu entry
+#   timestamps  an RFC 3161 timestamp dates the signature (Store signers are
+#               valid for days): only from a trusted time-stamping authority,
+#               at a time the signer was valid
 #   winget      with WINGET_DIR (a user-supplied winget, never shipped):
 #               `winget install --manifest` of an MSIX from a local server,
 #               then its alias runs, `winget list` shows it and
@@ -187,6 +191,38 @@ out=$(run msix-probe.exe list 4)
 printf '%s\n' "$out" | grep -q "BundleTest" && fail "resource packages left behind: $out" \
     || pass "and its resource packages with it"
 
+# ---- a bundle whose packages are signed on their own ------------------------------------
+# Newer bundles (Store's) map only their own metadata; each package in them
+# carries its own signature, which must be trusted, and must be the bundle's.
+for f in b-app b-en; do
+    osslsigncode sign -certs "$T/signer.pem" -key "$T/signer.key" -h sha256 -in "$B/$f.msix" -out "$B/s-$f.msix" \
+        >/dev/null 2>&1 || fail "osslsigncode could not sign $f"
+done
+$MK package "$B/b-other.msix" --name StainedGlass.SomethingElse --version 2.0.0.0 --app "App:msix-app.exe::Other" \
+    --file "$B/msix-app.exe:msix-app.exe"
+osslsigncode sign -certs "$T/signer.pem" -key "$T/signer.key" -h sha256 -in "$B/b-other.msix" -out "$B/s-b-other.msix" >/dev/null 2>&1
+mkdir -p "$B/s2" "$B/u2" "$B/o2"
+cp "$B/s-b-app.msix" "$B/s2/b-app.msix"; cp "$B/s-b-en.msix" "$B/s2/b-en.msix"
+cp "$B/b-app.msix" "$B/u2/b-app.msix"; cp "$B/b-en.msix" "$B/u2/b-en.msix"
+cp "$B/s-b-other.msix" "$B/o2/b-app.msix"; cp "$B/s-b-en.msix" "$B/o2/b-en.msix"
+for v in s2 u2 o2; do
+    $MK bundle "$B/$v.msixbundle" --name StainedGlass.BundleTest --version 2.0.0.0 --unmapped-payload \
+        --pkg "$B/$v/b-app.msix:application:x64" --pkg "$B/$v/b-en.msix:resource:en-us"
+    osslsigncode sign -certs "$T/signer.pem" -key "$T/signer.key" -h sha256 -in "$B/$v.msixbundle" \
+        -out "$C/$v.msixbundle" >/dev/null 2>&1 || fail "osslsigncode could not sign $v"
+done
+out=$(run msix-probe.exe add 'C:\u2.msixbundle')
+expect "$out" AddStatus 3 "a bundle whose unmapped packages are unsigned is refused"
+out=$(run msix-probe.exe add 'C:\o2.msixbundle')
+case "$out" in *"not the bundle's"*) pass "a signed package in a bundle that is not the bundle's is refused" ;;
+    *) fail "another package in the bundle: $(printf '%s' "$out" | tr '\n' ' ')" ;; esac
+out=$(run msix-probe.exe add 'C:\s2.msixbundle')
+expect "$out" AddStatus 1 "a bundle of packages signed on their own installs"
+out=$(run msix-probe.exe list 4)
+printf '%s\n' "$out" | grep -qxF "Package=$BEN" && pass "with its resource package" || fail "resources: $out"
+out=$(run msix-probe.exe remove "$BAPP")
+expect "$out" RemoveStatus 1 "(and is removed)"
+
 # ---- removal ---------------------------------------------------------------------------------
 out=$(run msix-probe.exe remove "$APP11")
 expect "$out" RemoveStatus 1 "the application is removed"
@@ -196,6 +232,62 @@ lnk=$(find "$C/users" -path '*Start Menu/Programs/MSIX test app.lnk' 2>/dev/null
 [ -z "$lnk" ] && pass "and its Start menu entry" || fail "Start menu entry left behind"
 out=$(run msix-probe.exe remove "$FW")
 expect "$out" RemoveStatus 1 "now the framework can be removed"
+
+# ---- timestamps --------------------------------------------------------------------------
+# Store packages are signed by certificates valid for days, with an RFC 3161
+# timestamp; the signature is checked as of the timestamp's time. A signer that
+# expired in January 2025, timestamped within its life by a TSA of the test root:
+# trusted. The same by a TSA under a root the machine does not trust, or at a
+# time the signer was not valid: expired. (osslsigncode will not timestamp with
+# a certificate that lacks the time-stamping usage, which winrust also requires.)
+TS="$T/ts"; mkdir -p "$TS"
+mk_cert() {   # mk_cert NAME CN NOT_BEFORE NOT_AFTER EXTLINES [CA]
+    openssl req -new -newkey rsa:2048 -nodes -keyout "$TS/$1.key" -out "$TS/$1.csr" -subj "/CN=$2" 2>/dev/null
+    printf "$5" > "$TS/$1.ext"
+    openssl x509 -req -in "$TS/$1.csr" -CA "$T/${6:-ca}.pem" -CAkey "$T/${6:-ca}.key" -set_serial "$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')" \
+        -not_before "$3" -not_after "$4" -extfile "$TS/$1.ext" -out "$TS/$1.pem" 2>/dev/null
+}
+mk_root() {   # mk_root NAME CN: a root valid since 2024 (the timestamps are from 2025)
+    openssl req -new -newkey rsa:2048 -nodes -keyout "$T/$1.key" -out "$T/$1.csr" -subj "/CN=$2" 2>/dev/null
+    printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n' > "$T/$1.ext"
+    openssl x509 -req -in "$T/$1.csr" -signkey "$T/$1.key" -not_before 20240101000000Z -not_after 20300101000000Z \
+        -extfile "$T/$1.ext" -out "$T/$1.pem" 2>/dev/null
+}
+mk_root oldca "Stained Glass Gate Root 2024"
+mk_root other "Untrusted Root"
+openssl x509 -in "$T/oldca.pem" -outform DER -out "$C/oldca.der"
+out=$(run trust-probe.exe --root 'C:\oldca.der')
+expect "$out" root added "a root valid since 2024 is trusted too"
+mk_cert oldsigner "Stained Glass Test Publisher" 20250101000000Z 20250110000000Z \
+    'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=codeSigning\n' oldca
+mk_cert tsa "SG Test TSA" 20240101000000Z 20300101000000Z \
+    'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,timeStamping\n' oldca
+mk_cert othertsa "SG Other TSA" 20240101000000Z 20300101000000Z \
+    'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,timeStamping\n' other
+python3 "$HERE/mkappx.py" "$TS/plain.msix" good
+tsign() {   # tsign OUT TSA ROOT WHEN
+    cat "$TS/$2.pem" "$T/$3.pem" > "$TS/$2-chain.pem"
+    osslsigncode sign -certs "$TS/oldsigner.pem" -key "$TS/oldsigner.key" -h sha256 \
+        -TSA-certs "$TS/$2-chain.pem" -TSA-key "$TS/$2.key" -TSA-time "$(date -u -d "$4" +%s)" \
+        -in "$TS/plain.msix" -out "$C/$1.msix" >/dev/null 2>&1 || fail "osslsigncode could not timestamp $1"
+}
+tsign ts-good tsa oldca 2025-01-05
+tsign ts-untrusted othertsa other 2025-01-05
+tsign ts-late tsa oldca 2025-02-01
+osslsigncode sign -certs "$TS/oldsigner.pem" -key "$TS/oldsigner.key" -h sha256 -in "$TS/plain.msix" \
+    -out "$C/ts-none.msix" >/dev/null 2>&1
+out=$(run trust-probe.exe 'C:\ts-none.msix')
+expect "$out" WinVerifyTrust 0x800b0101 "an expired signer without a timestamp: CERT_E_EXPIRED"
+out=$(run trust-probe.exe 'C:\ts-good.msix')
+expect "$out" WinVerifyTrust 0 "with a timestamp from within its life (RFC 3161): trusted"
+out=$(run trust-probe.exe 'C:\ts-untrusted.msix')
+expect "$out" WinVerifyTrust 0x800b0101 "a timestamp by an untrusted authority is ignored"
+out=$(run trust-probe.exe 'C:\ts-late.msix')
+expect "$out" WinVerifyTrust 0x800b0101 "a timestamp from after the signer expired: expired"
+out=$(run msix-probe.exe add 'C:\ts-good.msix')
+expect "$out" AddStatus 1 "a timestamped package whose signer has since expired deploys"
+out=$(run msix-probe.exe remove "StainedGlass.AppxTest_1.2.3.4_x64__$PUBID")
+expect "$out" RemoveStatus 1 "(and is removed)"
 
 # ---- winget --------------------------------------------------------------------------------
 if [ -n "${WINGET_DIR:-}" ] && [ -f "$WINGET_DIR/winget.exe" ] && command -v xvfb-run >/dev/null; then

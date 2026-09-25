@@ -10,8 +10,10 @@
 #             [--language L ...] [--dep NAME:MINVERSION ...]
 #             [--app ID:EXE[:ALIAS,ALIAS...][:DISPLAYNAME] ...]
 #             [--file SRC:NAME_IN_PACKAGE ...]
-#   mkmsix.py bundle OUT --name N --version V [--publisher P]
+#   mkmsix.py bundle OUT --name N --version V [--publisher P] [--unmapped-payload]
 #             --pkg FILE:application:ARCH ... --pkg FILE:resource:LANGUAGE ...
+#             (--unmapped-payload: the block map leaves the packages out, as
+#             newer bundles do; the packages must then be signed themselves)
 #
 # SPDX-License-Identifier: LGPL-2.1-or-later
 import argparse
@@ -63,8 +65,8 @@ def blockmap(files):
     return ''.join(parts).encode()
 
 
-def write_zip(out, files, types):
-    bm = blockmap(files)
+def write_zip(out, files, types, unmapped=()):
+    bm = blockmap([f for f in files if f[0] not in unmapped])
     with zipfile.ZipFile(out, 'w') as z:
         for name, content, method in files:
             z.writestr(zipfile.ZipInfo(name.replace('\\', '/'), DATE), content, compress_type=method)
@@ -157,7 +159,9 @@ def cmd_bundle(a):
             f'<Identity Name={quoteattr(a.name)} Publisher={quoteattr(a.publisher)} Version="{a.version}"/>'
             f'<Packages>{"".join(entries)}</Packages></Bundle>').encode()
     files.append(('AppxMetadata\\AppxBundleManifest.xml', bman, zipfile.ZIP_DEFLATED))
-    write_zip(a.out, files, BUNDLE_TYPES)
+    # newer bundles map only their metadata; each package is signed on its own
+    unmapped = [f[0] for f in files if f[0].endswith('.msix')] if a.unmapped_payload else ()
+    write_zip(a.out, files, BUNDLE_TYPES, unmapped)
 
 
 def main():
@@ -176,6 +180,7 @@ def main():
     p.add_argument('--app', action='append', default=[])
     p.add_argument('--file', action='append', default=[])
     p.add_argument('--pkg', action='append', default=[])
+    p.add_argument('--unmapped-payload', action='store_true')
     a = p.parse_args()
     (cmd_package if a.kind == 'package' else cmd_bundle)(a)
 

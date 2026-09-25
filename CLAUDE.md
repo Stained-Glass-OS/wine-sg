@@ -965,6 +965,38 @@ certificate generated for the run). 42 checks with `WINGET_DIR`; stock
 - Real-world check still to do: Microsoft's App Installer bundle (winget's
   own package) with its VCLibs/WindowsAppRuntime frameworks.
 
+## `patches/sg/0209`-`0210`: real Store packages -- timestamps and signed payloads
+
+Found by deploying Microsoft's own App Installer bundle (winget's package,
+a local test copy, never shipped).
+
+- **0209 wintrust: RFC 3161 timestamps.** Store signing certificates are
+  valid for about **three days**; the signature is dated by an RFC 3161
+  token (`1.3.6.1.4.1.311.3.3.1`, a SignedData with a TSTInfo). Wine only
+  knew the PKCS #9 countersignature, so every Store package failed with
+  CERT_E_EXPIRED three days after signing. The token counts only if its
+  imprint is the hash of this signature's encrypted digest, its signature
+  verifies, and its signer chains (at that time) to a trusted root with
+  the time-stamping usage; otherwise the current time is used. **Open the
+  token's certificates one by one** (`CERT_STORE_PROV_MSG` failed with
+  ASN1_BADTAG on Microsoft's token -- one undecodable item lost them all).
+  Wine's CMSG_CONTENT_PARAM returns the eContent still wrapped in its OCTET
+  STRING; the parser takes either.
+- **0210: bundles whose block map lists only the bundle manifest.** Newer
+  bundles sign each payload package on its own (and carry
+  `AppxMetadata\Stub\*` stub packages and `CodeIntegrity.cat`). The reader
+  accepts an unmapped entry only if the bundle manifest names it at that
+  size and it contains a signature; deployment copies such a payload to a
+  temp `.msix` (**the SIP is chosen by extension**), requires it trusted,
+  and requires every payload to be the bundle's (name, publisher).
+- Result: App Installer is verified and read and stops only at its
+  framework dependency (Microsoft.WindowsAppRuntime.1.8), as on Windows;
+  VCLibs (aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx) deploys.
+- Gate: `make test-msix` gained timestamps (expired signer + trusted TSA:
+  trusted; untrusted TSA, time after expiry, no timestamp: expired) and a
+  bundle of self-signed payloads (unsigned, foreign and good). 49 checks without WINGET_DIR;
+  the 10.0-46 build fails the 7 new ones.
+
 ## `patches/sg/0205`: a domain account's real SID
 
 A domain user had a SID of this machine's (`S-1-5-21-0-0-0-<1000+uid>`,
