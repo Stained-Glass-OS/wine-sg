@@ -1,0 +1,541 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: services, sechost, sc: a service's own security descriptor
+
+0141 made the SCM check the caller's access against Windows' default
+descriptors, but a service could not have one of its own: QueryService-
+ObjectSecurity returned an empty DACL, SetServiceObjectSecurity did nothing
+and `sc sdset` faked success. An administrator could not let standard users
+start a service, or shut them out of it.
+
+- services.exe keeps a service's descriptor as Windows does, the REG_BINARY
+  value Security of Services\<name>\Security (self-relative), read with the
+  service's configuration; OpenService's access check uses it, else the
+  default. svcctl_QueryServiceObjectSecurity (READ_CONTROL) returns the
+  owner/group/DACL asked for; svcctl_SetServiceObjectSecurity (WRITE_DAC for
+  the DACL, WRITE_OWNER for owner and group) replaces those parts, keeps the
+  rest, and saves it. SACLs are refused (ERROR_ACCESS_DENIED).
+- SERVICE_SET_STATUS is Wine's own right, which no descriptor written for
+  Windows grants: a SYSTEM caller always gets it, so a service whose
+  descriptor an administrator replaced can still report its state.
+- sechost's QueryServiceObjectSecurity/SetServiceObjectSecurity call the SCM
+  (an absolute descriptor is made self-relative first).
+- sc.exe: `sc sdshow NAME` prints the DACL in SDDL, `sc sdset NAME SDDL`
+  sets the parts the string has, with Windows' "[SC] SetServiceObjectSecurity
+  SUCCESS" / "[SC] OpenService FAILED 5:" output. sc opens the SCM with only
+  SC_MANAGER_CONNECT (CREATE_SERVICE for create), so a standard user can
+  query and show.
+
+Gate: test/scm-sd-gate.sh (make test-scm-sd).
+---
+--- a/programs/services/services.h
++++ b/programs/services/services.h
+@@ -64,6 +64,8 @@
+     BOOL marked_for_delete;
+     BOOL is_wow64;
+     BOOL delayed_autostart;
++    BYTE *sd;                          /* its own security descriptor (self-relative, Security\Security), or NULL for the default */
++    DWORD sd_size;
+     struct list handles;
+ };
+ 
+@@ -87,6 +89,7 @@
+ BOOL validate_service_name(LPCWSTR name);
+ BOOL validate_service_config(struct service_entry *entry);
+ DWORD save_service_config(struct service_entry *entry);
++DWORD save_service_security(struct service_entry *entry);
+ void free_service_entry(struct service_entry *entry);
+ struct service_entry *grab_service(struct service_entry *service);
+ void release_service(struct service_entry *service);
+--- a/programs/services/services.c
++++ b/programs/services/services.c
+@@ -131,10 +131,47 @@
+     free(entry->description);
+     free(entry->dependOnServices);
+     free(entry->dependOnGroups);
++    free(entry->sd);
+     if (entry->process) release_process(entry->process);
+     free(entry);
+ }
+ 
++/* The service's own security descriptor, as Windows keeps it: the value
++ * Security of its Security subkey, a self-relative descriptor (sc sdset). */
++static void load_service_security(HKEY key, struct service_entry *entry)
++{
++    DWORD type, size = 0;
++    BYTE *sd;
++
++    if (RegGetValueW(key, L"Security", L"Security", RRF_RT_REG_BINARY, &type, NULL, &size) || !size)
++        return;
++    if (!(sd = malloc(size))) return;
++    if (RegGetValueW(key, L"Security", L"Security", RRF_RT_REG_BINARY, &type, sd, &size) ||
++        !IsValidSecurityDescriptor(sd) || GetSecurityDescriptorLength(sd) > size)
++    {
++        WINE_WARN("%s: ignoring an invalid security descriptor\n", wine_dbgstr_w(entry->name));
++        free(sd);
++        return;
++    }
++    entry->sd = sd;
++    entry->sd_size = size;
++}
++
++DWORD save_service_security(struct service_entry *entry)
++{
++    HKEY key;
++    DWORD err;
++
++    if ((err = RegCreateKeyExW(entry->db->root_key, entry->name, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL)))
++        return err;
++    if (entry->sd)
++        err = RegSetKeyValueW(key, L"Security", L"Security", REG_BINARY, entry->sd, entry->sd_size);
++    else if ((err = RegDeleteTreeW(key, L"Security")) == ERROR_FILE_NOT_FOUND)
++        err = ERROR_SUCCESS;
++    RegCloseKey(key);
++    return err;
++}
++
+ static DWORD load_service_config(HKEY hKey, struct service_entry *entry)
+ {
+     DWORD err, value = 0;
+@@ -157,6 +194,7 @@
+         entry->is_wow64 = TRUE;
+     if (load_reg_dword(hKey, L"DelayedAutoStart", &value) == 0 && value == 1)
+         entry->delayed_autostart = TRUE;
++    load_service_security(hKey, entry);
+ 
+     WINE_TRACE("Image path           = %s\n", wine_dbgstr_w(entry->config.lpBinaryPathName) );
+     WINE_TRACE("Group                = %s\n", wine_dbgstr_w(entry->config.lpLoadOrderGroup) );
+--- a/programs/services/rpc.c
++++ b/programs/services/rpc.c
+@@ -108,13 +108,33 @@
+     return FALSE;
+ }
+ 
++/* The descriptor that decides who may do what with a service: its own
++ * (sc sdset, SetServiceObjectSecurity), else Windows' default. Called with
++ * the service locked. */
++static PSECURITY_DESCRIPTOR service_sd( struct service_entry *entry )
++{
++    if (entry->sd) return entry->sd;
++    return get_sd( is_system_service( entry ) ? svc_start_sddl : svc_sddl );
++}
++
++/* Is the token LocalSystem's? */
++static BOOL is_system_token( HANDLE token )
++{
++    BYTE buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
++    TOKEN_USER *user = (TOKEN_USER *)buf;
++    DWORD len;
++
++    if (!GetTokenInformation( token, TokenUser, buf, sizeof(buf), &len )) return FALSE;
++    return IsWellKnownSid( user->User.Sid, WinLocalSystemSid );
++}
++
+ /* The access the calling client is granted to an object with this descriptor
+  * (*access in: what was asked for, generic rights and MAXIMUM_ALLOWED
+  * included; out: what to put in the handle). */
+ static DWORD check_caller_access( PSECURITY_DESCRIPTOR sd, const GENERIC_MAPPING *mapping, DWORD *access )
+ {
+     PRIVILEGE_SET privs;
+-    DWORD privs_len = sizeof(privs), granted = 0, desired = *access;
++    DWORD privs_len = sizeof(privs), granted = 0, desired = *access, extra = 0;
+     BOOL status = FALSE;
+     HANDLE token;
+     RPC_STATUS rpc;
+@@ -134,10 +154,18 @@
+     RpcRevertToSelf();
+ 
+     RtlMapGenericMask( &desired, mapping );
++    /* SERVICE_SET_STATUS is Wine's own right, which no descriptor written for
++     * Windows (sc sdset) grants: a service process runs as SYSTEM and always
++     * has it, whatever the service's descriptor says */
++    if ((desired & SERVICE_SET_STATUS) && is_system_token( token ))
++    {
++        extra = SERVICE_SET_STATUS;
++        desired &= ~SERVICE_SET_STATUS;
++    }
+     if (!desired && !(*access & MAXIMUM_ALLOWED))
+     {
+         CloseHandle( token );
+-        *access = 0;
++        *access = extra;
+         return ERROR_SUCCESS;
+     }
+     if (!AccessCheck( sd, token, desired, (GENERIC_MAPPING *)mapping, &privs, &privs_len, &granted, &status ))
+@@ -151,7 +179,7 @@
+         WINE_TRACE( "access %#lx denied\n", desired );
+         return ERROR_ACCESS_DENIED;
+     }
+-    *access = granted;
++    *access = granted | extra;
+     return ERROR_SUCCESS;
+ }
+ 
+@@ -571,8 +599,10 @@
+     if (entry == NULL)
+         return ERROR_SERVICE_DOES_NOT_EXIST;
+ 
+-    if ((err = check_caller_access(get_sd(is_system_service(entry) ? svc_start_sddl : svc_sddl),
+-                                   &g_svc_generic, &dwDesiredAccess)) != ERROR_SUCCESS)
++    service_lock(entry);
++    err = check_caller_access(service_sd(entry), &g_svc_generic, &dwDesiredAccess);
++    service_unlock(entry);
++    if (err != ERROR_SUCCESS)
+     {
+         release_service(entry);
+         return err;
+@@ -2001,6 +2031,34 @@
+     return ERROR_CALL_NOT_IMPLEMENTED;
+ }
+ 
++#define SD_PARTS (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION)
++
++/* A self-relative copy of the parts of sd that info names, in *out (free()). */
++static DWORD sd_parts( PSECURITY_DESCRIPTOR sd, SECURITY_INFORMATION info, BYTE **out, DWORD *size )
++{
++    SECURITY_DESCRIPTOR abs;
++    PSID owner = NULL, group = NULL;
++    PACL dacl = NULL;
++    BOOL present = FALSE, defaulted;
++
++    InitializeSecurityDescriptor( &abs, SECURITY_DESCRIPTOR_REVISION );
++    if ((info & OWNER_SECURITY_INFORMATION) && GetSecurityDescriptorOwner( sd, &owner, &defaulted ))
++        SetSecurityDescriptorOwner( &abs, owner, FALSE );
++    if ((info & GROUP_SECURITY_INFORMATION) && GetSecurityDescriptorGroup( sd, &group, &defaulted ))
++        SetSecurityDescriptorGroup( &abs, group, FALSE );
++    if ((info & DACL_SECURITY_INFORMATION) && GetSecurityDescriptorDacl( sd, &present, &dacl, &defaulted ) && present)
++        SetSecurityDescriptorDacl( &abs, TRUE, dacl, FALSE );
++    *size = 0;
++    MakeSelfRelativeSD( &abs, NULL, size );
++    if (!*size || !(*out = malloc( *size ))) return ERROR_NOT_ENOUGH_SERVER_MEMORY;
++    if (!MakeSelfRelativeSD( &abs, *out, size ))
++    {
++        free( *out );
++        return GetLastError();
++    }
++    return ERROR_SUCCESS;
++}
++
+ DWORD __cdecl svcctl_QueryServiceObjectSecurity(
+     SC_RPC_HANDLE service,
+     SECURITY_INFORMATION info,
+@@ -2008,8 +2066,27 @@
+     DWORD buf_size,
+     DWORD *needed_size)
+ {
+-    WINE_FIXME("\n");
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    struct sc_service_handle *handle;
++    BYTE *sd;
++    DWORD err, size;
++
++    WINE_TRACE("(%p, %#lx, %lu)\n", service, info, buf_size);
++
++    /* the SACL would need ACCESS_SYSTEM_SECURITY; services have none here */
++    if (info & SACL_SECURITY_INFORMATION) return ERROR_ACCESS_DENIED;
++    if ((err = validate_service_handle(service, READ_CONTROL, &handle)) != ERROR_SUCCESS)
++        return err;
++
++    service_lock(handle->service_entry);
++    err = sd_parts(service_sd(handle->service_entry), info & SD_PARTS, &sd, &size);
++    service_unlock(handle->service_entry);
++    if (err) return err;
++
++    *needed_size = size;
++    if (size > buf_size) err = ERROR_INSUFFICIENT_BUFFER;
++    else memcpy(descriptor, sd, size);
++    free(sd);
++    return err;
+ }
+ 
+ DWORD __cdecl svcctl_SetServiceObjectSecurity(
+@@ -2018,8 +2095,68 @@
+     BYTE *descriptor,
+     DWORD buf_size)
+ {
+-    WINE_FIXME("\n");
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    struct sc_service_handle *handle;
++    struct service_entry *entry;
++    SECURITY_DESCRIPTOR abs;
++    PSECURITY_DESCRIPTOR cur;
++    PSID owner = NULL, group = NULL;
++    PACL dacl = NULL;
++    BOOL present = FALSE, defaulted;
++    BYTE *sd, *old;
++    DWORD err, size, old_size, needed = 0;
++
++    WINE_TRACE("(%p, %#lx, %lu)\n", service, info, buf_size);
++
++    if (!(info & SD_PARTS) || (info & ~(SD_PARTS | SACL_SECURITY_INFORMATION))) return ERROR_INVALID_PARAMETER;
++    if (info & SACL_SECURITY_INFORMATION) return ERROR_ACCESS_DENIED;
++    if (!descriptor || buf_size < sizeof(SECURITY_DESCRIPTOR_RELATIVE) || !IsValidSecurityDescriptor(descriptor) ||
++        GetSecurityDescriptorLength(descriptor) > buf_size)
++        return ERROR_INVALID_PARAMETER;
++    if (info & DACL_SECURITY_INFORMATION) needed |= WRITE_DAC;
++    if (info & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION)) needed |= WRITE_OWNER;
++    if ((err = validate_service_handle(service, needed, &handle)) != ERROR_SUCCESS)
++        return err;
++    entry = handle->service_entry;
++
++    service_lock(entry);
++    cur = service_sd(entry);
++    InitializeSecurityDescriptor(&abs, SECURITY_DESCRIPTOR_REVISION);
++    /* the parts named come from the caller, the rest stay as they were */
++    GetSecurityDescriptorOwner((info & OWNER_SECURITY_INFORMATION) ? descriptor : cur, &owner, &defaulted);
++    GetSecurityDescriptorGroup((info & GROUP_SECURITY_INFORMATION) ? descriptor : cur, &group, &defaulted);
++    GetSecurityDescriptorDacl((info & DACL_SECURITY_INFORMATION) ? descriptor : cur, &present, &dacl, &defaulted);
++    if ((info & OWNER_SECURITY_INFORMATION) && !owner) err = ERROR_INVALID_OWNER;
++    else if ((info & GROUP_SECURITY_INFORMATION) && !group) err = ERROR_INVALID_PRIMARY_GROUP;
++    if (!err)
++    {
++        SetSecurityDescriptorOwner(&abs, owner, FALSE);
++        SetSecurityDescriptorGroup(&abs, group, FALSE);
++        SetSecurityDescriptorDacl(&abs, present, dacl, FALSE);
++        size = 0;
++        MakeSelfRelativeSD(&abs, NULL, &size);
++        if (!(sd = malloc(size))) err = ERROR_NOT_ENOUGH_SERVER_MEMORY;
++        else if (!MakeSelfRelativeSD(&abs, sd, &size))
++        {
++            err = GetLastError();
++            free(sd);
++        }
++    }
++    if (!err)
++    {
++        old = entry->sd;
++        old_size = entry->sd_size;
++        entry->sd = sd;
++        entry->sd_size = size;
++        if ((err = save_service_security(entry)))
++        {
++            entry->sd = old;
++            entry->sd_size = old_size;
++            free(sd);
++        }
++        else free(old);
++    }
++    service_unlock(entry);
++    return err;
+ }
+ 
+ DWORD __cdecl svcctl_QueryServiceStatus(
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -1250,35 +1250,65 @@
+ BOOL WINAPI DECLSPEC_HOTPATCH QueryServiceObjectSecurity( SC_HANDLE service, SECURITY_INFORMATION type,
+                                                           PSECURITY_DESCRIPTOR ret_descriptor, DWORD size, DWORD *ret_size )
+ {
+-    SECURITY_DESCRIPTOR descriptor;
+-    NTSTATUS status;
+-    ACL acl;
++    BYTE dummy;
++    DWORD err;
+ 
+-    FIXME( "%p %ld %p %lu %p - semi-stub\n", service, type, ret_descriptor, size, ret_size );
++    TRACE( "%p %#lx %p %lu %p\n", service, type, ret_descriptor, size, ret_size );
+ 
+-    if (type != DACL_SECURITY_INFORMATION)
+-        FIXME("information %ld not supported\n", type);
++    if (!ret_size) return set_error( ERROR_INVALID_ADDRESS );
++    __TRY
++    {
++        err = svcctl_QueryServiceObjectSecurity( service, type, ret_descriptor && size ? ret_descriptor : &dummy,
++                                                 ret_descriptor ? size : 0, ret_size );
++    }
++    __EXCEPT(rpc_filter)
++    {
++        err = map_exception_code( GetExceptionCode() );
++    }
++    __ENDTRY
+ 
+-    InitializeSecurityDescriptor( &descriptor, SECURITY_DESCRIPTOR_REVISION );
+-
+-    InitializeAcl( &acl, sizeof(ACL), ACL_REVISION );
+-    SetSecurityDescriptorDacl( &descriptor, TRUE, &acl, TRUE );
+-
+-    status = RtlMakeSelfRelativeSD( &descriptor, ret_descriptor, &size );
+-    *ret_size = size;
+-
+-    return set_error( RtlNtStatusToDosError( status ) );
++    return set_error( err );
+ }
+ 
+ /******************************************************************************
+  *     SetServiceObjectSecurity   (sechost.@)
+  */
+-BOOL WINAPI SetServiceObjectSecurity(SC_HANDLE hService,
+-       SECURITY_INFORMATION dwSecurityInformation,
+-       PSECURITY_DESCRIPTOR lpSecurityDescriptor)
++BOOL WINAPI SetServiceObjectSecurity( SC_HANDLE service, SECURITY_INFORMATION type,
++                                      PSECURITY_DESCRIPTOR descriptor )
+ {
+-    FIXME("%p %ld %p\n", hService, dwSecurityInformation, lpSecurityDescriptor);
+-    return TRUE;
++    PSECURITY_DESCRIPTOR rel = descriptor;
++    DWORD err, len = 0;
++    SECURITY_DESCRIPTOR_CONTROL control;
++    DWORD revision;
++
++    TRACE( "%p %#lx %p\n", service, type, descriptor );
++
++    if (!descriptor || !IsValidSecurityDescriptor( descriptor )) return set_error( ERROR_INVALID_PARAMETER );
++    /* the SCM takes a self-relative descriptor */
++    if (GetSecurityDescriptorControl( descriptor, &control, &revision ) && !(control & SE_SELF_RELATIVE))
++    {
++        MakeSelfRelativeSD( descriptor, NULL, &len );
++        if (!len || !(rel = malloc( len ))) return set_error( ERROR_NOT_ENOUGH_MEMORY );
++        if (!MakeSelfRelativeSD( descriptor, rel, &len ))
++        {
++            free( rel );
++            return FALSE;
++        }
++    }
++    else len = GetSecurityDescriptorLength( descriptor );
++
++    __TRY
++    {
++        err = svcctl_SetServiceObjectSecurity( service, type, rel, len );
++    }
++    __EXCEPT(rpc_filter)
++    {
++        err = map_exception_code( GetExceptionCode() );
++    }
++    __ENDTRY
++
++    if (rel != descriptor) free( rel );
++    return set_error( err );
+ }
+ 
+ static DWORD WINAPI notify_thread(void *user)
+--- a/programs/sc/sc.c
++++ b/programs/sc/sc.c
+@@ -23,6 +23,7 @@
+ #include <stdlib.h>
+ #include <windows.h>
+ #include <winsvc.h>
++#include <sddl.h>
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(sc);
+@@ -269,6 +270,94 @@
+     return ret;
+ }
+ 
++/* "[SC] Function FAILED n:", then the system's text for n, as Windows' sc prints it. */
++static DWORD report_failure( const char *function, DWORD err )
++{
++    WCHAR msg[512];
++
++    printf( "[SC] %s FAILED %lu:\n\n", function, err );
++    if (FormatMessageW( FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err, 0, msg,
++                        ARRAY_SIZE(msg), NULL ))
++        printf( "%ls\n", msg );
++    return err;
++}
++
++/* sc sdshow NAME: the service's security descriptor (its DACL) in SDDL. */
++static DWORD sd_show( SC_HANDLE manager, const WCHAR *name )
++{
++    SC_HANDLE service;
++    PSECURITY_DESCRIPTOR sd;
++    WCHAR *sddl;
++    DWORD size = 0, err;
++
++    if (!(service = OpenServiceW( manager, name, READ_CONTROL )))
++        return report_failure( "OpenService", GetLastError() );
++    if (!QueryServiceObjectSecurity( service, DACL_SECURITY_INFORMATION, NULL, 0, &size ) &&
++        GetLastError() != ERROR_INSUFFICIENT_BUFFER)
++    {
++        err = GetLastError();
++        CloseServiceHandle( service );
++        return report_failure( "QueryServiceObjectSecurity", err );
++    }
++    sd = malloc( size );
++    if (!QueryServiceObjectSecurity( service, DACL_SECURITY_INFORMATION, sd, size, &size ))
++    {
++        err = GetLastError();
++        free( sd );
++        CloseServiceHandle( service );
++        return report_failure( "QueryServiceObjectSecurity", err );
++    }
++    CloseServiceHandle( service );
++    if (!ConvertSecurityDescriptorToStringSecurityDescriptorW( sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION,
++                                                               &sddl, NULL ))
++    {
++        err = GetLastError();
++        free( sd );
++        return report_failure( "ConvertSecurityDescriptorToStringSecurityDescriptor", err );
++    }
++    printf( "\n%ls\n", sddl );
++    LocalFree( sddl );
++    free( sd );
++    return ERROR_SUCCESS;
++}
++
++/* sc sdset NAME SDDL: replace the parts the SDDL string has (owner, group, DACL). */
++static DWORD sd_set( SC_HANDLE manager, const WCHAR *name, const WCHAR *sddl )
++{
++    SECURITY_INFORMATION info = 0;
++    PSECURITY_DESCRIPTOR sd;
++    SC_HANDLE service;
++    PSID sid;
++    PACL acl;
++    BOOL present, defaulted;
++    DWORD access = 0, err = ERROR_SUCCESS;
++
++    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW( sddl, SDDL_REVISION_1, &sd, NULL ))
++        return report_failure( "ConvertStringSecurityDescriptorToSecurityDescriptor", GetLastError() );
++    if (GetSecurityDescriptorOwner( sd, &sid, &defaulted ) && sid) info |= OWNER_SECURITY_INFORMATION;
++    if (GetSecurityDescriptorGroup( sd, &sid, &defaulted ) && sid) info |= GROUP_SECURITY_INFORMATION;
++    if (GetSecurityDescriptorDacl( sd, &present, &acl, &defaulted ) && present) info |= DACL_SECURITY_INFORMATION;
++    if (info & DACL_SECURITY_INFORMATION) access |= WRITE_DAC;
++    if (info & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION)) access |= WRITE_OWNER;
++    if (!info)
++    {
++        LocalFree( sd );
++        return report_failure( "SetServiceObjectSecurity", ERROR_INVALID_PARAMETER );
++    }
++    if (!(service = OpenServiceW( manager, name, access )))
++        err = report_failure( "OpenService", GetLastError() );
++    else
++    {
++        if (!SetServiceObjectSecurity( service, info, sd ))
++            err = report_failure( "SetServiceObjectSecurity", GetLastError() );
++        else
++            printf( "[SC] SetServiceObjectSecurity SUCCESS\n" );
++        CloseServiceHandle( service );
++    }
++    LocalFree( sd );
++    return err;
++}
++
+ int __cdecl wmain( int argc, const WCHAR *argv[] )
+ {
+     SC_HANDLE manager, service;
+@@ -283,7 +372,9 @@
+         return ERROR_INVALID_COMMAND_LINE;
+     }
+ 
+-    manager = OpenSCManagerW( NULL, NULL, SC_MANAGER_ALL_ACCESS );
++    /* only what the command needs: a standard user may query and show */
++    manager = OpenSCManagerW( NULL, NULL, wcsicmp( argv[1], L"create" ) ? SC_MANAGER_CONNECT
++                                                 : SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE );
+     if (!manager)
+     {
+         ret = GetLastError();
+@@ -427,9 +518,14 @@
+     {
+         ret = query_service( manager, argv[2] );
+     }
++    else if (!wcsicmp( argv[1], L"sdshow" ))
++    {
++        ret = sd_show( manager, argv[2] );
++    }
+     else if (!wcsicmp( argv[1], L"sdset" ))
+     {
+-        WINE_FIXME("SdSet command not supported, faking success\n");
++        if (argc < 4) usage();
++        ret = sd_set( manager, argv[2], argv[3] );
+     }
+     else
+     {

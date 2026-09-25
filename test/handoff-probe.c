@@ -1,14 +1,16 @@
 /* handoff-probe: the system32 names that hand off to App Paths
  * (patches/sg/0120, 0121, 0122), for test/handoff-gate.sh.
  *
- *   handoff-probe run CMDLINE     CreateProcess(NULL, CMDLINE) -- the search a
- *                                 program's "calc.exe" gets -- and wait for it
+ *   handoff-probe run CMDLINE [FILE] CreateProcess(NULL, CMDLINE) -- the search a
+ *                                 program's "calc.exe" gets -- and wait for it;
+ *                                 with FILE, say whether it exists once it ended
  *   handoff-probe find CLASS [TAG] is a visible top-level window of CLASS there
  *   handoff-probe count EXE       how many processes run EXE
  *   handoff-probe open FILE       ShellExecute(FILE) -- the Run box's and a
  *                                 shortcut's way (admintools-gate.sh)
  *   handoff-probe ARGS...         (anything else) the registered program: records
- *                                 its command line in C:\standin.log
+ *                                 its command line in C:\standin.log; given
+ *                                 /report FILE, writes FILE 2 s later, exit 3
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
@@ -19,7 +21,7 @@
 
 int wmain( int argc, WCHAR **argv )
 {
-    if (argc == 3 && !lstrcmpW( argv[1], L"run" ))
+    if ((argc == 3 || argc == 4) && !lstrcmpW( argv[1], L"run" ))
     {
         STARTUPINFOW si = { sizeof(si) };
         PROCESS_INFORMATION pi;
@@ -31,6 +33,7 @@ int wmain( int argc, WCHAR **argv )
         }
         if (WaitForSingleObject( pi.hProcess, 8000 )) printf( "still running\n" );
         else { GetExitCodeProcess( pi.hProcess, &code ); printf( "ran exit=%lu\n", code ); }
+        if (argc == 4) printf( "file=%d\n", GetFileAttributesW( argv[3] ) != INVALID_FILE_ATTRIBUTES );
         return 0;
     }
     if (argc == 3 && !lstrcmpW( argv[1], L"open" ))
@@ -59,6 +62,17 @@ int wmain( int argc, WCHAR **argv )
         FILE *f = _wfopen( L"C:\\standin.log", L"a" );
         fwprintf( f, L"cmdline=%ls\n", GetCommandLineW() );
         fclose( f );
+    }
+    {
+        int i;
+        for (i = 1; i + 1 < argc; i++)
+            if (!lstrcmpiW( argv[i], L"/report" ))
+            {
+                FILE *r;
+                Sleep( 2000 );
+                if ((r = _wfopen( argv[i + 1], L"w" ))) { fputs( "report\n", r ); fclose( r ); }
+                return 3;
+            }
     }
     return 0;
 }

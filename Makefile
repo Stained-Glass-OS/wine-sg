@@ -95,8 +95,17 @@ test-pipeimp:
 test-scm-access:
 	WINE=$(PREFIX)/bin/wine test/scm-access-gate.sh
 
+# A service's own security descriptor, sc sdshow/sdset (0185); second Unix user as above.
+test-scm-sd:
+	WINE=$(PREFIX)/bin/wine test/scm-sd-gate.sh
+
+# Audit events from the Linux side reach the Security log (0187); second Unix user as above.
+test-audit:
+	WINE=$(PREFIX)/bin/wine test/audit-gate.sh
+
 # The administrative tools' Windows names: mmc/eventvwr/resmon/cleanmgr/msinfo32
-# launchers, the .msc files and association, Start menu shortcuts, Win+X (0142, 0145).
+# launchers, the .msc files and association, Start menu shortcuts, Win+X (0142, 0145);
+# lusrmgr.msc/fsmgmt.msc and msinfo32 /report waiting for the file (0186).
 test-admintools:
 	WINE=$(PREFIX)/bin/wine test/admintools-gate.sh
 

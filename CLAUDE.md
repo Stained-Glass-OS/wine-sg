@@ -1500,8 +1500,7 @@ log for programs, administrators or Event Viewer.
 - **Not a Unix boundary**: the log files map to mode 0770 in the prefix's
   group (the shared prefix's files all are -- see D13); the Security log is
   protected from Windows programs, not from a user reading the prefix
-  through `Z:`/`\\?\unix`. Nothing writes Security events yet (no
-  auditing) -- it is empty unless SYSTEM reports one.
+  through `Z:`/`\\?\unix`. Security events come from the Linux side's audit spool (0187).
 - Formatting an event's text is the viewer's job, as on Windows:
   `EventMessageFile` (REG_EXPAND_SZ, `;`-separated) under
   `EventLog\<log>\<source>`, `FormatMessage(FORMAT_MESSAGE_FROM_HMODULE |
@@ -1549,6 +1548,70 @@ descriptors (`sc sdset`) are still not implemented.
   failed with 1060 -- stock too. The gate starts a sleeping probe first (it
   initialises the prefix) and keeps it for the run, as sg-services-start
   keeps the machine's services.
+
+## `patches/sg/0185`: a service's own security descriptor (`sc sdset`)
+
+0141 checked callers against Windows' *default* descriptors only; now a
+service can have its own. services.exe keeps it where Windows does -- the
+REG_BINARY value `Security` of `Services\<name>\Security`, self-relative --
+loads it with the configuration, and OpenService's `AccessCheck` uses it
+(else the default). `QueryServiceObjectSecurity` needs READ_CONTROL and returns
+the parts asked for; `SetServiceObjectSecurity` needs WRITE_DAC (DACL) /
+WRITE_OWNER (owner, group), replaces those parts and keeps the rest. SACLs:
+ERROR_ACCESS_DENIED. sechost's two functions now call the SCM; `sc sdshow`
+and `sc sdset` print Windows' `[SC] ...` lines, and sc opens the SCM with only
+SC_MANAGER_CONNECT (a standard user's `sc query`/`sdshow` failed with 5 under
+0141 because sc asked for SC_MANAGER_ALL_ACCESS).
+
+- **SERVICE_SET_STATUS (0x8000) is Wine's own right**: no SDDL written for
+  Windows grants it, and without it a service's own process (SYSTEM) cannot
+  report its state -- every start after an `sc sdset` returned 1053. A SYSTEM
+  caller now always gets it, whatever the descriptor says.
+- **Gate: `make test-scm-sd`** (`test/scm-sd-gate.sh`, shared prefix, `sgconf`
+  the standard user, `scm-probe`/`scm-svc` from 0141's gate): the default
+  DACL shown, readable by a standard user who may not change it, `sdset`
+  letting everyone start/stop (the standard user starts it; it reaches
+  RUNNING), the registry value, still in force after a wineserver restart,
+  then a DACL that shuts the standard user out (query 5, READ_CONTROL 5).
+  22 checks; the tree without 0185 fails 14; a mutant without the
+  SERVICE_SET_STATUS rule fails 7 (1053). advapi32:service 0 failures.
+
+## `patches/sg/0186`: `lusrmgr.msc`, `fsmgmt.msc`; `msinfo32 /report` waits
+
+wineboot's `create_msc_files` (0142) also writes `lusrmgr.msc` and
+`fsmgmt.msc`. Wine's msinfo32.exe hand-off waits for the App Paths program
+when given `/report` or `/nfo` and returns its exit code (Windows' msinfo32
+returns once the file is written). sg-shell's sg-msinfo waits for its own
+bridged copy the same way (an event; a native parent cannot be waited on --
+a Windows process's handle to a Unix child is not waitable). Gate: `make
+test-admintools` (+4 checks; the stand-in writes the report 2 s late and
+exits 3). The tree without 0186 fails exactly those 5.
+
+## `patches/sg/0187`: audit events from the Linux side reach the Security log
+
+Logons, logoffs and elevation happen in PAM and sg-session's broker, not in
+Windows. They write one small file per event into the **audit spool** (a
+Unix directory, `HKLM\...\EventLog\Security` `AuditSpool`, default
+`/var/lib/stained-glass-audit`, 0700 sgsystem -- only root and SYSTEM's
+account can write it, so no user can forge an audit event); the Event Log
+service imports them into Security once a second in name order and deletes
+them (`.name` files are still being written; non-events are dropped). File
+format: `ID`, `TYPE success|failure`, `CATEGORY`, `TIME`, `SID`, `SOURCE`,
+`STRING`... lines (see the comment in wevtsvc.c; sg-session's `sg-audit`
+writes them). wevtsvc.mc words 4624/4625/4634/4648/4672 and the categories
+12544-12548 (our own wording); wine.inf registers wevtsvc.dll as
+`Microsoft-Windows-Security-Auditing`'s message and category file.
+
+- **The Linux-level protection of the log files is sg-session's**: Wine maps a
+  DACL naming SYSTEM to *user + group* bits when the process holds that SID
+  (`sd_to_mode`), so wevtsvc cannot make its files 0600 itself;
+  sg-services-start makes `winevt/Logs` 0700 (the service is the only reader).
+- **Gate: `make test-audit`** (`test/audit-gate.sh`, `audit-probe.c`, shared
+  prefix): the spool emptied but a dot-file, 4624/4672/4625 with their
+  formatted messages, categories and types, the spool's time, exactly three
+  records in name order, a standard user refused, an event written while
+  running. 10 checks; the tree without 0187 fails 9. advapi32:eventlog
+  unchanged.
 
 ## `patches/sg/0142`, `0145`: the administrative tools' Windows names
 

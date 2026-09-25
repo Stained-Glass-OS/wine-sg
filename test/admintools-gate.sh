@@ -41,7 +41,7 @@ for n in mmc eventvwr resmon cleanmgr msinfo32; do
         [ -f "$C/windows/$d/$n.exe" ] && pass "$d\\$n.exe exists" || fail "no $d\\$n.exe"
     done
 done
-for m in services eventvwr devmgmt diskmgmt compmgmt; do
+for m in services eventvwr devmgmt diskmgmt compmgmt lusrmgr fsmgmt; do
     f="$C/windows/system32/$m.msc"
     grep -q "<StainedGlass Console=\"$m\"" "$f" 2>/dev/null && pass "system32\\$m.msc names its console" \
         || fail "system32\\$m.msc missing or wrong"
@@ -76,11 +76,13 @@ mark mmc64;      P probe64.exe run 'mmc.exe C:\\windows\\system32\\services.msc 
 mark eventvwr64; P probe64.exe run 'eventvwr.exe /l:Application'; seen
 mark resmon64;   P probe64.exe run 'resmon.exe'; seen
 mark cleanmgr64; P probe64.exe run 'cleanmgr /d c'; seen
-mark msinfo64;   P probe64.exe run 'msinfo32.exe /report "C:\\my report.txt"'; seen
+mark msinfo64;   P probe64.exe run 'msinfo32.exe /report "C:\\my report.txt"' 'C:\\my report.txt'; seen
 mark eventvwr32; P probe32.exe run 'eventvwr'; seen
 mark msinfo32;   P probe32.exe run 'msinfo32'; seen
 mark services;   P probe64.exe open services.msc; seen
 mark devmgmt;    P probe64.exe open devmgmt.msc; seen
+mark lusrmgr;    P probe64.exe open lusrmgr.msc; seen
+mark fsmgmt;     P probe64.exe open fsmgmt.msc; seen
 mark lnk;        P probe64.exe open 'C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools\\Services.lnk'; seen
 "$WINE" notepad >/dev/null 2>&1 &
 sleep 3; xdotool mousemove 200 150 click 1; sleep 1
@@ -115,6 +117,12 @@ want eventvwr32 '"C:\standin.exe"' 'eventvwr from a 32-bit program (syswow64)'
 want msinfo32 '"C:\standin.exe"' 'msinfo32 from a 32-bit program'
 wantlike services '*"C:\\windows\\system32\\services.msc"*' 'ShellExecute of services.msc (the Run box) opens it through mmc.exe'
 wantlike devmgmt '*"C:\\windows\\system32\\devmgmt.msc"*' 'ShellExecute of devmgmt.msc'
+wantlike lusrmgr '*"C:\\windows\\system32\\lusrmgr.msc"*' 'ShellExecute of lusrmgr.msc (0186)'
+wantlike fsmgmt '*"C:\\windows\\system32\\fsmgmt.msc"*' 'ShellExecute of fsmgmt.msc (0186)'
+# msinfo32 /report returns once the file is written (0186): the stand-in writes it 2 s later, exit 3
+ms=$(awk '/^probe64.exe run msinfo32.exe \/report/ { on = 1; next } /^probe/ { on = 0 } on' "$T/log.out" | tr '\n' ' ')
+case "$ms" in *"ran exit=3"*"file=1"*) pass "msinfo32 /report waits for the report, and passes its exit code on ($ms)" ;;
+    *) fail "msinfo32 /report did not wait: '$ms'" ;; esac
 wantlike lnk '*services.msc*' "the Start menu's Services shortcut opens services.msc"
 want winx_v '"C:\standin.exe"' 'Win+X, V: Event Viewer'
 wantlike winx_m '*devmgmt.msc*' 'Win+X, M: Device Manager'

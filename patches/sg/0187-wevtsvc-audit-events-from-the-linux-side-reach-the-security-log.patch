@@ -1,0 +1,307 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: wevtsvc: audit events from the Linux side reach the Security log
+
+Signing in and out and elevation happen outside Windows, in PAM and in
+sg-session's elevation broker, so nothing ever wrote the Security log (0143
+left it empty unless SYSTEM reported something).
+
+The Event Log service now imports audit events from a spool: a Unix
+directory (HKLM\...\EventLog\Security AuditSpool, default
+/var/lib/stained-glass-audit) that only root and SYSTEM's account may write
+-- sg-session creates it 0700. Each file is one event, a few "KEY value"
+lines (ID, TYPE success|failure, CATEGORY, TIME, SID, SOURCE, STRING...);
+the service moves the files into the Security log once a second, in name
+order, and deletes them; dot-names (still being written) are left alone,
+anything that is not an event is dropped.
+
+wevtsvc.dll's message table words the events (4624 logon, 4625 failed logon,
+4634 logoff, 4648 explicit credentials, 4672 special privileges; categories
+Logon, Logoff, Account Lockout, Special Logon -- our own wording), and
+wine.inf registers it for the Microsoft-Windows-Security-Auditing source.
+
+Gate: test/audit-gate.sh (make test-audit).
+---
+--- a/dlls/wevtsvc/wevtsvc.c
++++ b/dlls/wevtsvc/wevtsvc.c
+@@ -37,9 +37,11 @@
+ 
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winnls.h"
+ #include "winsvc.h"
+ #include "winreg.h"
+ #include "sddl.h"
+@@ -516,6 +518,170 @@
+     free( rec );
+ }
+ 
++/* ---- audit events from the Linux side ------------------------------------ */
++
++/* Signing in and out and elevation happen outside Windows: in PAM and in
++ * sg-session's elevation broker. They write each audit event as a small text
++ * file into the audit spool -- a Unix directory only root and SYSTEM's own
++ * account may write (sg-session makes it 0700) -- and the service moves them
++ * into the Security log, in the order of their names, as SYSTEM would report
++ * them. The spool is HKLM\...\EventLog\Security's AuditSpool (a Unix path),
++ * by default /var/lib/stained-glass-audit. A file:
++ *
++ *   ID 4624                  the event ID (< 65536)
++ *   TYPE success|failure     audit success or failure
++ *   CATEGORY 12544           the task category (optional)
++ *   TIME 1790000000          when it happened, seconds since 1970 (optional)
++ *   SID S-1-5-21-...         the account (optional)
++ *   SOURCE name              default Microsoft-Windows-Security-Auditing
++ *   STRING text              the insertion strings, in order (up to 32)
++ *
++ * UTF-8, one field per line. Files whose names start with "." are still being
++ * written and are left alone. */
++#define AUDIT_MAX_FILE      65536
++#define AUDIT_MAX_STRINGS   32
++static WCHAR audit_spool[MAX_PATH];
++static HANDLE audit_thread;
++
++static void init_audit_spool(void)
++{
++    WCHAR unix_path[MAX_PATH - 16], *p;
++    DWORD size = sizeof(unix_path);
++    WCHAR key[128];
++
++    swprintf( key, ARRAY_SIZE(key), L"%s\\Security", eventlog_key );
++    if (RegGetValueW( HKEY_LOCAL_MACHINE, key, L"AuditSpool", RRF_RT_REG_SZ, NULL, unix_path, &size ) ||
++        unix_path[0] != '/')
++        lstrcpyW( unix_path, L"/var/lib/stained-glass-audit" );
++    for (p = unix_path; *p; p++) if (*p == '/') *p = '\\';
++    swprintf( audit_spool, ARRAY_SIZE(audit_spool), L"\\\\?\\unix%s", unix_path );
++}
++
++static int __cdecl compare_names( const void *a, const void *b )
++{
++    return wcscmp( *(const WCHAR *const *)a, *(const WCHAR *const *)b );
++}
++
++/* One spool file into the Security log; FALSE if it is not an event. */
++static BOOL import_audit_file( const WCHAR *path )
++{
++    char *text, *line, *next;
++    WCHAR *strings = NULL, source[128] = L"Microsoft-Windows-Security-Auditing";
++    DWORD got = 0, len = 0, strings_len = 0, id = 0, time = 0, sid_len = 0;
++    WORD type = 0, category = 0, num = 0;
++    PSID sid = NULL;
++    struct log *log;
++    HANDLE file;
++    BYTE *rec;
++    BOOL ok = FALSE;
++
++    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return FALSE;
++    if (!(text = malloc( AUDIT_MAX_FILE + 1 )) ||
++        !ReadFile( file, text, AUDIT_MAX_FILE, &got, NULL ))
++    {
++        CloseHandle( file );
++        free( text );
++        return FALSE;
++    }
++    CloseHandle( file );
++    text[got] = 0;
++    if (!(strings = malloc( (got + AUDIT_MAX_STRINGS) * sizeof(WCHAR) ))) goto done;
++
++    for (line = text; line && *line; line = next)
++    {
++        char *value;
++        if ((next = strchr( line, '\n' ))) *next++ = 0;
++        if ((value = strchr( line, '\r' ))) *value = 0;
++        if (!(value = strchr( line, ' ' ))) continue;
++        *value++ = 0;
++        if (!strcmp( line, "ID" )) id = strtoul( value, NULL, 10 );
++        else if (!strcmp( line, "TYPE" ))
++        {
++            if (!strcmp( value, "success" )) type = EVENTLOG_AUDIT_SUCCESS;
++            else if (!strcmp( value, "failure" )) type = EVENTLOG_AUDIT_FAILURE;
++        }
++        else if (!strcmp( line, "CATEGORY" )) category = strtoul( value, NULL, 10 );
++        else if (!strcmp( line, "TIME" )) time = strtoul( value, NULL, 10 );
++        else if (!strcmp( line, "SOURCE" ))
++            MultiByteToWideChar( CP_UTF8, 0, value, -1, source, ARRAY_SIZE(source) - 1 );
++        else if (!strcmp( line, "SID" ) && !sid)
++        {
++            WCHAR wsid[128];
++            if (MultiByteToWideChar( CP_UTF8, 0, value, -1, wsid, ARRAY_SIZE(wsid) ) &&
++                ConvertStringSidToSidW( wsid, &sid ))
++                sid_len = GetLengthSid( sid );
++        }
++        else if (!strcmp( line, "STRING" ) && num < AUDIT_MAX_STRINGS)
++        {
++            int n = MultiByteToWideChar( CP_UTF8, 0, value, -1, strings + strings_len, got + AUDIT_MAX_STRINGS - strings_len );
++            if (n <= 0) continue;
++            strings_len += n;
++            num++;
++        }
++    }
++    if (!id || id > 0xffff || !type)
++    {
++        WARN( "%s is not an audit event\n", debugstr_w(path) );
++        goto done;
++    }
++    if (!(rec = build_record( source, type, category, id, sid, sid_len, strings, strings_len * sizeof(WCHAR),
++                              num, NULL, 0, &len )))
++        goto done;
++    if (time) ((EVENTLOGRECORD *)rec)->TimeGenerated = time;
++    EnterCriticalSection( &logs_cs );
++    if ((log = get_log( L"Security" ))) ok = !add_record( log, rec, len );
++    LeaveCriticalSection( &logs_cs );
++    free( rec );
++done:
++    if (sid) LocalFree( sid );
++    free( strings );
++    free( text );
++    return ok;
++}
++
++static void import_audit_spool(void)
++{
++    WIN32_FIND_DATAW fd;
++    WCHAR pattern[MAX_PATH], path[MAX_PATH], **names = NULL;
++    unsigned int n = 0, cap = 0, i;
++    HANDLE find;
++
++    swprintf( pattern, ARRAY_SIZE(pattern), L"%s\\*.evt", audit_spool );
++    if ((find = FindFirstFileW( pattern, &fd )) == INVALID_HANDLE_VALUE) return;
++    do
++    {
++        WCHAR **grown;
++        if (fd.cFileName[0] == '.' || (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
++        if (n == cap)
++        {
++            cap = cap ? cap * 2 : 16;
++            if (!(grown = realloc( names, cap * sizeof(*names) ))) break;
++            names = grown;
++        }
++        if (!(names[n] = wcsdup( fd.cFileName ))) break;
++        n++;
++    } while (FindNextFileW( find, &fd ));
++    FindClose( find );
++    if (n) qsort( names, n, sizeof(*names), compare_names );
++    for (i = 0; i < n; i++)
++    {
++        swprintf( path, ARRAY_SIZE(path), L"%s\\%s", audit_spool, names[i] );
++        if (!import_audit_file( path )) WARN( "dropping %s\n", debugstr_w(path) );
++        /* imported or not an event: either way it must not be read again */
++        DeleteFileW( path );
++        free( names[i] );
++    }
++    free( names );
++}
++
++static DWORD WINAPI audit_thread_proc( void *arg )
++{
++    do import_audit_spool();
++    while (WaitForSingleObject( stop_event, 1000 ) == WAIT_TIMEOUT);
++    return 0;
++}
++
+ /* ---- requests ---------------------------------------------------------- */
+ 
+ static void reply_init( struct wine_eventlog_reply *reply, DWORD status )
+@@ -920,6 +1086,8 @@
+     init_logs();
+     write_start_stop( EVENT_EventlogStarted );
+     listener = CreateThread( NULL, 0, listen_thread, NULL, 0, NULL );
++    init_audit_spool();
++    audit_thread = CreateThread( NULL, 0, audit_thread_proc, NULL, 0, NULL );
+ 
+     eventlog_update_status(SERVICE_RUNNING);
+ 
+@@ -931,6 +1099,11 @@
+         WaitForSingleObject( listener, 5000 );
+         CloseHandle( listener );
+     }
++    if (audit_thread)
++    {
++        WaitForSingleObject( audit_thread, 5000 );
++        CloseHandle( audit_thread );
++    }
+     write_start_stop( EVENT_EventlogStopped );
+     CloseHandle(done_event);
+ 
+--- a/dlls/wevtsvc/wevtsvc.mc
++++ b/dlls/wevtsvc/wevtsvc.mc
+@@ -42,3 +42,62 @@
+ Language=ENU
+ The Event log service was stopped.
+ .
++;
++; The Security log's audit events, which sg-session's PAM hook and elevation
++; broker hand to the service (the Microsoft-Windows-Security-Auditing source;
++; our own wording). Insertion strings: see sg-session's sg-audit.
++;
++MessageId=4624
++Severity=Success
++SymbolicName=EVENT_AUDIT_LOGON
++Language=ENU
++An account was successfully logged on.%n%nNew Logon:%n%tAccount Name:%t%t%1%n%tAccount Domain:%t%t%2%n%tLogon Type:%t%t%3%n%nProcess Information:%n%tLogon Process:%t%t%4%n%nNetwork Information:%n%tSource:%t%t%t%5
++.
++MessageId=4625
++Severity=Success
++SymbolicName=EVENT_AUDIT_LOGON_FAILED
++Language=ENU
++An account failed to log on.%n%nAccount For Which Logon Failed:%n%tAccount Name:%t%t%1%n%tAccount Domain:%t%t%2%n%tLogon Type:%t%t%3%n%nFailure Information:%n%tFailure Reason:%t%t%4%n%nProcess Information:%n%tLogon Process:%t%t%5%n%nNetwork Information:%n%tSource:%t%t%t%6
++.
++MessageId=4634
++Severity=Success
++SymbolicName=EVENT_AUDIT_LOGOFF
++Language=ENU
++An account was logged off.%n%nSubject:%n%tAccount Name:%t%t%1%n%tAccount Domain:%t%t%2%n%tLogon Type:%t%t%3%n%nProcess Information:%n%tLogon Process:%t%t%4
++.
++MessageId=4648
++Severity=Success
++SymbolicName=EVENT_AUDIT_EXPLICIT_CREDENTIALS
++Language=ENU
++A logon was attempted using explicit credentials.%n%nSubject:%n%tAccount Name:%t%t%1%n%tAccount Domain:%t%t%2%n%nAccount Whose Credentials Were Used:%n%tAccount Name:%t%t%3%n%tAccount Domain:%t%t%4%n%nProcess Information:%n%tProcess Name:%t%t%5
++.
++MessageId=4672
++Severity=Success
++SymbolicName=EVENT_AUDIT_SPECIAL_PRIVILEGES
++Language=ENU
++Special privileges assigned to new logon.%n%nSubject:%n%tAccount Name:%t%t%1%n%tAccount Domain:%t%t%2%n%nPrivileges:%t%t%3%n%nProcess Information:%n%tProcess Name:%t%t%4
++.
++MessageId=12544
++Severity=Success
++SymbolicName=CATEGORY_LOGON
++Language=ENU
++Logon
++.
++MessageId=12545
++Severity=Success
++SymbolicName=CATEGORY_LOGOFF
++Language=ENU
++Logoff
++.
++MessageId=12546
++Severity=Success
++SymbolicName=CATEGORY_ACCOUNT_LOCKOUT
++Language=ENU
++Account Lockout
++.
++MessageId=12548
++Severity=Success
++SymbolicName=CATEGORY_SPECIAL_LOGON
++Language=ENU
++Special Logon
++.
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -2515,6 +2515,10 @@
+ HKR,Security,"Retention",0x10003,0
+ HKR,System\EventLog,"EventMessageFile",0x20002,"%%SystemRoot%%\system32\wevtsvc.dll"
+ HKR,System\EventLog,"TypesSupported",0x10003,7
++HKR,Security\Microsoft-Windows-Security-Auditing,"EventMessageFile",0x20002,"%%SystemRoot%%\system32\wevtsvc.dll"
++HKR,Security\Microsoft-Windows-Security-Auditing,"CategoryMessageFile",0x20002,"%%SystemRoot%%\system32\wevtsvc.dll"
++HKR,Security\Microsoft-Windows-Security-Auditing,"CategoryCount",0x10003,4
++HKR,Security\Microsoft-Windows-Security-Auditing,"TypesSupported",0x10003,0x18
+ HKLM,%CurrentVersionNT%\SvcHost,"LocalServiceNetworkRestricted",0x00010008,"EventLog"
+ 
+ [StiServiceKeys]
