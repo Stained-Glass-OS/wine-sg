@@ -965,6 +965,44 @@ certificate generated for the run). 42 checks with `WINGET_DIR`; stock
 - Real-world check still to do: Microsoft's App Installer bundle (winget's
   own package) with its VCLibs/WindowsAppRuntime frameworks.
 
+## `patches/sg/0205`: a domain account's real SID
+
+A domain user had a SID of this machine's (`S-1-5-21-0-0-0-<1000+uid>`,
+0002): tokens, files, HKCU and ACLs named an account no other machine knows.
+Now **sg-session's `sg-domain-logon` (root, at sign-in, before the first
+Windows program) writes `/run/stained-glass/domain-sids/<uid>`** from
+winbind -- `user <SID> DOMAIN\name`, `group <SID> DOMAIN\group` (the first
+is the primary group), `name <SID> DOMAIN\group` (the domain's well-known
+groups the user is *not* in, for ACLs). **That file is an interface: change
+both sides together.** The server believes it only when it and its
+directory are root's and not group/world-writable; it never calls winbind.
+
+- The uid's SID becomes the domain SID (tokens, file owners, HKCU path --
+  the hive file is per uid, so settings carry over). **A uid whose hive is
+  loaded keeps its SID until the server restarts** (`settled`): switching
+  mid-life would lose HKCU. A domain SID, once read, is kept.
+- Tokens hold the domain groups (primary group = first); local groups stay;
+  **no Administrators** for Domain Admins -- elevation is the broker's.
+- **No protocol change**: `sg_lookup_account` with rid 0 and a SID string
+  answers `DOMAIN\name`; with a name, `<SID>\t<DOMAIN>`; reply rid
+  0x80000001 user / 0x80000002 group. advapi32 LookupAccountSid/Name, the
+  current user's domain, secur32 `NameSamCompatible` use it.
+- File ACLs still map to Unix modes (upstream Wine keeps no file SDs), so
+  an ACE for a domain group persists only on objects that keep descriptors
+  (registry keys, kernel objects) -- which is what the gate checks.
+- Gates: `make test-domainsid` (shared prefix, second Unix user, a made-up
+  domain record; 28 checks, 15 fail on 10.0-46), and sg-image's
+  `make domain-test` against a real Samba DC (her SID from dc1's objectSid).
+
+## `patches/sg/0206`: `dir \\server\share` in cmd
+
+cmd treated an argument starting with `\` as relative to the current drive:
+`dir \\dc1\shared` listed `Z:\dc1`. A UNC path is complete as given; the
+volume header/trailer are per root (`X:\` or `\\server\share\`), and a
+share without volume information is listed without a header. Gate: `make
+test-uncdir` (a tmpfs share mounted where sg-netmountd mounts shares; stock
+fails 6 of 6).
+
 ## `patches/sg/0064`-`0066`: text and scroll bars
 
 David: the fonts looked crappy and the scroll bars too. Two causes, two fixes.

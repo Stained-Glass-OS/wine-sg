@@ -43,6 +43,15 @@ test-appx:
 test-msix:
 	WINE=$(PREFIX)/bin/wine test/msix-gate.sh
 
+# A domain account's real SID (0205): tokens, files, HKCU, names, ACLs. Needs
+# sudo and the second Unix user sgconf (a made-up domain record in /run).
+test-domainsid:
+	WINE=$(PREFIX)/bin/wine test/domainsid-gate.sh
+
+# cmd's dir of a UNC path (0206). Needs sudo (a tmpfs share under /run).
+test-uncdir:
+	WINE=$(PREFIX)/bin/wine test/uncdir-gate.sh
+
 # The real winget end to end (WINGET_DIR=<a user-supplied winget>; network).
 test-winget:
 	WINE=$(PREFIX)/bin/wine test/winget-e2e.sh
