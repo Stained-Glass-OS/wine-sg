@@ -134,6 +134,10 @@ test-a11y:
 test-eventlog:
 	WINE=$(PREFIX)/bin/wine test/eventlog-gate.sh
 
+# fontview.exe, the Fonts folder, per-user fonts (HKCU Fonts), shell: URLs (0183).
+test-fonts:
+	WINE=$(PREFIX)/bin/wine test/fonts-gate.sh
+
 # Startup items disabled in Task Manager (0125).
 test-startup:
 	WINE=$(PREFIX)/bin/wine test/startup-gate.sh

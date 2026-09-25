@@ -1529,6 +1529,47 @@ Print Screen and Ctrl+Shift+Esc typed on the X keyboard, the loop refusal,
 and Wine's Task Manager without App Paths. 22 checks; stock wine-sg fails
 all of them; mutants (no loop guards; 0122 without 0123) turn it red.
 
+## `patches/sg/0183`: fontview.exe, the Fonts folder, per-user fonts, shell: URLs
+
+sg-shell's `sg-fontview` is Windows' font viewer and the Fonts folder (App
+Paths `fontview.exe`); this is what Wine itself needed for them.
+
+- **`programs/fontview`**: `fontview.exe` in system32 and syswow64 is calc's
+  launcher (0120's `handoff.c` via `PARENTSRC`) for App Paths' `fontview.exe`.
+- **wine.inf**: `.ttf`/`.otf`/`.ttc`/`.fon` -> `ttffile`/`otffile`/`ttcfile`/
+  `fonfile`, opened with `fontview.exe "%1"`, `print` = `/p`, Windows'
+  `install` ("Install") and `installallusers` ("Install for all users",
+  `HasLUAShield`) verbs = `/install [/allusers]`. No-clobber (flag 2).
+- **win32u: a user's own fonts load.** Windows 10 1809 installs a font per
+  user without an administrator: the file under `%LOCALAPPDATA%\Microsoft\
+  Windows\Fonts` and `HKCU\Software\Microsoft\Windows NT\CurrentVersion\
+  Fonts` "Name (TrueType)" = its full path. Wine's `load_registry_fonts`
+  read only HKLM's key, so such a font (installed by sg-fontview or by any
+  Windows installer that does this) was invisible. The loop is now
+  `load_fonts_from_key` over HKLM's key, then HKCU's. It runs in every
+  process (not only the one that builds the session's font cache), so a
+  value added or removed shows in the next new process.
+- **explorer**: `explorer shell:fonts`, its CLSID
+  (`::{BD84B380-8CA2-1069-AB1D-08000948F534}`) or `%WINDIR%\Fonts` open
+  `App Paths fontview.exe /folder` (the plain folder when nothing is
+  registered). `shell:<known folder>` (shell:downloads, shell:startup ...)
+  opens that folder through `IKnownFolderManager::GetFolderByName`;
+  `shell:::{CLSID}` through the desktop folder's parser. **explorer.c no
+  longer ShellExecutes a `shell:` root** -- with wine.inf now registering the
+  `shell` URL scheme to explorer (Wine had none: the Run box's `shell:fonts`
+  failed with "no association"), that would loop forever.
+- **Gate: `make test-fonts`** (`test/fonts-gate.sh`, `test/fonts-probe.c`):
+  the two launchers from a 64- and a 32-bit caller with the file argument
+  intact, the four associations and Install verbs, ShellExecute of a .ttf
+  and its `install` verb, `explorer shell:fonts`, `explorer C:\windows\Fonts`
+  and ShellExecute(`shell:fonts`) reaching `/folder`, ShellExecute
+  (`shell:downloads`) opening a window titled Downloads with the explorer
+  count steady, and a fontTools-made font named only in HKCU (in a folder
+  fontconfig does not scan, `HOME` redirected) enumerated by a new process,
+  in a new session, and gone when its value is deleted. 16 checks. Stock
+  wine-sg fails 14 (2 vacuous); a build without explorer.c's `shell:` guard
+  fails 4 (the loop).
+
 ## `patches/sg/0100`-`0101`: Notepad is a real editor
 
 David: "the wine notepad kinda sucks ... something a lot more like Kate."
