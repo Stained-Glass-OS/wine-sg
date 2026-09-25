@@ -2194,6 +2194,89 @@ gives up. No browser argument avoids the path (`--disable-gpu`,
   verified: dxgi conformance tests, input into the WebView, a real GPU,
   whether full Edge now takes the swap-chain path (`make test-edge`).
   Pages appear 15-40 s after launch on a loaded machine (llvmpipe).
+## `patches/sg/0160`-`0163`: dark mode, system-wide and live
+
+Settings > Personalization > Colors writes Windows' two modes,
+`HKCU\...\Themes\Personalize` `AppsUseLightTheme` (programs) and
+`SystemUsesLightTheme` (the shell), and broadcasts `WM_SETTINGCHANGE
+"ImmersiveColorSet"`. What follows:
+
+- **0160 light.msstyles gets a "Dark" colour scheme** beside "Blue" (Stained
+  Glass Light), as a Windows style carries several (COLORNAMES,
+  FILERESNAMES, display names). **Dark is generated, never drawn:**
+  `theme/dark.py` turns BLUE_INI into DARK_INI (images renamed, colours
+  remapped, the system colours replaced by its `DARK_SYS` table, check box and
+  radio text colours added -- Light leaves them to the program's DC, which is
+  black) and every rendered `blue_*.bmp` into `dark_*.bmp` (greys turned over
+  onto a dark ramp, pale accent tints to dark ones, the accent kept; 24- and
+  32-bit bitmaps). `build.sh` runs it after the series and the image render
+  (`generate_dark_scheme`), and the series fingerprint and CI's cache key
+  include `theme/`, so a script change refreshes the tree. `light.rc`
+  `#include`s the generated `dark.rc`; makedep tracks it and the images. Blue's
+  [SysMetrics] colours are now sg-shell's palette (50-sg-colors.reg), so
+  switching back lands where a new profile starts.
+- **0161 uxtheme/win32u:** `RefreshImmersiveColorPolicyState` (ordinal 104)
+  picks Dark while AppsUseLightTheme is 0 (only for a style that has a Dark
+  scheme), writes ColorName, applies the scheme's **system colours only**
+  (never its fonts/sizes -- `MSSTYLES_GetThemeSysColors`), saves them in
+  `Control Panel\Colors`, broadcasts WM_THEMECHANGED and repaints shown,
+  framed windows' frames. **Every process follows**: uxtheme watches the
+  ThemeManager key (RegNotifyChangeKeyValue) and reloads the style in
+  OpenThemeData/IsThemeActive; win32u re-reads its cached system colours
+  when another process's WM_SYSCOLORCHANGE arrives (`reload_sys_colors`,
+  in peek_message's sent-message path) -- stock Wine cached them per process
+  forever. A changed colour gets a new brush; the old one is left alive.
+- **0162 dwmapi/win32u: dark title bars.** `DWMWA_USE_IMMERSIVE_DARK_MODE`
+  (20, and 19) and `DWMWA_CAPTION_COLOR`/`DWMWA_TEXT_COLOR` become window
+  properties (`__wine_dark_caption`, `__wine_caption_color`/`_text`, colour +
+  1) that defwnd.c's caption painter reads (`caption_color`); own windows
+  only.
+- **0163 explorer:** the taskbar's palette follows SystemUsesLightTheme (a
+  light #eeeeee bar), and the shell calls RefreshImmersiveColorPolicyState at
+  start and on ImmersiveColorSet, then repaints the desktop **and every
+  window after it** (the desktop surface is flushed over its children, 0069 --
+  repainting only the desktop drew its icons over windows).
+- **Things that bit:** a frame repaint of *every* top-level window (hidden
+  and transparent helpers included) erased the desktop's icons -- only shown,
+  framed windows now. A test prefix keeps the `light.msstyles` it was created
+  with (wineboot copies it): make a new prefix after rebuilding the style.
+
+**Gate: `make test-darkmode`** (21 checks, pixels + the programs' own
+reports): a DWM-dark title bar in light mode, then the app mode dark -- another
+process's title bar, window background, menu bar and themed button go dark
+and it sees the Dark scheme and colours itself; a new process starts dark;
+the taskbar follows the Windows mode both ways; back to light everything but
+the DWM-dark title bar is light and the registry keeps the light colours.
+Against 10.0-43 (no 0160-0163) it fails 14. sg-shell's Settings, Start and
+network flyout follow the modes with `src/sg-mode.h`.
+
+## `patches/sg/0164`: the taskbar honours Settings
+
+`programs/explorer/systray.c` reads Settings > Personalization > Taskbar
+(`sg_load_settings`) at start and on `WM_SETTINGCHANGE "TraySettings"`:
+position (`HKCU\Software\Stained Glass\Taskbar` `Position`, ABE_*; vertical
+bars 62/48 px with square buttons, clock and tray icons at the foot),
+`AutoHide` (tucks to 2 px after 600 ms away, back at the edge, topmost, no
+work area; repaints what it uncovers), `TaskbarSmallIcons` (30 px),
+`TaskbarGlomLevel` (0/1/2; default 2 = never, as before -- combined buttons
+are one icon per executable, a stacked edge, a menu to choose),
+`TaskbarAl` (centre), `ShowTaskViewButton`, `...\Search SearchboxTaskbarMode`
+(icon or box; opens Start with wparam 1). SHAppBarMessage answers from it
+(ABM_GETSTATE, ABM_GETTASKBARPOS, ABM_GETAUTOHIDEBAR) and ABM_SETSTATE sets
+auto-hide (`ABM_SETSTATE` added to shellapi.h).
+
+- **The bar follows WinEvents** (show/hide/foreground/name change of top-level
+  windows, debounced 50 ms): before, a window shown after its creation
+  notification had no button until something else happened.
+- **Button icons come from the executable** (`ExtractIconEx` of
+  `QueryFullProcessImageName`): Wine's HICONs are per process, so another
+  program's `WM_GETICON` handle draws nothing here.
+- Not done: dragging the bar to an edge, resizing it, per-monitor bars,
+  jump lists, badges, peek.
+
+**Gate: `make test-taskbar`** (23 checks: the bar's rectangle, work area,
+SHAppBarMessage, its buttons and pixels for each option, auto-hide by the
+pointer, ABM_SETSTATE). 10.0-16 (no 0164) fails 21.
 
 ## Things that will bite you
 

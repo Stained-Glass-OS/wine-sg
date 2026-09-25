@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean
+.PHONY: all build install test deb deps clean distclean test-darkmode test-taskbar
 
 all: build
 
@@ -90,6 +90,15 @@ test-vdesk:
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
+
+# Dark mode: the Light style's Dark scheme, followed live by every program;
+# dark title bars (DWMWA_USE_IMMERSIVE_DARK_MODE); the taskbar's Windows mode (0160-0163).
+test-darkmode:
+	WINE=$(PREFIX)/bin/wine test/darkmode-gate.sh
+
+# The taskbar honours Settings > Personalization > Taskbar (0164).
+test-taskbar:
+	WINE=$(PREFIX)/bin/wine test/taskbar-gate.sh
 
 # The user's regional format is their choice (0168).
 test-region:

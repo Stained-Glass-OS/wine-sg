@@ -44,6 +44,8 @@ echo "$WINE_SHA256  $TARBALL" | sha256sum -c - >/dev/null
 series_fingerprint() {
     {
         cat "$HERE/wine-version"
+        # the generated Dark colour scheme is part of the tree (0160)
+        cat "$HERE/theme/dark.py"
         while read -r p; do
             [[ -z "$p" || "$p" == \#* ]] && continue
             echo "== $p"
@@ -63,6 +65,7 @@ prepare_tree() {
         patch -d "$tmp/wine-$WINE_VERSION" -p1 -s -i "$HERE/patches/$p"
     done < "$HERE/patches/series"
     regenerate_theme_images "$tmp/wine-$WINE_VERSION"
+    generate_dark_scheme "$tmp/wine-$WINE_VERSION"
     mv "$tmp/wine-$WINE_VERSION" "$dest"
     rmdir "$tmp"
 }
@@ -91,6 +94,17 @@ regenerate_theme_images() {
                 || log "    WARNING: could not render $(basename "$base.$ext")"
         done
     done
+}
+
+# The Light style's Dark colour scheme (patches/sg/0160): dark.rc and the
+# dark_*.bmp images, generated from the Light INI and the images just rendered
+# (theme/dark.py), so Dark follows every change to Light. light.rc includes
+# dark.rc; without it the style does not build, so a failure stops here.
+generate_dark_scheme() {
+    local dir="$1/dlls/light.msstyles"
+    [[ -f "$dir/light.rc" ]] && grep -q 'dark.rc' "$dir/light.rc" || return 0
+    log "  generating the Dark colour scheme"
+    python3 "$HERE/theme/dark.py" "$dir" >/dev/null
 }
 
 FINGERPRINT=$(series_fingerprint)
