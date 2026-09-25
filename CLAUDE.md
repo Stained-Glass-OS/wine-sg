@@ -1244,12 +1244,18 @@ Cygwin/MSYS runtime does exactly as Windows allows:
   10.0-34 narrows it; the gate checks a key keeps its DACL. Gate:
   `make test-objowner`.
 
-Still open: output from programs inside mintty does not reach its window
-(bash runs, alive, no fault) -- the Cygwin pty's data path under Wine. The
-child spins: `NtWaitForMultipleObjects(2 handles, wait-any, no timeout)`
-returns index 1 at once, over and over (thousands a second) -- an object
-Cygwin's pty wait loop expects to reset stays signalled. Next: find that
-handle (+server shows the select's handles) and what should reset it.
+- **0083 (server): a pipe end reports its WriteQuotaAvailable.** It was
+  always 0 (a FIXME). Cygwin polls it (1 ms timers -- genuine, not a stuck
+  object: the "spinning wait" was `fhandler_pty_slave::write` ->
+  `process_opost_output` waiting for room) before every pty write, so
+  nothing printed. Now the peer's `buffer_size` less what is queued there.
+  Gate: `make test-pipequota`. With 0081-0083 Git Bash comes up at its
+  `MINGW64` prompt and passes every compat stage.
+
+How it was found, for next time: a temporary ERR in `NtWaitForMultipleObjects`
+naming each handle's type (`NtQueryObject`) when a thread repeats a wait;
+`winedbg` `bt all` on the spinning process; and msys-2.0.dll's own symbols
+(`x86_64-w64-mingw32-nm -C`) to name the frames.
 
 **Firefox shutdown (open, cause not proven).** On the pinned 128.6 (keep
 `DisableAppUpdate`: it updated itself mid-test once and broke its install)

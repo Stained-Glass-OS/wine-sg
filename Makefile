@@ -117,6 +117,10 @@ test-objowner:
 test-notepad:
 	WINE=$(PREFIX)/bin/wine test/notepad-gate.sh
 
+# A pipe end reports how much it can write (0083).
+test-pipequota:
+	WINE=$(PREFIX)/bin/wine test/pipequota-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
