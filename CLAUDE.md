@@ -1653,9 +1653,19 @@ current in every prefix with nothing to install.
 - **The EDIT messages are answered** (WM_GETTEXT/SETTEXT, EM_GETSEL/SETSEL,
   EM_REPLACESEL, EM_LINEINDEX, ...), for programs that drive Notepad's text,
   but the class is not `Edit` -- as on Windows 11.
-- The menu bar stays light in the dark theme (Wine draws it); the tab strip,
-  find bar, status bar and editor follow `HKCU\...\Themes\Personalize
-  AppsUseLightTheme` or View > Theme.
+- **The theme** (`HKCU\...\Themes\Personalize AppsUseLightTheme` or View >
+  Theme) covers the tab strip, find bar, status bar, editor **and the menu
+  bar**: dark, Notepad makes the bar's items owner-drawn (their text kept in
+  `menubar_text[]`, Alt+letter answered in `WM_MENUCHAR`) and gives the bar a
+  dark MIM_BACKGROUND brush, which win32u paints since 0188. The popups stay
+  the system's (COLOR_MENU): a system-wide dark scheme darkens them.
+- **Page Setup** is the common dialog grown by a hook with Header and Footer
+  boxes (Windows Notepad's), kept at once in `szHeader`/`szTrailer`. `&l`,
+  `&c`, `&r` place what follows left/centre/right (no code: centred); `&f`
+  `&p` `&d` `&t` `&&`. Wine's Page Setup and Print dialogs need a printer:
+  none installed means "No default printer defined".
+  `NOTEPAD_PRINT_EMF=<dir>` makes printing write `page<N>.emf` there
+  (letter size, 96 dpi) -- the print gate reads their text records.
 - **0101 (wine.inf):** Wine had `txtfile` but no `.txt` -> `txtfile`, so
   ShellExecute of any .txt failed ("no application associated"). `.txt`,
   `.text`, `.log` now map to it (plus content type and ShellNew), `.inf`
@@ -1663,6 +1673,17 @@ current in every prefix with nothing to install.
   on `wineboot -u` when missing and never overrides a user's choice.
 - New strings are English only; the `.po` translations still cover the
   strings Wine's Notepad had.
+
+**Gate: `make test-notepad-print`** (`test/notepad-print-gate.sh`), 13
+checks: the dark bar's pixels and its light item text, Alt+F on the
+owner-drawn bar, the light theme's bar back to light; Page Setup's boxes
+typed into (xclip paste: xdotool loses Shift for `&`) and kept; the printed
+EMF pages' header parts left/centre/right with `&f`/`&p` expanded, above the
+text, the footer on every page below it. A private unprivileged cupsd (its
+own `cupsd.conf`, `CUPS_SERVER` a socket in the gate's directory, a raw
+`file:` queue) gives Wine a default printer without touching the machine's
+CUPS. Stock 10.0-43 fails 6 (the dark bar, the boxes, the printed pages and
+their header/footer); the series without 0188 fails the dark bar.
 
 **Gate: `make test-notepad`** (`test/notepad-gate.sh`, `test/notepad-probe.c`),
 28 checks in a shell session under xvfb: cmd, a 64-bit and a 32-bit
@@ -1673,6 +1694,50 @@ command line, Ctrl+N, Ctrl+Tab, Ctrl+W); the lexer's styles and the keyword's
 purple pixels. Stock Wine's Notepad fails 25 (3 vacuous); a build that swaps
 UTF-16 BE bytes or loses keywords fails those checks. To run it against a
 build tree: `WINE=build/<tree>/obj/wine WINESERVER=build/<tree>/obj/server/wineserver`.
+
+## `patches/sg/0180`, `0184`: WordPad
+
+- **0180**: Wine's `wordpad.exe` (Program Files\Windows NT\Accessories --
+  where system32's `write.exe` and the `rtffile`/`wrifile` associations go)
+  hands off to App Paths' `wordpad.exe` (sg-shell's sg-wordpad), as 0121
+  does for taskmgr.exe; nothing registered, Wine's WordPad runs.
+- **0184 riched20** -- found building sg-wordpad; every RichEdit program
+  benefits:
+  - **EM_FORMATRANGE** was an unsupported stub (Wine's own WordPad printed
+    blank pages). `editor_format_range()` (paint.c) re-wraps every paragraph
+    for the target DC (its dpi, the page's width: `rcFormat`, no zoom),
+    walks the rows from `cpMin` (`row_from_cursor`, `row_next_all_paras`;
+    a row's top is `para->pt.y + row->pt.y`) until one would pass the
+    page, draws those paragraphs with `draw_paragraph` clipped to the
+    rows that fit (`bHideSelection`, transparent background; with a target
+    of another resolution, `MM_ANISOTROPIC` so the drawing is in the
+    target's units), then re-wraps for the screen with
+    `wrap_marked_paras_dc(..., FALSE)`. Returns the next page's first
+    character, or the length + 1 when the rest fitted, sets `rc.bottom` to
+    where the text ended, and with no FORMATRANGE returns the length -- as
+    Windows; `cpMax` stops it early. riched20:editor's EM_FORMATRANGE tests
+    pass (their todo_wine removed); richole/txtsrv unchanged.
+  - `\pngblip`/`\jpegblip` read (OleLoadPicture -> bitmap);
+    `\dibitmap`'s bits were taken after `sizeof(BITMAPINFO)` (4 bytes too
+    far: colours shifted); a bitmap-cached picture is written back as
+    `\dibitmap0` (only EMFs were).
+  - The writer had `\li`/`\fi` wrong (dxOffset / dxStartIndent); RTF's
+    `\li` is `dxStartIndent + dxOffset`, `\fi` is `-dxOffset`, as the
+    reader always took them.
+  - A style's `script_cache` (Uniscribe's advances) is freed when its font
+    height changes (`script_cache_height`, editstr.h): after EM_SETZOOM the
+    old size's advances made letters overlap -- and a printer's resolution
+    would have done the same to printed text.
+- **Gate:** sg-shell's `test/wordpad-check.sh` (58 checks with this Wine;
+  stock 10.0-43 fails 16: the hand-offs, the saved indent, the zoomed
+  advance, pictures' colours and saving, printing and preview).
+
+## `patches/sg/0188`: a menu bar is painted with its MIM_BACKGROUND brush
+
+`draw_menu_bar` (win32u/menu.c) fills the bar -- and the line under it --
+with `menu->hbrBack` when SetMenuInfo gave one, as Windows does; otherwise
+COLOR_MENU/COLOR_MENUBAR and the 3D-face line as before. Notepad's dark
+theme uses it (0100). Gate: `make test-notepad-print`.
 
 ## `patches/sg/0140`: a pipe server impersonates its client
 

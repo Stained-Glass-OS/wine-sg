@@ -182,6 +182,11 @@ test-objowner:
 test-notepad:
 	WINE=$(PREFIX)/bin/wine test/notepad-gate.sh
 
+# Notepad's dark menu bar (0188) and Page Setup's header and footer (0100);
+# needs cups-daemon (the gate runs a private cupsd for a test printer).
+test-notepad-print:
+	WINE=$(PREFIX)/bin/wine test/notepad-print-gate.sh
+
 # A pipe end reports how much it can write (0083).
 test-pipequota:
 	WINE=$(PREFIX)/bin/wine test/pipequota-gate.sh
