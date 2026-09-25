@@ -1191,7 +1191,9 @@ applications with a failing stage.
   administrator (sg-session).
 - **A new header is not in makedep's dependencies** until the Makefile is
   regenerated: touch the including `.c` after changing it, or you test the
-  old binary.
+  old binary. **And list it in `include/Makefile.in`** (0094): otherwise a
+  clean configure cannot generate the Makefiles at all -- an incremental
+  tree hides it; prove a patch with a clean tarball+series `configure`.
 
 Gate: `make test-netsh` (a stand-in sg-netctl via `SG_NETCTL`; 14 checks,
 13 fail on stock). The real thing: sg-image's net gate.
