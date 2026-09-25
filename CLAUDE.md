@@ -1063,6 +1063,21 @@ everyone read) and runs the lookup with Administrators disabled
 (`CreateRestrictedToken`, patch 0055) -- and first checks that the child
 really is denied, or the gate proves nothing. Stock: empty path, empty cache.
 
+## `patches/sg/0071`: the Windows key's shortcuts
+
+`programs/explorer/shellkeys.c`: the Windows key alone opens Start (a
+`WH_KEYBOARD_LL` hook: on release, only if nothing else was pressed while it
+was down); Win+D (and back), Win+M, Win+Shift+M; Win+Left/Right snap to half
+the monitor's work area (and back from the other side), Win+Up maximize,
+Win+Down restore/minimize; Win+E File Explorer, Win+R Run (RunFileDlg,
+ordinal 61, on its own thread), Win+I and Win+Pause the Control Panel, Win+X
+the quick-link menu. Hotkey ids 0x5700.. share the tray's `WM_HOTKEY` with
+the virtual desktops' (0x5600..).
+
+**Gate: `make test-shellkeys`** -- 12 checks typed with xdotool (X keys; see
+0068 on SendInput). On stock, 4 "put back"/"restore" checks pass vacuously
+(nothing moved), after the step before them failed.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

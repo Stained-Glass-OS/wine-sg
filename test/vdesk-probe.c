@@ -16,6 +16,9 @@
  *   vdesk-probe alttab             Alt down, Tab: is the switcher up? Alt up: which
  *                                  window is in front now?
  *   vdesk-probe foreground         the foreground window's title
+ *   vdesk-probe rect TITLE         rect=l,t,r,b zoomed= iconic=
+ *   vdesk-probe workarea           work=l,t,r,b
+ *   vdesk-probe find CLASS [TITLE] whether such a window exists (and is visible)
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
@@ -157,6 +160,34 @@ int main( int argc, char **argv )
     {
         MultiByteToWideChar( CP_ACP, 0, argv[2], -1, wtitle, 64 );
         printf( "exists=%d\n", FindWindowW( wtitle, NULL ) != NULL );
+        return 0;
+    }
+    if (argc == 3 && !strcmp( argv[1], "rect" ))
+    {
+        HWND hwnd;
+        RECT rc;
+        MultiByteToWideChar( CP_ACP, 0, argv[2], -1, wtitle, 64 );
+        if (!(hwnd = FindWindowW( L"SgVdeskProbe", wtitle ))) { printf( "no window\n" ); return 1; }
+        GetWindowRect( hwnd, &rc );
+        printf( "rect=%ld,%ld,%ld,%ld zoomed=%d iconic=%d\n", rc.left, rc.top, rc.right, rc.bottom,
+                IsZoomed( hwnd ), IsIconic( hwnd ) );
+        return 0;
+    }
+    if (argc == 2 && !strcmp( argv[1], "workarea" ))
+    {
+        RECT rc;
+        SystemParametersInfoW( SPI_GETWORKAREA, 0, &rc, 0 );
+        printf( "work=%ld,%ld,%ld,%ld\n", rc.left, rc.top, rc.right, rc.bottom );
+        return 0;
+    }
+    if ((argc == 3 || argc == 4) && !strcmp( argv[1], "find" ))
+    {
+        WCHAR cls[64], title[64];
+        HWND hwnd;
+        MultiByteToWideChar( CP_ACP, 0, argv[2], -1, cls, 64 );
+        if (argc == 4) MultiByteToWideChar( CP_ACP, 0, argv[3], -1, title, 64 );
+        hwnd = FindWindowW( cls, argc == 4 ? title : NULL );
+        printf( "found=%d\n", hwnd && IsWindowVisible( hwnd ) );
         return 0;
     }
     if (argc == 2 && !strcmp( argv[1], "foreground" ))

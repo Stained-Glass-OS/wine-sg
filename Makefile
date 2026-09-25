@@ -70,6 +70,10 @@ test-wallpaper:
 test-shellfolders:
 	WINE=$(PREFIX)/bin/wine test/shellfolders-gate.sh
 
+# The Windows key's shortcuts (0071).
+test-shellkeys:
+	WINE=$(PREFIX)/bin/wine test/shellkeys-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
