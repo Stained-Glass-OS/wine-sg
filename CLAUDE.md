@@ -2026,6 +2026,62 @@ LocaleName is ignored. Stock Wine fails 5 of 6 (the unchosen check passes).
   win32u change fails "removing it gives the space back". sg-shell's
   `magnify-check.sh` and `osk-check.sh` drive the real programs on it.
 
+## `patches/sg/0190`-`0191`: WebView2 apps draw
+
+Apps built on Microsoft Edge WebView2 (the runtime is the user's: the
+Evergreen installer from Microsoft, never shipped; apps bring
+`WebView2Loader.dll`) worked except for the one thing a user sees: the
+Evergreen standalone installer runs silently (`/silent /install`, ~80 s),
+registers `HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}`
+`pv`/`location` and installs `EdgeWebView\Application\<ver>\msedgewebview2.exe`;
+the loader finds it, the environment and controller are created, pages load
+and `ExecuteScript` answers -- and nothing is ever painted. WebView2's GPU
+process calls `DCompositionCreateDevice(NULL, IID_IDCompositionDevice)`
+(Chromium's software output device on the swap-chain path), Wine answered
+`E_NOTIMPL`, the GPU process CHECKs and dies (`ProcessFailed=6`), restarts,
+gives up. No browser argument avoids the path (`--disable-gpu`,
+`--disable-direct-composition`, swiftshader... all tried).
+
+- **0190 dxgi:** `IDXGIFactory2::CreateSwapChainForComposition` for Direct3D
+  11 devices (`dlls/dxgi/composition.c`). The back buffer is a texture that
+  persists across presents; `Present` reads it back and draws it into the
+  target window with GDI -- slow next to a compositor, but simple. A private
+  interface, `IWineDXGICompositionSwapChain::set_target(hwnd, x, y)`
+  (`include/wine/winedxgi.idl`), is how DirectComposition tells it where.
+  The host window (in the app's process) can paint over the frame at any
+  time, so the last frame is drawn again 100 ms after each present and
+  every 500 ms after that: 1 run in 5 showed the page without, 5 of 5 with.
+- **0191 dcomp:** the version-1 device -- `CreateTargetForHwnd`,
+  `CreateVisual`, `Commit`, `IDCompositionTarget::SetRoot`, visuals with
+  offsets, content and children; `Commit` hands each composition swap chain
+  in a target's tree its window and offset. Version 2/3 devices still fail
+  on purpose (Chromium probes them to choose DirectComposition for GPU
+  compositing and keeps its plain window path without). Surfaces,
+  transforms, clips, effects and animations are not done.
+  **`include/dcomp.idl` had `IDCompositionVisual`'s overloads in the wrong
+  vtable order**: MSVC lays an overload set out in reverse declaration
+  order (mingw-w64's public `dcomp.h` encodes the same), so
+  `SetOffsetX(IDCompositionAnimation*)` comes before `SetOffsetX(float)`
+  (and SetOffsetY, SetTransform, SetClip). Other interfaces with overloads
+  (transforms) have the same problem, left alone: nothing implements them.
+- **Browser arguments at High integrity:** a prefix owner is an
+  administrator, and then the loader honours only the HKLM policy
+  `HKLM\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`
+  (value `*` or `<exe>`); `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` and the
+  HKCU policy are ignored. Useful for `--enable-logging --v=1` when
+  debugging; nothing needs it now.
+- **Gate: `make test-webview2`** (`test/webview2-gate.sh`,
+  `test/wv2test.c` -- our own app against the public SDK header, BSD-3,
+  fetched at test time): `WV2_INSTALLER=` the runtime installer and
+  `WV2_SDK=` the unpacked `Microsoft.Web.WebView2` package, or `NETWORK=1`
+  to fetch both into `~/.cache/stained-glass/webview2/`. Installs the
+  runtime into a fresh prefix, checks its registration, runs the app (a
+  page whose script sets the title, `ExecuteScript`) and requires the page's
+  green on the screen. Stock wine-sg fails only that last check. Not
+  verified: dxgi conformance tests, input into the WebView, a real GPU,
+  whether full Edge now takes the swap-chain path (`make test-edge`).
+  Pages appear 15-40 s after launch on a loaded machine (llvmpipe).
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

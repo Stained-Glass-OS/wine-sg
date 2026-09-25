@@ -65,6 +65,11 @@ test-winget:
 test-compress:
 	WINE=$(PREFIX)/bin/wine test/compress-gate.sh
 
+# WebView2 apps draw (0190-0191): WV2_INSTALLER=<the user's Evergreen runtime
+# installer> WV2_SDK=<unpacked Microsoft.Web.WebView2 package>, or NETWORK=1.
+test-webview2:
+	WINE=$(PREFIX)/bin/wine test/webview2-gate.sh
+
 # What Microsoft Edge needed (0049-0054); EDGE_MSI=<a user-supplied Edge
 # enterprise MSI> also installs and runs Edge itself.
 test-edge:

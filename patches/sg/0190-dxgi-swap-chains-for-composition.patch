@@ -1,0 +1,1042 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: dxgi: swap chains for composition
+
+IDXGIFactory2::CreateSwapChainForComposition was a stub. WebView2's GPU
+process makes one for every WebView (Chromium's software output device on
+the swap-chain path) and, when it fails, restarts itself for "context loss"
+until it gives up: the page loads, its script runs, and nothing is ever
+shown.
+
+A composition swap chain has no window. DirectComposition shows it as the
+content of a visual, and tells it, through the new private interface
+IWineDXGICompositionSwapChain, which window its visual tree is bound to and
+at what offset (patch 0191).
+
+Direct3D 11 devices only. The back buffer is an ordinary texture that
+persists across presents; Present reads it back and draws it into the
+target window with GDI. With no compositor, the host window (in WebView2,
+in another process) may paint over the frame at any time, so the last frame
+is drawn again 100 ms after each present and every 500 ms after that.
+
+--- a/include/wine/winedxgi.idl
++++ b/include/wine/winedxgi.idl
+@@ -87,6 +87,18 @@
+     HRESULT get_adapter_info([out] struct wine_dxgi_adapter_info *info);
+ }
+ 
++/* A swap chain made by CreateSwapChainForComposition: DirectComposition
++ * tells it which window shows it, and where, when its visual is committed. */
++[
++    object,
++    local,
++    uuid(7c3f5d2e-9a41-4b8e-b6d3-2f0e8a1c5b94)
++]
++interface IWineDXGICompositionSwapChain : IUnknown
++{
++    HRESULT set_target([in] HWND window, [in] int x, [in] int y);
++}
++
+ [
+     object,
+     local,
+--- a/dlls/dxgi/Makefile.in
++++ b/dlls/dxgi/Makefile.in
+@@ -5,6 +5,7 @@
+ 
+ SOURCES = \
+ 	adapter.c \
++	composition.c \
+ 	device.c \
+ 	dxgi_main.c \
+ 	factory.c \
+--- /dev/null
++++ b/dlls/dxgi/composition.c
+@@ -0,0 +1,944 @@
++/*
++ * Swap chains for composition (IDXGIFactory2::CreateSwapChainForComposition)
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * A composition swap chain has no window of its own: DirectComposition shows
++ * it as the content of a visual, and the visual tree is bound to a window by
++ * an IDCompositionTarget. dcomp.dll tells us that window (and the visual's
++ * offset) through IWineDXGICompositionSwapChain when the tree is committed.
++ *
++ * This implementation is for Direct3D 11 devices. The back buffer is an
++ * ordinary texture that persists across presents (so partial updates keep the
++ * rest of the frame). Present copies it into a staging texture, reads it back
++ * into memory and draws that into the target window with GDI. That is slow
++ * compared with a real compositor, but needs nothing from wined3d that a
++ * Direct3D 11 application could not do itself.
++ *
++ * On Windows the compositor puts a visual's content above whatever GDI draws
++ * in the window. Here there is no compositor: the window, or an ancestor in
++ * another process (a WebView2 host), may paint over the frame after it was
++ * drawn, and nobody tells us. So the last frame is drawn again shortly after
++ * each present and then periodically, from memory, on a thread-pool timer.
++ */
++
++#define COBJMACROS
++#include "d3d11.h"
++#include "dxgi_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(dxgi);
++
++struct composition_swapchain
++{
++    IDXGISwapChain4 IDXGISwapChain4_iface;
++    IWineDXGICompositionSwapChain IWineDXGICompositionSwapChain_iface;
++    LONG refcount;
++    struct wined3d_private_store private_store;
++
++    IWineDXGIFactory *factory;
++    ID3D11Device *device;
++    DXGI_SWAP_CHAIN_DESC1 desc;
++
++    CRITICAL_SECTION cs;
++    ID3D11Texture2D *buffer;
++    ID3D11Texture2D *staging;
++    DWORD *frame;               /* last presented frame, BGRX, width * height */
++    UINT frame_width, frame_height;
++    TP_TIMER *refresh_timer;
++    HWND window;
++    int x, y;
++    LONG present_count;
++    DXGI_RGBA background;
++    DXGI_MODE_ROTATION rotation;
++    UINT max_latency;
++};
++
++static inline struct composition_swapchain *impl_from_IDXGISwapChain4(IDXGISwapChain4 *iface)
++{
++    return CONTAINING_RECORD(iface, struct composition_swapchain, IDXGISwapChain4_iface);
++}
++
++static inline struct composition_swapchain *impl_from_IWineDXGICompositionSwapChain(IWineDXGICompositionSwapChain *iface)
++{
++    return CONTAINING_RECORD(iface, struct composition_swapchain, IWineDXGICompositionSwapChain_iface);
++}
++
++static BOOL composition_format_supported(DXGI_FORMAT format)
++{
++    switch (format)
++    {
++        case DXGI_FORMAT_B8G8R8A8_UNORM:
++        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++        case DXGI_FORMAT_R8G8B8A8_UNORM:
++        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++            return TRUE;
++        default:
++            return FALSE;
++    }
++}
++
++static HRESULT composition_create_buffers(struct composition_swapchain *swapchain)
++{
++    D3D11_TEXTURE2D_DESC desc;
++    HRESULT hr;
++
++    desc.Width = swapchain->desc.Width;
++    desc.Height = swapchain->desc.Height;
++    desc.MipLevels = 1;
++    desc.ArraySize = 1;
++    desc.Format = swapchain->desc.Format;
++    desc.SampleDesc.Count = 1;
++    desc.SampleDesc.Quality = 0;
++    desc.Usage = D3D11_USAGE_DEFAULT;
++    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++    desc.CPUAccessFlags = 0;
++    desc.MiscFlags = 0;
++    if (FAILED(hr = ID3D11Device_CreateTexture2D(swapchain->device, &desc, NULL, &swapchain->buffer)))
++    {
++        WARN("Failed to create back buffer, hr %#lx.\n", hr);
++        return hr;
++    }
++
++    desc.Usage = D3D11_USAGE_STAGING;
++    desc.BindFlags = 0;
++    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    if (FAILED(hr = ID3D11Device_CreateTexture2D(swapchain->device, &desc, NULL, &swapchain->staging)))
++    {
++        WARN("Failed to create staging texture, hr %#lx.\n", hr);
++        ID3D11Texture2D_Release(swapchain->buffer);
++        swapchain->buffer = NULL;
++        return hr;
++    }
++    return S_OK;
++}
++
++static void composition_destroy_buffers(struct composition_swapchain *swapchain)
++{
++    if (swapchain->buffer)
++        ID3D11Texture2D_Release(swapchain->buffer);
++    if (swapchain->staging)
++        ID3D11Texture2D_Release(swapchain->staging);
++    swapchain->buffer = NULL;
++    swapchain->staging = NULL;
++}
++
++/* Draws the last presented frame into the target window. Called with the
++ * critical section held; touches no Direct3D state, so any thread may call it. */
++static void composition_draw(struct composition_swapchain *swapchain)
++{
++    BITMAPINFO info;
++    HDC dc;
++
++    if (!swapchain->window || !swapchain->frame || !IsWindowVisible(swapchain->window))
++        return;
++
++    memset(&info, 0, sizeof(info));
++    info.bmiHeader.biSize = sizeof(info.bmiHeader);
++    info.bmiHeader.biWidth = swapchain->frame_width;
++    info.bmiHeader.biHeight = -(LONG)swapchain->frame_height;
++    info.bmiHeader.biPlanes = 1;
++    info.bmiHeader.biBitCount = 32;
++    info.bmiHeader.biCompression = BI_RGB;
++
++    if ((dc = GetDCEx(swapchain->window, 0, DCX_CACHE | DCX_CLIPSIBLINGS)))
++    {
++        SetDIBitsToDevice(dc, swapchain->x, swapchain->y, swapchain->frame_width, swapchain->frame_height,
++                0, 0, 0, swapchain->frame_height, swapchain->frame, &info, DIB_RGB_COLORS);
++        ReleaseDC(swapchain->window, dc);
++    }
++}
++
++/* Reads the back buffer into memory. Called with the critical section held,
++ * on the thread that presents. Premultiplied alpha is drawn opaque: nothing
++ * is composed beneath the visual here. */
++static void composition_read_frame(struct composition_swapchain *swapchain)
++{
++    UINT width = swapchain->desc.Width, height = swapchain->desc.Height, i, j;
++    BOOL swap_rb = swapchain->desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM
++            || swapchain->desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
++    ID3D11DeviceContext *context;
++    D3D11_MAPPED_SUBRESOURCE map;
++    const BYTE *src;
++    DWORD *dst;
++    HRESULT hr;
++
++    if (swapchain->frame_width != width || swapchain->frame_height != height)
++    {
++        free(swapchain->frame);
++        swapchain->frame_width = swapchain->frame_height = 0;
++        if (!(swapchain->frame = malloc(width * height * sizeof(*swapchain->frame))))
++            return;
++        swapchain->frame_width = width;
++        swapchain->frame_height = height;
++    }
++
++    ID3D11Device_GetImmediateContext(swapchain->device, &context);
++    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)swapchain->staging,
++            (ID3D11Resource *)swapchain->buffer);
++    if (FAILED(hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)swapchain->staging, 0,
++            D3D11_MAP_READ, 0, &map)))
++    {
++        WARN("Failed to map staging texture, hr %#lx.\n", hr);
++        ID3D11DeviceContext_Release(context);
++        return;
++    }
++    for (i = 0; i < height; ++i)
++    {
++        src = (const BYTE *)map.pData + i * map.RowPitch;
++        dst = swapchain->frame + i * width;
++        if (!swap_rb)
++            memcpy(dst, src, width * 4);
++        else
++            for (j = 0; j < width; ++j)
++                dst[j] = src[j * 4 + 2] | (src[j * 4 + 1] << 8) | (src[j * 4] << 16) | (src[j * 4 + 3] << 24);
++    }
++    ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)swapchain->staging, 0);
++    ID3D11DeviceContext_Release(context);
++}
++
++static void CALLBACK composition_refresh(TP_CALLBACK_INSTANCE *instance, void *context, TP_TIMER *timer)
++{
++    struct composition_swapchain *swapchain = context;
++
++    EnterCriticalSection(&swapchain->cs);
++    composition_draw(swapchain);
++    LeaveCriticalSection(&swapchain->cs);
++}
++
++/* Draw again 100 ms from now, then every 500 ms. */
++static void composition_schedule_refresh(struct composition_swapchain *swapchain)
++{
++    LARGE_INTEGER due;
++    FILETIME ft;
++
++    if (!swapchain->refresh_timer)
++        return;
++    due.QuadPart = -100 * 10000;
++    ft.dwLowDateTime = due.u.LowPart;
++    ft.dwHighDateTime = due.u.HighPart;
++    SetThreadpoolTimer(swapchain->refresh_timer, &ft, 500, 50);
++}
++
++/* IUnknown methods */
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_QueryInterface(IDXGISwapChain4 *iface, REFIID riid, void **object)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, riid %s, object %p.\n", iface, debugstr_guid(riid), object);
++
++    if (IsEqualGUID(riid, &IID_IUnknown)
++            || IsEqualGUID(riid, &IID_IDXGIObject)
++            || IsEqualGUID(riid, &IID_IDXGIDeviceSubObject)
++            || IsEqualGUID(riid, &IID_IDXGISwapChain)
++            || IsEqualGUID(riid, &IID_IDXGISwapChain1)
++            || IsEqualGUID(riid, &IID_IDXGISwapChain2)
++            || IsEqualGUID(riid, &IID_IDXGISwapChain3)
++            || IsEqualGUID(riid, &IID_IDXGISwapChain4))
++    {
++        IDXGISwapChain4_AddRef(iface);
++        *object = iface;
++        return S_OK;
++    }
++    if (IsEqualGUID(riid, &IID_IWineDXGICompositionSwapChain))
++    {
++        IDXGISwapChain4_AddRef(iface);
++        *object = &swapchain->IWineDXGICompositionSwapChain_iface;
++        return S_OK;
++    }
++
++    WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(riid));
++    *object = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE composition_swapchain_AddRef(IDXGISwapChain4 *iface)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++    ULONG refcount = InterlockedIncrement(&swapchain->refcount);
++
++    TRACE("%p increasing refcount to %lu.\n", swapchain, refcount);
++    return refcount;
++}
++
++static ULONG STDMETHODCALLTYPE composition_swapchain_Release(IDXGISwapChain4 *iface)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++    ULONG refcount = InterlockedDecrement(&swapchain->refcount);
++
++    TRACE("%p decreasing refcount to %lu.\n", swapchain, refcount);
++
++    if (!refcount)
++    {
++        if (swapchain->refresh_timer)
++        {
++            SetThreadpoolTimer(swapchain->refresh_timer, NULL, 0, 0);
++            WaitForThreadpoolTimerCallbacks(swapchain->refresh_timer, TRUE);
++            CloseThreadpoolTimer(swapchain->refresh_timer);
++        }
++        free(swapchain->frame);
++        composition_destroy_buffers(swapchain);
++        wined3d_private_store_cleanup(&swapchain->private_store);
++        swapchain->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection(&swapchain->cs);
++        ID3D11Device_Release(swapchain->device);
++        IWineDXGIFactory_Release(swapchain->factory);
++        free(swapchain);
++    }
++    return refcount;
++}
++
++/* IDXGIObject methods */
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetPrivateData(IDXGISwapChain4 *iface,
++        REFGUID guid, UINT data_size, const void *data)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, guid %s, data_size %u, data %p.\n", iface, debugstr_guid(guid), data_size, data);
++    return dxgi_set_private_data(&swapchain->private_store, guid, data_size, data);
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetPrivateDataInterface(IDXGISwapChain4 *iface,
++        REFGUID guid, const IUnknown *object)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, guid %s, object %p.\n", iface, debugstr_guid(guid), object);
++    return dxgi_set_private_data_interface(&swapchain->private_store, guid, object);
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetPrivateData(IDXGISwapChain4 *iface,
++        REFGUID guid, UINT *data_size, void *data)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, guid %s, data_size %p, data %p.\n", iface, debugstr_guid(guid), data_size, data);
++    return dxgi_get_private_data(&swapchain->private_store, guid, data_size, data);
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetParent(IDXGISwapChain4 *iface, REFIID riid, void **parent)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, riid %s, parent %p.\n", iface, debugstr_guid(riid), parent);
++    return IWineDXGIFactory_QueryInterface(swapchain->factory, riid, parent);
++}
++
++/* IDXGIDeviceSubObject methods */
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetDevice(IDXGISwapChain4 *iface, REFIID riid, void **device)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, riid %s, device %p.\n", iface, debugstr_guid(riid), device);
++    return ID3D11Device_QueryInterface(swapchain->device, riid, device);
++}
++
++/* IDXGISwapChain methods */
++
++static HRESULT composition_present(struct composition_swapchain *swapchain, UINT flags)
++{
++    if (flags & DXGI_PRESENT_TEST)
++        return S_OK;
++
++    EnterCriticalSection(&swapchain->cs);
++    if (swapchain->buffer)
++    {
++        composition_read_frame(swapchain);
++        composition_draw(swapchain);
++        composition_schedule_refresh(swapchain);
++    }
++    LeaveCriticalSection(&swapchain->cs);
++
++    InterlockedIncrement(&swapchain->present_count);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_Present(IDXGISwapChain4 *iface, UINT sync_interval, UINT flags)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, sync_interval %u, flags %#x.\n", iface, sync_interval, flags);
++    return composition_present(swapchain, flags);
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetBuffer(IDXGISwapChain4 *iface,
++        UINT buffer_idx, REFIID riid, void **surface)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, buffer_idx %u, riid %s, surface %p.\n", iface, buffer_idx, debugstr_guid(riid), surface);
++
++    /* Flip model: only the current back buffer, index 0, can be written. */
++    if (buffer_idx)
++    {
++        WARN("Buffer %u requested; only buffer 0 is accessible.\n", buffer_idx);
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
++    EnterCriticalSection(&swapchain->cs);
++    hr = swapchain->buffer ? ID3D11Texture2D_QueryInterface(swapchain->buffer, riid, surface) : DXGI_ERROR_INVALID_CALL;
++    LeaveCriticalSection(&swapchain->cs);
++    return hr;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetFullscreenState(IDXGISwapChain4 *iface,
++        BOOL fullscreen, IDXGIOutput *target)
++{
++    TRACE("iface %p, fullscreen %#x, target %p.\n", iface, fullscreen, target);
++
++    return fullscreen ? DXGI_ERROR_INVALID_CALL : S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetFullscreenState(IDXGISwapChain4 *iface,
++        BOOL *fullscreen, IDXGIOutput **target)
++{
++    TRACE("iface %p, fullscreen %p, target %p.\n", iface, fullscreen, target);
++
++    if (fullscreen)
++        *fullscreen = FALSE;
++    if (target)
++        *target = NULL;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetDesc(IDXGISwapChain4 *iface, DXGI_SWAP_CHAIN_DESC *desc)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, desc %p.\n", iface, desc);
++
++    if (!desc)
++        return E_INVALIDARG;
++
++    memset(desc, 0, sizeof(*desc));
++    desc->BufferDesc.Width = swapchain->desc.Width;
++    desc->BufferDesc.Height = swapchain->desc.Height;
++    desc->BufferDesc.Format = swapchain->desc.Format;
++    desc->SampleDesc = swapchain->desc.SampleDesc;
++    desc->BufferUsage = swapchain->desc.BufferUsage;
++    desc->BufferCount = swapchain->desc.BufferCount;
++    desc->OutputWindow = NULL;
++    desc->Windowed = TRUE;
++    desc->SwapEffect = swapchain->desc.SwapEffect;
++    desc->Flags = swapchain->desc.Flags;
++    return S_OK;
++}
++
++static HRESULT composition_resize(struct composition_swapchain *swapchain, UINT buffer_count,
++        UINT width, UINT height, DXGI_FORMAT format, UINT flags)
++{
++    DXGI_SWAP_CHAIN_DESC1 old = swapchain->desc;
++    HRESULT hr;
++
++    if (format != DXGI_FORMAT_UNKNOWN && !composition_format_supported(format))
++    {
++        FIXME("Unsupported format %#x.\n", format);
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
++    EnterCriticalSection(&swapchain->cs);
++    if (buffer_count)
++        swapchain->desc.BufferCount = buffer_count;
++    /* A composition swap chain has no window to take a size from. */
++    if (width)
++        swapchain->desc.Width = width;
++    if (height)
++        swapchain->desc.Height = height;
++    if (format != DXGI_FORMAT_UNKNOWN)
++        swapchain->desc.Format = format;
++    swapchain->desc.Flags = flags;
++
++    composition_destroy_buffers(swapchain);
++    if (FAILED(hr = composition_create_buffers(swapchain)))
++    {
++        swapchain->desc = old;
++        composition_create_buffers(swapchain);
++    }
++    LeaveCriticalSection(&swapchain->cs);
++    return hr;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_ResizeBuffers(IDXGISwapChain4 *iface,
++        UINT buffer_count, UINT width, UINT height, DXGI_FORMAT format, UINT flags)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, buffer_count %u, width %u, height %u, format %s, flags %#x.\n",
++            iface, buffer_count, width, height, debug_dxgi_format(format), flags);
++
++    return composition_resize(swapchain, buffer_count, width, height, format, flags);
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_ResizeTarget(IDXGISwapChain4 *iface,
++        const DXGI_MODE_DESC *target_mode_desc)
++{
++    TRACE("iface %p, target_mode_desc %p.\n", iface, target_mode_desc);
++
++    return DXGI_ERROR_INVALID_CALL;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetContainingOutput(IDXGISwapChain4 *iface, IDXGIOutput **output)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++    IDXGIAdapter *adapter;
++    IDXGIDevice *device;
++    HRESULT hr;
++
++    TRACE("iface %p, output %p.\n", iface, output);
++
++    if (FAILED(hr = ID3D11Device_QueryInterface(swapchain->device, &IID_IDXGIDevice, (void **)&device)))
++        return hr;
++    hr = IDXGIDevice_GetAdapter(device, &adapter);
++    IDXGIDevice_Release(device);
++    if (FAILED(hr))
++        return hr;
++    hr = IDXGIAdapter_EnumOutputs(adapter, 0, output);
++    IDXGIAdapter_Release(adapter);
++    return hr;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetFrameStatistics(IDXGISwapChain4 *iface,
++        DXGI_FRAME_STATISTICS *stats)
++{
++    FIXME("iface %p, stats %p stub!\n", iface, stats);
++
++    return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetLastPresentCount(IDXGISwapChain4 *iface,
++        UINT *last_present_count)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, last_present_count %p.\n", iface, last_present_count);
++
++    *last_present_count = swapchain->present_count;
++    return S_OK;
++}
++
++/* IDXGISwapChain1 methods */
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetDesc1(IDXGISwapChain4 *iface, DXGI_SWAP_CHAIN_DESC1 *desc)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, desc %p.\n", iface, desc);
++
++    if (!desc)
++        return E_INVALIDARG;
++    *desc = swapchain->desc;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetFullscreenDesc(IDXGISwapChain4 *iface,
++        DXGI_SWAP_CHAIN_FULLSCREEN_DESC *desc)
++{
++    TRACE("iface %p, desc %p.\n", iface, desc);
++
++    /* Only swap chains for windows have one. */
++    return DXGI_ERROR_INVALID_CALL;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetHwnd(IDXGISwapChain4 *iface, HWND *hwnd)
++{
++    TRACE("iface %p, hwnd %p.\n", iface, hwnd);
++
++    if (!hwnd)
++        return DXGI_ERROR_INVALID_CALL;
++    *hwnd = NULL;
++    return DXGI_ERROR_INVALID_CALL;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetCoreWindow(IDXGISwapChain4 *iface,
++        REFIID iid, void **core_window)
++{
++    TRACE("iface %p, iid %s, core_window %p.\n", iface, debugstr_guid(iid), core_window);
++
++    if (core_window)
++        *core_window = NULL;
++    return DXGI_ERROR_INVALID_CALL;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_Present1(IDXGISwapChain4 *iface,
++        UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS *present_parameters)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, sync_interval %u, flags %#x, present_parameters %p.\n",
++            iface, sync_interval, flags, present_parameters);
++
++    /* Dirty rectangles and scrolling are hints; the whole buffer is shown. */
++    return composition_present(swapchain, flags);
++}
++
++static BOOL STDMETHODCALLTYPE composition_swapchain_IsTemporaryMonoSupported(IDXGISwapChain4 *iface)
++{
++    TRACE("iface %p.\n", iface);
++
++    return FALSE;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetRestrictToOutput(IDXGISwapChain4 *iface, IDXGIOutput **output)
++{
++    TRACE("iface %p, output %p.\n", iface, output);
++
++    if (!output)
++        return E_INVALIDARG;
++    *output = NULL;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetBackgroundColor(IDXGISwapChain4 *iface, const DXGI_RGBA *color)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, color %p.\n", iface, color);
++
++    if (!color)
++        return E_INVALIDARG;
++    swapchain->background = *color;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetBackgroundColor(IDXGISwapChain4 *iface, DXGI_RGBA *color)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, color %p.\n", iface, color);
++
++    if (!color)
++        return E_INVALIDARG;
++    *color = swapchain->background;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetRotation(IDXGISwapChain4 *iface, DXGI_MODE_ROTATION rotation)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, rotation %#x.\n", iface, rotation);
++
++    if (rotation != DXGI_MODE_ROTATION_IDENTITY)
++        FIXME("Rotation %#x is not applied.\n", rotation);
++    swapchain->rotation = rotation;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetRotation(IDXGISwapChain4 *iface, DXGI_MODE_ROTATION *rotation)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, rotation %p.\n", iface, rotation);
++
++    if (!rotation)
++        return E_INVALIDARG;
++    *rotation = swapchain->rotation;
++    return S_OK;
++}
++
++/* IDXGISwapChain2 methods */
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetSourceSize(IDXGISwapChain4 *iface, UINT width, UINT height)
++{
++    FIXME("iface %p, width %u, height %u stub!\n", iface, width, height);
++
++    return E_NOTIMPL;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetSourceSize(IDXGISwapChain4 *iface, UINT *width, UINT *height)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, width %p, height %p.\n", iface, width, height);
++
++    if (!width || !height)
++        return E_INVALIDARG;
++    *width = swapchain->desc.Width;
++    *height = swapchain->desc.Height;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetMaximumFrameLatency(IDXGISwapChain4 *iface, UINT max_latency)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, max_latency %u.\n", iface, max_latency);
++
++    if (!max_latency || max_latency > DXGI_MAX_SWAP_CHAIN_BUFFERS)
++        return DXGI_ERROR_INVALID_CALL;
++    swapchain->max_latency = max_latency;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetMaximumFrameLatency(IDXGISwapChain4 *iface, UINT *max_latency)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, max_latency %p.\n", iface, max_latency);
++
++    if (!max_latency)
++        return DXGI_ERROR_INVALID_CALL;
++    *max_latency = swapchain->max_latency;
++    return S_OK;
++}
++
++static HANDLE STDMETHODCALLTYPE composition_swapchain_GetFrameLatencyWaitableObject(IDXGISwapChain4 *iface)
++{
++    FIXME("iface %p stub!\n", iface);
++
++    return NULL;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetMatrixTransform(IDXGISwapChain4 *iface,
++        const DXGI_MATRIX_3X2_F *matrix)
++{
++    FIXME("iface %p, matrix %p stub!\n", iface, matrix);
++
++    return E_NOTIMPL;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_GetMatrixTransform(IDXGISwapChain4 *iface,
++        DXGI_MATRIX_3X2_F *matrix)
++{
++    FIXME("iface %p, matrix %p stub!\n", iface, matrix);
++
++    return E_NOTIMPL;
++}
++
++/* IDXGISwapChain3 methods */
++
++static UINT STDMETHODCALLTYPE composition_swapchain_GetCurrentBackBufferIndex(IDXGISwapChain4 *iface)
++{
++    TRACE("iface %p.\n", iface);
++
++    return 0;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_CheckColorSpaceSupport(IDXGISwapChain4 *iface,
++        DXGI_COLOR_SPACE_TYPE colour_space, UINT *colour_space_support)
++{
++    TRACE("iface %p, colour_space %#x, colour_space_support %p.\n", iface, colour_space, colour_space_support);
++
++    if (!colour_space_support)
++        return E_INVALIDARG;
++    *colour_space_support = colour_space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
++            ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT : 0;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetColorSpace1(IDXGISwapChain4 *iface,
++        DXGI_COLOR_SPACE_TYPE colour_space)
++{
++    TRACE("iface %p, colour_space %#x.\n", iface, colour_space);
++
++    if (colour_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
++    {
++        FIXME("Colour space %#x is not supported.\n", colour_space);
++        return DXGI_ERROR_UNSUPPORTED;
++    }
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_ResizeBuffers1(IDXGISwapChain4 *iface,
++        UINT buffer_count, UINT width, UINT height, DXGI_FORMAT format, UINT flags,
++        const UINT *node_mask, IUnknown * const *present_queue)
++{
++    struct composition_swapchain *swapchain = impl_from_IDXGISwapChain4(iface);
++
++    TRACE("iface %p, buffer_count %u, width %u, height %u, format %s, flags %#x, "
++            "node_mask %p, present_queue %p.\n",
++            iface, buffer_count, width, height, debug_dxgi_format(format), flags, node_mask, present_queue);
++
++    return composition_resize(swapchain, buffer_count, width, height, format, flags);
++}
++
++/* IDXGISwapChain4 methods */
++
++static HRESULT STDMETHODCALLTYPE composition_swapchain_SetHDRMetaData(IDXGISwapChain4 *iface,
++        DXGI_HDR_METADATA_TYPE type, UINT size, void *metadata)
++{
++    FIXME("iface %p, type %#x, size %#x, metadata %p stub!\n", iface, type, size, metadata);
++
++    return type == DXGI_HDR_METADATA_TYPE_NONE ? S_OK : DXGI_ERROR_UNSUPPORTED;
++}
++
++static const struct IDXGISwapChain4Vtbl composition_swapchain_vtbl =
++{
++    /* IUnknown methods */
++    composition_swapchain_QueryInterface,
++    composition_swapchain_AddRef,
++    composition_swapchain_Release,
++    /* IDXGIObject methods */
++    composition_swapchain_SetPrivateData,
++    composition_swapchain_SetPrivateDataInterface,
++    composition_swapchain_GetPrivateData,
++    composition_swapchain_GetParent,
++    /* IDXGIDeviceSubObject methods */
++    composition_swapchain_GetDevice,
++    /* IDXGISwapChain methods */
++    composition_swapchain_Present,
++    composition_swapchain_GetBuffer,
++    composition_swapchain_SetFullscreenState,
++    composition_swapchain_GetFullscreenState,
++    composition_swapchain_GetDesc,
++    composition_swapchain_ResizeBuffers,
++    composition_swapchain_ResizeTarget,
++    composition_swapchain_GetContainingOutput,
++    composition_swapchain_GetFrameStatistics,
++    composition_swapchain_GetLastPresentCount,
++    /* IDXGISwapChain1 methods */
++    composition_swapchain_GetDesc1,
++    composition_swapchain_GetFullscreenDesc,
++    composition_swapchain_GetHwnd,
++    composition_swapchain_GetCoreWindow,
++    composition_swapchain_Present1,
++    composition_swapchain_IsTemporaryMonoSupported,
++    composition_swapchain_GetRestrictToOutput,
++    composition_swapchain_SetBackgroundColor,
++    composition_swapchain_GetBackgroundColor,
++    composition_swapchain_SetRotation,
++    composition_swapchain_GetRotation,
++    /* IDXGISwapChain2 methods */
++    composition_swapchain_SetSourceSize,
++    composition_swapchain_GetSourceSize,
++    composition_swapchain_SetMaximumFrameLatency,
++    composition_swapchain_GetMaximumFrameLatency,
++    composition_swapchain_GetFrameLatencyWaitableObject,
++    composition_swapchain_SetMatrixTransform,
++    composition_swapchain_GetMatrixTransform,
++    /* IDXGISwapChain3 methods */
++    composition_swapchain_GetCurrentBackBufferIndex,
++    composition_swapchain_CheckColorSpaceSupport,
++    composition_swapchain_SetColorSpace1,
++    composition_swapchain_ResizeBuffers1,
++    /* IDXGISwapChain4 methods */
++    composition_swapchain_SetHDRMetaData,
++};
++
++/* IWineDXGICompositionSwapChain methods */
++
++static HRESULT STDMETHODCALLTYPE composition_target_QueryInterface(IWineDXGICompositionSwapChain *iface,
++        REFIID riid, void **object)
++{
++    struct composition_swapchain *swapchain = impl_from_IWineDXGICompositionSwapChain(iface);
++
++    return composition_swapchain_QueryInterface(&swapchain->IDXGISwapChain4_iface, riid, object);
++}
++
++static ULONG STDMETHODCALLTYPE composition_target_AddRef(IWineDXGICompositionSwapChain *iface)
++{
++    struct composition_swapchain *swapchain = impl_from_IWineDXGICompositionSwapChain(iface);
++
++    return composition_swapchain_AddRef(&swapchain->IDXGISwapChain4_iface);
++}
++
++static ULONG STDMETHODCALLTYPE composition_target_Release(IWineDXGICompositionSwapChain *iface)
++{
++    struct composition_swapchain *swapchain = impl_from_IWineDXGICompositionSwapChain(iface);
++
++    return composition_swapchain_Release(&swapchain->IDXGISwapChain4_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE composition_target_set_target(IWineDXGICompositionSwapChain *iface,
++        HWND window, int x, int y)
++{
++    struct composition_swapchain *swapchain = impl_from_IWineDXGICompositionSwapChain(iface);
++
++    TRACE("iface %p, window %p, x %d, y %d.\n", iface, window, x, y);
++
++    EnterCriticalSection(&swapchain->cs);
++    swapchain->window = window;
++    swapchain->x = x;
++    swapchain->y = y;
++    composition_draw(swapchain);
++    composition_schedule_refresh(swapchain);
++    LeaveCriticalSection(&swapchain->cs);
++    return S_OK;
++}
++
++static const struct IWineDXGICompositionSwapChainVtbl composition_target_vtbl =
++{
++    composition_target_QueryInterface,
++    composition_target_AddRef,
++    composition_target_Release,
++    composition_target_set_target,
++};
++
++HRESULT dxgi_composition_swapchain_create(IWineDXGIFactory *factory, IUnknown *device,
++        const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGISwapChain1 **ret)
++{
++    struct composition_swapchain *swapchain;
++    ID3D11Device *d3d11_device;
++    HRESULT hr;
++
++    if (FAILED(IUnknown_QueryInterface(device, &IID_ID3D11Device, (void **)&d3d11_device)))
++    {
++        FIXME("Composition swap chains are only implemented for Direct3D 11 devices.\n");
++        return E_NOTIMPL;
++    }
++
++    /* Composition swap chains must use the flip model, and have no scaling
++     * that needs a window. */
++    if ((desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)
++            || !desc->Width || !desc->Height || desc->Scaling == DXGI_SCALING_NONE)
++    {
++        WARN("Invalid description for a composition swap chain.\n");
++        ID3D11Device_Release(d3d11_device);
++        return DXGI_ERROR_INVALID_CALL;
++    }
++    if (!composition_format_supported(desc->Format))
++    {
++        FIXME("Unsupported format %s.\n", debug_dxgi_format(desc->Format));
++        ID3D11Device_Release(d3d11_device);
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
++    if (!(swapchain = calloc(1, sizeof(*swapchain))))
++    {
++        ID3D11Device_Release(d3d11_device);
++        return E_OUTOFMEMORY;
++    }
++
++    swapchain->IDXGISwapChain4_iface.lpVtbl = &composition_swapchain_vtbl;
++    swapchain->IWineDXGICompositionSwapChain_iface.lpVtbl = &composition_target_vtbl;
++    swapchain->refcount = 1;
++    wined3d_private_store_init(&swapchain->private_store);
++    swapchain->factory = factory;
++    IWineDXGIFactory_AddRef(factory);
++    swapchain->device = d3d11_device;
++    swapchain->desc = *desc;
++    swapchain->max_latency = 3;
++    InitializeCriticalSectionEx(&swapchain->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    swapchain->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": composition_swapchain.cs");
++
++    if (FAILED(hr = composition_create_buffers(swapchain)))
++    {
++        IDXGISwapChain4_Release(&swapchain->IDXGISwapChain4_iface);
++        return hr;
++    }
++    if (!(swapchain->refresh_timer = CreateThreadpoolTimer(composition_refresh, swapchain, NULL)))
++        WARN("Failed to create the refresh timer, error %lu.\n", GetLastError());
++
++    TRACE("Created composition swapchain %p.\n", swapchain);
++    *ret = (IDXGISwapChain1 *)&swapchain->IDXGISwapChain4_iface;
++    return S_OK;
++}
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -188,6 +188,8 @@
+ HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,
+         struct wined3d_swapchain_desc *desc);
+ 
++HRESULT dxgi_composition_swapchain_create(IWineDXGIFactory *factory, IUnknown *device,
++        const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGISwapChain1 **swapchain);
+ HRESULT d3d12_swapchain_create(IWineDXGIFactory *factory, ID3D12CommandQueue *queue, HWND window,
+         const DXGI_SWAP_CHAIN_DESC1 *swapchain_desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc,
+         IDXGISwapChain1 **swapchain);
+--- a/dlls/dxgi/factory.c
++++ b/dlls/dxgi/factory.c
+@@ -381,10 +381,28 @@
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
+         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
+ {
+-    FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
++    TRACE("iface %p, device %p, desc %p, output %p, swapchain %p.\n",
+             iface, device, desc, output, swapchain);
+ 
+-    return E_NOTIMPL;
++    if (!device || !desc || !swapchain)
++    {
++        WARN("Invalid pointer.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
++    if (desc->Stereo)
++    {
++        FIXME("Stereo swapchains are not supported.\n");
++        return DXGI_ERROR_UNSUPPORTED;
++    }
++
++    if (!dxgi_validate_swapchain_desc(desc))
++        return DXGI_ERROR_INVALID_CALL;
++
++    if (output)
++        FIXME("Ignoring output %p.\n", output);
++
++    return dxgi_composition_swapchain_create(iface, device, desc, swapchain);
+ }
+ 
+ static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)
