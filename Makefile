@@ -207,6 +207,10 @@ test-notepad:
 test-notepad-print:
 	WINE=$(PREFIX)/bin/wine test/notepad-print-gate.sh
 
+# Notepad's minimap (0100).
+test-notepad-minimap:
+	WINE=$(PREFIX)/bin/wine test/notepad-minimap-gate.sh
+
 # A pipe end reports how much it can write (0083).
 test-pipequota:
 	WINE=$(PREFIX)/bin/wine test/pipequota-gate.sh

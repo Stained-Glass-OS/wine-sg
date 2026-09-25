@@ -1720,6 +1720,30 @@ current in every prefix with nothing to install.
 - New strings are English only; the `.po` translations still cover the
   strings Wine's Notepad had.
 
+- **The minimap** (Kate's; View > Minimap; `sgMinimap` 2 = code files, the
+  default, 1 always, 0 never -- the editor option `EDOPTS.minimap`): a strip
+  inside the editor control, right of the text (`e->cw` is the text's
+  width, `e->full_w` the client's). A document that fits gets `mm_row()` px
+  a line (2 at 96 dpi); a longer one is compressed to the strip's height
+  (`mm_line_at`/`mm_y_of`), a pixel row per n/h lines, drawn from the line
+  it stands for. Pixels go straight into a 32-bit DIB (`mm_paint`), only
+  for the rows shown; a compressed strip never lexes past `hl_valid` (lines
+  beyond are coloured from the start state), so opening a 300 000-line file
+  does not lex it all. The band (the lines on screen, at least 2 px) is
+  shaded; a click centres the editor on the line under it, dragging
+  follows (captured). Colours are mixes of the theme's bg/fg/styles, so
+  dark mode needs nothing. `SGE_GETMINIMAP`, `SGE_GETMMLINE`,
+  `SGE_GETTOPLINE`, `SGE_GETVISROWS` are for the gate.
+
+**Gate: `make test-notepad-minimap`** (`test/notepad-minimap-gate.sh`), 15
+checks: a C file's strip in the lexer's colours, the whole 10 000-line
+document in it, the band at the top; a click on row 300 centring the
+editor on that row's line (the band follows), a drag, a short file at 2 px
+a line; a 300 000-line file: a click at the foot reaches the end, quickly;
+the dark theme; a .txt with none until View > Minimap, and the choice kept.
+Mutants `SG_MUTANT_MMSCALE` (no compression) and `SG_MUTANT_MMCLICK`
+(clicks ignored) fail 4 and 6; stock has no minimap.
+
 **Gate: `make test-notepad-print`** (`test/notepad-print-gate.sh`), 13
 checks: the dark bar's pixels and its light item text, Alt+F on the
 owner-drawn bar, the light theme's bar back to light; Page Setup's boxes
