@@ -7,6 +7,8 @@
  *                                           window=0x.. class=.. title=.. WxH
  *                                           or window=none alive=0|1
  *   compat-probe close HWND                 WM_CLOSE, then whether it went
+ *                                           (closed=) and its process ended
+ *                                           within 30 s (exited=)
  *   compat-probe alive EXE-NAME             whether a process of that name runs
  *   compat-probe list                       every top-level window: pid, class,
  *                                           visible, iconic, rect, title (triage)
@@ -179,6 +181,16 @@ int wmain( int argc, WCHAR **argv )
             Sleep( 250 );
         }
         printf( "closed=%d\n", !IsWindow( hwnd ) || !IsWindowVisible( hwnd ) );
+        /* and whether its process then ends (a hung shutdown keeps it) */
+        {
+            HANDLE process = OpenProcess( SYNCHRONIZE, FALSE, close_pid );
+            if (process)
+            {
+                printf( "exited=%d\n", WaitForSingleObject( process, 30000 ) == WAIT_OBJECT_0 );
+                CloseHandle( process );
+            }
+            else printf( "exited=1\n" );
+        }
         return 0;
     }
     if (argc == 2 && !lstrcmpW( argv[1], L"list" ))

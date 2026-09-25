@@ -24,7 +24,7 @@ MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 CACHE="${CACHE:-$HOME/.cache/sg-compat}"
 ARTIFACTS="${ARTIFACTS:-$HERE/../../build/compat-results}"
 export WINESERVER
-for t in "$MINGW" xvfb-run import sha256sum curl; do command -v "$t" >/dev/null || { echo "SKIP: $t not installed"; exit 77; }; done
+for t in "$MINGW" xvfb-run import sha256sum curl unzip; do command -v "$t" >/dev/null || { echo "SKIP: $t not installed"; exit 77; }; done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 mkdir -p "$CACHE" "$ARTIFACTS"
 ARTIFACTS=$(cd "$ARTIFACTS" && pwd)
@@ -47,7 +47,9 @@ grep -v '^#' "$HERE/apps.list" | grep -v '^$' | while IFS='|' read -r name file 
     dl=- inst=- files=- sm=- la=- cl=- notes=""
     echo "== $name" | tee -a "$L"
 
-    # download
+    # download; "OUTER.zip!INNER" is an installer shipped inside a zip (the
+    # hash is the zip's)
+    inner=""; case "$file" in *!*) inner=${file#*!}; file=${file%%!*} ;; esac
     if [ ! -s "$CACHE/$file" ] && [ "${OFFLINE:-0}" != 1 ]; then curl -sL --max-time 1800 -o "$CACHE/$file.part" "$url" && mv "$CACHE/$file.part" "$CACHE/$file"; fi
     if [ -s "$CACHE/$file" ] && [ "$(sha256sum "$CACHE/$file" | cut -d' ' -f1)" = "$sha" ]; then dl=PASS; else dl=FAIL; notes="hash/download"; fi
 
@@ -69,7 +71,12 @@ grep -v '^#' "$HERE/apps.list" | grep -v '^$' | while IFS='|' read -r name file 
         done
         "$WINESERVER" -w
         cp "$T/compat-probe.exe" "$P/drive_c/"
-        inst_file=$("$WINE" winepath -w "$CACHE/$file" 2>/dev/null | tr -d '\r')
+        inst_path="$CACHE/$file"
+        if [ -n "$inner" ]; then
+            rm -rf "$T/unzip"; mkdir -p "$T/unzip"
+            unzip -q -o "$CACHE/$file" "$inner" -d "$T/unzip" && inst_path="$T/unzip/$inner"
+        fi
+        inst_file=$("$WINE" winepath -w "$inst_path" 2>/dev/null | tr -d '\r')
         tray=0; case "$prog" in tray:*) tray=1; prog=${prog#tray:} ;; esac
         cat > "$T/session.sh" <<EOF
 #!/bin/sh
@@ -90,7 +97,7 @@ prog_unix=\$("$WINE" winepath -u "\$prog_unix" 2>/dev/null | tr -d '\r')
 if [ -n '$smoke' ]; then
     sp=\$("$WINE" winepath -u '${smoke%%::*}' 2>/dev/null | tr -d '\r')
     timeout -s KILL 120 "$WINE" "\$sp" ${smoke#*::} > "$T/smoke" 2>&1
-    echo "smoke_out=\$(tr -d '\r' < "$T/smoke" | tr '\n' ' ' | head -c 300)" >> "$T/r"
+    echo "smoke_out=\$(tr -d '\r' < "$T/smoke" | tr '\n' ' ' | head -c 4000)" >> "$T/r"
 fi
 if [ $tray = 1 ]; then
     ( "$WINE" "\$prog_unix" >>"$L" 2>&1 & ) ; sleep 25
@@ -118,6 +125,7 @@ EOF
         elif grep -q '^window=0x' "$T/r"; then
             la=PASS; notes="$notes $(sed -n 's/^window=0x[0-9a-f]* //p' "$T/r")"
             grep -q '^closed=1' "$T/r" && cl=PASS || cl=FAIL
+            grep -q '^exited=0' "$T/r" && notes="$notes; still running 30 s after closing"
         else
             la=FAIL; notes="$notes $(grep -E '^(window|launch)=' "$T/r")"
         fi

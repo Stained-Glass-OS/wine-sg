@@ -1356,6 +1356,18 @@ applications with a failing stage.
   are other processes). `compat-probe list` dumps every top-level window,
   `LAUNCH_DEBUG=` traces just the launch, `KEEP_PREFIX=1` keeps prefixes in
   ARTIFACTS for poking at.
+- **Close also reports whether the process ended** within 30 s
+  (`exited=`; the note "still running 30 s after closing" -- Thunderbird's
+  first-run and qBittorrent, which keeps running in the tray, show it).
+- **Results (2026-09-25, 10.0-54 + 0170-0177): all 24 launch and show their
+  main window**, 23 close (Greenshot is a tray program). Added then:
+  Thunderbird, SumatraPDF, Inkscape (its smoke output is long: the runner
+  keeps 4000 bytes), Pinta 3.1 (.NET 9 + GTK 4; text still misshapen, see
+  0177), qBittorrent (`--confirm-legal-notice`), ShareX 17 (.NET;
+  `/NORUN`, else the installer starts it and the suite's launch only hands
+  off to that one), HxD, foobar2000, Steam (its CEF sign-in window).
+  Paint.NET 5.1 is left out: 0174-0176 got it past its first three walls,
+  then Direct2D effects stop it.
 - **Results (2026-09-24, 10.0-25 + 0080, with sg-shell's defaults):** 13 of
   14 launch and show their main window; 12 of 13 close. Open: Git for
   Windows' **mintty** dies silently inside `EnumFontFamiliesExW`'s callback
