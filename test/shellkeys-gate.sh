@@ -6,7 +6,7 @@
 # desktop and puts the windows back, dragging a window to the left/right
 # edge snaps it (with a preview) and to the top maximizes it (the move/size
 # WinEvents, 0073), the Windows key alone opens Start, Win+H voice typing,
-# Win+R the Run dialog, Win+E File Explorer, Win+I Settings (0130).
+# Win+R the Run dialog, Win+E File Explorer, Win+I Settings (0130), Win+X > Terminal (0133).
 #
 #   WINE=/opt/wine-sg/bin/wine test/shellkeys-gate.sh     (ARTIFACTS=DIR keeps logs)
 set -u
@@ -37,6 +37,9 @@ mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 cp "$T/vdesk-probe.exe" "$T/control-probe.exe" "$WINEPREFIX/drive_c/"
+cp "$T/control-probe.exe" "$WINEPREFIX/drive_c/wtprobe.exe"
+# the terminal (0133): a stand-in registered as wt.exe
+"$WINE" reg add 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\wt.exe' /ve /d 'C:\wtprobe.exe' /f >/dev/null 2>&1
 # voice typing: a stand-in for sg-dictate.exe that records how it was started
 "$WINE" reg add 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\sg-dictate.exe' /ve /d 'C:\control-probe.exe' /f >/dev/null 2>&1
 # Settings (0130): a stand-in registered for the ms-settings: protocol
@@ -83,6 +86,7 @@ K Escape
 K super+e; P find ExplorerWClass
 K super+h; sleep 1
 K super+i; sleep 1
+K super+x; K t; sleep 1
 EOF
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s '-screen 0 1024x700x24' "$T/session.sh"
@@ -115,6 +119,9 @@ grep -q '/toggle' "$WINEPREFIX/drive_c/standin.log" 2>/dev/null && pass "Win+H s
 
 grep -q 'settings "\{0,1\}ms-settings:' "$WINEPREFIX/drive_c/standin.log" 2>/dev/null && pass "Win+I opens Settings (ms-settings:)" \
     || fail "Win+I: $(cat "$WINEPREFIX/drive_c/standin.log" 2>/dev/null)"
+
+grep -qi 'wtprobe' "$WINEPREFIX/drive_c/standin.log" 2>/dev/null && pass "Win+X, T opens Terminal (wt.exe)" \
+    || fail "Win+X Terminal: $(cat "$WINEPREFIX/drive_c/standin.log" 2>/dev/null)"
 
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

@@ -1,0 +1,156 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: kernelbase, conhost: a pseudo console's programs get its handles, and it resizes
+
+Windows Terminal and every other ConPTY host start their shells on a pseudo
+console (CreatePseudoConsole, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE) and leave
+the standard handles alone. On Windows a console program started on a
+console is on a new console: it does not share its parent's standard
+handles and, given none, uses the console's. Wine connected the program to
+the pseudo console but gave it its parent's handles (none, for a terminal),
+so cmd and PowerShell wrote nowhere and read nothing. CreateProcess now
+drops the parent's handles for a pseudo console child (unless
+STARTF_USESTDHANDLES names some) and marks it (a Wine-private
+ConsoleFlags bit, cleared at start-up so it is not inherited further), and
+init_console opens the console's handles for such a console program, as it
+does for a new console. A program that merely inherits its parent's console
+with no handles still gets none (kernel32:console's with_console_tests[18],
+Windows' own result).
+
+ResizePseudoConsole was a FIXME returning E_NOTIMPL. It now sends conhost
+the resize signal Windows' conhost reads on its signal pipe (8, then the
+width and height), and conhost resizes the screen buffer and its window,
+tells the program (WINDOW_BUFFER_SIZE_EVENT, when it asked for them) and
+repaints the terminal from the buffer.
+
+Gate: sg-shell's test/terminal-check.sh (cmd and PowerShell 7 in a
+terminal's tabs; a program sees the new size after the window grows).
+Stock wine-sg shows no prompt at all.
+---
+--- a/dlls/kernelbase/console.c
++++ b/dlls/kernelbase/console.c
+@@ -2327,8 +2327,18 @@
+  */
+ HRESULT WINAPI ResizePseudoConsole( HPCON handle, COORD size )
+ {
+-    FIXME( "%p (%u,%u)\n", handle, size.X, size.Y );
+-    return E_NOTIMPL;
++    struct pseudo_console *pseudo_console = handle;
++    /* the signal pipe's message, as Windows' conhost reads it: the resize
++     * signal (8), then the new width and height */
++    unsigned short msg[3] = { 8, size.X, size.Y };
++    DWORD written;
++
++    TRACE( "%p (%u,%u)\n", handle, size.X, size.Y );
++
++    if (!pseudo_console || !pseudo_console->signal || !size.X || !size.Y) return E_INVALIDARG;
++    if (!WriteFile( pseudo_console->signal, msg, sizeof(msg), &written, NULL ) || written != sizeof(msg))
++        return HRESULT_FROM_WIN32( GetLastError() );
++    return S_OK;
+ }
+ 
+ static BOOL is_tty_handle( HANDLE handle )
+@@ -2385,5 +2395,15 @@
+             alloc_console( no_window );
+     }
+     else if (params->ConsoleHandle && params->ConsoleHandle != CONSOLE_HANDLE_SHELL_NO_WINDOW)
+-        create_console_connection( params->ConsoleHandle );
++    {
++        /* A console program started on a pseudo console (terminals start
++         * their shells so) is on a new console, as on Windows: with no
++         * standard handles of its own it uses the console's. One that merely
++         * inherits its parent's console does not. */
++        BOOL pseudo = params->ConsoleFlags & CONSOLE_FLAGS_PSEUDO_CONSOLE;
++        params->ConsoleFlags &= ~CONSOLE_FLAGS_PSEUDO_CONSOLE;     /* not for our own children */
++        if (create_console_connection( params->ConsoleHandle ) && pseudo &&
++            RtlImageNtHeader( GetModuleHandleW( NULL ))->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI)
++            init_console_std_handles( FALSE );
++    }
+ }
+--- a/dlls/kernelbase/kernelbase.h
++++ b/dlls/kernelbase/kernelbase.h
+@@ -55,4 +55,8 @@
+ #define HeapReAlloc(heap, flags, ptr, size) RtlReAllocateHeap(heap, flags, ptr, size)
+ #define HeapFree(heap, flags, ptr) RtlFreeHeap(heap, flags, ptr)
+ 
++/* RTL_USER_PROCESS_PARAMETERS.ConsoleFlags: the process starts on a pseudo
++ * console (Wine's own bit; bit 0 is Windows' "ignore Ctrl+C") */
++#define CONSOLE_FLAGS_PSEUDO_CONSOLE 0x10000000
++
+ #endif /* __WINE_KERNELBASE_H */
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -608,6 +608,11 @@
+                             TRACE( "PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE %p reference %p\n",
+                                    console, console->reference );
+                             params->ConsoleHandle = console->reference;
++                            /* a new console for the child: it does not share its parent's
++                             * standard handles, and opens the console's when given none */
++                            if (!(startup_info->dwFlags & STARTF_USESTDHANDLES))
++                                params->hStdInput = params->hStdOutput = params->hStdError = NULL;
++                            params->ConsoleFlags |= CONSOLE_FLAGS_PSEUDO_CONSOLE;
+                             break;
+                         }
+                     case PROC_THREAD_ATTRIBUTE_JOB_LIST:
+--- a/programs/conhost/conhost.c
++++ b/programs/conhost/conhost.c
+@@ -2857,6 +2857,39 @@
+            msg->message == WM_KEYUP   || msg->message == WM_SYSKEYUP;
+ }
+ 
++/* ResizePseudoConsole: the screen buffer and its window take the terminal's
++ * new size, the program hears of it (WINDOW_BUFFER_SIZE_EVENT when it asked
++ * for them), and the terminal is repainted from the buffer. */
++static void resize_pseudo_console( struct console *console, unsigned int width, unsigned int height )
++{
++    struct screen_buffer *sb = console->active;
++    RECT update;
++
++    TRACE( "%ux%u\n", width, height );
++    if (!sb || !width || !height || width > 32767 || height > 32767) return;
++    if (sb->width != width || sb->height != height)
++    {
++        if (change_screen_buffer_size( sb, width, height )) return;
++    }
++    sb->win.left = 0;
++    sb->win.top = 0;
++    sb->win.right = width - 1;
++    sb->win.bottom = height - 1;
++    if (sb->cursor_x >= width) sb->cursor_x = width - 1;
++    if (sb->cursor_y >= height) sb->cursor_y = height - 1;
++    notify_screen_buffer_size( sb );
++    if (console->tty_output)
++    {
++        tty_write( console, "\x1b[2J", 4 );
++        set_tty_attr( console, sb->attr );
++        tty_write( console, "\x1b[H", 3 );
++        console->tty_cursor_x = console->tty_cursor_y = 0;
++        SetRect( &update, 0, 0, width - 1, height - 1 );
++        update_output( sb, &update );
++        tty_sync( console );
++    }
++}
++
+ static int main_loop( struct console *console, HANDLE signal )
+ {
+     HANDLE signal_event = NULL;
+@@ -2919,7 +2952,19 @@
+                 TRACE( "signaled quit\n" );
+                 return 0;
+             }
+-            FIXME( "unimplemented signal %x\n", signal_id );
++            if (signal_id == 8)  /* ResizePseudoConsole: the new width and height follow */
++            {
++                unsigned short size[2];
++                IO_STATUS_BLOCK io;
++                if (!NtReadFile( signal, NULL, NULL, NULL, &io, size, sizeof(size), NULL, NULL ) &&
++                    io.Information == sizeof(size))
++                {
++                    EnterCriticalSection( &console_section );
++                    resize_pseudo_console( console, size[0], size[1] );
++                    LeaveCriticalSection( &console_section );
++                }
++            }
++            else FIXME( "unimplemented signal %x\n", signal_id );
+             status = NtReadFile( signal, signal_event, NULL, NULL, &signal_io, &signal_id,
+                                  sizeof(signal_id), NULL, NULL );
+             if (status && status != STATUS_PENDING) return 1;

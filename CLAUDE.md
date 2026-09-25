@@ -1089,6 +1089,42 @@ and its pages). Win+X > Control Panel stays the Control Panel. Gates:
 `make test-shellkeys` (a stand-in registered for ms-settings: records Win+I;
 stock fails it) and sg-shell's `test/settings-check.sh` with `WINI=1`.
 
+## `patches/sg/0131`-`0133`: pseudo consoles that terminals can use; wt.exe
+
+What sg-shell's Terminal (and any ConPTY host: Windows Terminal, VS Code,
+Git's terminals) needed from Wine's pseudo consoles:
+
+- **0131 (kernelbase, conhost)**: a program started on a pseudo console
+  (`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`) is on a new console: CreateProcess
+  drops the parent's standard handles (unless `STARTF_USESTDHANDLES`) and
+  sets a Wine-private `ConsoleFlags` bit (`CONSOLE_FLAGS_PSEUDO_CONSOLE`,
+  kernelbase.h), and the child's `init_console` opens the console's handles
+  for a console program, then clears the bit so its own children do not
+  inherit it. **Without it cmd and PowerShell wrote nowhere.** Scoping
+  matters: the first version opened handles for any console program with
+  none, and kernel32:console's `with_console_tests[18]` (an inherited
+  console, NULL handles: Windows gives none) failed -- run that test after
+  touching this. `ResizePseudoConsole` (was E_NOTIMPL) writes the resize
+  signal (8, width, height) on the signal pipe; conhost resizes the buffer
+  and its window, notifies, and repaints the tty.
+- **0132 (conhost)**: with `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, what a
+  program writes is interpreted as VT (the list is in the patch): cursor
+  movement, erasing, insert/delete, scrolling, SGR (256 and RGB to the
+  nearest of the buffer's 16), save/restore, ?25, ?7, the alternate screen,
+  DSR/DA replies (as input), RIS, OSC 0/2. Before, the sequences were stored
+  as characters -- PowerShell 7's PSReadLine showed escape codes, split at
+  line ends. `set_tty_attr` keeps a background across `\e[m` and passes
+  underline/reverse on. kernel32:console: 0 failures with 0131+0132 (19987
+  tests, same as stock).
+- **0133**: `wt.exe` in system32/syswow64 (0120's launcher, `PARENTSRC =
+  ../calc`) starts App Paths' `wt.exe`; explorer's Win+X has Terminal and
+  Terminal (Admin) where it had Windows PowerShell (wt.exe, else pwsh, else
+  cmd). New module: configure and configure.ac are patched (a clean
+  configure was run on the series).
+
+Gates: sg-shell's `test/terminal-check.sh` (needs these; stock shows no
+prompt) and `make test-shellkeys` (Win+X, T with a stand-in wt.exe).
+
 ## `patches/sg/0072`: control.exe follows App Paths
 
 `system32\control.exe` run directly (CreateProcess, not ShellExecute) now
