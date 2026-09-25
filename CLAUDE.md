@@ -1245,7 +1245,24 @@ Cygwin/MSYS runtime does exactly as Windows allows:
   `make test-objowner`.
 
 Still open: output from programs inside mintty does not reach its window
-(bash runs, alive, no fault) -- the Cygwin pty's data path under Wine.
+(bash runs, alive, no fault) -- the Cygwin pty's data path under Wine. The
+child spins: `NtWaitForMultipleObjects(2 handles, wait-any, no timeout)`
+returns index 1 at once, over and over (thousands a second) -- an object
+Cygwin's pty wait loop expects to reset stays signalled. Next: find that
+handle (+server shows the select's handles) and what should reset it.
+
+**Firefox shutdown (open, cause not proven).** On the pinned 128.6 (keep
+`DisableAppUpdate`: it updated itself mid-test once and broke its install)
+the window closes at once but the parent never exits: its main thread spins
+a nested message loop inside WM_CLOSE (173% CPU, memory climbing to 11 GB),
+an IPC thread is blocked in `WriteFile` on a pipe to a content process, and
+a content process has started an `explorer.exe` of its own -- the Chromium
+sandbox's alternate desktop gets a shell, as Wine starts one for any desktop
+without. The content processes log `CreateWindow failed with error 1411`
+for their OLE apartment window. Firefox's MOZ_DISABLE_*_SANDBOX switches did
+not make it close cleanly either, so the sandbox is not yet proven to be it.
+`winedbg`: pipe `attach 0x<pid>` / `bt all` / `detach` on stdin (the pid
+from `wine tasklist` is decimal).
 
 ## `patches/sg/0120`-`0122`: the Windows program names reach sg-shell's apps
 
