@@ -914,6 +914,57 @@ server checks each one. Wine only finds the results.
 - Not yet: resource and dependency packages, app execution aliases,
   GetCurrentPackageInfo, deployment for another user.
 
+## `patches/sg/0200`-`0204`: MSIX beyond one package; winget installs MSIX
+
+What 0060-0063 left out, and what winget needed to install Store/MSIX
+packages. `make test-msix` (`test/msix-gate.sh`, `msix-probe.c`, fixtures
+written by `test/mkmsix.py` -- our makeappx equivalent -- and signed with a
+certificate generated for the run). 42 checks with `WINGET_DIR`; stock
+10.0-43 fails 30 of them (the other 12 are set-up or vacuous).
+
+- **0200 iertutil**: `Windows.Foundation.Uri("C:\\x.msix")` is
+  `file:///C:/x.msix`, as on Windows. winget hands PackageManager its
+  downloaded MSIX that way; refusing it was winget's "0x80070057 Invalid
+  parameter" on every MSIX install.
+- **0201 appxpackaging**: the manifest's PackageDependency and Resource
+  elements, and a bundle payload's qualified resources (language, scale).
+- **0202 aliases** (`include/wine/appexeclink.h` -- registered in
+  `include/Makefile.in`): Windows' alias is an `APPEXECLINK` reparse point
+  in `%LOCALAPPDATA%\Microsoft\WindowsApps`; ours is a small UTF-16 text
+  file (family, AUMID, target). kernelbase's CreateProcess runs the target
+  in its place **only if the target is inside the install location of a
+  deployed package of that family**; shell32's `SHGFI_EXETYPE` reports the
+  target's type, or cmd.exe does not wait for a console program started
+  through an alias (errorlevel 0 instead of its exit code).
+- **0203 appxdeploymentclient**: dependency URIs are deployed first; every
+  PackageDependency must be met or nothing installs (0x80073CF3, text naming
+  the framework like Windows'); record value `Dependencies` (REG_MULTI_SZ of
+  full names) -- **ntdll and kernelbase read it: the record is an
+  interface**. A framework in use cannot be removed (0x80073CFA). Newer main
+  package replaces older; older refused (0x80073D06) unless
+  ForceUpdateFromAnyVersion; frameworks side by side. Bundles install the
+  resource packages for the user's languages and the scale nearest 100
+  (records with `ResourcePackage`=1, listed in the app's `ResourcePackages`,
+  removed with it). Aliases (record `Aliases`) and the WindowsApps folder on
+  the user's `HKCU\Environment\Path`. http(s) locations are downloaded.
+  IPackageManager6 (**winget calls `RequestAddPackageAsync`**),
+  RemovePackageWithOptions, typed queries (untyped = main + framework),
+  IPackage4 (**winget's installed list QIs for it**; SignatureKind
+  Enterprise, Developer for dev-mode). winget lists an MSIX as
+  `MSIX\<full name>`; uninstall it by that id.
+- **0204 package graph**: ntdll, before imports are resolved, puts the
+  frameworks' install locations at the front of a packaged process's PATH
+  (the process is packaged when its image is inside a record's
+  InstallLocation, the same rule as 0061). `GetCurrentPackageInfo` (was a
+  stub) returns the package and its frameworks; `appmodel.h` gains
+  `PACKAGE_INFO` and the flags. A process started directly from Unix
+  (`wine app.exe`) gets it too, since it is ntdll's.
+- Not yet: optional/related packages, `.appinstaller` files, staging,
+  per-user vs machine provisioning, merging a resource package's PRI into
+  the app's ResourceLoader, package volumes, DirectX-level resource packages.
+- Real-world check still to do: Microsoft's App Installer bundle (winget's
+  own package) with its VCLibs/WindowsAppRuntime frameworks.
+
 ## `patches/sg/0064`-`0066`: text and scroll bars
 
 David: the fonts looked crappy and the scroll bars too. Two causes, two fixes.
