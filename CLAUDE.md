@@ -1401,6 +1401,44 @@ rate; stock fails 2 of 5) and `make test-firefox` (the pinned installer:
 page title on the window, a GPU process, window closes, every process gone
 within 30 s; stock is OOM-killed in its 6 GB scope, fails 4 of 5).
 
+## `patches/sg/0171`: characters beyond the BMP (emoji) in GDI text
+
+A surrogate pair (emoji, 𝐀-style maths, CJK Extension B) drew as two
+missing-glyph boxes, even from a font that has the character: every GDI
+text path looked up each UTF-16 half on its own.
+
+- **win32u:** `text_char_at()` (ntgdi_private.h) turns `str[i]` into the
+  character to draw: the whole code point at a pair's first half, `~0u`
+  (nothing, no advance) at its second. Used by the DIB engine's
+  `render_string` (window surfaces and memory DCs -- what our sessions draw
+  through), the null driver and paths; `font_GetTextExtentExPoint` puts the
+  pair's width on its first half. The code point reaches the font code with
+  the internal `WINE_GGO_FULL_CHAR` format bit (wingdi.h, `__WINESRC__`):
+  **`GetGlyphOutlineW` must keep ignoring the high word** (gdi32:font tests
+  `0x10000 + 'A'` == `'A'`), so only win32u's own callers pass it. Glyphs
+  beyond the BMP bypass the DIB engine's 16-bit-page glyph cache (drawn,
+  then freed). winex11's XRender text path is unchanged (our sessions do not
+  draw through it).
+- **Fallback:** after a font's links, every font falls back to Segoe UI
+  Emoji, Segoe UI Symbol (Windows' links end with those), Noto Emoji,
+  Symbola, Noto Sans Symbols2, Noto Sans Symbols -- whichever are installed.
+  sg-image ships Symbola.
+- **Uniscribe:** its Surrogates script is complex, so edit controls
+  (`SSA_LINK|SSA_FALLBACK|SSA_GLYPHS`) shape it by glyph index in the
+  control's font and had no fallback font for it (an empty name): it now
+  takes the first of the same fonts whose cmap has the run.
+- freetype prefers a font's full-Unicode cmap (3,10), not its BMP one.
+- Monochrome only: Windows' GDI draws emoji in one colour too; colour is
+  DirectWrite's. No font on the build machine has CJK Extension B, so those
+  are still boxes there.
+
+**Gate: `make test-astral`** (`test/astral-gate.sh`, `astral-probe.c`): pixels
+of ExtTextOutW into a DIB (two emoji differ from each other and from boxes),
+extents, fallback from Liberation Sans to Symbola's glyph, a path, Uniscribe's
+ScriptStringOut, and GetGlyphOutlineW's high word. Stock fails 8 of 11; a
+mutant without the symbol fallback list fails 1 (another linked font had a
+different emoji). gdi32:font/dib/path/metafile and usp10: no new failures.
+
 ## `patches/sg/0125`: startup items disabled in Task Manager do not start
 
 sg-taskmgr's Startup tab writes Windows' `Explorer\StartupApproved\{Run,
@@ -1474,11 +1512,8 @@ current in every prefix with nothing to install.
   per-font cache and are passed to `ExtTextOutW` as `lpDx`, so caret and
   pixels agree. Glyphs the font lacks are drawn from installed fallback
   fonts (`fallback_faces[]`) -- Wine links fonts only for a few UI faces, so
-  a monospace font showed boxes for CJK. **Wine's GDI draws no character
-  beyond the BMP** (emoji) even from a font that has it -- tried with
-  Symbola: still a box -- so that needs win32u/freetype work, not the
-  editor. And **the image ships no CJK or emoji font** (sg-image's `fonts-*`
-  list), so CJK is boxes there too until one is added.
+  a monospace font showed boxes for CJK. Characters beyond the BMP
+  (emoji) draw since 0171, from the image's Symbola (fonts-symbola).
 - **Compatibility is deliberate** (see main.c's header): one process per
   invocation living until its window closes (git's `core.editor`), Windows
   Notepad's command line (`/p` prints and exits without a window, `/pt`,

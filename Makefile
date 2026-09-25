@@ -177,6 +177,10 @@ test-vsync:
 test-firefox:
 	WINE=$(PREFIX)/bin/wine test/firefox-e2e.sh
 
+# Characters beyond the BMP (emoji) in GDI text (0171).
+test-astral:
+	WINE=$(PREFIX)/bin/wine test/astral-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
