@@ -1122,6 +1122,38 @@ above the taskbar, drag preview/snap/top).
 
 Gate: `make test-printwindow` (stock returns black for all three).
 
+## `patches/sg/0080`: WinSta0\Default is the user's desktop
+
+Programs name `WinSta0\Default` in `STARTUPINFO.lpDesktop` (Mozilla-derived
+launchers/updaters; LibreOffice's first start relaunches through one). Our
+sessions' desktop is "shell", so the child landed on an empty "Default"
+desktop with no shell -- "no driver could be loaded", no window. In
+`winstation_init` (win32u), Default on WinSta0 now means the configured
+desktop (`get_default_desktop`), exactly as when none is given. Gate:
+`make test-default-desktop` (a child started with that lpDesktop must land on
+"shell" and make a window; stock: "Default", no window).
+
+## The application compatibility suite (`make test-compat`)
+
+`test/compat/apps.list` pins real Windows applications (official URL +
+sha256, silent-install arguments, the program, an optional smoke command);
+`test/compat/run.sh` installs each into a fresh prefix joined to a shell
+desktop under xvfb, checks the files, runs the smoke command, launches the
+program and waits for its largest new top-level window (a splash comes first;
+`%VAR%` in the path is expanded), screenshots it, and closes it as a person
+would (first-run dialogs in front first). Results: `results.md`/`.tsv`, a
+screenshot and log per application in `ARTIFACTS` (default
+`build/compat-results`). `SG_DEFAULTS=../sg-shell/theme` imports the system's
+registry defaults (fonts) first, as an installed machine has them -- the make
+target does. Installers are cached in `~/.cache/sg-compat`, hash-checked, and
+**never committed or shipped** (users install their own software). Not part
+of `make test`: it needs the network and ~1 h. The exit status counts the
+applications with a failing stage.
+
+- **Keep the probe's output in a file, not a pipe:** a launched program
+  inherits the pipe and holds it open -- the runner hung on 7-Zip that way.
+- A tray program (`tray:` prefix) has no window; it must still be running.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

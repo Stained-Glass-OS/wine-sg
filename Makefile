@@ -82,6 +82,14 @@ test-control:
 test-printwindow:
 	WINE=$(PREFIX)/bin/wine test/printwindow-gate.sh
 
+# WinSta0\Default is the user's desktop (0080).
+test-default-desktop:
+	WINE=$(PREFIX)/bin/wine test/default-desktop-gate.sh
+
+# Real applications, installed and run (network, ~1 h; not in `make test`).
+test-compat:
+	SG_DEFAULTS=$${SG_DEFAULTS:-../sg-shell/theme} WINE=$(PREFIX)/bin/wine test/compat/run.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
