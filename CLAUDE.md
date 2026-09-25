@@ -1179,6 +1179,21 @@ applications with a failing stage.
 Gate: `make test-netsh` (a stand-in sg-netctl via `SG_NETCTL`; 14 checks,
 13 fail on stock). The real thing: sg-image's net gate.
 
+## `patches/sg/0090`: the shell's desktop icons
+
+explorer's desktop draws This PC, the user's files, Network, Recycle Bin and
+Control Panel as Windows does, by `HKCU\...\Explorer\HideDesktopIcons\NewStartPanel`
+(`{CLSID}` DWORD 0 = shown; default: Recycle Bin only; sg-shell's
+`theme/54-sg-desktop-icons.reg` adds This PC and the user's folder). Icons
+fill **columns** (Windows) not rows; titles are shadowed. `explorer.exe
+::{CLSID}` now opens the folder -- `GetFullPathNameW` had turned it into
+`::\{...}`. Gate: `make test-desktop-icons` (xdotool double-click; the
+desktop is drawn only once a window exists -- the gate opens one away from
+the icons).
+
+**Patch numbers:** the compatibility work uses 0080-0089, the main session
+0090 on.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

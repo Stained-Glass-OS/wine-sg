@@ -94,6 +94,10 @@ test-compat:
 test-netsh:
 	WINE=$(PREFIX)/bin/wine test/netsh-gate.sh
 
+# The shell's desktop icons (0090).
+test-desktop-icons:
+	WINE=$(PREFIX)/bin/wine test/desktop-icons-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
