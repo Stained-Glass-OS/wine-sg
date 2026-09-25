@@ -1247,6 +1247,45 @@ Cygwin/MSYS runtime does exactly as Windows allows:
 Still open: output from programs inside mintty does not reach its window
 (bash runs, alive, no fault) -- the Cygwin pty's data path under Wine.
 
+## `patches/sg/0120`-`0122`: the Windows program names reach sg-shell's apps
+
+Windows has `calc.exe`, `mspaint.exe` and `snippingtool.exe` in system32, and
+programs start them with **CreateProcess, which searches system32 and PATH
+but never App Paths** -- so an App Paths entry alone (what sg-shell's
+`defaults/*.reg` register) only serves ShellExecute and the Run box.
+
+- **0120** adds them as Wine programs (`programs/calc/handoff.c`, shared by
+  `mspaint` and `snippingtool` through `PARENTSRC`), so wineboot puts them in
+  system32 and syswow64. Each reads App Paths for its **own file name** and
+  starts that program with the same arguments, then exits (Windows 10's
+  calc.exe is a launcher too). With nothing registered it says the program
+  is not installed. New modules: configure and configure.ac are patched.
+- **0121** does the same inside Wine's `taskmgr.exe` and `wmplayer.exe` (like
+  0072 for control.exe). With no App Paths entry Wine's Task Manager runs.
+- **0122**: explorer's Win+Shift+S and Print Screen run `snippingtool.exe
+  /clip` (Print Screen unless `HKCU\Control Panel\Keyboard
+  PrintScreenKeyForSnippingEnabled` = 0).
+
+Things that bit:
+- **`RegGetValue(RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ)` without
+  `RRF_NOEXPAND` fails with ERROR_INVALID_PARAMETER** (as on Windows) and
+  never reads the value. `RRF_RT_REG_SZ` alone takes and expands
+  REG_EXPAND_SZ. (0072's control.exe hand-off does not hit it: it asks for
+  REG_SZ only.)
+- **The 32-bit copies must open App Paths with `KEY_WOW64_64KEY`**: it is a
+  redirected key, and the .reg files are imported by 64-bit reg.exe.
+- **wmplayer.exe is in `Program Files\Windows Media Player`**, not system32,
+  as on Windows.
+- **Loops**: a target that is the launcher itself or sits in a system
+  directory is refused. The gate's mutant with both checks removed chains
+  launchers forever and never shows the refusal.
+
+Gate: `make test-handoff` (`test/handoff-gate.sh`): the six system files, a
+64-bit and a 32-bit caller's CreateProcess of each name with awkward
+arguments reaching a stand-in with its command line intact, Win+Shift+S and
+Print Screen typed on the X keyboard, the loop refusal, and Wine's Task
+Manager without App Paths. 18 checks; stock wine-sg fails all 18.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

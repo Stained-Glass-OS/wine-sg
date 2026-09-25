@@ -78,6 +78,10 @@ test-shellkeys:
 test-control:
 	WINE=$(PREFIX)/bin/wine test/control-gate.sh
 
+# calc/mspaint/snippingtool launchers, taskmgr/wmplayer hand-off, Win+Shift+S (0120-0122).
+test-handoff:
+	WINE=$(PREFIX)/bin/wine test/handoff-gate.sh
+
 # PrintWindow of another process's window (0076).
 test-printwindow:
 	WINE=$(PREFIX)/bin/wine test/printwindow-gate.sh
