@@ -143,6 +143,13 @@ if [[ -f "$OBJ_DIR/Makefile" ]] && ! grep -qF "$SRC_DIR" "$OBJ_DIR/Makefile"; th
     log "object tree was configured for a different path; reconfiguring"
     rm -f "$OBJ_DIR/Makefile"
 fi
+# A configure that failed in makedep (a header missing from include/Makefile.in,
+# 10.0-26..31) leaves only the Makefile's preamble: "make" then says "Wine build
+# complete" having built nothing, and a CI cache keeps that tree forever.
+if [[ -f "$OBJ_DIR/Makefile" ]] && ! grep -q '^install install-lib::' "$OBJ_DIR/Makefile"; then
+    log "object tree's Makefile is incomplete (a failed configure); reconfiguring"
+    rm -f "$OBJ_DIR/Makefile"
+fi
 # A patch that adds a module changes configure; an object tree configured
 # before it would build on without the module, and nothing would say so.
 if [[ -f "$OBJ_DIR/config.status" && "$SRC_DIR/configure" -nt "$OBJ_DIR/config.status" ]]; then
