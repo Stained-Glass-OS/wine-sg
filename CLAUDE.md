@@ -1401,6 +1401,20 @@ purple pixels. Stock Wine's Notepad fails 25 (3 vacuous); a build that swaps
 UTF-16 BE bytes or loses keywords fails those checks. To run it against a
 build tree: `WINE=build/<tree>/obj/wine WINESERVER=build/<tree>/obj/server/wineserver`.
 
+## `patches/sg/0140`: a pipe server impersonates its client
+
+`ImpersonateNamedPipeClient` (and `RpcImpersonateClient` over ncacn_np) gave
+the server thread a copy of the **server's own** token (an upstream FIXME).
+In a shared prefix every service runs as SYSTEM, so any service that decides
+by impersonating its caller -- the SCM's access checks, the event log's --
+saw SYSTEM for every standard user. The server now captures the client's
+token (thread impersonation token, else process token) when the client opens
+the pipe and hands a duplicate to `FSCTL_PIPE_IMPERSONATE`; dropped on
+disconnect. Server only, no protocol change. Gate: `make test-pipeimp`
+(`test/pipeimp-gate.sh`: a server run by the prefix owner impersonates a
+client run by `sgconf` and must see sgconf's SID and no Administrators);
+stock wine-sg sees S-1-5-18 with ADMIN 1 and fails 2 of 4.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

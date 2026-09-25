@@ -82,6 +82,11 @@ test-control:
 test-handoff:
 	WINE=$(PREFIX)/bin/wine test/handoff-gate.sh
 
+# A named pipe server impersonates its client, not itself (0140); needs a
+# second Unix user (SG_OTHER, default sgconf) and passwordless sudo -u to it.
+test-pipeimp:
+	WINE=$(PREFIX)/bin/wine test/pipeimp-gate.sh
+
 # Startup items disabled in Task Manager (0125).
 test-startup:
 	WINE=$(PREFIX)/bin/wine test/startup-gate.sh
