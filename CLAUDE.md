@@ -1257,16 +1257,31 @@ naming each handle's type (`NtQueryObject`) when a thread repeats a wait;
 `winedbg` `bt all` on the spinning process; and msys-2.0.dll's own symbols
 (`x86_64-w64-mingw32-nm -C`) to name the frames.
 
-**Firefox shutdown (open, cause not proven).** On the pinned 128.6 (keep
+**Firefox shutdown (open, narrowed).** On the pinned 128.6 (keep
 `DisableAppUpdate`: it updated itself mid-test once and broke its install)
-the window closes at once but the parent never exits: its main thread spins
-a nested message loop inside WM_CLOSE (173% CPU, memory climbing to 11 GB),
-an IPC thread is blocked in `WriteFile` on a pipe to a content process, and
-a content process has started an `explorer.exe` of its own -- the Chromium
-sandbox's alternate desktop gets a shell, as Wine starts one for any desktop
-without. The content processes log `CreateWindow failed with error 1411`
-for their OLE apartment window. Firefox's MOZ_DISABLE_*_SANDBOX switches did
-not make it close cleanly either, so the sandbox is not yet proven to be it.
+the window does not close because the **UI thread is already blocked**:
+Mozilla's public symbols show the parent's main thread in
+`MessageChannel::WaitForSyncNotify` <- `IProtocol::ChannelSend` <-
+`BrowserParent::InitRendering` <- `nsFrameLoader::TryRemoteBrowserInternal`
+-- a synchronous request to the GPU process's compositor while setting up a
+remote frame. The GPU process is idle: its compositor thread (a UI message
+pump) sits in `WinUtils::WaitForMessage`, WebRender's threads parked. So the
+request is not delivered to, or does not wake, the compositor thread. In
+another run the parent's IPC thread was in a busy `WriteFile` loop on its
+`gecko.<pid>...` pipe (an overlapped handle, options 0) with memory climbing
+to 11 GB -- the same channel from the writing side. Next: trace the
+`gecko.*` pipe reads/writes and completion-port packets in both processes
+(the parent's IO thread and the GPU process's `MessagePumpForIO`), and the
+`PostMessage` wake of the compositor thread's message window. Firefox's
+MOZ_DISABLE_*_SANDBOX switches did not change it. The content processes'
+`CreateWindow failed with error 1411` (OLE apartment window) is noise.
+
+**Mozilla symbols for triage:** read `xul.dll`'s CodeView debug ID (RSDS
+record: GUID + age), fetch
+`https://symbols.mozilla.org/xul.pdb/<ID>/xul.sym` (~600 MB, Breakpad text;
+public, fine to use), and map `xul (+0x...)` offsets from `winedbg` to the
+`FUNC` lines (some carry an `m` flag before the address).
+
 `winedbg`: pipe `attach 0x<pid>` / `bt all` / `detach` on stdin (the pid
 from `wine tasklist` is decimal).
 
