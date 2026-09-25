@@ -1616,6 +1616,27 @@ drag and drop onto the navigation pane, friendly type names (".txt file" ->
 "Text Document" needs HKCR class descriptions), unselected icons blended
 purple when selected (listview ILD_SELECTED).
 
+## `patches/sg/0168`: the user's regional format is their choice
+
+Found by the first-run setup (sg-session's OOBE): Wine took the user's locale
+from the Unix locale the process started with (`LC_MESSAGES`, in
+`ntdll/unix/env.c`) and at **every process start** kernelbase rewrote
+`HKCU\Control Panel\International` to match it -- so a format chosen in
+Settings > Region, or at first run, was undone by the very next program, and
+`Geo\Nation` was reset with it. Now, as on Windows, a valid `LocaleName` there
+decides the user's format (`GetUserDefaultLCID`, `LOCALE_USER_DEFAULT`); the
+Unix locale still decides the display language (ntdll's UI language is
+untouched). The other format values are regenerated once per new choice --
+`sg-FormatLocale` names the locale they were last generated for -- and a
+country chosen apart from the format is kept. A hive written before the patch
+has its values regenerated once for its own LocaleName (a hand-edited
+`sShortDate` is reset that once).
+
+**Gate: `make test-region`** (`test/region-gate.sh`, `test/region-probe.c`,
+LANG=C.UTF-8): en-GB chosen gives dd/MM/yyyy for the next two programs and in
+the registry; de-DE with country 94 keeps 94 and a decimal comma; a bogus
+LocaleName is ignored. Stock Wine fails 5 of 6 (the unchosen check passes).
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

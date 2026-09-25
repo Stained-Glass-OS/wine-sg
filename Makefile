@@ -66,6 +66,10 @@ test-vdesk:
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
 
+# The user's regional format is their choice (0168).
+test-region:
+	WINE=$(PREFIX)/bin/wine test/region-gate.sh
+
 # A standard user's shell folders (0070).
 test-shellfolders:
 	WINE=$(PREFIX)/bin/wine test/shellfolders-gate.sh
