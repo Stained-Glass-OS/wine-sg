@@ -54,6 +54,14 @@ test-edge:
 test-theme:
 	WINE=$(PREFIX)/bin/wine test/theme-gate.sh
 
+# Cloaked windows, the primitive virtual desktops are built on (0067).
+test-cloak:
+	WINE=$(PREFIX)/bin/wine test/cloak-gate.sh
+
+# Virtual desktops and Task View (0068).
+test-vdesk:
+	WINE=$(PREFIX)/bin/wine test/vdesk-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 

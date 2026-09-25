@@ -954,6 +954,77 @@ grey is gone. Against a Wine without these patches it fails 9 of 11 checks.
 `theme-gallery` with no arguments is a window of the common controls to look
 at; screenshot it under xvfb when judging the theme.
 
+## `patches/sg/0067`: cloaked windows (virtual desktops' primitive)
+
+Windows' virtual desktops are the shell cloaking windows, and programs cloak
+their own with `DwmSetWindowAttribute(DWMWA_CLOAK)`. A cloaked window keeps
+`WS_VISIBLE` and gets no messages, but is not drawn, clipped or hit. Wine runs
+as one virtual desktop inside our compositor, so this has to live in Wine.
+
+- **server:** `is_shown()` (visible and not cloaked) replaces the raw
+  `WS_VISIBLE` tests in everything about drawing, clipping and hit-testing.
+  The bits change only through `set_window_pos`'s paint flags
+  (`SET_WINPOS_CLOAK`/`UNCLOAK`/`CLOAK_SHELL`), inside the internal
+  `set_window_pos`, so exposure is the hide/show code's. Mirrored in the
+  `__wine_cloaked` property for other processes. **`cloaked` must be
+  initialised in `create_window`**: the server's allocator fills with 0x55,
+  and an uninitialised field cloaked every window -- a black screen.
+- **win32u:** `set_window_cloak()` re-applies the current rects and surface
+  through `apply_window_pos` (no messages). `NtUserSetWindowCloak` from any
+  thread (`WM_WINE_SETCLOAK`, sent without waiting); `NtUserGetWindowCloaked`.
+- **winex11:** `get_shown_style()` -- a cloaked window is unmapped.
+- **dwmapi:** `DWMWA_CLOAK` (own top-level windows), `DWMWA_CLOAKED`.
+
+**Gate: `make test-cloak`** (`test/cloak-gate.sh`, `test/cloak-probe.c`).
+The harness must be faithful to a session or it lies: its programs join the
+shell's desktop (`HKCU\Software\Wine\Explorer\Desktop=shell`, as
+sg-run-explorer sets) -- outside it, even a plain `SW_HIDE` leaves the hidden
+window's pixels on the screen, and a second program's overlapped window dies
+on an X `BadWindow` (stock Wine too). The probe's steps are synchronised
+through files, so screenshots are taken when each step is done.
+`ARTIFACTS=DIR` keeps the screenshots. Against a Wine without the patch every
+behaviour check fails.
+
+## `patches/sg/0068`: virtual desktops, Task View and Alt+Tab
+
+Explorer's `vdesktop.c`, on 0067's cloaking. An **application window** (what
+gets a taskbar button: unowned, not a tool window, not `WS_EX_NOACTIVATE`,
+not explorer's own) is on one desktop; owned windows follow their root owner;
+everything else is on all desktops. Switching shell-cloaks the other
+desktops' windows. Keys: Win+Ctrl+D / F4 / Left / Right,
+Win+Ctrl+Shift+Left/Right (carry the active window), Win+Tab (Task View,
+also the taskbar button beside Start). Task View: desktops strip on top
+(scaled window maps), thumbnails, hover a desktop to see its windows, drag a
+window onto a desktop, right-click menu.
+
+- **State is Windows':** `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops`
+  -- `VirtualDesktopIDs` (GUIDs), `CurrentVirtualDesktop`, `Desktops\{id}\Name`.
+  A window's desktop: its root owner's `__sg_vdesk` property (1-based);
+  `__sg_vdesk_pinned` = on every desktop.
+- **Driving it:** the registered message `SgVirtualDesktopCommand` to
+  `Shell_TrayWnd` -- wp 0 query (count | current<<8), 1 switch to lp, 2 new
+  (lp: go there), 3 close lp, 4 toggle Task View, 0x100+d move window lp to
+  desktop d. shell32's `IVirtualDesktopManager` and `test/vdesk-probe.c` use it.
+- **Thumbnails** come from the screen while a window is the foreground one
+  (captured every second, and before a switch): Wine has no cross-process
+  `PrintWindow` (GDI handles are per process), and a cloaked window has no
+  pixels. A window never active shows as an icon card. A real cross-process
+  capture (the owner renders into a shared section) is the upgrade.
+- **Alt+Tab** (Shift+Alt+Tab back): the current desktop's windows, most
+  recently used first, with thumbnails. It commits on Alt's release, watched
+  with a `WH_KEYBOARD_LL` hook only while it is up. **Test it with X-level
+  keys (xdotool), not SendInput:** injected keys are not down in the X
+  server, and winex11 releases them when focus moves -- Alt "lets go" 6 ms
+  after the switcher opens. A person's keys (XWayland) are X keys.
+- **The gate's explorer must own the desktop:** it waits for "desktop
+  message loop starting" before starting programs, or a program starts an
+  explorer of its own and the traced one is not the shell.
+
+**Gate: `make test-vdesk`** (`test/vdesk-gate.sh`): 29 checks through the real
+hotkeys (SendInput; Alt+Tab with xdotool), the probe's view of cloaking and properties,
+`IVirtualDesktopManager`, the taskbar's buttons, the registry and the X
+server's pixels. 23 fail on a Wine without the patch.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
