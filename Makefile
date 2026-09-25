@@ -157,6 +157,15 @@ test-notepad:
 test-pipequota:
 	WINE=$(PREFIX)/bin/wine test/pipequota-gate.sh
 
+# DwmFlush waits for the next vertical blank: Firefox's vsync (0170).
+test-vsync:
+	WINE=$(PREFIX)/bin/wine test/vsync-gate.sh
+
+# The pinned Firefox shows a page with its GPU process and exits (0170; the
+# compat suite's cached installer, network once).
+test-firefox:
+	WINE=$(PREFIX)/bin/wine test/firefox-e2e.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 

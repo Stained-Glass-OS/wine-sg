@@ -1213,10 +1213,9 @@ applications with a failing stage.
   when Lucida Console resolves (our font Replacements) -- the MSYS runtime
   runs out of stack there (gdi32's 32-entry, 14.5 KB stack buffer overflowed
   first; moving it to the heap removed that fault but not the death, so it
-  was not shipped); git.exe itself works. **Firefox** closes its window only
-  after >30 s and leaves its processes running (content processes fail
-  `CreateWindow` for their OLE apartment window, error 1411 -- the sandbox's
-  alternate desktop).
+  was not shipped); git.exe itself works. **Firefox** closed its window only
+  after >30 s and left its processes running -- fixed by 0170 (a vsync
+  flood). Its content processes' `CreateWindow` error 1411 is noise.
 
 ## `patches/sg/0078`-`0079`: native stdio; ipconfig and netsh on sg-netctl
 
@@ -1304,31 +1303,12 @@ naming each handle's type (`NtQueryObject`) when a thread repeats a wait;
 `winedbg` `bt all` on the spinning process; and msys-2.0.dll's own symbols
 (`x86_64-w64-mingw32-nm -C`) to name the frames.
 
-**Firefox shutdown (open; upstream Wine, not ours).** Proven on Debian's
-stock Wine 10.0 too (same hang, same prefix setup), so no wine-sg patch is
-the cause. Pinned 128.6, `DisableAppUpdate` (it once updated itself
-mid-test and broke its install). Two separate stalls:
-
-1. **With the GPU process (default):** the parent's UI thread blocks in
-   `MessageChannel::WaitForSyncNotify` <- `BrowserParent::InitRendering`
-   (a sync request to the GPU process while creating a remote frame), while
-   the GPU process sits idle (compositor thread in `WaitForMessage`,
-   WebRender parked). The parent's nested loop then posts ~100k wake
-   messages to its own window; memory climbs (to 11 GB once). WM_CLOSE is
-   never handled.
-2. **With `layers.gpu-process.enabled` = false** (policies.json
-   "Preferences"): the window closes, `Quit` runs, and a shutdown observer
-   spins `SpinEventLoopUntil`; tab processes take 45-60 s to go (the
-   watchdog, not a clean exit) and the parent, socket and utility processes
-   are still alive after 2 min.
-
-Common factor: IPC messages between Firefox processes are not delivered or
-not woken promptly -- Chromium IPC is overlapped named pipes on I/O
-completion ports. Next: a probe of that exact pattern (pending overlapped
-ReadFile on a pipe bound to an IOCP, peer writes, GetQueuedCompletionStatus
-on another thread; plus the "posted to a message window from another
-thread" wake), then trace the `gecko.<pid>.<n>` pipes in both processes.
-The content processes' `CreateWindow failed with error 1411` is noise.
+**Firefox shutdown: fixed by 0170 (below).** It was never the pipes: the
+IPC probe of Firefox's exact channel pattern (overlapped named pipe + IOCP +
+posted-message wake) works on stock Wine. `WINEDEBUG=+server` (the trace is
+the *wineserver's*, so it lands in whatever started the server) showed the
+parent's I/O thread writing ~100k messages in 30 s to the GPU process: its
+vsync thread loops on `DwmFlush()`, which was a stub returning at once.
 
 **Mozilla symbols for triage:** read `xul.dll`'s CodeView debug ID (RSDS
 record: GUID + age), fetch
@@ -1338,6 +1318,37 @@ public, fine to use), and map `xul (+0x...)` offsets from `winedbg` to the
 
 `winedbg`: pipe `attach 0x<pid>` / `bt all` / `detach` on stdin (the pid
 from `wine tasklist` is decimal).
+
+## `patches/sg/0170`: DwmFlush waits for the next vertical blank
+
+Firefox's vsync thread (`D3DVsyncSource::VBlankLoop`) is `NotifyVsync();
+DwmFlush();` in a loop. Wine's `DwmFlush` returned at once, so it notified
+thousands of times a second; with the GPU process (the default) each
+notification is an IPC message to it. The GPU process's I/O thread never
+caught up, synchronous requests (`BrowserParent::InitRendering`) timed out
+("Killing GPU process due to IPC reply timeout"), the parent's queued
+messages grew to 20+ GB (it swapped the build machine), pages did not load
+and closing the window left everything running. Without the GPU process
+the same loop kept the main thread busy and shutdown took minutes. Stock
+Debian Wine is the same. `DwmFlush` now sleeps to the next refresh boundary
+on the grid `DwmGetCompositionTimingInfo` already reports.
+
+- Firefox 128.6 ESR with its GPU process: the page loads, closing the window
+  ends every process (browser, gpu, socket, rdd, utility, tabs) in ~1 s.
+- **Run Firefox experiments in a memory-capped scope**
+  (`systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0`): a
+  broken build eats all RAM within a minute.
+- How it was found: `winedbg` `bt all` on the GPU process (IO thread in
+  `ReadFile`, not stuck but busy), Mozilla's `xul.sym` for names, then
+  `WINEDEBUG=+server` counting requests per thread id.
+- `IDXGIOutput::WaitForVBlank` is still `E_NOTIMPL` (Firefox then falls
+  back to `DwmFlush`).
+
+Gates: `make test-vsync` (thirty flushes take thirty frames, each on the
+vblank grid, and Firefox's vsync-over-pipe+IOCP pattern runs at the refresh
+rate; stock fails 2 of 5) and `make test-firefox` (the pinned installer:
+page title on the window, a GPU process, window closes, every process gone
+within 30 s; stock is OOM-killed in its 6 GB scope, fails 4 of 5).
 
 ## `patches/sg/0125`: startup items disabled in Task Manager do not start
 
