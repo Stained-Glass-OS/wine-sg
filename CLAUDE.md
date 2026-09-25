@@ -1264,7 +1264,7 @@ not make it close cleanly either, so the sandbox is not yet proven to be it.
 `winedbg`: pipe `attach 0x<pid>` / `bt all` / `detach` on stdin (the pid
 from `wine tasklist` is decimal).
 
-## `patches/sg/0120`-`0123`: the Windows program names reach sg-shell's apps
+## `patches/sg/0120`-`0124`: the Windows program names reach sg-shell's apps
 
 Windows has `calc.exe`, `mspaint.exe` and `snippingtool.exe` in system32, and
 programs start them with **CreateProcess, which searches system32 and PATH
@@ -1282,6 +1282,7 @@ but never App Paths** -- so an App Paths entry alone (what sg-shell's
 - **0122**: explorer's Win+Shift+S and Print Screen run `snippingtool.exe
   /clip` (Print Screen unless `HKCU\Control Panel\Keyboard
   PrintScreenKeyForSnippingEnabled` = 0).
+- **0124**: `charmap.exe`, the same launcher (sg-shell's Character Map).
 - **0123**: Ctrl+Shift+Esc runs `taskmgr.exe` (so sg-taskmgr, through App
   Paths).
 
@@ -1303,7 +1304,7 @@ Gate: `make test-handoff` (`test/handoff-gate.sh`): the six system files, a
 64-bit and a 32-bit caller's CreateProcess of each name with awkward
 arguments reaching a stand-in with its command line intact, Win+Shift+S and
 Print Screen and Ctrl+Shift+Esc typed on the X keyboard, the loop refusal,
-and Wine's Task Manager without App Paths. 19 checks; stock wine-sg fails
+and Wine's Task Manager without App Paths. 22 checks; stock wine-sg fails
 all of them; mutants (no loop guards; 0122 without 0123) turn it red.
 
 ## Things that will bite you

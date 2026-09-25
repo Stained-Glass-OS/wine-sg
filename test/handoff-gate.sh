@@ -1,7 +1,7 @@
 #!/bin/sh
-# The system32 names that hand off to App Paths (patches/sg/0120-0123).
+# The system32 names that hand off to App Paths (patches/sg/0120-0124).
 #
-# calc.exe, mspaint.exe and snippingtool.exe are system32 programs on Windows,
+# calc.exe, charmap.exe, mspaint.exe and snippingtool.exe are system32 programs on Windows,
 # which programs start with CreateProcess -- a search of system32 and PATH
 # that never reads App Paths. wine-sg ships them as launchers for what App
 # Paths registers (sg-shell's Calculator, Paint, Snipping Tool), and Wine's
@@ -35,13 +35,13 @@ timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 C="$WINEPREFIX/drive_c"
 cp "$T/probe64.exe" "$C/probe64.exe"; cp "$T/probe32.exe" "$C/probe32.exe"; cp "$T/probe64.exe" "$C/standin.exe"
-for n in calc mspaint snippingtool; do
+for n in calc charmap mspaint snippingtool; do
     for d in system32 syswow64; do
         [ -f "$C/windows/$d/$n.exe" ] && pass "$d\\$n.exe exists" || fail "no $d\\$n.exe"
     done
 done
 AP='HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths'
-for n in calc mspaint snippingtool taskmgr wmplayer; do
+for n in calc charmap mspaint snippingtool taskmgr wmplayer; do
     "$WINE" reg add "$AP\\$n.exe" /ve /d 'C:\standin.exe' /f >/dev/null 2>&1
 done
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
@@ -64,6 +64,7 @@ mark paint64;  P probe64.exe run 'mspaint "C:\\my pictures\\a b.png"'; seen
 mark snip64;   P probe64.exe run 'snippingtool.exe /clip'; seen
 mark task64;   P probe64.exe run 'taskmgr.exe /7'; seen
 mark wmp64;    P probe64.exe run '"C:\\Program Files\\Windows Media Player\\wmplayer.exe" "C:\\music\\x y.mp3"'; seen
+mark charmap32; P probe32.exe run 'charmap'; seen
 mark calc32;   P probe32.exe run 'calc.exe /x'; seen
 mark paint32;  P probe32.exe run 'mspaint.exe'; seen
 mark task32;   P probe32.exe run 'taskmgr.exe'; seen
@@ -102,6 +103,7 @@ want paint64 '"C:\standin.exe" "C:\my pictures\a b.png"' 'mspaint (no .exe) keep
 want snip64  '"C:\standin.exe" /clip' 'snippingtool.exe /clip hands off'
 want task64  '"C:\standin.exe" /7' "Wine's taskmgr.exe hands off to the App Paths Task Manager"
 want wmp64   '"C:\standin.exe" "C:\music\x y.mp3"' "Wine's wmplayer.exe hands off to the App Paths Media Player"
+want charmap32 '"C:\standin.exe"' 'charmap from a 32-bit program (0124)'
 want calc32  '"C:\standin.exe" /x' 'calc.exe from a 32-bit program (syswow64) reaches the 64-bit App Paths view'
 want paint32 '"C:\standin.exe"' 'mspaint.exe from a 32-bit program'
 want task32  '"C:\standin.exe"' 'taskmgr.exe from a 32-bit program'
