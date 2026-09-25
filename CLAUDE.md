@@ -1264,6 +1264,15 @@ not make it close cleanly either, so the sandbox is not yet proven to be it.
 `winedbg`: pipe `attach 0x<pid>` / `bt all` / `detach` on stdin (the pid
 from `wine tasklist` is decimal).
 
+## `patches/sg/0125`: startup items disabled in Task Manager do not start
+
+sg-taskmgr's Startup tab writes Windows' `Explorer\StartupApproved\{Run,
+Run32,StartupFolder}` values (12 bytes, first byte odd = disabled). wineboot
+now skips those Run entries and Startup folder items; RunOnce is unaffected.
+Note wineboot runs **HKLM** RunOnce only (HKCU RunOnce is explorer's on
+Windows). Gate: `make test-startup` (`test/startup-gate.sh`), 9 checks; stock
+wine-sg starts all four disabled items.
+
 ## `patches/sg/0120`-`0124`: the Windows program names reach sg-shell's apps
 
 Windows has `calc.exe`, `mspaint.exe` and `snippingtool.exe` in system32, and

@@ -82,6 +82,10 @@ test-control:
 test-handoff:
 	WINE=$(PREFIX)/bin/wine test/handoff-gate.sh
 
+# Startup items disabled in Task Manager (0125).
+test-startup:
+	WINE=$(PREFIX)/bin/wine test/startup-gate.sh
+
 # PrintWindow of another process's window (0076).
 test-printwindow:
 	WINE=$(PREFIX)/bin/wine test/printwindow-gate.sh
