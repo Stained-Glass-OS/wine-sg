@@ -1154,6 +1154,31 @@ applications with a failing stage.
   inherits the pipe and holds it open -- the runner hung on 7-Zip that way.
 - A tray program (`tray:` prefix) has no window; it must still be running.
 
+## `patches/sg/0078`-`0079`: native stdio; ipconfig and netsh on sg-netctl
+
+- **0078:** `fork_and_exec` (ntdll/unix/process.c, not `spawn_process` --
+  both have the same stdio block; edit the right one) passes files it is
+  given as a native child's stdin/stdout/**stderr** even when detached (no
+  console: GUI programs, `CREATE_NO_WINDOW`); stock closed them. **Wine pipes
+  have no Unix fd** and still do not reach a native child -- use a file.
+- **A native child's process handle does not wait for it** (fork_and_exec
+  double-forks). `include/wine/sgnetctl.h` runs the program under a fixed
+  `/bin/sh -c '"$@"; echo "SGNET-EXIT:$?"'` (program and arguments are
+  positional parameters) and polls its output file for the marker.
+- **0079:** ipconfig `/release` `/renew` (DHCP adapters; `prefix*`) and
+  `/flushdns`; netsh `interface ip|ipv4 set address|dns`, `add dns`, `show
+  config`, `interface show interface`, `wlan show networks|profiles`,
+  `connect`, `disconnect`. Adapter names are sg-netctl's device names. A
+  denial prints Windows' elevation message; unknown commands still succeed
+  quietly (installers). sg-netctl treats SYSTEM (elevated) as an
+  administrator (sg-session).
+- **A new header is not in makedep's dependencies** until the Makefile is
+  regenerated: touch the including `.c` after changing it, or you test the
+  old binary.
+
+Gate: `make test-netsh` (a stand-in sg-netctl via `SG_NETCTL`; 14 checks,
+13 fail on stock). The real thing: sg-image's net gate.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

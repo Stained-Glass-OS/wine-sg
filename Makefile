@@ -90,6 +90,10 @@ test-default-desktop:
 test-compat:
 	SG_DEFAULTS=$${SG_DEFAULTS:-../sg-shell/theme} WINE=$(PREFIX)/bin/wine test/compat/run.sh
 
+# Native stdio, ipconfig and netsh on sg-netctl (0078-0079).
+test-netsh:
+	WINE=$(PREFIX)/bin/wine test/netsh-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
