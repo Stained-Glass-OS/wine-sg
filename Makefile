@@ -87,6 +87,15 @@ test-handoff:
 test-pipeimp:
 	WINE=$(PREFIX)/bin/wine test/pipeimp-gate.sh
 
+# The SCM checks who asks (0141); a second Unix user as for test-pipeimp.
+test-scm-access:
+	WINE=$(PREFIX)/bin/wine test/scm-access-gate.sh
+
+# The administrative tools' Windows names: mmc/eventvwr/resmon/cleanmgr/msinfo32
+# launchers, the .msc files and association, Start menu shortcuts, Win+X (0142, 0145).
+test-admintools:
+	WINE=$(PREFIX)/bin/wine test/admintools-gate.sh
+
 # The event log (0143, 0144): the service, the API, who may read Security;
 # needs a second Unix user (SG_OTHER, default sgconf) and sudo -u to it.
 test-eventlog:

@@ -5,6 +5,8 @@
  *                                 program's "calc.exe" gets -- and wait for it
  *   handoff-probe find CLASS [TAG] is a visible top-level window of CLASS there
  *   handoff-probe count EXE       how many processes run EXE
+ *   handoff-probe open FILE       ShellExecute(FILE) -- the Run box's and a
+ *                                 shortcut's way (admintools-gate.sh)
  *   handoff-probe ARGS...         (anything else) the registered program: records
  *                                 its command line in C:\standin.log
  *
@@ -12,6 +14,7 @@
  */
 #include <windows.h>
 #include <tlhelp32.h>
+#include <shellapi.h>
 #include <stdio.h>
 
 int wmain( int argc, WCHAR **argv )
@@ -28,6 +31,12 @@ int wmain( int argc, WCHAR **argv )
         }
         if (WaitForSingleObject( pi.hProcess, 8000 )) printf( "still running\n" );
         else { GetExitCodeProcess( pi.hProcess, &code ); printf( "ran exit=%lu\n", code ); }
+        return 0;
+    }
+    if (argc == 3 && !lstrcmpW( argv[1], L"open" ))
+    {
+        INT_PTR r = (INT_PTR)ShellExecuteW( NULL, NULL, argv[2], NULL, NULL, SW_SHOWNORMAL );
+        printf( "open=%d\n", r > 32 ? 1 : (int)r );
         return 0;
     }
     if (argc >= 3 && !lstrcmpW( argv[1], L"find" ))

@@ -1,0 +1,191 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: services: check the caller's access to the SCM and to services
+
+Wine's Service Control Manager put whatever access a caller asked for into
+the handle it returned: in a shared prefix any standard user could stop,
+pause, reconfigure, delete or create services.
+
+OpenSCManager and OpenService now impersonate the caller (RPC over the
+svcctl pipe; wine-sg 0140 makes that the client's token) and AccessCheck
+the request against Windows' default descriptors:
+
+- the SCM: Authenticated Users may connect, enumerate and query the lock
+  (and READ_CONTROL); SYSTEM and Administrators everything;
+- a service: Authenticated Users may query its status and configuration,
+  enumerate dependents, interrogate it and send user-defined controls;
+  SYSTEM and Administrators everything (with Wine's private
+  SERVICE_SET_STATUS, which service processes -- SYSTEM -- need).
+
+MAXIMUM_ALLOWED gets what the descriptor grants. One deliberate difference
+from Windows: a service whose program is in the system directory may also
+be started by everyone, because Wine starts its own infrastructure (RpcSs,
+MSIServer, a COM server's service) from the calling program, where
+Windows' RPCSS would do it as SYSTEM. Third-party services stay
+administrator-only. In a single-user prefix the user is an administrator
+and nothing changes.
+
+Per-service descriptors (sc sdset, QueryServiceObjectSecurity) are still
+not implemented.
+
+Gate: test/scm-access-gate.sh.
+---
+--- a/programs/services/rpc.c	2025-01-21 08:42:16.000000000 -0800
++++ b/programs/services/rpc.c	2026-09-25 06:55:50.912223685 -0700
+@@ -29,6 +29,7 @@
+ #include <ddk/ntddk.h>
+ #include <ntsecapi.h>
+ #include <rpc.h>
++#include <sddl.h>
+ 
+ #include "wine/list.h"
+ #include "wine/debug.h"
+@@ -54,6 +55,106 @@
+     SERVICE_ALL_ACCESS
+ };
+ 
++/* Who may do what (Windows' defaults). The SCM: everyone signed in may
++ * connect, enumerate and query the lock; SYSTEM and Administrators may do
++ * anything. A service: everyone signed in may query it and send it
++ * user-defined controls; SYSTEM and Administrators may do anything. Wine
++ * starts its own infrastructure on demand from the calling program (RpcSs,
++ * MSIServer, a COM server's service...), where Windows' RPCSS would do it as
++ * SYSTEM, so a service whose program is in the system directory may also be
++ * started by everyone. SERVICE_SET_STATUS (0x8000, Wine's own right for a
++ * service process reporting its state) goes with SYSTEM's and Administrators'
++ * full control: services run as SYSTEM. */
++static const WCHAR scm_sddl[] = L"O:SYG:SYD:(A;;0x20015;;;AU)(A;;0xf003f;;;SY)(A;;0xf003f;;;BA)";
++static const WCHAR svc_sddl[] = L"O:SYG:SYD:(A;;0x2018d;;;AU)(A;;0xf81ff;;;SY)(A;;0xf81ff;;;BA)";
++static const WCHAR svc_start_sddl[] = L"O:SYG:SYD:(A;;0x2019d;;;AU)(A;;0xf81ff;;;SY)(A;;0xf81ff;;;BA)";
++
++static PSECURITY_DESCRIPTOR get_sd( const WCHAR *sddl )
++{
++    static PSECURITY_DESCRIPTOR sds[3];
++    static const WCHAR *const all[3] = { scm_sddl, svc_sddl, svc_start_sddl };
++    int i;
++
++    for (i = 0; i < 3; i++)
++    {
++        if (all[i] != sddl) continue;
++        if (!sds[i])
++        {
++            PSECURITY_DESCRIPTOR sd;
++            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW( sddl, SDDL_REVISION_1, &sd, NULL ))
++                return NULL;
++            if (InterlockedCompareExchangePointer( &sds[i], sd, NULL )) LocalFree( sd );
++        }
++        return sds[i];
++    }
++    return NULL;
++}
++
++/* Is the service's program in the system directory (Wine's own services)? */
++static BOOL is_system_service( struct service_entry *entry )
++{
++    WCHAR path[MAX_PATH], sysdir[MAX_PATH], *p;
++    const WCHAR *bin = entry->config.lpBinaryPathName;
++    UINT len;
++
++    if (!bin) return FALSE;
++    if (*bin == '"') bin++;
++    if (!ExpandEnvironmentStringsW( bin, path, MAX_PATH )) return FALSE;
++    if ((p = wcschr( path, '"' ))) *p = 0;
++    if (!(len = GetSystemDirectoryW( sysdir, MAX_PATH ))) return FALSE;
++    if (!wcsnicmp( path, sysdir, len ) && path[len] == '\\') return TRUE;
++    if ((len = GetSystemWow64DirectoryW( sysdir, MAX_PATH )) && !wcsnicmp( path, sysdir, len ) && path[len] == '\\')
++        return TRUE;
++    return FALSE;
++}
++
++/* The access the calling client is granted to an object with this descriptor
++ * (*access in: what was asked for, generic rights and MAXIMUM_ALLOWED
++ * included; out: what to put in the handle). */
++static DWORD check_caller_access( PSECURITY_DESCRIPTOR sd, const GENERIC_MAPPING *mapping, DWORD *access )
++{
++    PRIVILEGE_SET privs;
++    DWORD privs_len = sizeof(privs), granted = 0, desired = *access;
++    BOOL status = FALSE;
++    HANDLE token;
++    RPC_STATUS rpc;
++
++    if (!sd) return ERROR_NOT_ENOUGH_SERVER_MEMORY;
++    if ((rpc = RpcImpersonateClient( NULL )) != RPC_S_OK)
++    {
++        WINE_ERR( "cannot impersonate the caller: %ld\n", rpc );
++        return ERROR_ACCESS_DENIED;
++    }
++    if (!OpenThreadToken( GetCurrentThread(), TOKEN_QUERY, TRUE, &token ))
++    {
++        WINE_ERR( "no caller token: %lu\n", GetLastError() );
++        RpcRevertToSelf();
++        return ERROR_ACCESS_DENIED;
++    }
++    RpcRevertToSelf();
++
++    RtlMapGenericMask( &desired, mapping );
++    if (!desired && !(*access & MAXIMUM_ALLOWED))
++    {
++        CloseHandle( token );
++        *access = 0;
++        return ERROR_SUCCESS;
++    }
++    if (!AccessCheck( sd, token, desired, (GENERIC_MAPPING *)mapping, &privs, &privs_len, &granted, &status ))
++    {
++        WINE_ERR( "AccessCheck failed: %lu\n", GetLastError() );
++        status = FALSE;
++    }
++    CloseHandle( token );
++    if (!status)
++    {
++        WINE_TRACE( "access %#lx denied\n", desired );
++        return ERROR_ACCESS_DENIED;
++    }
++    *access = granted;
++    return ERROR_SUCCESS;
++}
++
+ typedef enum
+ {
+     SC_HTYPE_DONT_CARE = 0,
+@@ -272,6 +373,7 @@
+     SC_RPC_HANDLE *handle)
+ {
+     struct sc_manager_handle *manager;
++    DWORD err;
+ 
+     WINE_TRACE("(%s, %s, %lx)\n", wine_dbgstr_w(MachineName), wine_dbgstr_w(DatabaseName), dwAccessMask);
+ 
+@@ -283,15 +385,16 @@
+             return ERROR_INVALID_NAME;
+     }
+ 
++    /* SC_MANAGER_CONNECT is implied, as on Windows */
++    dwAccessMask |= SC_MANAGER_CONNECT;
++    if ((err = check_caller_access(get_sd(scm_sddl), &g_scm_generic, &dwAccessMask)) != ERROR_SUCCESS)
++        return err;
++
+     if (!(manager = malloc(sizeof(*manager))))
+         return ERROR_NOT_ENOUGH_SERVER_MEMORY;
+ 
+     manager->hdr.type = SC_HTYPE_MANAGER;
+-
+-    if (dwAccessMask & MAXIMUM_ALLOWED)
+-        dwAccessMask |= SC_MANAGER_ALL_ACCESS;
+     manager->hdr.access = dwAccessMask;
+-    RtlMapGenericMask(&manager->hdr.access, &g_scm_generic);
+     manager->db = active_database;
+     *handle = &manager->hdr;
+ 
+@@ -468,6 +571,13 @@
+     if (entry == NULL)
+         return ERROR_SERVICE_DOES_NOT_EXIST;
+ 
++    if ((err = check_caller_access(get_sd(is_system_service(entry) ? svc_start_sddl : svc_sddl),
++                                   &g_svc_generic, &dwDesiredAccess)) != ERROR_SUCCESS)
++    {
++        release_service(entry);
++        return err;
++    }
++
+     return create_handle_for_service(entry, dwDesiredAccess, phService);
+ }
+ 

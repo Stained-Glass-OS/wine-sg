@@ -1477,6 +1477,53 @@ wraparound, NotifyChangeEventLog. Stock wine-sg fails 15 (2 vacuous: its
 ReportEvent always "succeeds"); a mutant without the Security read check
 fails 2.
 
+## `patches/sg/0141`: the SCM checks who is asking
+
+Wine's SCM put whatever access was asked for into every handle, so in a
+shared prefix any standard user could stop, reconfigure, delete or create
+services. `OpenSCManager`/`OpenService` now `RpcImpersonateClient` (0140
+makes that the caller) and `AccessCheck` against Windows' defaults: SCM --
+Authenticated Users connect/enumerate/query lock, SYSTEM and Administrators
+all; a service -- Authenticated Users query/interrogate/user-defined
+controls, SYSTEM and Administrators all **plus Wine's private
+`SERVICE_SET_STATUS` (0x8000)**: without it every service process
+(`sechost`'s dispatcher opens its own service with it) failed and every
+service start returned 1053. Deliberate difference: a service whose program
+is in system32 may be **started** by anyone, because Wine starts RpcSs,
+MSIServer and COM servers' services from the calling program. Per-service
+descriptors (`sc sdset`) are still not implemented.
+
+- **Gate: `make test-scm-access`** (`test/scm-access-gate.sh`,
+  `scm-probe.c`, `scm-svc.c` -- a real start/stop/pause service also used
+  by sg-shell's Services gate). 25 checks; stock fails 17.
+- **A shared-prefix gate must keep one services.exe alive**: after a
+  `wineboot -i` that exits, the next program started a second services.exe
+  beside the exiting one, each with its own database, and every other call
+  failed with 1060 -- stock too. The gate starts a sleeping probe first (it
+  initialises the prefix) and keeps it for the run, as sg-services-start
+  keeps the machine's services.
+
+## `patches/sg/0142`, `0145`: the administrative tools' Windows names
+
+- **0142**: `mmc.exe`, `eventvwr.exe`, `resmon.exe`, `cleanmgr.exe` are
+  launchers (calc's `handoff.c`, 0120) for what App Paths registers --
+  sg-shell's console host and tools; Wine's `msinfo32.exe` hands off the same
+  way. **wineboot writes `services.msc`, `eventvwr.msc`, `devmgmt.msc`,
+  `diskmgmt.msc`, `compmgmt.msc`** into system32/syswow64 (an
+  `MMC_ConsoleFile` with `<StainedGlass Console="services" .../>`; a file
+  that is not ours is left alone), `.msc` is `MSCFile` opened with
+  `"mmc.exe" "%1" %*`, and wine.inf's `ProfileItems` make the Start menu's
+  `Administrative Tools` shortcuts (setupapi's ProfileItems takes only a
+  path, no arguments -- so .msc shortcuts point at the .msc files).
+- **0145**: Win+X gains Event Viewer (V), Device Manager (M), Disk
+  Management (I), Computer Management (G).
+- **Gate: `make test-admintools`** (`test/admintools-gate.sh`): the files,
+  .msc contents, shortcuts, association; each name from a 64- and 32-bit
+  CreateProcess, ShellExecute of `services.msc`/`devmgmt.msc` and of the
+  Services shortcut, and Win+X typed on the X keyboard, all reaching a
+  stand-in registered in App Paths. 39 checks; stock passes only the two
+  that Wine's own msinfo32.exe exists.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
