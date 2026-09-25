@@ -1,0 +1,1151 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: wevtsvc: the Event Log service keeps the logs
+
+Wine's EventLog service (wevtsvc.dll in svchost, auto-start) did nothing,
+and every event log function in advapi32 was a stub: ReportEvent printed its
+strings to the debug log and nothing could ever be read back. Programs and
+administrators have no Application, System or Security log.
+
+The service now owns the logs. Every log named under
+HKLM\System\CurrentControlSet\Services\EventLog is a file in
+%SystemRoot%\System32\winevt\Logs (<log>.sgevt: a header, then the records
+in ReadEventLogW's EVENTLOGRECORD layout, oldest first), loaded on first use
+and created when a log is first opened. A log past its MaxSize loses its
+oldest records (down to nine tenths, so the file is rewritten only now and
+then); record numbers carry on after a clear, as on Windows since Vista.
+
+Programs reach it over a private message-mode pipe, \\.\pipe\wine_eventlog,
+one request per connection (include/wine/eventlog.h; advapi32 is the client,
+the next patch). What a caller may do is decided from its own token
+(ImpersonateNamedPipeClient, which 0140 makes real): everyone reads and
+writes Application, System and other logs; only Administrators and SYSTEM
+read the Security log and only SYSTEM writes it; clearing and backing up a
+log is for Administrators and SYSTEM (ERROR_PRIVILEGE_NOT_HELD for a backup,
+ERROR_ACCESS_DENIED otherwise). The pipe's DACL withholds
+FILE_CREATE_PIPE_INSTANCE, so nobody else can serve the name.
+
+The service writes 6005/6006 when it starts and stops and 104 ("The %1 log
+file was cleared.", with the clearer's SID) to System, from the source
+EventLog, whose EventMessageFile is wevtsvc.dll's new message table.
+wine.inf creates the Application, System and Security logs (MaxSize 20 MB).
+
+Gate: test/eventlog-gate.sh.
+---
+--- a/dlls/wevtsvc/Makefile.in
++++ b/dlls/wevtsvc/Makefile.in
+@@ -2,4 +2,5 @@
+ IMPORTS   = rpcrt4 advapi32
+ 
+ SOURCES = \
+-	wevtsvc.c
++	wevtsvc.c \
++	wevtsvc.mc
+--- a/dlls/wevtsvc/wevtsvc.c
++++ b/dlls/wevtsvc/wevtsvc.c
+@@ -2,6 +2,7 @@
+  * Event Log Service
+  *
+  * Copyright 2020 Dmitry Timoshkov
++ * Copyright 2026 Stained Glass OS contributors
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -18,17 +19,823 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++/*
++ * The service owns the logs.  Every log named under
++ * HKLM\System\CurrentControlSet\Services\EventLog is a file in
++ * %SystemRoot%\System32\winevt\Logs (<log>.sgevt: a header, then the
++ * records in ReadEventLogW's layout, oldest first), kept in memory while the
++ * service runs.  A log that grows past its MaxSize loses its oldest records.
++ *
++ * Programs reach it through advapi32 over WINE_EVENTLOG_PIPE, one request
++ * per connection.  What a caller may do is decided here, from the caller's
++ * own token (ImpersonateNamedPipeClient):
++ *
++ *   Application, System and any other log: everyone reads and writes;
++ *   Security: only Administrators and SYSTEM read, only SYSTEM writes;
++ *   clearing and backing up any log: Administrators and SYSTEM.
++ */
++
+ #include <stdarg.h>
++#include <stdlib.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winsvc.h"
++#include "winreg.h"
++#include "sddl.h"
++#include "netevent.h"
++#include "wine/eventlog.h"
++#include "wine/list.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(eventlog);
+ 
++#define EVENT_LOG_CLEARED   104
++#define DEFAULT_MAX_SIZE    (20 * 1024 * 1024)
++#define MIN_MAX_SIZE        (64 * 1024)
++#define READ_REPLY_LIMIT    (1024 * 1024)
++#define WAIT_TIMEOUT_MS     20000
++
++static const WCHAR eventlog_key[] = L"System\\CurrentControlSet\\Services\\EventLog";
++/* SYSTEM and Administrators only: the log files, and their directory */
++static const WCHAR files_sddl[] = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
++/* Everyone may connect and read/write -- but not create an instance of the
++ * pipe (FILE_CREATE_PIPE_INSTANCE is FILE_APPEND_DATA), or anyone could sit
++ * behind this name and receive other programs' events. */
++static const WCHAR pipe_sddl[] = L"D:P(A;;0x12018b;;;WD)(A;;GA;;;SY)(A;;GA;;;BA)";
++
++struct log
++{
++    struct list entry;
++    WCHAR name[WINE_EVENTLOG_NAME_LEN];
++    WCHAR path[MAX_PATH];
++    BYTE *data;             /* the records, oldest first */
++    SIZE_T size, cap;
++    DWORD *offs;            /* where each record starts in data */
++    DWORD count, offs_cap;
++    DWORD first;            /* the oldest record's number (== next when empty) */
++    DWORD next;             /* the number the next record gets */
++    DWORD changes;
++    CONDITION_VARIABLE changed;
++};
++
++static CRITICAL_SECTION logs_cs;
++static CRITICAL_SECTION_DEBUG logs_cs_debug =
++{
++    0, 0, &logs_cs,
++    { &logs_cs_debug.ProcessLocksList, &logs_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": logs_cs") }
++};
++static CRITICAL_SECTION logs_cs = { &logs_cs_debug, -1, 0, 0, 0, 0 };
++static struct list logs = LIST_INIT( logs );
++
+ static SERVICE_STATUS_HANDLE svc_handle;
+-static HANDLE done_event;
++static HANDLE done_event, stop_event, listener;
++static WCHAR logs_dir[MAX_PATH];
++static WCHAR computer[256];
++
++/* ---- the caller -------------------------------------------------------- */
++
++struct caller
++{
++    BOOL system;
++    BOOL admin;
++    BYTE sid[SECURITY_MAX_SID_SIZE];
++};
++
++static BOOL get_caller( HANDLE pipe, struct caller *caller )
++{
++    BYTE buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
++    TOKEN_USER *user = (TOKEN_USER *)buf;
++    BYTE sysbuf[SECURITY_MAX_SID_SIZE], adminbuf[SECURITY_MAX_SID_SIZE];
++    DWORD len = sizeof(sysbuf);
++    HANDLE token;
++    BOOL ret = FALSE, member;
++
++    memset( caller, 0, sizeof(*caller) );
++    if (!ImpersonateNamedPipeClient( pipe ))
++    {
++        WARN( "cannot impersonate the client: %lu\n", GetLastError() );
++        return FALSE;
++    }
++    if (OpenThreadToken( GetCurrentThread(), TOKEN_QUERY, TRUE, &token ))
++    {
++        DWORD syslen = sizeof(sysbuf), adminlen = sizeof(adminbuf);
++        if (GetTokenInformation( token, TokenUser, user, sizeof(buf), &len ) &&
++            CreateWellKnownSid( WinLocalSystemSid, NULL, sysbuf, &syslen ) &&
++            CreateWellKnownSid( WinBuiltinAdministratorsSid, NULL, adminbuf, &adminlen ))
++        {
++            caller->system = EqualSid( user->User.Sid, sysbuf );
++            caller->admin = caller->system || (CheckTokenMembership( token, adminbuf, &member ) && member);
++            CopySid( sizeof(caller->sid), caller->sid, user->User.Sid );
++            ret = TRUE;
++        }
++        CloseHandle( token );
++    }
++    RevertToSelf();
++    return ret;
++}
++
++static BOOL is_security( const WCHAR *log )
++{
++    return !wcsicmp( log, L"Security" );
++}
++
++static BOOL may_read( const struct caller *c, const WCHAR *log )
++{
++    return !is_security( log ) || c->admin || c->system;
++}
++
++static BOOL may_write( const struct caller *c, const WCHAR *log )
++{
++    return !is_security( log ) || c->system;
++}
++
++static BOOL may_manage( const struct caller *c )
++{
++    return c->admin || c->system;
++}
++
++/* ---- logs -------------------------------------------------------------- */
++
++static BOOL valid_log_name( const WCHAR *name )
++{
++    if (!name[0] || wcslen( name ) >= 200 || !wcscmp( name, L"." ) || !wcscmp( name, L".." )) return FALSE;
++    return !wcspbrk( name, L"\\/:*?\"<>|" );
++}
++
++/* The log a name means: a log's own name, else the log that has a source by
++ * that name, else Application (as Windows does). */
++static void resolve_log( const WCHAR *name, WCHAR *log )
++{
++    WCHAR sub[WINE_EVENTLOG_NAME_LEN];
++    DWORD i, len;
++    HKEY key;
++
++    lstrcpyW( log, L"Application" );
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, eventlog_key, 0, KEY_READ, &key )) return;
++    for (i = 0; len = ARRAY_SIZE(sub), !RegEnumKeyExW( key, i, sub, &len, NULL, NULL, NULL, NULL ); i++)
++    {
++        if (valid_log_name( sub ) && !wcsicmp( sub, name ))
++        {
++            lstrcpyW( log, sub );
++            RegCloseKey( key );
++            return;
++        }
++    }
++    for (i = 0; len = ARRAY_SIZE(sub), !RegEnumKeyExW( key, i, sub, &len, NULL, NULL, NULL, NULL ); i++)
++    {
++        WCHAR path[2 * WINE_EVENTLOG_NAME_LEN + 2];
++        HKEY hsrc;
++
++        if (!valid_log_name( sub ) || !name[0] || wcschr( name, '\\' )) continue;
++        swprintf( path, ARRAY_SIZE(path), L"%s\\%s", sub, name );
++        if (!RegOpenKeyExW( key, path, 0, KEY_READ, &hsrc ))
++        {
++            RegCloseKey( hsrc );
++            lstrcpyW( log, sub );
++            break;
++        }
++    }
++    RegCloseKey( key );
++}
++
++/* Is this the exact name of a log that exists? */
++static BOOL log_exists( const WCHAR *name )
++{
++    WCHAR log[WINE_EVENTLOG_NAME_LEN];
++    resolve_log( name, log );
++    return !wcscmp( log, name );
++}
++
++static DWORD max_size( const WCHAR *name )
++{
++    WCHAR path[ARRAY_SIZE(eventlog_key) + WINE_EVENTLOG_NAME_LEN + 1];
++    DWORD value = DEFAULT_MAX_SIZE, size = sizeof(value);
++
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", eventlog_key, name );
++    if (RegGetValueW( HKEY_LOCAL_MACHINE, path, L"MaxSize", RRF_RT_REG_DWORD, NULL, &value, &size ))
++        value = DEFAULT_MAX_SIZE;
++    return max( value, MIN_MAX_SIZE );
++}
++
++static SECURITY_ATTRIBUTES *make_sa( SECURITY_ATTRIBUTES *sa, const WCHAR *sddl )
++{
++    sa->nLength = sizeof(*sa);
++    sa->bInheritHandle = FALSE;
++    sa->lpSecurityDescriptor = NULL;
++    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW( sddl, SDDL_REVISION_1, &sa->lpSecurityDescriptor, NULL ))
++        return NULL;
++    return sa;
++}
++
++static BOOL valid_record( const BYTE *p, SIZE_T left )
++{
++    const EVENTLOGRECORD *rec = (const EVENTLOGRECORD *)p;
++    if (left < sizeof(*rec) + sizeof(DWORD)) return FALSE;
++    if (rec->Length < sizeof(*rec) + sizeof(DWORD) || rec->Length > left || rec->Length % 4) return FALSE;
++    if (rec->Reserved != 0x654c664c) return FALSE;
++    return *(const DWORD *)(p + rec->Length - sizeof(DWORD)) == rec->Length;
++}
++
++static BOOL add_offset( struct log *log, DWORD off )
++{
++    if (log->count == log->offs_cap)
++    {
++        DWORD cap = max( 64, log->offs_cap * 2 );
++        DWORD *offs = realloc( log->offs, cap * sizeof(*offs) );
++        if (!offs) return FALSE;
++        log->offs = offs;
++        log->offs_cap = cap;
++    }
++    log->offs[log->count++] = off;
++    return TRUE;
++}
++
++static const EVENTLOGRECORD *record_at( const struct log *log, DWORD index )
++{
++    return (const EVENTLOGRECORD *)(log->data + log->offs[index]);
++}
++
++/* Write the whole log out (through a temporary file, so a failure leaves the
++ * old one). */
++static BOOL save_log( struct log *log )
++{
++    struct wine_eventlog_file_header hdr;
++    SECURITY_ATTRIBUTES sa, *psa = make_sa( &sa, files_sddl );
++    WCHAR tmp[MAX_PATH + 8];
++    HANDLE file;
++    DWORD written;
++    BOOL ok;
++
++    swprintf( tmp, ARRAY_SIZE(tmp), L"%s.tmp", log->path );
++    file = CreateFileW( tmp, GENERIC_WRITE, 0, psa, CREATE_ALWAYS, 0, NULL );
++    if (psa) LocalFree( sa.lpSecurityDescriptor );
++    if (file == INVALID_HANDLE_VALUE)
++    {
++        ERR( "cannot write %s: %lu\n", debugstr_w(tmp), GetLastError() );
++        return FALSE;
++    }
++    memcpy( hdr.magic, WINE_EVENTLOG_FILE_MAGIC, sizeof(hdr.magic) );
++    hdr.version = WINE_EVENTLOG_FILE_VERSION;
++    hdr.next_record = log->next;
++    ok = WriteFile( file, &hdr, sizeof(hdr), &written, NULL ) && written == sizeof(hdr) &&
++         (!log->size || (WriteFile( file, log->data, log->size, &written, NULL ) && written == log->size));
++    CloseHandle( file );
++    if (!ok || !MoveFileExW( tmp, log->path, MOVEFILE_REPLACE_EXISTING ))
++    {
++        ERR( "cannot save %s: %lu\n", debugstr_w(log->path), GetLastError() );
++        DeleteFileW( tmp );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static void load_file( struct log *log )
++{
++    struct wine_eventlog_file_header *hdr;
++    LARGE_INTEGER size;
++    HANDLE file;
++    DWORD got;
++    BYTE *buf;
++    SIZE_T off;
++
++    file = CreateFileW( log->path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return;
++    if (!GetFileSizeEx( file, &size ) || size.QuadPart < sizeof(*hdr) || size.QuadPart > 0x40000000 ||
++        !(buf = malloc( size.QuadPart )))
++    {
++        CloseHandle( file );
++        return;
++    }
++    if (!ReadFile( file, buf, size.QuadPart, &got, NULL ) || got != size.QuadPart)
++    {
++        CloseHandle( file );
++        free( buf );
++        return;
++    }
++    CloseHandle( file );
++
++    hdr = (struct wine_eventlog_file_header *)buf;
++    if (memcmp( hdr->magic, WINE_EVENTLOG_FILE_MAGIC, sizeof(hdr->magic) ) || hdr->version != WINE_EVENTLOG_FILE_VERSION)
++    {
++        ERR( "%s is not an event log; starting it afresh\n", debugstr_w(log->path) );
++        free( buf );
++        return;
++    }
++    log->next = max( 1, hdr->next_record );
++    memmove( buf, buf + sizeof(*hdr), got - sizeof(*hdr) );
++    log->data = buf;
++    log->cap = got;
++    for (off = 0; off < got - sizeof(*hdr); off += ((EVENTLOGRECORD *)(buf + off))->Length)
++    {
++        const EVENTLOGRECORD *rec = (const EVENTLOGRECORD *)(buf + off);
++        if (!valid_record( buf + off, got - sizeof(*hdr) - off ) ||
++            (log->count && rec->RecordNumber != record_at( log, log->count - 1 )->RecordNumber + 1))
++        {
++            ERR( "%s: damaged after %lu records; keeping those\n", debugstr_w(log->path), log->count );
++            break;
++        }
++        if (!add_offset( log, off )) break;
++    }
++    log->size = log->count ? off : 0;
++    if (log->count)
++    {
++        log->first = record_at( log, 0 )->RecordNumber;
++        log->next = max( log->next, record_at( log, log->count - 1 )->RecordNumber + 1 );
++    }
++    else log->first = log->next;
++}
++
++/* The log by its exact name, loaded (and its file created) on first use. */
++static struct log *get_log( const WCHAR *name )
++{
++    struct log *log;
++
++    LIST_FOR_EACH_ENTRY( log, &logs, struct log, entry )
++        if (!wcsicmp( log->name, name )) return log;
++
++    if (!valid_log_name( name ) || !(log = calloc( 1, sizeof(*log) ))) return NULL;
++    lstrcpynW( log->name, name, ARRAY_SIZE(log->name) );
++    swprintf( log->path, ARRAY_SIZE(log->path), L"%s\\%s.sgevt", logs_dir, name );
++    log->first = log->next = 1;
++    InitializeConditionVariable( &log->changed );
++    load_file( log );
++    if (GetFileAttributesW( log->path ) == INVALID_FILE_ATTRIBUTES) save_log( log );
++    list_add_tail( &logs, &log->entry );
++    TRACE( "%s: %lu records, %lu..%lu\n", debugstr_w(name), log->count, log->first, log->next );
++    return log;
++}
++
++static void log_changed( struct log *log )
++{
++    log->changes++;
++    WakeAllConditionVariable( &log->changed );
++}
++
++/* Append to the file; FALSE if it has to be written out whole instead. */
++static BOOL append_file( struct log *log, const BYTE *rec, DWORD len )
++{
++    HANDLE file = CreateFileW( log->path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    struct wine_eventlog_file_header hdr;
++    LARGE_INTEGER zero = {{0}};
++    DWORD written;
++    BOOL ok;
++
++    if (file == INVALID_HANDLE_VALUE) return FALSE;
++    ok = SetFilePointerEx( file, zero, NULL, FILE_END ) &&
++         WriteFile( file, rec, len, &written, NULL ) && written == len;
++    if (ok)
++    {
++        memcpy( hdr.magic, WINE_EVENTLOG_FILE_MAGIC, sizeof(hdr.magic) );
++        hdr.version = WINE_EVENTLOG_FILE_VERSION;
++        hdr.next_record = log->next;
++        ok = SetFilePointerEx( file, zero, NULL, FILE_BEGIN ) &&
++             WriteFile( file, &hdr, sizeof(hdr), &written, NULL ) && written == sizeof(hdr);
++    }
++    CloseHandle( file );
++    return ok;
++}
++
++static DWORD add_record( struct log *log, BYTE *rec, DWORD len )
++{
++    DWORD limit = max_size( log->name ), drop = 0, dropped = 0;
++    BOOL trimmed = FALSE;
++
++    ((EVENTLOGRECORD *)rec)->RecordNumber = log->next;
++
++    /* over the size: the oldest records go, down to nine tenths of it, so the
++     * file is rewritten only now and then */
++    if (log->size + len > limit)
++    {
++        while (drop < log->count && log->size - dropped + len > limit / 10 * 9)
++            dropped += record_at( log, drop++ )->Length;
++        if (drop)
++        {
++            DWORD i, base = log->offs[drop - 1] + record_at( log, drop - 1 )->Length;
++            memmove( log->data, log->data + base, log->size - base );
++            log->size -= base;
++            log->count -= drop;
++            for (i = 0; i < log->count; i++) log->offs[i] = log->offs[i + drop] - base;
++            trimmed = TRUE;
++        }
++    }
++    if (log->size + len > log->cap)
++    {
++        SIZE_T cap = max( log->cap * 2, log->size + len + 4096 );
++        BYTE *data = realloc( log->data, cap );
++        if (!data) return ERROR_NOT_ENOUGH_MEMORY;
++        log->data = data;
++        log->cap = cap;
++    }
++    if (!add_offset( log, log->size )) return ERROR_NOT_ENOUGH_MEMORY;
++    memcpy( log->data + log->size, rec, len );
++    log->size += len;
++    log->next++;
++    log->first = record_at( log, 0 )->RecordNumber;
++
++    if (trimmed || !append_file( log, rec, len )) save_log( log );
++    log_changed( log );
++    return ERROR_SUCCESS;
++}
++
++/* seconds since 1970, as EVENTLOGRECORD keeps time */
++static DWORD now_seconds(void)
++{
++    FILETIME ft;
++    ULARGE_INTEGER t;
++
++    GetSystemTimeAsFileTime( &ft );
++    t.LowPart = ft.dwLowDateTime;
++    t.HighPart = ft.dwHighDateTime;
++    return (DWORD)((t.QuadPart - 116444736000000000ull) / 10000000);
++}
++
++/* A record in ReadEventLogW's layout: the fixed part, the source and the
++ * computer, the SID on an 8-byte boundary, the strings, the data, padding
++ * to a DWORD, and the length again. */
++static BYTE *build_record( const WCHAR *source, WORD type, WORD category, DWORD id,
++                           const BYTE *sid, DWORD sid_len, const WCHAR *strings, DWORD strings_len,
++                           WORD num_strings, const BYTE *data, DWORD data_len, DWORD *len )
++{
++    DWORD src_len = (wcslen( source ) + 1) * sizeof(WCHAR);
++    DWORD comp_len = (wcslen( computer ) + 1) * sizeof(WCHAR);
++    DWORD sid_off = (sizeof(EVENTLOGRECORD) + src_len + comp_len + 7) & ~7;
++    DWORD str_off = sid_off + sid_len;
++    DWORD data_off = str_off + strings_len;
++    DWORD total = ((data_off + data_len + 3) & ~3) + sizeof(DWORD);
++    EVENTLOGRECORD *rec;
++    BYTE *p;
++
++    if (!(p = calloc( 1, total ))) return NULL;
++    rec = (EVENTLOGRECORD *)p;
++    rec->Length = total;
++    rec->Reserved = 0x654c664c;
++    rec->TimeGenerated = rec->TimeWritten = now_seconds();
++    rec->EventID = id;
++    /* anything but the documented types is recorded as EVENTLOG_SUCCESS */
++    switch (type)
++    {
++    case EVENTLOG_SUCCESS: case EVENTLOG_ERROR_TYPE: case EVENTLOG_WARNING_TYPE:
++    case EVENTLOG_INFORMATION_TYPE: case EVENTLOG_AUDIT_SUCCESS: case EVENTLOG_AUDIT_FAILURE:
++        rec->EventType = type;
++        break;
++    default:
++        rec->EventType = EVENTLOG_SUCCESS;
++    }
++    rec->NumStrings = num_strings;
++    rec->EventCategory = category;
++    rec->StringOffset = str_off;
++    rec->UserSidLength = sid_len;
++    rec->UserSidOffset = sid_off;
++    rec->DataLength = data_len;
++    rec->DataOffset = data_off;
++    memcpy( p + sizeof(*rec), source, src_len );
++    memcpy( p + sizeof(*rec) + src_len, computer, comp_len );
++    if (sid_len) memcpy( p + sid_off, sid, sid_len );
++    if (strings_len) memcpy( p + str_off, strings, strings_len );
++    if (data_len) memcpy( p + data_off, data, data_len );
++    *(DWORD *)(p + total - sizeof(DWORD)) = total;
++    *len = total;
++    return p;
++}
++
++/* The service's own events (the caller holds logs_cs). */
++static void write_own_event( const WCHAR *logname, WORD type, DWORD id, const BYTE *sid,
++                             const WCHAR *string, const BYTE *data, DWORD data_len )
++{
++    struct log *log = get_log( logname );
++    DWORD len, strings_len = string ? (wcslen( string ) + 1) * sizeof(WCHAR) : 0;
++    BYTE *rec;
++
++    if (!log) return;
++    if (!(rec = build_record( L"EventLog", type, 0, id, sid, sid ? GetLengthSid( (PSID)sid ) : 0,
++                              string, strings_len, string ? 1 : 0, data, data_len, &len )))
++        return;
++    add_record( log, rec, len );
++    free( rec );
++}
++
++/* ---- requests ---------------------------------------------------------- */
++
++static void reply_init( struct wine_eventlog_reply *reply, DWORD status )
++{
++    memset( reply, 0, sizeof(*reply) );
++    reply->magic = WINE_EVENTLOG_MAGIC;
++    reply->status = status;
++    reply->size = sizeof(*reply);
++}
++
++static DWORD do_open( const struct caller *c, const struct wine_eventlog_request *req, struct wine_eventlog_reply *reply )
++{
++    WCHAR log[WINE_EVENTLOG_NAME_LEN];
++
++    resolve_log( req->log, log );
++    if (req->access == WINE_EVENTLOG_ACCESS_WRITE ? !may_write( c, log ) : !may_read( c, log ))
++        return ERROR_ACCESS_DENIED;
++    if (!get_log( log )) return ERROR_INVALID_PARAMETER;
++    lstrcpyW( reply->log, log );
++    return ERROR_SUCCESS;
++}
++
++static DWORD do_report( const struct caller *c, const struct wine_eventlog_request *req, DWORD size,
++                        struct wine_eventlog_reply *reply )
++{
++    const BYTE *sid = (const BYTE *)(req + 1);
++    const WCHAR *strings;
++    const BYTE *data;
++    struct log *log;
++    DWORD i, len, ret, pos = 0, avail;
++    BYTE *rec;
++
++    if (!log_exists( req->log )) return ERROR_INVALID_HANDLE;
++    if (!may_write( c, req->log )) return ERROR_ACCESS_DENIED;
++    avail = size - sizeof(*req);
++    if (req->sid_len > avail || req->strings_len > avail - req->sid_len ||
++        req->data_len != avail - req->sid_len - req->strings_len || req->strings_len % sizeof(WCHAR) ||
++        req->num_strings > 0xffff)
++        return ERROR_INVALID_PARAMETER;
++    if (req->sid_len && (req->sid_len < 8 || !IsValidSid( (PSID)sid ) || GetLengthSid( (PSID)sid ) != req->sid_len))
++        return ERROR_INVALID_PARAMETER;
++    strings = (const WCHAR *)(sid + req->sid_len);
++    data = (const BYTE *)strings + req->strings_len;
++    /* exactly num_strings NUL-terminated strings */
++    for (i = 0; i < req->num_strings; i++)
++    {
++        while (pos < req->strings_len / sizeof(WCHAR) && strings[pos]) pos++;
++        if (pos >= req->strings_len / sizeof(WCHAR)) return ERROR_INVALID_PARAMETER;
++        pos++;
++    }
++    if (pos != req->strings_len / sizeof(WCHAR) || req->source[ARRAY_SIZE(req->source) - 1])
++        return ERROR_INVALID_PARAMETER;
++
++    if (!(log = get_log( req->log ))) return ERROR_INVALID_HANDLE;
++    if (!(rec = build_record( req->source, req->type, req->category, req->event_id, sid, req->sid_len,
++                              strings, req->strings_len, req->num_strings, data, req->data_len, &len )))
++        return ERROR_NOT_ENOUGH_MEMORY;
++    ret = add_record( log, rec, len );
++    reply->value = ((EVENTLOGRECORD *)rec)->RecordNumber;
++    free( rec );
++    return ret;
++}
++
++static DWORD do_read( const struct caller *c, const struct wine_eventlog_request *req,
++                      struct wine_eventlog_reply **reply )
++{
++    struct wine_eventlog_reply *r;
++    struct log *log;
++    DWORD start, n, total = 0, count = 0, ret;
++    DWORD budget = min( req->budget, READ_REPLY_LIMIT );
++
++    if (!log_exists( req->log )) return ERROR_INVALID_HANDLE;
++    if (!may_read( c, req->log )) return ERROR_ACCESS_DENIED;
++    if (!(log = get_log( req->log ))) return ERROR_INVALID_HANDLE;
++    if ((ret = wine_eventlog_start( log->first, log->next, req->record, req->pos, req->backwards, &start )))
++        return ret;
++
++    /* at least one record, then as many as the budget allows */
++    for (n = start; n >= log->first && n < log->next; n = req->backwards ? n - 1 : n + 1)
++    {
++        DWORD len = record_at( log, n - log->first )->Length;
++        if (count && total + len > budget) break;
++        total += len;
++        count++;
++    }
++    if (!(r = realloc( *reply, sizeof(*r) + total ))) return ERROR_NOT_ENOUGH_MEMORY;
++    *reply = r;
++    total = 0;
++    for (n = start; count && r->count < count; n = req->backwards ? n - 1 : n + 1)
++    {
++        const EVENTLOGRECORD *rec = record_at( log, n - log->first );
++        memcpy( (BYTE *)(r + 1) + total, rec, rec->Length );
++        total += rec->Length;
++        r->count++;
++    }
++    r->size = sizeof(*r) + total;
++    return ERROR_SUCCESS;
++}
++
++static DWORD do_info( const struct caller *c, const struct wine_eventlog_request *req, struct wine_eventlog_reply *reply )
++{
++    struct log *log;
++
++    if (!log_exists( req->log )) return ERROR_INVALID_HANDLE;
++    if (!may_read( c, req->log )) return ERROR_ACCESS_DENIED;
++    if (!(log = get_log( req->log ))) return ERROR_INVALID_HANDLE;
++    reply->count = log->count;
++    reply->oldest = log->count ? log->first : 0;
++    reply->full = 0;  /* the oldest records are overwritten as needed */
++    reply->value = log->changes;
++    return ERROR_SUCCESS;
++}
++
++static DWORD do_clear( const struct caller *c, const struct wine_eventlog_request *req )
++{
++    struct log *log;
++
++    if (!log_exists( req->log )) return ERROR_INVALID_HANDLE;
++    if (!may_read( c, req->log ) || !may_manage( c )) return ERROR_ACCESS_DENIED;
++    if (!(log = get_log( req->log ))) return ERROR_INVALID_HANDLE;
++    log->size = 0;
++    log->count = 0;
++    log->first = log->next;  /* numbering carries on, as on Windows since Vista */
++    if (!save_log( log )) return ERROR_WRITE_FAULT;
++    log_changed( log );
++    TRACE( "cleared %s\n", debugstr_w(log->name) );
++    write_own_event( L"System", EVENTLOG_INFORMATION_TYPE, EVENT_LOG_CLEARED, c->sid, log->name, NULL, 0 );
++    return ERROR_SUCCESS;
++}
++
++static DWORD do_backup( const struct caller *c, const struct wine_eventlog_request *req,
++                        struct wine_eventlog_reply **reply )
++{
++    struct wine_eventlog_file_header *hdr;
++    struct wine_eventlog_reply *r;
++    struct log *log;
++
++    if (!log_exists( req->log )) return ERROR_INVALID_HANDLE;
++    if (!may_read( c, req->log )) return ERROR_ACCESS_DENIED;
++    if (!may_manage( c )) return ERROR_PRIVILEGE_NOT_HELD;
++    if (!(log = get_log( req->log ))) return ERROR_INVALID_HANDLE;
++    if (!(r = realloc( *reply, sizeof(*r) + sizeof(*hdr) + log->size ))) return ERROR_NOT_ENOUGH_MEMORY;
++    *reply = r;
++    hdr = (struct wine_eventlog_file_header *)(r + 1);
++    memcpy( hdr->magic, WINE_EVENTLOG_FILE_MAGIC, sizeof(hdr->magic) );
++    hdr->version = WINE_EVENTLOG_FILE_VERSION;
++    hdr->next_record = log->next;
++    if (log->size) memcpy( hdr + 1, log->data, log->size );
++    r->size = sizeof(*r) + sizeof(*hdr) + log->size;
++    r->count = log->count;
++    return ERROR_SUCCESS;
++}
++
++static DWORD do_wait( const struct caller *c, const struct wine_eventlog_request *req, struct wine_eventlog_reply *reply )
++{
++    DWORD start = GetTickCount(), elapsed;
++    struct log *log;
++
++    if (!log_exists( req->log )) return ERROR_INVALID_HANDLE;
++    if (!may_read( c, req->log )) return ERROR_ACCESS_DENIED;
++    if (!(log = get_log( req->log ))) return ERROR_INVALID_HANDLE;
++    if (req->pos != ~0u)
++    {
++        while (log->changes == req->pos && (elapsed = GetTickCount() - start) < WAIT_TIMEOUT_MS &&
++               WaitForSingleObject( stop_event, 0 ) == WAIT_TIMEOUT)
++            SleepConditionVariableCS( &log->changed, &logs_cs, min( 1000, WAIT_TIMEOUT_MS - elapsed ) );
++    }
++    reply->value = log->changes;
++    return ERROR_SUCCESS;
++}
++
++static struct wine_eventlog_reply *handle_request( HANDLE pipe, struct wine_eventlog_request *req, DWORD size )
++{
++    struct wine_eventlog_reply *reply = malloc( sizeof(*reply) );
++    struct caller caller;
++    DWORD status;
++
++    if (!reply) return NULL;
++    reply_init( reply, ERROR_SUCCESS );
++    if (size < sizeof(*req) || req->magic != WINE_EVENTLOG_MAGIC || req->size != size)
++    {
++        reply->status = ERROR_INVALID_PARAMETER;
++        return reply;
++    }
++    req->log[ARRAY_SIZE(req->log) - 1] = 0;
++    req->source[ARRAY_SIZE(req->source) - 1] = 0;
++    if (!get_caller( pipe, &caller ))
++    {
++        reply->status = ERROR_ACCESS_DENIED;
++        return reply;
++    }
++
++    EnterCriticalSection( &logs_cs );
++    switch (req->op)
++    {
++    case WINE_EVENTLOG_OPEN:   status = do_open( &caller, req, reply ); break;
++    case WINE_EVENTLOG_REPORT: status = do_report( &caller, req, size, reply ); break;
++    case WINE_EVENTLOG_READ:   status = do_read( &caller, req, &reply ); break;
++    case WINE_EVENTLOG_INFO:   status = do_info( &caller, req, reply ); break;
++    case WINE_EVENTLOG_CLEAR:  status = do_clear( &caller, req ); break;
++    case WINE_EVENTLOG_BACKUP: status = do_backup( &caller, req, &reply ); break;
++    case WINE_EVENTLOG_WAIT:   status = do_wait( &caller, req, reply ); break;
++    default:                   status = ERROR_INVALID_FUNCTION; break;
++    }
++    LeaveCriticalSection( &logs_cs );
++    reply->status = status;
++    if (status) reply->size = sizeof(*reply), reply->count = 0;
++    TRACE( "op %lu %s -> %lu\n", req->op, debugstr_w(req->log), status );
++    return reply;
++}
++
++/* ---- the pipe ---------------------------------------------------------- */
++
++static BOOL wait_io( HANDLE pipe, OVERLAPPED *ov, DWORD *got, DWORD timeout )
++{
++    DWORD err = GetLastError();
++    if (err != ERROR_IO_PENDING && err != ERROR_MORE_DATA) return FALSE;
++    if (err == ERROR_IO_PENDING && WaitForSingleObject( ov->hEvent, timeout ))
++    {
++        CancelIo( pipe );
++        GetOverlappedResult( pipe, ov, got, TRUE );
++        return FALSE;
++    }
++    return GetOverlappedResult( pipe, ov, got, FALSE ) || GetLastError() == ERROR_MORE_DATA;
++}
++
++static DWORD WINAPI client_thread( void *arg )
++{
++    HANDLE pipe = arg;
++    OVERLAPPED ov = {0};
++    struct wine_eventlog_reply *reply = NULL;
++    BYTE *buf = malloc( WINE_EVENTLOG_MAX_REQUEST + 1 );
++    DWORD got = 0, written, total = 0;
++    BOOL ok;
++
++    ov.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL );
++    if (!buf || !ov.hEvent) goto done;
++
++    /* one message; a larger one is refused */
++    for (;;)
++    {
++        ResetEvent( ov.hEvent );
++        ok = ReadFile( pipe, buf + total, WINE_EVENTLOG_MAX_REQUEST + 1 - total, &got, &ov );
++        if (!ok && !wait_io( pipe, &ov, &got, 10000 )) goto done;
++        total += got;
++        if (ok || GetLastError() != ERROR_MORE_DATA) break;
++        if (total > WINE_EVENTLOG_MAX_REQUEST) goto done;
++    }
++    if (total > WINE_EVENTLOG_MAX_REQUEST) goto done;
++
++    if (!(reply = handle_request( pipe, (struct wine_eventlog_request *)buf, total ))) goto done;
++    ResetEvent( ov.hEvent );
++    if (!WriteFile( pipe, reply, reply->size, &written, &ov ) && !wait_io( pipe, &ov, &written, 30000 ))
++        goto done;
++    /* let the client read the reply before the pipe goes: wait for it to close */
++    ResetEvent( ov.hEvent );
++    if (!ReadFile( pipe, buf, 1, &got, &ov )) wait_io( pipe, &ov, &got, 30000 );
++
++done:
++    free( reply );
++    free( buf );
++    if (ov.hEvent) CloseHandle( ov.hEvent );
++    DisconnectNamedPipe( pipe );
++    CloseHandle( pipe );
++    return 0;
++}
++
++static DWORD WINAPI listen_thread( void *arg )
++{
++    SECURITY_ATTRIBUTES sa, *psa = make_sa( &sa, pipe_sddl );
++    DWORD flags = FILE_FLAG_FIRST_PIPE_INSTANCE;
++    OVERLAPPED ov = {0};
++
++    ov.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL );
++    for (;;)
++    {
++        HANDLE pipe, thread, waits[2] = { ov.hEvent, stop_event };
++        DWORD got;
++        BOOL connected;
++
++        pipe = CreateNamedPipeW( WINE_EVENTLOG_PIPE, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | flags,
++                                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
++                                 PIPE_UNLIMITED_INSTANCES, 65536, 65536, 0, psa );
++        if (pipe == INVALID_HANDLE_VALUE)
++        {
++            ERR( "cannot create %s: %lu\n", debugstr_w(WINE_EVENTLOG_PIPE), GetLastError() );
++            if (WaitForSingleObject( stop_event, 1000 ) != WAIT_TIMEOUT) break;
++            continue;
++        }
++        flags = 0;
++        ResetEvent( ov.hEvent );
++        connected = ConnectNamedPipe( pipe, &ov );
++        if (!connected)
++        {
++            DWORD err = GetLastError();
++            if (err == ERROR_PIPE_CONNECTED) connected = TRUE;
++            else if (err == ERROR_IO_PENDING)
++            {
++                if (WaitForMultipleObjects( 2, waits, FALSE, INFINITE ) != WAIT_OBJECT_0)
++                {
++                    CancelIo( pipe );
++                    CloseHandle( pipe );
++                    break;
++                }
++                connected = GetOverlappedResult( pipe, &ov, &got, FALSE );
++            }
++        }
++        if (!connected || !(thread = CreateThread( NULL, 0, client_thread, pipe, 0, NULL )))
++        {
++            CloseHandle( pipe );
++            continue;
++        }
++        CloseHandle( thread );
++    }
++    CloseHandle( ov.hEvent );
++    if (psa) LocalFree( sa.lpSecurityDescriptor );
++    return 0;
++}
++
++/* ---- the service ------------------------------------------------------- */
+ 
+ static void eventlog_update_status(DWORD state)
+ {
+@@ -63,6 +870,40 @@
+     }
+ }
+ 
++static void init_logs(void)
++{
++    SECURITY_ATTRIBUTES sa, *psa = make_sa( &sa, files_sddl );
++    DWORD len = ARRAY_SIZE(computer);
++    WCHAR dir[MAX_PATH];
++
++    if (!GetComputerNameExW( ComputerNameDnsFullyQualified, computer, &len ))
++    {
++        len = ARRAY_SIZE(computer);
++        if (!GetComputerNameW( computer, &len )) lstrcpyW( computer, L"localhost" );
++    }
++    GetSystemDirectoryW( dir, ARRAY_SIZE(dir) );
++    swprintf( logs_dir, ARRAY_SIZE(logs_dir), L"%s\\winevt", dir );
++    CreateDirectoryW( logs_dir, NULL );
++    swprintf( logs_dir, ARRAY_SIZE(logs_dir), L"%s\\winevt\\Logs", dir );
++    CreateDirectoryW( logs_dir, psa );
++    if (psa) LocalFree( sa.lpSecurityDescriptor );
++}
++
++/* 24 bytes of data, as Windows' own start and stop events carry: the time,
++ * and the service's process ID. */
++static void write_start_stop( DWORD id )
++{
++    BYTE data[24] = {0};
++    SYSTEMTIME st;
++
++    GetSystemTime( &st );
++    memcpy( data, &st, sizeof(st) );
++    *(DWORD *)(data + sizeof(st)) = GetCurrentProcessId();
++    EnterCriticalSection( &logs_cs );
++    write_own_event( L"System", EVENTLOG_INFORMATION_TYPE, id, NULL, NULL, data, sizeof(data) );
++    LeaveCriticalSection( &logs_cs );
++}
++
+ void WINAPI ServiceMain(DWORD argc, LPWSTR *argv)
+ {
+     TRACE("starting Event Log Service\n");
+@@ -74,10 +915,23 @@
+         return;
+     }
+ 
++    done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
++    stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
++    init_logs();
++    write_start_stop( EVENT_EventlogStarted );
++    listener = CreateThread( NULL, 0, listen_thread, NULL, 0, NULL );
++
+     eventlog_update_status(SERVICE_RUNNING);
+ 
+-    done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+     WaitForSingleObject(done_event, INFINITE);
++
++    SetEvent( stop_event );
++    if (listener)
++    {
++        WaitForSingleObject( listener, 5000 );
++        CloseHandle( listener );
++    }
++    write_start_stop( EVENT_EventlogStopped );
+     CloseHandle(done_event);
+ 
+     eventlog_update_status(SERVICE_STOPPED);
+--- /dev/null
++++ b/dlls/wevtsvc/wevtsvc.mc
+@@ -0,0 +1,44 @@
++;
++; The Event Log service's own messages (the EventLog source's
++; EventMessageFile)
++;
++; Copyright 2026 Stained Glass OS contributors
++;
++; This library is free software; you can redistribute it and/or
++; modify it under the terms of the GNU Lesser General Public
++; License as published by the Free Software Foundation; either
++; version 2.1 of the License, or (at your option) any later version.
++;
++; This library is distributed in the hope that it will be useful,
++; but WITHOUT ANY WARRANTY; without even the implied warranty of
++; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++; Lesser General Public License for more details.
++;
++; You should have received a copy of the GNU Lesser General Public
++; License along with this library; if not, write to the Free Software
++; Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++;
++
++LanguageNames=(ENU=0x409:wevtsvc)
++
++SeverityNames=(Success=0x0:STATUS_SEVERITY_SUCCESS
++Warning=0x2:STATUS_SEVERITY_WARNING)
++
++MessageId=104
++Severity=Success
++SymbolicName=EVENT_LOG_CLEARED
++Language=ENU
++The %1 log file was cleared.
++.
++MessageId=6005
++Severity=Warning
++SymbolicName=EVENT_EVENTLOG_STARTED
++Language=ENU
++The Event log service was started.
++.
++MessageId=6006
++Severity=Warning
++SymbolicName=EVENT_EVENTLOG_STOPPED
++Language=ENU
++The Event log service was stopped.
++.
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -927,6 +927,7 @@
+ 	wine/debug.h \
+ 	wine/dplaysp.h \
+ 	wine/epm.idl \
++	wine/eventlog.h \
+ 	wine/exception.h \
+ 	wine/fil_data.idl \
+ 	wine/gdi_driver.h \
+--- a/include/netevent.h
++++ b/include/netevent.h
+@@ -20,5 +20,6 @@
+ #define _NETEVENT_
+ 
+ #define EVENT_EventlogStarted       0x80001775
++#define EVENT_EventlogStopped       0x80001776
+ 
+ #endif
+--- /dev/null
++++ b/include/wine/eventlog.h
+@@ -0,0 +1,122 @@
++/*
++ * The event log service's private protocol (advapi32 <-> wevtsvc)
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_WINE_EVENTLOG_H
++#define __WINE_WINE_EVENTLOG_H
++
++/* One request per connection to this message-mode pipe; one reply message.
++ * The service decides what the caller may do from the caller's token
++ * (ImpersonateNamedPipeClient), never from anything in the request. */
++#define WINE_EVENTLOG_PIPE L"\\\\.\\pipe\\wine_eventlog"
++#define WINE_EVENTLOG_MAGIC 0x4c564557  /* "WEVL" */
++
++/* Logs and backups on disk: this header, then EVENTLOGRECORDs (the Unicode
++ * layout ReadEventLogW returns), oldest first. */
++#define WINE_EVENTLOG_FILE_MAGIC   "SGEVTLOG"
++#define WINE_EVENTLOG_FILE_VERSION 1
++struct wine_eventlog_file_header
++{
++    char  magic[8];
++    DWORD version;
++    DWORD next_record;      /* the number the next record will get */
++};
++
++enum wine_eventlog_op
++{
++    WINE_EVENTLOG_OPEN = 1, /* name -> log; access READ or WRITE */
++    WINE_EVENTLOG_REPORT,   /* a record, in the reply its number */
++    WINE_EVENTLOG_READ,     /* records from a position */
++    WINE_EVENTLOG_INFO,     /* count, oldest, full */
++    WINE_EVENTLOG_CLEAR,
++    WINE_EVENTLOG_BACKUP,   /* the whole log as a file image */
++    WINE_EVENTLOG_WAIT,     /* returns when the log changes (or a timeout) */
++};
++
++#define WINE_EVENTLOG_ACCESS_READ  1
++#define WINE_EVENTLOG_ACCESS_WRITE 2
++
++#define WINE_EVENTLOG_NAME_LEN 256
++#define WINE_EVENTLOG_MAX_REQUEST (512 * 1024)
++
++struct wine_eventlog_request
++{
++    DWORD magic;
++    DWORD op;
++    DWORD size;             /* of the whole message */
++    DWORD access;           /* OPEN */
++    WCHAR log[WINE_EVENTLOG_NAME_LEN];     /* a log's name (OPEN: the name given) */
++    WCHAR source[WINE_EVENTLOG_NAME_LEN];  /* REPORT: the source recorded */
++    /* READ: seek to `record` (0: sequential from `pos`; `pos` 0: from the
++     * start in the direction read); at least one record, then more while
++     * `budget` bytes allow.  WAIT: `pos` is the change count last seen,
++     * ~0 to learn it at once. */
++    DWORD record;
++    DWORD pos;
++    DWORD backwards;
++    DWORD budget;
++    /* REPORT: followed by the SID, the strings (each NUL-terminated) and the data */
++    WORD  type;
++    WORD  category;
++    DWORD event_id;
++    DWORD sid_len;
++    DWORD num_strings;
++    DWORD strings_len;      /* bytes */
++    DWORD data_len;
++};
++
++struct wine_eventlog_reply
++{
++    DWORD magic;
++    DWORD status;           /* a Win32 error code */
++    DWORD size;             /* of the whole message */
++    WCHAR log[WINE_EVENTLOG_NAME_LEN];     /* OPEN: the log's own name */
++    DWORD count;            /* INFO: records; READ: records that follow */
++    DWORD oldest;           /* INFO: the oldest record's number, 0 if empty */
++    DWORD full;             /* INFO */
++    DWORD value;            /* REPORT: the record's number; WAIT: the change count */
++    /* READ: the records; BACKUP: a file image */
++};
++
++/* Where a read starts, in the numbers of a log whose records are first..next-1:
++ * a seek (record) must name one of them; otherwise the position between
++ * records (pos: 0 not yet) is read forwards or backwards from. */
++static inline DWORD wine_eventlog_start( DWORD first, DWORD next, DWORD record, DWORD pos,
++                                         BOOL backwards, DWORD *start )
++{
++    DWORD s;
++
++    if (record)
++    {
++        if (record < first || record >= next) return ERROR_INVALID_PARAMETER;
++        *start = record;
++        return ERROR_SUCCESS;
++    }
++    if (!backwards)
++    {
++        *start = pos ? (pos > first ? pos : first) : first;
++        return *start < next ? ERROR_SUCCESS : ERROR_HANDLE_EOF;
++    }
++    s = pos ? (pos < next ? pos : next) : next;
++    if (s <= first) return ERROR_HANDLE_EOF;
++    *start = s - 1;
++    return ERROR_SUCCESS;
++}
++
++#endif /* __WINE_WINE_EVENTLOG_H */
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -2453,6 +2453,14 @@
+ 
+ [EventLogServiceKeys]
+ HKR,Parameters,"ServiceDll",,"%11%\wevtsvc.dll"
++HKR,Application,"MaxSize",0x10003,0x1400000
++HKR,Application,"Retention",0x10003,0
++HKR,System,"MaxSize",0x10003,0x1400000
++HKR,System,"Retention",0x10003,0
++HKR,Security,"MaxSize",0x10003,0x1400000
++HKR,Security,"Retention",0x10003,0
++HKR,System\EventLog,"EventMessageFile",0x20002,"%%SystemRoot%%\system32\wevtsvc.dll"
++HKR,System\EventLog,"TypesSupported",0x10003,7
+ HKLM,%CurrentVersionNT%\SvcHost,"LocalServiceNetworkRestricted",0x00010008,"EventLog"
+ 
+ [StiServiceKeys]

@@ -87,6 +87,11 @@ test-handoff:
 test-pipeimp:
 	WINE=$(PREFIX)/bin/wine test/pipeimp-gate.sh
 
+# The event log (0143, 0144): the service, the API, who may read Security;
+# needs a second Unix user (SG_OTHER, default sgconf) and sudo -u to it.
+test-eventlog:
+	WINE=$(PREFIX)/bin/wine test/eventlog-gate.sh
+
 # Startup items disabled in Task Manager (0125).
 test-startup:
 	WINE=$(PREFIX)/bin/wine test/startup-gate.sh

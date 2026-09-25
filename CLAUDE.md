@@ -1415,6 +1415,68 @@ disconnect. Server only, no protocol change. Gate: `make test-pipeimp`
 client run by `sgconf` and must see sgconf's SID and no Administrators);
 stock wine-sg sees S-1-5-18 with ADMIN 1 and fails 2 of 4.
 
+## `patches/sg/0143`-`0144`: a real event log
+
+Every event log function was a stub (ReportEvent only printed to the debug
+log; nothing could be read), so there was no Application, System or Security
+log for programs, administrators or Event Viewer.
+
+- **0143 wevtsvc: the EventLog service owns the logs** (svchost, auto-start,
+  as wine.inf already registered it). A log is a subkey of
+  `HKLM\System\CurrentControlSet\Services\EventLog`; its file is
+  `%SystemRoot%\System32\winevt\Logs\<log>.sgevt` -- our own format: a
+  16-byte header (`SGEVTLOG`, version 1, next record number) then the
+  records in ReadEventLogW's `EVENTLOGRECORD` layout, oldest first. Backups
+  are the same format. Kept in memory while the service runs; appended to,
+  and rewritten only when `MaxSize` (default 20 MB, min 64 KB) forces the
+  oldest out (down to 9/10 of it). Record numbers carry on after a clear.
+  The service writes 6005/6006 (start/stop, 24 bytes of data) and 104 ("The
+  %1 log file was cleared.", with the clearer's SID) to System from source
+  `EventLog`, whose `EventMessageFile` is wevtsvc.dll's message table
+  (`wevtsvc.mc`).
+- **0144 advapi32 is the client**, over `\\.\pipe\wine_eventlog`
+  (message mode, one request per connection, `include/wine/eventlog.h`:
+  OPEN, REPORT, READ, INFO, CLEAR, BACKUP, WAIT). **The protocol header is
+  shared: change both sides.** A handle is advapi32's own (log, source,
+  read position); backups are read into memory and served locally.
+  Unreachable service: RPC_S_SERVER_UNAVAILABLE after <= 3 s (then at once
+  for 30 s), so ReportEvent never hangs a program; it tries StartService
+  once per process.
+- **Who may do what is the service's decision, from the caller's token**
+  (ImpersonateNamedPipeClient -- real only since **0140**; without it every
+  caller is SYSTEM): Application/System/other logs -- everyone reads and
+  writes; **Security -- read only by Administrators or SYSTEM, written only by
+  SYSTEM** (ERROR_ACCESS_DENIED at OpenEventLog/RegisterEventSource);
+  clear -- Administrators/SYSTEM (ERROR_ACCESS_DENIED); backup --
+  Administrators/SYSTEM (ERROR_PRIVILEGE_NOT_HELD). The pipe's DACL leaves
+  out FILE_CREATE_PIPE_INSTANCE, so no one else can serve the name.
+- **Not a Unix boundary**: the log files map to mode 0770 in the prefix's
+  group (the shared prefix's files all are -- see D13); the Security log is
+  protected from Windows programs, not from a user reading the prefix
+  through `Z:`/`\\?\unix`. Nothing writes Security events yet (no
+  auditing) -- it is empty unless SYSTEM reports one.
+- Formatting an event's text is the viewer's job, as on Windows:
+  `EventMessageFile` (REG_EXPAND_SZ, `;`-separated) under
+  `EventLog\<log>\<source>`, `FormatMessage(FORMAT_MESSAGE_FROM_HMODULE |
+  FORMAT_MESSAGE_ARGUMENT_ARRAY, ..., EventID, ...)` with the record's
+  strings; `ParameterMessageFile`/`CategoryMessageFile` likewise.
+- **Not done**: the Vista+ Evt* API (wevtapi) and `.evtx`, `wevtutil`, remote
+  logs, `CustomSD`, `Retention` (always "overwrite as needed"), the
+  `Sources` value.
+- **Conformance**: advapi32:eventlog 506 tests, 0 failures (stock: 290, 115
+  todo); every test that now passes lost its `todo_wine`, the two that need
+  ten System records are `todo_wine_if` fewer, and 14 ETW todos remain.
+
+**Gate: `make test-eventlog`** (`test/eventlog-gate.sh`,
+`test/eventlog-probe.c`), 17 checks on a shared prefix with the second Unix
+user `sgconf` as the standard user: the probe's 39 functional checks in 64-
+and 32-bit, 6005 in System, a standard user writing and reading Application
+but refused Security (read and write), clear and backup, SYSTEM reading and
+writing Security, persistence across a wineserver restart, MaxSize
+wraparound, NotifyChangeEventLog. Stock wine-sg fails 15 (2 vacuous: its
+ReportEvent always "succeeds"); a mutant without the Security read check
+fails 2.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
