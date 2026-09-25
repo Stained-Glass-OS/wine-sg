@@ -176,6 +176,12 @@ test-desktop-icons:
 test-explorer:
 	WINE=$(PREFIX)/bin/wine test/explorer-gate.sh
 
+# File Explorer round 2: thumbnails, icon sizes, tiles, groups, panes, Quick
+# access, Send to, type names, drops on the navigation pane (0150-0157).
+# SGZIP=<sg-shell's sg-zip64.exe> for Send to > Compressed (zipped) Folder.
+test-explorer2:
+	WINE=$(PREFIX)/bin/wine test/explorer2-gate.sh
+
 # A self-managed stack grows read-write; SD-less objects have an owner (0081, 0082).
 test-stackgrow:
 	WINE=$(PREFIX)/bin/wine test/stackgrow-gate.sh

@@ -1994,13 +1994,94 @@ in-process columns/sort/selection). Stock fails all 18. The gate uses a temp
 `HOME` and replaces the prefix's user-folder symlinks -- **never let a test
 prefix's Documents point at the developer's home.**
 
-Next steps (not done): image thumbnails and larger icon sizes (DefView has
-32 px only; Large/Extra large need SHIL_EXTRALARGE/JUMBO and a WIC
-IThumbnailProvider), Tiles/Content views (comctl32 listview has no
-LV_VIEW_TILE or groups), Quick access pinning/recent files, the details pane,
-drag and drop onto the navigation pane, friendly type names (".txt file" ->
-"Text Document" needs HKCR class descriptions), unselected icons blended
-purple when selected (listview ILD_SELECTED).
+Round 2 (0150-0157, below) did the next steps round 1 listed.
+
+## `patches/sg/0150`-`0157`: File Explorer, round 2
+
+- **0150 comctl32: list view groups and the tile view.** Group view is a
+  *positioned* layout: `LISTVIEW_ArrangeGroups` puts every item's position in
+  `hdpaPosX/Y` (details included -- `GetItemOrigin`, the frame iterator and
+  the vertical scroll range read them when `is_group_view()`), an item in no
+  shown group gets `LV_HIDDEN_POS` and is never drawn or hit, and
+  `displayOrder` is the items in group order (Home/End). Group view is on only
+  once there are groups (`is_group_view`), never in List or owner data.
+  **Anything new that places items must go through `is_positioned()` /
+  `is_icon_view()`** (ICON, SMALLICON, TILE), not the old ICON||SMALLICON
+  test. Headers: the highlight colour darkened (not COLOR_HOTLIGHT, which the
+  Stained Glass colours set to a light grey), a line, a chevron for
+  LVGS_COLLAPSIBLE (click folds; a click elsewhere on a header selects the
+  group). Tiles: `himlNormal`, the name then `LVTILEINFO` columns in grey;
+  default 2 lines, width from `LVM_SETTILEVIEWINFO` or icon + ~20 chars.
+- **0151 comctl32:** a selected icon is blended (ILD_SELECTED) only if custom
+  draw left `CDIS_SELECTED` set -- DefView clears it for its light tint, so
+  File Explorer's icons no longer turn purple. Icons and tiles are drawn with
+  `CLR_NONE` so a custom-draw fill behind them shows.
+- **0152 shell32: type names** -- `HCR_GetFileTypeNameW` (classes.c):
+  FriendlyTypeName (indirect strings loaded), ProgID default, else "EXT
+  File"; "File folder". wine.inf gives common types names with flag 2
+  (no-clobber). **A ProgID shared by many extensions must not name itself**
+  ("Image"), or every picture says so: sg-shell's photos/media ProgIDs have
+  an empty default so .png reads "PNG File", as on Windows 10.
+- **0153 shell32: thumbnails** -- `thumbnail.c`: our WIC provider
+  `{8b9284a6-ab7a-41df-bcfa-c80995441db9}` (registered in
+  shell32_classes.idl; wine.inf's `ShellEx\{e357fccd-...}` for the image
+  extensions, flag 0 so `wineboot -u` repairs), box-filtered, EXIF
+  orientation, never enlarged; `SHELL_GetThumbnail` finds a type's
+  IThumbnailProvider or IExtractImage handler as Windows does;
+  `IShellItemImageFactory::GetImage` is real. shobjidl.idl gained
+  IInitializeWithItem, IExtractImage, IExtractImage2. **WIC/thumbcache GUIDs
+  are not in libuuid**: thumbnail.c includes initguid.h before those headers.
+- **0154 shell32: DefView** -- `ShellView_ApplyViewMode` is the one place a
+  mode becomes a list view view + image list: sizes above 32 get the view's
+  own ILC_COLOR32 list (`sys_to_own` maps system indices; icons from
+  SHIL_EXTRALARGE/JUMBO), thumbnails come from a per-view thread
+  (`thumb_queue`, refcounted because it may outlive the view; newest request
+  first; results posted as `WM_SV_THUMBNAIL`, matched by child pidl and
+  generation). Tiles/Content are LV_VIEW_TILE; Content's right column is
+  drawn in item post-paint. Grouping (`group_pid`) recomputes all groups on a
+  posted `WM_SV_REGROUP` after changes. Recent documents on open; Shift+F10
+  menu at the focused item.
+- **0155 shell32: the FS drop target is real** (was a stub that only logged):
+  HDROP or ID list, Windows' key rules and same-volume move, SHFileOperation.
+  A folder item's `GetUIObjectOf(IID_IDropTarget)` binds to the item.
+- **0156 shell32: Send to and pins** -- `sendto.c`. SendTo items by
+  extension: `.lnk` (folder: copy; program: run with the files), folder,
+  program, `.DeskLink`, `.mydocs`, else the type's `shell\sendto\command`
+  (`%*`): sg-shell's zip reg registers `.ZFSendToTarget` that way and
+  sg-session plants the empty SendTo files once per profile. Pins:
+  `HKCU\Software\Stained Glass\Explorer\QuickAccess` `Pinned`
+  (REG_MULTI_SZ; absent = Desktop, Downloads, Documents, Pictures) -- **the
+  same key fileexplorer.c reads; change both together.**
+- **0157 explorer:** views table (`views[]`, saved as mode | size << 8 in
+  `FolderViews`), `FolderGroups`, the pane (`PANE_DETAILS`/`PANE_PREVIEW`,
+  Alt+Shift+P / Alt+P, `Pane` value), Quick access as `CONTENT_QUICK` -- a
+  page like This PC, reached through a pidl of Windows' Home CLSID
+  (`fe.quick`, never given to the browser; `navigate()` diverts it) --
+  frequent folders (`QuickAccess\Frequent`, visits >= 2), recent files from
+  the Recent folder; the loop waits on `RegNotifyChangeKeyValue` so a pin
+  from any menu shows at once. The navigation pane is a drop target that
+  forwards to the hovered folder's.
+
+**Gate: `make test-explorer2`** (`test/explorer2-gate.sh`, 29 checks; with
+`SGZIP=` pointing at sg-shell's sg-zip64.exe for the zip check): thumbnail
+pixels of a known PNG and JPEG at Large and Extra large icons, the same
+pixels when selected (0151), a drag onto the navigation pane, Group by Type
+typed through the Sort menu (header line pixels) and in process, Tiles and
+Content in process, a sideways photo's EXIF orientation, no thumbnail for a
+text file, preview pane text, details pane, Send to (zip and desktop
+shortcut), pin and unpin, Quick access page, frequent folder, recent files
+(and a name outside the code page), type names. The build before 0150 failed
+23 of the first 25 (it passes "opens Pictures" and .txt's "Text Document"
+from 0101); 10.0-16 fails 24 of them; a mutant without orientation, with
+GetImage ignoring SIIGBF_THUMBNAILONLY, without the Unicode recent link and
+without unpin fails exactly those 4. **Editing `patches/series` in the shared
+checkout puts your patches into other agents' builds** (build.sh follows the
+series): cut and test in your own tree first.
+
+Not done: video/PDF thumbnails, a thumbnail cache on disk, the details
+pane's image dimensions and editable properties, Quick access "Remove from
+Quick access" for frequent items, collapsing groups from the keyboard,
+drag-to-reorder pins.
 
 ## `patches/sg/0168`: the user's regional format is their choice
 
