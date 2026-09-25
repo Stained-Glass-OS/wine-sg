@@ -1477,6 +1477,27 @@ ScriptStringOut, and GetGlyphOutlineW's high word. Stock fails 8 of 11; a
 mutant without the symbol fallback list fails 1 (another linked font had a
 different emoji). gdi32:font/dib/path/metafile and usp10: no new failures.
 
+## `patches/sg/0172`: dynamic time zone conversions
+
+`SystemTimeToTzSpecificLocalTimeEx` / `TzSpecificLocalTimeToSystemTimeEx`
+were stubs and `SetDynamicTimeZoneInformation` was not even exported (an
+importing program would not load). The conversions take the rules of the
+date's year from the zone's `Time Zones\<key>\Dynamic DST` table
+(`GetTimeZoneInformationForYear`), re-checking with the local year near New
+Year; a zone without a key name (or dynamic rules disabled and no key) uses
+its own fields; NULL is the current zone. `GetTimeZoneInformationForYear`
+now uses the table's first year before it and its last year after it
+(Windows' rule; Wine used today's `TZI` before it).
+`SetDynamicTimeZoneInformation` = `SetTimeZoneInformation`
+(`ERROR_PRIVILEGE_NOT_HELD`: the zone is the host's). **Setting the zone
+for real** would go through sg-shell's `sg-admind` (`timezone AREA/CITY`,
+SYSTEM-only spool) and needs a Windows-key-to-IANA table -- not done.
+
+Gate: `make test-tzex` (US Pacific 2006 vs 2008 rules both ways, before and
+after the table, disabled, key-less, NULL). Stock fails all 12 (no
+exports); a mutant without the first-year rule fails 1. kernel32:time and
+locale: 0 failures.
+
 ## `patches/sg/0125`: startup items disabled in Task Manager do not start
 
 sg-taskmgr's Startup tab writes Windows' `Explorer\StartupApproved\{Run,

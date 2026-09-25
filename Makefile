@@ -194,6 +194,10 @@ test-firefox:
 test-astral:
 	WINE=$(PREFIX)/bin/wine test/astral-gate.sh
 
+# The dynamic time zone conversions (0172).
+test-tzex:
+	WINE=$(PREFIX)/bin/wine test/tzex-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
