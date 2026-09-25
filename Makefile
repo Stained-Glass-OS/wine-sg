@@ -213,6 +213,14 @@ test-astral:
 test-tzex:
 	WINE=$(PREFIX)/bin/wine test/tzex-gate.sh
 
+# Windows.System.DispatcherQueue (0174).
+test-dispatcherq:
+	WINE=$(PREFIX)/bin/wine test/dispatcherq-gate.sh
+
+# Windows 10 22H2; DXGIDeclareAdapterRemovalSupport (0175, 0176).
+test-winver:
+	WINE=$(PREFIX)/bin/wine test/winver-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 

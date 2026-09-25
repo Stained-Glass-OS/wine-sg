@@ -1527,6 +1527,38 @@ after the table, disabled, key-less, NULL). Stock fails all 12 (no
 exports); a mutant without the first-year rule fails 1. kernel32:time and
 locale: 0 failures.
 
+## `patches/sg/0174`-`0176`: what Paint.NET 5 needed first
+
+Found trying Paint.NET 5.1 (.NET 9, self-contained) for the compat suite:
+
+- **0175: Windows 10 is 22H2, build 19045** (Wine said 19043 = 21H1, out of
+  support; Paint.NET: "Windows 10 (version 21H2) ... or newer is
+  required"). ntdll's version table, kernelbase's manifest table, winecfg,
+  and wine.inf's `CurrentBuild(Number)` / `DisplayVersion` 22H2 /
+  `ReleaseId` 2009 / `UBR` 6456 -- **without** no-clobber, because ntdll
+  reports the registry's `CurrentBuildNumber` when no version is configured:
+  an old prefix moves on at `wineboot -u`.
+- **0176: `DXGIDeclareAdapterRemovalSupport`** (S_OK, then
+  `DXGI_ERROR_ALREADY_EXISTS`).
+- **0174: Windows.System.DispatcherQueue** (coremessaging): was `E_NOTIMPL`.
+  Priority queue of work run by one thread's message loop -- the caller's
+  or a dedicated thread (optionally STA); a message-only window per queue
+  carries enqueue, timers (`DispatcherQueueTimer` = `WM_TIMER`) and
+  shutdown (`ShutdownStarting`, drain, `ShutdownCompleted`, then the
+  `IAsyncAction` completes). `GetForCurrentThread`,
+  `CreateOnDedicatedThread` (activation factories, registered by
+  `classes.idl`), `HasThreadAccess`. Deferrals are not waited for.
+  WinUI 3 / Windows App SDK programs need it too.
+- **Where Paint.NET stops now:** `ID2D1Factory7::GetEffectProperties` ->
+  `ERROR_NOT_FOUND` for Direct2D's built-in effects (it builds its UI and
+  rendering on D2D effects and custom effects) -- Wine's d2d1 effect support
+  is the next wall, a big one; its installer also still exits 2. Not in the
+  compat suite.
+
+Gates: `make test-dispatcherq` (12 checks; stock fails all; a
+priority-order mutant fails 1), `make test-winver` (6; stock fails all,
+including the `wineboot -u` upgrade of a 19043 prefix).
+
 ## `patches/sg/0125`: startup items disabled in Task Manager do not start
 
 sg-taskmgr's Startup tab writes Windows' `Explorer\StartupApproved\{Run,
