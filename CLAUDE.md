@@ -1571,6 +1571,51 @@ descriptors (`sc sdset`) are still not implemented.
   stand-in registered in App Paths. 39 checks; stock passes only the two
   that Wine's own msinfo32.exe exists.
 
+## `patches/sg/0110`-`0112`: File Explorer
+
+- **0110 explorer:** the folder window is ours (`programs/explorer/fileexplorer.c`;
+  explorer.c keeps only the command line) around shell32's ExplorerBrowser:
+  command bar, back/forward (our own history -- ebrowser's travel log has no
+  public query), up, breadcrumb/editable address bar, refresh, search
+  (a thread; results in our own list view, not a shell folder), navigation
+  pane (a tree we draw entirely in custom draw; its chevrons are ours, so
+  clicks left of the icon expand), status bar, This PC page (capacity bars).
+  No arguments opens This PC. Selection changes arrive through an
+  `ICommDlgBrowser` site (`SID_SExplorerBrowserFrame`) that ebrowser forwards.
+  State: `HKCU\Software\Stained Glass\Explorer` (window size, nav pane,
+  `FolderViews\<parsing name>` = view mode).
+- **Alt+key accelerators must be passed to DefWindowProc** after we handle
+  them, or Alt's release opens the window menu and swallows the next keys.
+- **0111 shell32:** columns Name/Date modified/Type/Size (shfldr_fs and
+  shfldr_desktop share the header layout; attributes are not on by default and
+  DefView stops at the first such column); sort by column *property*; header
+  arrows; SetSortColumns/GetSortColumns; selection counts; rename selects the
+  base name (posted EM_SETSEL: the list view selects all after
+  LVN_BEGINLABELEDIT); light selection tint via custom draw (clear
+  CDIS_SELECTED or comctl32 paints the highlight); This PC / Recycle Bin /
+  Network / "Local Disk (C:)". Column order changes can move shell32 winetests.
+- **0112:** SHFileOperation's progress window (`dlls/shell32/fileopdlg.c`,
+  its own thread, shown after 500 ms, paused while a question is up) and
+  "Replace or Skip Files" (replace / skip / keep both, for all). A nested
+  SHFileOperation (folder contents) reuses the running progress through TLS.
+  kernelbase CopyFileEx/CopyFile2 call their progress routines and honour
+  cancel (a cancelled copy's partial file is deleted).
+
+**Gate: `make test-explorer`** (18 checks, xdotool + `explorer-probe`: title
+changes prove navigation; This PC's accent pixels; search trace; files on
+disk; progress/conflict window classes `SGFileOperation`/`SGFileConflict`;
+in-process columns/sort/selection). Stock fails all 18. The gate uses a temp
+`HOME` and replaces the prefix's user-folder symlinks -- **never let a test
+prefix's Documents point at the developer's home.**
+
+Next steps (not done): image thumbnails and larger icon sizes (DefView has
+32 px only; Large/Extra large need SHIL_EXTRALARGE/JUMBO and a WIC
+IThumbnailProvider), Tiles/Content views (comctl32 listview has no
+LV_VIEW_TILE or groups), Quick access pinning/recent files, the details pane,
+drag and drop onto the navigation pane, friendly type names (".txt file" ->
+"Text Document" needs HKCR class descriptions), unselected icons blended
+purple when selected (listview ILD_SELECTED).
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

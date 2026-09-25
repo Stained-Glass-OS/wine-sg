@@ -125,6 +125,10 @@ test-netsh:
 test-desktop-icons:
 	WINE=$(PREFIX)/bin/wine test/desktop-icons-gate.sh
 
+# File Explorer: layout, This PC, search, address bar, file operations (0110-0112).
+test-explorer:
+	WINE=$(PREFIX)/bin/wine test/explorer-gate.sh
+
 # A self-managed stack grows read-write; SD-less objects have an owner (0081, 0082).
 test-stackgrow:
 	WINE=$(PREFIX)/bin/wine test/stackgrow-gate.sh
