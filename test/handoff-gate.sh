@@ -1,5 +1,5 @@
 #!/bin/sh
-# The system32 names that hand off to App Paths (patches/sg/0120-0122).
+# The system32 names that hand off to App Paths (patches/sg/0120-0123).
 #
 # calc.exe, mspaint.exe and snippingtool.exe are system32 programs on Windows,
 # which programs start with CreateProcess -- a search of system32 and PATH
@@ -8,7 +8,7 @@
 # own taskmgr.exe and wmplayer.exe hand off the same way. From a 64-bit and a
 # 32-bit caller, with the arguments intact; never in a loop; Wine's Task
 # Manager still runs when nothing is registered. Win+Shift+S and Print Screen
-# run snippingtool.exe /clip.
+# run snippingtool.exe /clip, Ctrl+Shift+Esc taskmgr.exe (0123).
 #
 #   WINE=/opt/wine-sg/bin/wine test/handoff-gate.sh
 set -u
@@ -74,6 +74,8 @@ mark keys
 xdotool key super+shift+s; seen
 mark prtsc
 xdotool key Print; seen
+mark ctrlshiftesc
+xdotool key ctrl+shift+Escape; seen
 mark end
 # loop guard: App Paths naming another system copy must not chain launchers
 "$WINE" reg add '$AP\\calc.exe' /ve /d 'C:\\windows\\syswow64\\calc.exe' /f >/dev/null 2>&1
@@ -105,6 +107,7 @@ want paint32 '"C:\standin.exe"' 'mspaint.exe from a 32-bit program'
 want task32  '"C:\standin.exe"' 'taskmgr.exe from a 32-bit program'
 want keys    '"C:\standin.exe" /clip' 'Win+Shift+S runs snippingtool.exe /clip'
 want prtsc   '"C:\standin.exe" /clip' 'Print Screen runs snippingtool.exe /clip'
+want ctrlshiftesc '"C:\standin.exe"' 'Ctrl+Shift+Esc opens Task Manager (taskmgr.exe, App Paths)'
 after() { awk -v c="$1" '$0 == c { getline; print; exit }' "$T/log.out"; }
 # a chain would never settle on the launcher's "cannot find" message
 [ "$(after 'probe64.exe count calc.exe')$(after 'probe64.exe find #32770')" = "count=1found=1" ] \

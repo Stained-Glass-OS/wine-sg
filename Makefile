@@ -78,7 +78,7 @@ test-shellkeys:
 test-control:
 	WINE=$(PREFIX)/bin/wine test/control-gate.sh
 
-# calc/mspaint/snippingtool launchers, taskmgr/wmplayer hand-off, Win+Shift+S (0120-0122).
+# calc/mspaint/snippingtool launchers, taskmgr/wmplayer hand-off, Win+Shift+S, Ctrl+Shift+Esc (0120-0123).
 test-handoff:
 	WINE=$(PREFIX)/bin/wine test/handoff-gate.sh
 
