@@ -1078,6 +1078,14 @@ the virtual desktops' (0x5600..).
 0068 on SendInput). On stock, 4 "put back"/"restore" checks pass vacuously
 (nothing moved), after the step before them failed.
 
+## `patches/sg/0072`: control.exe follows App Paths
+
+`system32\control.exe` run directly (CreateProcess, not ShellExecute) now
+starts the Control Panel `HKLM\...\App Paths\control.exe` names
+(sg-shell's sg-control) with the same arguments. `SG_CONTROL_HANDOFF=1` in
+its environment means "do not hand off again", so sg-control can run
+control.exe for Wine's own applets. Gate: `make test-control`.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

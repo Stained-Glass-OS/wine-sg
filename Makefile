@@ -74,6 +74,10 @@ test-shellfolders:
 test-shellkeys:
 	WINE=$(PREFIX)/bin/wine test/shellkeys-gate.sh
 
+# control.exe follows App Paths (0072).
+test-control:
+	WINE=$(PREFIX)/bin/wine test/control-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
