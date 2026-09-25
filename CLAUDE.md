@@ -1257,24 +1257,31 @@ naming each handle's type (`NtQueryObject`) when a thread repeats a wait;
 `winedbg` `bt all` on the spinning process; and msys-2.0.dll's own symbols
 (`x86_64-w64-mingw32-nm -C`) to name the frames.
 
-**Firefox shutdown (open, narrowed).** On the pinned 128.6 (keep
-`DisableAppUpdate`: it updated itself mid-test once and broke its install)
-the window does not close because the **UI thread is already blocked**:
-Mozilla's public symbols show the parent's main thread in
-`MessageChannel::WaitForSyncNotify` <- `IProtocol::ChannelSend` <-
-`BrowserParent::InitRendering` <- `nsFrameLoader::TryRemoteBrowserInternal`
--- a synchronous request to the GPU process's compositor while setting up a
-remote frame. The GPU process is idle: its compositor thread (a UI message
-pump) sits in `WinUtils::WaitForMessage`, WebRender's threads parked. So the
-request is not delivered to, or does not wake, the compositor thread. In
-another run the parent's IPC thread was in a busy `WriteFile` loop on its
-`gecko.<pid>...` pipe (an overlapped handle, options 0) with memory climbing
-to 11 GB -- the same channel from the writing side. Next: trace the
-`gecko.*` pipe reads/writes and completion-port packets in both processes
-(the parent's IO thread and the GPU process's `MessagePumpForIO`), and the
-`PostMessage` wake of the compositor thread's message window. Firefox's
-MOZ_DISABLE_*_SANDBOX switches did not change it. The content processes'
-`CreateWindow failed with error 1411` (OLE apartment window) is noise.
+**Firefox shutdown (open; upstream Wine, not ours).** Proven on Debian's
+stock Wine 10.0 too (same hang, same prefix setup), so no wine-sg patch is
+the cause. Pinned 128.6, `DisableAppUpdate` (it once updated itself
+mid-test and broke its install). Two separate stalls:
+
+1. **With the GPU process (default):** the parent's UI thread blocks in
+   `MessageChannel::WaitForSyncNotify` <- `BrowserParent::InitRendering`
+   (a sync request to the GPU process while creating a remote frame), while
+   the GPU process sits idle (compositor thread in `WaitForMessage`,
+   WebRender parked). The parent's nested loop then posts ~100k wake
+   messages to its own window; memory climbs (to 11 GB once). WM_CLOSE is
+   never handled.
+2. **With `layers.gpu-process.enabled` = false** (policies.json
+   "Preferences"): the window closes, `Quit` runs, and a shutdown observer
+   spins `SpinEventLoopUntil`; tab processes take 45-60 s to go (the
+   watchdog, not a clean exit) and the parent, socket and utility processes
+   are still alive after 2 min.
+
+Common factor: IPC messages between Firefox processes are not delivered or
+not woken promptly -- Chromium IPC is overlapped named pipes on I/O
+completion ports. Next: a probe of that exact pattern (pending overlapped
+ReadFile on a pipe bound to an IOCP, peer writes, GetQueuedCompletionStatus
+on another thread; plus the "posted to a message window from another
+thread" wake), then trace the `gecko.<pid>.<n>` pipes in both processes.
+The content processes' `CreateWindow failed with error 1411` is noise.
 
 **Mozilla symbols for triage:** read `xul.dll`'s CodeView debug ID (RSDS
 record: GUID + age), fetch
