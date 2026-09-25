@@ -98,6 +98,13 @@ test-netsh:
 test-desktop-icons:
 	WINE=$(PREFIX)/bin/wine test/desktop-icons-gate.sh
 
+# A self-managed stack grows read-write; SD-less objects have an owner (0081, 0082).
+test-stackgrow:
+	WINE=$(PREFIX)/bin/wine test/stackgrow-gate.sh
+
+test-objowner:
+	WINE=$(PREFIX)/bin/wine test/objowner-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 

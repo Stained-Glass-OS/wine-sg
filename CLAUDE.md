@@ -1213,6 +1213,33 @@ the icons).
 **Patch numbers:** the compatibility work uses 0080-0089, the main session
 0090 on.
 
+## `patches/sg/0081`, `0082`: what Git for Windows' terminal needed
+
+Found by the compatibility suite: mintty (Git Bash's terminal) died, then
+every program in it segfaulted. Two upstream Wine gaps, both in things the
+Cygwin/MSYS runtime does exactly as Windows allows:
+
+- **0081 (ntdll): a stack grows into read-write pages.** Cygwin reserves its
+  stacks `PAGE_NOACCESS` and commits the top read-write itself;
+  `grow_thread_stack` kept the reservation's protection, so the grown page
+  was committed with no access, the retry faulted again, and the process was
+  **killed by SIGSEGV -- which Windows code (and our probe) sees as exit code
+  0.** A silent "exit 0" with no NtTerminateProcess is this, not a clean exit.
+  Gate: `make test-stackgrow` (the probe builds a Cygwin-style stack and
+  switches onto it with a few lines of asm; its verdict is the child's
+  printed marker, never its exit code).
+- **0082 (server): SD-less objects have their creator as owner and group.**
+  `NtQuerySecurityObject` returned an empty descriptor for pipes, events,
+  mutexes, semaphores, sections created without one; Cygwin's
+  `cygpsid::get_id` read the pty pipe's NULL owner. `create_object` /
+  `create_named_object` now record the effective token's owner and primary
+  group -- **no DACL**, so access is unchanged (`token_access_check` grants
+  everything when no DACL is present, as it did for no descriptor). Threads
+  and files (their own paths) are untouched. Gate: `make test-objowner`.
+
+Still open: output from programs inside mintty does not reach its window
+(bash runs, alive, no fault) -- the Cygwin pty's data path under Wine.
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
