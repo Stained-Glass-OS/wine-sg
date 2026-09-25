@@ -1105,6 +1105,23 @@ control.exe for Wine's own applets. Gate: `make test-control`.
 Gate: `make test-shellkeys` (now 16 checks: work area 0,0,1024,660, maximize
 above the taskbar, drag preview/snap/top).
 
+## `patches/sg/0076`-`0077`: PrintWindow across processes; real thumbnails
+
+- **0076:** `NtUserPrintWindow` for another process's window creates a
+  section, duplicates it into the owner (`NtOpenProcess(PROCESS_DUP_HANDLE)`
+  + `NtDuplicateObject`) and sends `WM_WINE_PRINTWINDOW` (wparam: the
+  owner's handle; lparam: flags<<30 | width<<15 | height, 15 bits each). The
+  owner draws into a DIB on the section -- `WM_PRINT`, or with
+  `PW_RENDERFULLCONTENT` (defined now, 0x2) a copy of its surface's
+  `color_bitmap`, which survives cloaking -- and **always closes the
+  section handle**. Changes `ntuser.h`'s internal message enum and
+  `winuser.h`: rebuild everything.
+- **0077:** explorer's thumbnails use it (Task View refreshes every window
+  on open, Alt+Tab the current desktop's); the screen grab stays as the
+  fallback.
+
+Gate: `make test-printwindow` (stock returns black for all three).
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

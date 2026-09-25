@@ -78,6 +78,10 @@ test-shellkeys:
 test-control:
 	WINE=$(PREFIX)/bin/wine test/control-gate.sh
 
+# PrintWindow of another process's window (0076).
+test-printwindow:
+	WINE=$(PREFIX)/bin/wine test/printwindow-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
