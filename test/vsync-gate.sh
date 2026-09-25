@@ -1,5 +1,6 @@
 #!/bin/sh
-# DwmFlush waits for the next vertical blank (patches/sg/0170).
+# DwmFlush waits for the next vertical blank (patches/sg/0170), and so does
+# IDXGIOutput::WaitForVBlank (0173).
 #
 # Wine's DwmFlush returned at once. Firefox paces its vsync thread with it,
 # so its vsync notifications -- IPC messages to the GPU process -- became a
@@ -24,7 +25,7 @@ T=$(mktemp -d /var/tmp/sg-vsync.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" WINESERVER
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
-"$MINGW" -O2 -o "$T/vsync-probe.exe" "$HERE/vsync-probe.c" -ldwmapi || { fail "probe did not build"; exit 1; }
+"$MINGW" -O2 -o "$T/vsync-probe.exe" "$HERE/vsync-probe.c" -ldwmapi -ldxgi -ldxguid || { fail "probe did not build"; exit 1; }
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
@@ -41,6 +42,11 @@ else fail "30 DwmFlush calls took ${ms:-?} ms, not ~${exp:-?}"; fi
 if [ -n "$ps" ] && [ -n "$rate" ] && [ "$ps" -le $((rate * 3 / 2 + 5)) ] && [ "$ps" -ge $((rate / 2)) ]; then
     pass "Firefox's vsync over pipe + IOCP + posted message runs at the refresh rate ($ps/s)"
 else fail "Firefox's vsync pattern ran at ${ps:-?}/s, not ~$rate/s"; fi
+dx=$(printf '%s\n' "$out" | sed -n 's/^dxgi30_ms=//p')
+if printf '%s\n' "$out" | grep -qx 'dxgi=none'; then echo "info  no DXGI output here: IDXGIOutput::WaitForVBlank not checked"
+elif [ -n "$dx" ] && [ "$dx" -eq "$dx" ] 2>/dev/null && [ "$dx" -ge $((exp * 3 / 4)) ] && [ "$dx" -le $((exp * 3 / 2 + 50)) ]; then
+    pass "30 IDXGIOutput::WaitForVBlank calls take 30 frames (${dx} ms)"
+else fail "IDXGIOutput::WaitForVBlank: ${dx:-?} (not ~${exp} ms)"; fi
 case "$rt" in ''|-*) fail "a request through the same channel got no reply" ;;
     *) [ "$rt" -le 200 ] && pass "a request through the same channel is answered (${rt} ms)" || fail "request took ${rt} ms" ;; esac
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"

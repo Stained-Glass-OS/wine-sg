@@ -1430,12 +1430,13 @@ on the grid `DwmGetCompositionTimingInfo` already reports.
 - How it was found: `winedbg` `bt all` on the GPU process (IO thread in
   `ReadFile`, not stuck but busy), Mozilla's `xul.sym` for names, then
   `WINEDEBUG=+server` counting requests per thread id.
-- `IDXGIOutput::WaitForVBlank` is still `E_NOTIMPL` (Firefox then falls
-  back to `DwmFlush`).
+- **0173:** `IDXGIOutput::WaitForVBlank` (was `E_NOTIMPL`; Firefox tries it
+  before `DwmFlush`, Chromium's vsync thread uses it) waits the same way,
+  for the output mode's refresh rate.
 
 Gates: `make test-vsync` (thirty flushes take thirty frames, each on the
 vblank grid, and Firefox's vsync-over-pipe+IOCP pattern runs at the refresh
-rate; stock fails 2 of 5) and `make test-firefox` (the pinned installer:
+rate, and 30 `WaitForVBlank` calls take 30 frames; stock fails 3 of 6) and `make test-firefox` (the pinned installer:
 page title on the window, a GPU process, window closes, every process gone
 within 30 s; stock is OOM-killed in its 6 GB scope, fails 4 of 5).
 

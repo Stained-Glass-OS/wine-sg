@@ -14,11 +14,15 @@
  *                          flush30_ms=MS expect=MS
  *                          on_vblank=N/30
  *                          ipc_vsyncs=N per_s=HZ roundtrip_ms=MS
+ *                          dxgi30_ms=MS (IDXGIOutput::WaitForVBlank, 0173;
+ *                          dxgi=none without an output)
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
+#define COBJMACROS
 #include <windows.h>
 #include <dwmapi.h>
+#include <dxgi.h>
 #include <stdio.h>
 
 #define MSG_VSYNC (WM_APP + 1)
@@ -127,6 +131,34 @@ int main( void )
     expect = 30 * 1000.0 / rate;
     printf( "flush30_ms=%.0f expect=%.0f\n", t1 - t0, expect );
     printf( "on_vblank=%d/30\n", on_vblank );
+
+    /* 1b: IDXGIOutput::WaitForVBlank waits too (Chromium's vsync thread) */
+    {
+        IDXGIFactory1 *factory;
+        IDXGIAdapter1 *adapter;
+        IDXGIOutput *output = NULL;
+
+        if (SUCCEEDED( CreateDXGIFactory1( &IID_IDXGIFactory1, (void **)&factory ) ))
+        {
+            if (SUCCEEDED( IDXGIFactory1_EnumAdapters1( factory, 0, &adapter ) ))
+            {
+                IDXGIAdapter1_EnumOutputs( adapter, 0, &output );
+                IDXGIAdapter1_Release( adapter );
+            }
+            IDXGIFactory1_Release( factory );
+        }
+        if (output)
+        {
+            HRESULT hr = IDXGIOutput_WaitForVBlank( output );
+            t0 = now_ms();
+            for (i = 0; i < 30 && SUCCEEDED( hr ); i++) hr = IDXGIOutput_WaitForVBlank( output );
+            t1 = now_ms();
+            if (SUCCEEDED( hr )) printf( "dxgi30_ms=%.0f\n", t1 - t0 );
+            else printf( "dxgi30_ms=failed(%#lx)\n", hr );
+            IDXGIOutput_Release( output );
+        }
+        else printf( "dxgi=none\n" );
+    }
 
     /* 2: Firefox's vsync over its IPC channel, for one second */
     swprintf( name, 64, L"\\\\.\\pipe\\sg-vsync-probe.%lu", GetCurrentProcessId() );
