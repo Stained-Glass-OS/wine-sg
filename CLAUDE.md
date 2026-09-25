@@ -1337,9 +1337,11 @@ current in every prefix with nothing to install.
   per-font cache and are passed to `ExtTextOutW` as `lpDx`, so caret and
   pixels agree. Glyphs the font lacks are drawn from installed fallback
   fonts (`fallback_faces[]`) -- Wine links fonts only for a few UI faces, so
-  a monospace font showed boxes for CJK. Non-BMP characters (emoji) still use
-  the main font: **the image ships no CJK or emoji font** (sg-image's
-  `fonts-*` list), so those are boxes there whatever the editor does.
+  a monospace font showed boxes for CJK. **Wine's GDI draws no character
+  beyond the BMP** (emoji) even from a font that has it -- tried with
+  Symbola: still a box -- so that needs win32u/freetype work, not the
+  editor. And **the image ships no CJK or emoji font** (sg-image's `fonts-*`
+  list), so CJK is boxes there too until one is added.
 - **Compatibility is deliberate** (see main.c's header): one process per
   invocation living until its window closes (git's `core.editor`), Windows
   Notepad's command line (`/p` prints and exits without a window, `/pt`,
