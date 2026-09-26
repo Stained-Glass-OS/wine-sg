@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # What the meeting programs need at start (patches/sg/0425-0426), found by
 # the compat suite's Zoom and Teams entries:
 #
