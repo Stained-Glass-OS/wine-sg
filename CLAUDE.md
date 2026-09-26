@@ -396,6 +396,18 @@ test-sandboxdesk` (the probe builds Firefox's sandbox: winsta, desktop,
 **The tell:** `explorer.exe /desktop` at 100% CPU and `add_source: Assertion`
 in a log.
 
+## `patches/sg/0248`: sandboxed processes may read HKLM
+
+A restricted token must also be granted access through its restricting SIDs,
+an AppContainer through its package SIDs. The shared prefix's HKLM DACL
+(`sg_create_system_dacl`) and the display keys' (`sg_create_display_dacl`)
+named neither, so **Firefox's content processes (and any Chromium renderer)
+could read nothing in HKLM** -- no display config, no window class (error
+1411), tabs dying "Exiting due to channel error". Both now add GENERIC_READ
+for RESTRICTED (S-1-5-12) and ALL APPLICATION PACKAGES, as Windows' HKLM
+does. `make test-sandboxdesk` checks the sandboxed child reads HKLM and sees
+1280x800.
+
 ## `patches/sg/0012-windows-10-taskbar.patch`
 
 Explorer's taskbar (`Shell_TrayWnd`, `systray.c`) given a Windows 10 look **in

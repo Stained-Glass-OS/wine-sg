@@ -1,5 +1,6 @@
 #!/bin/bash
-# Gate for wine-sg 0247: a sandboxed program's own desktop comes up.
+# Gate for wine-sg 0247 and 0248: a sandboxed program's own desktop comes up,
+# and a restricted token may read HKLM (0248).
 #
 # Firefox's sandbox starts each content process on an alternate window station
 # and desktop with a restricted, low-integrity token. The first window on that
@@ -85,9 +86,14 @@ timeout 60 sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=err+system,-al
     > /dev/null 2> "$W/probe.err" &
 for _ in $(seq 1 40); do [ -s "$W/out/child.txt" ] && break; sleep 1; done
 sleep 8
+tr -d '\r' < "$W/out/child.txt" > "$W/out/child.lf" 2>/dev/null && mv "$W/out/child.lf" "$W/out/child.txt"   # the probe writes CRLF
 cat "$W/out/child.txt" 2>/dev/null
 grep -q '^CHILD_WINDOW 1' "$W/out/child.txt" 2>/dev/null && pass "the sandboxed process gets a window on its own desktop" \
     || fail "the sandboxed process made no window: $(cat "$W/out/child.txt" 2>/dev/null)"
+grep -q '^CHILD_HKLM 0$' "$W/out/child.txt" 2>/dev/null && pass "it may read HKLM (RESTRICTED is granted read, as on Windows)" \
+    || fail "the sandboxed process cannot read HKLM: $(grep HKLM "$W/out/child.txt" 2>/dev/null)"
+grep -q '^CHILD_MODE 1 1280x800' "$W/out/child.txt" 2>/dev/null && pass "and sees the display (1280x800)" \
+    || fail "the sandboxed process's display: $(grep MODE "$W/out/child.txt" 2>/dev/null)"
 n=$(cat "$W"/*.err | grep -c 'Assertion')
 [ "$n" = 0 ] && pass "no display-setup assertion" || fail "$n x: $(cat "$W"/*.err | grep -m1 Assertion)"
 # nothing of this prefix left spinning: explorers other than the shell's

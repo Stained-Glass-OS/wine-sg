@@ -25,7 +25,17 @@ int main(int argc, char **argv)
     if (argc > 2)
     {   /* the child, sandboxed */
         HWND w = CreateWindowW(L"STATIC", L"sandboxed", WS_OVERLAPPED, 0, 0, 50, 50, NULL, NULL, NULL, NULL);
-        if ((f = fopen(argv[1], "w"))) { fprintf(f, "CHILD_WINDOW %d\n", w != NULL); fclose(f); }
+        DEVMODEW dm = { .dmSize = sizeof(dm) };
+        BOOL cur = EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm);
+        HKEY k;
+        LONG hklm = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion", 0, KEY_READ, &k);
+        if (!hklm) RegCloseKey(k);
+        if ((f = fopen(argv[1], "w")))
+        {
+            fprintf(f, "CHILD_WINDOW %d\nCHILD_HKLM %ld\nCHILD_MODE %d %lux%lu\n", w != NULL, hklm,
+                    cur, cur ? dm.dmPelsWidth : 0, cur ? dm.dmPelsHeight : 0);
+            fclose(f);
+        }
         if (w) DestroyWindow(w);
         return w ? 0 : 1;
     }
