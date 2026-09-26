@@ -2081,6 +2081,49 @@ input, b0 constants) comes next. Gate: `make test-d2dfx` (Xvfb; 28
 checks; stock fails all but the probe's end). d2d1:d2d1 and
 uianimation:uianimation 0 failures.
 
+## `patches/sg/0340`-`0342`: Paint.NET's canvas and colours draw; a display's colour capabilities
+
+Found debugging Paint.NET 5.1 (portable) with two dev-only aids (not
+shipped; kept in `/var/tmp/sgcm/wip-full-*.diff`): `SG_FXDUMP=dir` wrote every
+effect node's texture as a PAM file with the effect's CLSID, and a
+`TRACE_(wuic)` dump of the composition visual tree. The dumps showed the
+canvas tiles' effect chains had an empty output rectangle and the
+checkerboard was offset by the canvas margin.
+
+- **0340 d2d1**: layers (a target-sized bitmap per pushed layer, put back
+  through content bounds, geometric mask, opacity and opacity brush);
+  `SetPrimitiveBlend` (COPY/ADD/MIN/MAX) and DrawImage's thirteen composite
+  modes as blend states. Careful: the composite mode is kept as `int` with
+  -1 for "none" -- `D2D1_COMPOSITE_MODE` is unsigned, and comparing -1 with
+  it silently took the wrong branch. Gate `make test-d2dlayer` (stock fails
+  12 of 19).
+- **0341 d2d1**: one effect input may feed several transform nodes (each
+  node records the effect input feeding each of its inputs; the graph kept
+  one node per input, so Paint.NET's Convert Alpha lost its input); a
+  transform gets `SetDrawInfo` when added to a graph (effects that rebuild
+  their graph in PrepareForRender had no shader); DrawImage's image
+  rectangle top left lands at the target offset for effects. Gate `make
+  test-d2dgraph` (stock fails 3 of 5).
+- **0342 win32u, dxgi**: `DisplayConfigGetDeviceInfo` advanced colour info and
+  SDR white level; `IDXGIOutput6::GetDesc1` bits, primaries, luminance.
+  Gate `make test-advcolor` (stock fails 3 of 6).
+
+**Paint.NET now**: the canvas shows the white layer where it belongs, the
+colour wheel, palette and primary/secondary swatches draw, colour picking
+works. **Still wrong**: the tool-option boxes in the second toolbar are
+black; **a paintbrush drag hangs the UI thread** -- found (by forcing a
+NullReferenceException in the spinning JIT code with gdb and reading
+Paint.NET's crash log) to be `SpriteTileSorter.Update` iterating tiles over
+unbounded stroke bounds: `GetImageLocalBounds` of an effect over a command
+list is infinite because command lists' extents are not tracked. WIP not
+shipped (in the wip diff): a command-list bounds sink
+(`d2d_command_list_get_bounds`), generic geometry operations for every
+stubbed `GetBounds`/`GetWidenedBounds`/`FillContainsPoint`/
+`StrokeContainsPoint`/`ComputeArea`/`ComputeLength`/`ComputePointAtLength`/
+`Outline`/`CompareWithGeometry` (new `geometry_ops.c`), and a real path
+`AddArc` (was a straight line). Next: wire the bounds into
+`d2d_image_get_rect` for command lists, gate, retest the drag, then saving.
+
 ## `patches/sg/0229`-`0234`: Windows.UI.Composition's first slice; Paint.NET 5 starts
 
 Paint.NET's compositor (`PdnCompositor`) is Windows.UI.Composition: a

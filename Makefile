@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dgraph test-advcolor
 
 all: build
 
@@ -366,6 +366,18 @@ test-dwscale:
 # feature level, Windows Animation, effect bounds, geometry combination and
 # widening, drawing effects and command lists, as Paint.NET uses them
 # (0223-0229).
+# Direct2D layers, primitive blends, DrawImage composite modes (0340);
+# effect graphs as Paint.NET builds them (0341); a display's colour
+# capabilities (0342). Xvfb.
+test-d2dlayer:
+	WINE=$(PREFIX)/bin/wine test/d2dlayer-gate.sh
+
+test-d2dgraph:
+	WINE=$(PREFIX)/bin/wine test/d2dgraph-gate.sh
+
+test-advcolor:
+	WINE=$(PREFIX)/bin/wine test/advcolor-gate.sh
+
 test-d2dfx:
 	WINE=$(PREFIX)/bin/wine test/d2dfx-gate.sh
 
