@@ -303,6 +303,11 @@ test-symlink:
 test-appcompat:
 	WINE=$(PREFIX)/bin/wine test/appcompat-gate.sh
 
+# ucrtbase imaxdiv and the wide intmax conversions exist (0421): 64/32-bit,
+# ucrtbase, msvcr120, msvcr120_app.
+test-crtimax:
+	WINE=$(PREFIX)/bin/wine test/crtimax-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
