@@ -63,7 +63,10 @@ sleep 2
 "$WINE" darkmode-probe.exe window Plain 40 60 >/dev/null 2>&1 &
 sleep 2
 "$WINE" darkmode-probe.exe window Dark 520 60 dark >/dev/null 2>&1 &
-sleep 2
+# wait for the window rather than a fixed sleep: on a loaded host it can
+# take longer than 2s to appear (a missing attribute still fails: hr=0)
+i=0; while ! "$WINE" darkmode-probe.exe state 2>/dev/null | grep -q 'hr=0\b' && [ \$i -lt 30 ]; do sleep 1; i=\$((i + 1)); done
+sleep 1
 P state
 shot light
 P mode apps dark

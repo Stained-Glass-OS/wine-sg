@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-darkmode test-taskbar
+.PHONY: all build install test deb deps clean distclean lint test-darkmode test-taskbar test-explorer-dark
 
 all: build
 
@@ -109,6 +109,10 @@ test-darkmode:
 # The Run dialog: in front, typed into at once, our words and icon (0266).
 test-rundialog:
 	WINE=$(PREFIX)/bin/wine test/rundialog-gate.sh
+
+# File Explorer follows the app mode, in Large icons and Details (0264, 0265).
+test-explorer-dark:
+	WINE=$(PREFIX)/bin/wine test/explorer-dark-gate.sh
 
 # The taskbar honours Settings > Personalization > Taskbar (0164).
 test-taskbar:

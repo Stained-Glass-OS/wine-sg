@@ -2838,6 +2838,30 @@ the DWM-dark title bar is light and the registry keeps the light colours.
 Against 10.0-43 (no 0160-0163) it fails 14. sg-shell's Settings, Start and
 network flyout follow the modes with `src/sg-mode.h`.
 
+## `patches/sg/0264`, `0265`: File Explorer in dark mode
+
+QA B19/B33: File Explorer stayed light but for its title bar, and a selected
+icon's white name sat on the light selection tint.
+- **0264 explorer:** `fileexplorer.c`'s `C_*` colours are a light or dark
+  palette (`fe_pal`), chosen from AppsUseLightTheme at creation and on
+  "ImmersiveColorSet" (`fe_apply_mode`: title bar, tree and results colours,
+  repaint). **WM_SYSCOLORCHANGE / WM_THEMECHANGED are forwarded to every
+  child**: a common control learns of colour changes only from its parent,
+  as on Windows. **shell32 DefView:** the selection tint is dark when
+  COLOR_WINDOW is (`view_is_dark`).
+- **0265 comctl32:** a list view took COLOR_WINDOW once, at creation; until
+  a program sets its own background (LVM_SETBKCOLOR), WM_SYSCOLORCHANGE now
+  gives it the new one. Without it Details showed dark rows on white.
+- **Gate: `make test-explorer-dark`**, run in Large icons and in Details:
+  command bar, navigation pane, folder view and status bar light, dark,
+  light by pixels; the selection's tint by colour on the whole screen (no
+  light tint in dark mode); a This PC window opened in dark mode is dark and
+  follows back. Mutants: shell32 light tint only, comctl32 without the
+  refresh, explorer palette always light -- each fails it.
+- `test/darkmode-gate.sh` now waits for the "Dark" probe window before its
+  first `state` (it slept 2 s: on a loaded host FindWindow missed it and
+  the gate failed with `hr=0x80004005`, not a dwmapi bug).
+
 ## `patches/sg/0164`: the taskbar honours Settings
 
 `programs/explorer/systray.c` reads Settings > Personalization > Taskbar
