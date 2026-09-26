@@ -323,6 +323,11 @@ test-aumid:
 test-keyedmutex:
 	WINE=$(PREFIX)/bin/wine test/keyedmutex-gate.sh
 
+# What Zoom and Teams need at start: SetThreadpoolTimerEx/WaitEx,
+# Windows.ApplicationModel.LimitedAccessFeatures (0425-0426).
+test-meetings:
+	WINE=$(PREFIX)/bin/wine test/meetings-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
