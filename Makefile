@@ -299,6 +299,12 @@ test-dwscale:
 test-d2dfx:
 	WINE=$(PREFIX)/bin/wine test/d2dfx-gate.sh
 
+# What popular installers need: a COM service by a long name with its
+# parameters, key DACLs through write handles, [string] typelib marshalling,
+# internet shortcuts, process group affinity (0235-0239).
+test-appfix:
+	WINE=$(PREFIX)/bin/wine test/appfix-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 

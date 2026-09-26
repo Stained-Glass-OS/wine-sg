@@ -1403,6 +1403,44 @@ desktop (`get_default_desktop`), exactly as when none is given. Gate:
 `make test-default-desktop` (a child started with that lpDesktop must land on
 "shell" and make a window; stock: "Default", no window).
 
+## `patches/sg/0235`-`0239`: what the installers people run first need
+
+Found by the compat suite's round of popular applications (Chrome, Node.js,
+Java; see the suite's section):
+
+- **0235 combase** (`rpc.c`, `create_local_service`): an AppID's
+  `LocalService` was read into a GUID-sized buffer, so a longer service name
+  (Google's updater's `GoogleUpdaterInternalService152.0.7933.0`) looked
+  absent and the class went to dllhost; and it read `ServiceParams`, not
+  Windows' **`ServiceParameters`** -- the service never got its
+  `--com-service`. Now 256-character names, parameters split like a command
+  line and passed to `StartService`.
+- **0236 advapi32** (`SetSecurityInfo`): on a registry key, a denied
+  `NtSetSecurityObject` is retried on the key **reopened relative to the
+  handle** with WRITE_DAC/WRITE_OWNER/ACCESS_SYSTEM_SECURITY (the normal
+  access check decides), as Windows' security API does. The updater sets
+  `ClientStateMedium`'s DACL through a KEY_WRITE handle (ATL `AtlSetDacl`).
+- **0237 rpcrt4** (`ndr_typelib.c`): VT_LPWSTR/VT_LPSTR in the typelib
+  marshaller -- `FC_UP FC_SIMPLE_POINTER FC_C_WSTRING/CSTRING FC_PAD`,
+  pointer-sized. Before, `get_param_info` said "unhandled type 31" and the
+  stub/proxy creation failed (`E_NOTIMPL` -> E_NOINTERFACE to the caller).
+  The updater's `IUpdaterSystem` uses `[in, string]` parameters.
+  **Chrome's enterprise MSI installs with 0235-0237** (before: MSI 1627,
+  updater error 75003/75035 in `Program Files (x86)\Google\GoogleUpdater\updater.log`,
+  which is the place to look).
+- **0238 ieframe** (`intshcut.c`): `IPersistFile::Save` of an internet
+  shortcut succeeds when the caller holds its property set open (WiX's
+  `WixCreateInternetShortcuts` does); it wrote the file then returned
+  STG_E_ACCESSDENIED and the MSI rolled back -- **Node.js's MSI: 1603**.
+- **0239 kernelbase**: `GetProcessGroupAffinity` (group 0; too small ->
+  ERROR_INSUFFICIENT_BUFFER + the count). Java 21 warned on every start.
+
+Gate: `make test-appfix` (7 checks, a test service with a long name and
+parameters, a typelib built with ICreateTypeLib2 called across apartments;
+the old build fails all but the service registration). advapi32:security,
+kernel32:process, ieframe:intshcut unchanged; ole32:marshal behaves the same
+(its window test needs a display either way).
+
 ## The application compatibility suite (`make test-compat`)
 
 `test/compat/apps.list` pins real Windows applications (official URL +
