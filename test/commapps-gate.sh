@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # What Discord and Spotify need at start (patches/sg/0380-0382), found by the
 # compat suite's entries for them:
 #
@@ -36,10 +37,6 @@ for t in "$MINGW" "$MINGW32"; do command -v "$t" >/dev/null || { echo "SKIP: $t 
 
 T=$(mktemp -d /var/tmp/sg-commapps.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINESERVER DISPLAY=
-# a scratch HOME: the prefix's Desktop, Documents... link to $HOME's
-export HOME="$T/home" XDG_CONFIG_HOME="$T/home/.config" XDG_DATA_HOME="$T/home/.local/share" \
-    XDG_DESKTOP_DIR="$T/home/Desktop" WINEDLLOVERRIDES="winemenubuilder.exe=d"
-mkdir -p "$HOME/Desktop"
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 
