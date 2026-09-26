@@ -3014,6 +3014,101 @@ target). Scratch trees can go, but copy the drafts somewhere safe before
 - **Skype** can no longer be downloaded (the download links redirect to
   skype.com and Teams free); nothing to test.
 - **Screen sharing** in Zoom/Teams was not reached.
+## Browsers in daily use: root causes found, fixes drafted (next steps)
+
+This came out of the 2026-09-26 communication-and-web compat round. **Nothing
+from it is in the series yet**, because the fixes are drafted but not gated.
+The drafts are unified diffs against the patched tree, in
+`/var/tmp/sgcomm/d-drafts/` (with the test pages, the local test server
+`www/server.py` and the xdotool driver scripts in `bin/`). They take the
+reserved numbers `sg/0395`-`0399`. Each one still needs a probe gate that
+fails on `/opt/wine-sg`, a mutation test and a conformance run.
+
+Here is what was tested, under Xvfb in a shell desktop. The browsers were
+Firefox 156.0.1 (the current release, extracted from the vendor's
+installer), Chrome 154 (unpacked from the enterprise MSI) and, not yet
+exercised, Edge 154:
+
+| Flow | Firefox, stock 10.0-16 | Firefox with the drafts | Chrome, stock |
+|---|---|---|---|
+| HTML5 video: VP9, AV1, H.264+AAC | "file is corrupt"; the media processes crash | all three play (140+ frames, no drops) | VP9 and AV1 play; the GPU process dies (see 4) |
+| WebAudio | - | runs | - |
+| Download to a folder, "Show in folder" | works, but leaves a `name:Zone.Identifier` file | works, and no junk file | not tested |
+| Upload through the open-file dialog | - | works | not tested |
+| Web notification | - | permission is granted, then **the browser crashes** (see 3) | not tested |
+| Print, sign-in/cookies, Edge | not reached | | |
+
+1. **`ucrtbase.imaxdiv` was a stub**, and so were `wcstoimax`,
+   `wcstoumax`, `_wcstoimax_l` and `_wcstoumax_l`, in ucrtbase, msvcr120
+   and msvcr120_app. Firefox's audio-decoder utility process and its content
+   process call `imaxdiv` as soon as a Media Foundation decoder starts
+   streaming. The process aborts, and Firefox shows the video as corrupt.
+   **Fix** (`ucrtbase-imaxdiv-wcstoimax.diff`): `imaxdiv_t` has the same
+   layout as `lldiv_t`, so the spec entries point `imaxdiv` at `lldiv`
+   (`-norelay`, because it returns a struct) and the `wcsto*max` entries
+   at `_wcstoi64` and `_wcstoui64`, with their `_l` variants.
+2. **Direct3D 11 textures created with `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`
+   had no `IDXGIKeyedMutex`.** On Windows, that interface always exists for
+   such a texture. Firefox's `DoesTextureSharingWorkInternal`
+   (`gfx/thebes/D3D11Checks.cpp`) calls `AcquireSync` on the result of
+   `QueryInterface` without checking it, and dereferences NULL. That crashes
+   the GPU process every time, and after three attempts Firefox falls back to
+   doing the same check in the **main process**, which then crashes at
+   startup now and then. The minidumps put all of these at
+   `xul.dll+0x3986fce`. The symbols came from `symbols.mozilla.org`, looked
+   up by the PE's CodeView id. **Fix** (`d3d11-keyed-mutex.diff`): the 2D
+   texture exposes a real in-process keyed mutex when it has that flag. It
+   uses an SRW lock and a condition variable. `AcquireSync(key, ms)` waits
+   until the mutex is released with that key and returns `WAIT_TIMEOUT` when
+   the time runs out. `ReleaseSync` returns `E_FAIL` when the caller does
+   not hold the mutex. Cross-process sharing is still missing
+   (`CreateSharedHandle` and `OpenSharedResource1` are `E_NOTIMPL`), and
+   Firefox handles that failure cleanly.
+3. **`kernel32.GetCurrentApplicationUserModelId` did not exist.** Firefox
+   delay-loads it when it shows a notification, and the result is
+   EXCEPTION_WINE_STUB (`0x80000100`) in the main process. **Fix**
+   (`kernelbase-aumid.diff`): it is implemented, along with
+   `GetApplicationUserModelId`, in kernelbase and forwarded from kernel32.
+   An unpackaged process gets `APPMODEL_ERROR_NO_APPLICATION`. A packaged
+   one gets the AUMID from the package's app execution alias whose target is
+   its own image. The draft is built but **not yet run**: whether Firefox
+   then shows the notification (its own alert window, or a toast through
+   `Windows.UI.Notifications`) is the next thing to check.
+4. **Every browser download left a `<file>:Zone.Identifier` file** next to
+   the download, in the user's real Downloads folder. That is Mark of the
+   Web, written as a named data stream. Wine has no named streams and does
+   not report `FILE_NAMED_STREAMS`, but `lookup_unix_name` accepted the
+   colon and created a literal file with that name. **Fix**
+   (`ntdll-no-named-streams.diff`): the last path component can no longer
+   create or open such a name. The lookup refuses it with
+   `STATUS_OBJECT_NAME_INVALID`, as a FAT volume does. A Unix file that
+   really has a colon in its name is still found, by the exact-match
+   shortcut before this check. `file::$DATA` opens the file itself. Firefox
+   ignores the failure, and the download has no junk file next to it. **Run
+   the ntdll and kernel32 file conformance tests before this lands**: it
+   changes what every CreateFile of a name with a colon does.
+5. **Chrome's GPU process dies under Xvfb** with a FATAL at
+   `skia_output_surface_impl.cc:1277` ("Couldn't create surface",
+   "CopySharedImage: Dest shared image is not writable"). On the third
+   death the browser exits. This is on llvmpipe through wined3d, and it is
+   not yet known whether real hardware does the same. Check whether draft 2
+   changes it, since Chrome's shared images use keyed mutexes. With
+   `--disable-gpu`, H.264 plays. Chrome writes a 90-380 MB minidump per crash
+   into `Crashpad/reports`, so clean them up.
+6. **Firefox's popups** (the downloads panel, the permission doorhanger)
+   have a thick **black frame** where their transparent shadow should be.
+   That is per-pixel alpha in the shell desktop. The cause is not yet
+   investigated.
+
+How it was driven: `bin/ff.sh` and `bin/chrome.sh` start the browser in a
+scratch prefix. A `distribution/policies.json` next to Firefox skips the
+Terms-of-Use screen, and `--autoplay-policy=no-user-gesture-required` lets
+Chrome play without a click. The test page `v.html?FILE` reports to the
+server's `/report`, and `bin/nav.sh` types URLs into the focused window
+inside the Wine desktop. xdotool cannot see Wine's windows there, only the
+desktop window. **Always use a scratch `HOME`**, with
+`WINEDLLOVERRIDES=winemenubuilder.exe=d`: browser downloads land in the
+prefix's Downloads, which a default prefix links to `~/Downloads`.
 
 ## Trademark: the text our patches add never calls us Windows
 
