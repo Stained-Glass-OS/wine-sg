@@ -1,0 +1,866 @@
+From: Stained Glass OS contributors
+Subject: rasapi32, rasdial: VPN connections are sg-netctl's
+
+A Windows VPN client needs a kernel driver (OpenVPN's TAP or ovpn-dco,
+WireGuard's wintun) that Wine cannot load, so on Stained Glass OS the tunnel
+is the Linux side's: NetworkManager's WireGuard and OpenVPN connections,
+which sg-netctl (sg-session) imports from the vendor's own .conf/.ovpn and
+lets anyone with a session dial. Here they are what a VPN connection is on
+Windows, a RAS phone-book entry:
+
+- RasEnumEntries lists them (all-users entries), RasEnumConnections the
+  connected ones (device type "vpn", device WireGuard/OpenVPN), for every
+  structure size Windows callers pass; RasGetConnectStatus, RasDial (A/W;
+  a notifier hears the outcome), RasHangUp, RasGetErrorString.
+- A connection's HRASCONN is derived from its NetworkManager UUID, so
+  another process (rasdial /disconnect) names the same connection.
+- A password goes to sg-netctl on its standard input: sgnetctl.h's
+  sgnet_run_native_input/sgnet_request_input write it to a temporary file
+  of the caller's own, handed over as stdin (0078), zeroed and deleted
+  after; it is never on a command line.
+- programs/rasdial: rasdial [entry [user [password|*]]] [/DISCONNECT], with
+  Windows' messages and the RAS error as the exit code.
+- Without sg-netctl (a plain Wine) nothing changes: no entries, stubs.
+
+Gate: test/rasdial-gate.sh (a stand-in sg-netctl; 18 checks, 17 fail on
+the build without this patch).
+---
+--- a/configure
++++ b/configure
+@@ -1712,6 +1712,7 @@
+ enable_powershell
+ enable_presentationfontcache
+ enable_progman
++enable_rasdial
+ enable_reg
+ enable_regasm
+ enable_regedit
+@@ -23170,6 +23171,7 @@
+ wine_fn_config_makefile programs/powershell enable_powershell
+ wine_fn_config_makefile programs/presentationfontcache enable_presentationfontcache
+ wine_fn_config_makefile programs/progman enable_progman
++wine_fn_config_makefile programs/rasdial enable_rasdial
+ wine_fn_config_makefile programs/reg enable_reg
+ wine_fn_config_makefile programs/reg/tests enable_tests
+ wine_fn_config_makefile programs/regasm enable_regasm
+--- a/configure.ac
++++ b/configure.ac
+@@ -3498,6 +3498,7 @@
+ WINE_CONFIG_MAKEFILE(programs/powershell)
+ WINE_CONFIG_MAKEFILE(programs/presentationfontcache)
+ WINE_CONFIG_MAKEFILE(programs/progman)
++WINE_CONFIG_MAKEFILE(programs/rasdial)
+ WINE_CONFIG_MAKEFILE(programs/reg)
+ WINE_CONFIG_MAKEFILE(programs/reg/tests)
+ WINE_CONFIG_MAKEFILE(programs/regasm)
+--- a/dlls/rasapi32/Makefile.in
++++ b/dlls/rasapi32/Makefile.in
+@@ -1,5 +1,6 @@
+ MODULE    = rasapi32.dll
+ IMPORTLIB = rasapi32
++DELAYIMPORTS = user32
+ 
+ SOURCES = \
+ 	rasapi.c
+--- a/dlls/rasapi32/rasapi.c
++++ b/dlls/rasapi32/rasapi.c
+@@ -19,15 +19,277 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdio.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winnls.h"
++#include "winuser.h"
+ #include "ras.h"
+ #include "raserror.h"
+ #include "wine/debug.h"
++#include "wine/sgnetctl.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ras);
+ 
++#ifndef REN_AllUsers
++#define REN_AllUsers 1
++#endif
++#ifndef RASCF_AllUsers
++#define RASCF_AllUsers 1
++#endif
++#ifndef RASDIALEVENT
++#define RASDIALEVENT "RasDialEvent"
++typedef void (WINAPI *RASDIALFUNC)( UINT, RASCONNSTATE, DWORD );
++typedef void (WINAPI *RASDIALFUNC1)( HRASCONN, UINT, RASCONNSTATE, DWORD, DWORD );
++#endif
++
++/* Stained Glass OS: VPN connections are the Linux side's -- NetworkManager's
++ * WireGuard and OpenVPN connections behind sg-netctl (sg-session), which
++ * decides who may do what: anyone with a session may dial and hang up the
++ * connections an administrator added for all users. Here they are RAS
++ * phone-book entries, as a VPN connection is on Windows: enumerated, dialled
++ * by name, listed while connected, hung up. A plain Wine without sg-netctl
++ * keeps the old behaviour (no entries, no connections). */
++
++struct sg_vpn
++{
++    WCHAR    uuid[40];
++    WCHAR    kind[16];    /* openvpn, wireguard */
++    BOOL     connected;
++    WCHAR    name[RAS_MaxEntryName + 1];
++    HRASCONN handle;
++};
++
++/* A connection's handle is derived from its NetworkManager UUID, so that
++ * another process (rasdial /disconnect) names the same connection by it. */
++static HRASCONN sg_vpn_handle( const WCHAR *uuid )
++{
++    UINT hash = 2166136261u;
++    for (; *uuid; uuid++) hash = (hash ^ *uuid) * 16777619u;
++    return (HRASCONN)(ULONG_PTR)((hash & 0x3ffffff0) | 0x4000000c);
++}
++
++/* sg-netctl vpn list: -1 no sg-netctl (plain Wine), else the number found */
++static int sg_vpn_list( struct sg_vpn **out )
++{
++    static const WCHAR *argv[] = { L"vpn", L"list" };
++    struct sgnet_reply r;
++    struct sg_vpn *v;
++    int i, n = 0, ret;
++
++    *out = NULL;
++    if ((ret = sgnet_request( argv, 2, &r )) < 0) return -1;
++    if (!ret) { sgnet_free( &r ); return 0; }
++    if (!(v = calloc( r.count + 1, sizeof(*v) ))) { sgnet_free( &r ); return 0; }
++    for (i = 0; i < r.count; i++)
++    {
++        /* VPN <uuid>\t<kind>\t<state>\t<name> */
++        WCHAR *f[4], *p = r.lines[i] + 4;
++        int k;
++        if (wcsncmp( r.lines[i], L"VPN ", 4 )) continue;
++        for (k = 0; k < 4 && p; k++)
++        {
++            f[k] = p;
++            if (k < 3 && (p = wcschr( p, '\t' ))) *p++ = 0;
++        }
++        if (k < 4 || !p) continue;
++        lstrcpynW( v[n].uuid, f[0], ARRAY_SIZE(v[n].uuid) );
++        lstrcpynW( v[n].kind, f[1], ARRAY_SIZE(v[n].kind) );
++        v[n].connected = !wcscmp( f[2], L"connected" );
++        lstrcpynW( v[n].name, f[3], ARRAY_SIZE(v[n].name) );
++        v[n].handle = sg_vpn_handle( v[n].uuid );
++        n++;
++    }
++    sgnet_free( &r );
++    *out = v;
++    return n;
++}
++
++static const WCHAR *sg_vpn_device( const struct sg_vpn *v )
++{
++    return !wcscmp( v->kind, L"wireguard" ) ? L"WireGuard" : L"OpenVPN";
++}
++
++static DWORD sg_vpn_error( const struct sgnet_reply *r )
++{
++    if (!wcscmp( r->kind, L"notfound" )) return ERROR_CANNOT_FIND_PHONEBOOK_ENTRY;
++    if (!wcscmp( r->kind, L"auth" )) return ERROR_AUTHENTICATION_FAILURE;
++    if (!wcscmp( r->kind, L"denied" )) return ERROR_ACCESS_DENIED;
++    if (!wcscmp( r->kind, L"invalid" )) return ERROR_INVALID_PARAMETER;
++    return ERROR_PORT_NOT_AVAILABLE;
++}
++
++/* RASENTRYNAME as Windows 2000 and later have it: dwFlags and the phone
++ * book's path after the name; callers pass either size */
++#define SG_ENTRY_FLAGS_OFF(unicode) (unicode ? (FIELD_OFFSET(RASENTRYNAMEW, szEntryName[RAS_MaxEntryName + 1]) + 3) / 4 * 4 \
++                                             : (FIELD_OFFSET(RASENTRYNAMEA, szEntryName[RAS_MaxEntryName + 1]) + 3) / 4 * 4)
++#define SG_ENTRY_V500(unicode) ((SG_ENTRY_FLAGS_OFF(unicode) + 4 + (MAX_PATH + 1) * (unicode ? sizeof(WCHAR) : 1) + 3) / 4 * 4)
++
++static DWORD sg_enum_entries( void *buf, DWORD *size, DWORD *count, BOOL unicode )
++{
++    struct sg_vpn *v;
++    DWORD stride, need, i;
++    BYTE *p = buf;
++    int n;
++
++    if (!size || !count) return ERROR_INVALID_PARAMETER;
++    if ((n = sg_vpn_list( &v )) < 0) return ~0u;
++    stride = buf ? *(DWORD *)buf : SG_ENTRY_V500(unicode);
++    if (buf && stride != (unicode ? sizeof(RASENTRYNAMEW) : sizeof(RASENTRYNAMEA)) && stride != SG_ENTRY_V500(unicode))
++    {
++        free( v );
++        return ERROR_INVALID_SIZE;
++    }
++    need = stride * n;
++    *count = n;
++    if (!buf || *size < need)
++    {
++        *size = need;
++        free( v );
++        return n ? ERROR_BUFFER_TOO_SMALL : 0;
++    }
++    for (i = 0; i < n; i++, p += stride)
++    {
++        memset( p, 0, stride );
++        *(DWORD *)p = stride;
++        if (unicode) lstrcpynW( ((RASENTRYNAMEW *)p)->szEntryName, v[i].name, RAS_MaxEntryName + 1 );
++        else WideCharToMultiByte( CP_ACP, 0, v[i].name, -1, ((RASENTRYNAMEA *)p)->szEntryName, RAS_MaxEntryName + 1, NULL, NULL );
++        if (stride == SG_ENTRY_V500(unicode))
++            *(DWORD *)(p + SG_ENTRY_FLAGS_OFF(unicode)) = REN_AllUsers;  /* an all-users entry */
++    }
++    *size = need;
++    free( v );
++    return 0;
++}
++
++static DWORD sg_enum_connections( void *buf, DWORD *size, DWORD *count, BOOL unicode )
++{
++    struct sg_vpn *v;
++    DWORD stride, min, need, i, n = 0;
++    BYTE *p = buf;
++    int all;
++
++    if (!size || !count) return ERROR_INVALID_PARAMETER;
++    if ((all = sg_vpn_list( &v )) < 0) return ~0u;
++    for (i = 0; i < all; i++) if (v[i].connected) v[n++] = v[i];
++    stride = buf ? *(DWORD *)buf : unicode ? sizeof(RASCONNW) : sizeof(RASCONNA);
++    min = unicode ? FIELD_OFFSET(RASCONNW, szPhonebook) : FIELD_OFFSET(RASCONNA, szPhonebook);
++    if (buf && (stride < min || stride > (unicode ? sizeof(RASCONNW) : sizeof(RASCONNA))))
++    {
++        free( v );
++        return ERROR_INVALID_SIZE;
++    }
++    need = stride * n;
++    *count = n;
++    if (!buf || *size < need)
++    {
++        *size = need;
++        free( v );
++        return n ? ERROR_BUFFER_TOO_SMALL : 0;
++    }
++    for (i = 0; i < n; i++, p += stride)
++    {
++        memset( p, 0, stride );
++        if (unicode)
++        {
++            RASCONNW c = { sizeof(c) };
++            c.hRasConn = v[i].handle;
++            lstrcpynW( c.szEntryName, v[i].name, ARRAY_SIZE(c.szEntryName) );
++            wcscpy( c.szDeviceType, L"vpn" );
++            lstrcpynW( c.szDeviceName, sg_vpn_device( &v[i] ), ARRAY_SIZE(c.szDeviceName) );
++            c.dwFlags = RASCF_AllUsers;
++            memcpy( p, &c, stride );
++        }
++        else
++        {
++            RASCONNA c = { sizeof(c) };
++            c.hRasConn = v[i].handle;
++            WideCharToMultiByte( CP_ACP, 0, v[i].name, -1, c.szEntryName, sizeof(c.szEntryName), NULL, NULL );
++            strcpy( c.szDeviceType, "vpn" );
++            WideCharToMultiByte( CP_ACP, 0, sg_vpn_device( &v[i] ), -1, c.szDeviceName, sizeof(c.szDeviceName), NULL, NULL );
++            c.dwFlags = RASCF_AllUsers;
++            memcpy( p, &c, stride );
++        }
++        *(DWORD *)p = stride;
++    }
++    *size = need;
++    free( v );
++    return 0;
++}
++
++/* dial: sg-netctl vpn connect NAME [--password-stdin] -- the password on the
++ * program's standard input, never its command line */
++static DWORD sg_dial( const WCHAR *entry, const WCHAR *password, HRASCONN *handle )
++{
++    const WCHAR *argv[4] = { L"vpn", L"connect", entry, L"--password-stdin" };
++    struct sgnet_reply r;
++    struct sg_vpn *v;
++    char *input = NULL;
++    DWORD err = 0;
++    int i, n, ret;
++
++    if ((n = sg_vpn_list( &v )) < 0) return ~0u;
++    for (i = 0; i < n; i++) if (!wcsicmp( v[i].name, entry )) break;
++    if (i == n) { free( v ); return ERROR_CANNOT_FIND_PHONEBOOK_ENTRY; }
++    argv[2] = v[i].uuid;
++    if (password && password[0])
++    {
++        int len = WideCharToMultiByte( CP_UTF8, 0, password, -1, NULL, 0, NULL, NULL );
++        if ((input = malloc( len + 1 )))
++        {
++            WideCharToMultiByte( CP_UTF8, 0, password, -1, input, len, NULL, NULL );
++            strcat( input, "\n" );
++        }
++    }
++    ret = sgnet_request_input( argv, input ? 4 : 3, input, &r );
++    if (input) { SecureZeroMemory( input, strlen( input ) ); free( input ); }
++    if (ret > 0) *handle = v[i].handle;
++    else err = sg_vpn_error( &r );
++    TRACE( "%s: %s %s\n", debugstr_w(entry), debugstr_w(r.kind), debugstr_w(r.message) );
++    sgnet_free( &r );
++    free( v );
++    return err;
++}
++
++/* the connection a handle names (connected or not): its index in v, or -1 */
++static int sg_find_handle( HRASCONN h, struct sg_vpn **v )
++{
++    int i, n = sg_vpn_list( v );
++    for (i = 0; i < n; i++) if ((*v)[i].handle == h) return i;
++    return n < 0 ? -2 : -1;
++}
++
++static DWORD sg_hang_up( HRASCONN h )
++{
++    const WCHAR *argv[3] = { L"vpn", L"disconnect" };
++    struct sgnet_reply r;
++    struct sg_vpn *v;
++    DWORD err = 0;
++    int i = sg_find_handle( h, &v );
++
++    if (i == -2) return ~0u;
++    if (i < 0) { free( v ); return ERROR_INVALID_HANDLE; }
++    argv[2] = v[i].uuid;
++    if (sgnet_request( argv, 3, &r ) <= 0) err = sg_vpn_error( &r );
++    sgnet_free( &r );
++    free( v );
++    return err;
++}
++
++static const struct { DWORD code; const WCHAR *text; } sg_ras_errors[] =
++{
++    { ERROR_BUFFER_TOO_SMALL, L"The buffer is too small." },
++    { ERROR_CANNOT_FIND_PHONEBOOK_ENTRY, L"The system could not find the phone book entry for this connection." },
++    { ERROR_INVALID_SIZE, L"The structure size is incorrect." },
++    { ERROR_NO_CONNECTION, L"The connection was terminated." },
++    { ERROR_PORT_NOT_AVAILABLE, L"The VPN connection could not be established." },
++    { ERROR_AUTHENTICATION_FAILURE, L"The remote connection was denied because the user name and password combination you provided is not recognized, or the selected authentication protocol is not permitted on the remote access server." },
++    { ERROR_ACCESS_DENIED, L"Access is denied." },
++    { ERROR_INVALID_HANDLE, L"The handle is invalid." },
++    { ERROR_INVALID_PARAMETER, L"The parameter is incorrect." },
++};
++
+ DWORD WINAPI RasConnectionNotificationA(HRASCONN hrasconn, HANDLE hEvent, DWORD dwFlags)
+ {
+     FIXME("(%p,%p,0x%08lx),stub!\n",hrasconn,hEvent,dwFlags);
+@@ -70,18 +332,60 @@
+                       LPRASDIALPARAMSA lpRasDialParams, DWORD dwNotifierType,
+                       LPVOID lpvNotifier, LPHRASCONN lphRasConn)
+ {
+-    FIXME("(%p,%s,%p,0x%08lx,%p,%p),stub!\n",lpRasDialExtensions,debugstr_a(lpszPhonebook),
++    RASDIALPARAMSW w = { sizeof(w) };
++    WCHAR *book = NULL;
++    DWORD ret;
++
++    TRACE("(%p,%s,%p,0x%08lx,%p,%p)\n",lpRasDialExtensions,debugstr_a(lpszPhonebook),
+           lpRasDialParams,dwNotifierType,lpvNotifier,lphRasConn);
+-    return 1;
++    if (!lpRasDialParams || !lphRasConn) return ERROR_INVALID_PARAMETER;
++    MultiByteToWideChar( CP_ACP, 0, lpRasDialParams->szEntryName, -1, w.szEntryName, ARRAY_SIZE(w.szEntryName) );
++    MultiByteToWideChar( CP_ACP, 0, lpRasDialParams->szUserName, -1, w.szUserName, ARRAY_SIZE(w.szUserName) );
++    MultiByteToWideChar( CP_ACP, 0, lpRasDialParams->szPassword, -1, w.szPassword, ARRAY_SIZE(w.szPassword) );
++    MultiByteToWideChar( CP_ACP, 0, lpRasDialParams->szDomain, -1, w.szDomain, ARRAY_SIZE(w.szDomain) );
++    if (lpszPhonebook)
++    {
++        int len = MultiByteToWideChar( CP_ACP, 0, lpszPhonebook, -1, NULL, 0 );
++        if ((book = malloc( len * sizeof(WCHAR) ))) MultiByteToWideChar( CP_ACP, 0, lpszPhonebook, -1, book, len );
++    }
++    ret = RasDialW( lpRasDialExtensions, book, &w, dwNotifierType, lpvNotifier, lphRasConn );
++    SecureZeroMemory( w.szPassword, sizeof(w.szPassword) );
++    free( book );
++    return ret;
+ }
+ 
+ DWORD WINAPI RasDialW(LPRASDIALEXTENSIONS lpRasDialExtensions, LPCWSTR lpszPhonebook,
+                       LPRASDIALPARAMSW lpRasDialParams, DWORD dwNotifierType,
+                       LPVOID lpvNotifier, LPHRASCONN lphRasConn)
+ {
+-    FIXME("(%p,%s,%p,0x%08lx,%p,%p),stub!\n",lpRasDialExtensions,debugstr_w(lpszPhonebook),
++    DWORD ret;
++
++    TRACE("(%p,%s,%p,0x%08lx,%p,%p)\n",lpRasDialExtensions,debugstr_w(lpszPhonebook),
+           lpRasDialParams,dwNotifierType,lpvNotifier,lphRasConn);
+-    return 1;
++    if (!lpRasDialParams || !lphRasConn) return ERROR_INVALID_PARAMETER;
++    *lphRasConn = NULL;
++    ret = sg_dial( lpRasDialParams->szEntryName, lpRasDialParams->szPassword, lphRasConn );
++    if (ret == ~0u)
++    {
++        FIXME("no sg-netctl: RAS is not available\n");
++        return ERROR_CANNOT_FIND_PHONEBOOK_ENTRY;
++    }
++    /* Dialled synchronously; a caller that asked to be notified hears the
++     * outcome, as it would from an asynchronous dial. */
++    if (lpvNotifier)
++    {
++        RASCONNSTATE state = ret ? RASCS_Disconnected : RASCS_Connected;
++        if (dwNotifierType == 0xffffffff)
++        {
++            static UINT msg;
++            if (!msg) msg = RegisterWindowMessageA( RASDIALEVENT );
++            PostMessageW( lpvNotifier, msg, state, ret );
++        }
++        else if (dwNotifierType == 0) ((RASDIALFUNC)lpvNotifier)( 0, state, ret );
++        else if (dwNotifierType == 1) ((RASDIALFUNC1)lpvNotifier)( *lphRasConn, 0, state, ret, 0 );
++        return 0;
++    }
++    return ret;
+ }
+ 
+ DWORD WINAPI RasEditPhonebookEntryA(HWND hwnd, LPCSTR lpszPhonebook, LPCSTR lpszEntryName)
+@@ -100,6 +404,8 @@
+  *                 RasEnumConnectionsA			[RASAPI32.544]
+  */
+ DWORD WINAPI RasEnumConnectionsA( LPRASCONNA rca, LPDWORD lpcb, LPDWORD lpcConnections) {
++	DWORD ret = sg_enum_connections( rca, lpcb, lpcConnections, FALSE );
++	if (ret != ~0u) return ret;
+ 	/* Remote Access Service stuff is done by underlying OS anyway */
+ 	FIXME("(%p,%p,%p),stub!\n",rca,lpcb,lpcConnections);
+ 	FIXME("RAS support is not implemented! Configure program to use LAN connection/winsock instead!\n");
+@@ -113,6 +419,8 @@
+  *                 RasEnumConnectionsW			[RASAPI32.545]
+  */
+ DWORD WINAPI RasEnumConnectionsW( LPRASCONNW rcw, LPDWORD lpcb, LPDWORD lpcConnections) {
++	DWORD ret = sg_enum_connections( rcw, lpcb, lpcConnections, TRUE );
++	if (ret != ~0u) return ret;
+ 	/* Remote Access Service stuff is done by underlying OS anyway */
+ 	FIXME("(%p,%p,%p),stub!\n",rcw,lpcb,lpcConnections);
+ 	FIXME("RAS support is not implemented! Configure program to use LAN connection/winsock instead!\n");
+@@ -129,6 +437,8 @@
+         LPRASENTRYNAMEA lpRasEntryName,
+         LPDWORD lpcb, LPDWORD lpcEntries)
+ {
++	DWORD ret = sg_enum_entries( lpRasEntryName, lpcb, lpcEntries, FALSE );
++	if (ret != ~0u) return ret;
+ 	FIXME("(%p,%s,%p,%p,%p),stub!\n",Reserved,debugstr_a(lpszPhoneBook),
+             lpRasEntryName,lpcb,lpcEntries);
+         *lpcEntries = 0;
+@@ -142,6 +452,8 @@
+         LPRASENTRYNAMEW lpRasEntryName,
+         LPDWORD lpcb, LPDWORD lpcEntries)
+ {
++	DWORD ret = sg_enum_entries( lpRasEntryName, lpcb, lpcEntries, TRUE );
++	if (ret != ~0u) return ret;
+ 	FIXME("(%p,%s,%p,%p,%p),stub!\n",Reserved,debugstr_w(lpszPhoneBook),
+             lpRasEntryName,lpcb,lpcEntries);
+         *lpcEntries = 0;
+@@ -150,13 +462,38 @@
+ 
+ DWORD WINAPI RasGetConnectStatusA(HRASCONN hrasconn, LPRASCONNSTATUSA lprasconnstatus)
+ {
+-    FIXME("(%p,%p),stub!\n",hrasconn,lprasconnstatus);
++    RASCONNSTATUSW w = { sizeof(w) };
++    DWORD ret;
++
++    if (!lprasconnstatus || lprasconnstatus->dwSize != sizeof(*lprasconnstatus)) return ERROR_INVALID_SIZE;
++    if ((ret = RasGetConnectStatusW( hrasconn, &w ))) return ret;
++    lprasconnstatus->rasconnstate = w.rasconnstate;
++    lprasconnstatus->dwError = w.dwError;
++    WideCharToMultiByte( CP_ACP, 0, w.szDeviceType, -1, lprasconnstatus->szDeviceType, sizeof(lprasconnstatus->szDeviceType), NULL, NULL );
++    WideCharToMultiByte( CP_ACP, 0, w.szDeviceName, -1, lprasconnstatus->szDeviceName, sizeof(lprasconnstatus->szDeviceName), NULL, NULL );
+     return 0;
+ }
+ 
+ DWORD WINAPI RasGetConnectStatusW(HRASCONN hrasconn, LPRASCONNSTATUSW lprasconnstatus)
+ {
+-    FIXME("(%p,%p),stub!\n",hrasconn,lprasconnstatus);
++    struct sg_vpn *v;
++    int i;
++
++    TRACE("(%p,%p)\n",hrasconn,lprasconnstatus);
++    if (!lprasconnstatus || lprasconnstatus->dwSize < FIELD_OFFSET(RASCONNSTATUSW, szDeviceType)) return ERROR_INVALID_SIZE;
++    if ((i = sg_find_handle( hrasconn, &v )) == -2)
++    {
++        FIXME("(%p,%p),stub!\n",hrasconn,lprasconnstatus);
++        return 0;
++    }
++    if (i < 0 || !v[i].connected) { free( v ); return ERROR_INVALID_HANDLE; }
++    lprasconnstatus->rasconnstate = RASCS_Connected;
++    lprasconnstatus->dwError = 0;
++    if (lprasconnstatus->dwSize >= sizeof(RASCONNSTATUSW) - sizeof(lprasconnstatus->szDeviceName))
++        wcscpy( lprasconnstatus->szDeviceType, L"vpn" );
++    if (lprasconnstatus->dwSize >= sizeof(RASCONNSTATUSW))
++        lstrcpynW( lprasconnstatus->szDeviceName, sg_vpn_device( &v[i] ), ARRAY_SIZE(lprasconnstatus->szDeviceName) );
++    free( v );
+     return 0;
+ }
+ 
+@@ -189,8 +526,7 @@
+  */
+ DWORD WINAPI RasHangUpA( HRASCONN hrasconn)
+ {
+-	FIXME("(%p),stub!\n",hrasconn);
+-	return 0;
++	return RasHangUpW( hrasconn );
+ }
+ 
+ /**************************************************************************
+@@ -198,8 +534,15 @@
+  */
+ DWORD WINAPI RasHangUpW(HRASCONN hrasconn)
+ {
+-    FIXME("(%p),stub!\n",hrasconn);
+-    return 0;
++    DWORD ret = sg_hang_up( hrasconn );
++
++    TRACE("(%p) %lu\n", hrasconn, ret);
++    if (ret == ~0u)
++    {
++        FIXME("(%p),stub!\n",hrasconn);
++        return 0;
++    }
++    return ret;
+ }
+ 
+ /**************************************************************************
+@@ -458,14 +801,33 @@
+ 
+ DWORD WINAPI RasGetErrorStringA(UINT uErrorValue, LPSTR lpszErrorString, DWORD cBufSize)
+ {
+-    FIXME("(0x%08x,%p,0x%08lx), stub!\n", uErrorValue, lpszErrorString, cBufSize);
+-    return 1;
++    WCHAR buf[512];
++    DWORD ret;
++
++    if (!lpszErrorString) return ERROR_INVALID_PARAMETER;
++    if ((ret = RasGetErrorStringW( uErrorValue, buf, ARRAY_SIZE(buf) ))) return ret;
++    if (!WideCharToMultiByte( CP_ACP, 0, buf, -1, lpszErrorString, cBufSize, NULL, NULL ))
++        return ERROR_INSUFFICIENT_BUFFER;
++    return 0;
+ }
+ 
+ DWORD WINAPI RasGetErrorStringW(UINT uErrorValue, LPWSTR lpszErrorString, DWORD cBufSize)
+ {
+-    FIXME("(0x%08x,%p,0x%08lx), stub!\n", uErrorValue, lpszErrorString, cBufSize);
+-    return 1;
++    int i;
++
++    TRACE("(0x%08x,%p,0x%08lx)\n", uErrorValue, lpszErrorString, cBufSize);
++    if (!lpszErrorString) return ERROR_INVALID_PARAMETER;
++    for (i = 0; i < ARRAY_SIZE(sg_ras_errors); i++)
++    {
++        if (sg_ras_errors[i].code != uErrorValue) continue;
++        if (wcslen( sg_ras_errors[i].text ) >= cBufSize) return ERROR_INSUFFICIENT_BUFFER;
++        wcscpy( lpszErrorString, sg_ras_errors[i].text );
++        return 0;
++    }
++    if (uErrorValue < RASBASE || uErrorValue > RASBASEEND) return ERROR_INVALID_PARAMETER;
++    if (cBufSize < 32) return ERROR_INSUFFICIENT_BUFFER;
++    swprintf( lpszErrorString, cBufSize, L"Remote Access error %u.", uErrorValue );
++    return 0;
+ }
+ 
+ DWORD WINAPI RasGetProjectionInfoA(HRASCONN hrasconn, RASPROJECTION rasprojection,
+--- a/include/wine/sgnetctl.h
++++ b/include/wine/sgnetctl.h
+@@ -121,9 +121,26 @@
+ /* Run a native program (path: its \\?\unix\ name); its standard output and
+  * error, as text, in *out (malloc'd, NUL-terminated UTF-8), and its exit
+  * code. FALSE: not run, or no answer within timeout ms. */
++/* Run a native program (path: its \\?\unix\ name) with `input` (text, or
++ * NULL for none) as its standard input -- a temporary file of the caller's
++ * own, deleted when closed: a secret (a VPN password) never goes on a
++ * command line. Its standard output and error, as text, in *out (malloc'd,
++ * NUL-terminated UTF-8), and its exit code. FALSE: not run, or no answer
++ * within timeout ms. */
++static inline BOOL sgnet_run_native_input( const WCHAR *path, const WCHAR *const *argv, int argc,
++                                           const char *input, char **out, DWORD *exit_code, DWORD timeout );
++
+ static inline BOOL sgnet_run_native( const WCHAR *path, const WCHAR *const *argv, int argc,
+                                      char **out, DWORD *exit_code, DWORD timeout )
+ {
++    return sgnet_run_native_input( path, argv, argc, NULL, out, exit_code, timeout );
++}
++
++static inline BOOL sgnet_run_native_input( const WCHAR *path, const WCHAR *const *argv, int argc,
++                                           const char *input, char **out, DWORD *exit_code, DWORD timeout )
++{
++    HANDLE in_file = NULL;
++    WCHAR in_name[MAX_PATH];
+     WCHAR unix_path[MAX_PATH], *p;
+     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+     STARTUPINFOW si = { sizeof(si) };
+@@ -144,6 +161,16 @@
+     file = CreateFileW( name, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                         CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL );
+     if (file == INVALID_HANDLE_VALUE) { DeleteFileW( name ); return FALSE; }
++    if (input)
++    {
++        DWORD written;
++        if (!sgnet_temp_file( tmp, in_name )) { CloseHandle( file ); return FALSE; }
++        in_file = CreateFileW( in_name, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
++                               FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL );
++        if (in_file == INVALID_HANDLE_VALUE) { DeleteFileW( in_name ); CloseHandle( file ); return FALSE; }
++        WriteFile( in_file, input, strlen( input ), &written, NULL );
++        SetFilePointer( in_file, 0, NULL, FILE_BEGIN );
++    }
+ 
+     /* A native program's process handle does not wait for it: run it under
+      * a fixed shell that writes its exit status last, and wait for that. The
+@@ -156,7 +183,7 @@
+     sgnet_quote( cmd, ARRAY_SIZE(cmd), unix_path );
+     for (i = 0; i < argc; i++) sgnet_quote( cmd, ARRAY_SIZE(cmd), argv[i] );
+     si.dwFlags = STARTF_USESTDHANDLES;
+-    si.hStdInput = NULL;
++    si.hStdInput = in_file;
+     si.hStdOutput = si.hStdError = file;
+     if (CreateProcessW( sgnet_shell, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi ))
+     {
+@@ -185,13 +212,32 @@
+             Sleep( 20 );
+         }
+     }
++    if (in_file)
++    {
++        /* the secret does not outlive the request */
++        DWORD len = strlen( input ), written;
++        char zero[256] = { 0 };
++        SetFilePointer( in_file, 0, NULL, FILE_BEGIN );
++        while (len) { DWORD n = len < sizeof(zero) ? len : sizeof(zero); WriteFile( in_file, zero, n, &written, NULL ); len -= n; }
++        CloseHandle( in_file );
++    }
+     CloseHandle( file );
+     return ret;
+ }
+ 
++static inline int sgnet_request_input( const WCHAR *const *argv, int argc, const char *input,
++                                       struct sgnet_reply *r );
++
+ /* sg-netctl ARGS; -1 when it is not there (a plain Wine), else 1 OK / 0 ERROR */
+ static inline int sgnet_request( const WCHAR *const *argv, int argc, struct sgnet_reply *r )
+ {
++    return sgnet_request_input( argv, argc, NULL, r );
++}
++
++/* the same, with `input` on its standard input */
++static inline int sgnet_request_input( const WCHAR *const *argv, int argc, const char *input,
++                                       struct sgnet_reply *r )
++{
+     char *text, *line, *next;
+     DWORD code;
+     WCHAR *w;
+@@ -199,7 +245,7 @@
+ 
+     memset( r, 0, sizeof(*r) );
+     if (GetFileAttributesW( sgnet_netctl_path() ) == INVALID_FILE_ATTRIBUTES) return -1;
+-    if (!sgnet_run_native( sgnet_netctl_path(), argv, argc, &text, &code, 120000 ))
++    if (!sgnet_run_native_input( sgnet_netctl_path(), argv, argc, input, &text, &code, 120000 ))
+     {
+         wcscpy( r->kind, L"failed" );
+         wcscpy( r->message, L"the network settings service did not answer" );
+--- /dev/null
++++ b/programs/rasdial/main.c
+@@ -0,0 +1,204 @@
++/*
++ * rasdial: dial, list and hang up remote access (VPN) connections
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ *   RASDIAL                                     the connections that are up
++ *   RASDIAL entryname [username [password|*]] [/DOMAIN:domain] [/PHONEBOOK:file]
++ *   RASDIAL [entryname] /DISCONNECT
++ *
++ * A thin client of rasapi32 (RasEnumConnections, RasDial, RasHangUp), as the
++ * Windows command is. The exit status is 0 or the RAS error.
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <windef.h>
++#include <winbase.h>
++#include <winnls.h>
++#include <wincon.h>
++#include <ras.h>
++#include <raserror.h>
++
++static void out( const WCHAR *fmt, ... )
++{
++    WCHAR buf[2048];
++    va_list args;
++    DWORD n;
++    char *a;
++    int len;
++
++    va_start( args, fmt );
++    n = vswprintf( buf, ARRAY_SIZE(buf), fmt, args );
++    va_end( args );
++    if (WriteConsoleW( GetStdHandle( STD_OUTPUT_HANDLE ), buf, n, &n, NULL )) return;
++    len = WideCharToMultiByte( GetConsoleOutputCP(), 0, buf, -1, NULL, 0, NULL, NULL );
++    if (!(a = malloc( len ))) return;
++    WideCharToMultiByte( GetConsoleOutputCP(), 0, buf, -1, a, len, NULL, NULL );
++    WriteFile( GetStdHandle( STD_OUTPUT_HANDLE ), a, len - 1, &n, NULL );
++    free( a );
++}
++
++static int error( DWORD err )
++{
++    WCHAR text[512];
++
++    if (RasGetErrorStringW( err, text, ARRAY_SIZE(text) )) swprintf( text, ARRAY_SIZE(text), L"Error %lu.", err );
++    out( L"Remote Access error %lu - %ls\r\n\r\nFor more help on this error:\r\n"
++         L"        Type 'hh netcfg.chm'\r\n        In help, click Troubleshooting, then Error Messages, then %lu\r\n\r\n",
++         err, text, err );
++    return err;
++}
++
++static RASCONNW *connections( DWORD *count )
++{
++    RASCONNW *c = calloc( 1, sizeof(*c) );
++    DWORD size = sizeof(*c), err;
++
++    *count = 0;
++    if (!c) return NULL;
++    c->dwSize = sizeof(*c);
++    err = RasEnumConnectionsW( c, &size, count );
++    if (err == ERROR_BUFFER_TOO_SMALL)
++    {
++        free( c );
++        if (!(c = calloc( 1, size ))) return NULL;
++        c->dwSize = sizeof(*c);
++        err = RasEnumConnectionsW( c, &size, count );
++    }
++    if (err) { free( c ); *count = 0; return NULL; }
++    return c;
++}
++
++static int list(void)
++{
++    DWORD i, n;
++    RASCONNW *c = connections( &n );
++
++    if (!n) out( L"No connections\r\n" );
++    else
++    {
++        out( L"Connected to\r\n" );
++        for (i = 0; i < n; i++) out( L"%ls\r\n", c[i].szEntryName );
++    }
++    out( L"Command completed successfully.\r\n" );
++    free( c );
++    return 0;
++}
++
++static int disconnect( const WCHAR *entry )
++{
++    DWORD i, n, err = 0, done = 0;
++    RASCONNW *c = connections( &n );
++
++    for (i = 0; i < n; i++)
++    {
++        if (entry && wcsicmp( c[i].szEntryName, entry )) continue;
++        if ((err = RasHangUpW( c[i].hRasConn ))) break;
++        done++;
++    }
++    free( c );
++    if (err) return error( err );
++    if (!done)
++    {
++        out( entry ? L"You are not connected to %ls.\r\n" : L"No connections\r\n", entry );
++        return ERROR_NO_CONNECTION;
++    }
++    out( L"Command completed successfully.\r\n" );
++    return 0;
++}
++
++static void read_password( WCHAR *pw, DWORD size )
++{
++    HANDLE in = GetStdHandle( STD_INPUT_HANDLE );
++    DWORD mode = 0, n = 0;
++    char a[PWLEN + 2];
++
++    out( L"Enter the password to connect to the server: " );
++    if (GetConsoleMode( in, &mode ))
++    {
++        SetConsoleMode( in, mode & ~ENABLE_ECHO_INPUT );
++        if (!ReadConsoleW( in, pw, size - 1, &n, NULL )) n = 0;
++        SetConsoleMode( in, mode );
++        pw[n] = 0;
++    }
++    else
++    {
++        if (!ReadFile( in, a, sizeof(a) - 1, &n, NULL )) n = 0;
++        a[n] = 0;
++        MultiByteToWideChar( GetConsoleCP(), 0, a, -1, pw, size );
++        SecureZeroMemory( a, sizeof(a) );
++    }
++    pw[wcscspn( pw, L"\r\n" )] = 0;
++    out( L"\r\n" );
++}
++
++int __cdecl wmain( int argc, WCHAR *argv[] )
++{
++    RASDIALPARAMSW params = { sizeof(params) };
++    const WCHAR *phonebook = NULL, *pos[3] = { NULL };
++    HRASCONN conn = NULL;
++    BOOL hangup = FALSE;
++    int i, npos = 0;
++    DWORD err;
++
++    for (i = 1; i < argc; i++)
++    {
++        if (argv[i][0] == '/')
++        {
++            if (!wcsicmp( argv[i], L"/disconnect" ) || !wcsicmp( argv[i], L"/d" )) hangup = TRUE;
++            else if (!wcsnicmp( argv[i], L"/domain:", 8 ))
++                lstrcpynW( params.szDomain, argv[i] + 8, ARRAY_SIZE(params.szDomain) );
++            else if (!wcsnicmp( argv[i], L"/phonebook:", 11 )) phonebook = argv[i] + 11;
++            else if (!wcsnicmp( argv[i], L"/phone:", 7 ) || !wcsnicmp( argv[i], L"/callback:", 10 ) ||
++                     !wcsicmp( argv[i], L"/prefixsuffix" )) continue;
++            else
++            {
++                out( L"USAGE:\r\n        rasdial entryname [username [password|*]] [/DOMAIN:domain]\r\n"
++                     L"                [/PHONE:phonenumber] [/CALLBACK:callbacknumber]\r\n"
++                     L"                [/PHONEBOOK:phonebookfile] [/PREFIXSUFFIX]\r\n\r\n"
++                     L"        rasdial [entryname] /DISCONNECT\r\n\r\n        rasdial\r\n\r\n"
++                     L"Command completed successfully.\r\n" );
++                return 0;
++            }
++        }
++        else if (npos < 3) pos[npos++] = argv[i];
++    }
++
++    if (hangup) return disconnect( pos[0] );
++    if (!npos) return list();
++
++    lstrcpynW( params.szEntryName, pos[0], ARRAY_SIZE(params.szEntryName) );
++    if (pos[1]) lstrcpynW( params.szUserName, pos[1], ARRAY_SIZE(params.szUserName) );
++    if (pos[2] && !wcscmp( pos[2], L"*" )) read_password( params.szPassword, ARRAY_SIZE(params.szPassword) );
++    else if (pos[2]) lstrcpynW( params.szPassword, pos[2], ARRAY_SIZE(params.szPassword) );
++
++    out( L"Connecting to %ls...\r\n", params.szEntryName );
++    err = RasDialW( NULL, phonebook, &params, 0, NULL, &conn );
++    SecureZeroMemory( params.szPassword, sizeof(params.szPassword) );
++    if (err)
++    {
++        if (conn) RasHangUpW( conn );
++        return error( err );
++    }
++    out( L"Verifying username and password...\r\nRegistering your computer on the network...\r\n"
++         L"Successfully connected to %ls.\r\nCommand completed successfully.\r\n", params.szEntryName );
++    return 0;
++}
+--- /dev/null
++++ b/programs/rasdial/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE    = rasdial.exe
++IMPORTS   = rasapi32
++
++EXTRADLLFLAGS = -mconsole -municode
++
++SOURCES = \
++	main.c

@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-darkmode test-taskbar test-explorer-dark
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark
 
 all: build
 
@@ -233,6 +233,34 @@ test-compat:
 # Native stdio, ipconfig and netsh on sg-netctl (0078-0079).
 test-netsh:
 	WINE=$(PREFIX)/bin/wine test/netsh-gate.sh
+
+# VPN connections through RAS: rasapi32 and rasdial on sg-netctl (0400).
+test-rasdial:
+	WINE=$(PREFIX)/bin/wine test/rasdial-gate.sh
+
+# A task dialog is made of comctl32 6's controls, manifest or not (0401).
+test-taskdialog:
+	WINE=$(PREFIX)/bin/wine test/taskdialog-gate.sh
+
+# Transforms made here and deployed with msiexec TRANSFORMS= (0402).
+test-msitransform:
+	WINE=$(PREFIX)/bin/wine test/msitransform-gate.sh
+
+# Console programs with no terminal get a console when they ask (0403).
+test-shellconsole:
+	WINE=$(PREFIX)/bin/wine test/shellconsole-gate.sh
+
+# PowerShell script signatures; the certificate stores (0404, 0405).
+test-pssig:
+	WINE=$(PREFIX)/bin/wine test/pssig-gate.sh
+
+# robocopy (0406).
+test-robocopy:
+	WINE=$(PREFIX)/bin/wine test/robocopy-gate.sh
+
+# JScript GetObject; FileSystemObject with an empty path (0407).
+test-jscript:
+	WINE=$(PREFIX)/bin/wine test/jscript-gate.sh
 
 # The shell's desktop icons (0090).
 test-desktop-icons:

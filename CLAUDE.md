@@ -3250,6 +3250,37 @@ Notepad with no click), the shutdown prompt, the Control Panel title, and
 ShellAbout keeps Wine's credits and license, allowlisted as attribution.
 **A new patch's messages: "Stained Glass ..." or neutral.**
 
+## `patches/sg/0400`-`0407`: admin and enterprise
+
+- **0400 VPN through RAS.** Windows VPN clients need kernel drivers (TAP,
+  ovpn-dco, wintun) Wine cannot load; the tunnel is NetworkManager's behind
+  sg-netctl's `vpn` commands (sg-session 0.1.0-39). rasapi32 lists those
+  connections as all-users phone-book entries, dials (password on the
+  native program's stdin: `sgnet_request_input` in sgnetctl.h), lists and
+  hangs up; HRASCONN is a hash of the NetworkManager UUID; `programs/rasdial`.
+  Gate `make test-rasdial` (stand-in sg-netctl; 17/18 fail on stock).
+- **0401** TaskDialogIndirect activates comctl32's own v6 context: a caller
+  without a manifest (KeePass under wine-mono) got user32 buttons 4 px high.
+- **0402** MsiDatabaseGenerateTransform / MsiCreateTransformSummaryInfo.
+  Added columns in existing tables are not written yet (FIXME).
+- **0403** a CUI program with no terminal ("shell, no window") gets a
+  headless console when it opens CONIN$/CONOUT$/CON, keeping redirected
+  std handles. Sits beside 0320 (code pages in that mode).
+- **0404** PowerShell SIP {603BCC1F-4B59-4E08-B724-D2C6297EF351} by
+  extension (.ps1/.psm1/.psd1). Digest: UTF-16LE of the text (a BOM counts
+  as U+FEFF) up to the CRLF before `# SIG # Begin signature block` --
+  established against PowerShell Gallery modules. test/pssig-make.py signs
+  test scripts (PKCS #7, not CMS). Signing (Set-AuthenticodeSignature:
+  CryptSIPCreateIndirectData/PutSignedDataMsg) is not done yet.
+- **0405** CertEnumSystemStore listed LocalMachine\Root twice (cert: drive
+  lost LocalMachine); wine.inf creates the standard stores in both locations.
+- **0406** robocopy was a stub (exit 16).
+- **0407** jscript GetObject (monikers, WMI); scrrun GetAbsolutePathName("").
+- **Not done:** junctions/symbolic links (FSCTL_SET_REPARSE_POINT; the server
+  keeps realpath()s, so a handle cannot tell a link from its target -- Scoop
+  needs `scoop config no_junction true`); Chocolatey (choco.exe needs Windows
+  PowerShell's System.Management.Automation 1.0, which is not open).
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**
