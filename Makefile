@@ -143,6 +143,14 @@ test-shutdown:
 test-dispcfg:
 	WINE=$(PREFIX)/bin/wine test/dispcfg-gate.sh
 
+# A standard user's time zone and locale lookups (0243).
+test-userlocale:
+	WINE=$(PREFIX)/bin/wine test/userlocale-gate.sh
+
+# A sandboxed program's own desktop comes up; nothing left spinning (0247).
+test-sandboxdesk:
+	WINE=$(PREFIX)/bin/wine test/sandboxdesk-gate.sh
+
 # The SCM checks who asks (0141); a second Unix user as for test-pipeimp.
 test-scm-access:
 	WINE=$(PREFIX)/bin/wine test/scm-access-gate.sh

@@ -367,6 +367,35 @@ desktop: no error, 1280x800, the screen's modes; the machine server restarted
 with `SG_WINSTATION` on the services' station, as at boot. Without the
 wineboot half: 0 x 0; without the server half: no modes.
 
+## `patches/sg/0243`: a signed-in user's time zone and locale lookups
+
+kernelbase's `tz_key` and `nls_key` were opened with `KEY_ALL_ACCESS`, which
+only administrators get on the shared prefix's HKLM: for every signed-in user
+both were NULL. `GetTimeZoneInformation` returned `TIME_ZONE_ID_INVALID`
+(name `@tzres.dll,-47168`), `GetTimeZoneInformationForYear` failed -- **Firefox
+panicked "No such local time"** (its Rust `chrono`) on the first page -- and
+`EnumSystemCodePages`/`EnumSystemLanguageGroups` found nothing. Now opened
+read-only when full access is refused; zone keys read with `KEY_READ`. Gate
+`make test-userlocale` (standard user vs the owner: same answers). **Any
+other `KEY_ALL_ACCESS` open of HKLM in a DLL's init is the same bug** (0070
+was shell32's).
+
+## `patches/sg/0247`: a sandboxed program's own desktop comes up
+
+Firefox's content processes run on an alternate window station/desktop with a
+restricted low-integrity token; the first window starts that desktop's
+explorer under that token, which cannot write the registry, so win32u's
+display setup recorded no GPU and `add_source` **asserted** -- and an abort in
+Wine left that `explorer.exe /desktop` (no desktop name, ppid 1, deaf to
+SIGTERM) **spinning at 100% CPU**, while the content process waited forever.
+Each Firefox start added spinners until thread creation failed
+(`nsThreadPool::PutEvent`). The asserts in add_source/add_monitor/add_modes,
+the default devices and the virtual source are now quiet returns. Gate `make
+test-sandboxdesk` (the probe builds Firefox's sandbox: winsta, desktop,
+`CreateRestrictedToken` with RESTRICTED, low IL, `CreateProcessAsUser`).
+**The tell:** `explorer.exe /desktop` at 100% CPU and `add_source: Assertion`
+in a log.
+
 ## `patches/sg/0012-windows-10-taskbar.patch`
 
 Explorer's taskbar (`Shell_TrayWnd`, `systray.c`) given a Windows 10 look **in
