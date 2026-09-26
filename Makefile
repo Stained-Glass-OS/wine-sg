@@ -293,6 +293,15 @@ test-stackgrow:
 test-objowner:
 	WINE=$(PREFIX)/bin/wine test/objowner-gate.sh
 
+# Symbolic links and junctions are real (0360): the EA app's installer.
+test-symlink:
+	WINE=$(PREFIX)/bin/wine test/symlink-gate.sh
+
+# Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
+# engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
+test-d3dshared:
+	WINE=$(PREFIX)/bin/wine test/d3dshared-gate.sh
+
 # Notepad, our editor, for everything that runs notepad.exe (0100, 0101).
 test-notepad:
 	WINE=$(PREFIX)/bin/wine test/notepad-gate.sh
