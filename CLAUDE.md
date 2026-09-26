@@ -2120,8 +2120,12 @@ list is infinite because command lists' extents are not tracked. **Fixed
 found the rest (a Clear in each stamp's list made it unbounded; the brush
 masks are alpha-only WIC render targets, drawn over what they held, on
 several threads). Paint.NET's paintbrush now draws; a fast stroke over
-earlier ones can still leave a stray piece (effect property changes are not
-serialised yet). The note as it was: a command-list bounds sink
+earlier ones can still leave a stray or missing piece. That is a race: with
+`WINE_CPU_TOPOLOGY=1:0` (one CPU, one tile worker) every stroke is exact.
+Taking the factory lock in the effect setters (SetValue/SetInput) did not
+change it; not yet found. Harness: `/var/tmp/sgcm/bin/pdn.sh` (W=dev obj dir,
+D=own Xvfb display), strokes with xdotool on that display only. The note as
+it was: a command-list bounds sink
 (`d2d_command_list_get_bounds`), generic geometry operations for every
 stubbed `GetBounds`/`GetWidenedBounds`/`FillContainsPoint`/
 `StrokeContainsPoint`/`ComputeArea`/`ComputeLength`/`ComputePointAtLength`/
