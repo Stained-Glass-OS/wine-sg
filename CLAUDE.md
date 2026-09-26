@@ -2221,6 +2221,47 @@ LocaleName is ignored. Stock Wine fails 5 of 6 (the unchosen check passes).
   win32u change fails "removing it gives the space back". sg-shell's
   `magnify-check.sh` and `osk-check.sh` drive the real programs on it.
 
+## `patches/sg/0250`-`0251`: the X keyboard layout's keys
+
+Found making sg-shell's On-Screen Keyboard label its keys from the layout
+(`MapVirtualKeyEx` from a scan code, `ToUnicodeEx`). Wine's keyboard is the
+X server's keymap: winex11 builds `keyc2vkey`/`keyc2scan` by matching it
+against its own layout tables (`main_key_tab`); **the HKL is only the
+locale's** (`GetKeyboardLayout` says 0409 whatever the X layout is), and
+`ActivateKeyboardLayout` is a stub -- a layout is switched on the X server
+(setxkbmap; the compositor's keymap under Xwayland).
+
+- **0250:** in a UTF-8 locale `X11DRV_InitKeyboard` matched no key whose
+  keysym is not ASCII (its fallback for XkbTranslateKeySym was 0; the tables
+  are ISO-8859 bytes, DetectLayout's fallback the keysym's low byte): German
+  ß ü ö ä, French é è à ... had spare virtual keys and scan codes 0x60+, so
+  nothing could reach them by scan code. Dead keys never reached the
+  matching, and the German table lacked the ´ key. **And a program is not
+  always given a MappingNotify on a layout switch** (Xlib reads the new XKB
+  map by itself), or gets it before the XKB map is new: its tables stayed
+  the old layout's while its keysyms were new -- German Z typed Y.
+  `check_keyboard_mapping()` compares the keysyms the tables were built from
+  (`keyc2sym`) with the current ones before every use (KeyEvent,
+  ToUnicodeEx, MapVirtualKeyEx, VkKeyScanEx, GetKeyNameText) and rebuilds.
+- **0251:** `ToUnicodeEx` with Ctrl+Alt in the key state gives the key's
+  third level (XKB level 3/4 in the current group, looked up with the
+  ISO_Level3_Shift or Mode_switch modifier instead of Control) -- Windows'
+  AltGr, what an on-screen keyboard sends; a key without one gives nothing,
+  as before (US Ctrl+Alt+Q).
+- **Gate: `make test-kbdlayout`** (`test/kbdlayout-gate.sh`,
+  `kbdlayout-probe.c`; setxkbmap us/de/fr under Xvfb): German ß ü ö ä ´ at
+  their scan codes, QWERTZ, AltGr @ and |, French a/é/AltGr #, US Ctrl+Alt+Q
+  nothing, a program started on US following a switch to German and typing
+  z ü @ by scan code. 8 checks; the tree without them fails 6 (the
+  following check is timing-dependent there: sg-shell's
+  `osk-layout-check.sh` catches the stale tables every time -- a build
+  without the rebuild fails its typing checks). user32:input 0 failures.
+- Not done: the HKL still does not name the X layout (Wine's FIXME: Winword
+  reads it as a code page), `ActivateKeyboardLayout`/`LoadKeyboardLayout`
+  cannot switch the X layout, no `WM_INPUTLANGCHANGE` reaches programs on a
+  switch, and a dead key sent by scan code types its accent at once (no
+  composition for injected input).
+
 ## `patches/sg/0190`-`0191`: WebView2 apps draw
 
 Apps built on Microsoft Edge WebView2 (the runtime is the user's: the

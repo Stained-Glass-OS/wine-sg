@@ -148,6 +148,10 @@ test-admintools:
 test-a11y:
 	WINE=$(PREFIX)/bin/wine test/a11y-gate.sh
 
+# The X keyboard layout's keys: scan codes, AltGr, following a switch (0250-0251).
+test-kbdlayout:
+	WINE=$(PREFIX)/bin/wine test/kbdlayout-gate.sh
+
 # The event log (0143, 0144): the service, the API, who may read Security;
 # needs a second Unix user (SG_OTHER, default sgconf) and sudo -u to it.
 test-eventlog:
