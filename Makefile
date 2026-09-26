@@ -308,6 +308,11 @@ test-appcompat:
 test-crtimax:
 	WINE=$(PREFIX)/bin/wine test/crtimax-gate.sh
 
+# A named stream (file:Zone.Identifier) is refused as on FAT, not made a
+# second file; file::$$DATA is the file (0422).
+test-streams:
+	WINE=$(PREFIX)/bin/wine test/streams-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
