@@ -3,9 +3,39 @@
 #include <windows.h>
 #include <d2d1_1.h>
 #include <d3d11.h>
+#include <wincodec.h>
 #include <stdio.h>
 
 static ID2D1Factory1 *factory;
+
+/* An alpha-only bitmap of the program's own, over its own memory, as
+ * Paint.NET hands Direct2D its brush masks (Wine's WIC cannot make one). */
+struct mem_bitmap : IWICBitmap, IWICBitmapLock
+{
+    BYTE pixels[32 * 32];
+    LONG refs = 1;
+    HRESULT STDMETHODCALLTYPE QueryInterface( REFIID iid, void **out ) override
+    {
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IWICBitmapSource) || iid == __uuidof(IWICBitmap))
+        { *out = static_cast<IWICBitmap *>(this); AddRef(); return S_OK; }
+        *out = NULL; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement( &refs ); }
+    ULONG STDMETHODCALLTYPE Release() override { return InterlockedDecrement( &refs ); }
+    HRESULT STDMETHODCALLTYPE GetSize( UINT *w, UINT *h ) override { *w = *h = 32; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPixelFormat( WICPixelFormatGUID *f ) override { *f = GUID_WICPixelFormat8bppAlpha; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetResolution( double *x, double *y ) override { *x = *y = 96.0; return S_OK; }
+    HRESULT STDMETHODCALLTYPE CopyPalette( IWICPalette * ) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE CopyPixels( const WICRect *, UINT, UINT, BYTE * ) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Lock( const WICRect *, DWORD, IWICBitmapLock **lock ) override
+    { *lock = static_cast<IWICBitmapLock *>(this); AddRef(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetPalette( IWICPalette * ) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetResolution( double, double ) override { return S_OK; }
+    /* IWICBitmapLock; its IUnknown is the bitmap's */
+    HRESULT STDMETHODCALLTYPE GetStride( UINT *stride ) override { *stride = 32; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDataPointer( UINT *size, BYTE **data ) override { *size = sizeof(pixels); *data = pixels; return S_OK; }
+};
+
 
 static ID2D1PathGeometry *path( const D2D1_POINT_2F *pts, unsigned int n, bool closed )
 {
@@ -47,6 +77,7 @@ int main( void )
     float v;
     HRESULT hr;
 
+    setvbuf( stdout, NULL, _IONBF, 0 );
     D2D1CreateFactory( D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), NULL, (void **)&factory );
 
     g = path( tri, 3, true );
@@ -114,6 +145,59 @@ int main( void )
         r = D2D1::RectF( 0, 0, 0, 0 );
         hr = dc->GetImageLocalBounds( list, &r );
         printf( "LISTBOUNDS %08lx %.0f,%.0f,%.0f,%.0f\n", hr, r.left, r.top, r.right, r.bottom );
+
+        /* a Clear outside any clip does not make a list unbounded (Paint.NET
+         * clears each brush stamp's list, then draws the stamp); inside a clip
+         * or a layer it covers that */
+        struct { const char *name; int kind; } cases[] = { { "CLEARED", 0 }, { "LAYER", 1 }, { "CLIPCLEAR", 2 } };
+        for (unsigned int k = 0; k < 3; k++)
+        {
+            ID2D1CommandList *l;
+            ID2D1Layer *layer = NULL;
+            D2D1_RECT_F fill = { 10, 10, 100, 100 }, clip = { 5, 5, 15, 15 };
+            dc->CreateCommandList( &l );
+            dc->SetTarget( l );
+            dc->BeginDraw();
+            if (cases[k].kind == 0) { dc->Clear( D2D1::ColorF( 0, 0, 0, 0 ) ); dc->FillRectangle( &r1, brush ); }
+            if (cases[k].kind == 1)
+            {
+                dc->CreateLayer( NULL, &layer );
+                dc->PushLayer( D2D1::LayerParameters( D2D1::RectF( 0, 0, 30, 30 ) ), layer );
+                dc->FillRectangle( &fill, brush );
+                dc->PopLayer();
+            }
+            if (cases[k].kind == 2) { dc->PushAxisAlignedClip( &clip, D2D1_ANTIALIAS_MODE_ALIASED ); dc->Clear( D2D1::ColorF( 1, 0, 0, 1 ) ); dc->PopAxisAlignedClip(); }
+            dc->EndDraw();
+            l->Close();
+            dc->SetTarget( NULL );
+            r = D2D1::RectF( 0, 0, 0, 0 );
+            hr = dc->GetImageLocalBounds( l, &r );
+            printf( "%s %08lx %.0f,%.0f,%.0f,%.0f\n", cases[k].name, hr, r.left, r.top, r.right, r.bottom );
+            if (layer) layer->Release();
+            l->Release();
+        }
+    }
+
+    /* a render target on an alpha-only WIC bitmap (a mask, as Paint.NET draws
+     * brush strokes): accepted; drawing lands in it on top of what the bitmap
+     * already held, as Paint.NET adds each update's stamps to a tile's mask */
+    {
+        static mem_bitmap bmp;
+        ID2D1RenderTarget *rt;
+        ID2D1SolidColorBrush *b;
+        D2D1_RECT_F part = { 8, 8, 16, 16 };
+
+        memset( bmp.pixels, 0x80, sizeof(bmp.pixels) );
+        hr = factory->CreateWicBitmapRenderTarget( &bmp, D2D1::RenderTargetProperties(), &rt );
+        printf( "A8TARGET %08lx\n", hr );
+        if (SUCCEEDED(hr))
+        {
+            rt->CreateSolidColorBrush( D2D1::ColorF( 0, 0, 0, 1 ), &b );
+            rt->BeginDraw();
+            rt->FillRectangle( &part, b );
+            rt->EndDraw();
+            printf( "A8PIXELS in %u out %u\n", bmp.pixels[12 * 32 + 12], bmp.pixels[2 * 32 + 2] );
+        }
     }
     return 0;
 }

@@ -329,7 +329,7 @@ test-meetings:
 	WINE=$(PREFIX)/bin/wine test/meetings-gate.sh
 
 # Direct2D geometries: area, length, containment, relations, arcs, and a
-# command list's bounds (0427). Needs Xvfb.
+# command list's bounds (0427); Paint.NET brush masks (0429). Needs Xvfb.
 test-d2dgeom:
 	WINE=$(PREFIX)/bin/wine test/d2dgeom-gate.sh
 

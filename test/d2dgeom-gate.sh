@@ -6,7 +6,11 @@
 #     to another geometry (stubs, E_NOTIMPL, in Wine 10.0)
 #   - an elliptical arc in a path is an arc, not a straight line
 #   - a command list's bounds are what it draws (were unbounded), so an
-#     effect taking it as input gets the right rectangle
+#     effect taking it as input gets the right rectangle; a Clear outside any
+#     clip adds nothing (Paint.NET clears each brush stamp's list -- a
+#     paintbrush drag hung it), a layer or clip bounds what is inside (0429)
+#   - a render target on an alpha-only (mask) bitmap works and draws on top
+#     of what the bitmap held (0429; Paint.NET's brush masks)
 #
 #   WINE=/opt/wine-sg/bin/wine test/d2dgeom-gate.sh     (needs Xvfb)
 set -u
@@ -49,5 +53,10 @@ has 'CONTAINS 00000000 3' && has 'CONTAINED 00000000 2' && has 'DISJOINT 0000000
 has 'ARCBOUNDS 00000000 0,0,100,50' && pass "an arc bulges to its radius" || fail "arc bounds"
 has 'ARCAREA 00000000 3927' && pass "a half circle's area (pi r^2 / 2)" || fail "arc area"
 has 'LISTBOUNDS 00000000 10,20,90,60' && pass "a command list's bounds are what it draws" || fail "command list bounds"
+has 'CLEARED 00000000 10,20,50,60' && pass "a Clear outside a clip does not make a list unbounded" || fail "cleared list: $(printf '%s\n' "$out" | grep CLEARED)"
+has 'LAYER 00000000 10,10,30,30' && pass "a layer's content bounds limit the list's" || fail "layer: $(printf '%s\n' "$out" | grep LAYER)"
+has 'CLIPCLEAR 00000000 5,5,15,15' && pass "a Clear inside a clip covers the clip" || fail "clip clear: $(printf '%s\n' "$out" | grep CLIPCLEAR)"
+has 'A8TARGET 00000000' && pass "a render target on an alpha-only bitmap" || fail "A8 target: $(printf '%s\n' "$out" | grep A8TARGET)"
+has 'A8PIXELS in 255 out 128' && pass "drawing lands in it, over what the bitmap held" || fail "A8 pixels: $(printf '%s\n' "$out" | grep A8PIXELS)"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
