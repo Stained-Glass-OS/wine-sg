@@ -328,6 +328,11 @@ test-keyedmutex:
 test-meetings:
 	WINE=$(PREFIX)/bin/wine test/meetings-gate.sh
 
+# Direct2D geometries: area, length, containment, relations, arcs, and a
+# command list's bounds (0427). Needs Xvfb.
+test-d2dgeom:
+	WINE=$(PREFIX)/bin/wine test/d2dgeom-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
