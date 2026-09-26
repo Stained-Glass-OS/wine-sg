@@ -58,6 +58,7 @@ DEFINE_GUID(probe_CLSID_ColorManagement,  0x1a28524c,0xfdd6,0x4aa4,0xae,0x8f,0x8
 DEFINE_GUID(probe_IID_ID2D1GradientStopCollection1, 0xae1572f4,0x5dd0,0x4777,0x99,0x8b,0x92,0x79,0x47,0x2a,0xe6,0x3b);
 DEFINE_GUID(probe_IID_IDXGIFactory4,      0x1bc6ea02,0xef36,0x464f,0xbf,0x0c,0x21,0xca,0x39,0xe5,0x16,0x8a);
 DEFINE_GUID(probe_IID_ID3D11ShaderReflection, 0x8d536ca1,0x0cca,0x4956,0xa8,0x37,0x78,0x69,0x63,0x75,0x55,0x84);
+DEFINE_GUID(probe_IID_IDXGIOutput6,       0x068346e8,0xaaec,0x4b84,0xad,0xd7,0x13,0x7f,0x51,0x3f,0x77,0xa1);
 DEFINE_GUID(probe_IID_IDXGIAdapter,       0x2411e7e1,0x12ac,0x4ccf,0xbd,0x14,0x97,0x98,0xe8,0x53,0x4d,0xc0);
 
 /* vtable slots of what the C headers lack (from the interfaces' definitions) */
@@ -75,6 +76,11 @@ DEFINE_GUID(probe_IID_IDXGIAdapter,       0x2411e7e1,0x12ac,0x4ccf,0xbd,0x14,0x9
 #define DC1_CREATE_FILLED_REALIZATION 92
 #define DC1_DRAW_REALIZATION          94
 #define REFLECTION_MIN_FEATURE_LEVEL  19
+#define DC_GET_IMAGE_LOCAL_BOUNDS     70
+#define EFFECT_SET_INPUT              14
+#define EFFECT_GET_OUTPUT             18
+#define GEOMETRY_COMBINE              11
+#define GEOMETRY_WIDEN                16
 #define DC_CREATE_BITMAP1             57
 #define DC_CREATE_COLOR_CONTEXT       59
 #define DC_CREATE_COMMAND_LIST        67
@@ -82,6 +88,8 @@ DEFINE_GUID(probe_IID_IDXGIAdapter,       0x2411e7e1,0x12ac,0x4ccf,0xbd,0x14,0x9
 #define RT(ctx) ((ID2D1RenderTarget *)(ctx))
 #define SET_TARGET(ctx, t) SLOT( ctx, DC_SET_TARGET, void (WINAPI *)( void *, IUnknown * ) )( ctx, (IUnknown *)(t) )
 #define DXGIFACTORY4_ENUM_WARP        27
+#define DXGIADAPTER_ENUM_OUTPUTS      7
+#define DXGIOUTPUT6_HW_COMPOSITION    28
 
 static const struct { const GUID *clsid; const char *name; } builtins[] =
 {
@@ -326,7 +334,23 @@ static void check_dxgi_d3dcompiler( void )
         hr = SLOT( factory, DXGIFACTORY4_ENUM_WARP, HRESULT (WINAPI *)( void *, REFIID, void ** ) )( factory, &probe_IID_IDXGIAdapter,
                                                                                  (void **)&adapter );
         printf( "warp_adapter=%d\n", SUCCEEDED( hr ) && adapter );
-        if (adapter) IUnknown_Release( adapter );
+        if (adapter)
+        {
+            /* its output says whether it composes in hardware (no: 0) */
+            IUnknown *output = NULL, *output6 = NULL;
+            UINT flags = 0xdead;
+            if (SUCCEEDED( SLOT( adapter, DXGIADAPTER_ENUM_OUTPUTS, HRESULT (WINAPI *)( void *, UINT, IUnknown ** ) )(
+                               adapter, 0, &output ) )
+                && SUCCEEDED( IUnknown_QueryInterface( output, &probe_IID_IDXGIOutput6, (void **)&output6 ) ))
+            {
+                hr = SLOT( output6, DXGIOUTPUT6_HW_COMPOSITION, HRESULT (WINAPI *)( void *, UINT * ) )( output6, &flags );
+                printf( "hw_composition=%d\n", hr == S_OK && flags == 0 );
+                IUnknown_Release( output6 );
+            }
+            else printf( "hw_composition=no-output\n" );
+            if (output) IUnknown_Release( output );
+            IUnknown_Release( adapter );
+        }
         IUnknown_Release( factory );
     }
     else printf( "warp_adapter=no-factory\n" );
@@ -351,6 +375,86 @@ static void check_dxgi_d3dcompiler( void )
     }
     if (code) ID3D10Blob_Release( code );
     printf( "min_feature_level=%#x,%#x\n", level, level9 );
+}
+
+/* a simplified geometry sink that adds up the area of what it is given */
+struct area_sink
+{
+    const void *vtbl;
+    double area, figure;
+    D2D1_POINT_2F first, last;
+};
+
+static HRESULT WINAPI as_QueryInterface( void *iface, REFIID iid, void **out ) { *out = iface; return S_OK; }
+static ULONG WINAPI as_AddRef( void *iface ) { return 2; }
+static ULONG WINAPI as_Release( void *iface ) { return 1; }
+static void WINAPI as_SetFillMode( void *iface, D2D1_FILL_MODE mode ) {}
+static void WINAPI as_SetSegmentFlags( void *iface, D2D1_PATH_SEGMENT flags ) {}
+static void WINAPI as_BeginFigure( struct area_sink *sink, D2D1_POINT_2F p, D2D1_FIGURE_BEGIN begin )
+{
+    sink->figure = 0;
+    sink->first = sink->last = p;
+}
+static void WINAPI as_AddLines( struct area_sink *sink, const D2D1_POINT_2F *p, UINT32 count )
+{
+    UINT32 i;
+    for (i = 0; i < count; i++)
+    {
+        sink->figure += (double)sink->last.x * p[i].y - (double)p[i].x * sink->last.y;
+        sink->last = p[i];
+    }
+}
+static void WINAPI as_AddBeziers( struct area_sink *sink, const D2D1_BEZIER_SEGMENT *b, UINT32 count )
+{
+    UINT32 i;
+    for (i = 0; i < count; i++) as_AddLines( sink, &b[i].point3, 1 );
+}
+static void WINAPI as_EndFigure( struct area_sink *sink, D2D1_FIGURE_END end )
+{
+    as_AddLines( sink, &sink->first, 1 );
+    sink->area += fabs( sink->figure ) / 2;
+}
+static HRESULT WINAPI as_Close( void *iface ) { return S_OK; }
+static const void *area_sink_vtbl[] =
+{
+    as_QueryInterface, as_AddRef, as_Release, as_SetFillMode, as_SetSegmentFlags, as_BeginFigure, as_AddLines,
+    as_AddBeziers, as_EndFigure, as_Close,
+};
+
+/* CombineWithGeometry and Widen: the areas of what they give */
+static void check_geometry( ID2D1Factory *factory )
+{
+    D2D1_RECT_F ra = { 0, 0, 10, 10 }, rb = { 5, 0, 15, 10 };
+    ID2D1RectangleGeometry *a, *b;
+    static const double expect[4] = { 150, 50, 100, 50 };  /* union, intersect, xor, exclude */
+    unsigned int mode, ok = 0;
+    struct area_sink sink;
+
+    if (FAILED( ID2D1Factory_CreateRectangleGeometry( factory, &ra, &a ) )
+        || FAILED( ID2D1Factory_CreateRectangleGeometry( factory, &rb, &b ) ))
+        return;
+    for (mode = 0; mode < 4; mode++)
+    {
+        memset( &sink, 0, sizeof(sink) );
+        sink.vtbl = area_sink_vtbl;
+        if (SUCCEEDED( SLOT( a, GEOMETRY_COMBINE, HRESULT (WINAPI *)( void *, ID2D1Geometry *, D2D1_COMBINE_MODE,
+                                                                      const D2D1_MATRIX_3X2_F *, float, void * ) )(
+                           a, (ID2D1Geometry *)b, mode, NULL, 0.25f, &sink ) )
+            && fabs( sink.area - expect[mode] ) < 0.01)
+            ok++;
+        else
+            printf( "combine_mode_%u_area=%.2f\n", mode, sink.area );
+    }
+    printf( "combine=%u/4\n", ok );
+
+    memset( &sink, 0, sizeof(sink) );
+    sink.vtbl = area_sink_vtbl;
+    /* a 10x10 square's 2-wide stroke with mitered corners: 12x12 - 8x8 */
+    SLOT( a, GEOMETRY_WIDEN, HRESULT (WINAPI *)( void *, float, ID2D1StrokeStyle *, const D2D1_MATRIX_3X2_F *, float,
+                                                 void * ) )( a, 2.0f, NULL, NULL, 0.25f, &sink );
+    printf( "widen_area=%.1f\n", sink.area );
+    ID2D1RectangleGeometry_Release( a );
+    ID2D1RectangleGeometry_Release( b );
 }
 
 int main( void )
@@ -437,6 +541,34 @@ int main( void )
         else typed = 0;
         printf( "builtin_typed=%d\n", typed );
         printf( "builtin_settable=%d\n", settable );
+    }
+
+    /* an effect's bounds: a blur of a 64x64 bitmap by a deviation of 3 grows by 9 each way */
+    {
+        D2D1_BITMAP_PROPERTIES1 plain = { { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, 96, 96,
+                                          D2D1_BITMAP_OPTIONS_NONE, NULL };
+        D2D1_SIZE_U bsize = { 64, 64 };
+        D2D1_RECT_F bounds = { 0 };
+        ID2D1Bitmap1 *bitmap;
+        ID2D1Image *output;
+        HRESULT bhr = E_FAIL;
+
+        if (SUCCEEDED( SLOT( ctx, DC_CREATE_BITMAP1, HRESULT (WINAPI *)( void *, D2D1_SIZE_U, const void *, UINT32,
+                                                                          const D2D1_BITMAP_PROPERTIES1 *, ID2D1Bitmap1 ** ) )(
+                           ctx, bsize, NULL, 0, &plain, &bitmap ) )
+            && SUCCEEDED( ID2D1DeviceContext_CreateEffect( ctx, &probe_CLSID_GaussianBlur, &effect ) ))
+        {
+            SLOT( effect, EFFECT_SET_INPUT, void (WINAPI *)( void *, UINT32, ID2D1Image *, BOOL ) )(
+                    effect, 0, (ID2D1Image *)bitmap, FALSE );
+            SLOT( effect, EFFECT_GET_OUTPUT, void (WINAPI *)( void *, ID2D1Image ** ) )( effect, &output );
+            bhr = SLOT( ctx, DC_GET_IMAGE_LOCAL_BOUNDS, HRESULT (WINAPI *)( void *, ID2D1Image *, D2D1_RECT_F * ) )(
+                    ctx, output, &bounds );
+            IUnknown_Release( (IUnknown *)output );
+            IUnknown_Release( (IUnknown *)effect );
+            IUnknown_Release( (IUnknown *)bitmap );
+        }
+        printf( "effect_bounds=%d (%.0f,%.0f,%.0f,%.0f)\n", bhr == S_OK && bounds.left == -9 && bounds.top == -9
+                && bounds.right == 73 && bounds.bottom == 73, bounds.left, bounds.top, bounds.right, bounds.bottom );
     }
 
     hr = ID2D1Factory1_RegisterEffectFromString( factory, &probe_CLSID_Custom, custom_xml, &binding, 1, custom_factory );
@@ -594,6 +726,7 @@ int main( void )
         printf( "gradient1=%d\n", gradient1 );
     }
 
+    check_geometry( (ID2D1Factory *)factory );
     check_dxgi_d3dcompiler();
     check_animation();
     printf( "done=1\n" );

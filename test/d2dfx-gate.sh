@@ -1,21 +1,24 @@
 #!/bin/sh
 # Direct2D, DXGI, the shader compiler and Windows Animation as Paint.NET
-# uses them (patches/sg/0223-0227), under Xvfb:
+# uses them (patches/sg/0223-0228), under Xvfb:
 #
 #  - Direct2D's built-in effects are registered with their properties'
-#    types and defaults, and those can be set (0223);
+#    types and defaults, and those can be set;
 #  - a custom effect made by a .NET ComWrappers-style factory is initialized
 #    through its ID2D1EffectImpl; its context is an ID2D1EffectContext2 that
-#    reports the feature level and makes transform nodes of effects (0223);
+#    reports the feature level and makes transform nodes of effects;
 #  - a WIC bitmap render target's device has feature level 11; Flush says
 #    whether the context is drawing; an empty command list closes and one
 #    set as the target mid-frame records; sRGB color contexts carry an ICC
 #    profile; gradients are ID2D1GradientStopCollection1; geometry
-#    realizations exist and draw (0224);
-#  - DXGI has a WARP adapter (0225); shader reflection reports a shader's
-#    minimum feature level (0226);
+#    realizations exist and draw (0223);
+#  - DXGI has a WARP adapter (0224); shader reflection reports a shader's
+#    minimum feature level (0225);
 #  - Windows Animation moves a variable along a storyboard, and its timer
-#    ticks (0227).
+#    ticks (0226);
+#  - an effect's bounds come from its graph (a blur of a bitmap grows by
+#    three deviations); CombineWithGeometry and Widen give the right areas
+#    (0227); DXGI outputs answer CheckHardwareCompositionSupport (0228).
 #
 #   WINE=/opt/wine-sg/bin/wine test/d2dfx-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
@@ -75,6 +78,11 @@ check 'srgb_profile=1'                "an sRGB color context carries an ICC prof
 check 'gradient1=1'                   "gradient stop collections are ID2D1GradientStopCollection1"
 check 'realization=1'                 "geometry realizations are made and drawn"
 check 'warp_adapter=1'                "DXGI has a WARP adapter"
+if printf '%s\n' "$out" | grep -qx 'hw_composition=no-output'; then
+    echo "SKIP  the adapter has no output here"
+else
+    check 'hw_composition=1'          "its output answers CheckHardwareCompositionSupport (none)"
+fi
 if printf '%s\n' "$out" | grep -q '^min_feature_level=0xb000,'; then
     pass "shader reflection: a shader model 5 shader needs feature level 11_0"
 else
@@ -86,6 +94,13 @@ else
     fail "animation: $(printf '%s\n' "$out" | grep '^animation=' || echo none)"
 fi
 check 'animation_timer=1'             "its timer tells the time and can be enabled"
+if printf '%s\n' "$out" | grep -q '^effect_bounds=1 '; then
+    pass "an effect's bounds: a blur of a 64x64 bitmap by 3 covers -9..73"
+else
+    fail "effect bounds: $(printf '%s\n' "$out" | grep '^effect_bounds=' || echo none)"
+fi
+check 'combine=4/4'                   "CombineWithGeometry: union, intersection, xor and difference of two squares"
+check 'widen_area=80.0'               "Widen: a square's 2-wide mitered stroke covers 12x12 - 8x8"
 check 'done=1'                        "the probe ran to the end"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

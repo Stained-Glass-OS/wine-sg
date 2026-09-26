@@ -268,7 +268,8 @@ test-dwscale:
 	WINE=$(PREFIX)/bin/wine test/dwscale-gate.sh
 
 # Direct2D effects and contexts, DXGI's WARP adapter, shader reflection's
-# feature level and Windows Animation, as Paint.NET uses them (0223-0226).
+# feature level, Windows Animation, effect bounds, geometry combination and
+# widening, as Paint.NET uses them (0223-0228).
 test-d2dfx:
 	WINE=$(PREFIX)/bin/wine test/d2dfx-gate.sh
 

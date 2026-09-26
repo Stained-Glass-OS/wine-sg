@@ -1379,8 +1379,9 @@ applications with a failing stage.
   0222), qBittorrent (`--confirm-legal-notice`), ShareX 17 (.NET;
   `/NORUN`, else the installer starts it and the suite's launch only hands
   off to that one), HxD, foobar2000, Steam (its CEF sign-in window).
-  Paint.NET 5.1 is left out: 0174-0176 got it past its first three walls,
-  then Direct2D effects stop it.
+  Paint.NET 5.1 is left out: 0174-0176 and 0223-0228 got it through
+  Direct2D; it now stops on **Windows.UI.Composition** (WinRT
+  `CompositorController`, CLASS_E_CLASSNOTAVAILABLE), which Wine lacks.
 - **Results (2026-09-24, 10.0-25 + 0080, with sg-shell's defaults):** 13 of
   14 launch and show their main window; 12 of 13 close. Open: Git for
   Windows' **mintty** dies silently inside `EnumFontFamiliesExW`'s callback
@@ -1645,7 +1646,7 @@ the glyph box and bitmap (cache keyed on it). Found by `CreateGlyphRunAnalysis`
 16 px: same box and pixels for 5 glyphs; stock 1/5 boxes, 0/5 pixels).
 dwrite:font/layout/analyzer unchanged.
 
-## `patches/sg/0223`-`0226`: Direct2D effects and the rest of what Paint.NET 5 needs
+## `patches/sg/0223`-`0228`: Direct2D effects and the rest of what Paint.NET 5 needs
 
 Paint.NET draws its whole UI with Direct2D -- its own effects (ComputeSharp.D2D1
 pixel shaders, registered with `RegisterEffectFromString` and property
@@ -1678,13 +1679,30 @@ each wall was found from its crash log (`Paint.NET App Files/CrashLogs/`,
   transitions, custom interpolators, manager Update with handlers called
   outside the lock, a timer ticking on the enabling thread's message loop).
 
-**Still open for Paint.NET**: `DrawImage` of an effect is not rendered
-(Wine's `d2d_device_context_DrawImage` draws bitmaps only) and
-`GetImageLocalBounds` of an effect is unimplemented -- Paint.NET's next
-crash, in its image strip. Rendering effect graphs (draw transforms with
-D2D's shader-linking input layout, built-in effects' shaders) is the next
-piece of work. Gate: `make test-d2dfx` (Xvfb; 24 checks; stock fails all
-but registration). d2d1:d2d1 and uianimation:uianimation 0 failures.
+- **0227 d2d1** (new `effect_render.c`, `geometry_combine.c`): effect
+  bounds from the transform graph (`MapInputRectsToOutputRect` after
+  `PrepareForRender`; built-ins from their properties; infinite =
+  LONG_MIN/LONG_MAX, +-FLT_MAX as floats); `GetImageWorldBounds`;
+  `CombineWithGeometry` for every geometry type (flatten, slab
+  decomposition at vertices and crossings, winding per fill mode, polygons
+  grown between edge pairs -- non-overlapping output) and `Widen`
+  (segment rectangles + joins + caps, oriented alike, united by the same
+  code; no dashes).
+- **0228 dxgi** `CheckHardwareCompositionSupport` = 0.
+
+**Still open for Paint.NET**: its compositor. `PdnCompositor` activates
+WinRT `Windows.UI.Composition.Core.CompositorController`; Wine has no
+Windows.UI.Composition at all (a visual tree, drawing surfaces through
+`ICompositionGraphicsDevice` on its D2D device, desktop window targets) --
+a subsystem of its own, not a gap. Behind it: `DrawImage` of an effect is
+not rendered (Wine's `d2d_device_context_DrawImage` draws bitmaps only;
+Paint.NET's canvas and many controls are its own ComputeSharp effects plus
+Premultiply/UnPremultiply/ColorManagement/WhiteLevelAdjustment), so
+rendering effect graphs (draw transforms with D2D's shader-linking input
+layout: SCENE_POSITION, TEXCOORDn = uv + texel size, t/s registers per
+input, b0 constants) comes next. Gate: `make test-d2dfx` (Xvfb; 28
+checks; stock fails all but the probe's end). d2d1:d2d1 and
+uianimation:uianimation 0 failures.
 
 ## `patches/sg/0178`-`0179`: HKEY_CLASSES_ROOT is the merged view; the user's choices
 
