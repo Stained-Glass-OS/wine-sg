@@ -257,6 +257,10 @@ test-hkcr:
 test-tzset:
 	WINE=$(PREFIX)/bin/wine test/tzset-gate.sh
 
+# DirectWrite hints a glyph at the size it is drawn at: cairo/GTK text (0222).
+test-dwscale:
+	WINE=$(PREFIX)/bin/wine test/dwscale-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 

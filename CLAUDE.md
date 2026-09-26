@@ -1362,8 +1362,8 @@ applications with a failing stage.
 - **Results (2026-09-25, 10.0-54 + 0170-0177): all 24 launch and show their
   main window**, 23 close (Greenshot is a tray program). Added then:
   Thunderbird, SumatraPDF, Inkscape (its smoke output is long: the runner
-  keeps 4000 bytes), Pinta 3.1 (.NET 9 + GTK 4; text still misshapen, see
-  0177), qBittorrent (`--confirm-legal-notice`), ShareX 17 (.NET;
+  keeps 4000 bytes), Pinta 3.1 (.NET 9 + GTK 4; its text needed 0177 and
+  0222), qBittorrent (`--confirm-legal-notice`), ShareX 17 (.NET;
   `/NORUN`, else the installer starts it and the suite's launch only hands
   off to that one), HxD, foobar2000, Steam (its CEF sign-in window).
   Paint.NET 5.1 is left out: 0174-0176 got it past its first three walls,
@@ -1614,8 +1614,23 @@ font for GDI's file -- else same family/weight/stretch/style -- is used.
 Gate: `make test-dwlogfont` (stock fails 2 of 4). dwrite:font/layout/
 analyzer unchanged (layout's 3 failures are stock's too).
 
-Pinta 3.1 (GTK 4) runs, but its text is still drawn misshapen (glyph
-parts missing) -- the GTK/cairo text path on Wine, not investigated yet.
+Pinta's misshapen text was 0222's.
+
+## `patches/sg/0222`: DirectWrite hints a glyph at the size it is drawn at
+
+cairo (GTK 4: Pinta, Inkscape 1.x, GIMP 3) draws each glyph with
+`IDWriteFactory3::CreateGlyphRunAnalysis` at **em size 1, the size in the
+transform**, a glyph offset putting the ink box at 0,0, and asks for exactly
+that box (never `GetAlphaTextureBounds`). Wine's FreeType glue sizes in whole
+pixels (`freetype_set_face_size(FT_UInt)`), so it hinted at 1 ppem and scaled
+the result: the box snapped to whole ems and the glyph was drawn above the
+texture -- lower-case tops cut ("Background" -> "Backyiuuliu"). `font.c`'s
+`fold_transform_scale` moves sqrt(|det|) of the transform into the em size for
+the glyph box and bitmap (cache keyed on it). Found by `CreateGlyphRunAnalysis`
+/`CreateAlphaTexture` in a `+dwrite` trace of Pinta and cairo 1.18.4's
+`cairo-dwrite-font.cpp`. Gate: `make test-dwscale` (cairo's call vs drawing at
+16 px: same box and pixels for 5 glyphs; stock 1/5 boxes, 0/5 pixels).
+dwrite:font/layout/analyzer unchanged.
 
 ## `patches/sg/0178`-`0179`: HKEY_CLASSES_ROOT is the merged view; the user's choices
 
