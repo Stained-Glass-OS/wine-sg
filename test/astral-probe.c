@@ -144,6 +144,27 @@ int main( int argc, char **argv )
         printf( "uniscribe=%d\n", SUCCEEDED( hr ) && ink_ss == ink_grin );
     }
 
+    /* CJK Extension B (U+20000) from a font without it: the installed font
+     * that has it (HanaMinB), when there is one */
+    {
+        static const WCHAR extb[] = { 0xd840, 0xdc00 };
+        HFONT hana = make_font( L"HanaMinB" );
+        WCHAR hface[LF_FACESIZE];
+        int ink_hana, ink_fbb, ink_box2;
+        unsigned int h_hana, h_fbb, h_box2;
+
+        SelectObject( dc, hana );
+        GetTextFaceW( dc, LF_FACESIZE, hface );
+        if (!lstrcmpiW( hface, L"HanaMinB" ))
+        {
+            h_hana = draw( hana, 0, extb, 2, &ink_hana );
+            h_fbb = draw( plain, 0, extb, 2, &ink_fbb );
+            h_box2 = draw( plain, ETO_GLYPH_INDEX, notdef, 2, &ink_box2 );
+            printf( "cjkb_fallback=%d\n", h_fbb != h_box2 && ink_fbb == ink_hana && ink_hana > 50 );
+        }
+        else printf( "cjkb_fallback=no-font\n" );
+    }
+
     /* the API that takes one UINT keeps Windows' behaviour: the high word is ignored */
     {
         GLYPHMETRICS gm1, gm2;

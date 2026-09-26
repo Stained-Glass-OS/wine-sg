@@ -1617,6 +1617,63 @@ analyzer unchanged (layout's 3 failures are stock's too).
 Pinta 3.1 (GTK 4) runs, but its text is still drawn misshapen (glyph
 parts missing) -- the GTK/cairo text path on Wine, not investigated yet.
 
+## `patches/sg/0178`-`0179`: HKEY_CLASSES_ROOT is the merged view; the user's choices
+
+Found by the PDF work: Wine's HKCR was `HKLM\Software\Classes` alone, so a
+per-user install's handlers and **Settings > Default apps' choices never took
+effect**. Now Windows' merged view:
+
+- **0178 kernelbase** (`registry.c`, the block before RegCreateKeyExW): a key
+  opened through HKCR -- or through such a key -- is the user's key
+  (`HKCU\Software\Classes\<path>`) when it exists, else the machine's. Such
+  handles are **tagged `| 2`** (Windows' HKCR mark; the server ignores the low
+  bits) and remembered with their path (`classes_keys`), so relative opens
+  resolve the whole path again. Values: `RegQueryValueEx*`, `RegSetValueEx*`,
+  `RegDeleteValue*`, `RegEnumValue*` are wrappers at the end of the file
+  around the original code (`query_value_ex_w` ...): the user's value first,
+  writes to the user's key when it exists, decided per call; a handle opened
+  on the user's key stays with it (`user_bound`: ERROR_KEY_DELETED after it
+  is deleted, as Windows). Subkeys (sorted) and values (user's, then the
+  machine's others) enumerate merged; RegQueryInfoKey counts both. A new key
+  goes to the machine's classes, or -- when denied, a standard user on the
+  multi-user machine -- to the user's (UAC-virtualization-like). Per-user
+  hives (0002) keep users' classes apart.
+- **0179 shell32**: `SHELL_GetUserChoice` -- `HKCU\...\Explorer\FileExts\
+  .ext\UserChoice\ProgId` and `...\Shell\Associations\UrlAssociations\
+  <proto>\UserChoice\ProgId` (a registered ProgId only; **Windows' hash is
+  not checked**) -- in IQueryAssociations::Init and its command lookup
+  (AssocQueryString), ShellExecute/FindExecutable for files and URLs, the
+  context menu's class, QueryCurrentDefault.
+- **Conformance**: advapi32:registry's HKCR tests (skipped on stock) now run,
+  0 failures 64- and 32-bit (their todo_wine removed); shell32 assoc/shlexec/
+  shlfileop, shlwapi assoc, ole32 compobj/marshal unchanged.
+
+**Gate: `make test-hkcr`** (`test/hkcr-gate.sh`, `hkcr-probe.c`): on a shared
+prefix the owner registers machine classes, `sgconf` their own classes and
+UserChoices; 21 checks (merged values/subkeys/enumeration/counts, writes,
+creates, AssocQueryString, QueryCurrentDefault, ShellExecute of a file and
+a URL, and the owner seeing none of sgconf's). Stock fails 10.
+
+## `patches/sg/0220`: CJK Extensions B-G fall back to SimSun-ExtB, HanaMinB, BabelStone Han
+
+0171's last-resort fallback list (GDI and Uniscribe) ends with the fonts that
+have CJK beyond the BMP; sg-image installs `fonts-hanazono` (HanaMinA/B).
+Gate: `make test-astral` (U+20000 from Liberation Sans is HanaMinB's glyph,
+when HanaMinB is installed).
+
+## `patches/sg/0221`: the time zone and the clock through sg-admind
+
+`SetDynamicTimeZoneInformation` (key -> IANA, a CLDR `windowsZones.xml`
+table in locale.c), `SetTimeZoneInformation` (by standard name),
+`SetLocalTime`/`SetSystemTime` file requests in **sg-shell's sg-admind spool**
+(`sg_admin_request`, locale.c; the same format sg-control uses: `<id>.req`,
+UTF-8 lines verb/arg, written as `.<id>` and renamed; `replies/<id>.rep`
+`OK`/`FAILED ...`). Only SYSTEM (elevated) can write the spool; others get
+ERROR_PRIVILEGE_NOT_HELD, as on Windows. **The spool format and verbs
+(`timezone`, `time`) are an interface with sg-admind -- change both
+together.** Gate: `make test-tzset` (the real sg-admind, test mode, stand-in
+timedatectl; 9 checks).
+
 ## `patches/sg/0125`: startup items disabled in Task Manager do not start
 
 sg-taskmgr's Startup tab writes Windows' `Explorer\StartupApproved\{Run,

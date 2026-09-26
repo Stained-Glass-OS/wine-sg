@@ -1,0 +1,1047 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: kernelbase: HKEY_CLASSES_ROOT is the merged view of the user's and the machine's classes
+
+Wine's HKEY_CLASSES_ROOT was HKLM\Software\Classes alone, so everything a
+user registers in HKCU\Software\Classes -- a per-user install's file types
+and ProgIds, Settings > Default apps' choices -- was invisible to every
+program. HKCR is now Windows' merged view:
+
+- A key opened through HKCR (or through a key opened through it) is the
+  user's key when that exists, else the machine's; handles are tagged with
+  Windows' HKCR mark (low bits 2, which the server ignores) and remembered
+  with their path below Classes, so keys opened relative to them resolve
+  the whole path again.
+- Values: a query finds the user's value first, then the machine's; a write
+  goes to the user's key when it exists, else the machine's; decided per
+  call, so a handle opened on the machine's key sees a user key created
+  later. A handle opened on the user's key stays with it (ERROR_KEY_DELETED
+  once it is deleted).
+- Subkeys and values enumerate merged (subkeys sorted; values the user's
+  then the machine's others), and RegQueryInfoKey counts them so.
+- A new key goes to the machine's classes, as on Windows -- or, when that is
+  denied (a standard user on the multi-user machine, whose HKLM is
+  administrators'), to the user's, as UAC's virtualization would put it.
+
+Each user of a shared prefix has their own HKCU (0002), so their classes
+stay theirs. advapi32:registry's HKCR merging tests now run: their
+todo_wine are removed, 0 failures in 64- and 32-bit.
+
+Gate: test/hkcr-gate.sh (with 0179).
+---
+--- a/dlls/kernelbase/registry.c
++++ b/dlls/kernelbase/registry.c
+@@ -581,6 +581,531 @@
+ }
+ 
+ 
++/* HKEY_CLASSES_ROOT is a merged view: HKCU\Software\Classes over
++ * HKLM\Software\Classes. A key opened through it is the user's key when that
++ * exists (its values are the key's values), else the machine's; its subkeys
++ * are both sides' together. Handles opened through the view are remembered
++ * with their path below Classes, so keys opened relative to them, their
++ * enumeration and their subkey counts see the merged view too. A new key
++ * goes to the machine's classes, as on Windows -- or, when that is denied
++ * (a standard user's per-user install), to the user's, as UAC's
++ * virtualization would put it. */
++
++struct classes_key
++{
++    struct list entry;
++    HKEY hkey;
++    WCHAR *path;          /* below Classes, no leading backslash */
++    BOOL user_bound;      /* opened on the user's key: stays with it */
++    WCHAR **names;        /* merged subkey names, while enumerating */
++    DWORD count;
++};
++
++static CRITICAL_SECTION classes_cs;
++static CRITICAL_SECTION_DEBUG classes_cs_debug =
++{
++    0, 0, &classes_cs,
++    { &classes_cs_debug.ProcessLocksList, &classes_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": classes_cs") }
++};
++static CRITICAL_SECTION classes_cs = { &classes_cs_debug, -1, 0, 0, 0, 0 };
++static struct list classes_keys = LIST_INIT( classes_keys );
++static struct classes_key classes_root_view;   /* HKEY_CLASSES_ROOT itself */
++
++static struct classes_key *find_classes_key( HKEY hkey )
++{
++    struct classes_key *key;
++
++    if (HandleToUlong( hkey ) == HandleToUlong( HKEY_CLASSES_ROOT )) return &classes_root_view;
++    LIST_FOR_EACH_ENTRY( key, &classes_keys, struct classes_key, entry )
++        if (key->hkey == hkey) return key;
++    return NULL;
++}
++
++static void free_classes_names( struct classes_key *key )
++{
++    DWORD i;
++    for (i = 0; i < key->count; i++) heap_free( key->names[i] );
++    heap_free( key->names );
++    key->names = NULL;
++    key->count = 0;
++}
++
++/* the path below Classes of a key of the merged view; NULL for any other key */
++static WCHAR *get_classes_path( HKEY hkey )
++{
++    struct classes_key *key;
++    WCHAR *ret = NULL;
++
++    RtlEnterCriticalSection( &classes_cs );
++    if ((key = find_classes_key( hkey )))
++    {
++        const WCHAR *path = key->path ? key->path : L"";
++        if ((ret = heap_alloc( (lstrlenW( path ) + 1) * sizeof(WCHAR) ))) lstrcpyW( ret, path );
++    }
++    RtlLeaveCriticalSection( &classes_cs );
++    return ret;
++}
++
++static void track_classes_key( HKEY hkey, const WCHAR *path, BOOL user_bound )
++{
++    struct classes_key *key;
++
++    if (!(key = heap_alloc_zero( sizeof(*key) ))) return;
++    if (!(key->path = heap_alloc( (lstrlenW( path ) + 1) * sizeof(WCHAR) )))
++    {
++        heap_free( key );
++        return;
++    }
++    lstrcpyW( key->path, path );
++    key->hkey = hkey;
++    key->user_bound = user_bound;
++    RtlEnterCriticalSection( &classes_cs );
++    list_add_head( &classes_keys, &key->entry );
++    RtlLeaveCriticalSection( &classes_cs );
++}
++
++static void untrack_classes_key( HKEY hkey )
++{
++    struct classes_key *key;
++
++    RtlEnterCriticalSection( &classes_cs );
++    LIST_FOR_EACH_ENTRY( key, &classes_keys, struct classes_key, entry )
++    {
++        if (key->hkey != hkey) continue;
++        list_remove( &key->entry );
++        free_classes_names( key );
++        heap_free( key->path );
++        heap_free( key );
++        break;
++    }
++    RtlLeaveCriticalSection( &classes_cs );
++}
++
++/* "path\name", without empty parts */
++static WCHAR *join_classes_path( const WCHAR *path, const UNICODE_STRING *name )
++{
++    DWORD len = lstrlenW( path ), name_len = name->Length / sizeof(WCHAR);
++    const WCHAR *n = name->Buffer;
++    WCHAR *ret;
++
++    while (name_len && *n == '\\') { n++; name_len--; }
++    while (name_len && n[name_len - 1] == '\\') name_len--;
++    if (!(ret = heap_alloc( (len + name_len + 2) * sizeof(WCHAR) ))) return NULL;
++    lstrcpyW( ret, path );
++    if (len && name_len) ret[len++] = '\\';
++    memcpy( ret + len, n, name_len * sizeof(WCHAR) );
++    ret[len + name_len] = 0;
++    return ret;
++}
++
++/* "Software\Classes\path", the user's side of a path */
++static WCHAR *user_classes_path( const WCHAR *path )
++{
++    WCHAR *ret = heap_alloc( (lstrlenW( path ) + 18) * sizeof(WCHAR) );
++
++    if (!ret) return NULL;
++    lstrcpyW( ret, L"Software\\Classes" );
++    if (*path)
++    {
++        lstrcatW( ret, L"\\" );
++        lstrcatW( ret, path );
++    }
++    return ret;
++}
++
++static BOOL is_user_bound( HKEY hkey )
++{
++    struct classes_key *key;
++    BOOL ret = FALSE;
++
++    RtlEnterCriticalSection( &classes_cs );
++    if ((key = find_classes_key( hkey ))) ret = key->user_bound;
++    RtlLeaveCriticalSection( &classes_cs );
++    return ret;
++}
++
++static void open_classes_sides( const WCHAR *path, ACCESS_MASK access, HKEY *user, HKEY *machine );
++
++/* the sides of a key of the view; a handle opened on the user's key keeps it
++ * (deleted: *deleted and no sides) */
++static void open_view_sides( HKEY hkey, const WCHAR *path, ACCESS_MASK access, HKEY *user, HKEY *machine,
++                             BOOL *deleted )
++{
++    *deleted = FALSE;
++    open_classes_sides( path, access, user, machine );
++    if (!is_user_bound( hkey )) return;
++    if (*user) NtClose( *user );
++    *user = 0;
++    if (NtDuplicateObject( GetCurrentProcess(), hkey, GetCurrentProcess(), (HANDLE *)user, 0, 0,
++                           DUPLICATE_SAME_ACCESS )) *user = 0;
++    else
++    {
++        char buffer[64];
++        DWORD len;
++        if (NtQueryKey( *user, KeyBasicInformation, buffer, sizeof(buffer), &len ) == STATUS_KEY_DELETED)
++        {
++            NtClose( *user );
++            *user = 0;
++            if (*machine) NtClose( *machine );
++            *machine = 0;
++            *deleted = TRUE;
++        }
++    }
++}
++
++/* the user's and the machine's key of a path, either may be 0 */
++static void open_classes_sides( const WCHAR *path, ACCESS_MASK access, HKEY *user, HKEY *machine )
++{
++    UNICODE_STRING nameW;
++    WCHAR *user_path;
++    HKEY root;
++
++    *user = *machine = 0;
++    if ((root = get_special_root_hkey( HKEY_CURRENT_USER )) && (user_path = user_classes_path( path )))
++    {
++        RtlInitUnicodeString( &nameW, user_path );
++        if (open_key( user, root, &nameW, 0, access, FALSE )) *user = 0;
++        heap_free( user_path );
++    }
++    if ((root = get_special_root_hkey( HKEY_CLASSES_ROOT )))
++    {
++        RtlInitUnicodeString( &nameW, path );
++        if (open_key( machine, root, &nameW, 0, access, FALSE )) *machine = 0;
++    }
++}
++
++/* open (or create) a key of the merged view */
++static NTSTATUS open_classes_key( HKEY *retkey, const WCHAR *base, const UNICODE_STRING *name, DWORD options,
++                                  ACCESS_MASK access, BOOL create, const UNICODE_STRING *class, DWORD *dispos )
++{
++    UNICODE_STRING pathW, userW;
++    WCHAR *path, *user_path = NULL;
++    NTSTATUS status = STATUS_OBJECT_NAME_NOT_FOUND;
++    ACCESS_MASK user_access = access & ~(KEY_WOW64_64KEY | KEY_WOW64_32KEY);
++    BOOL user_bound = FALSE;
++    HKEY user_root, machine_root;
++
++    if (!(path = join_classes_path( base, name ))) return STATUS_NO_MEMORY;
++    RtlInitUnicodeString( &pathW, path );
++    user_root = get_special_root_hkey( HKEY_CURRENT_USER );
++    machine_root = get_special_root_hkey( HKEY_CLASSES_ROOT );
++
++    /* the user's key when it exists */
++    if (user_root && (user_path = user_classes_path( path )))
++    {
++        RtlInitUnicodeString( &userW, user_path );
++        status = open_key( retkey, user_root, &userW, options & REG_OPTION_OPEN_LINK, user_access, FALSE );
++        if (!status && dispos) *dispos = REG_OPENED_EXISTING_KEY;
++        if (!status) user_bound = TRUE;
++    }
++    if (status)
++    {
++        if (!machine_root) status = STATUS_INVALID_HANDLE;
++        else if (create)
++        {
++            status = create_key( retkey, machine_root, pathW, options, access, class, dispos );
++            if (status == STATUS_ACCESS_DENIED && user_path &&
++                !(status = create_key( retkey, user_root, userW, options, user_access, class, dispos )))
++                user_bound = TRUE;
++        }
++        else status = open_key( retkey, machine_root, &pathW, options, access, FALSE );
++    }
++
++    if (!status)
++    {
++        *retkey = (HKEY)((UINT_PTR)*retkey | 2);  /* Windows marks HKCR's keys so */
++        track_classes_key( *retkey, path, user_bound );
++    }
++    heap_free( user_path );
++    heap_free( path );
++    return status;
++}
++
++static int __cdecl compare_names( const void *a, const void *b )
++{
++    return wcsicmp( *(const WCHAR * const *)a, *(const WCHAR * const *)b );
++}
++
++static void add_subkey_names( HKEY key, WCHAR ***names, DWORD *count, DWORD *size )
++{
++    char buffer[1024];
++    KEY_BASIC_INFORMATION *info = (KEY_BASIC_INFORMATION *)buffer;
++    DWORD index, len;
++
++    for (index = 0; !NtEnumerateKey( key, index, KeyBasicInformation, buffer, sizeof(buffer), &len ); index++)
++    {
++        WCHAR *name;
++
++        if (*count == *size)
++        {
++            WCHAR **tmp;
++            DWORD new_size = max( 64, *size * 2 );
++
++            if (!(tmp = *names ? heap_realloc( *names, new_size * sizeof(*tmp) ) : heap_alloc( new_size * sizeof(*tmp) )))
++                return;
++            *names = tmp;
++            *size = new_size;
++        }
++        if (!(name = heap_alloc( info->NameLength + sizeof(WCHAR) ))) return;
++        memcpy( name, info->Name, info->NameLength );
++        name[info->NameLength / sizeof(WCHAR)] = 0;
++        (*names)[(*count)++] = name;
++    }
++}
++
++/* the merged subkeys of a key of the view, when both sides have the key;
++ * FALSE when one side's own enumeration is the answer */
++static BOOL get_classes_subkeys( HKEY hkey, BOOL refresh, WCHAR ***names, DWORD *count )
++{
++    struct classes_key *key;
++    WCHAR *path, **list = NULL;
++    DWORD n = 0, size = 0, i, j;
++    HKEY user, machine;
++    BOOL deleted;
++
++    if (!(path = get_classes_path( hkey ))) return FALSE;
++
++    RtlEnterCriticalSection( &classes_cs );
++    key = find_classes_key( hkey );
++    if (key && key->names && !refresh)
++    {
++        *names = key->names;
++        *count = key->count;
++        RtlLeaveCriticalSection( &classes_cs );
++        heap_free( path );
++        return TRUE;
++    }
++    RtlLeaveCriticalSection( &classes_cs );
++
++    open_view_sides( hkey, path, KEY_ENUMERATE_SUB_KEYS, &user, &machine, &deleted );
++    heap_free( path );
++    if (!user || !machine)
++    {
++        if (user) NtClose( user );
++        if (machine) NtClose( machine );
++        return FALSE;
++    }
++    add_subkey_names( user, &list, &n, &size );
++    add_subkey_names( machine, &list, &n, &size );
++    NtClose( user );
++    NtClose( machine );
++
++    /* sorted, each name once */
++    if (n) qsort( list, n, sizeof(*list), compare_names );
++    for (i = j = 0; i < n; i++)
++    {
++        if (j && !wcsicmp( list[j - 1], list[i] )) heap_free( list[i] );
++        else list[j++] = list[i];
++    }
++
++    RtlEnterCriticalSection( &classes_cs );
++    if ((key = find_classes_key( hkey )))
++    {
++        free_classes_names( key );
++        key->names = list;
++        key->count = j;
++        *names = list;
++        *count = j;
++        RtlLeaveCriticalSection( &classes_cs );
++        return TRUE;
++    }
++    RtlLeaveCriticalSection( &classes_cs );
++    for (i = 0; i < j; i++) heap_free( list[i] );
++    heap_free( list );
++    return FALSE;
++}
++
++/* RegEnumKeyEx on a key of the view whose subkeys are merged */
++static BOOL enum_classes_subkey( HKEY hkey, DWORD index, WCHAR *name, DWORD *name_len, FILETIME *ft,
++                                 LSTATUS *ret )
++{
++    WCHAR **names;
++    DWORD count, len;
++
++    if (!get_classes_subkeys( hkey, !index, &names, &count )) return FALSE;
++
++    RtlEnterCriticalSection( &classes_cs );
++    if (index >= count) *ret = ERROR_NO_MORE_ITEMS;
++    else if ((len = lstrlenW( names[index] )) >= *name_len) *ret = ERROR_MORE_DATA;
++    else
++    {
++        lstrcpyW( name, names[index] );
++        *name_len = len;
++        if (ft) memset( ft, 0, sizeof(*ft) );
++        *ret = ERROR_SUCCESS;
++    }
++    RtlLeaveCriticalSection( &classes_cs );
++    return TRUE;
++}
++
++
++static LSTATUS WINAPI query_value_ex_w( HKEY hkey, LPCWSTR name, LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD count );
++static LSTATUS WINAPI query_value_ex_a( HKEY hkey, LPCSTR name, LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD count );
++static LSTATUS WINAPI set_value_ex_w( HKEY hkey, LPCWSTR name, DWORD reserved, DWORD type, const BYTE *data, DWORD count );
++static LSTATUS WINAPI set_value_ex_a( HKEY hkey, LPCSTR name, DWORD reserved, DWORD type, const BYTE *data, DWORD count );
++static LSTATUS WINAPI delete_value_w( HKEY hkey, LPCWSTR name );
++static LSTATUS WINAPI delete_value_a( HKEY hkey, LPCSTR name );
++static LSTATUS WINAPI enum_value_w( HKEY hkey, DWORD index, LPWSTR value, LPDWORD val_count,
++                                    LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD count );
++static LSTATUS WINAPI enum_value_a( HKEY hkey, DWORD index, LPSTR value, LPDWORD val_count,
++                                    LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD count );
++
++static BOOL value_exists( HKEY key, const WCHAR *name )
++{
++    UNICODE_STRING nameW;
++    char buffer[64];
++    DWORD len;
++    NTSTATUS status;
++
++    RtlInitUnicodeString( &nameW, name );
++    status = NtQueryValueKey( key, &nameW, KeyValueBasicInformation, buffer, sizeof(buffer), &len );
++    return status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_NAME_INVALID;
++}
++
++/* The key a value operation on a key of the view acts on: the user's key when
++ * it exists and has the value, or when writing; else the machine's. Decided at
++ * each call, as a user key may appear after the view key was opened. *tmp is
++ * the handle to close afterwards (0: hkey itself). */
++static HKEY classes_value_key( HKEY hkey, const WCHAR *name, BOOL write, HKEY *tmp )
++{
++    HKEY user, machine;
++    WCHAR *path;
++    BOOL deleted;
++
++    *tmp = 0;
++    if (!(path = get_classes_path( hkey ))) return hkey;
++    open_view_sides( hkey, path, write ? KEY_QUERY_VALUE | KEY_SET_VALUE : KEY_QUERY_VALUE, &user, &machine, &deleted );
++    heap_free( path );
++    if (user && (write || !machine || value_exists( user, name ? name : L"" )))
++    {
++        if (machine) NtClose( machine );
++        return *tmp = user;
++    }
++    if (user) NtClose( user );
++    if (machine) return *tmp = machine;
++    return hkey;
++}
++
++static WCHAR *ansi_to_wide( const char *str )
++{
++    WCHAR *ret;
++    DWORD len;
++
++    if (!str) return NULL;
++    len = MultiByteToWideChar( CP_ACP, 0, str, -1, NULL, 0 );
++    if ((ret = heap_alloc( len * sizeof(WCHAR) ))) MultiByteToWideChar( CP_ACP, 0, str, -1, ret, len );
++    return ret;
++}
++
++static void add_value_names( HKEY key, WCHAR ***names, DWORD *count, DWORD *size, BOOL skip_known, DWORD known )
++{
++    char buffer[1024];
++    KEY_VALUE_BASIC_INFORMATION *info = (KEY_VALUE_BASIC_INFORMATION *)buffer;
++    DWORD index, len, i;
++
++    for (index = 0; !NtEnumerateValueKey( key, index, KeyValueBasicInformation, buffer, sizeof(buffer), &len ); index++)
++    {
++        WCHAR *name;
++
++        if (!(name = heap_alloc( info->NameLength + sizeof(WCHAR) ))) return;
++        memcpy( name, info->Name, info->NameLength );
++        name[info->NameLength / sizeof(WCHAR)] = 0;
++        if (skip_known)
++        {
++            for (i = 0; i < known; i++) if (!wcsicmp( (*names)[i], name )) break;
++            if (i < known) { heap_free( name ); continue; }
++        }
++        if (*count == *size)
++        {
++            DWORD new_size = max( 16, *size * 2 );
++            WCHAR **tmp = *names ? heap_realloc( *names, new_size * sizeof(*tmp) ) : heap_alloc( new_size * sizeof(*tmp) );
++            if (!tmp) { heap_free( name ); return; }
++            *names = tmp;
++            *size = new_size;
++        }
++        (*names)[(*count)++] = name;
++    }
++}
++
++/* RegEnumValue on a key of the view: the user's values, then the machine's
++ * the user's key does not have. Returns the side key to enumerate and the
++ * index there, or FALSE for the handle itself. */
++static BOOL classes_enum_value( HKEY hkey, DWORD index, HKEY *side, DWORD *side_index )
++{
++    WCHAR **names = NULL, *path;
++    DWORD n = 0, size = 0, users, i;
++    HKEY user, machine;
++    BOOL ret = TRUE, deleted;
++
++    if (!(path = get_classes_path( hkey ))) return FALSE;
++    open_view_sides( hkey, path, KEY_QUERY_VALUE, &user, &machine, &deleted );
++    heap_free( path );
++    if (deleted) return FALSE;   /* the handle itself answers: ERROR_KEY_DELETED */
++    if (!user || !machine)
++    {
++        *side = user ? user : machine;
++        *side_index = index;
++        return *side != 0;
++    }
++    add_value_names( user, &names, &n, &size, FALSE, 0 );
++    users = n;
++    add_value_names( machine, &names, &n, &size, TRUE, users );
++    if (index >= n) { *side = user; *side_index = users + index; }   /* ERROR_NO_MORE_ITEMS */
++    else if (index < users) { *side = user; *side_index = index; }
++    else
++    {
++        /* its index among the machine's values */
++        char buffer[1024];
++        KEY_VALUE_BASIC_INFORMATION *info = (KEY_VALUE_BASIC_INFORMATION *)buffer;
++        DWORD j, len;
++
++        *side = machine;
++        *side_index = ~0u;
++        for (j = 0; !NtEnumerateValueKey( machine, j, KeyValueBasicInformation, buffer, sizeof(buffer), &len ); j++)
++        {
++            if (info->NameLength / sizeof(WCHAR) == lstrlenW( names[index] ) &&
++                !wcsnicmp( info->Name, names[index], info->NameLength / sizeof(WCHAR) ))
++            {
++                *side_index = j;
++                break;
++            }
++        }
++    }
++    if (*side == user) NtClose( machine ); else NtClose( user );
++    for (i = 0; i < n; i++) heap_free( names[i] );
++    heap_free( names );
++    return ret;
++}
++
++/* the merged value count of a key of the view, when both sides have it */
++static BOOL classes_value_count( HKEY hkey, DWORD *count )
++{
++    WCHAR **names = NULL, *path;
++    DWORD n = 0, size = 0, users, i;
++    HKEY user, machine;
++    BOOL deleted;
++
++    if (!(path = get_classes_path( hkey ))) return FALSE;
++    open_view_sides( hkey, path, KEY_QUERY_VALUE, &user, &machine, &deleted );
++    heap_free( path );
++    if (!user || !machine)
++    {
++        if (user) NtClose( user );
++        if (machine) NtClose( machine );
++        return FALSE;
++    }
++    add_value_names( user, &names, &n, &size, FALSE, 0 );
++    users = n;
++    add_value_names( machine, &names, &n, &size, TRUE, users );
++    NtClose( user );
++    NtClose( machine );
++    *count = n;
++    for (i = 0; i < n; i++) heap_free( names[i] );
++    heap_free( names );
++    return TRUE;
++}
++
+ /******************************************************************************
+  * RegCreateKeyExW   (kernelbase.@)
+  *
+@@ -592,13 +1117,22 @@
+ {
+     UNICODE_STRING nameW, classW;
+ 
++    WCHAR *path;
++
+     if (!retkey) return ERROR_BADKEY;
+     if (reserved) return ERROR_INVALID_PARAMETER;
+-    if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
+ 
+     RtlInitUnicodeString( &nameW, name );
+     RtlInitUnicodeString( &classW, class );
+ 
++    if ((path = get_classes_path( hkey )))
++    {
++        NTSTATUS status = open_classes_key( retkey, path, &nameW, options, access, TRUE, &classW, dispos );
++        heap_free( path );
++        return RtlNtStatusToDosError( status );
++    }
++    if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
++
+     return RtlNtStatusToDosError( create_key( retkey, hkey, nameW, options, access, &classW, dispos ) );
+ }
+ 
+@@ -641,19 +1175,27 @@
+         access = MAXIMUM_ALLOWED;  /* Win95 ignores the access mask */
+         if (name && *name == '\\') name++; /* win9x,ME ignores one (and only one) beginning backslash */
+     }
+-    if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
++    {
++        WCHAR *path = get_classes_path( hkey );
++        if (!path && !(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
+ 
+-    RtlInitAnsiString( &nameA, name );
+-    RtlInitAnsiString( &classA, class );
++        RtlInitAnsiString( &nameA, name );
++        RtlInitAnsiString( &classA, class );
+ 
+-    if (!(status = RtlAnsiStringToUnicodeString( &NtCurrentTeb()->StaticUnicodeString,
+-                                                 &nameA, FALSE )))
+-    {
+-        if (!(status = RtlAnsiStringToUnicodeString( &classW, &classA, TRUE )))
++        if (!(status = RtlAnsiStringToUnicodeString( &NtCurrentTeb()->StaticUnicodeString,
++                                                     &nameA, FALSE )))
+         {
+-            status = create_key( retkey, hkey, NtCurrentTeb()->StaticUnicodeString, options, access, &classW, dispos );
+-            RtlFreeUnicodeString( &classW );
++            if (!(status = RtlAnsiStringToUnicodeString( &classW, &classA, TRUE )))
++            {
++                if (path)
++                    status = open_classes_key( retkey, path, &NtCurrentTeb()->StaticUnicodeString, options, access,
++                                               TRUE, &classW, dispos );
++                else
++                    status = create_key( retkey, hkey, NtCurrentTeb()->StaticUnicodeString, options, access, &classW, dispos );
++                RtlFreeUnicodeString( &classW );
++            }
+         }
++        heap_free( path );
+     }
+     return RtlNtStatusToDosError( status );
+ }
+@@ -681,9 +1223,19 @@
+ 
+     if (!retkey) return ERROR_INVALID_PARAMETER;
+     *retkey = NULL;
+-    if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
+ 
+     RtlInitUnicodeString( &nameW, name );
++    {
++        WCHAR *path = get_classes_path( hkey );
++        if (path)
++        {
++            NTSTATUS status = open_classes_key( retkey, path, &nameW, options, access, FALSE, NULL, NULL );
++            heap_free( path );
++            return RtlNtStatusToDosError( status );
++        }
++    }
++    if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
++
+     return RtlNtStatusToDosError( open_key( retkey, hkey, &nameW, options, access, FALSE ) );
+ }
+ 
+@@ -728,14 +1280,19 @@
+         if (HandleToUlong(hkey) == HandleToUlong(HKEY_CLASSES_ROOT) && name && *name == '\\') name++;
+     }
+ 
+-    if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
+-
+-    RtlInitAnsiString( &nameA, name );
+-    if (!(status = RtlAnsiStringToUnicodeString( &NtCurrentTeb()->StaticUnicodeString,
+-                                                 &nameA, FALSE )))
+     {
+-        UNICODE_STRING nameW = NtCurrentTeb()->StaticUnicodeString;
+-        status = open_key( retkey, hkey, &nameW, options, access, FALSE );
++        WCHAR *path = get_classes_path( hkey );
++        if (!path && !(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
++
++        RtlInitAnsiString( &nameA, name );
++        if (!(status = RtlAnsiStringToUnicodeString( &NtCurrentTeb()->StaticUnicodeString,
++                                                     &nameA, FALSE )))
++        {
++            UNICODE_STRING nameW = NtCurrentTeb()->StaticUnicodeString;
++            if (path) status = open_classes_key( retkey, path, &nameW, options, access, FALSE, NULL, NULL );
++            else status = open_key( retkey, hkey, &nameW, options, access, FALSE );
++        }
++        heap_free( path );
+     }
+     return RtlNtStatusToDosError( status );
+ }
+@@ -833,6 +1390,12 @@
+            name_len ? *name_len : 0, reserved, class, class_len, ft );
+ 
+     if (reserved) return ERROR_INVALID_PARAMETER;
++    {
++        LSTATUS ret;
++        if (!class && !class_len && name && name_len &&
++            enum_classes_subkey( hkey, index, name, name_len, ft, &ret ))
++            return ret;
++    }
+     if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
+ 
+     status = NtEnumerateKey( hkey, index, KeyNodeInformation,
+@@ -897,6 +1460,23 @@
+            name_len ? *name_len : 0, reserved, class, class_len, ft );
+ 
+     if (reserved) return ERROR_INVALID_PARAMETER;
++    if (!class && !class_len && name && name_len)
++    {
++        WCHAR nameW[MAX_PATH];
++        DWORD lenW = ARRAY_SIZE(nameW), len;
++        LSTATUS ret;
++
++        if (enum_classes_subkey( hkey, index, nameW, &lenW, ft, &ret ))
++        {
++            if (ret) return ret;
++            RtlUnicodeToMultiByteSize( &len, nameW, lenW * sizeof(WCHAR) );
++            if (len >= *name_len) return ERROR_MORE_DATA;
++            RtlUnicodeToMultiByteN( name, len, NULL, nameW, lenW * sizeof(WCHAR) );
++            name[len] = 0;
++            *name_len = len;
++            return ERROR_SUCCESS;
++        }
++    }
+     if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
+ 
+     status = NtEnumerateKey( hkey, index, KeyNodeInformation,
+@@ -987,10 +1567,25 @@
+     KEY_FULL_INFORMATION *info = (KEY_FULL_INFORMATION *)buffer;
+     DWORD total_size;
+ 
++    WCHAR **merged;
++    DWORD merged_count = 0, merged_max = 0;
++    BOOL is_merged = FALSE;
++    HKEY hkey_view = hkey;
++
+     TRACE( "(%p,%p,%ld,%p,%p,%p,%p,%p,%p,%p,%p)\n", hkey, class, class_len ? *class_len : 0,
+            reserved, subkeys, max_subkey, values, max_value, max_data, security, modif );
+ 
+     if (class && !class_len && is_version_nt()) return ERROR_INVALID_PARAMETER;
++    if ((subkeys || max_subkey) && get_classes_subkeys( hkey, TRUE, &merged, &merged_count ))
++    {
++        DWORD i, len;
++
++        RtlEnterCriticalSection( &classes_cs );
++        for (i = 0; i < merged_count; i++)
++            if ((len = lstrlenW( merged[i] )) > merged_max) merged_max = len;
++        RtlLeaveCriticalSection( &classes_cs );
++        is_merged = TRUE;
++    }
+     if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
+ 
+     status = NtQueryKey( hkey, KeyFullInformation, buffer, sizeof(buffer), &total_size );
+@@ -1023,10 +1618,10 @@
+     else status = STATUS_SUCCESS;
+ 
+     if (class_len) *class_len = info->ClassLength / sizeof(WCHAR);
+-    if (subkeys) *subkeys = info->SubKeys;
+-    if (max_subkey) *max_subkey = info->MaxNameLen / sizeof(WCHAR);
++    if (subkeys) *subkeys = is_merged ? merged_count : info->SubKeys;
++    if (max_subkey) *max_subkey = is_merged ? merged_max : info->MaxNameLen / sizeof(WCHAR);
+     if (max_class) *max_class = info->MaxClassLen / sizeof(WCHAR);
+-    if (values) *values = info->Values;
++    if (values && !classes_value_count( hkey_view, values )) *values = info->Values;
+     if (max_value) *max_value = info->MaxValueNameLen / sizeof(WCHAR);
+     if (max_data) *max_data = info->MaxValueDataLen;
+     if (modif) *modif = *(FILETIME *)&info->LastWriteTime;
+@@ -1077,10 +1672,25 @@
+     KEY_FULL_INFORMATION *info = (KEY_FULL_INFORMATION *)buffer;
+     DWORD total_size;
+ 
++    WCHAR **merged;
++    DWORD merged_count = 0, merged_max = 0;
++    BOOL is_merged = FALSE;
++    HKEY hkey_view = hkey;
++
+     TRACE( "(%p,%p,%ld,%p,%p,%p,%p,%p,%p,%p,%p)\n", hkey, class, class_len ? *class_len : 0,
+            reserved, subkeys, max_subkey, values, max_value, max_data, security, modif );
+ 
+     if (class && !class_len && is_version_nt()) return ERROR_INVALID_PARAMETER;
++    if ((subkeys || max_subkey) && get_classes_subkeys( hkey, TRUE, &merged, &merged_count ))
++    {
++        DWORD i, len;
++
++        RtlEnterCriticalSection( &classes_cs );
++        for (i = 0; i < merged_count; i++)
++            if ((len = lstrlenW( merged[i] )) > merged_max) merged_max = len;
++        RtlLeaveCriticalSection( &classes_cs );
++        is_merged = TRUE;
++    }
+     if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
+ 
+     status = NtQueryKey( hkey, KeyFullInformation, buffer, sizeof(buffer), &total_size );
+@@ -1118,10 +1728,10 @@
+     }
+     else status = STATUS_SUCCESS;
+ 
+-    if (subkeys) *subkeys = info->SubKeys;
+-    if (max_subkey) *max_subkey = info->MaxNameLen / sizeof(WCHAR);
++    if (subkeys) *subkeys = is_merged ? merged_count : info->SubKeys;
++    if (max_subkey) *max_subkey = is_merged ? merged_max : info->MaxNameLen / sizeof(WCHAR);
+     if (max_class) *max_class = info->MaxClassLen / sizeof(WCHAR);
+-    if (values) *values = info->Values;
++    if (values && !classes_value_count( hkey_view, values )) *values = info->Values;
+     if (max_value) *max_value = info->MaxValueNameLen / sizeof(WCHAR);
+     if (max_data) *max_data = info->MaxValueDataLen;
+     if (modif) *modif = *(FILETIME *)&info->LastWriteTime;
+@@ -1153,6 +1763,7 @@
+ {
+     if (!hkey) return ERROR_INVALID_HANDLE;
+     if (hkey >= (HKEY)0x80000000) return ERROR_SUCCESS;
++    untrack_classes_key( hkey );
+     return RtlNtStatusToDosError( NtClose( hkey ) );
+ }
+ 
+@@ -1229,7 +1840,7 @@
+  *  Success: ERROR_SUCCESS
+  *  Failure: Error code
+  */
+-LSTATUS WINAPI DECLSPEC_HOTPATCH RegSetValueExW( HKEY hkey, LPCWSTR name, DWORD reserved,
++static LSTATUS WINAPI set_value_ex_w( HKEY hkey, LPCWSTR name, DWORD reserved,
+                                                  DWORD type, const BYTE *data, DWORD count )
+ {
+     UNICODE_STRING nameW;
+@@ -1261,7 +1872,7 @@
+  *  win95 does not care about count for REG_SZ and finds out the len by itself (js)
+  *  NT does definitely care (aj)
+  */
+-LSTATUS WINAPI DECLSPEC_HOTPATCH RegSetValueExA( HKEY hkey, LPCSTR name, DWORD reserved, DWORD type,
++static LSTATUS WINAPI set_value_ex_a( HKEY hkey, LPCSTR name, DWORD reserved, DWORD type,
+                                                  const BYTE *data, DWORD count )
+ {
+     ANSI_STRING nameA;
+@@ -1656,7 +2267,7 @@
+  *
+  * See RegQueryValueExA.
+  */
+-LSTATUS WINAPI DECLSPEC_HOTPATCH RegQueryValueExW( HKEY hkey, LPCWSTR name, LPDWORD reserved, LPDWORD type,
++static LSTATUS WINAPI query_value_ex_w( HKEY hkey, LPCWSTR name, LPDWORD reserved, LPDWORD type,
+                                                    LPBYTE data, LPDWORD count )
+ {
+     NTSTATUS status;
+@@ -1750,7 +2361,7 @@
+  *   MSDN states that if data is too small it is partially filled. In reality
+  *   it remains untouched.
+  */
+-LSTATUS WINAPI DECLSPEC_HOTPATCH RegQueryValueExA( HKEY hkey, LPCSTR name, LPDWORD reserved,
++static LSTATUS WINAPI query_value_ex_a( HKEY hkey, LPCSTR name, LPDWORD reserved,
+                                                    LPDWORD type, LPBYTE data, LPDWORD count )
+ {
+     NTSTATUS status;
+@@ -2164,7 +2775,7 @@
+  *  Success: ERROR_SUCCESS
+  *  Failure: nonzero error code from Winerror.h
+  */
+-LSTATUS WINAPI RegEnumValueW( HKEY hkey, DWORD index, LPWSTR value, LPDWORD val_count,
++static LSTATUS WINAPI enum_value_w( HKEY hkey, DWORD index, LPWSTR value, LPDWORD val_count,
+                               LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD count )
+ {
+     NTSTATUS status;
+@@ -2241,7 +2852,7 @@
+  *
+  * See RegEnumValueW.
+  */
+-LSTATUS WINAPI RegEnumValueA( HKEY hkey, DWORD index, LPSTR value, LPDWORD val_count,
++static LSTATUS WINAPI enum_value_a( HKEY hkey, DWORD index, LPSTR value, LPDWORD val_count,
+                               LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD count )
+ {
+     NTSTATUS status;
+@@ -2341,7 +2952,7 @@
+  *
+  * See RegDeleteValueA.
+  */
+-LSTATUS WINAPI RegDeleteValueW( HKEY hkey, LPCWSTR name )
++static LSTATUS WINAPI delete_value_w( HKEY hkey, LPCWSTR name )
+ {
+     return RegDeleteKeyValueW( hkey, NULL, name );
+ }
+@@ -2359,7 +2970,7 @@
+  *  Success: ERROR_SUCCESS
+  *  Failure: nonzero error code from Winerror.h
+  */
+-LSTATUS WINAPI RegDeleteValueA( HKEY hkey, LPCSTR name )
++static LSTATUS WINAPI delete_value_a( HKEY hkey, LPCSTR name )
+ {
+     return RegDeleteKeyValueA( hkey, NULL, name );
+ }
+@@ -4176,3 +4787,138 @@
+ 
+     return ret;
+ }
++
++
++/******************************************************************************
++ * RegQueryValueExW   (kernelbase.@)
++ */
++LSTATUS WINAPI DECLSPEC_HOTPATCH RegQueryValueExW( HKEY hkey, LPCWSTR name, LPDWORD reserved, LPDWORD type,
++                                                   LPBYTE data, LPDWORD count )
++{
++    HKEY tmp, key = classes_value_key( hkey, name, FALSE, &tmp );
++    LSTATUS ret = query_value_ex_w( key, name, reserved, type, data, count );
++    if (tmp) NtClose( tmp );
++    return ret;
++}
++
++/******************************************************************************
++ * RegQueryValueExA   (kernelbase.@)
++ */
++LSTATUS WINAPI DECLSPEC_HOTPATCH RegQueryValueExA( HKEY hkey, LPCSTR name, LPDWORD reserved, LPDWORD type,
++                                                   LPBYTE data, LPDWORD count )
++{
++    WCHAR *nameW = ansi_to_wide( name );
++    HKEY tmp, key = classes_value_key( hkey, nameW, FALSE, &tmp );
++    LSTATUS ret = query_value_ex_a( key, name, reserved, type, data, count );
++    if (tmp) NtClose( tmp );
++    heap_free( nameW );
++    return ret;
++}
++
++/******************************************************************************
++ * RegSetValueExW   (kernelbase.@)
++ */
++LSTATUS WINAPI DECLSPEC_HOTPATCH RegSetValueExW( HKEY hkey, LPCWSTR name, DWORD reserved, DWORD type,
++                                                 const BYTE *data, DWORD count )
++{
++    HKEY tmp, key = classes_value_key( hkey, name, TRUE, &tmp );
++    LSTATUS ret = set_value_ex_w( key, name, reserved, type, data, count );
++    if (tmp) NtClose( tmp );
++    return ret;
++}
++
++/******************************************************************************
++ * RegSetValueExA   (kernelbase.@)
++ */
++LSTATUS WINAPI DECLSPEC_HOTPATCH RegSetValueExA( HKEY hkey, LPCSTR name, DWORD reserved, DWORD type,
++                                                 const BYTE *data, DWORD count )
++{
++    WCHAR *nameW = ansi_to_wide( name );
++    HKEY tmp, key = classes_value_key( hkey, nameW, TRUE, &tmp );
++    LSTATUS ret = set_value_ex_a( key, name, reserved, type, data, count );
++    if (tmp) NtClose( tmp );
++    heap_free( nameW );
++    return ret;
++}
++
++/******************************************************************************
++ * RegDeleteValueW   (kernelbase.@)
++ */
++LSTATUS WINAPI RegDeleteValueW( HKEY hkey, LPCWSTR name )
++{
++    HKEY tmp, key = classes_value_key( hkey, name, FALSE, &tmp );
++    LSTATUS ret;
++
++    /* the side that has it, opened for writing */
++    if (tmp)
++    {
++        HKEY writable;
++        UNICODE_STRING empty = { 0 };
++        if (!open_key( &writable, tmp, &empty, 0, KEY_SET_VALUE, FALSE ))
++        {
++            NtClose( tmp );
++            tmp = key = writable;
++        }
++    }
++    ret = delete_value_w( key, name );
++    if (tmp) NtClose( tmp );
++    return ret;
++}
++
++/******************************************************************************
++ * RegDeleteValueA   (kernelbase.@)
++ */
++LSTATUS WINAPI RegDeleteValueA( HKEY hkey, LPCSTR name )
++{
++    WCHAR *nameW = ansi_to_wide( name );
++    LSTATUS ret;
++
++    WCHAR *path = get_classes_path( hkey );
++
++    if (path && (nameW || !name))
++    {
++        heap_free( path );
++        ret = RegDeleteValueW( hkey, nameW );
++        heap_free( nameW );
++        return ret;
++    }
++    heap_free( path );
++    heap_free( nameW );
++    return delete_value_a( hkey, name );
++}
++
++/******************************************************************************
++ * RegEnumValueW   (kernelbase.@)
++ */
++LSTATUS WINAPI RegEnumValueW( HKEY hkey, DWORD index, LPWSTR value, LPDWORD val_count,
++                              LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD count )
++{
++    HKEY side;
++    DWORD side_index;
++    LSTATUS ret;
++
++    if (!classes_enum_value( hkey, index, &side, &side_index ))
++        return enum_value_w( hkey, index, value, val_count, reserved, type, data, count );
++    ret = side_index == ~0u ? ERROR_NO_MORE_ITEMS
++                            : enum_value_w( side, side_index, value, val_count, reserved, type, data, count );
++    NtClose( side );
++    return ret;
++}
++
++/******************************************************************************
++ * RegEnumValueA   (kernelbase.@)
++ */
++LSTATUS WINAPI RegEnumValueA( HKEY hkey, DWORD index, LPSTR value, LPDWORD val_count,
++                              LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD count )
++{
++    HKEY side;
++    DWORD side_index;
++    LSTATUS ret;
++
++    if (!classes_enum_value( hkey, index, &side, &side_index ))
++        return enum_value_a( hkey, index, value, val_count, reserved, type, data, count );
++    ret = side_index == ~0u ? ERROR_NO_MORE_ITEMS
++                            : enum_value_a( side, side_index, value, val_count, reserved, type, data, count );
++    NtClose( side );
++    return ret;
++}
+--- a/dlls/advapi32/tests/registry.c
++++ b/dlls/advapi32/tests/registry.c
+@@ -3406,7 +3406,7 @@
+     /* try to open that key in hkcr */
+     res = RegOpenKeyExA( HKEY_CLASSES_ROOT, "WineTestCls", 0,
+                          KEY_QUERY_VALUE|KEY_SET_VALUE, &hkcr );
+-    todo_wine ok(res == ERROR_SUCCESS ||
++    ok(res == ERROR_SUCCESS ||
+                  broken(res == ERROR_FILE_NOT_FOUND /* WinNT */),
+                  "test key not found in hkcr: %ld\n", res);
+     if (res)
+@@ -3417,7 +3417,7 @@
+         return;
+     }
+ 
+-    todo_wine ok(IS_HKCR(hkcr), "hkcr mask not set in %p\n", hkcr);
++    ok(IS_HKCR(hkcr), "hkcr mask not set in %p\n", hkcr);
+ 
+     /* set a value in user's classes */
+     res = RegSetValueExA(hkey, "val1", 0, REG_SZ, (const BYTE *)"user", sizeof("user"));
+@@ -3702,7 +3702,7 @@
+     }
+ 
+     res = RegOpenKeyA( HKEY_CLASSES_ROOT, "WineTestCls", &hkcr );
+-    todo_wine ok(res == ERROR_SUCCESS ||
++    ok(res == ERROR_SUCCESS ||
+                  broken(res == ERROR_FILE_NOT_FOUND /* WinNT */),
+                  "test key not found in hkcr: %ld\n", res);
+     if (res)
+@@ -3863,7 +3863,7 @@
+ 
+     res = RegOpenKeyA( HKEY_CLASSES_ROOT, "CLSID", &hkey );
+     ok(res == ERROR_SUCCESS, "RegOpenKeyA failed: %ld\n", res);
+-    todo_wine ok(IS_HKCR(hkey) || broken(!IS_HKCR(hkey)) /* WinNT */,
++    ok(IS_HKCR(hkey) || broken(!IS_HKCR(hkey)) /* WinNT */,
+                  "hkcr mask not set in %p\n", hkey);
+     RegCloseKey( hkey );
+ 

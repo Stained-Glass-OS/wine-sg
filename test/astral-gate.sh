@@ -41,5 +41,8 @@ expect "fallback_same=1" "the same glyph as from that font"
 expect "path=1" "a path gets the character's outline"
 expect "uniscribe=1" "Uniscribe's ScriptStringOut (edit controls) falls back too"
 expect "ggo_highword=1" "GetGlyphOutlineW still ignores the high word, as on Windows"
+if fc-list 2>/dev/null | grep -q 'HanaMinB'; then
+    expect "cjkb_fallback=1" "CJK Extension B (U+20000) falls back to HanaMinB (fonts-hanazono, 0220)"
+else echo "info  HanaMinB not installed (fonts-hanazono): CJK Extension B not checked"; fi
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

@@ -248,6 +248,15 @@ test-winver:
 test-dwlogfont:
 	WINE=$(PREFIX)/bin/wine test/dwlogfont-gate.sh
 
+# HKEY_CLASSES_ROOT is the merged view; the user's choices (0178, 0179).
+# A shared prefix with a second Unix user (SG_OTHER, default sgconf) when there is one.
+test-hkcr:
+	WINE=$(PREFIX)/bin/wine test/hkcr-gate.sh
+
+# The time zone and the clock through sg-admind (0221; SG_ADMIND= sg-shell's).
+test-tzset:
+	WINE=$(PREFIX)/bin/wine test/tzset-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 
