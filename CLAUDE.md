@@ -2976,6 +2976,45 @@ auto-hide (`ABM_SETSTATE` added to shellapi.h).
 SHAppBarMessage, its buttons and pixels for each option, auto-hide by the
 pointer, ABM_SETSTATE). 10.0-16 (no 0164) fails 21.
 
+## Next: Zoom and Teams at start (reserved `0385`-`0389`, not landed)
+
+Root causes found in the communication compat round; fixes drafted, **not
+built or gated** (the round stopped). The drafts are in
+`/var/tmp/sgcomm/b-drafts/` (`0385-0386-draft.diff` against the patched
+tree, `meetings-gate.sh`, `meetings-probe.c`, the `test-meetings` Makefile
+target). Scratch trees can go, but copy the drafts somewhere safe before
+`/var/tmp` is cleaned.
+
+- **Zoom 7.2.1 (MSI) dies at start with 0x80000100 (`EXCEPTION_WINE_STUB`):**
+  `Zoom.exe` calls `kernel32.SetThreadpoolTimerEx`, which is only a
+  commented-out stub in kernelbase and missing from kernel32.
+  `SetThreadpoolWaitEx` is missing in the same way. Draft **0385**:
+  `TpSetTimerEx`/`TpSetWaitEx` in `dlls/ntdll/threadpool.c` (they return
+  whether a timer or wait was pending, read under the queue lock, then call
+  `TpSetTimer`/`TpSetWait`), forwarded from kernelbase and kernel32, with
+  headers (`winternl.h`, `threadpoolapiset.h`). What Zoom hits next is not
+  known.
+- **Teams (new, MSIX) exits 3:** at start it asks for
+  `Windows.ApplicationModel.LimitedAccessFeatures`
+  (`ILimitedAccessFeaturesStatics` {8be612d4-302b-5fbf-a632-1a99e43e8925}),
+  and the class is not registered. Draft **0386**:
+  `dlls/windows.applicationmodel/limited_access.c`, whose `TryUnlockFeature`
+  returns a `LimitedAccessFeatureRequestResult`
+  ({d45156a6-1e24-5ddd-abb4-6188aba4d5bf}) with the requested feature id and
+  `Status` = `Unavailable`, plus the IDL in
+  `include/windows.applicationmodel.idl` (IIDs from MIT windows-rs). Next
+  after that is expected to be WebView2 (the Evergreen runtime
+  154.0.4258.37 installs silently into a prefix; see 0190-0191).
+  `limited_access.c` is added to `Makefile.in`, so **re-run configure** in a
+  dev tree before building it.
+- **Gate draft (`make test-meetings`):** stock wine-sg 10.0-16 fails all 9
+  real checks (the exports, pending/fires semantics, LimitedAccessFeatures
+  activation, feature id, unavailable). It has not been run against a build
+  or mutation-tested.
+- **Skype** can no longer be downloaded (the download links redirect to
+  skype.com and Teams free); nothing to test.
+- **Screen sharing** in Zoom/Teams was not reached.
+
 ## Trademark: the text our patches add never calls us Windows
 
 "Windows" is Microsoft's trademark. `make lint` (a CI step) runs
