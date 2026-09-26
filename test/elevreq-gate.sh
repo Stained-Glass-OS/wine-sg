@@ -88,6 +88,14 @@ out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
     || fail "requireAdministrator CreateProcess: '$out'"
 out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/invoker.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "an asInvoker program runs" || fail "asInvoker: '$out'"
+# Its compatibility settings (the Compatibility tab: AppCompatFlags\Layers,
+# wine-sg 0420) say "run as an administrator": the same as requireAdministrator.
+cp "$W/invoker.exe" "$W/layered.exe"; chmod 755 "$W/layered.exe"
+other "$WINE" reg add 'HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers' \
+    /v "$(zp "$W/layered.exe")" /d '~ RUNASADMIN' /f >/dev/null
+out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/layered.exe")")
+[ "$out" = "CREATE err 740" ] && pass "a program whose compatibility settings say run as an administrator: ERROR_ELEVATION_REQUIRED" \
+    || fail "Layers RUNASADMIN: '$out'"
 out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/highest.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "a highestAvailable program runs as the invoker" || fail "highestAvailable: '$out'"
 rm -f "$W/out/elevate.log"

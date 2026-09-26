@@ -297,6 +297,12 @@ test-objowner:
 test-symlink:
 	WINE=$(PREFIX)/bin/wine test/symlink-gate.sh
 
+# A program's compatibility settings apply when it starts (0420): the
+# Environment, LaunchArgs and Version the Compatibility tab stores. RUNASADMIN
+# is in test-elevreq (it needs a user who is not elevated).
+test-appcompat:
+	WINE=$(PREFIX)/bin/wine test/appcompat-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
