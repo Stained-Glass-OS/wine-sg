@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0241: ExitWindowsEx shuts down and restarts the PC.
 #
 # Wine's ExitWindowsEx only ran wineboot --end-session: Start's Shut down and

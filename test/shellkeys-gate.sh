@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The Windows key's shortcuts (patches/sg/0071), typed on the X keyboard.
 #
 # Win+Left/Right snap the active window to half the work area and back,

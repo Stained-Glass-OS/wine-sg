@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/scratch-home.sh"
 # The wine-sg gate.
 #
 # Proves the one thing this repo exists to deliver: a single amd64 Wine that

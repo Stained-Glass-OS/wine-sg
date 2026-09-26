@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Objects created without a security descriptor have an owner and a group
 # (patches/sg/0082).
 #

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # WinSta0\Default is the user's desktop (patches/sg/0080).
 #
 # In a session, programs run on the shell's desktop ("shell"). A program that

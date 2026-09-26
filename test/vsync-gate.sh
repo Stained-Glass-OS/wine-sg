@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # DwmFlush waits for the next vertical blank (patches/sg/0170), and so does
 # IDXGIOutput::WaitForVBlank (0173).
 #

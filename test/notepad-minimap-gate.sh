@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Notepad's minimap (patches/sg/0100): a strip right of the text showing the
 # whole document in miniature, the lines on screen shaded; a click centres
 # the editor on the line under it, dragging keeps following. Under Xvfb, with

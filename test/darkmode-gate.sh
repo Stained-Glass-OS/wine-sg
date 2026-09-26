@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Dark mode (patches/sg/0160-0162), live, in a shell session, by pixels.
 #
 # Two programs' windows are open -- "Plain", and "Dark", which asked for a dark

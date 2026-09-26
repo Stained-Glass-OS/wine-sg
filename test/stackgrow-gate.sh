@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # A stack a program manages itself grows read-write (patches/sg/0081).
 #
 # The Cygwin/MSYS runtime (Git Bash's mintty) runs on stacks it reserves

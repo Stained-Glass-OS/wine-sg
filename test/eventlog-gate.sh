@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0143-0145: a real event log.
 #
 # The Event Log service (wevtsvc) owns the logs; advapi32 is its client. On a

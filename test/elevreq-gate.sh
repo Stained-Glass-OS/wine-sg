@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0259: a program whose manifest says requireAdministrator
 # asks for consent instead of failing.
 #

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # File Explorer (patches/sg/0110-0112), driven like a person on X, in a shell session.
 #
 # Win+E's File Explorer opens on This PC (folders, and drives with capacity

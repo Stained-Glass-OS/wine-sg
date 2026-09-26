@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # DWM cloaking (patches/sg/0067), the primitive virtual desktops are built on.
 #
 # A program cloaks its own window with DwmSetWindowAttribute(DWMWA_CLOAK), as

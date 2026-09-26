@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Desktop wallpaper (patches/sg/0069): any picture format, Windows' styles.
 #
 # A PNG and a JPEG made here, red/green/blue/yellow quadrants, 2:1, on an

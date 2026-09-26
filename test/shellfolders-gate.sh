@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # A standard user's shell folders (patches/sg/0070).
 #
 # On the shared system prefix only administrators may write HKLM. shell32

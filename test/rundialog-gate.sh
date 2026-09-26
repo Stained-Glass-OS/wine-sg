@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The Run dialog (Win+R, shell32's RunFileDlg; patch 0266), in a shell session.
 #
 # Win+R typed on the X keyboard opens it; what is typed next goes into its box

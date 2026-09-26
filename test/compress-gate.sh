@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The Compression API in cabinet.dll (patches/sg/0036): MSZIP buffers as
 # Windows writes them decode byte for byte, and ours round-trip.
 #

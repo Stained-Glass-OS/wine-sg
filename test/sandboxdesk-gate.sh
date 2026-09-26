@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0247 and 0248: a sandboxed program's own desktop comes up,
 # and a restricted token may read HKLM (0248).
 #

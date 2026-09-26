@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # fontview.exe, the Fonts folder, per-user fonts and shell: URLs (patches/sg/0183).
 #
 # Windows has fontview.exe in system32 and opens font files with it; the

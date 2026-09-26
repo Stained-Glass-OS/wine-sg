@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # ipconfig and netsh on sg-netctl (patches/sg/0078-0079).
 #
 # 0078: a native program gets the files it is given as stdin, stdout and

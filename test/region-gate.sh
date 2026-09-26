@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The user's regional format is their choice (patches/sg/0168).
 #
 # Wine took the user's locale from the Unix locale the process started with

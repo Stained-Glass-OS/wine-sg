@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The system32 names that hand off to App Paths (patches/sg/0120-0124).
 #
 # calc.exe, charmap.exe, mspaint.exe and snippingtool.exe are system32 programs on Windows,

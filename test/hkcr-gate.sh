@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # HKEY_CLASSES_ROOT is HKCU\Software\Classes over HKLM\Software\Classes, and
 # the shell honours the user's choices (patches/sg/0178).
 #

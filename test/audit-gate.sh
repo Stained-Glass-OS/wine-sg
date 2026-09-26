@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0187: audit events from the Linux side reach the Security
 # log. sg-session's PAM hook and elevation broker write each event as a file
 # into the audit spool (HKLM\...\EventLog\Security AuditSpool, a Unix

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Firefox starts, shows a local page and shuts down (patches/sg/0170).
 #
 # Installs the compatibility suite's pinned Firefox (test/compat/apps.list;
@@ -17,7 +18,7 @@ WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 [ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
-CACHE="${CACHE:-$HOME/.cache/sg-compat}"
+CACHE="${CACHE:-${SG_REAL_HOME:-$HOME}/.cache/sg-compat}"
 RC=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }

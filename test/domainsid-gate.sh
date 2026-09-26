@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0205: a domain account's real SID.
 #
 # On a shared (system) prefix -- this user owns it and is SYSTEM there; the

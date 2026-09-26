@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Characters beyond the BMP (emoji) in GDI text (patches/sg/0171).
 #
 # A surrogate pair drew as two missing-glyph boxes, even in a font that has

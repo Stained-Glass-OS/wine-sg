@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0243: a standard user's time zone and locale lookups work in
 # a shared (system) prefix.
 #

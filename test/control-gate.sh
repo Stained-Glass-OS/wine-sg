@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # control.exe follows App Paths (patches/sg/0072).
 #
 # A program that runs system32\control.exe itself -- not through

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Notepad's dark menu bar and its Page Setup header and footer (patches/sg/0100
 # and 0188), in a shell session under Xvfb.
 #

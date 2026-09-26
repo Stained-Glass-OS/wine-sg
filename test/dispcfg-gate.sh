@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0242: a standard user's programs read the display
 # configuration back in a shared (system) prefix.
 #

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Does Windows.ApplicationModel.Resources.ResourceLoader read an application's
 # resources.pri? (patches/sg/0032.) Without it every MRT-localised program --
 # winget among them -- prints resource keys instead of its text.

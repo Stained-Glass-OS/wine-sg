@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Text rendering and the scroll bars (patches/sg/0064, 0065), by pixels.
 #
 #   0064  The Windows font smoothing setting decides how text is drawn, even

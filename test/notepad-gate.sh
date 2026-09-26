@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Notepad is Stained Glass's editor (patches/sg/0100), for everything that
 # runs notepad.exe -- in a shell session, under xvfb.
 #

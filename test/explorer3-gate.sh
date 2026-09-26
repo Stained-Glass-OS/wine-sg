@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # File Explorer, round 3 (patches/sg/0244-0246), in a shell session under Xvfb.
 #
 #  - videos have thumbnails: a frame of an H.264 MP4 (red over blue), a VP8

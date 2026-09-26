@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # File Explorer follows the app mode, live (patches/sg/0264, QA B19/B33).
 #
 # A File Explorer window on a folder with an item selected, in light mode;

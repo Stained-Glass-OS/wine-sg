@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0185: a service's own security descriptor.
 # `sc sdshow` / `sc sdset`, QueryServiceObjectSecurity/SetServiceObjectSecurity:
 # the descriptor is kept as Windows keeps it (Services\<name>\Security,

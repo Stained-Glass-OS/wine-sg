@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0141: the Service Control Manager checks who is asking.
 # Wine's SCM granted every handle whatever access was asked for, so in a
 # shared prefix any standard user could stop, reconfigure, delete or create

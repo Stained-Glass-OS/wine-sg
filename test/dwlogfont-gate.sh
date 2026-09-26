@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # DirectWrite finds the font GDI uses for a substituted name (patches/sg/0177).
 #   WINE=/opt/wine-sg/bin/wine test/dwlogfont-gate.sh
 set -u

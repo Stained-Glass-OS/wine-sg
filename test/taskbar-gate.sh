@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The taskbar honours Settings > Personalization > Taskbar (patches/sg/0164).
 #
 # Settings writes the values where Windows keeps them and sends

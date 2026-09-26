@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Microsoft Edge (A4) on wine-sg -- patches/sg/0049-0054.
 #
 # Always: test/edgeapi-probe.c asks each function Edge needed and Wine lacked

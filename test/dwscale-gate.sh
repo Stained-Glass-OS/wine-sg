@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # A DirectWrite glyph run analysis whose size is in its transform (patches/sg/0222):
 # cairo's (GTK's) text. Needs Liberation Sans.
 #   WINE=/opt/wine-sg/bin/wine test/dwscale-gate.sh

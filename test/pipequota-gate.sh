@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # A pipe end reports how much it can write (patches/sg/0083).
 #
 # FilePipeLocalInformation.WriteQuotaAvailable was always 0 in Wine. The

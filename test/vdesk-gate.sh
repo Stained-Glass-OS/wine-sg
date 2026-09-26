@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Virtual desktops and Task View (patches/sg/0068), in a shell session.
 #
 # Two windows on desktop 1; Win+Ctrl+D makes desktop 2 and goes there (the

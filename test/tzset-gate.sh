@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # A Windows program sets the time zone and the clock through sg-admind
 # (patches/sg/0221): SetDynamicTimeZoneInformation / SetTimeZoneInformation
 # become sg-admind's "timezone <IANA zone>", SetLocalTime / SetSystemTime its

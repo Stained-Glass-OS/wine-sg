@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0249: a wineserver started on its own raises its open-files
 # limit, as Wine's clients raise theirs.
 #

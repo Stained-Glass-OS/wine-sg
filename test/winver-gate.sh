@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Windows 10 22H2 (patches/sg/0175) and DXGIDeclareAdapterRemovalSupport
 # (0176): what Paint.NET 5 checked first. Also that an existing prefix
 # moves to 19045 on `wineboot -u` (wine.inf rewrites the values).

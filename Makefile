@@ -26,7 +26,12 @@ install:
 # our patches ADD, and in the English resources of the Wine programs and
 # dialogs a user can reach (a series-applied tree, tools/lint-tree.sh).
 # tools/trademark-allow.txt lists the exceptions, each with its reason.
+# And every gate that runs Wine sources test/scratch-home.sh first, so no
+# prefix of a gate links into the real HOME (a gate once emptied a real Desktop).
 lint:
+	@for f in $$(grep -l WINEPREFIX test/*.sh); do \
+	    sed -n 2p "$$f" | grep -q '^\. "$$(dirname "$$0")/scratch-home.sh"$$' || \
+	    { echo "$$f: line 2 must be: . \"\$$(dirname \"\$$0\")/scratch-home.sh\""; exit 1; }; done
 	@T=$$(tools/lint-tree.sh) && \
 	python3 tools/trademark-check.py --allow tools/trademark-allow.txt --patches patches/sg --root "$$T" \
 	    --brand 'dlls/shell32/*' Wine --brand 'dlls/comdlg32/*' Wine --brand 'dlls/user32/*' Wine \
@@ -105,6 +110,10 @@ test-wallpaper:
 # dark title bars (DWMWA_USE_IMMERSIVE_DARK_MODE); the taskbar's Windows mode (0160-0163).
 test-darkmode:
 	WINE=$(PREFIX)/bin/wine test/darkmode-gate.sh
+
+# A gate's prefix links its user folders into the gate's HOME, never the real one.
+test-scratch-home:
+	WINE=$(PREFIX)/bin/wine test/scratch-home-gate.sh
 
 # The Run dialog: in front, typed into at once, our words and icon (0266).
 test-rundialog:

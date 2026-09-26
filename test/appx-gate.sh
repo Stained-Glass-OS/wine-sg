@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # AppX/MSIX packages, and the signature trust underneath them
 # (patches/sg/0034-0041).
 #

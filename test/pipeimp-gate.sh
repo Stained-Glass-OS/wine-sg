@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0140: a named pipe server impersonating its client gets the
 # CLIENT's token, not its own. Services (the SCM, the event log) decide what a
 # caller may do from that token, so a server that impersonated itself would

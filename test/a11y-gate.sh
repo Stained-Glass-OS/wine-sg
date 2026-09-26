@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Magnifier and the On-Screen Keyboard reach sg-shell's programs
 # (patches/sg/0181, 0182).
 #

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # WebView2 apps on wine-sg -- patches/sg/0190-0191.
 #
 # The Microsoft Edge WebView2 Runtime is the user's (downloaded from
@@ -31,7 +32,7 @@ WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 [ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 OUT="${OUT:-$HERE/../build}"
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/stained-glass/webview2"
+CACHE="${SG_REAL_HOME:-$HOME}/.cache/stained-glass/webview2"
 SDK_VERSION=1.0.4191.47
 RC=0; XP=""
 pass() { printf 'PASS  %s\n' "$*"; }

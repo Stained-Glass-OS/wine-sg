@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0207-0208: two winex11 display bugs.
 #
 #   1. (0207) A program on another X display than the desktop's owner (a

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # A startup item turned off in Task Manager does not start (patches/sg/0125).
 #
 # Windows keeps Task Manager's Startup tab choices in

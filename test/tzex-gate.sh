@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The dynamic time zone conversions (patches/sg/0172):
 # SystemTimeToTzSpecificLocalTimeEx and TzSpecificLocalTimeToSystemTimeEx
 # were stubs (and SetDynamicTimeZoneInformation not exported, so a program

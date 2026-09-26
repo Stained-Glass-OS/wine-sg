@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Acceptance: the real winget, end to end, in a fresh prefix on a private X
 # server (never the desktop's). winget is Microsoft's and is never shipped;
 # WINGET_DIR names a copy the user supplied -- winget.exe and its DLLs, plus

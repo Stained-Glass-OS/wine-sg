@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Gate for wine-sg 0206: cmd's `dir \\server\share` lists the share.
 #
 # cmd took an argument starting with "\" as relative to the current drive,

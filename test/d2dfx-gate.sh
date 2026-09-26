@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Direct2D, DXGI, the shader compiler and Windows Animation as Paint.NET
 # uses them (patches/sg/0223-0228), under Xvfb:
 #

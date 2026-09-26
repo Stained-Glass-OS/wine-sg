@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Windows.System.DispatcherQueue (patches/sg/0174).
 #
 # CreateDispatcherQueueController returned E_NOTIMPL, so programs built on

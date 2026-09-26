@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # MSIX / Store packages beyond a single package (patches/sg/0200-0204):
 #
 #   uri         Windows.Foundation.Uri takes a DOS path as a file: URI

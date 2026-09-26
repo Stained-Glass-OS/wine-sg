@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # File Explorer, round 2 (patches/sg/0150-0156), driven like a person on X, in a shell session.
 #
 # Pictures shows its pictures (a PNG's own pixels in the view, at Large and

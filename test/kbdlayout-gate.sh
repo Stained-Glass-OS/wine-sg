@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The X keyboard layout's keys in Wine (patches/sg/0250, 0251), under Xvfb,
 # with setxkbmap:
 #

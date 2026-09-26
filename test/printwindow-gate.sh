@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # PrintWindow of another process's window (patches/sg/0076).
 #
 # A window painted green, in its own process; this gate's other process

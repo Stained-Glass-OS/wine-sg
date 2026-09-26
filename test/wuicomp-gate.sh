@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # Windows.UI.Composition's first slice and what Paint.NET needs around it
 # (patches/sg/0229-0234), under Xvfb:
 #

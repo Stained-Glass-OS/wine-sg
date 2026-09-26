@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The Windows administrative tools' names (patches/sg/0142).
 #
 # mmc.exe, eventvwr.exe, resmon.exe and cleanmgr.exe are system32 launchers for

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # What the installers people run first need of Wine (patches/sg/0235-0239),
 # found by the compat suite's Chrome, Node.js and Java entries:
 #

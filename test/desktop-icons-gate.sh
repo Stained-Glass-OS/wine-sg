@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
 # The shell's desktop icons (patches/sg/0080... see CLAUDE.md), typed and clicked on X.
 #
 # With HideDesktopIcons\NewStartPanel showing This PC and the user's files
