@@ -33,6 +33,13 @@ mkdir -p "$CACHE" "$ARTIFACTS"
 ARTIFACTS=$(cd "$ARTIFACTS" && pwd)
 T=$(mktemp -d /var/tmp/sg-compat.XXXXXX)
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
+# A scratch HOME and no menu/desktop integration: a prefix links its Desktop,
+# Documents, Downloads... to $HOME's, and installers and uninstallers write
+# and delete there. (CACHE and DXVK_TGZ above keep the real one.)
+export HOME="$T/home" XDG_CONFIG_HOME="$T/home/.config" XDG_DATA_HOME="$T/home/.local/share" \
+    XDG_DESKTOP_DIR="$T/home/Desktop"
+mkdir -p "$HOME/Desktop"
+export WINEDLLOVERRIDES="winemenubuilder.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 "$MINGW" -municode -O2 -o "$T/compat-probe.exe" "$HERE/compat-probe.c" || { echo "probe did not build"; exit 1; }
 # MSIX packages are added through the Store's PackageManager (msix-probe add)
 "$MINGW" -O2 -o "$T/msix-probe.exe" "$HERE/../msix-probe.c" -lruntimeobject -lshlwapi 2>/dev/null || true
