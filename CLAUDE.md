@@ -422,6 +422,22 @@ or `grep 'open files' /proc/$(pgrep -x wineserver)/limits` showing 1024.
 Gate `make test-serverfds` (server started under `prlimit --nofile=1024:hard`,
 a program holds 1500 files; the mutant stops at ~760).
 
+## `patches/sg/0259`: a requireAdministrator program asks for consent
+
+Since 0019 the loader's `elevate_token()` cannot elevate in a shared prefix,
+so installers (their manifests say `requireAdministrator`) ran as the user and
+failed on Program Files -- "Access denied", no prompt (2026-09-26 ISO QA,
+7-Zip). Now `CreateProcessInternalW` reads the image's `RT_MANIFEST` 1 (as a
+datafile) and returns **`ERROR_ELEVATION_REQUIRED` (740)** when the caller is
+not elevated and has no linked token (Windows' behaviour), and
+`SHELL_ExecuteW` answers 740 through the broker (0022's code, now
+`sg_execute_via_broker`). Only when sg-elevate exists; never under
+`SG_IN_BROKER`; `highestAvailable` runs as invoker. `SG_ELEVATE=/abs/path`
+names a stand-in. Gate `make test-elevreq` (7 checks; each half's mutant
+fails it). **Still open (sg-session/elevation owner):** after consent the
+elevated program cannot reach the session's X server and the first launch
+hangs as `start.exe /exec` -- see stained-glass `docs/qa-2026-09-26.md` B56.
+
 ## `patches/sg/0012-windows-10-taskbar.patch`
 
 Explorer's taskbar (`Shell_TrayWnd`, `systray.c`) given a Windows 10 look **in

@@ -1,0 +1,208 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: kernelbase, shell32: a requireAdministrator program asks for consent
+
+Installers declare requireAdministrator. Wine's loader elevated inside the new
+process, which 0019 forbids in a shared prefix, so they ran as the user and
+failed on Program Files ("Access denied") without any prompt. As on Windows,
+CreateProcess now refuses such an image with ERROR_ELEVATION_REQUIRED (740)
+when the caller is not elevated and has no linked token to elevate with, and
+ShellExecuteEx (Explorer, PowerShell's Start-Process) answers 740 by handing
+the command to the elevation broker (0022's path, now a helper). Only where
+the broker exists; never inside a program the broker started (SG_IN_BROKER);
+highestAvailable runs as the invoker, as for a standard user on Windows.
+SG_ELEVATE names a stand-in broker client (an absolute Unix path) for gates.
+
+Found by the 2026-09-26 ISO QA pass. Gate: test/elevreq-gate.sh
+(make test-elevreq).
+---
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -559,6 +559,74 @@
+     return ret;
+ }
+ 
++/* Stained Glass OS (ADR 0012): does starting app_name need an administrator?
++ *
++ * On Windows, CreateProcess of a program whose manifest says
++ * requireAdministrator fails with ERROR_ELEVATION_REQUIRED unless the caller
++ * is elevated, and ShellExecute answers that by asking for consent. Wine's
++ * loader instead elevated inside the new process, which wine-sg 0019 rightly
++ * forbids in a shared prefix -- so installers (7-Zip, VLC, ...) ran as the
++ * user and failed on Program Files with "Access denied", no prompt at all.
++ * Only where the elevation broker exists (sg-elevate), only for a caller that
++ * is not elevated and has no linked token of its own to elevate with, and
++ * never inside a program the broker started. highestAvailable runs as the
++ * invoker, as it does for a standard user on Windows. */
++static BOOL sg_elevation_required( const WCHAR *app_name, HANDLE token )
++{
++    static const char tag[] = "requestedexecutionlevel", level[] = "requireadministrator";
++    HANDLE tok = token ? token : GetCurrentThreadEffectiveToken();
++    TOKEN_ELEVATION_TYPE type;
++    TOKEN_ELEVATION elevation;
++    const char *xml;
++    DWORD size, len, i, j;
++    BOOL in_tag = FALSE, ret = FALSE;
++    HMODULE module;
++    HRSRC res;
++
++    WCHAR broker[MAX_PATH + 16] = L"\\\\?\\unix\\usr\\libexec\\stained-glass\\sg-elevate", *p;
++
++    if (!app_name || GetEnvironmentVariableW( L"SG_IN_BROKER", NULL, 0 )) return FALSE;
++    /* SG_ELEVATE names a stand-in broker client (an absolute Unix path), for gates */
++    if (GetEnvironmentVariableW( L"SG_ELEVATE", broker + 8, MAX_PATH ) && broker[8] == '/')
++    {
++        for (p = broker + 8; *p; p++) if (*p == '/') *p = '\\';
++    }
++    else lstrcpyW( broker, L"\\\\?\\unix\\usr\\libexec\\stained-glass\\sg-elevate" );
++    if (GetFileAttributesW( broker ) == INVALID_FILE_ATTRIBUTES) return FALSE;
++    if (GetTokenInformation( tok, TokenElevation, &elevation, sizeof(elevation), &size ) &&
++        elevation.TokenIsElevated) return FALSE;
++    if (GetTokenInformation( tok, TokenElevationType, &type, sizeof(type), &size ) &&
++        type == TokenElevationTypeLimited) return FALSE;  /* the loader elevates with the linked token */
++
++    if (!(module = LoadLibraryExW( app_name, 0, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE )))
++        return FALSE;
++    /* RT_MANIFEST (24), CREATEPROCESS_MANIFEST_RESOURCE_ID (1): winuser.h is not ours here */
++    if ((res = FindResourceW( module, (const WCHAR *)(ULONG_PTR)1, (const WCHAR *)(ULONG_PTR)24 )) &&
++        (xml = LoadResource( module, res )) && (len = SizeofResource( module, res )))
++    {
++        /* level="requireAdministrator" inside <requestedExecutionLevel ...> */
++        for (i = 0; i < len && !ret; i++)
++        {
++            if (xml[i] == '<') in_tag = FALSE;
++            if (!in_tag && len - i >= sizeof(tag) - 1)
++            {
++                for (j = 0; j < sizeof(tag) - 1 && (xml[i + j] | 0x20) == tag[j]; j++);
++                if (j == sizeof(tag) - 1) { in_tag = TRUE; i += j - 1; continue; }
++            }
++            if (in_tag && xml[i] == '>') in_tag = FALSE;
++            if (in_tag && len - i >= sizeof(level) - 1)
++            {
++                for (j = 0; j < sizeof(level) - 1 && (xml[i + j] | 0x20) == level[j]; j++);
++                if (j == sizeof(level) - 1) ret = TRUE;
++            }
++        }
++    }
++    FreeLibrary( module );
++    if (ret) TRACE( "%s requires an administrator\n", debugstr_w(app_name) );
++    return ret;
++}
++
++
+ /**********************************************************************
+  *           CreateProcessInternalW   (kernelbase.@)
+  */
+@@ -603,6 +671,12 @@
+     /* an app execution alias starts its package's program */
+     if (app_exec_link_target( app_name, alias_target, ARRAY_SIZE(alias_target) )) app_name = alias_target;
+ 
++    if (sg_elevation_required( app_name, token ))
++    {
++        status = STATUS_ELEVATION_REQUIRED;
++        goto done;
++    }
++
+     /* Warn if unsupported features are used */
+ 
+     if (flags & (IDLE_PRIORITY_CLASS | HIGH_PRIORITY_CLASS | REALTIME_PRIORITY_CLASS |
+--- a/dlls/shell32/shlexec.c
++++ b/dlls/shell32/shlexec.c
+@@ -310,6 +310,35 @@
+     return linked.LinkedToken;
+ }
+ 
++/* Stained Glass OS (ADR 0012): start lpCmd through the elevation broker, which
++ * prompts on the secure surface and runs it as the SYSTEM account. sg-elevate
++ * (its client) and the broker are Unix programs, reached through \\?\unix\;
++ * --wine tells sg-elevate the rest is a Windows command to run under Wine as
++ * SYSTEM. Only with the client installed, and never inside a program the
++ * broker itself launched (SG_IN_BROKER). */
++static BOOL sg_execute_via_broker( const WCHAR *lpCmd, DWORD flags, void *env,
++                                   STARTUPINFOW *startup, PROCESS_INFORMATION *info )
++{
++    WCHAR broker[MAX_PATH + 16] = L"\\\\?\\unix\\usr\\libexec\\stained-glass\\sg-elevate", *broker_cmd, *p;
++    BOOL ret;
++
++    if (GetEnvironmentVariableW( L"SG_IN_BROKER", NULL, 0 )) return FALSE;
++    /* SG_ELEVATE names a stand-in broker client (an absolute Unix path), for gates */
++    if (GetEnvironmentVariableW( L"SG_ELEVATE", broker + 8, MAX_PATH ) && broker[8] == '/')
++    {
++        for (p = broker + 8; *p; p++) if (*p == '/') *p = '\\';
++    }
++    else wcscpy( broker, L"\\\\?\\unix\\usr\\libexec\\stained-glass\\sg-elevate" );
++    if (GetFileAttributesW( broker ) == INVALID_FILE_ATTRIBUTES) return FALSE;
++    if (!(broker_cmd = malloc( (wcslen( broker ) + wcslen( L" --wine " ) + wcslen( lpCmd ) + 1) * sizeof(WCHAR) ))) return FALSE;
++    wcscpy( broker_cmd, broker );
++    wcscat( broker_cmd, L" --wine " );
++    wcscat( broker_cmd, lpCmd );
++    ret = CreateProcessW( NULL, broker_cmd, NULL, NULL, FALSE, flags, env, NULL, startup, info );
++    free( broker_cmd );
++    return ret;
++}
++
+ /*************************************************************************
+  *	SHELL_ExecuteW [Internal]
+  *
+@@ -352,35 +381,16 @@
+     /* Stained Glass OS (ADR 0012): "Run as administrator" for a user with no
+      * administrator token of their own (get_admin_token() returned NULL) goes
+      * to the elevation broker, which prompts on the secure surface and starts
+-     * the program as the SYSTEM account. sg-elevate (its client) and the
+-     * broker are Unix programs, reached through \\?\unix\; --wine tells
+-     * sg-elevate the rest is a Windows command to run under Wine as SYSTEM.
+-     * Guarded so it only fires with the client installed, and never inside a
+-     * program the broker itself launched (SG_IN_BROKER). */
++     * the program as the SYSTEM account (see sg_execute_via_broker). */
+     if (psei->lpVerb && !wcsicmp( psei->lpVerb, L"runas" ) && !token &&
+-        !GetEnvironmentVariableW( L"SG_IN_BROKER", NULL, 0 ) &&
+-        GetFileAttributesW( L"\\\\?\\unix\\usr\\libexec\\stained-glass\\sg-elevate" ) != INVALID_FILE_ATTRIBUTES)
++        sg_execute_via_broker( lpCmd, dwCreationFlags, env, &startup, &info ))
+     {
+-        static const WCHAR headW[] = L"\\\\?\\unix\\usr\\libexec\\stained-glass\\sg-elevate --wine ";
+-        size_t len = wcslen( headW ) + wcslen( lpCmd ) + 1;
+-        WCHAR *broker_cmd = malloc( len * sizeof(WCHAR) );
+-
+-        if (broker_cmd)
+-        {
+-            wcscpy( broker_cmd, headW );
+-            wcscat( broker_cmd, lpCmd );
+-            if (CreateProcessW( NULL, broker_cmd, NULL, NULL, FALSE, dwCreationFlags, env, NULL, &startup, &info ))
+-            {
+-                free( broker_cmd );
+-                if (psei->fMask & SEE_MASK_NOCLOSEPROCESS) psei_out->hProcess = info.hProcess;
+-                else CloseHandle( info.hProcess );
+-                CloseHandle( info.hThread );
+-                TRACE( "routed runas to the elevation broker\n" );
+-                retval = 33;
+-                goto sg_done;
+-            }
+-            free( broker_cmd );
+-        }
++        if (psei->fMask & SEE_MASK_NOCLOSEPROCESS) psei_out->hProcess = info.hProcess;
++        else CloseHandle( info.hProcess );
++        CloseHandle( info.hThread );
++        TRACE( "routed runas to the elevation broker\n" );
++        retval = 33;
++        goto sg_done;
+     }
+ 
+     if (CreateProcessAsUserW(token, NULL, (LPWSTR)lpCmd, NULL, NULL, FALSE,
+@@ -398,6 +408,18 @@
+             CloseHandle( info.hProcess );
+         CloseHandle( info.hThread );
+     }
++    /* Stained Glass OS: the program needs an administrator (its manifest says
++     * requireAdministrator; kernelbase refused with ERROR_ELEVATION_REQUIRED,
++     * as Windows does): ask for consent, as Windows' ShellExecute does. */
++    else if (GetLastError() == ERROR_ELEVATION_REQUIRED &&
++             sg_execute_via_broker( lpCmd, dwCreationFlags, env, &startup, &info ))
++    {
++        if (psei->fMask & SEE_MASK_NOCLOSEPROCESS) psei_out->hProcess = info.hProcess;
++        else CloseHandle( info.hProcess );
++        CloseHandle( info.hThread );
++        TRACE( "elevation required: routed to the elevation broker\n" );
++        retval = 33;
++    }
+     else if ((retval = GetLastError()) >= 32)
+     {
+         TRACE("CreateProcess returned error %Id\n", retval);

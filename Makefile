@@ -155,6 +155,11 @@ test-userlocale:
 test-sandboxdesk:
 	WINE=$(PREFIX)/bin/wine test/sandboxdesk-gate.sh
 
+# A requireAdministrator program: ERROR_ELEVATION_REQUIRED, ShellExecute asks
+# the elevation broker (a stand-in here) (0259).
+test-elevreq:
+	WINE=$(PREFIX)/bin/wine test/elevreq-gate.sh
+
 # The SCM checks who asks (0141); a second Unix user as for test-pipeimp.
 test-scm-access:
 	WINE=$(PREFIX)/bin/wine test/scm-access-gate.sh
