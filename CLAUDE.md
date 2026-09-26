@@ -2658,10 +2658,16 @@ comments pass. `tools/trademark-allow.txt` holds the exceptions, keyed by
 `PATCH:TARGET` with a reason each: the .reg header check, Notepad's "Windows
 (CRLF)", the "Microsoft Windows Network" provider name, Win+X's Windows
 PowerShell and winecfg's "Windows 10". Wine's own strings are upstream's
-and out of scope. The worst of those are winecfg's "Windows Version" tab and
-"Windows registration information", progman's "Exit Windows", "Windows
-Media Player" and "simulate a Windows reboot". **A new patch's messages:
-"Stained Glass ..." or neutral.**
+**and the English resources of the Wine programs and dialogs a user can reach**
+-- `programs/*/*.rc`, shell32's, comdlg32's and user32's -- in a
+series-applied tree that `tools/lint-tree.sh` prepares (cached by the
+series' hash in `$TMPDIR`). **0260** rewrote those (progman's "Exit",
+shell32's "simulate a restart", winecfg's "Compatibility version" and
+"Registration information", wmplayer's "Media Player", ...); left with
+reasons: cmd's `ver` banner ("Microsoft Windows <version>", which batch
+scripts parse), "Windows (CRLF)", winetest's "the Windows API". The .po
+translations keep the old msgids' text until retranslated (English meanwhile).
+**A new patch's messages: "Stained Glass ..." or neutral.**
 
 ## Things that will bite you
 

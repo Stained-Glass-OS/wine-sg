@@ -22,11 +22,14 @@ build:
 install:
 	PREFIX=$(PREFIX) JOBS=$(JOBS) DESTDIR=$(DESTDIR) DO_INSTALL=1 ./build.sh
 
-# No user-visible "Windows" as our name in the text our patches ADD
-# (Microsoft's trademark); Wine's own strings are upstream's.
+# No user-visible "Windows" as our name (Microsoft's trademark): in the text
+# our patches ADD, and in the English resources of the Wine programs and
+# dialogs a user can reach (a series-applied tree, tools/lint-tree.sh).
 # tools/trademark-allow.txt lists the exceptions, each with its reason.
 lint:
-	python3 tools/trademark-check.py --allow tools/trademark-allow.txt --patches patches/sg
+	@T=$$(tools/lint-tree.sh) && \
+	python3 tools/trademark-check.py --allow tools/trademark-allow.txt --patches patches/sg --root "$$T" \
+	    "$$T"/programs/*/*.rc "$$T"/dlls/shell32/*.rc "$$T"/dlls/comdlg32/*.rc "$$T"/dlls/user32/*.rc
 
 # Runs against the *installed* tree, not the build tree, because what we ship
 # is what we care about. Install first.
