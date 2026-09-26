@@ -112,6 +112,26 @@ int main( int argc, char **argv )
     int n;
 
     if (argc == 4 && !strcmp( argv[1], "acl" )) return acl( argv[2], argv[3] );
+    if (argc == 3 && !strcmp( argv[1], "mkkey" ))
+    {
+        /* a subkey this user creates in a shared HKLM key: its owner */
+        PSID owner = NULL;
+        PSECURITY_DESCRIPTOR sd = NULL;
+        LONG err = RegCreateKeyExA( HKEY_LOCAL_MACHINE, argv[2], 0, NULL, REG_OPTION_VOLATILE,
+                                    KEY_READ, NULL, &key, NULL );
+        if (err) { printf( "KeyOwner=error %ld\n", err ); return 0; }
+        if (!GetSecurityInfo( key, SE_REGISTRY_KEY, OWNER_SECURITY_INFORMATION, &owner, NULL, NULL, NULL, &sd ))
+            printf( "KeyOwner=%s\n", sid_str( owner ) );
+        else printf( "KeyOwner=error\n" );
+        LocalFree( sd );
+        RegCloseKey( key );
+        return 0;
+    }
+    if (argc == 3 && !strcmp( argv[1], "rmkey" ))
+    {
+        printf( "Deleted=%ld\n", RegDeleteKeyA( HKEY_LOCAL_MACHINE, argv[2] ) );
+        return 0;
+    }
     if (!OpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &token )) return 1;
     GetTokenInformation( token, TokenUser, buffer, sizeof(buffer), &len );
     lstrcpyA( user_sid, sid_str( user->User.Sid ) );

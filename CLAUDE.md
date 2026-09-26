@@ -1026,6 +1026,19 @@ directory are root's and not group/world-writable; it never calls winbind.
   domain record; 28 checks, 15 fail on 10.0-46), and sg-image's
   `make domain-test` against a real Samba DC (her SID from dc1's objectSid).
 
+- **0211: the owner of what a domain account creates.** Wine makes a
+  token's primary group its owner too; after 0205 that was the domain's
+  Domain Users, which the greeter and local accounts do not hold. Their
+  display setup (win32u `prepare_devices`) empties `Enum\DISPLAY` and the
+  monitor class key, and `reg_empty_key` retried the undeletable key for
+  ever: **after the first domain user signed out the greeter spun at full
+  CPU and nobody could sign in**. The token's owner is now the machine's
+  Users group (every token holds it, as for local accounts); the primary
+  group stays the domain's. `reg_empty_key` also stops at a key it cannot
+  delete. How it was found: `wineserver -f -d` (the system server's
+  requests are in its journal) showed `delete_key() = ACCESS_DENIED` in a
+  loop. `make test-domainsid` checks a key's owner (31 checks).
+
 ## `patches/sg/0206`: `dir \\server\share` in cmd
 
 cmd treated an argument starting with `\` as relative to the current drive:

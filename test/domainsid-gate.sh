@@ -129,12 +129,43 @@ out=$(other "$W/probe.exe" acl notheld 'TESTDOM\Enterprise Admins')
 expect "$out" "Ace=$DOMSID-519" "a domain group the user is not in (a name-only entry) can be named in an ACL"
 expect "$out" "Opened=5" "and the user may not open what only it may"
 
+# a key the domain user makes in shared HKLM state (as display setup does
+# in Enum\DISPLAY) is owned by the machine's Users group, which every
+# account holds -- not by the domain's Domain Users, which the greeter and
+# local accounts do not, and which left them unable ever to delete it
+cat > "$W/share.c" <<'EOF2'
+#include <windows.h>
+#include <sddl.h>
+#include <stdio.h>
+int main( void )
+{
+    PSECURITY_DESCRIPTOR sd;
+    HKEY key;
+    LONG err;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA( "D:(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KA;;;BU)",
+                                                              SDDL_REVISION_1, &sd, NULL )) return 1;
+    if (!(err = RegCreateKeyExA( HKEY_LOCAL_MACHINE, "Software\\StainedGlassShared", 0, NULL,
+                                 REG_OPTION_VOLATILE, KEY_ALL_ACCESS, NULL, &key, NULL )))
+        err = RegSetKeySecurity( key, DACL_SECURITY_INFORMATION, sd );
+    printf( "Shared=%ld\n", err );
+    return 0;
+}
+EOF2
+"$MINGW64" -O2 -o "$W/share.exe" "$W/share.c" -ladvapi32 && chmod 755 "$W/share.exe"
+out=$(me "$W/share.exe")
+expect "$out" "Shared=0" "(a shared HKLM key that Users may write)"
+out=$(other "$W/probe.exe" mkkey 'Software\StainedGlassShared\ByDomainUser')
+expect "$out" "KeyOwner=S-1-5-21-0-0-0-513" "a key the domain user creates in HKLM is owned by the machine's Users group"
+out=$(other "$W/probe.exe" rmkey 'Software\StainedGlassShared\ByDomainUser')
+expect "$out" "Deleted=0" "and its creator may delete it"
+
 # 3. anyone else resolves it
 out=$(me "$W/probe.exe" '' "TESTDOM\\$SG_OTHER")
 expect "$out" "Name[TESTDOM\\$SG_OTHER]=$DOMSID-1104 TESTDOM use=1" "SYSTEM resolves the domain account's name"
 cat > "$W/sidname.c" <<'EOF'
 #include <windows.h>
 #include <sddl.h>
+#include <aclapi.h>
 #include <stdio.h>
 int main( int argc, char **argv )
 {
