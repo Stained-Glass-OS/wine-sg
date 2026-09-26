@@ -2616,6 +2616,21 @@ auto-hide (`ABM_SETSTATE` added to shellapi.h).
 SHAppBarMessage, its buttons and pixels for each option, auto-hide by the
 pointer, ABM_SETSTATE). 10.0-16 (no 0164) fails 21.
 
+## Trademark: the text our patches add never calls us Windows
+
+"Windows" is Microsoft's trademark. `make lint` (a CI step) runs
+`tools/trademark-check.py --patches patches/sg`: the string literals on the
+lines our patches **add** to C, .rc, .mc, .idl and wine.inf files must not
+use "Windows" as a name. Paths, dotted and hyphenated identifiers and
+comments pass. `tools/trademark-allow.txt` holds the exceptions, keyed by
+`PATCH:TARGET` with a reason each: the .reg header check, Notepad's "Windows
+(CRLF)", the "Microsoft Windows Network" provider name, Win+X's Windows
+PowerShell and winecfg's "Windows 10". Wine's own strings are upstream's
+and out of scope. The worst of those are winecfg's "Windows Version" tab and
+"Windows registration information", progman's "Exit Windows", "Windows
+Media Player" and "simulate a Windows reboot". **A new patch's messages:
+"Stained Glass ..." or neutral.**
+
 ## Things that will bite you
 
 - **`patches/fixes/binutils2.44.patch` is not optional on Debian trixie.**

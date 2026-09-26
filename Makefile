@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean test-darkmode test-taskbar
+.PHONY: all build install test deb deps clean distclean lint test-darkmode test-taskbar
 
 all: build
 
@@ -21,6 +21,12 @@ build:
 
 install:
 	PREFIX=$(PREFIX) JOBS=$(JOBS) DESTDIR=$(DESTDIR) DO_INSTALL=1 ./build.sh
+
+# No user-visible "Windows" as our name in the text our patches ADD
+# (Microsoft's trademark); Wine's own strings are upstream's.
+# tools/trademark-allow.txt lists the exceptions, each with its reason.
+lint:
+	python3 tools/trademark-check.py --allow tools/trademark-allow.txt --patches patches/sg
 
 # Runs against the *installed* tree, not the build tree, because what we ship
 # is what we care about. Install first.
