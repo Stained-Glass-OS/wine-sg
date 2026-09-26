@@ -2232,10 +2232,68 @@ without unpin fails exactly those 4. **Editing `patches/series` in the shared
 checkout puts your patches into other agents' builds** (build.sh follows the
 series): cut and test in your own tree first.
 
-Not done: video/PDF thumbnails, a thumbnail cache on disk, the details
-pane's image dimensions and editable properties, Quick access "Remove from
-Quick access" for frequent items, collapsing groups from the keyboard,
-drag-to-reorder pins.
+Not done: editable properties in the details pane, collapsing groups from
+the keyboard (video/PDF thumbnails, the thumbnail cache, image dimensions,
+Remove from Quick access and pin reordering: 0244-0246 below).
+
+## `patches/sg/0244`-`0246`: File Explorer, round 3
+
+- **0244 shell32: video and PDF thumbnails** -- two more providers in
+  `thumbnail.c` (`struct image_thumbnail` has a `kind`): video
+  `{a3d8b0f2-6c1e-4d57-9b8a-2f4e7c9d1a60}`, PDF
+  `{c51f3e8a-2b7d-4e90-8f6a-9d3c1b5e7a24}`, wine.inf ShellEx lines for
+  their extensions after .jxr's (**a prefix needs `wineboot -u`** for them).
+  They take a path (IInitializeWithItem/File), not a stream -- the WIC one
+  alone exposes IInitializeWithStream. Video: `IMFSourceReader` with
+  `MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING`, RGB32, the frame at 1/10 of
+  the length (3/10 if dark); works for H.264, VP8, MPEG-4 in STA and MTA.
+  **Wine's `MF_MT_DEFAULT_STRIDE` is in pixels, not bytes** (320 for a
+  320-wide frame): `read_frame` keeps only the sign of a stride smaller than
+  a row. **MF GUIDs come from `mfuuid` and the MF headers must come before
+  `initguid.h`** (otherwise IID_IMFSample etc. are defined twice). PDF: a
+  Windows program has no pipe to a native one, so shell32 starts
+  `\\?\unix/usr/bin/sg-pdf --thumbnail PDF SIZE OUT.png` (sg-session;
+  `SG_PDF` names another) on unix paths from `wine_get_unix_file_name`, and
+  polls up to 20 s for OUT.png (written then renamed) or OUT.png.err.
+- **0245 shell32: the thumbnail cache** --
+  `%LOCALAPPDATA%\Microsoft\Windows\Explorer\sg-thumbcache\HASH_SIZE.thumb`,
+  HASH = FNV-1a 64 of the lower-cased path's UTF-16. `struct tc_header` (40
+  bytes: magic "SGTC", version 1, width, height, the source's last write
+  time, its size, path length) then the path then BGRA rows; used only if
+  time, size and path match; a hit touches the entry's time, which is the
+  LRU order. `ThumbnailCacheKB` (HKCU `Software\Stained Glass\Explorer`,
+  default 102400, min 16) -- over it, oldest go down to 3/4; checked at a
+  process's first write and whenever the running total passes the limit.
+  Policies `NoThumbnailCache` / `DisableThumbnailCache` turn it off. Bump
+  `TC_VERSION` if the layout changes.
+- **0246 explorer:** `fileprops.c` -- `image_properties` (WIC size and
+  `IWICPixelFormatInfo` bits per pixel) and `video_properties` (MF frame size,
+  `MF_PD_DURATION`); `media_lines` adds them to the details pane after "Date
+  created". Quick access: `QuickAccess\Excluded` (REG_MULTI_SZ) --
+  "Remove from Quick access" (`CMD_QA_REMOVE`, first in a frequent folder's
+  menu, in the tree and on the page) deletes its `Frequent` value and lists
+  it there; `qa_visit`/`qa_frequent` skip excluded folders. Pin reordering is
+  done by hand in `tree_proc` (**it eats WM_LBUTTONDOWN, so TVN_BEGINDRAG
+  never comes**): press on a pin + move past the drag threshold = drag, an
+  insert mark (TVM_SETINSERTMARK), drop = `move_pin` rewrites `Pinned`;
+  Escape / lost capture cancel. `trace_quick_rows` traces each Quick access
+  row's centre in window coordinates after every `layout()` (the gate clicks
+  them).
+
+**Gate: `make test-explorer3`** (`test/explorer3-gate.sh`, 19 checks, Xvfb
+:153 or `EXPLORER3_DPY`; needs ffmpeg and python3 with PIL and cairo;
+`SG_PDF_HELPER=` a checkout's `bin/sg-pdf` if sg-session's is not
+installed): MP4/WebM/AVI thumbnail colours and the Videos view's pixels,
+the PDF's first page, the cache entry, a doctored entry read back (magenta),
+a touched file regenerated, the 16 KB limit with the newest kept, the
+details pane lines for a PNG and an MP4, Remove from Quick access typed
+through the tree's context menu (trace, registry, not back after visits),
+a pin dragged above Desktop with xdotool (registry order, the tree).
+explorer-probe gained `close-all`. The build before (10.0-57) failed 12 of
+the first 13. Mutants: no cache (cache always off) fails the 4 cache
+checks; width and height swapped in `media_lines` fails dimensions; the
+menu command not calling `qa_remove_frequent` fails the 3 remove checks.
+Also run `make test-explorer2` (29/29 with these).
 
 ## `patches/sg/0168`: the user's regional format is their choice
 

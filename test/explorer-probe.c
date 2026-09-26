@@ -19,6 +19,7 @@
  *   explorer-probe findchild CLASS        found=1 if File Explorer has a visible child of that class
  *   explorer-probe thumb PATH SIZE        IShellItemImageFactory's picture: thumb=WxH top=RRGGBB bottom=RRGGBB
  *   explorer-probe recent PATH            SHAddToRecentDocs(SHARD_PATHW) of a path, in Unicode
+ *   explorer-probe close-all              closes every File Explorer window and waits for them to go
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
@@ -366,6 +367,18 @@ int main( int argc, char **argv )
         MultiByteToWideChar( CP_ACP, 0, argv[2], -1, cls, 64 );
         hwnd = FindWindowExW( explorer(), NULL, cls, NULL );
         printf( "found=%d\n", hwnd && IsWindowVisible( hwnd ) );
+        return 0;
+    }
+    if (argc == 2 && !strcmp( argv[1], "close-all" ))
+    {
+        HWND hwnd;
+        int i;
+        for (i = 0; i < 100 && (hwnd = explorer()); i++)
+        {
+            PostMessageW( hwnd, WM_CLOSE, 0, 0 );
+            Sleep( 100 );
+        }
+        printf( "closed=%d\n", explorer() ? 0 : 1 );
         return 0;
     }
     if (argc == 2 && !strcmp( argv[1], "panetext" ))

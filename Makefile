@@ -195,6 +195,12 @@ test-explorer:
 test-explorer2:
 	WINE=$(PREFIX)/bin/wine test/explorer2-gate.sh
 
+# File Explorer round 3: video and PDF thumbnails, the thumbnail cache, picture
+# and video details, Quick access remove and pin reordering (0244-0246).
+# SG_PDF_HELPER=<sg-session's bin/sg-pdf> if it is not installed.
+test-explorer3:
+	WINE=$(PREFIX)/bin/wine test/explorer3-gate.sh
+
 # A self-managed stack grows read-write; SD-less objects have an owner (0081, 0082).
 test-stackgrow:
 	WINE=$(PREFIX)/bin/wine test/stackgrow-gate.sh
