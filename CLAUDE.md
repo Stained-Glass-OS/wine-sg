@@ -1483,6 +1483,58 @@ the old build fails all but the service registration). advapi32:security,
 kernel32:process, ieframe:intshcut unchanged; ole32:marshal behaves the same
 (its window test needs a display either way).
 
+## `patches/sg/0320`-`0324`: what developer tools needed
+
+Found by the developer-tools compatibility round (2026-09-26); gate
+`make test-devtools` (test/devtools-gate.sh: 43 checks, 64- and 32-bit; the
+old build fails 37 of them).
+
+- **0320 kernelbase**: a program started from a Unix shell with its output
+  redirected (`CONSOLE_HANDLE_SHELL_NO_WINDOW`: scripts, CI, our own tools)
+  can get and set the console code pages. .NET's `Console.OutputEncoding`
+  setter throws when `SetConsoleOutputCP` fails and the dotnet CLI sets it
+  first: every `dotnet ... > log` died ("IOException: Invalid access").
+- **0321 msi**: an Environment-table value containing `%` is written
+  REG_EXPAND_SZ, as Windows Installer does. Go's MSI sets
+  `GOPATH=%USERPROFILE%\go`; as REG_SZ `go` refused to run at all.
+- **0322 msvcrt**: the C99 complex functions of msvcr120/ucrtbase (all of
+  `<complex.h>` but creal/_Cbuild were stubs). `import numpy` aborted on
+  `crealf`. _Dcomplex returns through a hidden pointer (listed first in the
+  specs), _Fcomplex in registers as a 64-bit integer.
+- **0323 advapi32**: `CredEnumerate(NULL, CRED_ENUMERATE_ALL_CREDENTIALS)`.
+  Git Credential Manager enumerates so; `get` failed "[0x3ec] Invalid flags".
+- **0324 conhost**: a pseudo console on named pipes nobody has connected to
+  yet (node-pty: VS Code's integrated terminal) keeps reading its input --
+  the input thread read STATUS_PIPE_LISTENING and quit, so nothing typed
+  reached the shell.
+
+Results (dev tree on 10.0-70 + these): .NET SDK 8.0.425 (console, WinForms,
+WPF: new/build/run, windows shown), Go 1.27.1 (build + HTTPS), CMake 4.4.3,
+Rust 1.98.1 GNU MSI (`cargo run`), Node.js 22 npm native modules
+(better-sqlite3, bcrypt, esbuild), Python 3.12 venv + pip wheels (numpy,
+cryptography, lxml, psutil; numpy needs 0322), Git for Windows HTTPS
+clone/commit + credential manager store/get/erase (0323), VS Code 1.96
+extensions install and integrated terminal with cmd (0324), WinMerge,
+Sublime Text, Sysinternals sigcheck/handle all work. Open:
+- **Visual Studio Build Tools / Community**: the bootstrapper runs on Wine
+  Mono and rejects `vs_installer.opc`'s signature. Wine Mono's managed
+  X509Chain neither fetches the intermediate (AIA; crypt32's
+  CertGetCertificateChain does, 3 elements) nor reads CRLs
+  (`Mono.Security.X509.X509Store.get_Crls` throws NotImplemented in
+  X509Store.wincrypto.cs). The fix belongs in a Wine Mono build (MIT):
+  implement get_Crls with CertEnumCRLsInStore and build chains through
+  crypt32. Also BITS `IBackgroundCopyJob::SetProxySettings` is E_NOTIMPL
+  (qmgr; it falls back to WinINet).
+- VS Code's default terminal profile is PowerShell, which Wine only stubs:
+  no shell starts; `Command Prompt` works. Terminal text is spaced wide
+  (xterm's DOM renderer measures the font oddly). Title says
+  "[Administrator]" (the user is an administrator).
+- GCM's provider probe on Wine Mono: TrustFailure (warning only).
+- PsList: "Processor performance object not found" (no perf counters).
+- Not yet run: GitHub Desktop, Postman, Insomnia, MSYS2, IntelliJ IDEA,
+  PyCharm, Android Studio, rustup-init, VS Code debuggers (installers are
+  in ~/.cache/sg-compat).
+
 ## The application compatibility suite (`make test-compat`)
 
 `test/compat/apps.list` pins real Windows applications (official URL +

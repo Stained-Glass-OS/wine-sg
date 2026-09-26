@@ -282,6 +282,11 @@ test-notepad-minimap:
 test-pipequota:
 	WINE=$(PREFIX)/bin/wine test/pipequota-gate.sh
 
+# What developer tools need (0320 on): the console code pages of a program
+# whose output is redirected (dotnet CLI).
+test-devtools:
+	WINE=$(PREFIX)/bin/wine test/devtools-gate.sh
+
 # DwmFlush waits for the next vertical blank: Firefox's vsync (0170).
 test-vsync:
 	WINE=$(PREFIX)/bin/wine test/vsync-gate.sh
