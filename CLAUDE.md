@@ -1619,6 +1619,61 @@ applications with a failing stage.
   after >30 s and left its processes running -- fixed by 0170 (a vsync
   flood). Its content processes' `CreateWindow` error 1411 is noise.
 
+## `patches/sg/0300`-`0304`: office and documents (compat round, 2026-09-26)
+
+- **0300 d2d1 / 0301 wineps -- LibreOffice prints text.** LibreOffice 24.8
+  prints (subpixel-positioned) text through a premultiplied
+  `ID2D1DCRenderTarget` bound to the printer DC, never clearing it. Wine
+  BitBlt'ed the whole transparent-black bitmap: every printed line was a
+  black box. A premultiplied DC target now starts transparent and presents
+  with `GdiAlphaBlend`; wineps' EMF playback, which dropped
+  `EMR_ALPHABLEND`, prints the bitmap's >=50%-covered pixels
+  (un-premultiplied) through a clip region built from them. Gate
+  `make test-dcrt-print` (6 checks; each half's mutant fails two).
+- **0302 powershell -- Electron installers.** The stub exited 0 for every
+  script, so electron-builder NSIS setups (Joplin, Obsidian, most Electron
+  apps) concluded "the app is running" and quit with rc 2. A script it
+  cannot run now exits 1 ("exit N" alone returns N). Gate `make
+  test-powershell` (7; stock stub fails 5).
+- **0303 cryptbase.dll** (new module; configure hunks): SystemFunction
+  exports forwarded to advapi32. Firefox-140-based mozglue imports
+  `CRYPTBASE.SystemFunction036`: Zotero 10 now opens its library window.
+  Gate `make test-cryptbase` (3; stock fails 3).
+- **0304 msi -- any exception in a custom action is caught** (was page
+  faults only): Foxit PDF Reader's silent install hung forever on the
+  debugger's crash dialog. Gate `make test-msica` (a generated package;
+  stock hangs, killed at 180 s).
+- `make test-office-docs`: LibreOffice for Windows does real work -- .docx
+  -> PDF (text, table, Calibri set in Carlito), .xlsx formulas recalculated
+  on load, UNO edit over a named pipe from its own Python (B2 := 10 ->
+  22.5, saved .xlsx reads back), .pptx -> PDF, .docx -> .odt -> .docx, a
+  print job. 8/9 passed before 0300/0301 (the print text check); fixtures
+  are written by test/office-docs/mkdocs.py (no office suite on the host).
+  LibreOffice's online updater is off by policy there: on first start the
+  pinned 24.8.4 updates itself (24.8.6, then 25.2.6) -- it works, it is
+  just slow.
+- Printing in gates: Debian's cupsd is AppArmor-confined and silently
+  drops a `file://` device outside its dirs; capture the job on the Wine
+  side instead with `HKCU\Software\Wine\Printing\Spooler` `CUPS:<queue>`
+  = a Unix path.
+- Compat suite (run.sh: `OUTER!INNER` now also opens non-zip archives
+  with 7z -- an NSIS wrapper around an MSI). Results on 10.0-70 + 0300-0304:
+
+  | Application | Result |
+  |---|---|
+  | LibreOffice 24.8 | works: office-docs gate; printing fixed (0300/0301) |
+  | ONLYOFFICE 9.4 | launches, closes |
+  | Scribus 1.6.6, LibreCAD 2.2, FreeCAD 1.1.3 | launch, close (FreeCAD smoke: Part box volume 6.0) |
+  | SumatraPDF 3.5.2 | launches, closes |
+  | Zotero 10.0.3 | opens "My Library" (0303) |
+  | Joplin 3.7 | installs (0302); launch not re-run yet |
+  | Obsidian 1.13, Evernote | same installer family as Joplin -- re-run with 0302 (Evernote's path is Program Files (x86)) |
+  | Foxit PDF Reader 2026.2 | installs and launches; installer hang fixed by 0304 (re-run pending) |
+  | Apache OpenOffice 4.1.15 | its NSIS wrapper ignores /S; entry now installs the inner MSI (not re-run) |
+  | calibre 9.15 | exits 1: its Qt6Core imports the system ICU (`icuuc.dll`: 20 `ucnv_*`) -- same wall as winget; needs ICU built as PE DLLs |
+  | Adobe Acrobat Reader | 67 = its MSI's PatchFiles fails: mspatcha's PA19 lacks the "32-bit executable" transform (`read_header` FIXME) for AcroPDF.dll |
+  | WPS Office | online installer downloaded; not run |
+
 ## `patches/sg/0078`-`0079`: native stdio; ipconfig and netsh on sg-netctl
 
 - **0078:** `fork_and_exec` (ntdll/unix/process.c, not `spawn_process` --

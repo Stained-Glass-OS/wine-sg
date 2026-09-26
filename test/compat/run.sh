@@ -117,7 +117,12 @@ grep -v '^#' "$HERE/apps.list" | grep -v '^$' | while IFS='|' read -r name file 
         inst_path="$CACHE/$file"
         if [ -n "$inner" ]; then
             rm -rf "$T/unzip"; mkdir -p "$T/unzip"
-            unzip -q -o "$CACHE/$file" "$inner" -d "$T/unzip" && inst_path="$T/unzip/$inner"
+            # a zip, or anything else 7-Zip opens (an NSIS installer wrapping
+            # an MSI: the whole archive, since the MSI's cabinets sit beside it)
+            case "$file" in
+                *.zip) unzip -q -o "$CACHE/$file" "$inner" -d "$T/unzip" && inst_path="$T/unzip/$inner" ;;
+                *) 7z x -y -o"$T/unzip" "$CACHE/$file" >/dev/null 2>&1 && inst_path="$T/unzip/$inner" ;;
+            esac
         fi
         # kind zip: a portable program (most games), unpacked into C:\Games
         if [ "$kind" = zip ]; then

@@ -402,3 +402,15 @@ clean:
 
 distclean:
 	rm -rf build
+
+# Office and documents compat round (0300-0304).
+test-dcrt-print:
+	WINE=$(PREFIX)/bin/wine test/dcrt-print-gate.sh
+test-powershell:
+	WINE=$(PREFIX)/bin/wine test/powershell-gate.sh
+test-cryptbase:
+	WINE=$(PREFIX)/bin/wine test/cryptbase-gate.sh
+test-msica:
+	WINE=$(PREFIX)/bin/wine test/msica-gate.sh
+test-office-docs:
+	WINE=$(PREFIX)/bin/wine test/office-docs-gate.sh
