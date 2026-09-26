@@ -2115,8 +2115,13 @@ black; **a paintbrush drag hangs the UI thread** -- found (by forcing a
 NullReferenceException in the spinning JIT code with gdb and reading
 Paint.NET's crash log) to be `SpriteTileSorter.Update` iterating tiles over
 unbounded stroke bounds: `GetImageLocalBounds` of an effect over a command
-list is infinite because command lists' extents are not tracked. WIP not
-shipped (in the wip diff): a command-list bounds sink
+list is infinite because command lists' extents are not tracked. **Fixed
+2026-09-26 by 0427 and 0429**: the bounds sink below landed in 0427; 0429
+found the rest (a Clear in each stamp's list made it unbounded; the brush
+masks are alpha-only WIC render targets, drawn over what they held, on
+several threads). Paint.NET's paintbrush now draws; a fast stroke over
+earlier ones can still leave a stray piece (effect property changes are not
+serialised yet). The note as it was: a command-list bounds sink
 (`d2d_command_list_get_bounds`), generic geometry operations for every
 stubbed `GetBounds`/`GetWidenedBounds`/`FillContainsPoint`/
 `StrokeContainsPoint`/`ComputeArea`/`ComputeLength`/`ComputePointAtLength`/
@@ -3175,13 +3180,15 @@ target). Scratch trees can go, but copy the drafts somewhere safe before
 - **Screen sharing** in Zoom/Teams was not reached.
 ## Browsers in daily use: root causes found, fixes drafted (next steps)
 
-This came out of the 2026-09-26 communication-and-web compat round. **Nothing
-from it is in the series yet**, because the fixes are drafted but not gated.
-The drafts are unified diffs against the patched tree, in
-`/var/tmp/sgcomm/d-drafts/` (with the test pages, the local test server
-`www/server.py` and the xdotool driver scripts in `bin/`). They take the
-reserved numbers `sg/0395`-`0399`. Each one still needs a probe gate that
-fails on `/opt/wine-sg`, a mutation test and a conformance run.
+This came out of the 2026-09-26 communication-and-web compat round. **Landed
+2026-09-26** (numbers differ from the drafts'): 1 as `0421` (`make
+test-crtimax`), 2 as `0424` (`test-keyedmutex`), 3 as `0423`
+(`test-aumid`, which also fixes Thunderbird below), 4 as `0422`
+(`test-streams`; the symlink and appcompat gates still pass). Zoom's and
+Teams' start-up fixes (drafts 0385/0386) landed as `0425`/`0426`
+(`test-meetings`). Still open: 5 and 6 below, and rerunning each app. The
+test pages, local server (`www/server.py`) and xdotool drivers (`bin/`)
+are in `/var/tmp/sgcomm/d-drafts/`.
 
 Here is what was tested, under Xvfb in a shell desktop. The browsers were
 Firefox 156.0.1 (the current release, extracted from the vendor's
@@ -3303,8 +3310,8 @@ vendor installers downloaded at test time (entries in `test/compat/apps.list`).
   sink (manual configuration, probe, insecure-server warning, account
   created, first message downloaded). **Then Thunderbird crashes**:
   xul.dll imports `kernel32!GetCurrentApplicationUserModelId`, which we do
-  not export; the loader's stub raises 0x80000100. A drafted fix (sg/0392,
-  **not in the series**: kernelbase export returning
+  not export; the loader's stub raises 0x80000100. **Fixed by 0423**
+  (2026-09-26; the draft below was sg/0392: kernelbase export returning
   APPMODEL_ERROR_NO_APPLICATION for unpackaged processes, the package's
   `Id|Executable` list recorded by appxdeploymentclient for packaged ones)
   is in `/var/tmp/sgcomm/c-drafts/`; it needs a build, a gate and a rerun of
