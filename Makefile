@@ -349,6 +349,12 @@ test-wuicomp:
 test-appfix:
 	WINE=$(PREFIX)/bin/wine test/appfix-gate.sh
 
+# What Discord and Spotify need at start: the SSL policy's ignore-unknown-
+# revocation flags, ProcessHandleTable/ProcessHandleCount (64- and 32-bit),
+# the shell's tray settings key, DecryptMessage's missing count (0380-0383).
+test-commapps:
+	WINE=$(PREFIX)/bin/wine test/commapps-gate.sh
+
 deb:
 	dpkg-buildpackage -us -uc -b
 

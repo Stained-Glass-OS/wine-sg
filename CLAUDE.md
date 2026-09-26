@@ -1598,8 +1598,8 @@ applications with a failing stage.
   | Baldi's Basics (Unity, D3D11) | launches through DXVK (d3d11+dxgi), closes |
   | Fears to Fathom ep. 1 (Unity, D3D11) | settings dialog accepted; main menu renders through DXVK |
   | Doki Doki Literature Club (Ren'Py) | launches (OpenGL; DXVK not used) |
-  | Discord 1.0.9259 | installs; its updater says "Update failed -- retrying" forever (the installer never returns) |
-  | Spotify | installs; Spotify.exe (32-bit) access violation in its own code at start |
+  | Discord 1.0.9259 | installs; its updater says "Update failed -- retrying" forever (the installer never returns) -- **fixed by 0380, 0382, 0383**: login screen in ~30 s |
+  | Spotify | installs; Spotify.exe (32-bit) access violation in its own code at start -- **fixed by 0381**: sign-in screen |
   | Zoom 7.2.1 (MSI) | installs; Zoom.exe crashes in ntdll at start (exception 0x80000100; crashrpt in `%APPDATA%\Zoom\logs`) |
   | Microsoft Teams (new, MSIX) | adds; ms-teams.exe exits 3 (`Windows.ApplicationModel.LimitedAccessFeatures` missing; WebView2 host next) |
   | Adobe Acrobat Reader 26.002 | installer (`/sAll`) exits 67, nothing installed -- not triaged |
@@ -1906,6 +1906,67 @@ the glyph box and bitmap (cache keyed on it). Found by `CreateGlyphRunAnalysis`
 `cairo-dwrite-font.cpp`. Gate: `make test-dwscale` (cairo's call vs drawing at
 16 px: same box and pixels for 5 glyphs; stock 1/5 boxes, 0/5 pixels).
 dwrite:font/layout/analyzer unchanged.
+
+## `patches/sg/0380`-`0383`: Discord and Spotify start
+
+Found by the compat suite's Discord and Spotify entries (2026-09-26).
+
+- **0380 (crypt32):** the SSL chain policy honours
+  `CERT_CHAIN_POLICY_IGNORE_{END,CA,ROOT}_REV_UNKNOWN_FLAG`. Rust's schannel
+  crate (reqwest; Discord's updater) builds chains with
+  `CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY` -- every CRL is then "offline" --
+  and passes `..._IGNORE_ALL_REV_UNKNOWN_FLAGS`; we failed every HTTPS
+  request with `CERT_E_REVOCATION_FAILURE` (0x800b010e): "Update failed --
+  retrying" forever.
+- **0381 (ntdll, wow64):** `NtQueryInformationProcess` answers
+  `ProcessHandleTable` (58) and `ProcessHandleCount` from the server's
+  `get_system_handles`; WoW64 passes 58 through. Chromium's sandbox
+  (`sandbox/win/src/handle_closer_agent.cc`) lists the handles in every
+  renderer; failing that the renderer exits 7010 (`SBOX_FATAL_CLOSEHANDLES`),
+  and Spotify's browser process then crashes on purpose (a store of 0x4711
+  through NULL at `Spotify.exe+0xce0a3`, after logging `renderer_crash_url`) --
+  the "access violation at start". Only 32-bit processes failed outright
+  (WoW64 rejected the class); ntdll:info's `todo_wine` for the count now passes
+  and is removed.
+- **0382 (explorer):** the desktop process creates
+  `HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify`.
+  Squirrel's `TrayStateChanger.RemoveDeadEntries` reads `IconStreams` there
+  and throws `NullReferenceException` when the key is missing: the install
+  aborted and Discord's installer never returned.
+- **0383 (secur32):** on `SEC_E_INCOMPLETE_MESSAGE`, `DecryptMessage`'s
+  second `SECBUFFER_MISSING` buffer (`pBuffers[1]`) said the whole record's
+  size instead of the bytes still missing. The schannel crate reads
+  `pBuffers[1]` and waited for bytes the server never sends: every download
+  stalled on its last record until the server closed the idle connection
+  (Discord's first start took ~7 minutes; later starts stalled too).
+
+Discord: install **without `--silent`** (apps.list now does): Squirrel runs
+`--squirrel-firstrun` only on a non-silent install, and that is what moves
+`app-*/installer.db` into place; a silent install leaves the updater with
+"InconsistentInstallerState: Attempt to install host that is currently
+running" -- Discord's behaviour, not ours. Its login flow opens the default
+browser (a `discord.com/handoff` URL): expected.
+
+Spotify's text needs sg-shell's font Replacements (`52-sg-fonts.reg`: Arial ->
+Liberation Sans...). In a bare prefix Chromium's generic families map to
+Arial, which is absent, and every label measures 0 px wide. A session always
+has them; `SG_DEFAULTS=` gives the compat suite the same.
+
+**Gate: `make test-commapps`** (`test/commapps-gate.sh`, probe
+`test/commapps-probe.c`, 64- and 32-bit; the TLS check runs a local
+`openssl s_server` with a throwaway certificate). Stock fails 7 of 13 checks;
+each patch reverted alone fails only its own checks (mutation-tested).
+**Conformance:** crypt32:chain 2841/0 failures (as stock); ntdll:info 64- and
+32-bit 0 failures; secur32:schannel's one failure (`cert_cnt`, network) is
+the same on stock.
+
+**Next steps (not done):**
+- The compat suite's run of these two entries was disrupted (its temp
+  directory vanished mid-run): rerun `test/compat/run.sh Discord Spotify`
+  with `SG_DEFAULTS=` and update the table above.
+- Discord: a stray 160x20 white window at the desktop's top-left while it
+  runs (a Chromium helper window); Crashpad uploaded ~117 MB of reports from
+  runs that were killed -- check whether any crash is real.
 
 ## `patches/sg/0223`-`0228`: Direct2D effects and the rest of what Paint.NET 5 needs
 
