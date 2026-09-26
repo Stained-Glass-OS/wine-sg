@@ -335,6 +335,38 @@ this patch gives them the writable DACL.
 app launch fails with "no driver could be loaded", only in the multi-user
 image. `Failed to read display config` in the journal is the smoking gun.
 
+## `patches/sg/0241`: ExitWindowsEx shuts down and restarts the PC
+
+Wine's `ExitWindowsEx` only runs `wineboot --end-session`, so Start's Shut
+down and Restart (and every program's) left the PC on (found by the
+2026-09-26 ISO QA). After starting wineboot, `EWX_SHUTDOWN`/`EWX_POWEROFF`/
+`EWX_REBOOT` also start `\\?\unix/usr/bin/sg-settingsctl shutdown
+poweroff|reboot` (sg-session 0.1.0-34), which waits for the user's
+`wineboot.exe --end-session` to finish and asks logind (sg-session's polkit
+rule lets a local active user shut down, as on a Windows workstation).
+`EWX_LOGOFF` is unchanged. `SG_POWERCTL` (an absolute Unix path) names a
+stand-in. Gate: `make test-shutdown` (the stand-in records what it was asked
+and that it outlives the session's end; sign-out asks nothing).
+
+## `patches/sg/0242`: signed-in users' programs read the display configuration back
+
+With 0011 the display-config keys under `Control\Video`/`GraphicsDrivers`
+are user-writable, but win32u also needs `HKLM\HARDWARE\DEVICEMAP\VIDEO` and
+`Hardware Profiles\Current\System\CurrentControlSet\Control\Video`, whose
+containers nobody allowed ever created: the machine server's first process
+is on the services' window station (no adapters, nothing recorded), and a
+signed-in user -- even an administrator, whose token is filtered -- cannot
+create keys under the administrator-owned parents. Every program logged
+**`Failed to read display config`**: Settings offered "0 x 0" and one mode,
+and DirectDraw's primary surface failed (Media Player crashed on video;
+`vmr7_presenter_create Failed to create primary surface`). wineboot (SYSTEM,
+at machine start) now creates those volatile containers, and the server's
+display-config name rule also matches `\DEVICEMAP\VIDEO`. Gate: `make
+test-dispcfg` -- a standard user's probe on its own `explorer /desktop=shell`
+desktop: no error, 1280x800, the screen's modes; the machine server restarted
+with `SG_WINSTATION` on the services' station, as at boot. Without the
+wineboot half: 0 x 0; without the server half: no modes.
+
 ## `patches/sg/0012-windows-10-taskbar.patch`
 
 Explorer's taskbar (`Shell_TrayWnd`, `systray.c`) given a Windows 10 look **in

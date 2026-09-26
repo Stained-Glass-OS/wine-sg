@@ -131,6 +131,15 @@ test-handoff:
 test-pipeimp:
 	WINE=$(PREFIX)/bin/wine test/pipeimp-gate.sh
 
+# ExitWindowsEx shuts down and restarts the PC through sg-settingsctl (0241).
+test-shutdown:
+	WINE=$(PREFIX)/bin/wine test/shutdown-gate.sh
+
+# A standard user's programs read the display configuration back (0242); a
+# second Unix user as for test-pipeimp.
+test-dispcfg:
+	WINE=$(PREFIX)/bin/wine test/dispcfg-gate.sh
+
 # The SCM checks who asks (0141); a second Unix user as for test-pipeimp.
 test-scm-access:
 	WINE=$(PREFIX)/bin/wine test/scm-access-gate.sh
