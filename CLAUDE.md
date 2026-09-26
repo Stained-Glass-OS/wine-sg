@@ -2885,6 +2885,16 @@ shell32's "simulate a restart", winecfg's "Compatibility version" and
 reasons: cmd's `ver` banner ("Microsoft Windows <version>", which batch
 scripts parse), "Windows (CRLF)", winetest's "the Windows API". The .po
 translations keep the old msgids' text until retranslated (English meanwhile).
+The checker also flags Microsoft's feature names everywhere ("User Account
+Control" -- the consent prompt had it --, SmartScreen, Cortana, BitLocker,
+OneDrive), and, with `--brand GLOB WORD`, "Wine" in shell32's, comdlg32's
+and user32's dialogs, where it is our system speaking (the Run dialog said
+"Wine will open it for you"). **0266** fixed those: the Run dialog (our
+words, shell32's Run icon, and in front with the focus -- the shell opens it
+from a background thread; gate `make test-rundialog`, which types over
+Notepad with no click), the shutdown prompt, the Control Panel title, and
+"About Wine" in every system menu. The About box programs open with
+ShellAbout keeps Wine's credits and license, allowlisted as attribution.
 **A new patch's messages: "Stained Glass ..." or neutral.**
 
 ## Things that will bite you

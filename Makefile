@@ -29,6 +29,7 @@ install:
 lint:
 	@T=$$(tools/lint-tree.sh) && \
 	python3 tools/trademark-check.py --allow tools/trademark-allow.txt --patches patches/sg --root "$$T" \
+	    --brand 'dlls/shell32/*' Wine --brand 'dlls/comdlg32/*' Wine --brand 'dlls/user32/*' Wine \
 	    "$$T"/programs/*/*.rc "$$T"/dlls/shell32/*.rc "$$T"/dlls/comdlg32/*.rc "$$T"/dlls/user32/*.rc
 
 # Runs against the *installed* tree, not the build tree, because what we ship
@@ -104,6 +105,10 @@ test-wallpaper:
 # dark title bars (DWMWA_USE_IMMERSIVE_DARK_MODE); the taskbar's Windows mode (0160-0163).
 test-darkmode:
 	WINE=$(PREFIX)/bin/wine test/darkmode-gate.sh
+
+# The Run dialog: in front, typed into at once, our words and icon (0266).
+test-rundialog:
+	WINE=$(PREFIX)/bin/wine test/rundialog-gate.sh
 
 # The taskbar honours Settings > Personalization > Taskbar (0164).
 test-taskbar:
