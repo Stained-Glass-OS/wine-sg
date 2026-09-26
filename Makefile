@@ -134,6 +134,10 @@ test-handoff:
 test-pipeimp:
 	WINE=$(PREFIX)/bin/wine test/pipeimp-gate.sh
 
+# A wineserver started on its own raises its open-files limit (0249).
+test-serverfds:
+	WINE=$(PREFIX)/bin/wine test/serverfds-gate.sh
+
 # ExitWindowsEx shuts down and restarts the PC through sg-settingsctl (0241).
 test-shutdown:
 	WINE=$(PREFIX)/bin/wine test/shutdown-gate.sh

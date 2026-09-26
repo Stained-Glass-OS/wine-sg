@@ -408,6 +408,20 @@ for RESTRICTED (S-1-5-12) and ALL APPLICATION PACKAGES, as Windows' HKLM
 does. `make test-sandboxdesk` checks the sandboxed child reads HKLM and sees
 1280x800.
 
+## `patches/sg/0249`: a wineserver started on its own raises its open-files limit
+
+The server holds a descriptor for every file, mapping and socket of every
+attached process. Clients raise `RLIMIT_NOFILE` to the hard limit (ntdll's
+`set_max_limit`) and a server they spawn inherits it; **the machine server
+started by systemd (sg-wineserver) kept the soft 1024**. One Firefox
+(~1300 server fds) exhausted it: DLL loads failed with
+`STATUS_TOO_MANY_OPENED_FILES` (c000011f) -- "Couldn't load XPCOM", tabs
+"Exiting due to channel error", Firefox gone at startup. The server now
+raises its soft limit itself. **The tell:** `c000011f` in an import_dll error,
+or `grep 'open files' /proc/$(pgrep -x wineserver)/limits` showing 1024.
+Gate `make test-serverfds` (server started under `prlimit --nofile=1024:hard`,
+a program holds 1500 files; the mutant stops at ~760).
+
 ## `patches/sg/0012-windows-10-taskbar.patch`
 
 Explorer's taskbar (`Shell_TrayWnd`, `systray.c`) given a Windows 10 look **in
