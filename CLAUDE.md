@@ -1881,7 +1881,7 @@ purple pixels. Stock Wine's Notepad fails 25 (3 vacuous); a build that swaps
 UTF-16 BE bytes or loses keywords fails those checks. To run it against a
 build tree: `WINE=build/<tree>/obj/wine WINESERVER=build/<tree>/obj/server/wineserver`.
 
-## `patches/sg/0180`, `0184`: WordPad
+## `patches/sg/0180`, `0184`, `0240`: WordPad
 
 - **0180**: Wine's `wordpad.exe` (Program Files\Windows NT\Accessories --
   where system32's `write.exe` and the `rtffile`/`wrifile` associations go)
@@ -1917,6 +1917,19 @@ build tree: `WINE=build/<tree>/obj/wine WINESERVER=build/<tree>/obj/server/wines
 - **Gate:** sg-shell's `test/wordpad-check.sh` (58 checks with this Wine;
   stock 10.0-43 fails 16: the hand-offs, the saved indent, the zoomed
   advance, pictures' colours and saving, printing and preview).
+- **0240 riched20 tables** (4.1 mode) -- found adding Insert > Table:
+  - writer.c `stream_out_para_props` skipped a paragraph's properties equal
+    to the previous paragraph's; a row's first cell shares its ROWSTART's
+    format, so its `\intbl` was never written and a reopened table fell
+    apart. No skip after a ROWSTART/ROWEND. `\trowd` is written as
+    `\pard\trowd` so a row doesn't inherit the paragraph before's spacing.
+  - editor.c's `\cell` (4.1) applies and resets `info->fmt` as `\par`
+    does (a cell kept the pre-table paragraph's format).
+  - wrap.c: a ROWSTART/ROWEND paragraph's space before/after is not laid
+    out (they are delimiters), so rows touch.
+  - Gate: wordpad-check.sh's inserted table -> RTF -> reopen checks (a grid
+    of 3 evenly spaced lines; the .docx saved from it has 2 rows). Without
+    0240 both fail. riched20 editor/richole/txtsrv tests: no new failures.
 
 ## `patches/sg/0188`: a menu bar is painted with its MIM_BACKGROUND brush
 
