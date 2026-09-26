@@ -1493,6 +1493,38 @@ applications with a failing stage.
   Paint.NET 5.1 is left out: 0174-0176 and 0223-0228 got it through
   Direct2D; it now stops on **Windows.UI.Composition** (WinRT
   `CompositorController`, CLASS_E_CLASSNOTAVAILABLE), which Wine lacks.
+- **Round 2 (2026-09-25, 10.0-66 + 0235-0239): the applications people
+  install first.** New kinds: `msix` (added through PackageManager with
+  `test/msix-probe.c`), `zip` (portable, unpacked into `C:\Games\<slug>`),
+  `cli:` (smoke only), `accept:` (press a first dialog's default button -- a
+  Unity game's settings; `SG_ACCEPT_DIALOG=1` to the probe), a `dxvk`
+  registry value (DXVK 3.1.1's PE DLLs + native overrides, as
+  sg-install-d3d does; `DXVK_TGZ=`, the note then says which APIs DXVK
+  served), `itch:USER/GAME/UPLOAD-ID` URLs (itch.io free downloads). Also
+  fixed: the prep values were never applied (`read` skipped the last line
+  without a newline) -- Firefox's and ShareX's no-update policies included.
+
+  | Application | Result |
+  |---|---|
+  | Google Chrome 154 (enterprise MSI) | **launches, closes** (was MSI 1627: 0235-0237) |
+  | Microsoft Edge 154 (enterprise MSI) | launches, closes |
+  | Slack 4.52 | launches ("Sign in"), closes |
+  | Node.js 22.23 (MSI) | **smoke passes** (was MSI 1603: 0238) |
+  | Java 21 Temurin (MSI) | `java -version` passes, no warnings (0239) |
+  | Baldi's Basics (Unity, D3D11) | launches through DXVK (d3d11+dxgi), closes |
+  | Fears to Fathom ep. 1 (Unity, D3D11) | settings dialog accepted; main menu renders through DXVK |
+  | Doki Doki Literature Club (Ren'Py) | launches (OpenGL; DXVK not used) |
+  | Discord 1.0.9259 | installs; its updater says "Update failed -- retrying" forever (the installer never returns) |
+  | Spotify | installs; Spotify.exe (32-bit) access violation in its own code at start |
+  | Zoom 7.2.1 (MSI) | installs; Zoom.exe crashes in ntdll at start (exception 0x80000100; crashrpt in `%APPDATA%\Zoom\logs`) |
+  | Microsoft Teams (new, MSIX) | adds; ms-teams.exe exits 3 (`Windows.ApplicationModel.LimitedAccessFeatures` missing; WebView2 host next) |
+  | Adobe Acrobat Reader 26.002 | installer (`/sAll`) exits 67, nothing installed -- not triaged |
+  | Microsoft 365 (online bootstrapper) | Click-to-Run setup never finishes (killed at 25 min) |
+  | Visual Studio 2022 Build Tools | bootstrapper crashes (rc 139) before the installer is laid down |
+
+  Steam games: Steam's client needs a signed-in account, so the two free
+  games are itch.io downloads instead (both Unity/D3D11 via DXVK).
+
 - **Results (2026-09-24, 10.0-25 + 0080, with sg-shell's defaults):** 13 of
   14 launch and show their main window; 12 of 13 close. Open: Git for
   Windows' **mintty** dies silently inside `EnumFontFamiliesExW`'s callback

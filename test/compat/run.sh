@@ -13,6 +13,9 @@
 #   LAUNCH_DEBUG=channels: WINEDEBUG for the launch only (into the log)
 #   SG_DEFAULTS=DIR: import these .reg defaults first (sg-shell's theme/), as
 #   an installed system has them; KEEP_PREFIX=1 keeps each prefix in ARTIFACTS
+#   DXVK_TGZ=FILE: the DXVK release the image stages in /opt/sg-d3d (default:
+#   sg-image's cached one, else /opt/sg-d3d/dxvk), for entries with "dxvk"
+#   among their registry values -- installed as sg-install-d3d does
 #
 # Not part of `make test`: it needs the network and takes a while. Exit
 # status is the number of applications with a failing stage.
@@ -31,6 +34,21 @@ ARTIFACTS=$(cd "$ARTIFACTS" && pwd)
 T=$(mktemp -d /var/tmp/sg-compat.XXXXXX)
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 "$MINGW" -municode -O2 -o "$T/compat-probe.exe" "$HERE/compat-probe.c" || { echo "probe did not build"; exit 1; }
+# MSIX packages are added through the Store's PackageManager (msix-probe add)
+"$MINGW" -O2 -o "$T/msix-probe.exe" "$HERE/../msix-probe.c" -lruntimeobject -lshlwapi 2>/dev/null || true
+DXVK_TGZ="${DXVK_TGZ:-$HERE/../../../sg-image/build/d3d-cache/dxvk-3.1.1.tar.gz}"
+[ -f "$DXVK_TGZ" ] || DXVK_TGZ="$HOME/.cache/sg-compat/dxvk-3.1.1.tar.gz"
+
+# itch.io's free downloads: "itch:USER/GAME/UPLOAD-ID" -- the page's CSRF
+# token buys a short-lived signed URL for the upload
+itch_url() {
+    ck="$T/itch.cookies"; rm -f "$ck"
+    u=${1#itch:}; user=${u%%/*}; rest=${u#*/}; game=${rest%%/*}; id=${rest#*/}
+    tok=$(curl -sL -A Mozilla/5.0 -c "$ck" -b "$ck" "https://$user.itch.io/$game" | grep -oE 'name="csrf_token" value="[^"]+"' | head -1 | sed 's/.*value="//;s/"$//')
+    curl -s -A Mozilla/5.0 -c "$ck" -b "$ck" -X POST --data-urlencode "csrf_token=$tok" \
+        "https://$user.itch.io/$game/file/$id?source=view_game&as_props=1&after_download_lightbox=true" |
+        sed -n 's/^{"url":"\([^"]*\)".*/\1/p' | sed 's,\\/,/,g'
+}
 
 TSV="$ARTIFACTS/results.tsv"
 printf 'app\tdownload\tinstall\tfiles\tsmoke\tlaunch\tclose\tnotes\n' > "$TSV"
@@ -50,6 +68,7 @@ grep -v '^#' "$HERE/apps.list" | grep -v '^$' | while IFS='|' read -r name file 
     # download; "OUTER.zip!INNER" is an installer shipped inside a zip (the
     # hash is the zip's)
     inner=""; case "$file" in *!*) inner=${file#*!}; file=${file%%!*} ;; esac
+    case "$url" in itch:*) [ -s "$CACHE/$file" ] || [ "${OFFLINE:-0}" = 1 ] || url=$(itch_url "$url") ;; esac
     if [ ! -s "$CACHE/$file" ] && [ "${OFFLINE:-0}" != 1 ]; then curl -sL --max-time 1800 -o "$CACHE/$file.part" "$url" && mv "$CACHE/$file.part" "$CACHE/$file"; fi
     if [ -s "$CACHE/$file" ] && [ "$(sha256sum "$CACHE/$file" | cut -d' ' -f1)" = "$sha" ]; then dl=PASS; else dl=FAIL; notes="hash/download"; fi
 
@@ -65,19 +84,43 @@ grep -v '^#' "$HERE/apps.list" | grep -v '^$' | while IFS='|' read -r name file 
         for r in ${SG_DEFAULTS:+"$SG_DEFAULTS"/*.reg}; do
             [ -f "$r" ] && "$WINE" regedit /S "$("$WINE" winepath -w "$r" 2>/dev/null | tr -d '\r')" >/dev/null 2>&1
         done
-        # registry values the application needs before installing (prep)
-        printf '%s' "$prep" | tr ';' '\n' | while IFS='!' read -r rk rn rt rd; do
+        # registry values the application needs before installing (prep);
+        # "dxvk": DXVK's PE DLLs and native overrides, as the image has them
+        # (each on a line of its own: read skips a last line without a newline,
+        # which had every entry's values unapplied)
+        printf '%s\n' "$prep" | tr ';' '\n' | while IFS='!' read -r rk rn rt rd; do
+            if [ "$rk" = dxvk ]; then
+                rm -rf "$T/dxvk"; mkdir -p "$T/dxvk"
+                if [ -f "$DXVK_TGZ" ]; then tar -C "$T/dxvk" --strip-components=1 -xzf "$DXVK_TGZ"
+                elif [ -d /opt/sg-d3d/dxvk ]; then cp -r /opt/sg-d3d/dxvk/. "$T/dxvk/"; fi
+                for d in "$T"/dxvk/x64/*.dll; do [ -f "$d" ] && cp "$d" "$P/drive_c/windows/system32/"; done
+                for d in "$T"/dxvk/x32/*.dll; do [ -f "$d" ] && cp "$d" "$P/drive_c/windows/syswow64/"; done
+                for d in "$T"/dxvk/x64/*.dll; do
+                    [ -f "$d" ] && "$WINE" reg add 'HKLM\Software\Wine\DllOverrides' /v "$(basename "$d" .dll)" /d native /f >/dev/null 2>&1
+                done
+                # DXVK writes a log per API it serves: which one ran is in the notes
+                mkdir -p "$P/drive_c/dxvk-logs"
+                continue
+            fi
             [ -n "$rk" ] && "$WINE" reg add "$rk" /v "$rn" /t "$rt" /d "$rd" /f >/dev/null 2>&1
         done
         "$WINESERVER" -w
         cp "$T/compat-probe.exe" "$P/drive_c/"
+        [ -f "$T/msix-probe.exe" ] && cp "$T/msix-probe.exe" "$P/drive_c/"
         inst_path="$CACHE/$file"
         if [ -n "$inner" ]; then
             rm -rf "$T/unzip"; mkdir -p "$T/unzip"
             unzip -q -o "$CACHE/$file" "$inner" -d "$T/unzip" && inst_path="$T/unzip/$inner"
         fi
+        # kind zip: a portable program (most games), unpacked into C:\Games
+        if [ "$kind" = zip ]; then
+            mkdir -p "$P/drive_c/Games"
+            unzip -q -o "$CACHE/$file" -d "$P/drive_c/Games/$s"
+        fi
         inst_file=$("$WINE" winepath -w "$inst_path" 2>/dev/null | tr -d '\r')
-        tray=0; case "$prog" in tray:*) tray=1; prog=${prog#tray:} ;; esac
+        tray=0; accept=0
+        case "$prog" in accept:*) accept=1; prog=${prog#accept:} ;; esac
+        case "$prog" in tray:*) tray=1; prog=${prog#tray:} ;; cli:*) tray=2; prog=${prog#cli:} ;; esac
         cat > "$T/session.sh" <<EOF
 #!/bin/sh
 cd "$P/drive_c"
@@ -87,6 +130,10 @@ i=0; while ! grep -q 'desktop message loop starting' "$T/explorer.out" 2>/dev/nu
 sleep 3
 if [ "$kind" = msi ]; then
     timeout -s KILL 1500 "$WINE" msiexec /i "$inst_file" /qn $iargs >>"$L" 2>&1; echo "install_rc=\$?" > "$T/r"
+elif [ "$kind" = zip ]; then
+    echo "install_rc=0" > "$T/r"
+elif [ "$kind" = msix ]; then
+    timeout -s KILL 1500 "$WINE" msix-probe.exe add "$inst_file" >>"$L" 2>&1; echo "install_rc=\$?" > "$T/r"
 else
     timeout -s KILL 1500 "$WINE" "$inst_file" $iargs >>"$L" 2>&1; echo "install_rc=\$?" > "$T/r"
 fi
@@ -99,12 +146,14 @@ if [ -n '$smoke' ]; then
     timeout -s KILL 120 "$WINE" "\$sp" ${smoke#*::} > "$T/smoke" 2>&1
     echo "smoke_out=\$(tr -d '\r' < "$T/smoke" | tr '\n' ' ' | head -c 4000)" >> "$T/r"
 fi
-if [ $tray = 1 ]; then
+if [ $tray = 2 ]; then
+    :   # a command-line program: its smoke command is the test
+elif [ $tray = 1 ]; then
     ( "$WINE" "\$prog_unix" >>"$L" 2>&1 & ) ; sleep 25
     W compat-probe.exe alive "\$(basename "\$prog_unix")"
     import -window root "$ARTIFACTS/$s.png"
 else
-    WINEDEBUG="${LAUNCH_DEBUG:-\$WINEDEBUG}" W compat-probe.exe launch 240 "$prog" $largs
+    SG_ACCEPT_DIALOG=$accept DXVK_LOG_PATH='C:\dxvk-logs' WINEDEBUG="${LAUNCH_DEBUG:-\$WINEDEBUG}" W compat-probe.exe launch 240 "$prog" $largs
     import -window root "$ARTIFACTS/$s.png"
     hw=\$(sed -n 's/^window=\(0x[0-9a-f]*\).*/\1/p' "$T/r")
     [ -n "\$hw" ] || W compat-probe.exe list
@@ -120,12 +169,18 @@ EOF
         if [ -n "$smoke" ]; then
             if grep -q "^smoke_out=.*$expect" "$T/r"; then sm=PASS; else sm=FAIL; notes="$notes smoke: $(sed -n 's/^smoke_out=//p' "$T/r" | head -c 100)"; fi
         fi
-        if [ $tray = 1 ]; then
+        if [ $tray = 2 ]; then
+            :
+        elif [ $tray = 1 ]; then
             grep -q '^alive=1' "$T/r" && la=PASS || { la=FAIL; notes="$notes not running"; }
         elif grep -q '^window=0x' "$T/r"; then
             la=PASS; notes="$notes $(sed -n 's/^window=0x[0-9a-f]* //p' "$T/r")"
             grep -q '^closed=1' "$T/r" && cl=PASS || cl=FAIL
             grep -q '^exited=0' "$T/r" && notes="$notes; still running 30 s after closing"
+            if [ -d "$P/drive_c/dxvk-logs" ]; then
+                dx=$(ls "$P/drive_c/dxvk-logs" 2>/dev/null | sed -n 's/.*_\(d3d[0-9]*\|dxgi\)\.log$/\1/p' | sort -u | tr '\n' ' ')
+                notes="$notes; DXVK: ${dx:-not loaded}"
+            fi
         else
             la=FAIL; notes="$notes $(grep -E '^(window|launch)=' "$T/r")"
         fi

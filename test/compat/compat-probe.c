@@ -3,7 +3,10 @@
  *
  *   compat-probe launch SECONDS EXE [ARGS]   start it; wait for a new visible
  *                                           top-level window (any process: some
- *                                           applications are launchers)
+ *                                           applications are launchers); with
+ *                                           SG_ACCEPT_DIALOG=1 a dialog that comes
+ *                                           first (a game's settings) is accepted
+ *                                           with its default button
  *                                           window=0x.. class=.. title=.. WxH
  *                                           or window=none alive=0|1
  *   compat-probe close HWND                 WM_CLOSE, then whether it went
@@ -115,8 +118,10 @@ int wmain( int argc, WCHAR **argv )
         struct found f = { 0 };
         DWORD code = STILL_ACTIVE;
 
+        WCHAR exe[MAX_PATH], flag[4] = L"";
+        BOOL accept = GetEnvironmentVariableW( L"SG_ACCEPT_DIALOG", flag, ARRAYSIZE(flag) ) && flag[0] == '1';
+
         EnumWindows( snapshot, 0 );
-        WCHAR exe[MAX_PATH];
 
         ExpandEnvironmentStringsW( argv[3], exe, MAX_PATH );   /* %LOCALAPPDATA% and the like */
         swprintf( cmd, 4096, L"\"%ls\"", exe );
@@ -138,6 +143,22 @@ int wmain( int argc, WCHAR **argv )
                 EnumWindows( find_new, (LPARAM)&f );
                 if (f.hwnd && f.hwnd == chosen) stable++;
                 else { chosen = f.hwnd; stable = 0; }
+                if (accept && chosen && stable == 8)
+                {
+                    WCHAR cls[16] = L"";
+                    GetClassNameW( chosen, cls, ARRAYSIZE(cls) );
+                    if (!lstrcmpW( cls, L"#32770" ))
+                    {
+                        DWORD def = SendMessageW( chosen, DM_GETDEFID, 0, 0 );
+                        WORD id = HIWORD(def) == DC_HASDEFID ? LOWORD(def) : IDOK;
+                        HWND button = GetDlgItem( chosen, id );
+                        printf( "accepted=%#x\n", id );
+                        PostMessageW( chosen, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)button );
+                        accept = FALSE;
+                        chosen = 0;
+                        stable = 0;
+                    }
+                }
                 /* settle early only on a main-window-sized one: a first-run
                  * dialog ("please wait while we update") comes and goes too */
                 if (chosen && stable >= 16 &&
