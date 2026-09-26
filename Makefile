@@ -238,6 +238,10 @@ test-netsh:
 test-desktop-icons:
 	WINE=$(PREFIX)/bin/wine test/desktop-icons-gate.sh
 
+# The desktop: watched Desktop folders, selection, its menus, Alt+F4 asks (0261, 0262).
+test-desktop:
+	WINE=$(PREFIX)/bin/wine test/desktop-gate.sh
+
 # File Explorer: layout, This PC, search, address bar, file operations (0110-0112).
 test-explorer:
 	WINE=$(PREFIX)/bin/wine test/explorer-gate.sh

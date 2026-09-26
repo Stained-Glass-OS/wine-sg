@@ -1609,6 +1609,40 @@ the icons).
 **Patch numbers:** the compatibility work uses 0080-0089, the main session
 0090 on.
 
+## `patches/sg/0261`, `0262`: the desktop's folders, selection, menus and Alt+F4
+
+0261 (QA B15, B16): the desktop shows **every** file and folder of the
+user's and the public Desktop folders, watches both with
+ReadDirectoryChangesW and rescans on its own thread (the watcher only posts
+`WM_SG_DESKTOP_RESCAN`; a 150 ms timer folds a burst into one scan). F5
+rescans. A click selects (translucent purple), Enter opens; right-click on
+an icon = its shell `IContextMenu`; right-click on empty desktop / menu key /
+Shift+F10 = View, Sort by, Refresh, New (Folder, Text Document), Display
+settings, Personalize (`ms-settings:`). View state: `Shell\Bags\1\Desktop`
+IconSize, `Explorer\Advanced` HideIcons, `HKCU\Software\Stained
+Glass\Desktop` SortBy (0 name, 1 size, 2 type, 3 date). Not done: New >
+Shortcut (no wizard), rename in place after New.
+
+Two Wine facts it works around: the desktop window can never be the
+foreground window, so keys go to a 1x1 layered, fully transparent tool
+window at (0,0) (`SgDesktopKeys`; off-screen it gets no X focus) that a
+desktop click activates and that owns the menus; and `UpdateWindow` on the
+desktop only erases (win32u `update_now`), so before a menu's modal loop the
+desktop draws itself through `sg_draw_now` or the menu opens over a blank
+desktop.
+
+0262 (QA B18): Alt+F4 that reaches the desktop (it signed out at once) or
+the taskbar (it hid the taskbar for good -- the taskbar is the foreground
+window after the last window closes) opens "Shut Down" (Sign out / Restart /
+Shut down, OK / Cancel) -> `ExitWindowsEx`. File Explorer's Alt+F4 already
+worked; the Terminal's was sg-shell's (the key went to the shell as F4).
+
+Gate: `make test-desktop` (test/desktop-gate.sh + desktop-gate-steps.sh,
+reading the desktop's `SG_DESKTOP_DUMP`): 33 checks. It creates and deletes
+files in the Desktop folder, so it runs on scratch-home.sh's HOME, refuses a
+Desktop that resolves into the real home, and points `SG_POWERCTL` at a
+stand-in before the Restart check -- never run it any other way.
+
 ## `patches/sg/0081`, `0082`: what Git for Windows' terminal needed
 
 Found by the compatibility suite: mintty (Git Bash's terminal) died, then
