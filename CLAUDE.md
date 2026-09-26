@@ -1645,6 +1645,47 @@ the glyph box and bitmap (cache keyed on it). Found by `CreateGlyphRunAnalysis`
 16 px: same box and pixels for 5 glyphs; stock 1/5 boxes, 0/5 pixels).
 dwrite:font/layout/analyzer unchanged.
 
+## `patches/sg/0223`-`0226`: Direct2D effects and the rest of what Paint.NET 5 needs
+
+Paint.NET draws its whole UI with Direct2D -- its own effects (ComputeSharp.D2D1
+pixel shaders, registered with `RegisterEffectFromString` and property
+bindings) and Direct2D's built-ins -- animates with Windows Animation, and
+picks its GPU through DXGI. It stopped at startup on one gap after another;
+each wall was found from its crash log (`Paint.NET App Files/CrashLogs/`,
+.NET stack traces with Direct2D method names) or a `+d2d,+seh` trace:
+
+- **0223 d2d1** (`effect.c`, `device.c`, `factory.c`, `brush.c`,
+  `command_list.c`, new `color_context.c` and `geometry_realization.c`,
+  new `include/d2d1effectauthor_1.idl`): all 65 built-in effects registered
+  with properties (`builtin_*_description`, generated from a table of the
+  D2D1_*_PROP enums -- names, types, documented defaults; the generator is
+  not shipped, the strings are the source), settable (`effect->builtin`);
+  the factory's IUnknown is QI'd for ID2D1EffectImpl (**.NET ComWrappers
+  objects' IUnknown is a different vtable** -- Wine called Initialize
+  through it); ID2D1EffectContext2, `GetMaximumSupportedFeatureLevel`,
+  `CreateTransformNodeFromEffect`; ID2D1DrawInfo state; the drawing
+  context state at the device's feature level (**at 10_0 it downgraded
+  the device while drawing, and ps_5_0 effect shaders were refused**);
+  WIC/DC/HWND render targets' device at 11_1 (was 10_0); Flush's
+  D2DERR_WRONG_STATE outside drawing; command lists (empty close,
+  mid-frame target); color contexts with a built sRGB/scRGB ICC profile;
+  ID2D1GradientStopCollection1; geometry realizations.
+- **0224 dxgi** `EnumWarpAdapter` = adapter 0 (d3d11's WARP falls back there).
+- **0225 d3dcompiler** `GetMinFeatureLevel` from the shader model (+Aon9,
+  +SFI0 flags), `GetRequiresFlags` from SFI0. Wine's own HLSL compiler emits
+  no Aon9 chunk, so a 4_0_level_9_x shader it compiled reports 10_0.
+- **0226 uianimation**: a real engine (storyboards, keyframes, all library
+  transitions, custom interpolators, manager Update with handlers called
+  outside the lock, a timer ticking on the enabling thread's message loop).
+
+**Still open for Paint.NET**: `DrawImage` of an effect is not rendered
+(Wine's `d2d_device_context_DrawImage` draws bitmaps only) and
+`GetImageLocalBounds` of an effect is unimplemented -- Paint.NET's next
+crash, in its image strip. Rendering effect graphs (draw transforms with
+D2D's shader-linking input layout, built-in effects' shaders) is the next
+piece of work. Gate: `make test-d2dfx` (Xvfb; 24 checks; stock fails all
+but registration). d2d1:d2d1 and uianimation:uianimation 0 failures.
+
 ## `patches/sg/0178`-`0179`: HKEY_CLASSES_ROOT is the merged view; the user's choices
 
 Found by the PDF work: Wine's HKCR was `HKLM\Software\Classes` alone, so a
