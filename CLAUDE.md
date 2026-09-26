@@ -1521,8 +1521,10 @@ applications with a failing stage.
   `/NORUN`, else the installer starts it and the suite's launch only hands
   off to that one), HxD, foobar2000, Steam (its CEF sign-in window).
   Paint.NET 5.1 is left out: 0174-0176 and 0223-0228 got it through
-  Direct2D; it now stops on **Windows.UI.Composition** (WinRT
-  `CompositorController`, CLASS_E_CLASSNOTAVAILABLE), which Wine lacks.
+  Direct2D and it stopped on Windows.UI.Composition. **With 0229-0234 its
+  main window comes up** (menus, tools, History, Layers, Colors, the
+  canvas's swap chain), but it is not usable yet -- see the 0229-0234
+  section.
 - **Round 2 (2026-09-25, 10.0-66 + 0235-0239): the applications people
   install first.** New kinds: `msix` (added through PackageManager with
   `test/msix-probe.c`), `zip` (portable, unpacked into `C:\Games\<slug>`),
@@ -1876,6 +1878,81 @@ layout: SCENE_POSITION, TEXCOORDn = uv + texel size, t/s registers per
 input, b0 constants) comes next. Gate: `make test-d2dfx` (Xvfb; 28
 checks; stock fails all but the probe's end). d2d1:d2d1 and
 uianimation:uianimation 0 failures.
+
+## `patches/sg/0229`-`0234`: Windows.UI.Composition's first slice; Paint.NET 5 starts
+
+Paint.NET's compositor (`PdnCompositor`) is Windows.UI.Composition: a
+`CompositorController`, a desktop window target per window, sprite visuals
+whose brushes are surfaces for composition swap chains or drawing surfaces
+drawn with Direct2D. Behind that, its UI draws Direct2D effects and command
+lists. Walls were found as before (crash logs, `+d2d,+seh`; an access
+violation's module from `+loaddll` bases, then `addr2line` on the dev
+tree's PE file).
+
+- **0229 d2d1**: `DrawImage` renders effects (`effect_render.c`: each graph
+  node into an R16G16B16A16_FLOAT texture over the wanted part of its output
+  rect; draw transforms run their own pixel shader with a vertex shader
+  generated from the shader's input signature (`D3DReflect`): SV_POSITION,
+  SCENE_POSITION, TEXCOORDn = uv of input n + texel size; built-ins share
+  one internal shader with modes; the result drawn as a bitmap inside
+  `SwapDeviceContextState(context->d3d_state)`). Command lists draw: played
+  onto the context through a command sink that forwards to it (base
+  transform = offset x context transform, image rect as a clip); as an
+  effect input, played into a texture with a second device context.
+  **Upstream bugs fixed**: `DrawGeometry` was recorded without its geometry;
+  glyph runs/rects stored after a command pointed into a buffer that
+  `realloc`s -- now offsets (+1) from the command, resolved in `Stream`
+  (`d2d_command_field`). Ellipse/rounded rectangle/group `Simplify`
+  (quarter arcs k=0.5523; a group forwards members, keeping its fill mode),
+  path `Stream` (= Simplify CUBICS_AND_LINES into the sink). Also WIC
+  half/float/16-bit/alpha formats in `CreateBitmapFromWicBitmap`,
+  `GetDxgiDevice`, `IsDxgiFormatSupported`, `IsSupported`,
+  ID2D1StrokeStyle1, Crop's BorderMode and a few more effect properties (the
+  2D affine transform's are not: the tests check its enum subproperties).
+- **0230 windowscodecs**: pixel format info for the half formats; the
+  default converter to/from 64bppPRGBA, 64bppRGBAHalf/PRGBAHalf,
+  128bppRGBAFloat/PRGBAFloat via premultiplied linear floats (float and
+  half = scRGB linear, integers = sRGB). `copypixels_wide` is called by
+  CanConvert with `prc` NULL on a converter that has no `dst_format` yet --
+  check `prc` first.
+- **0231 dcomp** (new `composition.c`, `composition_private.h`,
+  `classes.idl`; new `windows.ui.composition.core.idl`/`.desktop.idl`, more
+  interop in `windows.ui.composition.interop.idl`): the classes register
+  from `classes.idl` (`#pragma makedep register`), so a prefix made after
+  this has them; an older prefix needs `wineboot -u` (or
+  `regsvr32 /s dcomp.dll` -- **without /s regsvr32 waits on a message box**).
+  Changes post WM to a hidden window; with a controller that raises
+  CommitNeeded, else commits. A target renders into an offscreen Direct2D
+  bitmap on the program's device, reads it back and `SetDIBitsToDevice`s it;
+  swap chain surfaces are then placed through 0190's
+  `IWineDXGICompositionSwapChain::set_target`. No animations, effects
+  brushes, or input.
+- **0232 d3d11, dxgi**: ID3D11Device3-5 and ID3D11DeviceContext2-4 (vtables
+  retyped to the newest, old entries cast), IDXGIDevice4; composition swap
+  chains take R16G16B16A16_FLOAT (read back half -> sRGB, LUT).
+- **0233 user32**: `Set/GetWindowFeedbackSetting` (a window property per
+  type). Stock has no export: the probe calls it last.
+- **0234 dwrite**: a glyph box outside the run's bounds is clipped in
+  `glyphrunanalysis_render` (Paint.NET wrote past the bitmap,
+  intermittently, from a panel's text).
+
+**Paint.NET 5.1 now starts** (portable, `WINEDLLOVERRIDES` unset): main
+window, menus, tools, History ("New Image"), Layers ("Background"), status
+bar, and the canvas's FP16 swap chain. **Not yet right**: the canvas shows
+the transparency checkerboard instead of the white layer; the color
+swatches/wheel and some toolbar boxes are black or empty; `PushLayer` is a
+stub; the multithreaded factory still races somewhere rarely. Next: find
+which effect or blend loses the layer (its ComputeSharp shaders, composite
+modes other than SOURCE_OVER, layers).
+
+Gates: `make test-wuicomp` (Xvfb; 17 checks: compositor, desktop target,
+sprite with a color brush and one with a drawing surface drawn green with
+Direct2D, read back from the window; Device5/Context4/IDXGIDevice4; WIC
+half; feedback) and `make test-d2dfx` (now 37: effect/command list drawing,
+simplify, stream). Mutations: dropping the commit, the recorded geometry or
+the feedback property each fail their checks. d2d1:d2d1 0 failures;
+windowscodecs converter/info/bitmap 0; d3d11:d3d11, dxgi:dxgi,
+dwrite:font/layout the same before and after.
 
 ## `patches/sg/0178`-`0179`: HKEY_CLASSES_ROOT is the merged view; the user's choices
 

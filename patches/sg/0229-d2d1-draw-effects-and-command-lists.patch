@@ -1,0 +1,2298 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: d2d1: draw effects and command lists; fixes Paint.NET's UI needs
+
+DrawImage of an effect drew nothing. Now the effect's transform graph is
+drawn with Direct3D 11: each node renders into a 16-bit float texture over
+the part of its output rectangle that is wanted. Draw transforms run their
+own pixel shaders, with a vertex shader made to match the shader's inputs
+(SV_POSITION, SCENE_POSITION, TEXCOORDn = input n's position and texel
+size). Built-in effects use one internal shader with modes (premultiply,
+unpremultiply, color matrix, sRGB/linear, opacity, flood, blur, resample,
+shadow, invert). The result is drawn onto the target as a bitmap.
+
+A command list can now be drawn: DrawImage plays it onto the context, under
+the offset and clip the call asks for. As an effect's input it is first
+played into a texture. Two command list bugs are fixed:
+ - DrawGeometry was recorded without its geometry (NULL on replay, which
+   crashed);
+ - glyph runs, bitmap and image rectangles are kept after their command in
+   a buffer that moves when it grows, so the recorded pointers dangled.
+   They are now offsets from the command, resolved when streamed.
+
+Geometries: ellipses, rounded rectangles and geometry groups simplify (to
+lines or Béziers), so Widen and CombineWithGeometry work on them. Path
+geometries stream into a geometry sink.
+
+Also:
+ - CreateBitmapFromWicBitmap takes 64bppPRGBA, 64bppPRGBAHalf,
+   64bppRGBHalf, 128bppPRGBAFloat, 128bppRGBFloat and 8bppAlpha;
+ - ID2D1Device::GetDxgiDevice, IsDxgiFormatSupported and IsSupported;
+ - stroke styles are ID2D1StrokeStyle1;
+ - the Crop effect has its BorderMode property, Composite its Mode, Shadow
+   its three properties and 3DPerspectiveTransform its eight (two
+   todo_wine in the tests now pass).
+
+Gate: test/d2dfx-gate.sh.
+---
+--- a/dlls/d2d1/bitmap.c
++++ b/dlls/d2d1/bitmap.c
+@@ -681,6 +681,12 @@
+         {&GUID_WICPixelFormat32bppPRGBA, {DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}},
+         {&GUID_WICPixelFormat32bppBGR,   {DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE}},
+         {&GUID_WICPixelFormat32bppRGB,   {DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_IGNORE}},
++        {&GUID_WICPixelFormat64bppPRGBA, {DXGI_FORMAT_R16G16B16A16_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}},
++        {&GUID_WICPixelFormat64bppPRGBAHalf, {DXGI_FORMAT_R16G16B16A16_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED}},
++        {&GUID_WICPixelFormat64bppRGBHalf, {DXGI_FORMAT_R16G16B16A16_FLOAT, D2D1_ALPHA_MODE_IGNORE}},
++        {&GUID_WICPixelFormat128bppPRGBAFloat, {DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED}},
++        {&GUID_WICPixelFormat128bppRGBFloat, {DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_IGNORE}},
++        {&GUID_WICPixelFormat8bppAlpha, {DXGI_FORMAT_A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}},
+     };
+ 
+     if (FAILED(hr = IWICBitmapSource_GetSize(bitmap_source, &size.width, &size.height)))
+@@ -736,6 +742,19 @@
+             bpp = 4;
+             break;
+ 
++        case DXGI_FORMAT_R16G16B16A16_UNORM:
++        case DXGI_FORMAT_R16G16B16A16_FLOAT:
++            bpp = 8;
++            break;
++
++        case DXGI_FORMAT_R32G32B32A32_FLOAT:
++            bpp = 16;
++            break;
++
++        case DXGI_FORMAT_A8_UNORM:
++            bpp = 1;
++            break;
++
+         default:
+             FIXME("Unhandled format %#x.\n", bitmap_desc.pixelFormat.format);
+             return D2DERR_UNSUPPORTED_PIXEL_FORMAT;
+--- a/dlls/d2d1/command_list.c
++++ b/dlls/d2d1/command_list.c
+@@ -273,6 +273,33 @@
+     ID2D1Factory_AddRef(*factory = command_list->factory);
+ }
+ 
++/* Variable-size fields follow their command in the command list's buffer,
++ * which moves when it grows. So a field's pointer is stored as its offset
++ * from the command, plus one (NULL stays NULL), and resolved when the
++ * command list is streamed. */
++static inline void d2d_command_list_write_field(BYTE **data, const void *command, void *dst, const void *src,
++        size_t size)
++{
++    void **ptr = dst;
++
++    if (!src)
++    {
++        *ptr = NULL;
++        return;
++    }
++
++    *ptr = (void *)(ULONG_PTR)(*data - (const BYTE *)command + 1);
++    memcpy(*data, src, size);
++    *data = *data + size;
++}
++
++static inline void *d2d_command_field(const void *command, const void *field)
++{
++    if (!field)
++        return NULL;
++    return (BYTE *)command + (ULONG_PTR)field - 1;
++}
++
+ static HRESULT STDMETHODCALLTYPE d2d_command_list_Stream(ID2D1CommandList *iface, ID2D1CommandSink *sink)
+ {
+     struct d2d_command_list *command_list = impl_from_ID2D1CommandList(iface);
+@@ -376,7 +403,21 @@
+             case D2D_COMMAND_DRAW_GLYPH_RUN:
+             {
+                 const struct d2d_command_draw_glyph_run *c = data;
+-                hr = ID2D1CommandSink_DrawGlyphRun(sink, c->origin, &c->run, c->run_desc, c->brush, c->measuring_mode);
++                DWRITE_GLYPH_RUN_DESCRIPTION desc, *d = NULL;
++                DWRITE_GLYPH_RUN run = c->run;
++
++                run.glyphIndices = d2d_command_field(c, c->run.glyphIndices);
++                run.glyphAdvances = d2d_command_field(c, c->run.glyphAdvances);
++                run.glyphOffsets = d2d_command_field(c, c->run.glyphOffsets);
++                if (c->run_desc)
++                {
++                    d = &desc;
++                    desc = *(const DWRITE_GLYPH_RUN_DESCRIPTION *)d2d_command_field(c, c->run_desc);
++                    desc.localeName = d2d_command_field(c, desc.localeName);
++                    desc.string = d2d_command_field(c, desc.string);
++                    desc.clusterMap = d2d_command_field(c, desc.clusterMap);
++                }
++                hr = ID2D1CommandSink_DrawGlyphRun(sink, c->origin, &run, d, c->brush, c->measuring_mode);
+                 break;
+             }
+             case D2D_COMMAND_DRAW_LINE:
+@@ -403,14 +444,16 @@
+             case D2D_COMMAND_DRAW_BITMAP:
+             {
+                 const struct d2d_command_draw_bitmap *c = data;
+-                hr = ID2D1CommandSink_DrawBitmap(sink, c->bitmap, c->dst_rect, c->opacity,
+-                        c->interpolation_mode, c->src_rect, c->perspective_transform);
++                hr = ID2D1CommandSink_DrawBitmap(sink, c->bitmap, d2d_command_field(c, c->dst_rect), c->opacity,
++                        c->interpolation_mode, d2d_command_field(c, c->src_rect),
++                        d2d_command_field(c, c->perspective_transform));
+                 break;
+             }
+             case D2D_COMMAND_DRAW_IMAGE:
+             {
+                 const struct d2d_command_draw_image *c = data;
+-                hr = ID2D1CommandSink_DrawImage(sink, c->image, c->target_offset, c->image_rect,
++                hr = ID2D1CommandSink_DrawImage(sink, c->image, d2d_command_field(c, c->target_offset),
++                        d2d_command_field(c, c->image_rect),
+                         c->interpolation_mode, c->composite_mode);
+                 break;
+             }
+@@ -423,7 +466,8 @@
+             case D2D_COMMAND_FILL_OPACITY_MASK:
+             {
+                 const struct d2d_command_fill_opacity_mask *c = data;
+-                hr = ID2D1CommandSink_FillOpacityMask(sink, c->bitmap, c->brush, c->dst_rect, c->src_rect);
++                hr = ID2D1CommandSink_FillOpacityMask(sink, c->bitmap, c->brush, d2d_command_field(c, c->dst_rect),
++                        d2d_command_field(c, c->src_rect));
+                 break;
+             }
+             case D2D_COMMAND_FILL_GEOMETRY:
+@@ -797,6 +841,7 @@
+ 
+     command = d2d_command_list_require_space(command_list, sizeof(*command));
+     command->c.op = D2D_COMMAND_DRAW_GEOMETRY;
++    command->geometry = geometry;
+     command->brush = brush;
+     command->stroke_width = stroke_width;
+     command->stroke_style = stroke_style;
+@@ -903,20 +948,6 @@
+     d2d_command_list_set_text_rendering_params_internal(command_list, FALSE, params);
+ }
+ 
+-static inline void d2d_command_list_write_field(BYTE **data, void *dst, const void *src, size_t size)
+-{
+-    void **ptr = dst;
+-
+-    if (!src)
+-    {
+-        *ptr = NULL;
+-        return;
+-    }
+-
+-    *ptr = *data;
+-    memcpy(*data, src, size);
+-    *data = *data + size;
+-}
+ 
+ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
+         const struct d2d_device_context *context, D2D1_POINT_2F origin, const DWRITE_GLYPH_RUN *run,
+@@ -975,21 +1006,22 @@
+ 
+     data = (BYTE *)(command + 1);
+ 
+-    d2d_command_list_write_field(&data, &r->glyphIndices, run->glyphIndices, glyph_count * sizeof(*r->glyphIndices));
+-    d2d_command_list_write_field(&data, &r->glyphAdvances, run->glyphAdvances, glyph_count * sizeof(*r->glyphAdvances));
+-    d2d_command_list_write_field(&data, &r->glyphOffsets, run->glyphOffsets, glyph_count * sizeof(*r->glyphOffsets));
++    d2d_command_list_write_field(&data, command, &r->glyphIndices, run->glyphIndices, glyph_count * sizeof(*r->glyphIndices));
++    d2d_command_list_write_field(&data, command, &r->glyphAdvances, run->glyphAdvances, glyph_count * sizeof(*r->glyphAdvances));
++    d2d_command_list_write_field(&data, command, &r->glyphOffsets, run->glyphOffsets, glyph_count * sizeof(*r->glyphOffsets));
+ 
+     command->run_desc = NULL;
+     if (run_desc)
+     {
+-        d = command->run_desc = (DWRITE_GLYPH_RUN_DESCRIPTION *)data;
++        d = (DWRITE_GLYPH_RUN_DESCRIPTION *)data;
++        command->run_desc = (DWRITE_GLYPH_RUN_DESCRIPTION *)(ULONG_PTR)(data - (BYTE *)command + 1);
+         memset(d, 0, sizeof(*d));
+         data += sizeof(*d);
+ 
+-        d2d_command_list_write_field(&data, &d->localeName, run_desc->localeName, (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName));
+-        d2d_command_list_write_field(&data, &d->string, run_desc->string, run_desc->stringLength * sizeof(*run_desc->string));
++        d2d_command_list_write_field(&data, command, &d->localeName, run_desc->localeName, (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName));
++        d2d_command_list_write_field(&data, command, &d->string, run_desc->string, run_desc->stringLength * sizeof(*run_desc->string));
+         d->stringLength = run_desc->stringLength;
+-        d2d_command_list_write_field(&data, &d->clusterMap, run_desc->clusterMap, run_desc->stringLength * sizeof(*run_desc->clusterMap));
++        d2d_command_list_write_field(&data, command, &d->clusterMap, run_desc->clusterMap, run_desc->stringLength * sizeof(*run_desc->clusterMap));
+         d->textPosition = run_desc->textPosition;
+     }
+ 
+@@ -1021,9 +1053,9 @@
+ 
+     data = (BYTE *)(command + 1);
+ 
+-    d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
+-    d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
+-    d2d_command_list_write_field(&data, &command->perspective_transform, perspective_transform, sizeof(*perspective_transform));
++    d2d_command_list_write_field(&data, command, &command->dst_rect, dst_rect, sizeof(*dst_rect));
++    d2d_command_list_write_field(&data, command, &command->src_rect, src_rect, sizeof(*src_rect));
++    d2d_command_list_write_field(&data, command, &command->perspective_transform, perspective_transform, sizeof(*perspective_transform));
+ }
+ 
+ void d2d_command_list_draw_image(struct d2d_command_list *command_list, ID2D1Image *image,
+@@ -1048,8 +1080,8 @@
+ 
+     data = (BYTE *)(command + 1);
+ 
+-    d2d_command_list_write_field(&data, &command->target_offset, target_offset, sizeof(*target_offset));
+-    d2d_command_list_write_field(&data, &command->image_rect, image_rect, sizeof(*image_rect));
++    d2d_command_list_write_field(&data, command, &command->target_offset, target_offset, sizeof(*target_offset));
++    d2d_command_list_write_field(&data, command, &command->image_rect, image_rect, sizeof(*image_rect));
+ }
+ 
+ void d2d_command_list_fill_mesh(struct d2d_command_list *command_list, const struct d2d_device_context *context,
+@@ -1099,6 +1131,290 @@
+ 
+     data = (BYTE *)(command + 1);
+ 
+-    d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
+-    d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
++    d2d_command_list_write_field(&data, command, &command->dst_rect, dst_rect, sizeof(*dst_rect));
++    d2d_command_list_write_field(&data, command, &command->src_rect, src_rect, sizeof(*src_rect));
++}
++
++/* Replays a closed command list onto a device context: a command sink that
++ * forwards each command, with the command list's transforms applied on top
++ * of a base transform. */
++struct d2d_replay_sink
++{
++    ID2D1CommandSink ID2D1CommandSink_iface;
++    ID2D1DeviceContext *context;
++    D2D1_MATRIX_3X2_F base;
++};
++
++static inline struct d2d_replay_sink *impl_from_replay_sink(ID2D1CommandSink *iface)
++{
++    return CONTAINING_RECORD(iface, struct d2d_replay_sink, ID2D1CommandSink_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_QueryInterface(ID2D1CommandSink *iface, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_ID2D1CommandSink) || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_replay_sink_AddRef(ID2D1CommandSink *iface)
++{
++    return 2;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_replay_sink_Release(ID2D1CommandSink *iface)
++{
++    return 1;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_BeginDraw(ID2D1CommandSink *iface)
++{
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_EndDraw(ID2D1CommandSink *iface)
++{
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_SetAntialiasMode(ID2D1CommandSink *iface, D2D1_ANTIALIAS_MODE mode)
++{
++    ID2D1DeviceContext_SetAntialiasMode(impl_from_replay_sink(iface)->context, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_SetTags(ID2D1CommandSink *iface, D2D1_TAG tag1, D2D1_TAG tag2)
++{
++    ID2D1DeviceContext_SetTags(impl_from_replay_sink(iface)->context, tag1, tag2);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_SetTextAntialiasMode(ID2D1CommandSink *iface,
++        D2D1_TEXT_ANTIALIAS_MODE mode)
++{
++    ID2D1DeviceContext_SetTextAntialiasMode(impl_from_replay_sink(iface)->context, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_SetTextRenderingParams(ID2D1CommandSink *iface,
++        IDWriteRenderingParams *params)
++{
++    ID2D1DeviceContext_SetTextRenderingParams(impl_from_replay_sink(iface)->context, params);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_SetTransform(ID2D1CommandSink *iface, const D2D1_MATRIX_3X2_F *m)
++{
++    struct d2d_replay_sink *sink = impl_from_replay_sink(iface);
++    const D2D1_MATRIX_3X2_F *b = &sink->base;
++    D2D1_MATRIX_3X2_F r;
++
++    r._11 = m->_11 * b->_11 + m->_12 * b->_21;
++    r._12 = m->_11 * b->_12 + m->_12 * b->_22;
++    r._21 = m->_21 * b->_11 + m->_22 * b->_21;
++    r._22 = m->_21 * b->_12 + m->_22 * b->_22;
++    r._31 = m->_31 * b->_11 + m->_32 * b->_21 + b->_31;
++    r._32 = m->_31 * b->_12 + m->_32 * b->_22 + b->_32;
++    ID2D1DeviceContext_SetTransform(sink->context, &r);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_SetPrimitiveBlend(ID2D1CommandSink *iface, D2D1_PRIMITIVE_BLEND blend)
++{
++    ID2D1DeviceContext_SetPrimitiveBlend(impl_from_replay_sink(iface)->context, blend);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_SetUnitMode(ID2D1CommandSink *iface, D2D1_UNIT_MODE mode)
++{
++    ID2D1DeviceContext_SetUnitMode(impl_from_replay_sink(iface)->context, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_Clear(ID2D1CommandSink *iface, const D2D1_COLOR_F *color)
++{
++    ID2D1DeviceContext_Clear(impl_from_replay_sink(iface)->context, color);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_DrawGlyphRun(ID2D1CommandSink *iface, D2D1_POINT_2F origin,
++        const DWRITE_GLYPH_RUN *run, const DWRITE_GLYPH_RUN_DESCRIPTION *desc, ID2D1Brush *brush,
++        DWRITE_MEASURING_MODE mode)
++{
++    ID2D1DeviceContext_DrawGlyphRun(impl_from_replay_sink(iface)->context, origin, run, desc, brush, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_DrawLine(ID2D1CommandSink *iface, D2D1_POINT_2F p0,
++        D2D1_POINT_2F p1, ID2D1Brush *brush, float width, ID2D1StrokeStyle *style)
++{
++    ID2D1DeviceContext_DrawLine(impl_from_replay_sink(iface)->context, p0, p1, brush, width, style);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_DrawGeometry(ID2D1CommandSink *iface, ID2D1Geometry *geometry,
++        ID2D1Brush *brush, float width, ID2D1StrokeStyle *style)
++{
++    ID2D1DeviceContext_DrawGeometry(impl_from_replay_sink(iface)->context, geometry, brush, width, style);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_DrawRectangle(ID2D1CommandSink *iface, const D2D1_RECT_F *rect,
++        ID2D1Brush *brush, float width, ID2D1StrokeStyle *style)
++{
++    ID2D1DeviceContext_DrawRectangle(impl_from_replay_sink(iface)->context, rect, brush, width, style);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_DrawBitmap(ID2D1CommandSink *iface, ID2D1Bitmap *bitmap,
++        const D2D1_RECT_F *dst_rect, float opacity, D2D1_INTERPOLATION_MODE mode, const D2D1_RECT_F *src_rect,
++        const D2D1_MATRIX_4X4_F *perspective)
++{
++    ID2D1DeviceContext_DrawBitmap(impl_from_replay_sink(iface)->context, bitmap, dst_rect, opacity, mode,
++            src_rect, perspective);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_DrawImage(ID2D1CommandSink *iface, ID2D1Image *image,
++        const D2D1_POINT_2F *offset, const D2D1_RECT_F *rect, D2D1_INTERPOLATION_MODE mode,
++        D2D1_COMPOSITE_MODE composite)
++{
++    ID2D1DeviceContext_DrawImage(impl_from_replay_sink(iface)->context, image, offset, rect, mode, composite);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_DrawGdiMetafile(ID2D1CommandSink *iface,
++        ID2D1GdiMetafile *metafile, const D2D1_POINT_2F *offset)
++{
++    ID2D1DeviceContext_DrawGdiMetafile(impl_from_replay_sink(iface)->context, metafile, offset);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_FillMesh(ID2D1CommandSink *iface, ID2D1Mesh *mesh,
++        ID2D1Brush *brush)
++{
++    ID2D1DeviceContext_FillMesh(impl_from_replay_sink(iface)->context, mesh, brush);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_FillOpacityMask(ID2D1CommandSink *iface, ID2D1Bitmap *bitmap,
++        ID2D1Brush *brush, const D2D1_RECT_F *dst_rect, const D2D1_RECT_F *src_rect)
++{
++    ID2D1DeviceContext_FillOpacityMask(impl_from_replay_sink(iface)->context, bitmap, brush, dst_rect, src_rect);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_FillGeometry(ID2D1CommandSink *iface, ID2D1Geometry *geometry,
++        ID2D1Brush *brush, ID2D1Brush *opacity_brush)
++{
++    ID2D1DeviceContext_FillGeometry(impl_from_replay_sink(iface)->context, geometry, brush, opacity_brush);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_FillRectangle(ID2D1CommandSink *iface, const D2D1_RECT_F *rect,
++        ID2D1Brush *brush)
++{
++    ID2D1DeviceContext_FillRectangle(impl_from_replay_sink(iface)->context, rect, brush);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_PushAxisAlignedClip(ID2D1CommandSink *iface,
++        const D2D1_RECT_F *rect, D2D1_ANTIALIAS_MODE mode)
++{
++    ID2D1DeviceContext_PushAxisAlignedClip(impl_from_replay_sink(iface)->context, rect, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_PushLayer(ID2D1CommandSink *iface,
++        const D2D1_LAYER_PARAMETERS1 *params, ID2D1Layer *layer)
++{
++    ID2D1DeviceContext_PushLayer(impl_from_replay_sink(iface)->context, params, layer);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_PopAxisAlignedClip(ID2D1CommandSink *iface)
++{
++    ID2D1DeviceContext_PopAxisAlignedClip(impl_from_replay_sink(iface)->context);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_replay_sink_PopLayer(ID2D1CommandSink *iface)
++{
++    ID2D1DeviceContext_PopLayer(impl_from_replay_sink(iface)->context);
++    return S_OK;
++}
++
++static const ID2D1CommandSinkVtbl d2d_replay_sink_vtbl =
++{
++    d2d_replay_sink_QueryInterface,
++    d2d_replay_sink_AddRef,
++    d2d_replay_sink_Release,
++    d2d_replay_sink_BeginDraw,
++    d2d_replay_sink_EndDraw,
++    d2d_replay_sink_SetAntialiasMode,
++    d2d_replay_sink_SetTags,
++    d2d_replay_sink_SetTextAntialiasMode,
++    d2d_replay_sink_SetTextRenderingParams,
++    d2d_replay_sink_SetTransform,
++    d2d_replay_sink_SetPrimitiveBlend,
++    d2d_replay_sink_SetUnitMode,
++    d2d_replay_sink_Clear,
++    d2d_replay_sink_DrawGlyphRun,
++    d2d_replay_sink_DrawLine,
++    d2d_replay_sink_DrawGeometry,
++    d2d_replay_sink_DrawRectangle,
++    d2d_replay_sink_DrawBitmap,
++    d2d_replay_sink_DrawImage,
++    d2d_replay_sink_DrawGdiMetafile,
++    d2d_replay_sink_FillMesh,
++    d2d_replay_sink_FillOpacityMask,
++    d2d_replay_sink_FillGeometry,
++    d2d_replay_sink_FillRectangle,
++    d2d_replay_sink_PushAxisAlignedClip,
++    d2d_replay_sink_PushLayer,
++    d2d_replay_sink_PopAxisAlignedClip,
++    d2d_replay_sink_PopLayer,
++};
++
++/* Plays the commands onto the context, keeping the context's drawing state. */
++HRESULT d2d_command_list_replay(ID2D1CommandList *list, ID2D1DeviceContext *context,
++        const D2D1_MATRIX_3X2_F *base)
++{
++    D2D1_TEXT_ANTIALIAS_MODE text_aa;
++    D2D1_PRIMITIVE_BLEND blend;
++    struct d2d_replay_sink sink;
++    D2D1_ANTIALIAS_MODE aa;
++    D2D1_MATRIX_3X2_F m;
++    D2D1_UNIT_MODE unit;
++    HRESULT hr;
++
++    ID2D1DeviceContext_GetTransform(context, &m);
++    aa = ID2D1DeviceContext_GetAntialiasMode(context);
++    text_aa = ID2D1DeviceContext_GetTextAntialiasMode(context);
++    blend = ID2D1DeviceContext_GetPrimitiveBlend(context);
++    unit = ID2D1DeviceContext_GetUnitMode(context);
++
++    sink.ID2D1CommandSink_iface.lpVtbl = &d2d_replay_sink_vtbl;
++    sink.context = context;
++    sink.base = *base;
++    ID2D1DeviceContext_SetTransform(context, base);
++    hr = ID2D1CommandList_Stream(list, &sink.ID2D1CommandSink_iface);
++
++    ID2D1DeviceContext_SetTransform(context, &m);
++    ID2D1DeviceContext_SetAntialiasMode(context, aa);
++    ID2D1DeviceContext_SetTextAntialiasMode(context, text_aa);
++    ID2D1DeviceContext_SetPrimitiveBlend(context, blend);
++    ID2D1DeviceContext_SetUnitMode(context, unit);
++    return hr;
++}
++
++ID2D1CommandList *d2d_command_list_from_image(ID2D1Image *image)
++{
++    if (image && image->lpVtbl == (void *)&d2d_command_list_vtbl)
++        return (ID2D1CommandList *)image;
++    return NULL;
+ }
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -622,6 +622,9 @@
+     IDXGIDevice *dxgi_device;
+ 
+     struct d2d_indexed_objects shaders;
++    struct d2d_indexed_objects shader_code;     /* the pixel shaders' byte code (ID3DBlob) */
++    struct d2d_indexed_objects fx_vertex_shaders; /* made to feed each pixel shader */
++    struct d2d_indexed_objects fx_internal;     /* the effect renderer's own shaders */
+ };
+ 
+ struct d2d_device *unsafe_impl_from_ID2D1Device(ID2D1Device1 *iface);
+@@ -853,6 +856,11 @@
+ struct d2d_effect *d2d_effect_from_transform_node(ID2D1TransformNode *node);
+ HRESULT d2d_image_get_rect(ID2D1Image *image, unsigned int depth, D2D1_RECT_L *rect);
+ HRESULT d2d_effect_get_rect(struct d2d_effect *effect, D2D1_RECT_L *rect);
++HRESULT d2d_device_context_draw_effect(struct d2d_device_context *context, ID2D1Image *image,
++        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect, D2D1_INTERPOLATION_MODE interpolation_mode);
++void d2d_device_context_draw_bitmap(struct d2d_device_context *context, ID2D1Bitmap *bitmap,
++        const D2D1_RECT_F *dst_rect, float opacity, D2D1_INTERPOLATION_MODE interpolation_mode,
++        const D2D1_RECT_F *src_rect, const D2D1_POINT_2F *offset, const D2D1_MATRIX_4X4_F *perspective_transform);
+ void d2d_rect_f_from_rect_l(D2D1_RECT_F *dst, const D2D1_RECT_L *src, float scale_x, float scale_y);
+ void d2d_effect_init_properties(struct d2d_effect *effect, struct d2d_effect_properties *properties);
+ HRESULT d2d_effect_properties_add(struct d2d_effect_properties *props, const WCHAR *name,
+@@ -900,6 +908,9 @@
+ 
+ HRESULT d2d_command_list_create(ID2D1Factory *factory, struct d2d_command_list **command_list);
+ struct d2d_command_list *unsafe_impl_from_ID2D1CommandList(ID2D1CommandList *iface);
++ID2D1CommandList *d2d_command_list_from_image(ID2D1Image *image);
++HRESULT d2d_command_list_replay(ID2D1CommandList *list, ID2D1DeviceContext *context,
++        const D2D1_MATRIX_3X2_F *base);
+ void d2d_command_list_begin_draw(struct d2d_command_list *command_list, const struct d2d_device_context *context);
+ void d2d_command_list_set_antialias_mode(struct d2d_command_list *command_list, D2D1_ANTIALIAS_MODE mode);
+ void d2d_command_list_set_primitive_blend(struct d2d_command_list *command_list,
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1139,7 +1139,7 @@
+         d2d_command_list_fill_opacity_mask(context->target.command_list, context, mask, brush, dst_rect, src_rect);
+ }
+ 
+-static void d2d_device_context_draw_bitmap(struct d2d_device_context *context, ID2D1Bitmap *bitmap,
++void d2d_device_context_draw_bitmap(struct d2d_device_context *context, ID2D1Bitmap *bitmap,
+         const D2D1_RECT_F *dst_rect, float opacity, D2D1_INTERPOLATION_MODE interpolation_mode,
+         const D2D1_RECT_F *src_rect, const D2D1_POINT_2F *offset,
+         const D2D1_MATRIX_4X4_F *perspective_transform)
+@@ -2046,12 +2046,26 @@
+     return D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+ }
+ 
++static BOOL d2d_device_context_format_supported(struct d2d_device_context *context, DXGI_FORMAT format);
++
+ static BOOL STDMETHODCALLTYPE d2d_device_context_IsSupported(ID2D1DeviceContext6 *iface,
+         const D2D1_RENDER_TARGET_PROPERTIES *desc)
+ {
+-    FIXME("iface %p, desc %p stub!\n", iface, desc);
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++
++    TRACE("iface %p, desc %p.\n", iface, desc);
+ 
+-    return FALSE;
++    /* drawing is done by the device: not a software target, not GDI's */
++    if (desc->type == D2D1_RENDER_TARGET_TYPE_SOFTWARE)
++        return FALSE;
++    if (desc->usage & D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE)
++        return FALSE;
++    if (desc->minLevel > D2D1_FEATURE_LEVEL_10)
++        return FALSE;
++    if (desc->pixelFormat.format != DXGI_FORMAT_UNKNOWN
++            && !d2d_device_context_format_supported(context, desc->pixelFormat.format))
++        return FALSE;
++    return TRUE;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_CreateBitmap(ID2D1DeviceContext6 *iface,
+@@ -2297,11 +2311,39 @@
+     return hr;
+ }
+ 
++/* the formats a bitmap can have, when the device can make textures of them */
++static BOOL d2d_device_context_format_supported(struct d2d_device_context *context, DXGI_FORMAT format)
++{
++    UINT support = 0;
++
++    switch (format)
++    {
++        case DXGI_FORMAT_B8G8R8A8_UNORM:
++        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++        case DXGI_FORMAT_B8G8R8X8_UNORM:
++        case DXGI_FORMAT_R8G8B8A8_UNORM:
++        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++        case DXGI_FORMAT_A8_UNORM:
++        case DXGI_FORMAT_R16G16B16A16_FLOAT:
++        case DXGI_FORMAT_R16G16B16A16_UNORM:
++        case DXGI_FORMAT_R32G32B32A32_FLOAT:
++        case DXGI_FORMAT_R10G10B10A2_UNORM:
++            break;
++        default:
++            return FALSE;
++    }
++    if (FAILED(ID3D11Device1_CheckFormatSupport(context->d3d_device, format, &support)))
++        return FALSE;
++    return !!(support & D3D11_FORMAT_SUPPORT_TEXTURE2D);
++}
++
+ static BOOL STDMETHODCALLTYPE d2d_device_context_IsDxgiFormatSupported(ID2D1DeviceContext6 *iface, DXGI_FORMAT format)
+ {
+-    FIXME("iface %p, format %#x stub!\n", iface, format);
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++
++    TRACE("iface %p, format %#x.\n", iface, format);
+ 
+-    return FALSE;
++    return d2d_device_context_format_supported(context, format);
+ }
+ 
+ static BOOL STDMETHODCALLTYPE d2d_device_context_IsBufferPrecisionSupported(ID2D1DeviceContext6 *iface,
+@@ -2625,7 +2667,9 @@
+         D2D1_COMPOSITE_MODE composite_mode)
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    ID2D1CommandList *list;
+     ID2D1Bitmap *bitmap;
++    HRESULT hr;
+ 
+     TRACE("iface %p, image %p, target_offset %s, image_rect %s, interpolation_mode %#x, composite_mode %#x.\n",
+             iface, image, debug_d2d_point_2f(target_offset), debug_d2d_rect_f(image_rect),
+@@ -2638,7 +2682,29 @@
+         return;
+     }
+ 
+-    if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER)
++    if ((list = d2d_command_list_from_image(image)))
++    {
++        D2D1_MATRIX_3X2_F m = context->drawing_state.transform, base;
++        float x = target_offset ? target_offset->x : 0.0f, y = target_offset ? target_offset->y : 0.0f;
++
++        if (image_rect)
++        {
++            D2D1_RECT_F clip = {x, y, x + image_rect->right - image_rect->left, y + image_rect->bottom - image_rect->top};
++
++            ID2D1DeviceContext6_PushAxisAlignedClip(iface, &clip, context->drawing_state.antialiasMode);
++            x -= image_rect->left;
++            y -= image_rect->top;
++        }
++        base = m;
++        base._31 = x * m._11 + y * m._21 + m._31;
++        base._32 = x * m._12 + y * m._22 + m._32;
++        d2d_command_list_replay(list, (ID2D1DeviceContext *)iface, &base);
++        if (image_rect)
++            ID2D1DeviceContext6_PopAxisAlignedClip(iface);
++        return;
++    }
++
++    if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER && composite_mode != D2D1_COMPOSITE_MODE_BOUNDED_SOURCE_COPY)
+         FIXME("Unhandled composite mode %#x.\n", composite_mode);
+ 
+     if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Bitmap, (void **)&bitmap)))
+@@ -2649,7 +2715,11 @@
+         return;
+     }
+ 
+-    FIXME("Unhandled image %p.\n", image);
++    if (FAILED(hr = d2d_device_context_draw_effect(context, image, target_offset, image_rect, interpolation_mode)))
++    {
++        WARN("Failed to draw image %p, hr %#lx.\n", image, hr);
++        d2d_device_context_set_error(context, hr);
++    }
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawGdiMetafile(ID2D1DeviceContext6 *iface,
+@@ -4407,6 +4477,9 @@
+         IDXGIDevice_Release(device->dxgi_device);
+         ID2D1Factory1_Release(device->factory);
+         d2d_device_indexed_objects_clear(&device->shaders);
++        d2d_device_indexed_objects_clear(&device->shader_code);
++        d2d_device_indexed_objects_clear(&device->fx_vertex_shaders);
++        d2d_device_indexed_objects_clear(&device->fx_internal);
+         free(device);
+     }
+ 
+@@ -4530,9 +4603,14 @@
+ static HRESULT STDMETHODCALLTYPE d2d_device_GetDxgiDevice(ID2D1Device6 *iface,
+         IDXGIDevice **dxgi_device)
+ {
+-    FIXME("iface %p, dxgi_device %p stub!\n", iface, dxgi_device);
++    struct d2d_device *device = impl_from_ID2D1Device(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, dxgi_device %p.\n", iface, dxgi_device);
++
++    if (!dxgi_device)
++        return E_POINTER;
++    IDXGIDevice_AddRef(*dxgi_device = device->dxgi_device);
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_ID2D1Device3_CreateDeviceContext(ID2D1Device6 *iface,
+--- a/dlls/d2d1/effect.c
++++ b/dlls/d2d1/effect.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "d2d1_private.h"
++#include <d3dcompiler.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
+ 
+@@ -1025,6 +1026,14 @@
+     <Inputs>                                                                      \
+       <Input name='Source'/>                                                      \
+     </Inputs>                                                                     \
++    <Property name='InterpolationMode' type='enum' value='1'/> \
++    <Property name='BorderMode' type='enum' value='0'/> \
++    <Property name='Depth' type='float' value='1000'/> \
++    <Property name='PerspectiveOrigin' type='vector2' value='(0,0)'/> \
++    <Property name='LocalOffset' type='vector3' value='(0,0,0)'/> \
++    <Property name='GlobalOffset' type='vector3' value='(0,0,0)'/> \
++    <Property name='RotationOrigin' type='vector3' value='(0,0,0)'/> \
++    <Property name='Rotation' type='vector3' value='(0,0,0)'/> \
+   </Effect>";
+ 
+ static const WCHAR composite_description[] =
+@@ -1038,6 +1047,7 @@
+       <Input name='Source1'/>                                             \
+       <Input name='Source2'/>                                             \
+     </Inputs>                                                             \
++    <Property name='Mode' type='enum' value='0'/> \
+   </Effect>";
+ 
+ static const WCHAR crop_description[] =
+@@ -1051,6 +1061,7 @@
+       <Input name='Source'/>                                              \
+     </Inputs>                                                             \
+     <Property name='Rect' type='vector4' />                               \
++    <Property name='BorderMode' type='enum' value='0'/> \
+   </Effect>";
+ 
+ static const WCHAR shadow_description[] =
+@@ -1063,6 +1074,9 @@
+     <Inputs >                                                             \
+       <Input name='Source'/>                                              \
+     </Inputs>                                                             \
++    <Property name='BlurStandardDeviation' type='float' value='3'/> \
++    <Property name='Color' type='vector4' value='(0,0,0,1)'/> \
++    <Property name='Optimization' type='enum' value='1'/> \
+   </Effect>";
+ 
+ static const WCHAR grayscale_description[] =
+@@ -2039,6 +2053,19 @@
+     hr = d2d_device_add_indexed_object(&device->shaders, shader_id, (IUnknown *)shader);
+     ID3D11PixelShader_Release(shader);
+ 
++    /* kept for drawing: the vertex shader that feeds it is made from its inputs */
++    if (SUCCEEDED(hr))
++    {
++        ID3DBlob *code;
++
++        if (SUCCEEDED(D3DCreateBlob(buffer_size, &code)))
++        {
++            memcpy(ID3D10Blob_GetBufferPointer(code), buffer, buffer_size);
++            d2d_device_add_indexed_object(&device->shader_code, shader_id, (IUnknown *)code);
++            ID3D10Blob_Release(code);
++        }
++    }
++
+     return hr;
+ }
+ 
+@@ -2829,7 +2856,10 @@
+     TRACE("iface %p, index %#x, type %u, value %p, value_size %u.\n", iface, index, type, value, value_size);
+ 
+     if (!(prop = d2d_effect_properties_get_property_by_index(properties, index)))
++    {
++        WARN("Effect %s has no property %#x.\n", properties->effect ? debugstr_guid(&properties->effect->id) : "(none)", index);
+         return D2DERR_INVALID_PROPERTY;
++    }
+ 
+     return d2d_effect_property_set_value(properties, prop, type, value, value_size);
+ }
+--- a/dlls/d2d1/effect_render.c
++++ b/dlls/d2d1/effect_render.c
+@@ -18,6 +18,8 @@
+ 
+ #include "d2d1_private.h"
+ #include "wincodec.h"
++#include <d3dcompiler.h>
++#include <d3d11shader.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
+ 
+@@ -335,6 +337,8 @@
+         else
+             hr = ID2D1Transform_MapInputRectsToOutputRect(transform, rects, opaque, node->input_count,
+                     rect, &opaque_out);
++        if (FAILED(hr))
++            WARN("MapInputRectsToOutputRect failed, hr %#lx.\n", hr);
+         free(opaque);
+         ID2D1Transform_Release(transform);
+     }
+@@ -380,7 +384,7 @@
+ static HRESULT d2d_effect_output_rect(struct d2d_effect *effect, const D2D1_RECT_L *given_inputs, unsigned int depth,
+         D2D1_RECT_L *rect)
+ {
+-    D2D1_RECT_L stack_rects[8], *inputs = stack_rects;
++    D2D1_RECT_L stack_rects[8] = {{0}}, *inputs = stack_rects;
+     struct d2d_transform_graph *graph = effect->graph;
+     HRESULT hr = S_OK;
+     unsigned int i;
+@@ -438,3 +442,1145 @@
+     dst->right = src->right == LONG_MAX ? FLT_MAX : src->right * scale_x;
+     dst->bottom = src->bottom == LONG_MAX ? FLT_MAX : src->bottom * scale_y;
+ }
++
++/*
++ * Drawing an effect's output.
++ *
++ * Each node of the graph is drawn into a texture covering its output
++ * rectangle (clipped to what is wanted): a draw transform by running its
++ * pixel shader over a quad, with its inputs bound as Direct2D binds them --
++ * input n's texture at t<n> and sampler at s<n>, its constants at b0, and
++ * the vertex shader giving SV_POSITION, SCENE_POSITION (the pixel's
++ * position in the effect's space) and TEXCOORD<n> (xy: where that is in
++ * input n's texture, zw: the size of one of its texels there), which is
++ * what shaders written for Direct2D read. The vertex shader is made to
++ * match the pixel shader's inputs. Built-in effects are drawn by shaders of
++ * our own. Intermediate textures are 16-bit float, premultiplied.
++ */
++
++struct fx_texture
++{
++    ID3D11Texture2D *texture;
++    ID3D11ShaderResourceView *srv;
++    D2D1_RECT_L rect;
++};
++
++struct fx_renderer
++{
++    struct d2d_device_context *context;
++    ID3D11Device1 *device;
++    ID3D11DeviceContext1 *dc;
++    unsigned int depth;
++};
++
++static void fx_texture_release(struct fx_texture *t)
++{
++    if (t->srv) ID3D11ShaderResourceView_Release(t->srv);
++    if (t->texture) ID3D11Texture2D_Release(t->texture);
++    memset(t, 0, sizeof(*t));
++}
++
++static void fx_texture_copy(struct fx_texture *dst, const struct fx_texture *src)
++{
++    *dst = *src;
++    if (dst->srv) ID3D11ShaderResourceView_AddRef(dst->srv);
++    if (dst->texture) ID3D11Texture2D_AddRef(dst->texture);
++}
++
++#define FX_MAX_SIZE 8192
++
++static HRESULT fx_texture_create(struct fx_renderer *r, const D2D1_RECT_L *rect, DXGI_FORMAT format,
++        struct fx_texture *t, ID3D11RenderTargetView **rtv)
++{
++    D3D11_TEXTURE2D_DESC desc;
++    HRESULT hr;
++
++    memset(t, 0, sizeof(*t));
++    desc.Width = rect->right - rect->left;
++    desc.Height = rect->bottom - rect->top;
++    desc.MipLevels = 1;
++    desc.ArraySize = 1;
++    desc.Format = format;
++    desc.SampleDesc.Count = 1;
++    desc.SampleDesc.Quality = 0;
++    desc.Usage = D3D11_USAGE_DEFAULT;
++    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++    desc.CPUAccessFlags = 0;
++    desc.MiscFlags = 0;
++    if (FAILED(hr = ID3D11Device1_CreateTexture2D(r->device, &desc, NULL, &t->texture)))
++        return hr;
++    if (FAILED(hr = ID3D11Device1_CreateShaderResourceView(r->device, (ID3D11Resource *)t->texture, NULL, &t->srv))
++            || FAILED(hr = ID3D11Device1_CreateRenderTargetView(r->device, (ID3D11Resource *)t->texture, NULL, rtv)))
++    {
++        fx_texture_release(t);
++        return hr;
++    }
++    t->rect = *rect;
++    return S_OK;
++}
++
++/* a rectangle to draw: what is wanted of what there is, not too big */
++static BOOL fx_clip(D2D1_RECT_L *rect, const D2D1_RECT_L *bounds, const D2D1_RECT_L *want)
++{
++    *rect = *bounds;
++    rect_l_intersect(rect, want);
++    if (rect_l_is_empty(rect))
++        return FALSE;
++    if ((double)rect->right - rect->left > FX_MAX_SIZE || (double)rect->bottom - rect->top > FX_MAX_SIZE)
++    {
++        WARN("Effect output %ld,%ld-%ld,%ld too big, clipped.\n", rect->left, rect->top, rect->right, rect->bottom);
++        if ((double)rect->right - rect->left > FX_MAX_SIZE) rect->right = rect->left + FX_MAX_SIZE;
++        if ((double)rect->bottom - rect->top > FX_MAX_SIZE) rect->bottom = rect->top + FX_MAX_SIZE;
++    }
++    return TRUE;
++}
++
++/* the vertex shader feeding a pixel shader: its outputs are the pixel shader's inputs */
++static const char fx_vs_prologue[] =
++    "cbuffer c : register(b0) { float4 o; float4 i[16]; };\n"
++    "struct O {\n";
++static const char fx_vs_body[] =
++    "};\n"
++    "O main(uint id : SV_VertexID)\n"
++    "{\n"
++    "    float2 c = float2(id & 1, id >> 1);\n"
++    "    float2 s = o.xy + c * o.zw;\n"
++    "    O r;\n";
++
++static HRESULT fx_append(char **buffer, size_t *size, size_t *len, const char *text)
++{
++    size_t n = strlen(text);
++
++    if (!d2d_array_reserve((void **)buffer, size, *len + n + 1, 1))
++        return E_OUTOFMEMORY;
++    memcpy(*buffer + *len, text, n + 1);
++    *len += n;
++    return S_OK;
++}
++
++static HRESULT fx_make_vertex_shader(struct fx_renderer *r, const void *ps_code, SIZE_T ps_size,
++        ID3D11VertexShader **vs)
++{
++    ID3D11ShaderReflection *reflection;
++    D3D11_SIGNATURE_PARAMETER_DESC param;
++    D3D11_SHADER_DESC desc;
++    char *src = NULL, line[160];
++    size_t size = 0, len = 0;
++    ID3DBlob *code = NULL, *errors = NULL;
++    unsigned int i, reg, pass;
++    HRESULT hr;
++
++    if (FAILED(hr = D3DReflect(ps_code, ps_size, &IID_ID3D11ShaderReflection, (void **)&reflection)))
++        return hr;
++    reflection->lpVtbl->GetDesc(reflection, &desc);
++
++    fx_append(&src, &size, &len, fx_vs_prologue);
++    /* the members in register order, then how each is filled */
++    for (pass = 0; pass < 2; ++pass)
++    {
++        if (pass)
++            fx_append(&src, &size, &len, fx_vs_body);
++        for (reg = 0; reg < 32; ++reg)
++        {
++            for (i = 0; i < desc.InputParameters; ++i)
++            {
++                if (FAILED(reflection->lpVtbl->GetInputParameterDesc(reflection, i, &param))
++                        || param.Register != reg)
++                    continue;
++                if (!pass)
++                {
++                    snprintf(line, sizeof(line), "    float4 m%u : %s%u;\n", i,
++                            param.SystemValueType == D3D_NAME_POSITION ? "SV_POSITION" : param.SemanticName,
++                            param.SystemValueType == D3D_NAME_POSITION ? 0 : param.SemanticIndex);
++                }
++                else if (param.SystemValueType == D3D_NAME_POSITION)
++                    snprintf(line, sizeof(line), "    r.m%u = float4(c.x * 2.0 - 1.0, 1.0 - c.y * 2.0, 0.0, 1.0);\n", i);
++                else if (!stricmp(param.SemanticName, "SCENE_POSITION"))
++                    snprintf(line, sizeof(line), "    r.m%u = float4(s, 0.0, 0.0);\n", i);
++                else if (!stricmp(param.SemanticName, "TEXCOORD") && param.SemanticIndex < 16)
++                    snprintf(line, sizeof(line), "    r.m%u = float4((s - i[%u].xy) * i[%u].zw, i[%u].zw);\n", i,
++                            param.SemanticIndex, param.SemanticIndex, param.SemanticIndex);
++                else if (param.SystemValueType != D3D_NAME_UNDEFINED)
++                    continue;
++                else
++                    snprintf(line, sizeof(line), "    r.m%u = 0;\n", i);
++                if (FAILED(hr = fx_append(&src, &size, &len, line)))
++                    goto done;
++            }
++        }
++    }
++    fx_append(&src, &size, &len, "    return r;\n}\n");
++    TRACE("Vertex shader:\n%s", debugstr_a(src));
++
++    if (FAILED(hr = D3DCompile(src, len, "fx_vs", NULL, NULL, "main", "vs_4_0", 0, 0, &code, &errors)))
++    {
++        ERR("Failed to compile the vertex shader, hr %#lx: %s\n", hr,
++                errors ? debugstr_a(ID3D10Blob_GetBufferPointer(errors)) : "");
++        goto done;
++    }
++    hr = ID3D11Device1_CreateVertexShader(r->device, ID3D10Blob_GetBufferPointer(code),
++            ID3D10Blob_GetBufferSize(code), NULL, vs);
++
++done:
++    if (code) ID3D10Blob_Release(code);
++    if (errors) ID3D10Blob_Release(errors);
++    reflection->lpVtbl->Release(reflection);
++    free(src);
++    return hr;
++}
++
++/* a pixel shader loaded by an effect, and the vertex shader made for it */
++static HRESULT fx_get_shaders(struct fx_renderer *r, const GUID *id, ID3D11PixelShader **ps, ID3D11VertexShader **vs)
++{
++    struct d2d_device *device = r->context->device;
++    ID3DBlob *code;
++    HRESULT hr;
++
++    *ps = NULL;
++    *vs = NULL;
++    if (!d2d_device_get_indexed_object(&device->shaders, id, (IUnknown **)ps))
++    {
++        WARN("Shader %s was not loaded.\n", debugstr_guid(id));
++        return D2DERR_SHADER_COMPILE_FAILED;
++    }
++    if (d2d_device_get_indexed_object(&device->fx_vertex_shaders, id, (IUnknown **)vs))
++        return S_OK;
++    if (!d2d_device_get_indexed_object(&device->shader_code, id, (IUnknown **)&code))
++    {
++        ID3D11PixelShader_Release(*ps);
++        *ps = NULL;
++        return E_FAIL;
++    }
++    hr = fx_make_vertex_shader(r, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), vs);
++    ID3D10Blob_Release(code);
++    if (SUCCEEDED(hr))
++        d2d_device_add_indexed_object(&device->fx_vertex_shaders, id, (IUnknown *)*vs);
++    else
++    {
++        ID3D11PixelShader_Release(*ps);
++        *ps = NULL;
++    }
++    return hr;
++}
++
++struct fx_pass_input
++{
++    const struct fx_texture *texture;
++    D3D11_FILTER filter;
++};
++
++/* one pass: a quad over the output rectangle */
++static HRESULT fx_draw(struct fx_renderer *r, ID3D11VertexShader *vs, ID3D11PixelShader *ps,
++        const D2D1_RECT_L *rect, const struct fx_pass_input *inputs, unsigned int input_count,
++        const void *constants, UINT32 constants_size, ID3D11BlendState *blend, BOOL keep, struct fx_texture *out)
++{
++    struct
++    {
++        float o[4];
++        float i[16][4];
++    } vs_constants;
++    ID3D11ShaderResourceView *srvs[16] = { 0 };
++    ID3D11SamplerState *samplers[16] = { 0 };
++    ID3D11Buffer *vs_cb = NULL, *ps_cb = NULL;
++    ID3D11RenderTargetView *rtv = NULL;
++    D3D11_SUBRESOURCE_DATA data;
++    D3D11_SAMPLER_DESC sampler_desc;
++    D3D11_BUFFER_DESC buffer_desc;
++    static const float transparent[4];
++    D3D11_VIEWPORT vp;
++    unsigned int i;
++    HRESULT hr;
++
++    input_count = min(input_count, 16);
++    if (keep)
++    {
++        /* drawing on over what is there (blending into out) */
++        if (FAILED(hr = ID3D11Device1_CreateRenderTargetView(r->device, (ID3D11Resource *)out->texture, NULL, &rtv)))
++            return hr;
++    }
++    else if (FAILED(hr = fx_texture_create(r, rect, DXGI_FORMAT_R16G16B16A16_FLOAT, out, &rtv)))
++        return hr;
++
++    memset(&vs_constants, 0, sizeof(vs_constants));
++    vs_constants.o[0] = rect->left;
++    vs_constants.o[1] = rect->top;
++    vs_constants.o[2] = rect->right - rect->left;
++    vs_constants.o[3] = rect->bottom - rect->top;
++    for (i = 0; i < input_count; ++i)
++    {
++        const struct fx_texture *t = inputs[i].texture;
++
++        if (!t || !t->srv)
++            continue;
++        vs_constants.i[i][0] = t->rect.left;
++        vs_constants.i[i][1] = t->rect.top;
++        vs_constants.i[i][2] = 1.0f / (t->rect.right - t->rect.left);
++        vs_constants.i[i][3] = 1.0f / (t->rect.bottom - t->rect.top);
++        srvs[i] = t->srv;
++
++        memset(&sampler_desc, 0, sizeof(sampler_desc));
++        sampler_desc.Filter = inputs[i].filter;
++        /* outside an input is transparent */
++        sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
++        sampler_desc.MaxAnisotropy = 1;
++        sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
++        sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
++        if (FAILED(hr = ID3D11Device1_CreateSamplerState(r->device, &sampler_desc, &samplers[i])))
++            goto done;
++    }
++
++    buffer_desc.ByteWidth = sizeof(vs_constants);
++    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
++    buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++    buffer_desc.CPUAccessFlags = 0;
++    buffer_desc.MiscFlags = 0;
++    buffer_desc.StructureByteStride = 0;
++    data.pSysMem = &vs_constants;
++    data.SysMemPitch = data.SysMemSlicePitch = 0;
++    if (FAILED(hr = ID3D11Device1_CreateBuffer(r->device, &buffer_desc, &data, &vs_cb)))
++        goto done;
++    if (constants_size)
++    {
++        void *padded;
++
++        buffer_desc.ByteWidth = (constants_size + 15) & ~15u;
++        if (!(padded = calloc(1, buffer_desc.ByteWidth)))
++        {
++            hr = E_OUTOFMEMORY;
++            goto done;
++        }
++        memcpy(padded, constants, constants_size);
++        data.pSysMem = padded;
++        hr = ID3D11Device1_CreateBuffer(r->device, &buffer_desc, &data, &ps_cb);
++        free(padded);
++        if (FAILED(hr))
++            goto done;
++    }
++
++    vp.TopLeftX = 0.0f;
++    vp.TopLeftY = 0.0f;
++    vp.Width = rect->right - rect->left;
++    vp.Height = rect->bottom - rect->top;
++    vp.MinDepth = 0.0f;
++    vp.MaxDepth = 1.0f;
++    if (keep)
++    {
++        vp.TopLeftX = rect->left - out->rect.left;
++        vp.TopLeftY = rect->top - out->rect.top;
++    }
++    else
++        ID3D11DeviceContext1_ClearRenderTargetView(r->dc, rtv, transparent);
++
++    ID3D11DeviceContext1_IASetInputLayout(r->dc, NULL);
++    ID3D11DeviceContext1_IASetPrimitiveTopology(r->dc, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
++    ID3D11DeviceContext1_VSSetShader(r->dc, vs, NULL, 0);
++    ID3D11DeviceContext1_VSSetConstantBuffers(r->dc, 0, 1, &vs_cb);
++    ID3D11DeviceContext1_PSSetShader(r->dc, ps, NULL, 0);
++    ID3D11DeviceContext1_PSSetConstantBuffers(r->dc, 0, 1, &ps_cb);
++    ID3D11DeviceContext1_PSSetShaderResources(r->dc, 0, 16, srvs);
++    ID3D11DeviceContext1_PSSetSamplers(r->dc, 0, 16, samplers);
++    ID3D11DeviceContext1_RSSetViewports(r->dc, 1, &vp);
++    ID3D11DeviceContext1_RSSetState(r->dc, NULL);
++    ID3D11DeviceContext1_OMSetBlendState(r->dc, blend, NULL, D3D11_DEFAULT_SAMPLE_MASK);
++    ID3D11DeviceContext1_OMSetRenderTargets(r->dc, 1, &rtv, NULL);
++    ID3D11DeviceContext1_Draw(r->dc, 4, 0);
++
++    /* let go of the inputs and the output */
++    memset(srvs, 0, sizeof(srvs));
++    ID3D11DeviceContext1_PSSetShaderResources(r->dc, 0, 16, srvs);
++    ID3D11DeviceContext1_OMSetRenderTargets(r->dc, 0, NULL, NULL);
++    hr = S_OK;
++
++done:
++    for (i = 0; i < ARRAY_SIZE(samplers); ++i)
++        if (samplers[i]) ID3D11SamplerState_Release(samplers[i]);
++    if (vs_cb) ID3D11Buffer_Release(vs_cb);
++    if (ps_cb) ID3D11Buffer_Release(ps_cb);
++    if (rtv) ID3D11RenderTargetView_Release(rtv);
++    if (FAILED(hr) && !keep)
++        fx_texture_release(out);
++    return hr;
++}
++
++/* The built-in effects' shader: one, with a mode. Its inputs are those of a
++ * Direct2D pixel shader, so the same vertex shader making feeds it. */
++static const char fx_builtin_ps[] =
++    "cbuffer p : register(b0) { float4x4 m; float4 v0; float4 v1; float4 v2; uint mode; };\n"
++    "Texture2D t0 : register(t0); SamplerState s0 : register(s0);\n"
++    "Texture2D t1 : register(t1); SamplerState s1 : register(s1);\n"
++    "float3 to_linear(float3 c) { return c <= 0.04045 ? c / 12.92 : pow(abs((c + 0.055) / 1.055), 2.4); }\n"
++    "float3 to_srgb(float3 c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(abs(c), 1.0 / 2.4) - 0.055; }\n"
++    "float4 unpremul(float4 c) { return c.a > 0.0 ? float4(c.rgb / c.a, c.a) : float4(0, 0, 0, 0); }\n"
++    "float4 premul(float4 c) { return float4(c.rgb * c.a, c.a); }\n"
++    "float4 main(float4 pos : SV_POSITION, float4 scene : SCENE_POSITION, float4 uv0 : TEXCOORD0,\n"
++    "        float4 uv1 : TEXCOORD1) : SV_TARGET\n"
++    "{\n"
++    "    float4 c = t0.SampleLevel(s0, uv0.xy, 0);\n"
++    "    if (mode == 1) return premul(c);\n"                          /* premultiply */
++    "    if (mode == 2) return unpremul(c);\n"                        /* un-premultiply */
++    "    if (mode == 3) {\n"                                          /* color matrix (5x4) */
++    "        float4 u = v1.x > 0.5 ? c : unpremul(c);\n"
++    "        float4 r = mul(u, m) + v0;\n"
++    "        if (v1.y > 0.5) r = saturate(r);\n"
++    "        return v1.x > 0.5 ? r : premul(r);\n"
++    "    }\n"
++    "    if (mode == 4) { float4 u = unpremul(c); return premul(float4(to_linear(u.rgb), u.a)); }\n"
++    "    if (mode == 5) { float4 u = unpremul(c); return premul(float4(to_srgb(max(u.rgb, 0)), u.a)); }\n"
++    "    if (mode == 6) return float4(c.rgb * v0.x, c.a);\n"          /* scale the colour */
++    "    if (mode == 7) return c * v0.x;\n"                           /* opacity */
++    "    if (mode == 8) return premul(v0);\n"                         /* flood */
++    "    if (mode == 9) {\n"                                          /* blur along v0.yz by deviation v0.x */
++    "        float4 sum = 0; float weight = 0; int radius = min(int(ceil(v0.x * 3.0)), 96);\n"
++    "        for (int k = -radius; k <= radius; ++k) {\n"
++    "            float w = exp(-(k * k) / (2.0 * v0.x * v0.x));\n"
++    "            sum += w * t0.SampleLevel(s0, uv0.xy + k * v0.yz * uv0.zw, 0); weight += w;\n"
++    "        }\n"
++    "        return sum / weight;\n"
++    "    }\n"
++    "    if (mode == 10) {\n"                                         /* resample through the inverse transform m */
++    "        float2 p = mul(float4(scene.xy, 0, 1), m).xy;\n"
++    "        return t0.SampleLevel(s0, (p - v0.xy) * uv0.zw, 0);\n"
++    "    }\n"
++    "    if (mode == 11) return premul(float4(v0.rgb, v0.a * c.a));\n" /* a shadow: colour v0, the input's alpha */
++    "    if (mode == 12) {\n"                                         /* invert */
++    "        float4 u = unpremul(c); return premul(float4(1.0 - u.rgb, u.a));\n"
++    "    }\n"
++    "    return c;\n"
++    "}\n";
++
++struct fx_builtin_constants
++{
++    float m[16];
++    float v0[4], v1[4], v2[4];
++    UINT32 mode, pad[3];
++};
++
++static HRESULT fx_builtin_shaders(struct fx_renderer *r, ID3D11PixelShader **ps, ID3D11VertexShader **vs)
++{
++    /* {5f2b0e8a-7c1d-4a3e-9b6f-1d2c3e4f5a6b}, {6f2b0e8a-...}: this renderer's own */
++    static const GUID ps_id = {0x5f2b0e8a, 0x7c1d, 0x4a3e, {0x9b, 0x6f, 0x1d, 0x2c, 0x3e, 0x4f, 0x5a, 0x6b}};
++    static const GUID vs_id = {0x6f2b0e8a, 0x7c1d, 0x4a3e, {0x9b, 0x6f, 0x1d, 0x2c, 0x3e, 0x4f, 0x5a, 0x6b}};
++    struct d2d_device *device = r->context->device;
++    ID3DBlob *code = NULL, *errors = NULL;
++    HRESULT hr;
++
++    if (d2d_device_get_indexed_object(&device->fx_internal, &ps_id, (IUnknown **)ps)
++            && d2d_device_get_indexed_object(&device->fx_internal, &vs_id, (IUnknown **)vs))
++        return S_OK;
++    if (*ps) ID3D11PixelShader_Release(*ps);
++    *ps = NULL;
++
++    if (FAILED(hr = D3DCompile(fx_builtin_ps, sizeof(fx_builtin_ps) - 1, "fx_builtin", NULL, NULL, "main",
++            "ps_4_0", 0, 0, &code, &errors)))
++    {
++        ERR("Failed to compile the built-in effects' shader, hr %#lx: %s\n", hr,
++                errors ? debugstr_a(ID3D10Blob_GetBufferPointer(errors)) : "");
++        if (errors) ID3D10Blob_Release(errors);
++        return hr;
++    }
++    if (SUCCEEDED(hr = ID3D11Device1_CreatePixelShader(r->device, ID3D10Blob_GetBufferPointer(code),
++            ID3D10Blob_GetBufferSize(code), NULL, ps)))
++        hr = fx_make_vertex_shader(r, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), vs);
++    ID3D10Blob_Release(code);
++    if (FAILED(hr))
++    {
++        if (*ps) ID3D11PixelShader_Release(*ps);
++        *ps = NULL;
++        return hr;
++    }
++    d2d_device_add_indexed_object(&device->fx_internal, &ps_id, (IUnknown *)*ps);
++    d2d_device_add_indexed_object(&device->fx_internal, &vs_id, (IUnknown *)*vs);
++    return S_OK;
++}
++
++static HRESULT fx_builtin_pass(struct fx_renderer *r, const struct fx_builtin_constants *c,
++        const struct fx_texture *input, D3D11_FILTER filter, const D2D1_RECT_L *rect, struct fx_texture *out)
++{
++    struct fx_pass_input in = { input, filter };
++    ID3D11PixelShader *ps;
++    ID3D11VertexShader *vs;
++    HRESULT hr;
++
++    if (FAILED(hr = fx_builtin_shaders(r, &ps, &vs)))
++        return hr;
++    hr = fx_draw(r, vs, ps, rect, &in, input ? 1 : 0, c, sizeof(*c), NULL, FALSE, out);
++    ID3D11PixelShader_Release(ps);
++    ID3D11VertexShader_Release(vs);
++    return hr;
++}
++
++static ID3D11BlendState *fx_blend_over(struct fx_renderer *r)
++{
++    D3D11_BLEND_DESC desc;
++    ID3D11BlendState *bs = NULL;
++
++    memset(&desc, 0, sizeof(desc));
++    desc.RenderTarget[0].BlendEnable = TRUE;
++    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
++    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
++    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
++    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
++    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
++    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
++    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++    ID3D11Device1_CreateBlendState(r->device, &desc, &bs);
++    return bs;
++}
++
++/* the colour space of a colour context property: 1 sRGB, 2 scRGB, 0 other */
++static D2D1_COLOR_SPACE fx_color_space(struct d2d_effect *effect, UINT32 index)
++{
++    ID2D1ColorContext *color = NULL;
++    D2D1_COLOR_SPACE space = D2D1_COLOR_SPACE_CUSTOM;
++
++    if (SUCCEEDED(ID2D1Effect_GetValue(&effect->ID2D1Effect_iface, index, D2D1_PROPERTY_TYPE_COLOR_CONTEXT,
++            (BYTE *)&color, sizeof(color))) && color)
++    {
++        space = ID2D1ColorContext_GetColorSpace(color);
++        ID2D1ColorContext_Release(color);
++    }
++    return space;
++}
++
++static HRESULT fx_render_image(struct fx_renderer *r, ID2D1Image *image, const D2D1_RECT_L *want,
++        struct fx_texture *out);
++static HRESULT fx_render_effect(struct fx_renderer *r, struct d2d_effect *effect, const struct fx_texture *given,
++        const D2D1_RECT_L *want, struct fx_texture *out);
++
++static HRESULT fx_render_builtin(struct fx_renderer *r, struct d2d_effect *effect, const struct fx_texture *inputs,
++        const D2D1_RECT_L *want, struct fx_texture *out)
++{
++    static unsigned int once;
++    const GUID *id = &effect->id;
++    struct fx_builtin_constants c;
++    D2D1_RECT_L bounds, *in_rects, rect;
++    struct fx_texture tmp;
++    unsigned int i;
++    float f, v[20];
++    HRESULT hr;
++
++    memset(out, 0, sizeof(*out));
++    memset(&c, 0, sizeof(c));
++    c.m[0] = c.m[5] = c.m[10] = c.m[15] = 1.0f;
++
++    if (!(in_rects = calloc(max(effect->input_count, 1), sizeof(*in_rects))))
++        return E_OUTOFMEMORY;
++    for (i = 0; i < effect->input_count; ++i)
++        in_rects[i] = inputs[i].rect;
++    d2d_builtin_output_rect(effect, in_rects, &bounds);
++    free(in_rects);
++    if (!fx_clip(&rect, &bounds, want))
++        return S_OK;
++
++    if (IsEqualGUID(id, &CLSID_D2D1Flood))
++    {
++        c.mode = 8;
++        if (!get_floats(effect, 0, D2D1_PROPERTY_TYPE_VECTOR4, c.v0, 4)) c.v0[3] = 1.0f;
++        return fx_builtin_pass(r, &c, NULL, D3D11_FILTER_MIN_MAG_MIP_POINT, &rect, out);
++    }
++    if (!effect->input_count)
++        return S_OK;
++
++    if (IsEqualGUID(id, &CLSID_D2D1Composite) || IsEqualGUID(id, &CLSID_D2D1Blend)
++            || IsEqualGUID(id, &CLSID_D2D1ArithmeticComposite) || IsEqualGUID(id, &CLSID_D2D1CrossFade))
++    {
++        ID3D11BlendState *over = fx_blend_over(r);
++
++        /* each input over the ones before (source over; other modes drawn so too) */
++        if (FAILED(hr = fx_builtin_pass(r, &c, &inputs[0], D3D11_FILTER_MIN_MAG_MIP_POINT, &rect, out)))
++            goto composite_done;
++        for (i = 1; i < effect->input_count; ++i)
++        {
++            struct fx_pass_input in = { &inputs[i], D3D11_FILTER_MIN_MAG_MIP_POINT };
++            ID3D11PixelShader *ps;
++            ID3D11VertexShader *vs;
++
++            if (!inputs[i].srv)
++                continue;
++            if (FAILED(hr = fx_builtin_shaders(r, &ps, &vs)))
++                break;
++            hr = fx_draw(r, vs, ps, &rect, &in, 1, &c, sizeof(c), over, TRUE, out);
++            ID3D11PixelShader_Release(ps);
++            ID3D11VertexShader_Release(vs);
++        }
++    composite_done:
++        if (over) ID3D11BlendState_Release(over);
++        return hr;
++    }
++
++    if (!inputs[0].srv)
++        return S_OK;
++
++    if (IsEqualGUID(id, &CLSID_D2D1Premultiply))
++        c.mode = 1;
++    else if (IsEqualGUID(id, &CLSID_D2D1UnPremultiply))
++        c.mode = 2;
++    else if (IsEqualGUID(id, &CLSID_D2D1ColorMatrix))
++    {
++        UINT32 alpha_mode = 1 /* premultiplied */, clamp = 0;
++
++        c.mode = 3;
++        if (get_floats(effect, 0, D2D1_PROPERTY_TYPE_MATRIX_5X4, v, 20))
++        {
++            memcpy(c.m, v, 16 * sizeof(float));
++            memcpy(c.v0, v + 16, 4 * sizeof(float));
++        }
++        get_uint(effect, 1, D2D1_PROPERTY_TYPE_ENUM, &alpha_mode);
++        get_uint(effect, 2, D2D1_PROPERTY_TYPE_BOOL, &clamp);
++        c.v1[0] = alpha_mode == 2 /* straight */ ? 1.0f : 0.0f;
++        c.v1[1] = clamp ? 1.0f : 0.0f;
++    }
++    else if (IsEqualGUID(id, &CLSID_D2D1Grayscale) || IsEqualGUID(id, &CLSID_D2D1Saturation))
++    {
++        /* luminance weights, mixed with the colour by the saturation */
++        float s = 0.0f;
++        static const float lum[3] = { 0.2126f, 0.7152f, 0.0722f };
++        unsigned int row, col;
++
++        if (IsEqualGUID(id, &CLSID_D2D1Saturation) && !get_float(effect, 0, &s)) s = 0.5f;
++        c.mode = 3;
++        memset(c.m, 0, sizeof(c.m));
++        for (row = 0; row < 3; ++row)
++            for (col = 0; col < 3; ++col)
++                c.m[row * 4 + col] = (1.0f - s) * lum[row] + (row == col ? s : 0.0f);
++        c.m[15] = 1.0f;
++    }
++    else if (IsEqualGUID(id, &CLSID_D2D1Opacity))
++    {
++        c.mode = 7;
++        if (!get_float(effect, 0, &c.v0[0])) c.v0[0] = 1.0f;
++    }
++    else if (IsEqualGUID(id, &CLSID_D2D1Invert))
++        c.mode = 12;
++    else if (IsEqualGUID(id, &CLSID_D2D1ColorManagement))
++    {
++        D2D1_COLOR_SPACE src = fx_color_space(effect, 0), dst = fx_color_space(effect, 2);
++
++        if (src == D2D1_COLOR_SPACE_SRGB && dst == D2D1_COLOR_SPACE_SCRGB)
++            c.mode = 4;
++        else if (src == D2D1_COLOR_SPACE_SCRGB && dst == D2D1_COLOR_SPACE_SRGB)
++            c.mode = 5;
++    }
++    else if (IsEqualGUID(id, &CLSID_D2D1WhiteLevelAdjustment))
++    {
++        float in_level = 80.0f, out_level = 80.0f;
++
++        get_float(effect, 0, &in_level);
++        get_float(effect, 1, &out_level);
++        c.mode = 6;
++        c.v0[0] = in_level > 0.0f ? out_level / in_level : 1.0f;
++    }
++    else if (IsEqualGUID(id, &CLSID_D2D1GaussianBlur) || IsEqualGUID(id, &CLSID_D2D1Shadow))
++    {
++        D2D1_RECT_L mid = rect;
++
++        if (!get_float(effect, 0, &f)) f = 3.0f;
++        if (f <= 0.0f)
++            return fx_builtin_pass(r, &c, &inputs[0], D3D11_FILTER_MIN_MAG_MIP_POINT, &rect, out);
++        c.mode = 9;
++        c.v0[0] = f;
++        c.v0[1] = 1.0f;
++        rect_l_inflate(&mid, 0.0, ceil(3.0 * f));
++        rect_l_intersect(&mid, &bounds);
++        if (FAILED(hr = fx_builtin_pass(r, &c, &inputs[0], D3D11_FILTER_MIN_MAG_MIP_POINT, &mid, &tmp)))
++            return hr;
++        c.v0[1] = 0.0f;
++        c.v0[2] = 1.0f;
++        if (IsEqualGUID(id, &CLSID_D2D1Shadow))
++        {
++            struct fx_texture blurred;
++
++            hr = fx_builtin_pass(r, &c, &tmp, D3D11_FILTER_MIN_MAG_MIP_POINT, &rect, &blurred);
++            fx_texture_release(&tmp);
++            if (FAILED(hr))
++                return hr;
++            memset(&c, 0, sizeof(c));
++            c.mode = 11;
++            if (!get_floats(effect, 1, D2D1_PROPERTY_TYPE_VECTOR4, c.v0, 4)) c.v0[3] = 1.0f;
++            hr = fx_builtin_pass(r, &c, &blurred, D3D11_FILTER_MIN_MAG_MIP_POINT, &rect, out);
++            fx_texture_release(&blurred);
++            return hr;
++        }
++        hr = fx_builtin_pass(r, &c, &tmp, D3D11_FILTER_MIN_MAG_MIP_POINT, &rect, out);
++        fx_texture_release(&tmp);
++        return hr;
++    }
++    else if (IsEqualGUID(id, &CLSID_D2D1Scale) || IsEqualGUID(id, &CLSID_D2D12DAffineTransform))
++    {
++        D2D1_MATRIX_3X2_F m = {{{ 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f }}}, inv;
++
++        if (IsEqualGUID(id, &CLSID_D2D1Scale))
++        {
++            if (get_floats(effect, 0, D2D1_PROPERTY_TYPE_VECTOR2, v, 2)
++                    && get_floats(effect, 1, D2D1_PROPERTY_TYPE_VECTOR2, v + 2, 2))
++            {
++                m._11 = v[0]; m._22 = v[1];
++                m._31 = v[2] - v[2] * v[0]; m._32 = v[3] - v[3] * v[1];
++            }
++        }
++        else
++            get_floats(effect, 2, D2D1_PROPERTY_TYPE_MATRIX_3X2, (float *)&m, 6);
++        inv = m;
++        if (!d2d_matrix_invert(&inv, &m))
++            return S_OK;
++        c.mode = 10;
++        /* row vector (x, y, 0, 1) times m */
++        memset(c.m, 0, sizeof(c.m));
++        c.m[0] = inv._11; c.m[1] = inv._12;
++        c.m[4] = inv._21; c.m[5] = inv._22;
++        c.m[10] = 1.0f;
++        c.m[12] = inv._31; c.m[13] = inv._32; c.m[15] = 1.0f;
++        c.v0[0] = inputs[0].rect.left;
++        c.v0[1] = inputs[0].rect.top;
++        return fx_builtin_pass(r, &c, &inputs[0], D3D11_FILTER_MIN_MAG_MIP_LINEAR, &rect, out);
++    }
++    else if (!IsEqualGUID(id, &CLSID_D2D1Crop) && !IsEqualGUID(id, &CLSID_D2D1Border)
++            && !IsEqualGUID(id, &CLSID_D2D1DpiCompensation) && !IsEqualGUID(id, &CLSID_D2D1Atlas)
++            && !IsEqualGUID(id, &CLSID_D2D1OpacityMetadata) && !once++)
++        FIXME("Built-in effect %s is drawn as its input.\n", debugstr_guid(id));
++
++    return fx_builtin_pass(r, &c, &inputs[0], D3D11_FILTER_MIN_MAG_MIP_POINT, &rect, out);
++}
++
++/* the input a node reads at an index: another node, or one of the effect's inputs */
++static HRESULT fx_render_node(struct fx_renderer *r, struct d2d_effect *effect, struct d2d_transform_node *node,
++        const struct fx_texture *effect_inputs, const D2D1_RECT_L *want, struct fx_texture *out);
++
++static HRESULT fx_render_node_input(struct fx_renderer *r, struct d2d_effect *effect,
++        struct d2d_transform_node *node, unsigned int index, const struct fx_texture *effect_inputs,
++        const D2D1_RECT_L *want, struct fx_texture *out)
++{
++    unsigned int input;
++    D2D1_RECT_L rect;
++
++    memset(out, 0, sizeof(*out));
++    if (node->inputs[index])
++        return fx_render_node(r, effect, node->inputs[index], effect_inputs, want, out);
++    if (graph_input_owner(effect->graph, node, index, &input) && effect_inputs[input].srv)
++    {
++        /* already drawn; the part wanted is used where it is */
++        rect = effect_inputs[input].rect;
++        rect_l_intersect(&rect, want);
++        if (!rect_l_is_empty(&rect))
++            fx_texture_copy(out, &effect_inputs[input]);
++    }
++    return S_OK;
++}
++
++static D3D11_FILTER fx_filter(const struct d2d_render_info *info, unsigned int index)
++{
++    if (info && index < info->input_desc_count)
++    {
++        switch (info->input_descs[index].filter)
++        {
++            case D2D1_FILTER_MIN_MAG_MIP_POINT: return D3D11_FILTER_MIN_MAG_MIP_POINT;
++            case D2D1_FILTER_ANISOTROPIC: return D3D11_FILTER_MIN_MAG_MIP_LINEAR;
++            default: return (D3D11_FILTER)info->input_descs[index].filter;
++        }
++    }
++    return D3D11_FILTER_MIN_MAG_MIP_LINEAR;
++}
++
++static HRESULT fx_render_node(struct fx_renderer *r, struct d2d_effect *effect, struct d2d_transform_node *node,
++        const struct fx_texture *effect_inputs, const D2D1_RECT_L *want, struct fx_texture *out)
++{
++    D2D1_RECT_L stack_rects[8], *rects = stack_rects, *effect_rects = NULL, bounds, rect;
++    struct fx_texture stack_textures[8], *textures = stack_textures;
++    ID2D1OffsetTransform *offset_transform;
++    ID2D1DrawTransform *draw;
++    struct d2d_effect *nested;
++    unsigned int i, n = node->input_count;
++    HRESULT hr = S_OK;
++
++    memset(out, 0, sizeof(*out));
++    if (++r->depth > 64)
++    {
++        --r->depth;
++        return E_FAIL;
++    }
++    if (n > ARRAY_SIZE(stack_rects)
++            && (!(rects = calloc(n, sizeof(*rects))) || !(textures = calloc(n, sizeof(*textures)))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    memset(textures, 0, max(n, 1) * sizeof(*textures));
++
++    /* the node's full output rectangle, from its inputs' */
++    if (!(effect_rects = calloc(max(effect->input_count, 1), sizeof(*effect_rects))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    for (i = 0; i < effect->input_count; ++i)
++        effect_rects[i] = effect_inputs[i].rect;
++    if (FAILED(hr = d2d_node_output_rect(effect, node, effect_rects, 0, &bounds)))
++    {
++        WARN("Failed to get node %p's output rectangle, hr %#lx.\n", node->object, hr);
++        goto done;
++    }
++    if (!fx_clip(&rect, &bounds, want))
++        goto done;
++
++    if (SUCCEEDED(ID2D1TransformNode_QueryInterface(node->object, &IID_ID2D1DrawTransform, (void **)&draw)))
++    {
++        ID3D11PixelShader *ps = NULL;
++        ID3D11VertexShader *vs = NULL;
++        struct fx_pass_input pass_inputs[16];
++        struct d2d_render_info *info = node->render_info;
++
++        /* what of its inputs it reads */
++        /* a transform with no inputs is not asked (generators need not answer) */
++        if (n)
++            hr = ID2D1DrawTransform_MapOutputRectToInputRects(draw, &rect, rects, n);
++        ID2D1DrawTransform_Release(draw);
++        if (FAILED(hr))
++            WARN("MapOutputRectToInputRects failed, hr %#lx.\n", hr);
++        for (i = 0; i < n && SUCCEEDED(hr); ++i)
++            hr = fx_render_node_input(r, effect, node, i, effect_inputs, &rects[i], &textures[i]);
++        if (FAILED(hr))
++            goto done;
++        if (!info || !(info->mask & D2D_RENDER_INFO_PIXEL_SHADER))
++        {
++            FIXME("Draw transform %p has no pixel shader.\n", node->object);
++            goto done;
++        }
++        if (FAILED(hr = fx_get_shaders(r, &info->pixel_shader, &ps, &vs)))
++            goto done;
++        for (i = 0; i < min(n, 16); ++i)
++        {
++            pass_inputs[i].texture = &textures[i];
++            pass_inputs[i].filter = fx_filter(info, i);
++        }
++        hr = fx_draw(r, vs, ps, &rect, pass_inputs, min(n, 16), info->ps_constants, info->ps_constants_size,
++                NULL, FALSE, out);
++        ID3D11PixelShader_Release(ps);
++        ID3D11VertexShader_Release(vs);
++    }
++    else if ((nested = d2d_effect_from_transform_node(node->object)))
++    {
++        /* an effect as a node: its inputs are this node's, drawn as far as it may read */
++        D2D1_RECT_L input_want = rect;
++
++        rect_l_inflate(&input_want, 256.0, 256.0);
++        for (i = 0; i < n && SUCCEEDED(hr); ++i)
++            hr = fx_render_node_input(r, effect, node, i, effect_inputs, &input_want, &textures[i]);
++        if (SUCCEEDED(hr))
++            hr = fx_render_effect(r, nested, textures, &rect, out);
++    }
++    else if (SUCCEEDED(ID2D1TransformNode_QueryInterface(node->object, &IID_ID2D1OffsetTransform,
++            (void **)&offset_transform)))
++    {
++        D2D1_POINT_2L offset = ID2D1OffsetTransform_GetOffset(offset_transform);
++        D2D1_RECT_L input_want = rect;
++
++        ID2D1OffsetTransform_Release(offset_transform);
++        rect_l_offset(&input_want, -offset.x, -offset.y);
++        if (n && SUCCEEDED(hr = fx_render_node_input(r, effect, node, 0, effect_inputs, &input_want, out)))
++            rect_l_offset(&out->rect, offset.x, offset.y);
++    }
++    else
++    {
++        /* blend: the inputs over each other; border, bounds adjustment: the input */
++        ID2D1BlendTransform *blend;
++
++        for (i = 0; i < n && SUCCEEDED(hr); ++i)
++            hr = fx_render_node_input(r, effect, node, i, effect_inputs, &rect, &textures[i]);
++        if (FAILED(hr))
++            goto done;
++        if (n > 1 && SUCCEEDED(ID2D1TransformNode_QueryInterface(node->object, &IID_ID2D1BlendTransform,
++                (void **)&blend)))
++        {
++            struct fx_builtin_constants c;
++            ID3D11BlendState *over = fx_blend_over(r);
++            ID3D11PixelShader *ps;
++            ID3D11VertexShader *vs;
++
++            ID2D1BlendTransform_Release(blend);
++            memset(&c, 0, sizeof(c));
++            if (SUCCEEDED(hr = fx_builtin_pass(r, &c, &textures[0], D3D11_FILTER_MIN_MAG_MIP_POINT, &rect, out))
++                    && SUCCEEDED(hr = fx_builtin_shaders(r, &ps, &vs)))
++            {
++                for (i = 1; i < n && SUCCEEDED(hr); ++i)
++                {
++                    struct fx_pass_input in = { &textures[i], D3D11_FILTER_MIN_MAG_MIP_POINT };
++                    if (textures[i].srv)
++                        hr = fx_draw(r, vs, ps, &rect, &in, 1, &c, sizeof(c), over, TRUE, out);
++                }
++                ID3D11PixelShader_Release(ps);
++                ID3D11VertexShader_Release(vs);
++            }
++            if (over) ID3D11BlendState_Release(over);
++        }
++        else if (n)
++        {
++            fx_texture_copy(out, &textures[0]);
++        }
++    }
++
++done:
++    for (i = 0; i < n && textures; ++i)
++        fx_texture_release(&textures[i]);
++    if (rects != stack_rects) free(rects);
++    if (textures != stack_textures) free(textures);
++    free(effect_rects);
++    --r->depth;
++    return hr;
++}
++
++/* an effect's output over (part of) a rectangle; given: its inputs, already drawn (as a node) */
++static HRESULT fx_render_effect(struct fx_renderer *r, struct d2d_effect *effect, const struct fx_texture *given,
++        const D2D1_RECT_L *want, struct fx_texture *out)
++{
++    struct fx_texture *inputs = NULL;
++    struct d2d_transform_graph *graph = effect->graph;
++    D2D1_RECT_L bounds, input_want;
++    unsigned int i;
++    HRESULT hr = S_OK;
++
++    memset(out, 0, sizeof(*out));
++    if (++r->depth > 64)
++    {
++        --r->depth;
++        return E_FAIL;
++    }
++
++    if (effect->impl && !effect->builtin)
++        ID2D1EffectImpl_PrepareForRender(effect->impl, D2D1_CHANGE_TYPE_NONE);
++
++    if (!(inputs = calloc(max(effect->input_count, 1), sizeof(*inputs))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    /* its inputs, as far as the effect may read them (a margin for filters) */
++    input_want = *want;
++    rect_l_inflate(&input_want, 256.0, 256.0);
++    for (i = 0; i < effect->input_count && SUCCEEDED(hr); ++i)
++    {
++        if (given)
++            fx_texture_copy(&inputs[i], &given[i]);
++        else
++            hr = fx_render_image(r, effect->inputs[i], &input_want, &inputs[i]);
++    }
++    if (FAILED(hr))
++        goto done;
++
++    if (effect->builtin)
++    {
++        hr = fx_render_builtin(r, effect, inputs, want, out);
++    }
++    else if (!graph)
++        ;
++    else if (graph->passthrough)
++    {
++        if (graph->passthrough_input < effect->input_count)
++            fx_texture_copy(out, &inputs[graph->passthrough_input]);
++        (void)bounds;
++    }
++    else if (graph->output)
++        hr = fx_render_node(r, effect, graph->output, inputs, want, out);
++
++done:
++    for (i = 0; inputs && i < effect->input_count; ++i)
++        fx_texture_release(&inputs[i]);
++    free(inputs);
++    --r->depth;
++    return hr;
++}
++
++/* a command list, played into a texture covering the wanted rectangle */
++static HRESULT fx_render_command_list(struct fx_renderer *r, ID2D1CommandList *list, const D2D1_RECT_L *want,
++        struct fx_texture *out)
++{
++    D2D1_BITMAP_PROPERTIES1 props = {{DXGI_FORMAT_R16G16B16A16_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED},
++            96.0f, 96.0f, D2D1_BITMAP_OPTIONS_TARGET};
++    static const D2D1_COLOR_F transparent = {0.0f, 0.0f, 0.0f, 0.0f};
++    D2D1_MATRIX_3X2_F base = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
++    ID2D1DeviceContext *dc;
++    ID2D1Bitmap1 *bitmap;
++    D2D1_RECT_L rect;
++    D2D1_SIZE_U size;
++    HRESULT hr;
++
++    if (!fx_clip(&rect, &infinite_rect, want))
++        return S_OK;
++    size.width = rect.right - rect.left;
++    size.height = rect.bottom - rect.top;
++
++    if (FAILED(hr = ID2D1Device6_CreateDeviceContext(&r->context->device->ID2D1Device6_iface,
++            D2D1_DEVICE_CONTEXT_OPTIONS_NONE, (ID2D1DeviceContext6 **)&dc)))
++        return hr;
++    if (FAILED(hr = ID2D1DeviceContext_CreateBitmap(dc, size, NULL, 0, &props, &bitmap)))
++    {
++        ID2D1DeviceContext_Release(dc);
++        return hr;
++    }
++    ID2D1DeviceContext_SetTarget(dc, (ID2D1Image *)bitmap);
++    ID2D1DeviceContext_BeginDraw(dc);
++    ID2D1DeviceContext_Clear(dc, &transparent);
++    base._31 = -rect.left;
++    base._32 = -rect.top;
++    d2d_command_list_replay(list, dc, &base);
++    hr = ID2D1DeviceContext_EndDraw(dc, NULL, NULL);
++    if (FAILED(hr))
++        WARN("Failed to play command list %p, hr %#lx.\n", list, hr);
++
++    out->srv = unsafe_impl_from_ID2D1Bitmap((ID2D1Bitmap *)bitmap)->srv;
++    if (out->srv)
++        ID3D11ShaderResourceView_AddRef(out->srv);
++    out->rect = rect;
++    ID2D1Bitmap1_Release(bitmap);
++    ID2D1DeviceContext_Release(dc);
++    return S_OK;
++}
++
++/* an image as a texture: a bitmap is one, an effect is drawn */
++static HRESULT fx_render_image(struct fx_renderer *r, ID2D1Image *image, const D2D1_RECT_L *want,
++        struct fx_texture *out)
++{
++    struct d2d_bitmap *bitmap_impl;
++    struct d2d_effect *effect;
++    ID2D1CommandList *list;
++    ID2D1Bitmap *bitmap;
++
++    memset(out, 0, sizeof(*out));
++    if (!image)
++        return S_OK;
++    if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Bitmap, (void **)&bitmap)))
++    {
++        bitmap_impl = unsafe_impl_from_ID2D1Bitmap(bitmap);
++        if (bitmap_impl->srv)
++        {
++            out->srv = bitmap_impl->srv;
++            ID3D11ShaderResourceView_AddRef(out->srv);
++            out->rect.right = bitmap_impl->pixel_size.width;
++            out->rect.bottom = bitmap_impl->pixel_size.height;
++        }
++        else
++            FIXME("Bitmap %p cannot be drawn from.\n", bitmap);
++        ID2D1Bitmap_Release(bitmap);
++        return S_OK;
++    }
++    if ((effect = d2d_effect_from_image(image)))
++        return fx_render_effect(r, effect, NULL, want, out);
++    if ((list = d2d_command_list_from_image(image)))
++        return fx_render_command_list(r, list, want, out);
++
++    FIXME("Drawing image %p is not supported.\n", image);
++    return S_OK;
++}
++
++/* Draws an effect's output: into a texture, then as a bitmap. */
++HRESULT d2d_device_context_draw_effect(struct d2d_device_context *context, ID2D1Image *image,
++        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect, D2D1_INTERPOLATION_MODE interpolation_mode)
++{
++    struct fx_renderer r = { context, context->d3d_device };
++    struct fx_texture result = { 0 }, final = { 0 };
++    ID3D11RenderTargetView *rtv = NULL;
++    ID3DDeviceContextState *prev_state;
++    D2D1_BITMAP_PROPERTIES1 props;
++    D2D1_RECT_L want, bounds, rect;
++    struct d2d_bitmap *bitmap = NULL;
++    IDXGISurface *surface = NULL;
++    D2D1_POINT_2F offset;
++    D2D1_RECT_F src;
++    float dpi_scale;
++    HRESULT hr;
++
++    dpi_scale = context->desc.dpiX > 0.0f ? context->desc.dpiX / 96.0f : 1.0f;
++
++    /* what of it can show: the image rectangle asked for, or what covers the target */
++    if (FAILED(hr = d2d_image_get_rect(image, 0, &bounds)))
++        return hr;
++    if (image_rect)
++    {
++        want.left = floorf(image_rect->left * dpi_scale);
++        want.top = floorf(image_rect->top * dpi_scale);
++        want.right = ceilf(image_rect->right * dpi_scale);
++        want.bottom = ceilf(image_rect->bottom * dpi_scale);
++    }
++    else
++    {
++        const D2D1_MATRIX_3X2_F *m = &context->drawing_state.transform;
++        D2D1_MATRIX_3X2_F scaled = *m, inv;
++        D2D1_RECT_L target = { 0, 0, context->pixel_size.width, context->pixel_size.height };
++        float ox = target_offset ? target_offset->x * dpi_scale : 0.0f;
++        float oy = target_offset ? target_offset->y * dpi_scale : 0.0f;
++
++        /* the target, back through the transform and the offset */
++        scaled._31 *= dpi_scale;
++        scaled._32 *= dpi_scale;
++        want = target;
++        if (d2d_matrix_invert(&inv, &scaled))
++            rect_l_transform(&want, &inv);
++        else
++            want = infinite_rect;
++        rect_l_offset(&want, clamp_to_long(-ox), clamp_to_long(-oy));
++        rect_l_inflate(&want, 2.0, 2.0);
++    }
++    if (!fx_clip(&rect, &bounds, &want))
++        return S_OK;
++
++    if (context->cs)
++        EnterCriticalSection(context->cs);
++    ID3D11Device1_GetImmediateContext1(r.device, &r.dc);
++    ID3D11DeviceContext1_SwapDeviceContextState(r.dc, context->d3d_state, &prev_state);
++
++    hr = fx_render_image(&r, image, &rect, &result);
++    if (SUCCEEDED(hr) && result.srv)
++    {
++        struct fx_builtin_constants c;
++        D2D1_RECT_L out_rect = result.rect;
++        struct fx_pass_input in = { &result, D3D11_FILTER_MIN_MAG_MIP_POINT };
++        ID3D11PixelShader *ps;
++        ID3D11VertexShader *vs;
++
++        /* into a texture Direct2D can draw as a bitmap */
++        rect_l_intersect(&out_rect, &rect);
++        memset(&c, 0, sizeof(c));
++        if (!rect_l_is_empty(&out_rect)
++                && SUCCEEDED(hr = fx_texture_create(&r, &out_rect, DXGI_FORMAT_B8G8R8A8_UNORM, &final, &rtv)))
++        {
++            ID3D11RenderTargetView_Release(rtv);
++            if (SUCCEEDED(hr = fx_builtin_shaders(&r, &ps, &vs)))
++            {
++                hr = fx_draw(&r, vs, ps, &out_rect, &in, 1, &c, sizeof(c), NULL, TRUE, &final);
++                ID3D11PixelShader_Release(ps);
++                ID3D11VertexShader_Release(vs);
++            }
++        }
++    }
++
++    ID3D11DeviceContext1_SwapDeviceContextState(r.dc, prev_state, NULL);
++    ID3DDeviceContextState_Release(prev_state);
++    ID3D11DeviceContext1_Release(r.dc);
++    if (context->cs)
++        LeaveCriticalSection(context->cs);
++    fx_texture_release(&result);
++
++    if (SUCCEEDED(hr) && final.texture
++            && SUCCEEDED(hr = ID3D11Texture2D_QueryInterface(final.texture, &IID_IDXGISurface, (void **)&surface)))
++    {
++        memset(&props, 0, sizeof(props));
++        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
++        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
++        props.dpiX = props.dpiY = 96.0f * dpi_scale;
++        props.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
++        if (SUCCEEDED(hr = d2d_bitmap_create_shared(context, &IID_IDXGISurface, surface, &props, &bitmap)))
++        {
++            offset.x = (target_offset ? target_offset->x : 0.0f) + final.rect.left / dpi_scale;
++            offset.y = (target_offset ? target_offset->y : 0.0f) + final.rect.top / dpi_scale;
++            src.left = 0.0f;
++            src.top = 0.0f;
++            src.right = (final.rect.right - final.rect.left) / dpi_scale;
++            src.bottom = (final.rect.bottom - final.rect.top) / dpi_scale;
++            d2d_device_context_draw_bitmap(context, (ID2D1Bitmap *)&bitmap->ID2D1Bitmap1_iface, NULL, 1.0f,
++                    interpolation_mode, &src, &offset, NULL);
++            ID2D1Bitmap1_Release(&bitmap->ID2D1Bitmap1_iface);
++        }
++        IDXGISurface_Release(surface);
++    }
++    fx_texture_release(&final);
++    return hr;
++}
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3725,6 +3725,61 @@
+     ID2D1SimplifiedGeometrySink_SetSegmentFlags(sink, D2D1_PATH_SEGMENT_NONE);
+ }
+ 
++/* Emits one closed figure made of line and cubic segments. "segs" holds
++ * "count" segments; for a line only point3 is used. */
++struct d2d_simple_segment
++{
++    BOOL bezier;
++    D2D1_BEZIER_SEGMENT b;
++};
++
++static void d2d_geometry_emit_figure(ID2D1SimplifiedGeometrySink *sink, D2D1_GEOMETRY_SIMPLIFICATION_OPTION option,
++        const D2D1_MATRIX_3X2_F *transform, float tolerance, D2D1_POINT_2F start,
++        const struct d2d_simple_segment *segs, unsigned int count)
++{
++    D2D1_BEZIER_SEGMENT b;
++    D2D1_POINT_2F p;
++    unsigned int i;
++
++    if (!(tolerance > 0.0f))
++        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
++    if (transform)
++        d2d_point_transform(&start, transform, start.x, start.y);
++    ID2D1SimplifiedGeometrySink_BeginFigure(sink, start, D2D1_FIGURE_BEGIN_FILLED);
++    p = start;
++    for (i = 0; i < count; ++i)
++    {
++        b = segs[i].b;
++        if (transform)
++        {
++            d2d_point_transform(&b.point1, transform, b.point1.x, b.point1.y);
++            d2d_point_transform(&b.point2, transform, b.point2.x, b.point2.y);
++            d2d_point_transform(&b.point3, transform, b.point3.x, b.point3.y);
++        }
++        if (!segs[i].bezier)
++            ID2D1SimplifiedGeometrySink_AddLines(sink, &b.point3, 1);
++        else if (option == D2D1_GEOMETRY_SIMPLIFICATION_OPTION_LINES)
++            d2d_geometry_flatten_cubic(sink, &p, &b, tolerance);
++        else
++            ID2D1SimplifiedGeometrySink_AddBeziers(sink, &b, 1);
++        p = b.point3;
++    }
++    ID2D1SimplifiedGeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
++}
++
++/* Quarter arc of an axis-aligned ellipse from (cx + rx * cos a0, ...) to angle a0 + 90 degrees,
++ * given as the two endpoints' unit directions. */
++static void d2d_quarter_arc(struct d2d_simple_segment *seg, float cx, float cy, float rx, float ry,
++        float ux0, float uy0, float ux1, float uy1)
++{
++    static const float k = 0.55228475f;
++
++    seg->bezier = TRUE;
++    d2d_point_set(&seg->b.point1, cx + rx * (ux0 + k * ux1), cy + ry * (uy0 + k * uy1));
++    d2d_point_set(&seg->b.point2, cx + rx * (ux1 + k * ux0), cy + ry * (uy1 + k * uy0));
++    d2d_point_set(&seg->b.point3, cx + rx * ux1, cy + ry * uy1);
++}
++
+ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_Simplify(ID2D1PathGeometry1 *iface,
+         D2D1_GEOMETRY_SIMPLIFICATION_OPTION option, const D2D1_MATRIX_3X2_F *transform, float tolerance,
+         ID2D1SimplifiedGeometrySink *sink)
+@@ -3893,9 +3948,17 @@
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_Stream(ID2D1PathGeometry1 *iface, ID2D1GeometrySink *sink)
+ {
+-    FIXME("iface %p, sink %p stub!\n", iface, sink);
++    struct d2d_geometry *geometry = impl_from_ID2D1PathGeometry1(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, sink %p.\n", iface, sink);
++
++    if (geometry->u.path.state != D2D_GEOMETRY_STATE_CLOSED)
++        return D2DERR_WRONG_STATE;
++
++    /* A geometry sink is a simplified geometry sink; the figures go to it
++     * with their lines and Bézier curves as they are. */
++    return ID2D1PathGeometry1_Simplify(iface, D2D1_GEOMETRY_SIMPLIFICATION_OPTION_CUBICS_AND_LINES, NULL,
++            0.0f, (ID2D1SimplifiedGeometrySink *)sink);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetSegmentCount(ID2D1PathGeometry1 *iface, UINT32 *count)
+@@ -4083,10 +4146,25 @@
+         D2D1_GEOMETRY_SIMPLIFICATION_OPTION option, const D2D1_MATRIX_3X2_F *transform, float tolerance,
+         ID2D1SimplifiedGeometrySink *sink)
+ {
+-    FIXME("iface %p, option %#x, transform %p, tolerance %.8e, sink %p stub!\n",
++    struct d2d_geometry *geometry = impl_from_ID2D1EllipseGeometry(iface);
++    const D2D1_ELLIPSE *e = &geometry->u.ellipse.ellipse;
++    struct d2d_simple_segment segs[4];
++    float cx = e->point.x, cy = e->point.y, rx = e->radiusX, ry = e->radiusY;
++    D2D1_POINT_2F start;
++
++    TRACE("iface %p, option %#x, transform %p, tolerance %.8e, sink %p.\n",
+             iface, option, transform, tolerance, sink);
+ 
+-    return E_NOTIMPL;
++    d2d_quarter_arc(&segs[0], cx, cy, rx, ry, 1.0f, 0.0f, 0.0f, 1.0f);
++    d2d_quarter_arc(&segs[1], cx, cy, rx, ry, 0.0f, 1.0f, -1.0f, 0.0f);
++    d2d_quarter_arc(&segs[2], cx, cy, rx, ry, -1.0f, 0.0f, 0.0f, -1.0f);
++    d2d_quarter_arc(&segs[3], cx, cy, rx, ry, 0.0f, -1.0f, 1.0f, 0.0f);
++    d2d_point_set(&start, cx + rx, cy);
++
++    ID2D1SimplifiedGeometrySink_SetFillMode(sink, D2D1_FILL_MODE_ALTERNATE);
++    d2d_geometry_emit_figure(sink, option, transform, tolerance, start, segs, 4);
++
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_Tessellate(ID2D1EllipseGeometry *iface,
+@@ -4773,10 +4851,41 @@
+         D2D1_GEOMETRY_SIMPLIFICATION_OPTION option, const D2D1_MATRIX_3X2_F *transform, float tolerance,
+         ID2D1SimplifiedGeometrySink *sink)
+ {
+-    FIXME("iface %p, option %#x, transform %p, tolerance %.8e, sink %p stub!\n",
++    struct d2d_geometry *geometry = impl_from_ID2D1RoundedRectangleGeometry(iface);
++    const D2D1_ROUNDED_RECT *r = &geometry->u.rounded_rectangle.rounded_rect;
++    float l = min(r->rect.left, r->rect.right), t = min(r->rect.top, r->rect.bottom);
++    float rt = max(r->rect.left, r->rect.right), b = max(r->rect.top, r->rect.bottom);
++    float rx = min(fabsf(r->radiusX), (rt - l) / 2.0f), ry = min(fabsf(r->radiusY), (b - t) / 2.0f);
++    struct d2d_simple_segment segs[8];
++    D2D1_POINT_2F start;
++    unsigned int n = 0;
++
++    TRACE("iface %p, option %#x, transform %p, tolerance %.8e, sink %p.\n",
+             iface, option, transform, tolerance, sink);
+ 
+-    return E_NOTIMPL;
++    ID2D1SimplifiedGeometrySink_SetFillMode(sink, D2D1_FILL_MODE_ALTERNATE);
++    if (rx <= 0.0f || ry <= 0.0f)
++    {
++        d2d_point_set(&start, l, t);
++        segs[n].bezier = FALSE; d2d_point_set(&segs[n++].b.point3, rt, t);
++        segs[n].bezier = FALSE; d2d_point_set(&segs[n++].b.point3, rt, b);
++        segs[n].bezier = FALSE; d2d_point_set(&segs[n++].b.point3, l, b);
++        d2d_geometry_emit_figure(sink, option, transform, tolerance, start, segs, n);
++        return S_OK;
++    }
++
++    d2d_point_set(&start, l + rx, t);
++    segs[n].bezier = FALSE; d2d_point_set(&segs[n++].b.point3, rt - rx, t);
++    d2d_quarter_arc(&segs[n++], rt - rx, t + ry, rx, ry, 0.0f, -1.0f, 1.0f, 0.0f);
++    segs[n].bezier = FALSE; d2d_point_set(&segs[n++].b.point3, rt, b - ry);
++    d2d_quarter_arc(&segs[n++], rt - rx, b - ry, rx, ry, 1.0f, 0.0f, 0.0f, 1.0f);
++    segs[n].bezier = FALSE; d2d_point_set(&segs[n++].b.point3, l + rx, b);
++    d2d_quarter_arc(&segs[n++], l + rx, b - ry, rx, ry, 0.0f, 1.0f, -1.0f, 0.0f);
++    segs[n].bezier = FALSE; d2d_point_set(&segs[n++].b.point3, l, t + ry);
++    d2d_quarter_arc(&segs[n++], l + rx, t + ry, rx, ry, -1.0f, 0.0f, 0.0f, -1.0f);
++    d2d_geometry_emit_figure(sink, option, transform, tolerance, start, segs, n);
++
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_Tessellate(ID2D1RoundedRectangleGeometry *iface,
+@@ -5367,14 +5476,118 @@
+     return E_NOTIMPL;
+ }
+ 
++/* Forwards a member geometry's figures to the caller's sink, keeping the
++ * group's fill mode. */
++struct d2d_group_simplify_sink
++{
++    ID2D1SimplifiedGeometrySink ID2D1SimplifiedGeometrySink_iface;
++    ID2D1SimplifiedGeometrySink *sink;
++};
++
++static inline struct d2d_group_simplify_sink *impl_from_group_simplify_sink(ID2D1SimplifiedGeometrySink *iface)
++{
++    return CONTAINING_RECORD(iface, struct d2d_group_simplify_sink, ID2D1SimplifiedGeometrySink_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_group_simplify_sink_QueryInterface(ID2D1SimplifiedGeometrySink *iface,
++        REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_ID2D1SimplifiedGeometrySink) || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_group_simplify_sink_AddRef(ID2D1SimplifiedGeometrySink *iface)
++{
++    return 2;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_group_simplify_sink_Release(ID2D1SimplifiedGeometrySink *iface)
++{
++    return 1;
++}
++
++static void STDMETHODCALLTYPE d2d_group_simplify_sink_SetFillMode(ID2D1SimplifiedGeometrySink *iface,
++        D2D1_FILL_MODE mode)
++{
++}
++
++static void STDMETHODCALLTYPE d2d_group_simplify_sink_SetSegmentFlags(ID2D1SimplifiedGeometrySink *iface,
++        D2D1_PATH_SEGMENT flags)
++{
++    ID2D1SimplifiedGeometrySink_SetSegmentFlags(impl_from_group_simplify_sink(iface)->sink, flags);
++}
++
++static void STDMETHODCALLTYPE d2d_group_simplify_sink_BeginFigure(ID2D1SimplifiedGeometrySink *iface,
++        D2D1_POINT_2F start, D2D1_FIGURE_BEGIN begin)
++{
++    ID2D1SimplifiedGeometrySink_BeginFigure(impl_from_group_simplify_sink(iface)->sink, start, begin);
++}
++
++static void STDMETHODCALLTYPE d2d_group_simplify_sink_AddLines(ID2D1SimplifiedGeometrySink *iface,
++        const D2D1_POINT_2F *points, UINT32 count)
++{
++    ID2D1SimplifiedGeometrySink_AddLines(impl_from_group_simplify_sink(iface)->sink, points, count);
++}
++
++static void STDMETHODCALLTYPE d2d_group_simplify_sink_AddBeziers(ID2D1SimplifiedGeometrySink *iface,
++        const D2D1_BEZIER_SEGMENT *beziers, UINT32 count)
++{
++    ID2D1SimplifiedGeometrySink_AddBeziers(impl_from_group_simplify_sink(iface)->sink, beziers, count);
++}
++
++static void STDMETHODCALLTYPE d2d_group_simplify_sink_EndFigure(ID2D1SimplifiedGeometrySink *iface,
++        D2D1_FIGURE_END end)
++{
++    ID2D1SimplifiedGeometrySink_EndFigure(impl_from_group_simplify_sink(iface)->sink, end);
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_group_simplify_sink_Close(ID2D1SimplifiedGeometrySink *iface)
++{
++    return S_OK;
++}
++
++static const ID2D1SimplifiedGeometrySinkVtbl d2d_group_simplify_sink_vtbl =
++{
++    d2d_group_simplify_sink_QueryInterface,
++    d2d_group_simplify_sink_AddRef,
++    d2d_group_simplify_sink_Release,
++    d2d_group_simplify_sink_SetFillMode,
++    d2d_group_simplify_sink_SetSegmentFlags,
++    d2d_group_simplify_sink_BeginFigure,
++    d2d_group_simplify_sink_AddLines,
++    d2d_group_simplify_sink_AddBeziers,
++    d2d_group_simplify_sink_EndFigure,
++    d2d_group_simplify_sink_Close,
++};
++
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_group_Simplify(ID2D1GeometryGroup *iface,
+         D2D1_GEOMETRY_SIMPLIFICATION_OPTION option, const D2D1_MATRIX_3X2_F *transform, float tolerance,
+         ID2D1SimplifiedGeometrySink *sink)
+ {
+-    FIXME("iface %p, option %#x, transform %p, tolerance %.8e, sink %p stub!.\n",
++    struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
++    struct d2d_group_simplify_sink group_sink;
++    unsigned int i;
++    HRESULT hr;
++
++    TRACE("iface %p, option %#x, transform %p, tolerance %.8e, sink %p.\n",
+             iface, option, transform, tolerance, sink);
+ 
+-    return E_NOTIMPL;
++    ID2D1SimplifiedGeometrySink_SetFillMode(sink, geometry->u.group.fill_mode);
++    group_sink.ID2D1SimplifiedGeometrySink_iface.lpVtbl = &d2d_group_simplify_sink_vtbl;
++    group_sink.sink = sink;
++    for (i = 0; i < geometry->u.group.geometry_count; ++i)
++    {
++        if (FAILED(hr = ID2D1Geometry_Simplify(geometry->u.group.src_geometries[i], option, transform,
++                tolerance, &group_sink.ID2D1SimplifiedGeometrySink_iface)))
++            return hr;
++    }
++
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_group_Tessellate(ID2D1GeometryGroup *iface,
+--- a/dlls/d2d1/stroke.c
++++ b/dlls/d2d1/stroke.c
+@@ -29,7 +29,8 @@
+ {
+     TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+ 
+-    if (IsEqualGUID(iid, &IID_ID2D1StrokeStyle)
++    if (IsEqualGUID(iid, &IID_ID2D1StrokeStyle1)
++            || IsEqualGUID(iid, &IID_ID2D1StrokeStyle)
+             || IsEqualGUID(iid, &IID_ID2D1Resource)
+             || IsEqualGUID(iid, &IID_IUnknown))
+     {
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -12623,7 +12623,7 @@
+     check_system_properties(effect);
+ 
+     count = ID2D1Effect_GetPropertyCount(effect);
+-    todo_wine ok(count == 2, "Got unexpected property count %u.\n", count);
++    ok(count == 2, "Got unexpected property count %u.\n", count);
+ 
+     for (i = 0; i < ARRAY_SIZE(crop_effect_tests); ++i)
+     {
+@@ -14888,7 +14888,6 @@
+     ID2D1Properties_Release(properties2);
+ 
+     count = ID2D1Properties_GetPropertyCount(properties);
+-    todo_wine
+     ok(count == 2, "Unexpected property count %u.\n", count);
+ 
+     hr = ID2D1Properties_GetPropertyName(properties, 0, buffW, ARRAY_SIZE(buffW));

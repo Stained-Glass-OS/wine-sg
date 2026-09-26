@@ -18,7 +18,11 @@
 #    ticks (0226);
 #  - an effect's bounds come from its graph (a blur of a bitmap grows by
 #    three deviations); CombineWithGeometry and Widen give the right areas
-#    (0227); DXGI outputs answer CheckHardwareCompositionSupport (0228).
+#    (0227); DXGI outputs answer CheckHardwareCompositionSupport (0228);
+#  - DrawImage draws effects (a custom pixel shader, a flood, a blur) and
+#    command lists, as images and as effects' inputs; ellipses, rounded
+#    rectangles and groups simplify and widen; path geometries stream
+#    (0229).
 #
 #   WINE=/opt/wine-sg/bin/wine test/d2dfx-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
@@ -58,6 +62,11 @@ out=$(timeout -s KILL 120 "$WINE" "$T/d2dfx-probe.exe" 2>/dev/null | tr -d '\r')
 printf '%s\n' "$out" | sed 's/^/      /'
 has() { printf '%s\n' "$out" | grep -qx "$1"; }
 check() { if has "$1"; then pass "$2"; else fail "$2 ($(printf '%s\n' "$out" | grep "^${1%%=*}=" || echo none))"; fi; }
+# a value followed by details in parentheses
+checkp() {
+    if printf '%s\n' "$out" | grep -q "^$1 "; then pass "$2"
+    else fail "$2 ($(printf '%s\n' "$out" | grep "^${1%%=*}=" || echo none))"; fi
+}
 
 printf '%s\n' "$out" | grep -q '^no_d3d11=' && { echo "SKIP: no Direct3D 11 device here"; exit 77; }
 check 'builtin_props=12/12'           "the built-in effects Paint.NET asks for are registered"
@@ -101,6 +110,17 @@ else
 fi
 check 'combine=4/4'                   "CombineWithGeometry: union, intersection, xor and difference of two squares"
 check 'widen_area=80.0'               "Widen: a square's 2-wide mitered stroke covers 12x12 - 8x8"
+checkp 'draw_custom=1'                 "DrawImage of a custom effect runs its pixel shader (red becomes green) where it is put (0229)"
+checkp 'draw_flood=1'                  "a flood effect fills the target"
+checkp 'draw_blur=1'                   "a Gaussian blur keeps the middle and softens the edge"
+checkp 'draw_command_list=1'           "a command list is drawn as an image, where it is put"
+checkp 'draw_command_list_stroke=1'    "with the geometry it recorded for DrawGeometry"
+checkp 'draw_command_list_blur=1'      "and as an effect's input"
+checkp 'simplify_ellipse=1'            "an ellipse simplifies to lines (a circle of radius 10)"
+checkp 'widen_ellipse=1'               "and widens (a ring from 9 to 11)"
+checkp 'simplify_rounded=1'            "a rounded rectangle simplifies"
+checkp 'simplify_group=1'              "a geometry group simplifies its members"
+checkp 'path_stream=1'                 "a path geometry streams into another's sink"
 check 'done=1'                        "the probe ran to the end"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

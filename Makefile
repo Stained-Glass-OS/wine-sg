@@ -304,9 +304,17 @@ test-dwscale:
 
 # Direct2D effects and contexts, DXGI's WARP adapter, shader reflection's
 # feature level, Windows Animation, effect bounds, geometry combination and
-# widening, as Paint.NET uses them (0223-0228).
+# widening, drawing effects and command lists, as Paint.NET uses them
+# (0223-0229).
 test-d2dfx:
 	WINE=$(PREFIX)/bin/wine test/d2dfx-gate.sh
+
+# Windows.UI.Composition (compositor, visuals, brushes, drawing surfaces,
+# desktop window targets), ID3D11Device5/ID3D11DeviceContext4/IDXGIDevice4,
+# WIC half-float formats, window feedback settings (0229-0234; 0229's
+# Direct2D drawing is in test-d2dfx).
+test-wuicomp:
+	WINE=$(PREFIX)/bin/wine test/wuicomp-gate.sh
 
 # What popular installers need: a COM service by a long name with its
 # parameters, key DACLs through write handles, [string] typelib marshalling,
