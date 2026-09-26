@@ -333,6 +333,11 @@ test-meetings:
 test-d2dgeom:
 	WINE=$(PREFIX)/bin/wine test/d2dgeom-gate.sh
 
+# msvcp140's mutex and condition variable in the layout Visual Studio 2022
+# 17.10+ constructs inline (0428).
+test-stlmtx:
+	WINE=$(PREFIX)/bin/wine test/stlmtx-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
