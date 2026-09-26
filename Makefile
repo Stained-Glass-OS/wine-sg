@@ -287,6 +287,11 @@ test-pipequota:
 test-devtools:
 	WINE=$(PREFIX)/bin/wine test/devtools-gate.sh
 
+# What Telegram and Signal need of WinRT at start: ApiInformation's answers
+# (0390), Windows.Storage.Streams' DataWriter and in-memory streams (0391).
+test-winrtstreams:
+	WINE=$(PREFIX)/bin/wine test/winrtstreams-gate.sh
+
 # DwmFlush waits for the next vertical blank: Firefox's vsync (0170).
 test-vsync:
 	WINE=$(PREFIX)/bin/wine test/vsync-gate.sh

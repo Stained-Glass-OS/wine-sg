@@ -3171,6 +3171,54 @@ desktop window. **Always use a scratch `HOME`**, with
 `WINEDLLOVERRIDES=winemenubuilder.exe=d`: browser downloads land in the
 prefix's Downloads, which a default prefix links to `~/Downloads`.
 
+## `patches/sg/0390`, `0391`: Telegram and Signal start; Thunderbird mail (next steps)
+
+Messengers and mail, tested 2026-09-26 under xvfb in fresh prefixes, with
+vendor installers downloaded at test time (entries in `test/compat/apps.list`).
+
+- **Signal Desktop 8.28** stopped at start with "A JavaScript error occurred
+  in the main process": its notification module asks
+  `ApiInformation.IsPropertyPresent`, which returned E_NOTIMPL, and C++/WinRT
+  threw that out of the Node module's initialization. **0390** answers every
+  ApiInformation query (types from registered classes and contracts; members
+  "not present": no .winmd to look in). Signal then shows its link-a-device
+  QR code, fetched from Signal's servers.
+- **Telegram Desktop 7.2.9** exited silently before its window (a crash dump
+  in `tdata/dumps`): its media controls construct a
+  `Windows.Storage.Streams.DataWriter`, and there was no windows.storage.dll.
+  **0391** adds one: Buffer, InMemoryRandomAccessStream, DataWriter,
+  RandomAccessStreamReference.CreateFromStream. Telegram then shows its
+  welcome page and a login QR code from Telegram's servers.
+- Gate: `test/winrtstreams-gate.sh` (`make test-winrtstreams`), failing on
+  10.0-16 and passing with both; six mutations (E_NOTIMPL back, IsTypePresent
+  always true, no Completed call, wrong default byte order, a read that copies
+  nothing, DataWriter unregistered) each fail it.
+- **Not yet done for 0390/0391:** they were built by hand (winegcc, the same
+  sources) and checked to apply on the series, but not yet through a full
+  configure+make; the release's clean build is the first. `dlls/wintypes/tests`
+  marks the member queries todo_wine; the ones that now succeed (S_OK/FALSE
+  for a NULL member name) must lose their todo_wine before those tests run.
+- **Thunderbird 128 ESR**: on 10.0-16 its window stayed blank ("Loading...",
+  "Killing GPU process due to IPC reply timeout"): that is the old DwmFlush
+  busy loop, already fixed by 0170 -- with the series' dwmapi the account
+  setup renders. The account wizard then works against a local POP3/SMTP
+  sink (manual configuration, probe, insecure-server warning, account
+  created, first message downloaded). **Then Thunderbird crashes**:
+  xul.dll imports `kernel32!GetCurrentApplicationUserModelId`, which we do
+  not export; the loader's stub raises 0x80000100. A drafted fix (sg/0392,
+  **not in the series**: kernelbase export returning
+  APPMODEL_ERROR_NO_APPLICATION for unpackaged processes, the package's
+  `Id|Executable` list recorded by appxdeploymentclient for packaged ones)
+  is in `/var/tmp/sgcomm/c-drafts/`; it needs a build, a gate and a rerun of
+  compose, attachments (file picker), address book and print-to-file, which
+  were not reached.
+- Cosmetic, not chased: a translucent window edge (Telegram's frame shadow,
+  Thunderbird's popups) is opaque black under xvfb, which has no compositing
+  manager; check under the session's compositor before treating it as a bug.
+- **WhatsApp**: no vendor installer found outside the Microsoft Store: the
+  old direct-installer URL (web.whatsapp.com/desktop/windows/release/x64/WhatsAppSetup.exe) now redirects to the web client; not
+  tested.
+
 ## Trademark: the text our patches add never calls us Windows
 
 "Windows" is Microsoft's trademark. `make lint` (a CI step) runs
