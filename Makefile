@@ -338,6 +338,15 @@ test-d2dgeom:
 test-stlmtx:
 	WINE=$(PREFIX)/bin/wine test/stlmtx-gate.sh
 
+# Image pages shared between processes when sections are not page-aligned in
+# the file (0431: Chromium/Electron DLLs); huge PAGE_NOACCESS reservations cost
+# no memory (0432: V8/PartitionAlloc cages).
+test-imgshare:
+	WINE=$(PREFIX)/bin/wine test/imgshare-gate.sh
+
+test-bigreserve:
+	WINE=$(PREFIX)/bin/wine test/bigreserve-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
