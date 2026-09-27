@@ -380,6 +380,10 @@ test-cmdbanner:
 test-winlogo:
 	WINE=$(PREFIX)/bin/wine test/winlogo-gate.sh
 
+# A changed tray icon does not show the old one through it (0442). Needs Xvfb.
+test-trayicon:
+	WINE=$(PREFIX)/bin/wine test/trayicon-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
