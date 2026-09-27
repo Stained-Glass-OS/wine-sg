@@ -20,6 +20,8 @@
  *   vdesk-probe rect TITLE         rect=l,t,r,b zoomed= iconic=
  *   vdesk-probe workarea           work=l,t,r,b
  *   vdesk-probe find CLASS [TITLE] whether such a window exists (and is visible)
+ *   vdesk-probe pager              the taskbar's pager and Task View button:
+ *                                  pager=l,t,r,b taskview=l,t,r,b (screen)
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
@@ -105,6 +107,18 @@ int main( int argc, char **argv )
     {
         LRESULT r = send_command( 0, 0 );
         printf( "desktops=%d current=%d\n", (int)(r & 0xff), (int)((r >> 8) & 0xff) );
+        return 0;
+    }
+    if (argc == 2 && !strcmp( argv[1], "pager" ))
+    {
+        HWND tray = FindWindowW( L"Shell_TrayWnd", NULL ), pager, button;
+        RECT p = {0}, b = {0};
+        pager = FindWindowExW( tray, NULL, L"SgVirtualDesktopPager", NULL );
+        button = GetDlgItem( tray, 0x5654 );
+        if (pager && IsWindowVisible( pager )) GetWindowRect( pager, &p );
+        if (button && IsWindowVisible( button )) GetWindowRect( button, &b );
+        printf( "pager=%ld,%ld,%ld,%ld taskview=%ld,%ld,%ld,%ld\n", p.left, p.top, p.right, p.bottom,
+                b.left, b.top, b.right, b.bottom );
         return 0;
     }
     if (argc == 2 && !strcmp( argv[1], "new" )) { send_command( 2, 1 ); return 0; }

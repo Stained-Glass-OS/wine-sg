@@ -44,6 +44,9 @@ cp "$T/vdesk-probe.exe" "$WINEPREFIX/drive_c/"
 # programs join the shell's desktop, as in a session (sg-session's sg-run-explorer)
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer\Desktops' /v shell /d 1024x700 /f >/dev/null 2>&1
+# one desktop to start with (a new account has four, test/vdpager-gate.sh)
+"$WINE" reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops' /v VirtualDesktopIDs \
+    /t REG_BINARY /d 5347564431000000a1b2c3d4e5f60718 /f >/dev/null 2>&1
 "$WINESERVER" -w
 
 cat > "$T/session.sh" <<EOF

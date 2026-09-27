@@ -102,6 +102,10 @@ test-cloak:
 test-vdesk:
 	WINE=$(PREFIX)/bin/wine test/vdesk-gate.sh
 
+# The taskbar's desktop pager, four desktops, Task View reopens (0446).
+test-vdpager:
+	WINE=$(PREFIX)/bin/wine test/vdpager-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
