@@ -347,6 +347,10 @@ test-imgshare:
 test-bigreserve:
 	WINE=$(PREFIX)/bin/wine test/bigreserve-gate.sh
 
+# NtQueryWnfStateData: Thunderbird's new-mail notification (0433).
+test-wnf:
+	WINE=$(PREFIX)/bin/wine test/wnf-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
