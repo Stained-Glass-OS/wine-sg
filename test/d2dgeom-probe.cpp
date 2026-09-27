@@ -197,6 +197,17 @@ int main( void )
             rt->FillRectangle( &part, b );
             rt->EndDraw();
             printf( "A8PIXELS in %u out %u\n", bmp.pixels[12 * 32 + 12], bmp.pixels[2 * 32 + 2] );
+
+            /* the same target again, after the program put new pixels in the
+             * bitmap: drawing starts from those (Paint.NET reuses a target for
+             * another tile), not from what the target drew last time */
+            D2D1_RECT_F other = { 20, 20, 28, 28 };
+            memset( bmp.pixels, 0x40, sizeof(bmp.pixels) );
+            rt->BeginDraw();
+            rt->FillRectangle( &other, b );
+            rt->EndDraw();
+            printf( "A8REUSE first %u second %u elsewhere %u\n", bmp.pixels[12 * 32 + 12],
+                    bmp.pixels[24 * 32 + 24], bmp.pixels[2 * 32 + 2] );
         }
     }
     return 0;

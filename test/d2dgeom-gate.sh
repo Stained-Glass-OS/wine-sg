@@ -10,7 +10,8 @@
 #     clip adds nothing (Paint.NET clears each brush stamp's list -- a
 #     paintbrush drag hung it), a layer or clip bounds what is inside (0429)
 #   - a render target on an alpha-only (mask) bitmap works and draws on top
-#     of what the bitmap held (0429; Paint.NET's brush masks)
+#     of what the bitmap held (0429; Paint.NET's brush masks) -- what it holds
+#     at each BeginDraw, as Paint.NET reuses a target for other tiles (0430)
 #
 #   WINE=/opt/wine-sg/bin/wine test/d2dgeom-gate.sh     (needs Xvfb)
 set -u
@@ -58,5 +59,7 @@ has 'LAYER 00000000 10,10,30,30' && pass "a layer's content bounds limit the lis
 has 'CLIPCLEAR 00000000 5,5,15,15' && pass "a Clear inside a clip covers the clip" || fail "clip clear: $(printf '%s\n' "$out" | grep CLIPCLEAR)"
 has 'A8TARGET 00000000' && pass "a render target on an alpha-only bitmap" || fail "A8 target: $(printf '%s\n' "$out" | grep A8TARGET)"
 has 'A8PIXELS in 255 out 128' && pass "drawing lands in it, over what the bitmap held" || fail "A8 pixels: $(printf '%s\n' "$out" | grep A8PIXELS)"
+has 'A8REUSE first 64 second 255 elsewhere 64' && pass "drawing on it again starts from the bitmap's new pixels (a reused target)" \
+    || fail "reuse: $(printf '%s\n' "$out" | grep A8REUSE)"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
