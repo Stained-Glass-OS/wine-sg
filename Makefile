@@ -388,6 +388,10 @@ test-trayicon:
 test-nsroot:
 	WINE=$(PREFIX)/bin/wine test/nsroot-gate.sh
 
+# A battery reporting energy reads right (0445). Needs sudo -n (a mount namespace).
+test-battery:
+	WINE=$(PREFIX)/bin/wine test/battery-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
