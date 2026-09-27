@@ -351,6 +351,10 @@ test-bigreserve:
 test-wnf:
 	WINE=$(PREFIX)/bin/wine test/wnf-gate.sh
 
+# AppContainer SID names: Chrome's sandbox quit the browser without them (0434).
+test-appcontainer:
+	WINE=$(PREFIX)/bin/wine test/appcontainer-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
