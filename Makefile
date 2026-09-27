@@ -364,6 +364,10 @@ test-glass:
 test-toast:
 	WINE=$(PREFIX)/bin/wine test/toast-gate.sh
 
+# shutdown.exe (0438): /s /r /p /l /t /c, as scripts and the Ctrl+Alt+Del screen use it.
+test-shutdownexe:
+	WINE=$(PREFIX)/bin/wine test/shutdownexe-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
