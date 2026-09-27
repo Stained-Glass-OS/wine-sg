@@ -368,6 +368,10 @@ test-toast:
 test-shutdownexe:
 	WINE=$(PREFIX)/bin/wine test/shutdownexe-gate.sh
 
+# Signing out ends the shell, so the session ends (0439). Needs Xvfb.
+test-logoff:
+	WINE=$(PREFIX)/bin/wine test/logoff-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
