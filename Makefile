@@ -359,6 +359,11 @@ test-appcontainer:
 test-glass:
 	WINE=$(PREFIX)/bin/wine test/glass-gate.sh
 
+# Toast notifications and their XML documents (0436-0437): Firefox, Chrome,
+# Electron and .NET programs show them; clicks and dismissals reach the program.
+test-toast:
+	WINE=$(PREFIX)/bin/wine test/toast-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:

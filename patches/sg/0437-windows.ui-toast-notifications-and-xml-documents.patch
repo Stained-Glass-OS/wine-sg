@@ -1,0 +1,4454 @@
+--- a/dlls/windows.ui/Makefile.in
++++ b/dlls/windows.ui/Makefile.in
+@@ -1,9 +1,14 @@
+ MODULE  = windows.ui.dll
+-IMPORTS = combase advapi32
++IMPORTS = combase advapi32 user32 gdi32 oleaut32 uuid
++DELAYIMPORTS = shell32 shlwapi version windowscodecs
+ 
+ SOURCES = \
+ 	classes.idl \
++	toast_classes.idl \
++	xmldom_classes.idl \
+ 	inputpane.c \
+ 	main.c \
++	toast.c \
+ 	uisettings.c \
+-	uiviewsettings.c
++	uiviewsettings.c \
++	xmldom.c
+--- a/dlls/windows.ui/main.c
++++ b/dlls/windows.ui/main.c
+@@ -47,6 +47,15 @@
+     if (!wcscmp( buffer, RuntimeClass_Windows_UI_ViewManagement_InputPane ))
+         IActivationFactory_QueryInterface( inputpane_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( buffer, RuntimeClass_Windows_Data_Xml_Dom_XmlDocument ))
++        IActivationFactory_QueryInterface( xml_document_factory, &IID_IActivationFactory, (void **)factory );
++
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Notifications_ToastNotificationManager ))
++        IActivationFactory_QueryInterface( toast_manager_factory, &IID_IActivationFactory, (void **)factory );
++
++    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Notifications_ToastNotification ))
++        IActivationFactory_QueryInterface( toast_notification_factory, &IID_IActivationFactory, (void **)factory );
++
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
+--- a/dlls/windows.ui/private.h
++++ b/dlls/windows.ui/private.h
+@@ -35,10 +35,26 @@
+ #include "windows.ui.h"
+ #define WIDL_using_Windows_UI_ViewManagement
+ #include "windows.ui.viewmanagement.h"
++#include "ole2.h"
++#include "msxml6.h"
++#define WIDL_using_Windows_Foundation_Collections
++#include "windows.foundation.collections.h"
++#define WIDL_using_Windows_Data_Xml_Dom
++#include "windows.data.xml.dom.h"
++#define WIDL_using_Windows_UI_Notifications
++#include "windows.ui.notifications.h"
++#include "appmodel.h"
++#include "roapi.h"
+ 
+ extern IActivationFactory *uisettings_factory;
+ extern IActivationFactory *uiviewsettings_factory;
+ extern IActivationFactory *inputpane_factory;
++extern IActivationFactory *xml_document_factory;
++extern IActivationFactory *toast_manager_factory;
++extern IActivationFactory *toast_notification_factory;
++
++HRESULT xml_document_create( IXmlDocument **out );
++IXMLDOMDocument *xml_document_dom( IXmlDocument *iface );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+--- /dev/null
++++ b/dlls/windows.ui/toast.c
+@@ -0,0 +1,2186 @@
++/* WinRT Windows.UI.Notifications toasts
++ *
++ * Copyright (C) 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#include "winuser.h"
++#include "wingdi.h"
++#include "winreg.h"
++#include "shlwapi.h"
++#include "shellapi.h"
++#include "wincodec.h"
++
++#include "wine/debug.h"
++#include "wine/list.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(ui);
++
++/* A toast is shown by the program that sends it, in a window of its own at
++ * the bottom right of the screen above the taskbar, stacked with the toasts
++ * of other programs.  Clicking it (or one of its buttons) raises Activated,
++ * its close button or its time running out raise Dismissed. */
++
++#define TOAST_CLASS L"WineToastNotification"
++
++enum toast_event_kind
++{
++    TOAST_ACTIVATED,
++    TOAST_DISMISSED,
++    TOAST_FAILED,
++};
++
++struct handler
++{
++    struct list entry;
++    EventRegistrationToken token;
++    ITypedEventHandler_ToastNotification_IInspectable *handler;
++    HWND apartment;         /* the single-threaded apartment the handler lives in */
++};
++
++struct toast
++{
++    IToastNotification IToastNotification_iface;
++    IToastNotification2 IToastNotification2_iface;
++    LONG ref;
++
++    CRITICAL_SECTION cs;
++    IXmlDocument *content;
++    IReference_DateTime *expiration;
++    HSTRING tag, group;
++    boolean suppress_popup;
++    struct list handlers[3];
++    INT64 next_token;
++    HWND hwnd;              /* the toast on screen; guarded by toast_cs */
++    WCHAR *aumid;           /* the notifier that showed it */
++};
++
++struct toast_action
++{
++    WCHAR *content;
++    WCHAR *arguments;
++    BOOL protocol;
++    RECT rect;
++};
++
++/* what the toast window shows, from the toast's XML */
++struct toast_view
++{
++    struct toast *toast;
++    WCHAR *app_name;
++    WCHAR *title;
++    WCHAR *body;
++    WCHAR *attribution;
++    WCHAR *launch;
++    BOOL launch_protocol;
++    struct toast_action actions[5];
++    UINT action_count;
++    HBITMAP logo;
++    HICON icon;
++    UINT timeout;
++    int hot;                /* -2 nothing, -1 close button, 0.. action */
++    BOOL tracking;
++    RECT close_rect;
++};
++
++static CRITICAL_SECTION toast_cs;
++static CRITICAL_SECTION_DEBUG toast_cs_debug =
++{
++    0, 0, &toast_cs,
++    { &toast_cs_debug.ProcessLocksList, &toast_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": toast_cs") }
++};
++static CRITICAL_SECTION toast_cs = { &toast_cs_debug, -1, 0, 0, 0, 0 };
++
++static DWORD ui_thread_id;
++static HINSTANCE module_instance;
++
++#define WM_TOAST_SHOW  (WM_APP + 1)
++#define WM_TOAST_CLOSE (WM_APP + 2)
++
++static WCHAR *wcsdup_hstring( HSTRING str )
++{
++    UINT32 len;
++    const WCHAR *buf = WindowsGetStringRawBuffer( str, &len );
++    WCHAR *ret = malloc( (len + 1) * sizeof(WCHAR) );
++    if (ret)
++    {
++        memcpy( ret, buf, len * sizeof(WCHAR) );
++        ret[len] = 0;
++    }
++    return ret;
++}
++
++static WCHAR *wcsdup_bstr( BSTR str )
++{
++    return str ? wcsdup( str ) : NULL;
++}
++
++static BOOL hstring_equal( HSTRING a, HSTRING b )
++{
++    INT32 order = 1;
++    WindowsCompareStringOrdinal( a, b, &order );
++    return !order;
++}
++
++/*
++ * Event arguments
++ */
++
++struct toast_event_args
++{
++    IToastActivatedEventArgs IToastActivatedEventArgs_iface;
++    IToastDismissedEventArgs IToastDismissedEventArgs_iface;
++    IToastFailedEventArgs IToastFailedEventArgs_iface;
++    LONG ref;
++    enum toast_event_kind kind;
++    HSTRING arguments;
++    ToastDismissalReason reason;
++    HRESULT error;
++};
++
++static inline struct toast_event_args *impl_from_IToastActivatedEventArgs( IToastActivatedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct toast_event_args, IToastActivatedEventArgs_iface );
++}
++
++static HRESULT WINAPI event_args_QueryInterface( IToastActivatedEventArgs *iface, REFIID iid, void **out )
++{
++    struct toast_event_args *impl = impl_from_IToastActivatedEventArgs( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    *out = NULL;
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) || IsEqualGUID( iid, &IID_IAgileObject ))
++        *out = &impl->IToastActivatedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_IToastActivatedEventArgs ) && impl->kind == TOAST_ACTIVATED)
++        *out = &impl->IToastActivatedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_IToastDismissedEventArgs ) && impl->kind == TOAST_DISMISSED)
++        *out = &impl->IToastDismissedEventArgs_iface;
++    else if (IsEqualGUID( iid, &IID_IToastFailedEventArgs ) && impl->kind == TOAST_FAILED)
++        *out = &impl->IToastFailedEventArgs_iface;
++
++    if (!*out)
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI event_args_AddRef( IToastActivatedEventArgs *iface )
++{
++    struct toast_event_args *impl = impl_from_IToastActivatedEventArgs( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI event_args_Release( IToastActivatedEventArgs *iface )
++{
++    struct toast_event_args *impl = impl_from_IToastActivatedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        WindowsDeleteString( impl->arguments );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI event_args_GetIids( IToastActivatedEventArgs *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI event_args_GetRuntimeClassName( IToastActivatedEventArgs *iface, HSTRING *class_name )
++{
++    struct toast_event_args *impl = impl_from_IToastActivatedEventArgs( iface );
++    const WCHAR *name = impl->kind == TOAST_ACTIVATED ? L"Windows.UI.Notifications.ToastActivatedEventArgs" :
++                        impl->kind == TOAST_DISMISSED ? L"Windows.UI.Notifications.ToastDismissedEventArgs" :
++                                                        L"Windows.UI.Notifications.ToastFailedEventArgs";
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI event_args_GetTrustLevel( IToastActivatedEventArgs *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI event_args_get_Arguments( IToastActivatedEventArgs *iface, HSTRING *value )
++{
++    struct toast_event_args *impl = impl_from_IToastActivatedEventArgs( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return WindowsDuplicateString( impl->arguments, value );
++}
++
++static const struct IToastActivatedEventArgsVtbl activated_args_vtbl =
++{
++    event_args_QueryInterface,
++    event_args_AddRef,
++    event_args_Release,
++    /* IInspectable methods */
++    event_args_GetIids,
++    event_args_GetRuntimeClassName,
++    event_args_GetTrustLevel,
++    /* IToastActivatedEventArgs methods */
++    event_args_get_Arguments,
++};
++
++DEFINE_IINSPECTABLE( dismissed_args, IToastDismissedEventArgs, struct toast_event_args, IToastActivatedEventArgs_iface )
++
++static HRESULT WINAPI dismissed_args_get_Reason( IToastDismissedEventArgs *iface, ToastDismissalReason *value )
++{
++    struct toast_event_args *impl = impl_from_IToastDismissedEventArgs( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = impl->reason;
++    return S_OK;
++}
++
++static const struct IToastDismissedEventArgsVtbl dismissed_args_vtbl =
++{
++    dismissed_args_QueryInterface,
++    dismissed_args_AddRef,
++    dismissed_args_Release,
++    /* IInspectable methods */
++    dismissed_args_GetIids,
++    dismissed_args_GetRuntimeClassName,
++    dismissed_args_GetTrustLevel,
++    /* IToastDismissedEventArgs methods */
++    dismissed_args_get_Reason,
++};
++
++DEFINE_IINSPECTABLE( failed_args, IToastFailedEventArgs, struct toast_event_args, IToastActivatedEventArgs_iface )
++
++static HRESULT WINAPI failed_args_get_ErrorCode( IToastFailedEventArgs *iface, HRESULT *value )
++{
++    struct toast_event_args *impl = impl_from_IToastFailedEventArgs( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = impl->error;
++    return S_OK;
++}
++
++static const struct IToastFailedEventArgsVtbl failed_args_vtbl =
++{
++    failed_args_QueryInterface,
++    failed_args_AddRef,
++    failed_args_Release,
++    /* IInspectable methods */
++    failed_args_GetIids,
++    failed_args_GetRuntimeClassName,
++    failed_args_GetTrustLevel,
++    /* IToastFailedEventArgs methods */
++    failed_args_get_ErrorCode,
++};
++
++/*
++ * ToastNotification
++ */
++
++static inline struct toast *impl_from_IToastNotification( IToastNotification *iface )
++{
++    return CONTAINING_RECORD( iface, struct toast, IToastNotification_iface );
++}
++
++static HRESULT WINAPI toast_QueryInterface( IToastNotification *iface, REFIID iid, void **out )
++{
++    struct toast *impl = impl_from_IToastNotification( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    *out = NULL;
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IToastNotification ))
++        *out = &impl->IToastNotification_iface;
++    else if (IsEqualGUID( iid, &IID_IToastNotification2 ))
++        *out = &impl->IToastNotification2_iface;
++
++    if (!*out)
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI toast_AddRef( IToastNotification *iface )
++{
++    struct toast *impl = impl_from_IToastNotification( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI toast_Release( IToastNotification *iface )
++{
++    struct toast *impl = impl_from_IToastNotification( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    struct handler *handler, *next;
++    int i;
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        for (i = 0; i < ARRAY_SIZE(impl->handlers); i++)
++        {
++            LIST_FOR_EACH_ENTRY_SAFE( handler, next, &impl->handlers[i], struct handler, entry )
++            {
++                list_remove( &handler->entry );
++                ITypedEventHandler_ToastNotification_IInspectable_Release( handler->handler );
++                free( handler );
++            }
++        }
++        if (impl->content) IXmlDocument_Release( impl->content );
++        if (impl->expiration) IReference_DateTime_Release( impl->expiration );
++        WindowsDeleteString( impl->tag );
++        WindowsDeleteString( impl->group );
++        free( impl->aumid );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI toast_GetIids( IToastNotification *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI toast_GetRuntimeClassName( IToastNotification *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.UI.Notifications.ToastNotification";
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI toast_GetTrustLevel( IToastNotification *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI toast_get_Content( IToastNotification *iface, IXmlDocument **value )
++{
++    struct toast *impl = impl_from_IToastNotification( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    IXmlDocument_AddRef( (*value = impl->content) );
++    return S_OK;
++}
++
++static HRESULT WINAPI toast_put_ExpirationTime( IToastNotification *iface, IReference_DateTime *value )
++{
++    struct toast *impl = impl_from_IToastNotification( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    EnterCriticalSection( &impl->cs );
++    if (impl->expiration) IReference_DateTime_Release( impl->expiration );
++    if ((impl->expiration = value)) IReference_DateTime_AddRef( value );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI toast_get_ExpirationTime( IToastNotification *iface, IReference_DateTime **value )
++{
++    struct toast *impl = impl_from_IToastNotification( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    EnterCriticalSection( &impl->cs );
++    if ((*value = impl->expiration)) IReference_DateTime_AddRef( *value );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++/* A handler that is not agile is called in the apartment that registered
++ * it, as COM would marshal the call: Firefox insists on its main thread.
++ * There are no proxies for these delegates, so a single-threaded apartment
++ * gets the call through a message-only window of its thread. */
++
++#define WM_TOAST_INVOKE (WM_APP + 3)
++
++struct invocation
++{
++    ITypedEventHandler_ToastNotification_IInspectable *handler;
++    IToastNotification *sender;
++    IInspectable *args;
++};
++
++static void invoke( struct invocation *call )
++{
++    ITypedEventHandler_ToastNotification_IInspectable_Invoke( call->handler, call->sender, call->args );
++    ITypedEventHandler_ToastNotification_IInspectable_Release( call->handler );
++    IToastNotification_Release( call->sender );
++    IInspectable_Release( call->args );
++    free( call );
++}
++
++static LRESULT CALLBACK apartment_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    if (msg == WM_TOAST_INVOKE)
++    {
++        invoke( (struct invocation *)lparam );
++        return 0;
++    }
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static HWND apartment_window( IUnknown *handler )
++{
++    static const WCHAR class_name[] = L"WineToastApartment";
++    static ATOM atom;
++    APTTYPEQUALIFIER qualifier;
++    APTTYPE type;
++    IUnknown *agile;
++    HWND hwnd = NULL;
++
++    if (SUCCEEDED(IUnknown_QueryInterface( handler, &IID_IAgileObject, (void **)&agile )))
++    {
++        IUnknown_Release( agile );
++        return NULL;
++    }
++    if (FAILED(CoGetApartmentType( &type, &qualifier )) || (type != APTTYPE_STA && type != APTTYPE_MAINSTA)) return NULL;
++
++    /* one window per thread, found by its class among the thread's windows */
++    while ((hwnd = FindWindowExW( HWND_MESSAGE, hwnd, class_name, NULL )))
++        if (GetWindowThreadProcessId( hwnd, NULL ) == GetCurrentThreadId()) return hwnd;
++
++    if (!atom)
++    {
++        WNDCLASSW class = {0};
++        GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (const WCHAR *)apartment_wndproc, &class.hInstance );
++        class.lpfnWndProc = apartment_wndproc;
++        class.lpszClassName = class_name;
++        atom = RegisterClassW( &class );
++    }
++    return CreateWindowExW( 0, class_name, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL );
++}
++
++static HRESULT add_handler( struct toast *impl, enum toast_event_kind kind, void *handler, EventRegistrationToken *token )
++{
++    struct handler *entry;
++
++    if (!handler) return E_INVALIDARG;
++    if (!(entry = calloc( 1, sizeof(*entry) ))) return E_OUTOFMEMORY;
++    entry->handler = handler;
++    entry->apartment = apartment_window( handler );
++    ITypedEventHandler_ToastNotification_IInspectable_AddRef( entry->handler );
++    EnterCriticalSection( &impl->cs );
++    entry->token.value = ++impl->next_token;
++    list_add_tail( &impl->handlers[kind], &entry->entry );
++    LeaveCriticalSection( &impl->cs );
++    *token = entry->token;
++    return S_OK;
++}
++
++static HRESULT remove_handler( struct toast *impl, enum toast_event_kind kind, EventRegistrationToken token )
++{
++    struct handler *entry, *found = NULL;
++
++    EnterCriticalSection( &impl->cs );
++    LIST_FOR_EACH_ENTRY( entry, &impl->handlers[kind], struct handler, entry )
++    {
++        if (entry->token.value != token.value) continue;
++        list_remove( &entry->entry );
++        found = entry;
++        break;
++    }
++    LeaveCriticalSection( &impl->cs );
++    if (found)
++    {
++        ITypedEventHandler_ToastNotification_IInspectable_Release( found->handler );
++        free( found );
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI toast_add_Dismissed( IToastNotification *iface,
++                                           ITypedEventHandler_ToastNotification_ToastDismissedEventArgs *handler,
++                                           EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    return add_handler( impl_from_IToastNotification( iface ), TOAST_DISMISSED, handler, token );
++}
++
++static HRESULT WINAPI toast_remove_Dismissed( IToastNotification *iface, EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return remove_handler( impl_from_IToastNotification( iface ), TOAST_DISMISSED, token );
++}
++
++static HRESULT WINAPI toast_add_Activated( IToastNotification *iface, ITypedEventHandler_ToastNotification_IInspectable *handler,
++                                           EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    return add_handler( impl_from_IToastNotification( iface ), TOAST_ACTIVATED, handler, token );
++}
++
++static HRESULT WINAPI toast_remove_Activated( IToastNotification *iface, EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return remove_handler( impl_from_IToastNotification( iface ), TOAST_ACTIVATED, token );
++}
++
++static HRESULT WINAPI toast_add_Failed( IToastNotification *iface,
++                                        ITypedEventHandler_ToastNotification_ToastFailedEventArgs *handler,
++                                        EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    return add_handler( impl_from_IToastNotification( iface ), TOAST_FAILED, handler, token );
++}
++
++static HRESULT WINAPI toast_remove_Failed( IToastNotification *iface, EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return remove_handler( impl_from_IToastNotification( iface ), TOAST_FAILED, token );
++}
++
++static const struct IToastNotificationVtbl toast_vtbl =
++{
++    toast_QueryInterface,
++    toast_AddRef,
++    toast_Release,
++    /* IInspectable methods */
++    toast_GetIids,
++    toast_GetRuntimeClassName,
++    toast_GetTrustLevel,
++    /* IToastNotification methods */
++    toast_get_Content,
++    toast_put_ExpirationTime,
++    toast_get_ExpirationTime,
++    toast_add_Dismissed,
++    toast_remove_Dismissed,
++    toast_add_Activated,
++    toast_remove_Activated,
++    toast_add_Failed,
++    toast_remove_Failed,
++};
++
++DEFINE_IINSPECTABLE( toast2, IToastNotification2, struct toast, IToastNotification_iface )
++
++static HRESULT WINAPI toast2_put_Tag( IToastNotification2 *iface, HSTRING value )
++{
++    struct toast *impl = impl_from_IToastNotification2( iface );
++    HSTRING copy;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring( value ) );
++
++    if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
++    EnterCriticalSection( &impl->cs );
++    WindowsDeleteString( impl->tag );
++    impl->tag = copy;
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI toast2_get_Tag( IToastNotification2 *iface, HSTRING *value )
++{
++    struct toast *impl = impl_from_IToastNotification2( iface );
++    HRESULT hr;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    EnterCriticalSection( &impl->cs );
++    hr = WindowsDuplicateString( impl->tag, value );
++    LeaveCriticalSection( &impl->cs );
++    return hr;
++}
++
++static HRESULT WINAPI toast2_put_Group( IToastNotification2 *iface, HSTRING value )
++{
++    struct toast *impl = impl_from_IToastNotification2( iface );
++    HSTRING copy;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring( value ) );
++
++    if (FAILED(hr = WindowsDuplicateString( value, &copy ))) return hr;
++    EnterCriticalSection( &impl->cs );
++    WindowsDeleteString( impl->group );
++    impl->group = copy;
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI toast2_get_Group( IToastNotification2 *iface, HSTRING *value )
++{
++    struct toast *impl = impl_from_IToastNotification2( iface );
++    HRESULT hr;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    EnterCriticalSection( &impl->cs );
++    hr = WindowsDuplicateString( impl->group, value );
++    LeaveCriticalSection( &impl->cs );
++    return hr;
++}
++
++static HRESULT WINAPI toast2_put_SuppressPopup( IToastNotification2 *iface, boolean value )
++{
++    struct toast *impl = impl_from_IToastNotification2( iface );
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl->suppress_popup = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI toast2_get_SuppressPopup( IToastNotification2 *iface, boolean *value )
++{
++    struct toast *impl = impl_from_IToastNotification2( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = impl->suppress_popup;
++    return S_OK;
++}
++
++static const struct IToastNotification2Vtbl toast2_vtbl =
++{
++    toast2_QueryInterface,
++    toast2_AddRef,
++    toast2_Release,
++    /* IInspectable methods */
++    toast2_GetIids,
++    toast2_GetRuntimeClassName,
++    toast2_GetTrustLevel,
++    /* IToastNotification2 methods */
++    toast2_put_Tag,
++    toast2_get_Tag,
++    toast2_put_Group,
++    toast2_get_Group,
++    toast2_put_SuppressPopup,
++    toast2_get_SuppressPopup,
++};
++
++static struct toast *unsafe_impl_from_IToastNotification( IToastNotification *iface )
++{
++    if (!iface || iface->lpVtbl != &toast_vtbl) return NULL;
++    return impl_from_IToastNotification( iface );
++}
++
++/*
++ * Raising events, from a thread pool thread as Windows does
++ */
++
++struct toast_event
++{
++    struct toast *toast;
++    enum toast_event_kind kind;
++    HSTRING arguments;
++    ToastDismissalReason reason;
++    HRESULT error;
++};
++
++static void CALLBACK toast_event_callback( TP_CALLBACK_INSTANCE *instance, void *context )
++{
++    struct toast_event *event = context;
++    struct toast *toast = event->toast;
++    ITypedEventHandler_ToastNotification_IInspectable **handlers = NULL;
++    HWND *apartments = NULL;
++    struct toast_event_args *args;
++    struct handler *entry;
++    UINT count = 0, i;
++
++    TRACE( "toast %p, kind %d, arguments %s, reason %d.\n", toast, event->kind, debugstr_hstring( event->arguments ),
++           event->reason );
++
++    if (!(args = calloc( 1, sizeof(*args) ))) goto done;
++    args->IToastActivatedEventArgs_iface.lpVtbl = &activated_args_vtbl;
++    args->IToastDismissedEventArgs_iface.lpVtbl = &dismissed_args_vtbl;
++    args->IToastFailedEventArgs_iface.lpVtbl = &failed_args_vtbl;
++    args->ref = 1;
++    args->kind = event->kind;
++    args->arguments = event->arguments;
++    event->arguments = NULL;
++    args->reason = event->reason;
++    args->error = event->error;
++
++    EnterCriticalSection( &toast->cs );
++    count = list_count( &toast->handlers[event->kind] );
++    if (count && (handlers = calloc( count, sizeof(*handlers) )) && (apartments = calloc( count, sizeof(*apartments) )))
++    {
++        i = 0;
++        LIST_FOR_EACH_ENTRY( entry, &toast->handlers[event->kind], struct handler, entry )
++        {
++            apartments[i] = entry->apartment;
++            handlers[i] = entry->handler;
++            ITypedEventHandler_ToastNotification_IInspectable_AddRef( handlers[i++] );
++        }
++    }
++    else count = 0;
++    LeaveCriticalSection( &toast->cs );
++
++    for (i = 0; i < count; i++)
++    {
++        IInspectable *arg = event->kind == TOAST_ACTIVATED ? (IInspectable *)&args->IToastActivatedEventArgs_iface :
++                            event->kind == TOAST_DISMISSED ? (IInspectable *)&args->IToastDismissedEventArgs_iface :
++                                                             (IInspectable *)&args->IToastFailedEventArgs_iface;
++        struct invocation *call;
++
++        if (!(call = malloc( sizeof(*call) )))
++        {
++            ITypedEventHandler_ToastNotification_IInspectable_Release( handlers[i] );
++            continue;
++        }
++        /* the three handler types differ only in the type of their second argument */
++        call->handler = handlers[i];
++        call->sender = &toast->IToastNotification_iface;
++        IToastNotification_AddRef( call->sender );
++        call->args = arg;
++        IInspectable_AddRef( arg );
++        if (!apartments[i] || !PostMessageW( apartments[i], WM_TOAST_INVOKE, 0, (LPARAM)call )) invoke( call );
++    }
++    free( handlers );
++    free( apartments );
++    IToastActivatedEventArgs_Release( &args->IToastActivatedEventArgs_iface );
++
++done:
++    WindowsDeleteString( event->arguments );
++    IToastNotification_Release( &toast->IToastNotification_iface );
++    free( event );
++}
++
++static void raise_event( struct toast *toast, enum toast_event_kind kind, const WCHAR *arguments,
++                         ToastDismissalReason reason, HRESULT error )
++{
++    struct toast_event *event;
++
++    if (!(event = calloc( 1, sizeof(*event) ))) return;
++    event->toast = toast;
++    IToastNotification_AddRef( &toast->IToastNotification_iface );
++    event->kind = kind;
++    if (arguments) WindowsCreateString( arguments, wcslen( arguments ), &event->arguments );
++    event->reason = reason;
++    event->error = error;
++    if (!TrySubmitThreadpoolCallback( toast_event_callback, event, NULL )) toast_event_callback( NULL, event );
++}
++
++/*
++ * The toast window
++ */
++
++static int scale( int value )
++{
++    static UINT dpi;
++    if (!dpi)
++    {
++        HDC hdc = GetDC( 0 );
++        dpi = GetDeviceCaps( hdc, LOGPIXELSY );
++        ReleaseDC( 0, hdc );
++        if (!dpi) dpi = 96;
++    }
++    return MulDiv( value, dpi, 96 );
++}
++
++#define TOAST_WIDTH   364
++#define TOAST_PAD     16
++#define TOAST_LOGO    48
++#define TOAST_BUTTON  32
++#define TOAST_GAP     8
++
++static const COLORREF color_back = RGB(0x2B, 0x28, 0x33), color_accent = RGB(0x70, 0x30, 0xC0),
++                      color_dim = RGB(0xC8, 0xC2, 0xD4), color_title = RGB(0xFF, 0xFF, 0xFF),
++                      color_body = RGB(0xE8, 0xE4, 0xF0), color_button = RGB(0x45, 0x40, 0x52),
++                      color_button_hot = RGB(0x57, 0x51, 0x66), color_close_hot = RGB(0x45, 0x40, 0x52);
++
++static HFONT font_small, font_title, font_body;
++
++static void create_fonts(void)
++{
++    NONCLIENTMETRICSW metrics = {sizeof(metrics)};
++    LOGFONTW font;
++
++    SystemParametersInfoW( SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0 );
++    font = metrics.lfMessageFont;
++    font.lfQuality = CLEARTYPE_QUALITY;
++    font.lfHeight = -scale( 12 );
++    font_small = CreateFontIndirectW( &font );
++    font.lfHeight = -scale( 15 );
++    font.lfWeight = FW_SEMIBOLD;
++    font_title = CreateFontIndirectW( &font );
++    font.lfHeight = -scale( 14 );
++    font.lfWeight = FW_NORMAL;
++    font_body = CreateFontIndirectW( &font );
++}
++
++static int text_x( const struct toast_view *view )
++{
++    return scale( TOAST_PAD ) + (view->logo ? scale( TOAST_LOGO ) + scale( 12 ) : 0);
++}
++
++/* lays the toast out; returns its height */
++static int layout( HDC hdc, struct toast_view *view, RECT *title, RECT *body, RECT *attribution )
++{
++    int width = scale( TOAST_WIDTH ), x = text_x( view ), right = width - scale( TOAST_PAD ), y = scale( 40 ), bottom;
++    UINT i;
++
++    SetRect( title, x, y, right, y );
++    if (view->title)
++    {
++        SelectObject( hdc, font_title );
++        DrawTextW( hdc, view->title, -1, title, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL );
++        title->right = right;
++        if (title->bottom - title->top > scale( 42 )) title->bottom = title->top + scale( 42 );
++        y = title->bottom + scale( 2 );
++    }
++    SetRect( body, x, y, right, y );
++    if (view->body)
++    {
++        SelectObject( hdc, font_body );
++        DrawTextW( hdc, view->body, -1, body, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL );
++        body->right = right;
++        if (body->bottom - body->top > scale( 80 )) body->bottom = body->top + scale( 80 );
++        y = body->bottom;
++    }
++    SetRect( attribution, x, y, right, y );
++    if (view->attribution)
++    {
++        SelectObject( hdc, font_small );
++        attribution->top = y + scale( 4 );
++        attribution->bottom = attribution->top + scale( 18 );
++        y = attribution->bottom;
++    }
++    bottom = max( y, view->logo ? scale( 40 + TOAST_LOGO ) : 0 ) + scale( TOAST_PAD );
++
++    if (view->action_count)
++    {
++        int button_width = (width - 2 * scale( TOAST_PAD ) - (view->action_count - 1) * scale( TOAST_GAP )) / view->action_count;
++        for (i = 0; i < view->action_count; i++)
++            SetRect( &view->actions[i].rect, scale( TOAST_PAD ) + i * (button_width + scale( TOAST_GAP )), bottom,
++                     scale( TOAST_PAD ) + i * (button_width + scale( TOAST_GAP )) + button_width, bottom + scale( TOAST_BUTTON ) );
++        bottom += scale( TOAST_BUTTON ) + scale( TOAST_PAD );
++    }
++    SetRect( &view->close_rect, width - scale( 40 ), scale( 4 ), width - scale( 8 ), scale( 36 ) );
++    return bottom;
++}
++
++static void fill( HDC hdc, const RECT *rect, COLORREF color )
++{
++    HBRUSH brush = CreateSolidBrush( color );
++    FillRect( hdc, rect, brush );
++    DeleteObject( brush );
++}
++
++static void paint( HWND hwnd, HDC hdc, struct toast_view *view )
++{
++    RECT client, rect, title, body, attribution;
++    HDC mem = CreateCompatibleDC( hdc );
++    HBITMAP bitmap, old;
++    HDC draw;
++    UINT i;
++
++    GetClientRect( hwnd, &client );
++    bitmap = CreateCompatibleBitmap( hdc, client.right, client.bottom );
++    old = SelectObject( mem, bitmap );
++    draw = mem;
++
++    fill( draw, &client, color_back );
++    SetRect( &rect, 0, 0, scale( 4 ), client.bottom );
++    fill( draw, &rect, color_accent );
++    SetBkMode( draw, TRANSPARENT );
++
++    /* the program's icon and name */
++    if (view->icon) DrawIconEx( draw, scale( TOAST_PAD ), scale( 12 ), view->icon, scale( 16 ), scale( 16 ), 0, NULL, DI_NORMAL );
++    SelectObject( draw, font_small );
++    SetTextColor( draw, color_dim );
++    SetRect( &rect, scale( TOAST_PAD ) + (view->icon ? scale( 24 ) : 0), scale( 10 ), view->close_rect.left, scale( 30 ) );
++    DrawTextW( draw, view->app_name ? view->app_name : L"", -1, &rect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS );
++
++    /* the close button */
++    if (view->hot == -1) fill( draw, &view->close_rect, color_close_hot );
++    {
++        HPEN pen = CreatePen( PS_SOLID, max( 1, scale( 1 ) ), view->hot == -1 ? color_title : color_dim ), old_pen;
++        int cx = (view->close_rect.left + view->close_rect.right) / 2, cy = (view->close_rect.top + view->close_rect.bottom) / 2, d = scale( 5 );
++        old_pen = SelectObject( draw, pen );
++        MoveToEx( draw, cx - d, cy - d, NULL );
++        LineTo( draw, cx + d + 1, cy + d + 1 );
++        MoveToEx( draw, cx + d, cy - d, NULL );
++        LineTo( draw, cx - d - 1, cy + d + 1 );
++        SelectObject( draw, old_pen );
++        DeleteObject( pen );
++    }
++
++    layout( draw, view, &title, &body, &attribution );
++
++    if (view->logo)
++    {
++        HDC logo_dc = CreateCompatibleDC( draw );
++        BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
++        BITMAP info;
++        HBITMAP prev = SelectObject( logo_dc, view->logo );
++        GetObjectW( view->logo, sizeof(info), &info );
++        GdiAlphaBlend( draw, scale( TOAST_PAD ), scale( 40 ), scale( TOAST_LOGO ), scale( TOAST_LOGO ),
++                       logo_dc, 0, 0, info.bmWidth, info.bmHeight, blend );
++        SelectObject( logo_dc, prev );
++        DeleteDC( logo_dc );
++    }
++    if (view->title)
++    {
++        SelectObject( draw, font_title );
++        SetTextColor( draw, color_title );
++        DrawTextW( draw, view->title, -1, &title, DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL | DT_END_ELLIPSIS );
++    }
++    if (view->body)
++    {
++        SelectObject( draw, font_body );
++        SetTextColor( draw, color_body );
++        DrawTextW( draw, view->body, -1, &body, DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL | DT_END_ELLIPSIS );
++    }
++    if (view->attribution)
++    {
++        SelectObject( draw, font_small );
++        SetTextColor( draw, color_dim );
++        DrawTextW( draw, view->attribution, -1, &attribution, DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS );
++    }
++    SelectObject( draw, font_body );
++    for (i = 0; i < view->action_count; i++)
++    {
++        fill( draw, &view->actions[i].rect, view->hot == (int)i ? color_button_hot : color_button );
++        SetTextColor( draw, color_title );
++        rect = view->actions[i].rect;
++        InflateRect( &rect, -scale( 6 ), 0 );
++        DrawTextW( draw, view->actions[i].content, -1, &rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS );
++    }
++
++    BitBlt( hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY );
++    SelectObject( mem, old );
++    DeleteObject( bitmap );
++    DeleteDC( mem );
++}
++
++static void free_view( struct toast_view *view )
++{
++    UINT i;
++
++    free( view->app_name );
++    free( view->title );
++    free( view->body );
++    free( view->attribution );
++    free( view->launch );
++    for (i = 0; i < view->action_count; i++)
++    {
++        free( view->actions[i].content );
++        free( view->actions[i].arguments );
++    }
++    if (view->logo) DeleteObject( view->logo );
++    if (view->icon) DestroyIcon( view->icon );
++    if (view->toast) IToastNotification_Release( &view->toast->IToastNotification_iface );
++    free( view );
++}
++
++static BOOL CALLBACK find_lowest_toast( HWND hwnd, LPARAM lparam )
++{
++    int *top = (int *)lparam;
++    WCHAR name[64];
++    RECT rect;
++
++    if (!IsWindowVisible( hwnd ) || !GetClassNameW( hwnd, name, ARRAY_SIZE(name) ) || wcscmp( name, TOAST_CLASS )) return TRUE;
++    GetWindowRect( hwnd, &rect );
++    if (rect.top < *top) *top = rect.top;
++    return TRUE;
++}
++
++/* above the toasts already on screen, whichever program shows them */
++static void place( HWND hwnd, int height )
++{
++    RECT work;
++    int top;
++
++    SystemParametersInfoW( SPI_GETWORKAREA, 0, &work, 0 );
++    top = work.bottom - scale( 4 );
++    EnumWindows( find_lowest_toast, (LPARAM)&top );
++    if (top < work.bottom - scale( 4 )) top -= scale( TOAST_GAP );
++    else top -= scale( 8 );
++    if (top - height < work.top) top = work.bottom - scale( 12 );
++    SetWindowPos( hwnd, HWND_TOPMOST, work.right - scale( TOAST_WIDTH ) - scale( 12 ), top - height,
++                  scale( TOAST_WIDTH ), height, SWP_NOACTIVATE | SWP_SHOWWINDOW );
++}
++
++static void close_toast( HWND hwnd, enum toast_event_kind kind, const WCHAR *arguments, ToastDismissalReason reason )
++{
++    struct toast_view *view = (struct toast_view *)GetWindowLongPtrW( hwnd, GWLP_USERDATA );
++    struct toast *toast;
++
++    if (!view) return;
++    toast = view->toast;
++    EnterCriticalSection( &toast_cs );
++    if (toast->hwnd == hwnd) toast->hwnd = NULL;
++    LeaveCriticalSection( &toast_cs );
++    if (kind == TOAST_ACTIVATED || kind == TOAST_DISMISSED) raise_event( toast, kind, arguments, reason, S_OK );
++    DestroyWindow( hwnd );
++}
++
++static void activate( HWND hwnd, struct toast_view *view, const WCHAR *arguments, BOOL protocol )
++{
++    if (protocol && arguments && *arguments)
++    {
++        /* the argument is a URI to open, not something for the program */
++        ShellExecuteW( NULL, NULL, arguments, NULL, NULL, SW_SHOWNORMAL );
++        close_toast( hwnd, -1, NULL, 0 );
++        return;
++    }
++    close_toast( hwnd, TOAST_ACTIVATED, arguments ? arguments : L"", 0 );
++}
++
++static int hit_test( struct toast_view *view, POINT pt )
++{
++    UINT i;
++    if (PtInRect( &view->close_rect, pt )) return -1;
++    for (i = 0; i < view->action_count; i++) if (PtInRect( &view->actions[i].rect, pt )) return i;
++    return -2;
++}
++
++static LRESULT CALLBACK toast_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    struct toast_view *view = (struct toast_view *)GetWindowLongPtrW( hwnd, GWLP_USERDATA );
++    POINT pt;
++
++    switch (msg)
++    {
++    case WM_MOUSEACTIVATE:
++        return MA_NOACTIVATE;
++    case WM_ERASEBKGND:
++        return 1;
++    case WM_PAINT:
++    {
++        PAINTSTRUCT ps;
++        HDC hdc = BeginPaint( hwnd, &ps );
++        if (view) paint( hwnd, hdc, view );
++        EndPaint( hwnd, &ps );
++        return 0;
++    }
++    case WM_SETCURSOR:
++        SetCursor( LoadCursorW( NULL, (LPCWSTR)IDC_HAND ) );
++        return TRUE;
++    case WM_MOUSEMOVE:
++        if (!view) break;
++        if (!view->tracking)
++        {
++            TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, hwnd};
++            TrackMouseEvent( &track );
++            view->tracking = TRUE;
++            KillTimer( hwnd, 1 );   /* no timing out while the pointer rests on it */
++        }
++        pt.x = (short)LOWORD( lparam );
++        pt.y = (short)HIWORD( lparam );
++        if (hit_test( view, pt ) != view->hot)
++        {
++            view->hot = hit_test( view, pt );
++            InvalidateRect( hwnd, NULL, FALSE );
++        }
++        break;
++    case WM_MOUSELEAVE:
++        if (!view) break;
++        view->tracking = FALSE;
++        view->hot = -2;
++        InvalidateRect( hwnd, NULL, FALSE );
++        if (view->timeout) SetTimer( hwnd, 1, view->timeout, NULL );
++        break;
++    case WM_LBUTTONUP:
++    {
++        int hit;
++        if (!view) break;
++        pt.x = (short)LOWORD( lparam );
++        pt.y = (short)HIWORD( lparam );
++        hit = hit_test( view, pt );
++        if (hit == -1) close_toast( hwnd, TOAST_DISMISSED, NULL, ToastDismissalReason_UserCanceled );
++        else if (hit >= 0) activate( hwnd, view, view->actions[hit].arguments, view->actions[hit].protocol );
++        else activate( hwnd, view, view->launch, view->launch_protocol );
++        return 0;
++    }
++    case WM_RBUTTONUP:
++        if (view) close_toast( hwnd, TOAST_DISMISSED, NULL, ToastDismissalReason_UserCanceled );
++        return 0;
++    case WM_TIMER:
++        if (wparam == 1 && view) close_toast( hwnd, TOAST_DISMISSED, NULL, ToastDismissalReason_TimedOut );
++        return 0;
++    case WM_TOAST_CLOSE:
++        if (view) close_toast( hwnd, wparam ? TOAST_DISMISSED : -1, NULL, ToastDismissalReason_ApplicationHidden );
++        return 0;
++    case WM_NCDESTROY:
++        SetWindowLongPtrW( hwnd, GWLP_USERDATA, 0 );
++        if (view) free_view( view );
++        break;
++    }
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static void show_view( struct toast_view *view )
++{
++    struct toast *toast = view->toast;
++    RECT title, body, attribution;
++    HWND hwnd;
++    HDC hdc;
++    int height;
++
++    hwnd = CreateWindowExW( WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, TOAST_CLASS, view->title ? view->title : L"",
++                            WS_POPUP, 0, 0, scale( TOAST_WIDTH ), scale( 100 ), NULL, NULL, module_instance, NULL );
++    if (!hwnd)
++    {
++        raise_event( toast, TOAST_FAILED, NULL, 0, HRESULT_FROM_WIN32( GetLastError() ) );
++        free_view( view );
++        return;
++    }
++    SetWindowLongPtrW( hwnd, GWLP_USERDATA, (LONG_PTR)view );
++    EnterCriticalSection( &toast_cs );
++    toast->hwnd = hwnd;
++    LeaveCriticalSection( &toast_cs );
++
++    hdc = GetDC( hwnd );
++    height = layout( hdc, view, &title, &body, &attribution );
++    ReleaseDC( hwnd, hdc );
++    place( hwnd, height );
++    if (view->timeout) SetTimer( hwnd, 1, view->timeout, NULL );
++    TRACE( "toast %p shown in %p\n", toast, hwnd );
++}
++
++static DWORD WINAPI toast_thread( void *arg )
++{
++    WNDCLASSW class = {0};
++    MSG msg;
++
++    SetThreadDescription( GetCurrentThread(), L"wine_toast_notifications" );
++    class.lpfnWndProc = toast_wndproc;
++    class.hInstance = module_instance;
++    class.hCursor = LoadCursorW( NULL, (LPCWSTR)IDC_ARROW );
++    class.lpszClassName = TOAST_CLASS;
++    RegisterClassW( &class );
++    create_fonts();
++
++    PeekMessageW( &msg, NULL, 0, 0, PM_NOREMOVE );
++    SetEvent( arg );
++
++    while (GetMessageW( &msg, NULL, 0, 0 ))
++    {
++        if (!msg.hwnd && msg.message == WM_TOAST_SHOW)
++        {
++            show_view( (struct toast_view *)msg.lParam );
++            continue;
++        }
++        TranslateMessage( &msg );
++        DispatchMessageW( &msg );
++    }
++    return 0;
++}
++
++static BOOL start_toast_thread(void)
++{
++    HANDLE thread, ready;
++    DWORD id;
++
++    EnterCriticalSection( &toast_cs );
++    if (!ui_thread_id && (ready = CreateEventW( NULL, TRUE, FALSE, NULL )))
++    {
++        GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (const WCHAR *)start_toast_thread, &module_instance );
++        if ((thread = CreateThread( NULL, 0, toast_thread, ready, 0, &id )))
++        {
++            WaitForSingleObject( ready, INFINITE );
++            CloseHandle( thread );
++            ui_thread_id = id;
++        }
++        CloseHandle( ready );
++    }
++    LeaveCriticalSection( &toast_cs );
++    return !!ui_thread_id;
++}
++
++/*
++ * Reading the toast's XML
++ */
++
++static WCHAR *select_text( IXMLDOMNode *root, const WCHAR *xpath )
++{
++    IXMLDOMNode *node = NULL;
++    BSTR path = SysAllocString( xpath ), text = NULL;
++    WCHAR *ret = NULL;
++
++    if (IXMLDOMNode_selectSingleNode( root, path, &node ) == S_OK)
++    {
++        if (SUCCEEDED(IXMLDOMNode_get_text( node, &text )) && text && *text) ret = wcsdup_bstr( text );
++        SysFreeString( text );
++        IXMLDOMNode_Release( node );
++    }
++    SysFreeString( path );
++    return ret;
++}
++
++static WCHAR *append_line( WCHAR *str, const WCHAR *line )
++{
++    size_t len = str ? wcslen( str ) : 0;
++    WCHAR *ret = realloc( str, (len + wcslen( line ) + 2) * sizeof(WCHAR) );
++    if (!ret) return str;
++    if (len) ret[len++] = '\n';
++    wcscpy( ret + len, line );
++    return ret;
++}
++
++/* a 32-bit premultiplied bitmap of an image file, for the app logo */
++static HBITMAP load_image( const WCHAR *src )
++{
++    IWICImagingFactory *factory = NULL;
++    IWICBitmapDecoder *decoder = NULL;
++    IWICBitmapFrameDecode *frame = NULL;
++    IWICBitmapSource *converted = NULL;
++    BITMAPINFO info = {{sizeof(BITMAPINFOHEADER)}};
++    WCHAR path[MAX_PATH];
++    DWORD len = ARRAY_SIZE(path);
++    HBITMAP bitmap = NULL;
++    UINT width, height;
++    void *bits;
++
++    if (!wcsnicmp( src, L"file:", 5 ))
++    {
++        if (FAILED(PathCreateFromUrlW( src, path, &len, 0 ))) return NULL;
++    }
++    else if (wcsstr( src, L"://" )) return NULL;   /* ms-appx:, http: and the like */
++    else lstrcpynW( path, src, ARRAY_SIZE(path) );
++
++    if (FAILED(CoCreateInstance( &CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&factory )))
++        return NULL;
++    if (SUCCEEDED(IWICImagingFactory_CreateDecoderFromFilename( factory, path, NULL, GENERIC_READ,
++                                                                WICDecodeMetadataCacheOnDemand, &decoder )) &&
++        SUCCEEDED(IWICBitmapDecoder_GetFrame( decoder, 0, &frame )) &&
++        SUCCEEDED(WICConvertBitmapSource( &GUID_WICPixelFormat32bppPBGRA, (IWICBitmapSource *)frame, &converted )) &&
++        SUCCEEDED(IWICBitmapSource_GetSize( converted, &width, &height )) && width && height && width <= 1024 && height <= 1024)
++    {
++        info.bmiHeader.biWidth = width;
++        info.bmiHeader.biHeight = -(int)height;
++        info.bmiHeader.biPlanes = 1;
++        info.bmiHeader.biBitCount = 32;
++        if ((bitmap = CreateDIBSection( NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0 )) &&
++            FAILED(IWICBitmapSource_CopyPixels( converted, NULL, width * 4, width * height * 4, bits )))
++        {
++            DeleteObject( bitmap );
++            bitmap = NULL;
++        }
++    }
++    if (converted) IWICBitmapSource_Release( converted );
++    if (frame) IWICBitmapFrameDecode_Release( frame );
++    if (decoder) IWICBitmapDecoder_Release( decoder );
++    IWICImagingFactory_Release( factory );
++    TRACE( "%s -> %p\n", debugstr_w(src), bitmap );
++    return bitmap;
++}
++
++/* the name the program registered for its AppUserModelID, or its own */
++static WCHAR *app_display_name( const WCHAR *aumid )
++{
++    static const HKEY roots[] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
++    WCHAR key[512], name[256], exe[MAX_PATH], *p;
++    DWORD size, handle;
++    void *version;
++    UINT i, len;
++    struct { WORD language, codepage; } *translation;
++
++    if (aumid && *aumid)
++    {
++        swprintf( key, ARRAY_SIZE(key), L"Software\\Classes\\AppUserModelId\\%s", aumid );
++        for (i = 0; i < ARRAY_SIZE(roots); i++)
++        {
++            size = sizeof(name);
++            if (!RegGetValueW( roots[i], key, L"DisplayName", RRF_RT_REG_SZ, NULL, name, &size ) && *name) return wcsdup( name );
++        }
++    }
++
++    GetModuleFileNameW( NULL, exe, ARRAY_SIZE(exe) );
++    if ((size = GetFileVersionInfoSizeW( exe, &handle )) && (version = malloc( size )))
++    {
++        WCHAR *description = NULL, *ret = NULL;
++        if (GetFileVersionInfoW( exe, 0, size, version ) &&
++            VerQueryValueW( version, L"\\VarFileInfo\\Translation", (void **)&translation, &len ) && len >= sizeof(*translation))
++        {
++            swprintf( key, ARRAY_SIZE(key), L"\\StringFileInfo\\%04x%04x\\FileDescription", translation->language,
++                      translation->codepage );
++            if (VerQueryValueW( version, key, (void **)&description, &len ) && len > 1 && *description)
++                ret = wcsdup( description );
++        }
++        free( version );
++        if (ret) return ret;
++    }
++    p = wcsrchr( exe, '\\' );
++    p = p ? p + 1 : exe;
++    if (wcsrchr( p, '.' )) *wcsrchr( p, '.' ) = 0;
++    return wcsdup( p );
++}
++
++static IXMLDOMDocument *toast_dom( IXmlDocument *content )
++{
++    IXMLDOMDocument *doc = xml_document_dom( content );
++    IXmlNodeSerializer *serializer;
++    IXmlDocument *copy;
++    IXmlDocumentIO *io;
++    HSTRING xml;
++
++    if (doc) return doc;
++    /* another XmlDocument implementation: go through its text */
++    if (FAILED(IXmlDocument_QueryInterface( content, &IID_IXmlNodeSerializer, (void **)&serializer ))) return NULL;
++    if (SUCCEEDED(IXmlNodeSerializer_GetXml( serializer, &xml )))
++    {
++        if (SUCCEEDED(xml_document_create( &copy )))
++        {
++            if (SUCCEEDED(IXmlDocument_QueryInterface( copy, &IID_IXmlDocumentIO, (void **)&io )))
++            {
++                if (SUCCEEDED(IXmlDocumentIO_LoadXml( io, xml ))) doc = xml_document_dom( copy );
++                IXmlDocumentIO_Release( io );
++            }
++            IXmlDocument_Release( copy );
++        }
++        WindowsDeleteString( xml );
++    }
++    IXmlNodeSerializer_Release( serializer );
++    return doc;
++}
++
++static struct toast_view *create_view( struct toast *toast, const WCHAR *aumid )
++{
++    IXMLDOMDocument *doc;
++    IXMLDOMNodeList *list;
++    IXMLDOMNode *root, *node;
++    struct toast_view *view;
++    WCHAR *scenario, *duration, *type, *src;
++    BSTR path, text;
++    WCHAR exe[MAX_PATH];
++    BOOL first = TRUE;
++
++    if (!(doc = toast_dom( toast->content ))) return NULL;
++    if (!(view = calloc( 1, sizeof(*view) )))
++    {
++        IXMLDOMDocument_Release( doc );
++        return NULL;
++    }
++    root = (IXMLDOMNode *)doc;
++    view->hot = -2;
++    view->app_name = app_display_name( aumid );
++    GetModuleFileNameW( NULL, exe, ARRAY_SIZE(exe) );
++    ExtractIconExW( exe, 0, NULL, &view->icon, 1 );
++
++    /* the texts of the first binding: a title, then the body */
++    path = SysAllocString( L"/toast/visual/binding[1]/text" );
++    if (SUCCEEDED(IXMLDOMNode_selectNodes( root, path, &list )))
++    {
++        while (IXMLDOMNodeList_nextNode( list, &node ) == S_OK && node)
++        {
++            WCHAR *placement = NULL;
++            IXMLDOMElement *element;
++            VARIANT var;
++
++            if (SUCCEEDED(IXMLDOMNode_QueryInterface( node, &IID_IXMLDOMElement, (void **)&element )))
++            {
++                VariantInit( &var );
++                if (IXMLDOMElement_getAttribute( element, (BSTR)L"placement", &var ) == S_OK && V_VT( &var ) == VT_BSTR)
++                    placement = wcsdup_bstr( V_BSTR( &var ) );
++                VariantClear( &var );
++                IXMLDOMElement_Release( element );
++            }
++            if (SUCCEEDED(IXMLDOMNode_get_text( node, &text )) && text && *text)
++            {
++                if (placement && !wcscmp( placement, L"attribution" )) view->attribution = wcsdup_bstr( text );
++                else if (first) view->title = wcsdup_bstr( text );
++                else view->body = append_line( view->body, text );
++                if (!placement || wcscmp( placement, L"attribution" )) first = FALSE;
++            }
++            SysFreeString( text );
++            free( placement );
++            IXMLDOMNode_Release( node );
++        }
++        IXMLDOMNodeList_Release( list );
++    }
++    SysFreeString( path );
++
++    /* the logo: appLogoOverride, or the image of the old templates */
++    if (!(src = select_text( root, L"/toast/visual/binding[1]/image[@placement='appLogoOverride']/@src" )))
++        src = select_text( root, L"/toast/visual/binding[1]/image[not(@placement)]/@src" );
++    if (src)
++    {
++        view->logo = load_image( src );
++        free( src );
++    }
++
++    view->launch = select_text( root, L"/toast/@launch" );
++    type = select_text( root, L"/toast/@activationType" );
++    view->launch_protocol = type && !wcscmp( type, L"protocol" );
++    free( type );
++
++    path = SysAllocString( L"/toast/actions/action[not(@placement='contextMenu')]" );
++    if (SUCCEEDED(IXMLDOMNode_selectNodes( root, path, &list )))
++    {
++        while (view->action_count < ARRAY_SIZE(view->actions) && IXMLDOMNodeList_nextNode( list, &node ) == S_OK && node)
++        {
++            struct toast_action *action = &view->actions[view->action_count];
++            if ((action->content = select_text( node, L"@content" )))
++            {
++                action->arguments = select_text( node, L"@arguments" );
++                type = select_text( node, L"@activationType" );
++                action->protocol = type && !wcscmp( type, L"protocol" );
++                free( type );
++                view->action_count++;
++            }
++            IXMLDOMNode_Release( node );
++        }
++        IXMLDOMNodeList_Release( list );
++    }
++    SysFreeString( path );
++
++    scenario = select_text( root, L"/toast/@scenario" );
++    duration = select_text( root, L"/toast/@duration" );
++    if (scenario && (!wcscmp( scenario, L"reminder" ) || !wcscmp( scenario, L"alarm" ) ||
++                     !wcscmp( scenario, L"incomingCall" ) || !wcscmp( scenario, L"urgent" )))
++        view->timeout = 0;
++    else if (duration && !wcscmp( duration, L"long" )) view->timeout = 25000;
++    else view->timeout = 7000;
++    free( scenario );
++    free( duration );
++
++    IXMLDOMDocument_Release( doc );
++    TRACE( "title %s, body %s, launch %s, %u actions, timeout %u\n", debugstr_w(view->title), debugstr_w(view->body),
++           debugstr_w(view->launch), view->action_count, view->timeout );
++    view->toast = toast;
++    IToastNotification_AddRef( &toast->IToastNotification_iface );
++    return view;
++}
++
++/* closes the toasts on screen that match; with raise, as the program hiding them */
++struct close_match
++{
++    const WCHAR *aumid;
++    HSTRING tag, group;
++    BOOL match_tag, match_group;
++    struct toast *toast;
++    BOOL raise;
++};
++
++static void close_matching( const struct close_match *match )
++{
++    HWND *windows = NULL, hwnd = NULL;
++    UINT count = 0, capacity = 0, i;
++    WCHAR name[64];
++
++    /* our own toasts only: those of this process */
++    while ((hwnd = FindWindowExW( HWND_DESKTOP, hwnd, TOAST_CLASS, NULL )))
++    {
++        struct toast_view *view;
++        DWORD pid;
++
++        GetWindowThreadProcessId( hwnd, &pid );
++        if (pid != GetCurrentProcessId() || !GetClassNameW( hwnd, name, ARRAY_SIZE(name) )) continue;
++        if (!(view = (struct toast_view *)GetWindowLongPtrW( hwnd, GWLP_USERDATA ))) continue;
++        if (match->toast && view->toast != match->toast) continue;
++        if (match->aumid && (!view->toast->aumid || wcsicmp( view->toast->aumid, match->aumid ))) continue;
++        if (match->match_tag && !hstring_equal( view->toast->tag, match->tag )) continue;
++        if (match->match_group && !hstring_equal( view->toast->group, match->group )) continue;
++        if (count == capacity)
++        {
++            HWND *grown = realloc( windows, (capacity = capacity * 2 + 4) * sizeof(*windows) );
++            if (!grown) break;
++            windows = grown;
++        }
++        windows[count++] = hwnd;
++    }
++    for (i = 0; i < count; i++) SendMessageW( windows[i], WM_TOAST_CLOSE, match->raise, 0 );
++    free( windows );
++}
++
++/*
++ * ToastNotifier
++ */
++
++struct notifier
++{
++    IToastNotifier IToastNotifier_iface;
++    LONG ref;
++    WCHAR *aumid;
++};
++
++static inline struct notifier *impl_from_IToastNotifier( IToastNotifier *iface )
++{
++    return CONTAINING_RECORD( iface, struct notifier, IToastNotifier_iface );
++}
++
++static HRESULT WINAPI notifier_QueryInterface( IToastNotifier *iface, REFIID iid, void **out )
++{
++    struct notifier *impl = impl_from_IToastNotifier( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IToastNotifier ))
++    {
++        IInspectable_AddRef( (*out = &impl->IToastNotifier_iface) );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI notifier_AddRef( IToastNotifier *iface )
++{
++    struct notifier *impl = impl_from_IToastNotifier( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI notifier_Release( IToastNotifier *iface )
++{
++    struct notifier *impl = impl_from_IToastNotifier( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        free( impl->aumid );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI notifier_GetIids( IToastNotifier *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI notifier_GetRuntimeClassName( IToastNotifier *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.UI.Notifications.ToastNotifier";
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI notifier_GetTrustLevel( IToastNotifier *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static BOOL notifications_enabled( const WCHAR *aumid )
++{
++    WCHAR key[512];
++    DWORD value, size = sizeof(value);
++
++    /* Settings > Notifications turns them off for everyone, or for one program */
++    if (!RegGetValueW( HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications",
++                       L"ToastEnabled", RRF_RT_REG_DWORD, NULL, &value, &size ) && !value)
++        return FALSE;
++    swprintf( key, ARRAY_SIZE(key), L"Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings\\%s", aumid );
++    size = sizeof(value);
++    if (!RegGetValueW( HKEY_CURRENT_USER, key, L"Enabled", RRF_RT_REG_DWORD, NULL, &value, &size ) && !value)
++        return FALSE;
++    return TRUE;
++}
++
++static HRESULT WINAPI notifier_Show( IToastNotifier *iface, IToastNotification *notification )
++{
++    struct notifier *impl = impl_from_IToastNotifier( iface );
++    struct toast *toast = unsafe_impl_from_IToastNotification( notification );
++    struct close_match match = {0};
++    struct toast_view *view;
++
++    TRACE( "iface %p, notification %p.\n", iface, notification );
++
++    if (!toast) return E_INVALIDARG;
++    if (!notifications_enabled( impl->aumid ))
++    {
++        TRACE( "notifications are turned off for %s\n", debugstr_w(impl->aumid) );
++        return S_OK;
++    }
++
++    EnterCriticalSection( &toast->cs );
++    free( toast->aumid );
++    toast->aumid = wcsdup( impl->aumid );
++    LeaveCriticalSection( &toast->cs );
++
++    /* a toast with the same tag and group replaces the one on screen */
++    if (toast->tag && WindowsGetStringLen( toast->tag ))
++    {
++        match.aumid = impl->aumid;
++        match.tag = toast->tag;
++        match.group = toast->group;
++        match.match_tag = match.match_group = TRUE;
++        close_matching( &match );
++    }
++
++    if (toast->suppress_popup) return S_OK;
++    if (!start_toast_thread()) return E_FAIL;
++    if (!(view = create_view( toast, impl->aumid )))
++    {
++        raise_event( toast, TOAST_FAILED, NULL, 0, E_INVALIDARG );
++        return S_OK;
++    }
++    if (!PostThreadMessageW( ui_thread_id, WM_TOAST_SHOW, 0, (LPARAM)view ))
++    {
++        free_view( view );
++        return E_FAIL;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI notifier_Hide( IToastNotifier *iface, IToastNotification *notification )
++{
++    struct toast *toast = unsafe_impl_from_IToastNotification( notification );
++    struct close_match match = {0};
++
++    TRACE( "iface %p, notification %p.\n", iface, notification );
++
++    if (!toast) return E_INVALIDARG;
++    match.toast = toast;
++    match.raise = TRUE;
++    close_matching( &match );
++    return S_OK;
++}
++
++static HRESULT WINAPI notifier_get_Setting( IToastNotifier *iface, NotificationSetting *value )
++{
++    struct notifier *impl = impl_from_IToastNotifier( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = notifications_enabled( impl->aumid ) ? NotificationSetting_Enabled : NotificationSetting_DisabledForUser;
++    return S_OK;
++}
++
++static HRESULT WINAPI notifier_AddToSchedule( IToastNotifier *iface, IScheduledToastNotification *scheduled_toast )
++{
++    FIXME( "iface %p, scheduled_toast %p stub!\n", iface, scheduled_toast );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI notifier_RemoveFromSchedule( IToastNotifier *iface, IScheduledToastNotification *scheduled_toast )
++{
++    FIXME( "iface %p, scheduled_toast %p stub!\n", iface, scheduled_toast );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI notifier_GetScheduledToastNotifications( IToastNotifier *iface,
++                                                               IVectorView_ScheduledToastNotification **result )
++{
++    FIXME( "iface %p, result %p stub!\n", iface, result );
++    return E_NOTIMPL;
++}
++
++static const struct IToastNotifierVtbl notifier_vtbl =
++{
++    notifier_QueryInterface,
++    notifier_AddRef,
++    notifier_Release,
++    /* IInspectable methods */
++    notifier_GetIids,
++    notifier_GetRuntimeClassName,
++    notifier_GetTrustLevel,
++    /* IToastNotifier methods */
++    notifier_Show,
++    notifier_Hide,
++    notifier_get_Setting,
++    notifier_AddToSchedule,
++    notifier_RemoveFromSchedule,
++    notifier_GetScheduledToastNotifications,
++};
++
++static HRESULT notifier_create( const WCHAR *aumid, IToastNotifier **out )
++{
++    struct notifier *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IToastNotifier_iface.lpVtbl = &notifier_vtbl;
++    impl->ref = 1;
++    if (!(impl->aumid = wcsdup( aumid )))
++    {
++        free( impl );
++        return E_OUTOFMEMORY;
++    }
++    *out = &impl->IToastNotifier_iface;
++    return S_OK;
++}
++
++/*
++ * ToastNotificationHistory
++ */
++
++struct history
++{
++    IToastNotificationHistory IToastNotificationHistory_iface;
++    LONG ref;
++};
++
++static inline struct history *impl_from_IToastNotificationHistory( IToastNotificationHistory *iface )
++{
++    return CONTAINING_RECORD( iface, struct history, IToastNotificationHistory_iface );
++}
++
++static HRESULT WINAPI history_QueryInterface( IToastNotificationHistory *iface, REFIID iid, void **out )
++{
++    struct history *impl = impl_from_IToastNotificationHistory( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IToastNotificationHistory ))
++    {
++        IInspectable_AddRef( (*out = &impl->IToastNotificationHistory_iface) );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI history_AddRef( IToastNotificationHistory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI history_Release( IToastNotificationHistory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI history_GetIids( IToastNotificationHistory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI history_GetRuntimeClassName( IToastNotificationHistory *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.UI.Notifications.ToastNotificationHistory";
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI history_GetTrustLevel( IToastNotificationHistory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++/* there is no notification centre yet: removing from the history removes
++ * what is still on screen */
++static HRESULT history_remove( HSTRING tag, BOOL match_tag, HSTRING group, BOOL match_group, HSTRING application_id )
++{
++    struct close_match match = {0};
++    WCHAR *aumid = application_id ? wcsdup_hstring( application_id ) : NULL;
++
++    match.aumid = aumid;
++    match.tag = tag;
++    match.match_tag = match_tag;
++    match.group = group;
++    match.match_group = match_group;
++    close_matching( &match );
++    free( aumid );
++    return S_OK;
++}
++
++static HRESULT WINAPI history_RemoveGroup( IToastNotificationHistory *iface, HSTRING group )
++{
++    TRACE( "iface %p, group %s.\n", iface, debugstr_hstring( group ) );
++    return history_remove( NULL, FALSE, group, TRUE, NULL );
++}
++
++static HRESULT WINAPI history_RemoveGroupWithId( IToastNotificationHistory *iface, HSTRING group, HSTRING application_id )
++{
++    TRACE( "iface %p, group %s, application_id %s.\n", iface, debugstr_hstring( group ), debugstr_hstring( application_id ) );
++    return history_remove( NULL, FALSE, group, TRUE, application_id );
++}
++
++static HRESULT WINAPI history_RemoveGroupedTagWithId( IToastNotificationHistory *iface, HSTRING tag, HSTRING group,
++                                                      HSTRING application_id )
++{
++    TRACE( "iface %p, tag %s, group %s, application_id %s.\n", iface, debugstr_hstring( tag ), debugstr_hstring( group ),
++           debugstr_hstring( application_id ) );
++    return history_remove( tag, TRUE, group, TRUE, application_id );
++}
++
++static HRESULT WINAPI history_RemoveGroupedTag( IToastNotificationHistory *iface, HSTRING tag, HSTRING group )
++{
++    TRACE( "iface %p, tag %s, group %s.\n", iface, debugstr_hstring( tag ), debugstr_hstring( group ) );
++    return history_remove( tag, TRUE, group, TRUE, NULL );
++}
++
++static HRESULT WINAPI history_Remove( IToastNotificationHistory *iface, HSTRING tag )
++{
++    TRACE( "iface %p, tag %s.\n", iface, debugstr_hstring( tag ) );
++    return history_remove( tag, TRUE, NULL, FALSE, NULL );
++}
++
++static HRESULT WINAPI history_Clear( IToastNotificationHistory *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return history_remove( NULL, FALSE, NULL, FALSE, NULL );
++}
++
++static HRESULT WINAPI history_ClearWithId( IToastNotificationHistory *iface, HSTRING application_id )
++{
++    TRACE( "iface %p, application_id %s.\n", iface, debugstr_hstring( application_id ) );
++    return history_remove( NULL, FALSE, NULL, FALSE, application_id );
++}
++
++static const struct IToastNotificationHistoryVtbl history_vtbl =
++{
++    history_QueryInterface,
++    history_AddRef,
++    history_Release,
++    /* IInspectable methods */
++    history_GetIids,
++    history_GetRuntimeClassName,
++    history_GetTrustLevel,
++    /* IToastNotificationHistory methods */
++    history_RemoveGroup,
++    history_RemoveGroupWithId,
++    history_RemoveGroupedTagWithId,
++    history_RemoveGroupedTag,
++    history_Remove,
++    history_Clear,
++    history_ClearWithId,
++};
++
++static struct history history = { {&history_vtbl}, 1 };
++
++/*
++ * ToastNotificationManager statics
++ */
++
++struct manager_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IToastNotificationManagerStatics IToastNotificationManagerStatics_iface;
++    IToastNotificationManagerStatics2 IToastNotificationManagerStatics2_iface;
++    LONG ref;
++};
++
++static inline struct manager_statics *manager_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct manager_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI manager_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct manager_statics *impl = manager_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    *out = NULL;
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IToastNotificationManagerStatics ))
++        *out = &impl->IToastNotificationManagerStatics_iface;
++    else if (IsEqualGUID( iid, &IID_IToastNotificationManagerStatics2 ))
++        *out = &impl->IToastNotificationManagerStatics2_iface;
++
++    if (!*out)
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI manager_factory_AddRef( IActivationFactory *iface )
++{
++    struct manager_statics *impl = manager_from_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI manager_factory_Release( IActivationFactory *iface )
++{
++    struct manager_statics *impl = manager_from_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI manager_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI manager_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI manager_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI manager_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl manager_factory_vtbl =
++{
++    manager_factory_QueryInterface,
++    manager_factory_AddRef,
++    manager_factory_Release,
++    /* IInspectable methods */
++    manager_factory_GetIids,
++    manager_factory_GetRuntimeClassName,
++    manager_factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    manager_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( manager_statics, IToastNotificationManagerStatics, struct manager_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI manager_statics_CreateToastNotifierWithId( IToastNotificationManagerStatics *iface, HSTRING application_id,
++                                                                 IToastNotifier **result )
++{
++    WCHAR *aumid;
++    HRESULT hr;
++
++    TRACE( "iface %p, application_id %s, result %p.\n", iface, debugstr_hstring( application_id ), result );
++
++    *result = NULL;
++    if (!WindowsGetStringLen( application_id )) return E_INVALIDARG;
++    if (!(aumid = wcsdup_hstring( application_id ))) return E_OUTOFMEMORY;
++    hr = notifier_create( aumid, result );
++    free( aumid );
++    return hr;
++}
++
++static HRESULT WINAPI manager_statics_CreateToastNotifier( IToastNotificationManagerStatics *iface, IToastNotifier **result )
++{
++    WCHAR aumid[256], exe[MAX_PATH], *name;
++    UINT32 len = ARRAY_SIZE(aumid);
++
++    TRACE( "iface %p, result %p.\n", iface, result );
++
++    /* a packaged program's own identity; a desktop program has none on
++     * Windows, and gets its executable's name here */
++    if (GetCurrentApplicationUserModelId( &len, aumid ))
++    {
++        GetModuleFileNameW( NULL, exe, ARRAY_SIZE(exe) );
++        name = wcsrchr( exe, '\\' );
++        lstrcpynW( aumid, name ? name + 1 : exe, ARRAY_SIZE(aumid) );
++    }
++    return notifier_create( aumid, result );
++}
++
++static const WCHAR *const toast_templates[] =
++{
++    /* ToastImageAndText01 */
++    L"<toast><visual><binding template=\"ToastImageAndText01\"><image id=\"1\" src=\"\"/><text id=\"1\"></text></binding></visual></toast>",
++    /* ToastImageAndText02 */
++    L"<toast><visual><binding template=\"ToastImageAndText02\"><image id=\"1\" src=\"\"/><text id=\"1\"></text><text id=\"2\"></text></binding></visual></toast>",
++    /* ToastImageAndText03 */
++    L"<toast><visual><binding template=\"ToastImageAndText03\"><image id=\"1\" src=\"\"/><text id=\"1\"></text><text id=\"2\"></text></binding></visual></toast>",
++    /* ToastImageAndText04 */
++    L"<toast><visual><binding template=\"ToastImageAndText04\"><image id=\"1\" src=\"\"/><text id=\"1\"></text><text id=\"2\"></text><text id=\"3\"></text></binding></visual></toast>",
++    /* ToastText01 */
++    L"<toast><visual><binding template=\"ToastText01\"><text id=\"1\"></text></binding></visual></toast>",
++    /* ToastText02 */
++    L"<toast><visual><binding template=\"ToastText02\"><text id=\"1\"></text><text id=\"2\"></text></binding></visual></toast>",
++    /* ToastText03 */
++    L"<toast><visual><binding template=\"ToastText03\"><text id=\"1\"></text><text id=\"2\"></text></binding></visual></toast>",
++    /* ToastText04 */
++    L"<toast><visual><binding template=\"ToastText04\"><text id=\"1\"></text><text id=\"2\"></text><text id=\"3\"></text></binding></visual></toast>",
++};
++
++static HRESULT WINAPI manager_statics_GetTemplateContent( IToastNotificationManagerStatics *iface, ToastTemplateType type,
++                                                          IXmlDocument **result )
++{
++    IXmlDocumentIO *io;
++    HSTRING xml;
++    HRESULT hr;
++
++    TRACE( "iface %p, type %d, result %p.\n", iface, type, result );
++
++    *result = NULL;
++    if ((UINT)type >= ARRAY_SIZE(toast_templates)) return E_INVALIDARG;
++    if (FAILED(hr = xml_document_create( result ))) return hr;
++    if (SUCCEEDED(hr = IXmlDocument_QueryInterface( *result, &IID_IXmlDocumentIO, (void **)&io )))
++    {
++        if (SUCCEEDED(hr = WindowsCreateString( toast_templates[type], wcslen( toast_templates[type] ), &xml )))
++        {
++            hr = IXmlDocumentIO_LoadXml( io, xml );
++            WindowsDeleteString( xml );
++        }
++        IXmlDocumentIO_Release( io );
++    }
++    if (FAILED(hr))
++    {
++        IXmlDocument_Release( *result );
++        *result = NULL;
++    }
++    return hr;
++}
++
++static const struct IToastNotificationManagerStaticsVtbl manager_statics_vtbl =
++{
++    manager_statics_QueryInterface,
++    manager_statics_AddRef,
++    manager_statics_Release,
++    /* IInspectable methods */
++    manager_statics_GetIids,
++    manager_statics_GetRuntimeClassName,
++    manager_statics_GetTrustLevel,
++    /* IToastNotificationManagerStatics methods */
++    manager_statics_CreateToastNotifier,
++    manager_statics_CreateToastNotifierWithId,
++    manager_statics_GetTemplateContent,
++};
++
++DEFINE_IINSPECTABLE( manager_statics2, IToastNotificationManagerStatics2, struct manager_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI manager_statics2_get_History( IToastNotificationManagerStatics2 *iface, IToastNotificationHistory **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = &history.IToastNotificationHistory_iface;
++    return S_OK;
++}
++
++static const struct IToastNotificationManagerStatics2Vtbl manager_statics2_vtbl =
++{
++    manager_statics2_QueryInterface,
++    manager_statics2_AddRef,
++    manager_statics2_Release,
++    /* IInspectable methods */
++    manager_statics2_GetIids,
++    manager_statics2_GetRuntimeClassName,
++    manager_statics2_GetTrustLevel,
++    /* IToastNotificationManagerStatics2 methods */
++    manager_statics2_get_History,
++};
++
++static struct manager_statics manager_statics =
++{
++    {&manager_factory_vtbl},
++    {&manager_statics_vtbl},
++    {&manager_statics2_vtbl},
++    1,
++};
++
++IActivationFactory *toast_manager_factory = &manager_statics.IActivationFactory_iface;
++
++/*
++ * ToastNotification factory
++ */
++
++struct toast_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IToastNotificationFactory IToastNotificationFactory_iface;
++    LONG ref;
++};
++
++static inline struct toast_statics *toast_statics_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct toast_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI toast_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct toast_statics *impl = toast_statics_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    *out = NULL;
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IToastNotificationFactory ))
++        *out = &impl->IToastNotificationFactory_iface;
++
++    if (!*out)
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI toast_factory_AddRef( IActivationFactory *iface )
++{
++    struct toast_statics *impl = toast_statics_from_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI toast_factory_Release( IActivationFactory *iface )
++{
++    struct toast_statics *impl = toast_statics_from_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI toast_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI toast_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI toast_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI toast_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl toast_factory_vtbl =
++{
++    toast_factory_QueryInterface,
++    toast_factory_AddRef,
++    toast_factory_Release,
++    /* IInspectable methods */
++    toast_factory_GetIids,
++    toast_factory_GetRuntimeClassName,
++    toast_factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    toast_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( toast_notification_factory, IToastNotificationFactory, struct toast_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI toast_notification_factory_CreateToastNotification( IToastNotificationFactory *iface, IXmlDocument *content,
++                                                                          IToastNotification **value )
++{
++    struct toast *impl;
++    int i;
++
++    TRACE( "iface %p, content %p, value %p.\n", iface, content, value );
++
++    *value = NULL;
++    if (!content) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IToastNotification_iface.lpVtbl = &toast_vtbl;
++    impl->IToastNotification2_iface.lpVtbl = &toast2_vtbl;
++    impl->ref = 1;
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": toast.cs");
++    for (i = 0; i < ARRAY_SIZE(impl->handlers); i++) list_init( &impl->handlers[i] );
++    IXmlDocument_AddRef( (impl->content = content) );
++    *value = &impl->IToastNotification_iface;
++    return S_OK;
++}
++
++static const struct IToastNotificationFactoryVtbl toast_notification_factory_vtbl =
++{
++    toast_notification_factory_QueryInterface,
++    toast_notification_factory_AddRef,
++    toast_notification_factory_Release,
++    /* IInspectable methods */
++    toast_notification_factory_GetIids,
++    toast_notification_factory_GetRuntimeClassName,
++    toast_notification_factory_GetTrustLevel,
++    /* IToastNotificationFactory methods */
++    toast_notification_factory_CreateToastNotification,
++};
++
++static struct toast_statics toast_statics =
++{
++    {&toast_factory_vtbl},
++    {&toast_notification_factory_vtbl},
++    1,
++};
++
++IActivationFactory *toast_notification_factory = &toast_statics.IActivationFactory_iface;
+--- /dev/null
++++ b/dlls/windows.ui/toast_classes.idl
+@@ -0,0 +1,25 @@
++/*
++ * Runtime Classes for windows.ui.dll: toasts
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep register
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++#include "windows.ui.notifications.idl"
+--- /dev/null
++++ b/dlls/windows.ui/xmldom.c
+@@ -0,0 +1,2140 @@
++/* WinRT Windows.Data.Xml.Dom implementation, on top of MSXML
++ *
++ * Copyright (C) 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(ui);
++
++/* Every node kind is one object wrapping an IXMLDOMNode; the interfaces it
++ * answers depend on the node type, as with the runtime classes XmlElement,
++ * XmlText, XmlAttribute, XmlDocument and the rest. */
++struct xml_node
++{
++    IXmlNode IXmlNode_iface;
++    IXmlNodeSerializer IXmlNodeSerializer_iface;
++    IXmlNodeSelector IXmlNodeSelector_iface;
++    IXmlElement IXmlElement_iface;
++    IXmlCharacterData IXmlCharacterData_iface;
++    IXmlText IXmlText_iface;
++    IXmlAttribute IXmlAttribute_iface;
++    IXmlDocument IXmlDocument_iface;
++    IXmlDocumentIO IXmlDocumentIO_iface;
++    LONG ref;
++    IXMLDOMNode *node;
++    DOMNodeType type;
++};
++
++struct xml_node_list
++{
++    IXmlNodeList IXmlNodeList_iface;
++    IVectorView_IXmlNode IVectorView_IXmlNode_iface;
++    IIterable_IXmlNode IIterable_IXmlNode_iface;
++    LONG ref;
++    IXMLDOMNodeList *list;
++};
++
++struct xml_node_iterator
++{
++    IIterator_IXmlNode IIterator_IXmlNode_iface;
++    LONG ref;
++    struct xml_node_list *list;
++    UINT32 index;
++};
++
++struct xml_named_node_map
++{
++    IXmlNamedNodeMap IXmlNamedNodeMap_iface;
++    LONG ref;
++    IXMLDOMNamedNodeMap *map;
++};
++
++static const struct IXmlNodeVtbl xml_node_vtbl;
++
++static HRESULT xml_node_create( IXMLDOMNode *node, REFIID iid, void **out );
++static HRESULT xml_node_list_create( IXMLDOMNodeList *list, IXmlNodeList **out );
++
++static BSTR bstr_from_hstring( HSTRING str )
++{
++    UINT32 len;
++    const WCHAR *buf = WindowsGetStringRawBuffer( str, &len );
++    return SysAllocStringLen( buf, len );
++}
++
++static HRESULT hstring_from_bstr( BSTR str, HSTRING *out )
++{
++    return WindowsCreateString( str, str ? SysStringLen( str ) : 0, out );
++}
++
++/* the value of a string, as the IPropertyValue WinRT boxes strings in */
++static HRESULT box_string( BSTR str, IInspectable **out )
++{
++    static const WCHAR property_value[] = L"Windows.Foundation.PropertyValue";
++    IPropertyValueStatics *statics;
++    HSTRING name, value;
++    HRESULT hr;
++
++    *out = NULL;
++    if (FAILED(hr = WindowsCreateString( property_value, wcslen( property_value ), &name ))) return hr;
++    hr = RoGetActivationFactory( name, &IID_IPropertyValueStatics, (void **)&statics );
++    WindowsDeleteString( name );
++    if (FAILED(hr)) return hr;
++    if (SUCCEEDED(hr = hstring_from_bstr( str, &value )))
++    {
++        hr = IPropertyValueStatics_CreateString( statics, value, out );
++        WindowsDeleteString( value );
++    }
++    IPropertyValueStatics_Release( statics );
++    return hr;
++}
++
++static HRESULT unbox_string( IInspectable *value, BSTR *out )
++{
++    IPropertyValue *property;
++    HSTRING str;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!value) return S_OK;
++    if (FAILED(hr = IInspectable_QueryInterface( value, &IID_IPropertyValue, (void **)&property ))) return hr;
++    hr = IPropertyValue_GetString( property, &str );
++    IPropertyValue_Release( property );
++    if (FAILED(hr)) return hr;
++    *out = bstr_from_hstring( str );
++    WindowsDeleteString( str );
++    return S_OK;
++}
++
++static HRESULT wrap_result( HRESULT hr, IXMLDOMNode *node, REFIID iid, void **out )
++{
++    *out = NULL;
++    if (FAILED(hr)) return hr;
++    if (!node) return S_OK;
++    hr = xml_node_create( node, iid, out );
++    IXMLDOMNode_Release( node );
++    return hr;
++}
++
++static struct xml_node *unsafe_impl_from_IXmlNode( IXmlNode *iface );
++
++/* the MSXML node behind any of our node interfaces */
++static IXMLDOMNode *dom_node( IUnknown *iface )
++{
++    struct xml_node *impl;
++    IXmlNode *node;
++
++    if (!iface || FAILED(IUnknown_QueryInterface( iface, &IID_IXmlNode, (void **)&node ))) return NULL;
++    impl = unsafe_impl_from_IXmlNode( node );
++    IXmlNode_Release( node );
++    return impl ? impl->node : NULL;
++}
++
++/*
++ * IXmlNode
++ */
++
++static inline struct xml_node *impl_from_IXmlNode( IXmlNode *iface )
++{
++    return CONTAINING_RECORD( iface, struct xml_node, IXmlNode_iface );
++}
++
++static struct xml_node *unsafe_impl_from_IXmlNode( IXmlNode *iface )
++{
++    if (!iface || iface->lpVtbl != &xml_node_vtbl) return NULL;
++    return impl_from_IXmlNode( iface );
++}
++
++static HRESULT WINAPI xml_node_QueryInterface( IXmlNode *iface, REFIID iid, void **out )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    *out = NULL;
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IXmlNode ))
++        *out = &impl->IXmlNode_iface;
++    else if (IsEqualGUID( iid, &IID_IXmlNodeSerializer ))
++        *out = &impl->IXmlNodeSerializer_iface;
++    else if (IsEqualGUID( iid, &IID_IXmlNodeSelector ))
++        *out = &impl->IXmlNodeSelector_iface;
++    else if (IsEqualGUID( iid, &IID_IXmlElement ) && impl->type == NODE_ELEMENT)
++        *out = &impl->IXmlElement_iface;
++    else if (IsEqualGUID( iid, &IID_IXmlCharacterData ) &&
++             (impl->type == NODE_TEXT || impl->type == NODE_CDATA_SECTION || impl->type == NODE_COMMENT))
++        *out = &impl->IXmlCharacterData_iface;
++    else if (IsEqualGUID( iid, &IID_IXmlText ) && (impl->type == NODE_TEXT || impl->type == NODE_CDATA_SECTION))
++        *out = &impl->IXmlText_iface;
++    else if (IsEqualGUID( iid, &IID_IXmlAttribute ) && impl->type == NODE_ATTRIBUTE)
++        *out = &impl->IXmlAttribute_iface;
++    else if (IsEqualGUID( iid, &IID_IXmlDocument ) && impl->type == NODE_DOCUMENT)
++        *out = &impl->IXmlDocument_iface;
++    else if (IsEqualGUID( iid, &IID_IXmlDocumentIO ) && impl->type == NODE_DOCUMENT)
++        *out = &impl->IXmlDocumentIO_iface;
++    /* interfaces without methods of their own */
++    else if ((IsEqualGUID( iid, &IID_IXmlComment ) && impl->type == NODE_COMMENT) ||
++             (IsEqualGUID( iid, &IID_IXmlCDataSection ) && impl->type == NODE_CDATA_SECTION) ||
++             (IsEqualGUID( iid, &IID_IXmlDocumentFragment ) && impl->type == NODE_DOCUMENT_FRAGMENT) ||
++             (IsEqualGUID( iid, &IID_IXmlEntityReference ) && impl->type == NODE_ENTITY_REFERENCE))
++        *out = &impl->IXmlNode_iface;
++
++    if (!*out)
++    {
++        TRACE( "%s not implemented for node type %d, returning E_NOINTERFACE.\n", debugstr_guid( iid ), impl->type );
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI xml_node_AddRef( IXmlNode *iface )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI xml_node_Release( IXmlNode *iface )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        IXMLDOMNode_Release( impl->node );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI xml_node_GetIids( IXmlNode *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI xml_node_GetRuntimeClassName( IXmlNode *iface, HSTRING *class_name )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    const WCHAR *name;
++
++    switch (impl->type)
++    {
++    case NODE_ELEMENT: name = L"Windows.Data.Xml.Dom.XmlElement"; break;
++    case NODE_ATTRIBUTE: name = L"Windows.Data.Xml.Dom.XmlAttribute"; break;
++    case NODE_TEXT: name = L"Windows.Data.Xml.Dom.XmlText"; break;
++    case NODE_CDATA_SECTION: name = L"Windows.Data.Xml.Dom.XmlCDataSection"; break;
++    case NODE_ENTITY_REFERENCE: name = L"Windows.Data.Xml.Dom.XmlEntityReference"; break;
++    case NODE_PROCESSING_INSTRUCTION: name = L"Windows.Data.Xml.Dom.XmlProcessingInstruction"; break;
++    case NODE_COMMENT: name = L"Windows.Data.Xml.Dom.XmlComment"; break;
++    case NODE_DOCUMENT: name = L"Windows.Data.Xml.Dom.XmlDocument"; break;
++    case NODE_DOCUMENT_TYPE: name = L"Windows.Data.Xml.Dom.XmlDocumentType"; break;
++    case NODE_DOCUMENT_FRAGMENT: name = L"Windows.Data.Xml.Dom.XmlDocumentFragment"; break;
++    case NODE_ENTITY: name = L"Windows.Data.Xml.Dom.DtdEntity"; break;
++    case NODE_NOTATION: name = L"Windows.Data.Xml.Dom.DtdNotation"; break;
++    default: return E_NOTIMPL;
++    }
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI xml_node_GetTrustLevel( IXmlNode *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_node_get_NodeValue( IXmlNode *iface, IInspectable **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    VARIANT var;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    *value = NULL;
++    VariantInit( &var );
++    if (FAILED(hr = IXMLDOMNode_get_nodeValue( impl->node, &var ))) return hr;
++    if (V_VT( &var ) == VT_BSTR) hr = box_string( V_BSTR( &var ), value );
++    else hr = S_OK;
++    VariantClear( &var );
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_put_NodeValue( IXmlNode *iface, IInspectable *value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    VARIANT var;
++    HRESULT hr;
++    BSTR str;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (FAILED(hr = unbox_string( value, &str ))) return hr;
++    V_VT( &var ) = VT_BSTR;
++    V_BSTR( &var ) = str ? str : SysAllocString( L"" );
++    hr = IXMLDOMNode_put_nodeValue( impl->node, var );
++    VariantClear( &var );
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_get_NodeType( IXmlNode *iface, NodeType *value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = (NodeType)impl->type;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_node_get_NodeName( IXmlNode *iface, HSTRING *value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    HRESULT hr;
++    BSTR str;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (FAILED(hr = IXMLDOMNode_get_nodeName( impl->node, &str ))) return hr;
++    hr = hstring_from_bstr( str, value );
++    SysFreeString( str );
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_get_ParentNode( IXmlNode *iface, IXmlNode **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *node = NULL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return wrap_result( IXMLDOMNode_get_parentNode( impl->node, &node ), node, &IID_IXmlNode, (void **)value );
++}
++
++static HRESULT WINAPI xml_node_get_ChildNodes( IXmlNode *iface, IXmlNodeList **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNodeList *list;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    *value = NULL;
++    if (FAILED(hr = IXMLDOMNode_get_childNodes( impl->node, &list ))) return hr;
++    hr = xml_node_list_create( list, value );
++    IXMLDOMNodeList_Release( list );
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_get_FirstChild( IXmlNode *iface, IXmlNode **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *node = NULL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return wrap_result( IXMLDOMNode_get_firstChild( impl->node, &node ), node, &IID_IXmlNode, (void **)value );
++}
++
++static HRESULT WINAPI xml_node_get_LastChild( IXmlNode *iface, IXmlNode **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *node = NULL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return wrap_result( IXMLDOMNode_get_lastChild( impl->node, &node ), node, &IID_IXmlNode, (void **)value );
++}
++
++static HRESULT WINAPI xml_node_get_PreviousSibling( IXmlNode *iface, IXmlNode **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *node = NULL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return wrap_result( IXMLDOMNode_get_previousSibling( impl->node, &node ), node, &IID_IXmlNode, (void **)value );
++}
++
++static HRESULT WINAPI xml_node_get_NextSibling( IXmlNode *iface, IXmlNode **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *node = NULL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return wrap_result( IXMLDOMNode_get_nextSibling( impl->node, &node ), node, &IID_IXmlNode, (void **)value );
++}
++
++static const struct IXmlNamedNodeMapVtbl xml_named_node_map_vtbl;
++
++static HRESULT WINAPI xml_node_get_Attributes( IXmlNode *iface, IXmlNamedNodeMap **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    struct xml_named_node_map *map;
++    IXMLDOMNamedNodeMap *attributes = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    *value = NULL;
++    if (FAILED(hr = IXMLDOMNode_get_attributes( impl->node, &attributes )) || !attributes) return hr;
++    if (!(map = calloc( 1, sizeof(*map) )))
++    {
++        IXMLDOMNamedNodeMap_Release( attributes );
++        return E_OUTOFMEMORY;
++    }
++    map->IXmlNamedNodeMap_iface.lpVtbl = &xml_named_node_map_vtbl;
++    map->ref = 1;
++    map->map = attributes;
++    *value = &map->IXmlNamedNodeMap_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_node_HasChildNodes( IXmlNode *iface, boolean *value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    VARIANT_BOOL has;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (FAILED(hr = IXMLDOMNode_hasChildNodes( impl->node, &has ))) return hr;
++    *value = has == VARIANT_TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_node_get_OwnerDocument( IXmlNode *iface, IXmlDocument **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMDocument *doc = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    *value = NULL;
++    if (FAILED(hr = IXMLDOMNode_get_ownerDocument( impl->node, &doc )) || !doc) return hr;
++    return wrap_result( hr, (IXMLDOMNode *)doc, &IID_IXmlDocument, (void **)value );
++}
++
++static HRESULT WINAPI xml_node_InsertBefore( IXmlNode *iface, IXmlNode *new_child, IXmlNode *reference_child,
++                                             IXmlNode **inserted_child )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *child = dom_node( (IUnknown *)new_child ), *ref = dom_node( (IUnknown *)reference_child ), *node = NULL;
++    VARIANT var;
++
++    TRACE( "iface %p, new_child %p, reference_child %p, inserted_child %p.\n", iface, new_child, reference_child, inserted_child );
++
++    if (!child) return E_INVALIDARG;
++    V_VT( &var ) = ref ? VT_UNKNOWN : VT_NULL;
++    V_UNKNOWN( &var ) = (IUnknown *)ref;
++    return wrap_result( IXMLDOMNode_insertBefore( impl->node, child, var, &node ), node, &IID_IXmlNode, (void **)inserted_child );
++}
++
++static HRESULT WINAPI xml_node_ReplaceChild( IXmlNode *iface, IXmlNode *new_child, IXmlNode *reference_child,
++                                             IXmlNode **replaced_child )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *child = dom_node( (IUnknown *)new_child ), *ref = dom_node( (IUnknown *)reference_child ), *node = NULL;
++
++    TRACE( "iface %p, new_child %p, reference_child %p, replaced_child %p.\n", iface, new_child, reference_child, replaced_child );
++
++    if (!child || !ref) return E_INVALIDARG;
++    return wrap_result( IXMLDOMNode_replaceChild( impl->node, child, ref, &node ), node, &IID_IXmlNode, (void **)replaced_child );
++}
++
++static HRESULT WINAPI xml_node_RemoveChild( IXmlNode *iface, IXmlNode *child_node, IXmlNode **removed_child )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *child = dom_node( (IUnknown *)child_node ), *node = NULL;
++
++    TRACE( "iface %p, child_node %p, removed_child %p.\n", iface, child_node, removed_child );
++
++    if (!child) return E_INVALIDARG;
++    return wrap_result( IXMLDOMNode_removeChild( impl->node, child, &node ), node, &IID_IXmlNode, (void **)removed_child );
++}
++
++static HRESULT WINAPI xml_node_AppendChild( IXmlNode *iface, IXmlNode *new_child, IXmlNode **appended_child )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *child = dom_node( (IUnknown *)new_child ), *node = NULL;
++
++    TRACE( "iface %p, new_child %p, appended_child %p.\n", iface, new_child, appended_child );
++
++    if (!child) return E_INVALIDARG;
++    return wrap_result( IXMLDOMNode_appendChild( impl->node, child, &node ), node, &IID_IXmlNode, (void **)appended_child );
++}
++
++static HRESULT WINAPI xml_node_CloneNode( IXmlNode *iface, boolean deep, IXmlNode **new_node )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMNode *node = NULL;
++    TRACE( "iface %p, deep %d, new_node %p.\n", iface, deep, new_node );
++    return wrap_result( IXMLDOMNode_cloneNode( impl->node, deep ? VARIANT_TRUE : VARIANT_FALSE, &node ),
++                        node, &IID_IXmlNode, (void **)new_node );
++}
++
++static HRESULT boxed_bstr_result( HRESULT hr, BSTR str, IInspectable **value )
++{
++    *value = NULL;
++    if (FAILED(hr)) return hr;
++    if (str && *str) hr = box_string( str, value );
++    else hr = S_OK;
++    SysFreeString( str );
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_get_NamespaceUri( IXmlNode *iface, IInspectable **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    BSTR str = NULL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return boxed_bstr_result( IXMLDOMNode_get_namespaceURI( impl->node, &str ), str, value );
++}
++
++static HRESULT WINAPI xml_node_get_LocalName( IXmlNode *iface, IInspectable **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    BSTR str = NULL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return boxed_bstr_result( IXMLDOMNode_get_baseName( impl->node, &str ), str, value );
++}
++
++static HRESULT WINAPI xml_node_get_Prefix( IXmlNode *iface, IInspectable **value )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    BSTR str = NULL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return boxed_bstr_result( IXMLDOMNode_get_prefix( impl->node, &str ), str, value );
++}
++
++static HRESULT WINAPI xml_node_Normalize( IXmlNode *iface )
++{
++    struct xml_node *impl = impl_from_IXmlNode( iface );
++    IXMLDOMElement *element;
++    HRESULT hr;
++
++    TRACE( "iface %p.\n", iface );
++
++    if (FAILED(IXMLDOMNode_QueryInterface( impl->node, &IID_IXMLDOMElement, (void **)&element ))) return S_OK;
++    hr = IXMLDOMElement_normalize( element );
++    IXMLDOMElement_Release( element );
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_put_Prefix( IXmlNode *iface, IInspectable *value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static const struct IXmlNodeVtbl xml_node_vtbl =
++{
++    xml_node_QueryInterface,
++    xml_node_AddRef,
++    xml_node_Release,
++    /* IInspectable methods */
++    xml_node_GetIids,
++    xml_node_GetRuntimeClassName,
++    xml_node_GetTrustLevel,
++    /* IXmlNode methods */
++    xml_node_get_NodeValue,
++    xml_node_put_NodeValue,
++    xml_node_get_NodeType,
++    xml_node_get_NodeName,
++    xml_node_get_ParentNode,
++    xml_node_get_ChildNodes,
++    xml_node_get_FirstChild,
++    xml_node_get_LastChild,
++    xml_node_get_PreviousSibling,
++    xml_node_get_NextSibling,
++    xml_node_get_Attributes,
++    xml_node_HasChildNodes,
++    xml_node_get_OwnerDocument,
++    xml_node_InsertBefore,
++    xml_node_ReplaceChild,
++    xml_node_RemoveChild,
++    xml_node_AppendChild,
++    xml_node_CloneNode,
++    xml_node_get_NamespaceUri,
++    xml_node_get_LocalName,
++    xml_node_get_Prefix,
++    xml_node_Normalize,
++    xml_node_put_Prefix,
++};
++
++/*
++ * IXmlNodeSerializer
++ */
++
++DEFINE_IINSPECTABLE( xml_node_serializer, IXmlNodeSerializer, struct xml_node, IXmlNode_iface )
++
++/* MSXML indents what it writes; WinRT writes the markup as it is: drop the
++ * line breaks and indentation it puts between tags */
++static UINT compact_xml( WCHAR *str, UINT len )
++{
++    UINT i, j, out = 0;
++
++    for (i = 0; i < len; i++)
++    {
++        if (str[i] == '>' || !i)
++        {
++            BOOL newline = FALSE;
++            if (str[i] == '>') str[out++] = str[i++];
++            for (j = i; j < len && (str[j] == ' ' || str[j] == '\t' || str[j] == '\r' || str[j] == '\n'); j++)
++                if (str[j] == '\n') newline = TRUE;
++            if ((newline || !out) && (j == len || str[j] == '<')) i = j;
++            if (i == len) break;
++        }
++        str[out++] = str[i];
++    }
++    return out;
++}
++
++static HRESULT WINAPI xml_node_serializer_GetXml( IXmlNodeSerializer *iface, HSTRING *outer_xml )
++{
++    struct xml_node *impl = impl_from_IXmlNodeSerializer( iface );
++    HRESULT hr;
++    BSTR str;
++
++    TRACE( "iface %p, outer_xml %p.\n", iface, outer_xml );
++
++    if (FAILED(hr = IXMLDOMNode_get_xml( impl->node, &str ))) return hr;
++    hr = WindowsCreateString( str, str ? compact_xml( str, SysStringLen( str ) ) : 0, outer_xml );
++    SysFreeString( str );
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_serializer_get_InnerText( IXmlNodeSerializer *iface, HSTRING *value )
++{
++    struct xml_node *impl = impl_from_IXmlNodeSerializer( iface );
++    HRESULT hr;
++    BSTR str;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (FAILED(hr = IXMLDOMNode_get_text( impl->node, &str ))) return hr;
++    hr = hstring_from_bstr( str, value );
++    SysFreeString( str );
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_serializer_put_InnerText( IXmlNodeSerializer *iface, HSTRING value )
++{
++    struct xml_node *impl = impl_from_IXmlNodeSerializer( iface );
++    BSTR str = bstr_from_hstring( value );
++    HRESULT hr;
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring( value ) );
++
++    hr = IXMLDOMNode_put_text( impl->node, str );
++    SysFreeString( str );
++    return hr;
++}
++
++static const struct IXmlNodeSerializerVtbl xml_node_serializer_vtbl =
++{
++    xml_node_serializer_QueryInterface,
++    xml_node_serializer_AddRef,
++    xml_node_serializer_Release,
++    /* IInspectable methods */
++    xml_node_serializer_GetIids,
++    xml_node_serializer_GetRuntimeClassName,
++    xml_node_serializer_GetTrustLevel,
++    /* IXmlNodeSerializer methods */
++    xml_node_serializer_GetXml,
++    xml_node_serializer_get_InnerText,
++    xml_node_serializer_put_InnerText,
++};
++
++/*
++ * IXmlNodeSelector
++ */
++
++DEFINE_IINSPECTABLE( xml_node_selector, IXmlNodeSelector, struct xml_node, IXmlNode_iface )
++
++static HRESULT WINAPI xml_node_selector_SelectSingleNode( IXmlNodeSelector *iface, HSTRING xpath, IXmlNode **node )
++{
++    struct xml_node *impl = impl_from_IXmlNodeSelector( iface );
++    BSTR str = bstr_from_hstring( xpath );
++    IXMLDOMNode *result = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, xpath %s, node %p.\n", iface, debugstr_hstring( xpath ), node );
++
++    hr = IXMLDOMNode_selectSingleNode( impl->node, str, &result );
++    SysFreeString( str );
++    return wrap_result( hr, result, &IID_IXmlNode, (void **)node );
++}
++
++static HRESULT WINAPI xml_node_selector_SelectNodes( IXmlNodeSelector *iface, HSTRING xpath, IXmlNodeList **node_list )
++{
++    struct xml_node *impl = impl_from_IXmlNodeSelector( iface );
++    BSTR str = bstr_from_hstring( xpath );
++    IXMLDOMNodeList *list;
++    HRESULT hr;
++
++    TRACE( "iface %p, xpath %s, node_list %p.\n", iface, debugstr_hstring( xpath ), node_list );
++
++    *node_list = NULL;
++    hr = IXMLDOMNode_selectNodes( impl->node, str, &list );
++    SysFreeString( str );
++    if (FAILED(hr)) return hr;
++    hr = xml_node_list_create( list, node_list );
++    IXMLDOMNodeList_Release( list );
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_selector_SelectSingleNodeNS( IXmlNodeSelector *iface, HSTRING xpath, IInspectable *namespaces,
++                                                            IXmlNode **node )
++{
++    FIXME( "iface %p, xpath %s, namespaces %p, node %p semi-stub!\n", iface, debugstr_hstring( xpath ), namespaces, node );
++    return xml_node_selector_SelectSingleNode( iface, xpath, node );
++}
++
++static HRESULT WINAPI xml_node_selector_SelectNodesNS( IXmlNodeSelector *iface, HSTRING xpath, IInspectable *namespaces,
++                                                       IXmlNodeList **node_list )
++{
++    FIXME( "iface %p, xpath %s, namespaces %p, node_list %p semi-stub!\n", iface, debugstr_hstring( xpath ), namespaces, node_list );
++    return xml_node_selector_SelectNodes( iface, xpath, node_list );
++}
++
++static const struct IXmlNodeSelectorVtbl xml_node_selector_vtbl =
++{
++    xml_node_selector_QueryInterface,
++    xml_node_selector_AddRef,
++    xml_node_selector_Release,
++    /* IInspectable methods */
++    xml_node_selector_GetIids,
++    xml_node_selector_GetRuntimeClassName,
++    xml_node_selector_GetTrustLevel,
++    /* IXmlNodeSelector methods */
++    xml_node_selector_SelectSingleNode,
++    xml_node_selector_SelectNodes,
++    xml_node_selector_SelectSingleNodeNS,
++    xml_node_selector_SelectNodesNS,
++};
++
++/*
++ * IXmlElement
++ */
++
++DEFINE_IINSPECTABLE( xml_element, IXmlElement, struct xml_node, IXmlNode_iface )
++
++static IXMLDOMElement *dom_element( struct xml_node *impl )
++{
++    IXMLDOMElement *element = NULL;
++    IXMLDOMNode_QueryInterface( impl->node, &IID_IXMLDOMElement, (void **)&element );
++    return element;
++}
++
++static HRESULT WINAPI xml_element_get_TagName( IXmlElement *iface, HSTRING *value )
++{
++    struct xml_node *impl = impl_from_IXmlElement( iface );
++    return xml_node_get_NodeName( &impl->IXmlNode_iface, value );
++}
++
++static HRESULT WINAPI xml_element_GetAttribute( IXmlElement *iface, HSTRING attribute_name, HSTRING *attribute_value )
++{
++    struct xml_node *impl = impl_from_IXmlElement( iface );
++    IXMLDOMElement *element = dom_element( impl );
++    BSTR name = bstr_from_hstring( attribute_name );
++    VARIANT var;
++    HRESULT hr;
++
++    TRACE( "iface %p, attribute_name %s, attribute_value %p.\n", iface, debugstr_hstring( attribute_name ), attribute_value );
++
++    *attribute_value = NULL;
++    VariantInit( &var );
++    hr = IXMLDOMElement_getAttribute( element, name, &var );
++    SysFreeString( name );
++    IXMLDOMElement_Release( element );
++    if (FAILED(hr)) return hr;
++    /* a missing attribute reads as the empty string */
++    if (V_VT( &var ) == VT_BSTR) hr = hstring_from_bstr( V_BSTR( &var ), attribute_value );
++    else hr = S_OK;
++    VariantClear( &var );
++    return hr;
++}
++
++static HRESULT WINAPI xml_element_SetAttribute( IXmlElement *iface, HSTRING attribute_name, HSTRING attribute_value )
++{
++    struct xml_node *impl = impl_from_IXmlElement( iface );
++    IXMLDOMElement *element = dom_element( impl );
++    BSTR name = bstr_from_hstring( attribute_name );
++    VARIANT var;
++    HRESULT hr;
++
++    TRACE( "iface %p, attribute_name %s, attribute_value %s.\n", iface, debugstr_hstring( attribute_name ),
++           debugstr_hstring( attribute_value ) );
++
++    V_VT( &var ) = VT_BSTR;
++    V_BSTR( &var ) = bstr_from_hstring( attribute_value );
++    hr = IXMLDOMElement_setAttribute( element, name, var );
++    VariantClear( &var );
++    SysFreeString( name );
++    IXMLDOMElement_Release( element );
++    return hr;
++}
++
++static HRESULT WINAPI xml_element_RemoveAttribute( IXmlElement *iface, HSTRING attribute_name )
++{
++    struct xml_node *impl = impl_from_IXmlElement( iface );
++    IXMLDOMElement *element = dom_element( impl );
++    BSTR name = bstr_from_hstring( attribute_name );
++    HRESULT hr;
++
++    TRACE( "iface %p, attribute_name %s.\n", iface, debugstr_hstring( attribute_name ) );
++
++    hr = IXMLDOMElement_removeAttribute( element, name );
++    SysFreeString( name );
++    IXMLDOMElement_Release( element );
++    return hr == S_FALSE ? S_OK : hr;
++}
++
++static HRESULT WINAPI xml_element_GetAttributeNode( IXmlElement *iface, HSTRING attribute_name, IXmlAttribute **attribute_node )
++{
++    struct xml_node *impl = impl_from_IXmlElement( iface );
++    IXMLDOMElement *element = dom_element( impl );
++    BSTR name = bstr_from_hstring( attribute_name );
++    IXMLDOMAttribute *attr = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, attribute_name %s, attribute_node %p.\n", iface, debugstr_hstring( attribute_name ), attribute_node );
++
++    hr = IXMLDOMElement_getAttributeNode( element, name, &attr );
++    SysFreeString( name );
++    IXMLDOMElement_Release( element );
++    return wrap_result( hr, (IXMLDOMNode *)attr, &IID_IXmlAttribute, (void **)attribute_node );
++}
++
++static HRESULT WINAPI xml_element_SetAttributeNode( IXmlElement *iface, IXmlAttribute *new_attribute,
++                                                    IXmlAttribute **previous_attribute )
++{
++    struct xml_node *impl = impl_from_IXmlElement( iface );
++    IXMLDOMNode *node = dom_node( (IUnknown *)new_attribute );
++    IXMLDOMElement *element;
++    IXMLDOMAttribute *attr, *old = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, new_attribute %p, previous_attribute %p.\n", iface, new_attribute, previous_attribute );
++
++    if (!node || FAILED(IXMLDOMNode_QueryInterface( node, &IID_IXMLDOMAttribute, (void **)&attr ))) return E_INVALIDARG;
++    element = dom_element( impl );
++    hr = IXMLDOMElement_setAttributeNode( element, attr, &old );
++    IXMLDOMElement_Release( element );
++    IXMLDOMAttribute_Release( attr );
++    return wrap_result( hr, (IXMLDOMNode *)old, &IID_IXmlAttribute, (void **)previous_attribute );
++}
++
++static HRESULT WINAPI xml_element_RemoveAttributeNode( IXmlElement *iface, IXmlAttribute *attribute_node,
++                                                       IXmlAttribute **removed_attribute )
++{
++    struct xml_node *impl = impl_from_IXmlElement( iface );
++    IXMLDOMNode *node = dom_node( (IUnknown *)attribute_node );
++    IXMLDOMElement *element;
++    IXMLDOMAttribute *attr, *old = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, attribute_node %p, removed_attribute %p.\n", iface, attribute_node, removed_attribute );
++
++    if (!node || FAILED(IXMLDOMNode_QueryInterface( node, &IID_IXMLDOMAttribute, (void **)&attr ))) return E_INVALIDARG;
++    element = dom_element( impl );
++    hr = IXMLDOMElement_removeAttributeNode( element, attr, &old );
++    IXMLDOMElement_Release( element );
++    IXMLDOMAttribute_Release( attr );
++    return wrap_result( hr, (IXMLDOMNode *)old, &IID_IXmlAttribute, (void **)removed_attribute );
++}
++
++static HRESULT WINAPI xml_element_GetElementsByTagName( IXmlElement *iface, HSTRING tag_name, IXmlNodeList **elements )
++{
++    struct xml_node *impl = impl_from_IXmlElement( iface );
++    IXMLDOMElement *element = dom_element( impl );
++    BSTR name = bstr_from_hstring( tag_name );
++    IXMLDOMNodeList *list;
++    HRESULT hr;
++
++    TRACE( "iface %p, tag_name %s, elements %p.\n", iface, debugstr_hstring( tag_name ), elements );
++
++    *elements = NULL;
++    hr = IXMLDOMElement_getElementsByTagName( element, name, &list );
++    SysFreeString( name );
++    IXMLDOMElement_Release( element );
++    if (FAILED(hr)) return hr;
++    hr = xml_node_list_create( list, elements );
++    IXMLDOMNodeList_Release( list );
++    return hr;
++}
++
++static HRESULT WINAPI xml_element_SetAttributeNS( IXmlElement *iface, IInspectable *namespace_uri, HSTRING qualified_name,
++                                                  HSTRING value )
++{
++    FIXME( "iface %p, namespace_uri %p, qualified_name %s, value %s semi-stub!\n", iface, namespace_uri,
++           debugstr_hstring( qualified_name ), debugstr_hstring( value ) );
++    return xml_element_SetAttribute( iface, qualified_name, value );
++}
++
++static HRESULT WINAPI xml_element_GetAttributeNS( IXmlElement *iface, IInspectable *namespace_uri, HSTRING local_name,
++                                                  HSTRING *value )
++{
++    FIXME( "iface %p, namespace_uri %p, local_name %s, value %p semi-stub!\n", iface, namespace_uri,
++           debugstr_hstring( local_name ), value );
++    return xml_element_GetAttribute( iface, local_name, value );
++}
++
++static HRESULT WINAPI xml_element_RemoveAttributeNS( IXmlElement *iface, IInspectable *namespace_uri, HSTRING local_name )
++{
++    FIXME( "iface %p, namespace_uri %p, local_name %s semi-stub!\n", iface, namespace_uri, debugstr_hstring( local_name ) );
++    return xml_element_RemoveAttribute( iface, local_name );
++}
++
++static HRESULT WINAPI xml_element_SetAttributeNodeNS( IXmlElement *iface, IXmlAttribute *new_attribute,
++                                                      IXmlAttribute **previous_attribute )
++{
++    return xml_element_SetAttributeNode( iface, new_attribute, previous_attribute );
++}
++
++static HRESULT WINAPI xml_element_GetAttributeNodeNS( IXmlElement *iface, IInspectable *namespace_uri, HSTRING local_name,
++                                                      IXmlAttribute **previous_attribute )
++{
++    FIXME( "iface %p, namespace_uri %p, local_name %s, previous_attribute %p semi-stub!\n", iface, namespace_uri,
++           debugstr_hstring( local_name ), previous_attribute );
++    return xml_element_GetAttributeNode( iface, local_name, previous_attribute );
++}
++
++static const struct IXmlElementVtbl xml_element_vtbl =
++{
++    xml_element_QueryInterface,
++    xml_element_AddRef,
++    xml_element_Release,
++    /* IInspectable methods */
++    xml_element_GetIids,
++    xml_element_GetRuntimeClassName,
++    xml_element_GetTrustLevel,
++    /* IXmlElement methods */
++    xml_element_get_TagName,
++    xml_element_GetAttribute,
++    xml_element_SetAttribute,
++    xml_element_RemoveAttribute,
++    xml_element_GetAttributeNode,
++    xml_element_SetAttributeNode,
++    xml_element_RemoveAttributeNode,
++    xml_element_GetElementsByTagName,
++    xml_element_SetAttributeNS,
++    xml_element_GetAttributeNS,
++    xml_element_RemoveAttributeNS,
++    xml_element_SetAttributeNodeNS,
++    xml_element_GetAttributeNodeNS,
++};
++
++/*
++ * IXmlCharacterData
++ */
++
++DEFINE_IINSPECTABLE( xml_character_data, IXmlCharacterData, struct xml_node, IXmlNode_iface )
++
++static IXMLDOMCharacterData *dom_character_data( struct xml_node *impl )
++{
++    IXMLDOMCharacterData *data = NULL;
++    IXMLDOMNode_QueryInterface( impl->node, &IID_IXMLDOMCharacterData, (void **)&data );
++    return data;
++}
++
++static HRESULT WINAPI xml_character_data_get_Data( IXmlCharacterData *iface, HSTRING *value )
++{
++    struct xml_node *impl = impl_from_IXmlCharacterData( iface );
++    IXMLDOMCharacterData *data = dom_character_data( impl );
++    HRESULT hr;
++    BSTR str;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    hr = IXMLDOMCharacterData_get_data( data, &str );
++    IXMLDOMCharacterData_Release( data );
++    if (FAILED(hr)) return hr;
++    hr = hstring_from_bstr( str, value );
++    SysFreeString( str );
++    return hr;
++}
++
++static HRESULT WINAPI xml_character_data_put_Data( IXmlCharacterData *iface, HSTRING value )
++{
++    struct xml_node *impl = impl_from_IXmlCharacterData( iface );
++    IXMLDOMCharacterData *data = dom_character_data( impl );
++    BSTR str = bstr_from_hstring( value );
++    HRESULT hr;
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring( value ) );
++
++    hr = IXMLDOMCharacterData_put_data( data, str );
++    SysFreeString( str );
++    IXMLDOMCharacterData_Release( data );
++    return hr;
++}
++
++static HRESULT WINAPI xml_character_data_get_Length( IXmlCharacterData *iface, UINT32 *value )
++{
++    struct xml_node *impl = impl_from_IXmlCharacterData( iface );
++    IXMLDOMCharacterData *data = dom_character_data( impl );
++    LONG len = 0;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    hr = IXMLDOMCharacterData_get_length( data, &len );
++    IXMLDOMCharacterData_Release( data );
++    *value = len;
++    return hr;
++}
++
++static HRESULT WINAPI xml_character_data_SubstringData( IXmlCharacterData *iface, UINT32 offset, UINT32 count, HSTRING *value )
++{
++    struct xml_node *impl = impl_from_IXmlCharacterData( iface );
++    IXMLDOMCharacterData *data = dom_character_data( impl );
++    BSTR str = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, offset %u, count %u, value %p.\n", iface, offset, count, value );
++
++    hr = IXMLDOMCharacterData_substringData( data, offset, count, &str );
++    IXMLDOMCharacterData_Release( data );
++    if (FAILED(hr)) return hr;
++    hr = hstring_from_bstr( str, value );
++    SysFreeString( str );
++    return hr;
++}
++
++static HRESULT WINAPI xml_character_data_AppendData( IXmlCharacterData *iface, HSTRING value )
++{
++    struct xml_node *impl = impl_from_IXmlCharacterData( iface );
++    IXMLDOMCharacterData *data = dom_character_data( impl );
++    BSTR str = bstr_from_hstring( value );
++    HRESULT hr;
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring( value ) );
++
++    hr = IXMLDOMCharacterData_appendData( data, str );
++    SysFreeString( str );
++    IXMLDOMCharacterData_Release( data );
++    return hr;
++}
++
++static HRESULT WINAPI xml_character_data_InsertData( IXmlCharacterData *iface, UINT32 offset, HSTRING value )
++{
++    struct xml_node *impl = impl_from_IXmlCharacterData( iface );
++    IXMLDOMCharacterData *data = dom_character_data( impl );
++    BSTR str = bstr_from_hstring( value );
++    HRESULT hr;
++
++    TRACE( "iface %p, offset %u, value %s.\n", iface, offset, debugstr_hstring( value ) );
++
++    hr = IXMLDOMCharacterData_insertData( data, offset, str );
++    SysFreeString( str );
++    IXMLDOMCharacterData_Release( data );
++    return hr;
++}
++
++static HRESULT WINAPI xml_character_data_DeleteData( IXmlCharacterData *iface, UINT32 offset, UINT32 count )
++{
++    struct xml_node *impl = impl_from_IXmlCharacterData( iface );
++    IXMLDOMCharacterData *data = dom_character_data( impl );
++    HRESULT hr;
++
++    TRACE( "iface %p, offset %u, count %u.\n", iface, offset, count );
++
++    hr = IXMLDOMCharacterData_deleteData( data, offset, count );
++    IXMLDOMCharacterData_Release( data );
++    return hr;
++}
++
++static HRESULT WINAPI xml_character_data_ReplaceData( IXmlCharacterData *iface, UINT32 offset, UINT32 count, HSTRING value )
++{
++    struct xml_node *impl = impl_from_IXmlCharacterData( iface );
++    IXMLDOMCharacterData *data = dom_character_data( impl );
++    BSTR str = bstr_from_hstring( value );
++    HRESULT hr;
++
++    TRACE( "iface %p, offset %u, count %u, value %s.\n", iface, offset, count, debugstr_hstring( value ) );
++
++    hr = IXMLDOMCharacterData_replaceData( data, offset, count, str );
++    SysFreeString( str );
++    IXMLDOMCharacterData_Release( data );
++    return hr;
++}
++
++static const struct IXmlCharacterDataVtbl xml_character_data_vtbl =
++{
++    xml_character_data_QueryInterface,
++    xml_character_data_AddRef,
++    xml_character_data_Release,
++    /* IInspectable methods */
++    xml_character_data_GetIids,
++    xml_character_data_GetRuntimeClassName,
++    xml_character_data_GetTrustLevel,
++    /* IXmlCharacterData methods */
++    xml_character_data_get_Data,
++    xml_character_data_put_Data,
++    xml_character_data_get_Length,
++    xml_character_data_SubstringData,
++    xml_character_data_AppendData,
++    xml_character_data_InsertData,
++    xml_character_data_DeleteData,
++    xml_character_data_ReplaceData,
++};
++
++/*
++ * IXmlText
++ */
++
++DEFINE_IINSPECTABLE( xml_text, IXmlText, struct xml_node, IXmlNode_iface )
++
++static HRESULT WINAPI xml_text_SplitText( IXmlText *iface, UINT32 offset, IXmlText **second_part )
++{
++    struct xml_node *impl = impl_from_IXmlText( iface );
++    IXMLDOMText *text, *second = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, offset %u, second_part %p.\n", iface, offset, second_part );
++
++    if (FAILED(hr = IXMLDOMNode_QueryInterface( impl->node, &IID_IXMLDOMText, (void **)&text ))) return hr;
++    hr = IXMLDOMText_splitText( text, offset, &second );
++    IXMLDOMText_Release( text );
++    return wrap_result( hr, (IXMLDOMNode *)second, &IID_IXmlText, (void **)second_part );
++}
++
++static const struct IXmlTextVtbl xml_text_vtbl =
++{
++    xml_text_QueryInterface,
++    xml_text_AddRef,
++    xml_text_Release,
++    /* IInspectable methods */
++    xml_text_GetIids,
++    xml_text_GetRuntimeClassName,
++    xml_text_GetTrustLevel,
++    /* IXmlText methods */
++    xml_text_SplitText,
++};
++
++/*
++ * IXmlAttribute
++ */
++
++DEFINE_IINSPECTABLE( xml_attribute, IXmlAttribute, struct xml_node, IXmlNode_iface )
++
++static HRESULT WINAPI xml_attribute_get_Name( IXmlAttribute *iface, HSTRING *value )
++{
++    struct xml_node *impl = impl_from_IXmlAttribute( iface );
++    return xml_node_get_NodeName( &impl->IXmlNode_iface, value );
++}
++
++static HRESULT WINAPI xml_attribute_get_Specified( IXmlAttribute *iface, boolean *value )
++{
++    struct xml_node *impl = impl_from_IXmlAttribute( iface );
++    VARIANT_BOOL specified = VARIANT_TRUE;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    hr = IXMLDOMNode_get_specified( impl->node, &specified );
++    *value = specified == VARIANT_TRUE;
++    return hr;
++}
++
++static HRESULT WINAPI xml_attribute_get_Value( IXmlAttribute *iface, HSTRING *value )
++{
++    struct xml_node *impl = impl_from_IXmlAttribute( iface );
++    HRESULT hr;
++    BSTR str;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (FAILED(hr = IXMLDOMNode_get_text( impl->node, &str ))) return hr;
++    hr = hstring_from_bstr( str, value );
++    SysFreeString( str );
++    return hr;
++}
++
++static HRESULT WINAPI xml_attribute_put_Value( IXmlAttribute *iface, HSTRING value )
++{
++    struct xml_node *impl = impl_from_IXmlAttribute( iface );
++    VARIANT var;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %s.\n", iface, debugstr_hstring( value ) );
++
++    V_VT( &var ) = VT_BSTR;
++    V_BSTR( &var ) = bstr_from_hstring( value );
++    hr = IXMLDOMNode_put_nodeValue( impl->node, var );
++    VariantClear( &var );
++    return hr;
++}
++
++static const struct IXmlAttributeVtbl xml_attribute_vtbl =
++{
++    xml_attribute_QueryInterface,
++    xml_attribute_AddRef,
++    xml_attribute_Release,
++    /* IInspectable methods */
++    xml_attribute_GetIids,
++    xml_attribute_GetRuntimeClassName,
++    xml_attribute_GetTrustLevel,
++    /* IXmlAttribute methods */
++    xml_attribute_get_Name,
++    xml_attribute_get_Specified,
++    xml_attribute_get_Value,
++    xml_attribute_put_Value,
++};
++
++/*
++ * IXmlDocument
++ */
++
++DEFINE_IINSPECTABLE( xml_document, IXmlDocument, struct xml_node, IXmlNode_iface )
++
++static IXMLDOMDocument *dom_document( struct xml_node *impl )
++{
++    IXMLDOMDocument *doc = NULL;
++    IXMLDOMNode_QueryInterface( impl->node, &IID_IXMLDOMDocument, (void **)&doc );
++    return doc;
++}
++
++static HRESULT WINAPI xml_document_get_Doctype( IXmlDocument *iface, IXmlDocumentType **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_document_get_Implementation( IXmlDocument *iface, IXmlDomImplementation **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI xml_document_get_DocumentElement( IXmlDocument *iface, IXmlElement **value )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    IXMLDOMElement *element = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    hr = IXMLDOMDocument_get_documentElement( doc, &element );
++    IXMLDOMDocument_Release( doc );
++    return wrap_result( hr, (IXMLDOMNode *)element, &IID_IXmlElement, (void **)value );
++}
++
++static HRESULT WINAPI xml_document_CreateElement( IXmlDocument *iface, HSTRING tag_name, IXmlElement **new_element )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    BSTR name = bstr_from_hstring( tag_name );
++    IXMLDOMElement *element = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, tag_name %s, new_element %p.\n", iface, debugstr_hstring( tag_name ), new_element );
++
++    hr = IXMLDOMDocument_createElement( doc, name, &element );
++    SysFreeString( name );
++    IXMLDOMDocument_Release( doc );
++    return wrap_result( hr, (IXMLDOMNode *)element, &IID_IXmlElement, (void **)new_element );
++}
++
++static HRESULT WINAPI xml_document_CreateDocumentFragment( IXmlDocument *iface, IXmlDocumentFragment **new_document_fragment )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    IXMLDOMDocumentFragment *fragment = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, new_document_fragment %p.\n", iface, new_document_fragment );
++
++    hr = IXMLDOMDocument_createDocumentFragment( doc, &fragment );
++    IXMLDOMDocument_Release( doc );
++    return wrap_result( hr, (IXMLDOMNode *)fragment, &IID_IXmlDocumentFragment, (void **)new_document_fragment );
++}
++
++static HRESULT WINAPI xml_document_CreateTextNode( IXmlDocument *iface, HSTRING data, IXmlText **new_text_node )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    BSTR str = bstr_from_hstring( data );
++    IXMLDOMText *text = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, data %s, new_text_node %p.\n", iface, debugstr_hstring( data ), new_text_node );
++
++    hr = IXMLDOMDocument_createTextNode( doc, str, &text );
++    SysFreeString( str );
++    IXMLDOMDocument_Release( doc );
++    return wrap_result( hr, (IXMLDOMNode *)text, &IID_IXmlText, (void **)new_text_node );
++}
++
++static HRESULT WINAPI xml_document_CreateComment( IXmlDocument *iface, HSTRING data, IXmlComment **new_comment )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    BSTR str = bstr_from_hstring( data );
++    IXMLDOMComment *comment = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, data %s, new_comment %p.\n", iface, debugstr_hstring( data ), new_comment );
++
++    hr = IXMLDOMDocument_createComment( doc, str, &comment );
++    SysFreeString( str );
++    IXMLDOMDocument_Release( doc );
++    return wrap_result( hr, (IXMLDOMNode *)comment, &IID_IXmlComment, (void **)new_comment );
++}
++
++static HRESULT WINAPI xml_document_CreateProcessingInstruction( IXmlDocument *iface, HSTRING target, HSTRING data,
++                                                                IXmlProcessingInstruction **new_processing_instruction )
++{
++    FIXME( "iface %p, target %s, data %s, new_processing_instruction %p stub!\n", iface, debugstr_hstring( target ),
++           debugstr_hstring( data ), new_processing_instruction );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI xml_document_CreateAttribute( IXmlDocument *iface, HSTRING name, IXmlAttribute **new_attribute )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    BSTR str = bstr_from_hstring( name );
++    IXMLDOMAttribute *attr = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, name %s, new_attribute %p.\n", iface, debugstr_hstring( name ), new_attribute );
++
++    hr = IXMLDOMDocument_createAttribute( doc, str, &attr );
++    SysFreeString( str );
++    IXMLDOMDocument_Release( doc );
++    return wrap_result( hr, (IXMLDOMNode *)attr, &IID_IXmlAttribute, (void **)new_attribute );
++}
++
++static HRESULT WINAPI xml_document_CreateEntityReference( IXmlDocument *iface, HSTRING name,
++                                                          IXmlEntityReference **new_entity_reference )
++{
++    FIXME( "iface %p, name %s, new_entity_reference %p stub!\n", iface, debugstr_hstring( name ), new_entity_reference );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI xml_document_GetElementsByTagName( IXmlDocument *iface, HSTRING tag_name, IXmlNodeList **elements )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    BSTR name = bstr_from_hstring( tag_name );
++    IXMLDOMNodeList *list;
++    HRESULT hr;
++
++    TRACE( "iface %p, tag_name %s, elements %p.\n", iface, debugstr_hstring( tag_name ), elements );
++
++    *elements = NULL;
++    hr = IXMLDOMDocument_getElementsByTagName( doc, name, &list );
++    SysFreeString( name );
++    IXMLDOMDocument_Release( doc );
++    if (FAILED(hr)) return hr;
++    hr = xml_node_list_create( list, elements );
++    IXMLDOMNodeList_Release( list );
++    return hr;
++}
++
++static HRESULT WINAPI xml_document_CreateCDataSection( IXmlDocument *iface, HSTRING data, IXmlCDataSection **new_cdata_section )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    BSTR str = bstr_from_hstring( data );
++    IXMLDOMCDATASection *cdata = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, data %s, new_cdata_section %p.\n", iface, debugstr_hstring( data ), new_cdata_section );
++
++    hr = IXMLDOMDocument_createCDATASection( doc, str, &cdata );
++    SysFreeString( str );
++    IXMLDOMDocument_Release( doc );
++    return wrap_result( hr, (IXMLDOMNode *)cdata, &IID_IXmlCDataSection, (void **)new_cdata_section );
++}
++
++static HRESULT WINAPI xml_document_get_DocumentUri( IXmlDocument *iface, HSTRING *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_document_CreateAttributeNS( IXmlDocument *iface, IInspectable *namespace_uri, HSTRING qualified_name,
++                                                      IXmlAttribute **new_attribute )
++{
++    FIXME( "iface %p, namespace_uri %p, qualified_name %s, new_attribute %p semi-stub!\n", iface, namespace_uri,
++           debugstr_hstring( qualified_name ), new_attribute );
++    return xml_document_CreateAttribute( iface, qualified_name, new_attribute );
++}
++
++static HRESULT WINAPI xml_document_CreateElementNS( IXmlDocument *iface, IInspectable *namespace_uri, HSTRING qualified_name,
++                                                    IXmlElement **new_element )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    BSTR name = bstr_from_hstring( qualified_name ), uri = NULL;
++    IXMLDOMNode *node = NULL;
++    VARIANT type;
++    HRESULT hr;
++
++    TRACE( "iface %p, namespace_uri %p, qualified_name %s, new_element %p.\n", iface, namespace_uri,
++           debugstr_hstring( qualified_name ), new_element );
++
++    if (SUCCEEDED(hr = unbox_string( namespace_uri, &uri )))
++    {
++        V_VT( &type ) = VT_I4;
++        V_I4( &type ) = NODE_ELEMENT;
++        hr = IXMLDOMDocument_createNode( doc, type, name, uri, &node );
++    }
++    SysFreeString( uri );
++    SysFreeString( name );
++    IXMLDOMDocument_Release( doc );
++    return wrap_result( hr, node, &IID_IXmlElement, (void **)new_element );
++}
++
++static HRESULT WINAPI xml_document_GetElementById( IXmlDocument *iface, HSTRING element_id, IXmlElement **element )
++{
++    FIXME( "iface %p, element_id %s, element %p stub!\n", iface, debugstr_hstring( element_id ), element );
++    *element = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_document_ImportNode( IXmlDocument *iface, IXmlNode *node, boolean deep, IXmlNode **new_node )
++{
++    struct xml_node *impl = impl_from_IXmlDocument( iface );
++    IXMLDOMNode *source = dom_node( (IUnknown *)node ), *clone = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, node %p, deep %d, new_node %p.\n", iface, node, deep, new_node );
++
++    if (!source) return E_INVALIDARG;
++    /* MSXML lets nodes move between documents: a clone is the import */
++    hr = IXMLDOMNode_cloneNode( source, deep ? VARIANT_TRUE : VARIANT_FALSE, &clone );
++    (void)impl;
++    return wrap_result( hr, clone, &IID_IXmlNode, (void **)new_node );
++}
++
++static const struct IXmlDocumentVtbl xml_document_vtbl =
++{
++    xml_document_QueryInterface,
++    xml_document_AddRef,
++    xml_document_Release,
++    /* IInspectable methods */
++    xml_document_GetIids,
++    xml_document_GetRuntimeClassName,
++    xml_document_GetTrustLevel,
++    /* IXmlDocument methods */
++    xml_document_get_Doctype,
++    xml_document_get_Implementation,
++    xml_document_get_DocumentElement,
++    xml_document_CreateElement,
++    xml_document_CreateDocumentFragment,
++    xml_document_CreateTextNode,
++    xml_document_CreateComment,
++    xml_document_CreateProcessingInstruction,
++    xml_document_CreateAttribute,
++    xml_document_CreateEntityReference,
++    xml_document_GetElementsByTagName,
++    xml_document_CreateCDataSection,
++    xml_document_get_DocumentUri,
++    xml_document_CreateAttributeNS,
++    xml_document_CreateElementNS,
++    xml_document_GetElementById,
++    xml_document_ImportNode,
++};
++
++/*
++ * IXmlDocumentIO
++ */
++
++DEFINE_IINSPECTABLE( xml_document_io, IXmlDocumentIO, struct xml_node, IXmlNode_iface )
++
++static HRESULT WINAPI xml_document_io_LoadXml( IXmlDocumentIO *iface, HSTRING xml )
++{
++    struct xml_node *impl = impl_from_IXmlDocumentIO( iface );
++    IXMLDOMDocument *doc = dom_document( impl );
++    BSTR str = bstr_from_hstring( xml );
++    IXMLDOMParseError *error;
++    VARIANT_BOOL ok = VARIANT_FALSE;
++    LONG code = 0;
++    HRESULT hr;
++
++    TRACE( "iface %p, xml %s.\n", iface, debugstr_hstring( xml ) );
++
++    hr = IXMLDOMDocument_loadXML( doc, str, &ok );
++    SysFreeString( str );
++    if (hr == S_FALSE || ok != VARIANT_TRUE)
++    {
++        if (SUCCEEDED(IXMLDOMDocument_get_parseError( doc, &error )))
++        {
++            IXMLDOMParseError_get_errorCode( error, &code );
++            IXMLDOMParseError_Release( error );
++        }
++        WARN( "parse error %#lx\n", code );
++        hr = code ? code : E_FAIL;
++    }
++    IXMLDOMDocument_Release( doc );
++    return hr;
++}
++
++static HRESULT WINAPI xml_document_io_LoadXmlWithSettings( IXmlDocumentIO *iface, HSTRING xml, IXmlLoadSettings *load_settings )
++{
++    FIXME( "iface %p, xml %s, load_settings %p semi-stub!\n", iface, debugstr_hstring( xml ), load_settings );
++    return xml_document_io_LoadXml( iface, xml );
++}
++
++static HRESULT WINAPI xml_document_io_SaveToFileAsync( IXmlDocumentIO *iface, __x_ABI_CWindows_CStorage_CIStorageFile *file,
++                                                       IAsyncAction **async_info )
++{
++    FIXME( "iface %p, file %p, async_info %p stub!\n", iface, file, async_info );
++    return E_NOTIMPL;
++}
++
++static const struct IXmlDocumentIOVtbl xml_document_io_vtbl =
++{
++    xml_document_io_QueryInterface,
++    xml_document_io_AddRef,
++    xml_document_io_Release,
++    /* IInspectable methods */
++    xml_document_io_GetIids,
++    xml_document_io_GetRuntimeClassName,
++    xml_document_io_GetTrustLevel,
++    /* IXmlDocumentIO methods */
++    xml_document_io_LoadXml,
++    xml_document_io_LoadXmlWithSettings,
++    xml_document_io_SaveToFileAsync,
++};
++
++static HRESULT xml_node_create( IXMLDOMNode *node, REFIID iid, void **out )
++{
++    struct xml_node *impl;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IXmlNode_iface.lpVtbl = &xml_node_vtbl;
++    impl->IXmlNodeSerializer_iface.lpVtbl = &xml_node_serializer_vtbl;
++    impl->IXmlNodeSelector_iface.lpVtbl = &xml_node_selector_vtbl;
++    impl->IXmlElement_iface.lpVtbl = &xml_element_vtbl;
++    impl->IXmlCharacterData_iface.lpVtbl = &xml_character_data_vtbl;
++    impl->IXmlText_iface.lpVtbl = &xml_text_vtbl;
++    impl->IXmlAttribute_iface.lpVtbl = &xml_attribute_vtbl;
++    impl->IXmlDocument_iface.lpVtbl = &xml_document_vtbl;
++    impl->IXmlDocumentIO_iface.lpVtbl = &xml_document_io_vtbl;
++    impl->ref = 1;
++    IXMLDOMNode_AddRef( (impl->node = node) );
++    IXMLDOMNode_get_nodeType( node, &impl->type );
++
++    hr = xml_node_QueryInterface( &impl->IXmlNode_iface, iid, out );
++    xml_node_Release( &impl->IXmlNode_iface );
++    return hr;
++}
++
++HRESULT xml_document_create( IXmlDocument **out )
++{
++    IXMLDOMDocument2 *doc;
++    VARIANT var;
++    HRESULT hr;
++
++    *out = NULL;
++    if (FAILED(hr = CoCreateInstance( &CLSID_DOMDocument60, NULL, CLSCTX_INPROC_SERVER, &IID_IXMLDOMDocument2, (void **)&doc )))
++    {
++        ERR( "no MSXML document, hr %#lx\n", hr );
++        return hr;
++    }
++    V_VT( &var ) = VT_BSTR;
++    V_BSTR( &var ) = SysAllocString( L"XPath" );
++    IXMLDOMDocument2_setProperty( doc, (BSTR)L"SelectionLanguage", var );
++    VariantClear( &var );
++    IXMLDOMDocument2_put_async( doc, VARIANT_FALSE );
++    IXMLDOMDocument2_put_preserveWhiteSpace( doc, VARIANT_TRUE );
++    hr = xml_node_create( (IXMLDOMNode *)doc, &IID_IXmlDocument, (void **)out );
++    IXMLDOMDocument2_Release( doc );
++    return hr;
++}
++
++/* the MSXML document behind an XmlDocument, NULL for another implementation */
++IXMLDOMDocument *xml_document_dom( IXmlDocument *iface )
++{
++    IXMLDOMNode *node = dom_node( (IUnknown *)iface );
++    IXMLDOMDocument *doc = NULL;
++    if (node) IXMLDOMNode_QueryInterface( node, &IID_IXMLDOMDocument, (void **)&doc );
++    return doc;
++}
++
++/*
++ * IXmlNodeList, IVectorView<IXmlNode>, IIterable<IXmlNode>
++ */
++
++static inline struct xml_node_list *impl_from_IXmlNodeList( IXmlNodeList *iface )
++{
++    return CONTAINING_RECORD( iface, struct xml_node_list, IXmlNodeList_iface );
++}
++
++static HRESULT WINAPI xml_node_list_QueryInterface( IXmlNodeList *iface, REFIID iid, void **out )
++{
++    struct xml_node_list *impl = impl_from_IXmlNodeList( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    *out = NULL;
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IXmlNodeList ))
++        *out = &impl->IXmlNodeList_iface;
++    else if (IsEqualGUID( iid, &IID_IVectorView_IXmlNode ))
++        *out = &impl->IVectorView_IXmlNode_iface;
++    else if (IsEqualGUID( iid, &IID_IIterable_IXmlNode ))
++        *out = &impl->IIterable_IXmlNode_iface;
++
++    if (!*out)
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI xml_node_list_AddRef( IXmlNodeList *iface )
++{
++    struct xml_node_list *impl = impl_from_IXmlNodeList( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI xml_node_list_Release( IXmlNodeList *iface )
++{
++    struct xml_node_list *impl = impl_from_IXmlNodeList( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IXMLDOMNodeList_Release( impl->list );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI xml_node_list_GetIids( IXmlNodeList *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI xml_node_list_GetRuntimeClassName( IXmlNodeList *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Data.Xml.Dom.XmlNodeList";
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI xml_node_list_GetTrustLevel( IXmlNodeList *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_node_list_get_Length( IXmlNodeList *iface, UINT32 *value )
++{
++    struct xml_node_list *impl = impl_from_IXmlNodeList( iface );
++    LONG len = 0;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    hr = IXMLDOMNodeList_get_length( impl->list, &len );
++    *value = len;
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_list_Item( IXmlNodeList *iface, UINT32 index, IXmlNode **node )
++{
++    struct xml_node_list *impl = impl_from_IXmlNodeList( iface );
++    IXMLDOMNode *item = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, index %u, node %p.\n", iface, index, node );
++
++    hr = IXMLDOMNodeList_get_item( impl->list, index, &item );
++    return wrap_result( hr == S_FALSE ? S_OK : hr, item, &IID_IXmlNode, (void **)node );
++}
++
++static const struct IXmlNodeListVtbl xml_node_list_vtbl =
++{
++    xml_node_list_QueryInterface,
++    xml_node_list_AddRef,
++    xml_node_list_Release,
++    /* IInspectable methods */
++    xml_node_list_GetIids,
++    xml_node_list_GetRuntimeClassName,
++    xml_node_list_GetTrustLevel,
++    /* IXmlNodeList methods */
++    xml_node_list_get_Length,
++    xml_node_list_Item,
++};
++
++DEFINE_IINSPECTABLE( xml_node_view, IVectorView_IXmlNode, struct xml_node_list, IXmlNodeList_iface )
++
++static HRESULT WINAPI xml_node_view_GetAt( IVectorView_IXmlNode *iface, UINT32 index, IXmlNode **value )
++{
++    struct xml_node_list *impl = impl_from_IVectorView_IXmlNode( iface );
++    UINT32 size;
++    HRESULT hr;
++
++    if (FAILED(hr = xml_node_list_get_Length( &impl->IXmlNodeList_iface, &size ))) return hr;
++    if (index >= size) return E_BOUNDS;
++    return xml_node_list_Item( &impl->IXmlNodeList_iface, index, value );
++}
++
++static HRESULT WINAPI xml_node_view_get_Size( IVectorView_IXmlNode *iface, UINT32 *value )
++{
++    struct xml_node_list *impl = impl_from_IVectorView_IXmlNode( iface );
++    return xml_node_list_get_Length( &impl->IXmlNodeList_iface, value );
++}
++
++static HRESULT WINAPI xml_node_view_IndexOf( IVectorView_IXmlNode *iface, IXmlNode *element, UINT32 *index, boolean *found )
++{
++    struct xml_node_list *impl = impl_from_IVectorView_IXmlNode( iface );
++    IXMLDOMNode *wanted = dom_node( (IUnknown *)element ), *item;
++    UINT32 size, i;
++
++    *found = FALSE;
++    *index = 0;
++    if (!wanted || FAILED(xml_node_list_get_Length( &impl->IXmlNodeList_iface, &size ))) return S_OK;
++    for (i = 0; i < size; i++)
++    {
++        if (IXMLDOMNodeList_get_item( impl->list, i, &item ) != S_OK) continue;
++        IXMLDOMNode_Release( item );
++        if (item == wanted)
++        {
++            *found = TRUE;
++            *index = i;
++            break;
++        }
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_node_view_GetMany( IVectorView_IXmlNode *iface, UINT32 start_index, UINT32 items_size,
++                                             IXmlNode **items, UINT32 *count )
++{
++    struct xml_node_list *impl = impl_from_IVectorView_IXmlNode( iface );
++    UINT32 size, i;
++    HRESULT hr;
++
++    *count = 0;
++    if (FAILED(hr = xml_node_list_get_Length( &impl->IXmlNodeList_iface, &size ))) return hr;
++    if (start_index > size) return E_BOUNDS;
++    for (i = start_index; i < size && i - start_index < items_size; i++)
++    {
++        if (FAILED(hr = xml_node_list_Item( &impl->IXmlNodeList_iface, i, &items[i - start_index] )))
++        {
++            while (i-- > start_index) IXmlNode_Release( items[i - start_index] );
++            return hr;
++        }
++    }
++    *count = i - start_index;
++    return S_OK;
++}
++
++static const struct IVectorView_IXmlNodeVtbl xml_node_view_vtbl =
++{
++    xml_node_view_QueryInterface,
++    xml_node_view_AddRef,
++    xml_node_view_Release,
++    /* IInspectable methods */
++    xml_node_view_GetIids,
++    xml_node_view_GetRuntimeClassName,
++    xml_node_view_GetTrustLevel,
++    /* IVectorView<IXmlNode> methods */
++    xml_node_view_GetAt,
++    xml_node_view_get_Size,
++    xml_node_view_IndexOf,
++    xml_node_view_GetMany,
++};
++
++static inline struct xml_node_iterator *impl_from_IIterator_IXmlNode( IIterator_IXmlNode *iface )
++{
++    return CONTAINING_RECORD( iface, struct xml_node_iterator, IIterator_IXmlNode_iface );
++}
++
++static HRESULT WINAPI xml_node_iterator_QueryInterface( IIterator_IXmlNode *iface, REFIID iid, void **out )
++{
++    struct xml_node_iterator *impl = impl_from_IIterator_IXmlNode( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IIterator_IXmlNode ))
++    {
++        IInspectable_AddRef( (*out = &impl->IIterator_IXmlNode_iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI xml_node_iterator_AddRef( IIterator_IXmlNode *iface )
++{
++    struct xml_node_iterator *impl = impl_from_IIterator_IXmlNode( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI xml_node_iterator_Release( IIterator_IXmlNode *iface )
++{
++    struct xml_node_iterator *impl = impl_from_IIterator_IXmlNode( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IXmlNodeList_Release( &impl->list->IXmlNodeList_iface );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI xml_node_iterator_GetIids( IIterator_IXmlNode *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI xml_node_iterator_GetRuntimeClassName( IIterator_IXmlNode *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI xml_node_iterator_GetTrustLevel( IIterator_IXmlNode *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_node_iterator_get_Current( IIterator_IXmlNode *iface, IXmlNode **value )
++{
++    struct xml_node_iterator *impl = impl_from_IIterator_IXmlNode( iface );
++    return xml_node_view_GetAt( &impl->list->IVectorView_IXmlNode_iface, impl->index, value );
++}
++
++static HRESULT WINAPI xml_node_iterator_get_HasCurrent( IIterator_IXmlNode *iface, boolean *value )
++{
++    struct xml_node_iterator *impl = impl_from_IIterator_IXmlNode( iface );
++    UINT32 size = 0;
++    HRESULT hr = xml_node_list_get_Length( &impl->list->IXmlNodeList_iface, &size );
++    *value = impl->index < size;
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_iterator_MoveNext( IIterator_IXmlNode *iface, boolean *value )
++{
++    struct xml_node_iterator *impl = impl_from_IIterator_IXmlNode( iface );
++    UINT32 size = 0;
++    HRESULT hr = xml_node_list_get_Length( &impl->list->IXmlNodeList_iface, &size );
++    if (impl->index < size) impl->index++;
++    *value = impl->index < size;
++    return hr;
++}
++
++static HRESULT WINAPI xml_node_iterator_GetMany( IIterator_IXmlNode *iface, UINT32 items_size, IXmlNode **items, UINT32 *count )
++{
++    struct xml_node_iterator *impl = impl_from_IIterator_IXmlNode( iface );
++    HRESULT hr = xml_node_view_GetMany( &impl->list->IVectorView_IXmlNode_iface, impl->index, items_size, items, count );
++    if (SUCCEEDED(hr)) impl->index += *count;
++    return hr;
++}
++
++static const struct IIterator_IXmlNodeVtbl xml_node_iterator_vtbl =
++{
++    xml_node_iterator_QueryInterface,
++    xml_node_iterator_AddRef,
++    xml_node_iterator_Release,
++    /* IInspectable methods */
++    xml_node_iterator_GetIids,
++    xml_node_iterator_GetRuntimeClassName,
++    xml_node_iterator_GetTrustLevel,
++    /* IIterator<IXmlNode> methods */
++    xml_node_iterator_get_Current,
++    xml_node_iterator_get_HasCurrent,
++    xml_node_iterator_MoveNext,
++    xml_node_iterator_GetMany,
++};
++
++DEFINE_IINSPECTABLE( xml_node_iterable, IIterable_IXmlNode, struct xml_node_list, IXmlNodeList_iface )
++
++static HRESULT WINAPI xml_node_iterable_First( IIterable_IXmlNode *iface, IIterator_IXmlNode **value )
++{
++    struct xml_node_list *impl = impl_from_IIterable_IXmlNode( iface );
++    struct xml_node_iterator *iter;
++
++    if (!(iter = calloc( 1, sizeof(*iter) ))) return E_OUTOFMEMORY;
++    iter->IIterator_IXmlNode_iface.lpVtbl = &xml_node_iterator_vtbl;
++    iter->ref = 1;
++    iter->list = impl;
++    IXmlNodeList_AddRef( &impl->IXmlNodeList_iface );
++    *value = &iter->IIterator_IXmlNode_iface;
++    return S_OK;
++}
++
++static const struct IIterable_IXmlNodeVtbl xml_node_iterable_vtbl =
++{
++    xml_node_iterable_QueryInterface,
++    xml_node_iterable_AddRef,
++    xml_node_iterable_Release,
++    /* IInspectable methods */
++    xml_node_iterable_GetIids,
++    xml_node_iterable_GetRuntimeClassName,
++    xml_node_iterable_GetTrustLevel,
++    /* IIterable<IXmlNode> methods */
++    xml_node_iterable_First,
++};
++
++static HRESULT xml_node_list_create( IXMLDOMNodeList *list, IXmlNodeList **out )
++{
++    struct xml_node_list *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IXmlNodeList_iface.lpVtbl = &xml_node_list_vtbl;
++    impl->IVectorView_IXmlNode_iface.lpVtbl = &xml_node_view_vtbl;
++    impl->IIterable_IXmlNode_iface.lpVtbl = &xml_node_iterable_vtbl;
++    impl->ref = 1;
++    IXMLDOMNodeList_AddRef( (impl->list = list) );
++    *out = &impl->IXmlNodeList_iface;
++    return S_OK;
++}
++
++/*
++ * IXmlNamedNodeMap
++ */
++
++static inline struct xml_named_node_map *impl_from_IXmlNamedNodeMap( IXmlNamedNodeMap *iface )
++{
++    return CONTAINING_RECORD( iface, struct xml_named_node_map, IXmlNamedNodeMap_iface );
++}
++
++static HRESULT WINAPI xml_named_node_map_QueryInterface( IXmlNamedNodeMap *iface, REFIID iid, void **out )
++{
++    struct xml_named_node_map *impl = impl_from_IXmlNamedNodeMap( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IXmlNamedNodeMap ))
++    {
++        IInspectable_AddRef( (*out = &impl->IXmlNamedNodeMap_iface) );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI xml_named_node_map_AddRef( IXmlNamedNodeMap *iface )
++{
++    struct xml_named_node_map *impl = impl_from_IXmlNamedNodeMap( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI xml_named_node_map_Release( IXmlNamedNodeMap *iface )
++{
++    struct xml_named_node_map *impl = impl_from_IXmlNamedNodeMap( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IXMLDOMNamedNodeMap_Release( impl->map );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI xml_named_node_map_GetIids( IXmlNamedNodeMap *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI xml_named_node_map_GetRuntimeClassName( IXmlNamedNodeMap *iface, HSTRING *class_name )
++{
++    static const WCHAR name[] = L"Windows.Data.Xml.Dom.XmlNamedNodeMap";
++    return WindowsCreateString( name, wcslen( name ), class_name );
++}
++
++static HRESULT WINAPI xml_named_node_map_GetTrustLevel( IXmlNamedNodeMap *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI xml_named_node_map_get_Length( IXmlNamedNodeMap *iface, UINT32 *value )
++{
++    struct xml_named_node_map *impl = impl_from_IXmlNamedNodeMap( iface );
++    LONG len = 0;
++    HRESULT hr = IXMLDOMNamedNodeMap_get_length( impl->map, &len );
++    *value = len;
++    return hr;
++}
++
++static HRESULT WINAPI xml_named_node_map_Item( IXmlNamedNodeMap *iface, UINT32 index, IXmlNode **node )
++{
++    struct xml_named_node_map *impl = impl_from_IXmlNamedNodeMap( iface );
++    IXMLDOMNode *item = NULL;
++    HRESULT hr = IXMLDOMNamedNodeMap_get_item( impl->map, index, &item );
++    return wrap_result( hr == S_FALSE ? S_OK : hr, item, &IID_IXmlNode, (void **)node );
++}
++
++static HRESULT WINAPI xml_named_node_map_GetNamedItem( IXmlNamedNodeMap *iface, HSTRING name, IXmlNode **node )
++{
++    struct xml_named_node_map *impl = impl_from_IXmlNamedNodeMap( iface );
++    BSTR str = bstr_from_hstring( name );
++    IXMLDOMNode *item = NULL;
++    HRESULT hr = IXMLDOMNamedNodeMap_getNamedItem( impl->map, str, &item );
++    SysFreeString( str );
++    return wrap_result( hr == S_FALSE ? S_OK : hr, item, &IID_IXmlNode, (void **)node );
++}
++
++static HRESULT WINAPI xml_named_node_map_SetNamedItem( IXmlNamedNodeMap *iface, IXmlNode *node, IXmlNode **previous_node )
++{
++    struct xml_named_node_map *impl = impl_from_IXmlNamedNodeMap( iface );
++    IXMLDOMNode *item = dom_node( (IUnknown *)node ), *old = NULL;
++    if (!item) return E_INVALIDARG;
++    return wrap_result( IXMLDOMNamedNodeMap_setNamedItem( impl->map, item, &old ), old, &IID_IXmlNode, (void **)previous_node );
++}
++
++static HRESULT WINAPI xml_named_node_map_RemoveNamedItem( IXmlNamedNodeMap *iface, HSTRING name, IXmlNode **previous_node )
++{
++    struct xml_named_node_map *impl = impl_from_IXmlNamedNodeMap( iface );
++    BSTR str = bstr_from_hstring( name );
++    IXMLDOMNode *old = NULL;
++    HRESULT hr = IXMLDOMNamedNodeMap_removeNamedItem( impl->map, str, &old );
++    SysFreeString( str );
++    return wrap_result( hr == S_FALSE ? S_OK : hr, old, &IID_IXmlNode, (void **)previous_node );
++}
++
++static HRESULT WINAPI xml_named_node_map_GetNamedItemNS( IXmlNamedNodeMap *iface, IInspectable *namespace_uri, HSTRING name,
++                                                         IXmlNode **node )
++{
++    return xml_named_node_map_GetNamedItem( iface, name, node );
++}
++
++static HRESULT WINAPI xml_named_node_map_RemoveNamedItemNS( IXmlNamedNodeMap *iface, IInspectable *namespace_uri, HSTRING name,
++                                                            IXmlNode **previous_node )
++{
++    return xml_named_node_map_RemoveNamedItem( iface, name, previous_node );
++}
++
++static HRESULT WINAPI xml_named_node_map_SetNamedItemNS( IXmlNamedNodeMap *iface, IXmlNode *node, IXmlNode **previous_node )
++{
++    return xml_named_node_map_SetNamedItem( iface, node, previous_node );
++}
++
++static const struct IXmlNamedNodeMapVtbl xml_named_node_map_vtbl =
++{
++    xml_named_node_map_QueryInterface,
++    xml_named_node_map_AddRef,
++    xml_named_node_map_Release,
++    /* IInspectable methods */
++    xml_named_node_map_GetIids,
++    xml_named_node_map_GetRuntimeClassName,
++    xml_named_node_map_GetTrustLevel,
++    /* IXmlNamedNodeMap methods */
++    xml_named_node_map_get_Length,
++    xml_named_node_map_Item,
++    xml_named_node_map_GetNamedItem,
++    xml_named_node_map_SetNamedItem,
++    xml_named_node_map_RemoveNamedItem,
++    xml_named_node_map_GetNamedItemNS,
++    xml_named_node_map_RemoveNamedItemNS,
++    xml_named_node_map_SetNamedItemNS,
++};
++
++/*
++ * XmlDocument activation factory
++ */
++
++struct xml_document_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    LONG ref;
++};
++
++static inline struct xml_document_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct xml_document_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct xml_document_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        IInspectable_AddRef( (*out = &impl->IActivationFactory_iface) );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface )
++{
++    struct xml_document_statics *impl = impl_from_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI factory_Release( IActivationFactory *iface )
++{
++    struct xml_document_statics *impl = impl_from_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return xml_document_create( (IXmlDocument **)instance );
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++static struct xml_document_statics xml_document_statics =
++{
++    {&factory_vtbl},
++    1,
++};
++
++IActivationFactory *xml_document_factory = &xml_document_statics.IActivationFactory_iface;
+--- /dev/null
++++ b/dlls/windows.ui/xmldom_classes.idl
+@@ -0,0 +1,25 @@
++/*
++ * Runtime Classes for windows.ui.dll: Windows.Data.Xml.Dom
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep register
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++#include "windows.data.xml.dom.idl"
