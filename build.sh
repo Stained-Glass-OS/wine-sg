@@ -45,7 +45,7 @@ series_fingerprint() {
     {
         cat "$HERE/wine-version"
         # the generated Dark colour scheme is part of the tree (0160)
-        cat "$HERE/theme/dark.py"
+        cat "$HERE/theme/dark.py" "$HERE/theme/images.list"
         while read -r p; do
             [[ -z "$p" || "$p" == \#* ]] && continue
             echo "== $p"
@@ -85,6 +85,18 @@ regenerate_theme_images() {
         return 0
     fi
     log "  rendering the purple Light theme images"
+    # and the images the series redraws elsewhere (theme/images.list: SVGs
+    # whose .ico/.bmp/.cur are re-rendered, e.g. user32's default window icon)
+    while read -r svg; do
+        case "$svg" in ''|'#'*) continue ;; esac
+        base=$tree/${svg%.svg}
+        for ext in bmp cur ico; do
+            [[ -f "$base.$ext" ]] || continue
+            CONVERT=convert ICOTOOL=icotool RSVG=rsvg-convert \
+                perl "$tree/tools/buildimage" "$tree/$svg" "$base.$ext" >/dev/null 2>&1 \
+                || log "    WARNING: could not render $(basename "$base.$ext")"
+        done
+    done < "$HERE/theme/images.list"
     for svg in "$dir"/*.svg; do
         base=${svg%.svg}
         for ext in bmp cur ico; do
