@@ -372,6 +372,10 @@ test-shutdownexe:
 test-logoff:
 	WINE=$(PREFIX)/bin/wine test/logoff-gate.sh
 
+# cmd's banner and console title (0440).
+test-cmdbanner:
+	WINE=$(PREFIX)/bin/wine test/cmdbanner-gate.sh
+
 # Shared D3D11 textures under DXVK do not crash (0361): GOG Galaxy, browser
 # engines. Needs DXVK_DIR (a DXVK build with x64/d3d11.dll) and Xvfb.
 test-d3dshared:
