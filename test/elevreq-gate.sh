@@ -53,7 +53,7 @@ build() { # name level
 EOM
     printf '1 24 "%s"\n' "$W/$1.manifest" > "$W/$1.rc"
     "$WINDRES" "$W/$1.rc" -O coff -o "$W/$1.res" && \
-        "$MINGW" -O2 -o "$W/$1.exe" "$HERE/elevreq-probe.c" "$W/$1.res" -lshell32 || { echo "FAIL build $1"; exit 1; }
+        "$MINGW" -O2 -o "$W/$1.exe" "$HERE/elevreq-probe.c" "$W/$1.res" -lshell32 -lole32 -luuid || { echo "FAIL build $1"; exit 1; }
 }
 build admin requireAdministrator
 build highest highestAvailable
@@ -108,6 +108,20 @@ rm -f "$W/out/elevate.log"
 out=$(other "$WINE" "$W/invoker.exe" shell "$(zp "$W/invoker.exe")")
 [ "$out" = "SHELL ok" ] && [ ! -s "$W/out/elevate.log" ] && pass "an asInvoker program is not sent to the broker" \
     || fail "asInvoker via ShellExecuteEx: '$out', broker '$(cat "$W/out/elevate.log" 2>/dev/null)'"
+# Run as administrator on a shortcut (the Start menu's PowerShell 7): the
+# broker is given the shortcut's target, quoted -- it was given the shortcut's
+# own path, split at its first space ("C:\ProgramData\Microsoft\Windows\Start"),
+# and nothing ran (0444).
+rm -f "$W/out/elevate.log"
+# the account's profile, as its session would have made it (sg-profile-create):
+# without a Desktop folder the shell namespace does not open at all
+sudo -n -u "$SG_OTHER" mkdir -p "$PFX/drive_c/users/$SG_OTHER/Desktop"
+out=$(other "$WINE" "$W/invoker.exe" runaslnk "$(zp "$W/highest.exe")")
+sleep 1
+log=$(cat "$W/out/elevate.log" 2>/dev/null)
+if [ "$out" = "SHELL ok" ] && grep -q 'highest\.exe' <<<"$log" && ! grep -qi '\.lnk' <<<"$log" && grep -q -- '-NoLogo' <<<"$log"; then
+    pass "Run as administrator on a shortcut hands its target and arguments to the broker ($log)"
+else fail "runas on a shortcut: '$out', broker saw '$log'"; fi
 out=$(other env SG_IN_BROKER=1 "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "inside a program the broker started, it runs (no loop)" || fail "SG_IN_BROKER: '$out'"
 # no broker installed (a relative SG_ELEVATE is not a stand-in, and this
