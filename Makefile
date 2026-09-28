@@ -140,6 +140,11 @@ test-crashbrand:
 test-fgthread:
 	WINE=$(PREFIX)/bin/wine test/fgthread-gate.sh
 
+# The interface fonts' names are families ("Segoe UI"), not faces' full names:
+# Firefox's system-ui font (0462).
+test-metricsfont:
+	WINE=$(PREFIX)/bin/wine test/metricsfont-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
