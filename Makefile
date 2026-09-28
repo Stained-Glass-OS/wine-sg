@@ -114,6 +114,10 @@ test-userroots:
 test-focusmap:
 	WINE=$(PREFIX)/bin/wine test/focusmap-gate.sh
 
+# A folder's right-click menu: New > Folder, Shortcut, Text Document (0450).
+test-newtext:
+	WINE=$(PREFIX)/bin/wine test/newtext-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
