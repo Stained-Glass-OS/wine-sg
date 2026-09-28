@@ -89,11 +89,12 @@ wait_for 10 selected_is "New Text Document.txt" && pass "... and selects it" || 
 empty_menu; xdotool key w f
 wait_for 10 exists "$DESK/New folder (2)" && pass "a second New > Folder makes 'New folder (2)'" || fail "no New folder (2): $(ls "$DESK" | tr '\n' '|')"
 
+field_is size 48 && pass "Medium icons (48 px) by default" || fail "default size: $(head1)"
 empty_menu; xdotool key v l
-wait_for 10 field_is size 48 && pass "View > Large icons" || fail "large icons: $(head1)"
+wait_for 10 field_is size 96 && pass "View > Large icons (96 px, as Windows)" || fail "large icons: $(head1)"
 sleep 1; shot large
 empty_menu; xdotool key v m
-wait_for 10 field_is size 32 && pass "View > Medium icons" || fail "medium icons: $(head1)"
+wait_for 10 field_is size 48 && pass "View > Medium icons (48 px)" || fail "medium icons: $(head1)"
 empty_menu; xdotool key o d
 wait_for 10 field_is sort 3 && pass "Sort by > Date modified" || fail "sort: $(head1)"
 reg_sort=$("$WINE" reg query 'HKCU\Software\Stained Glass\Desktop' /v SortBy 2>/dev/null | tr -d '\r' | awk '/SortBy/ {print $3}')
