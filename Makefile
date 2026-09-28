@@ -170,6 +170,10 @@ test-logonvars:
 test-drivemenu:
 	WINE=$(PREFIX)/bin/wine test/drivemenu-gate.sh
 
+# The Network folder: computers, their shares, \\\\server paths (0469).
+test-netplaces:
+	WINE=$(PREFIX)/bin/wine test/netplaces-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
