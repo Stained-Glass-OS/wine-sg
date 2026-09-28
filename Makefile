@@ -157,6 +157,11 @@ test-traymenu:
 test-sysrelevated:
 	WINE=$(PREFIX)/bin/wine test/sysrelevated-gate.sh
 
+# SYSTEM may change the permissions of a file another account owns: CAP_FOWNER,
+# permitted only, effective for one fchmod (0466).
+test-sysfowner:
+	WINE=$(PREFIX)/bin/wine test/sysfowner-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
