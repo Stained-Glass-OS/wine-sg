@@ -145,6 +145,10 @@ test-fgthread:
 test-metricsfont:
 	WINE=$(PREFIX)/bin/wine test/metricsfont-gate.sh
 
+# The administrative tools' launchers carry icons; .msc files show mmc.exe's (0463).
+test-admintoolicons:
+	WINE=$(PREFIX)/bin/wine test/admintoolicons-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
