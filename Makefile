@@ -118,6 +118,10 @@ test-focusmap:
 test-newtext:
 	WINE=$(PREFIX)/bin/wine test/newtext-gate.sh
 
+# Push buttons and message boxes as Windows 10 draws them (0454).
+test-flatbuttons:
+	WINE=$(PREFIX)/bin/wine test/flatbuttons-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
