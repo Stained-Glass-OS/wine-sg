@@ -162,6 +162,10 @@ test-sysrelevated:
 test-sysfowner:
 	WINE=$(PREFIX)/bin/wine test/sysfowner-gate.sh
 
+# Every user of a shared prefix has APPDATA, LOCALAPPDATA, HOMEDRIVE, HOMEPATH (0467).
+test-logonvars:
+	WINE=$(PREFIX)/bin/wine test/logonvars-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
