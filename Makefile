@@ -106,6 +106,10 @@ test-vdesk:
 test-vdpager:
 	WINE=$(PREFIX)/bin/wine test/vdpager-gate.sh
 
+# A standard user trusts the machine's root certificates (0447).
+test-userroots:
+	WINE=$(PREFIX)/bin/wine test/userroots-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
