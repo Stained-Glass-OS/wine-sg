@@ -126,6 +126,11 @@ test-flatbuttons:
 test-usersacl:
 	WINE=$(PREFIX)/bin/wine test/usersacl-gate.sh
 
+# A key granted to BUILTIN\\Users is theirs to write from a 64-bit program's
+# view of the 32-bit registry: the keys on the way are passed through (0459).
+test-regwalk:
+	WINE=$(PREFIX)/bin/wine test/regwalk-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
