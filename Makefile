@@ -149,6 +149,10 @@ test-metricsfont:
 test-admintoolicons:
 	WINE=$(PREFIX)/bin/wine test/admintoolicons-gate.sh
 
+# Right-clicking the taskbar opens its menu, Start the quick link menu (0464).
+test-traymenu:
+	WINE=$(PREFIX)/bin/wine test/traymenu-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
