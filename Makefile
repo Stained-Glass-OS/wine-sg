@@ -153,6 +153,10 @@ test-admintoolicons:
 test-traymenu:
 	WINE=$(PREFIX)/bin/wine test/traymenu-gate.sh
 
+# On a shared prefix SYSTEM's token is elevated; a standard user's is not (0465).
+test-sysrelevated:
+	WINE=$(PREFIX)/bin/wine test/sysrelevated-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
