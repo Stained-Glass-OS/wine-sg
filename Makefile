@@ -131,6 +131,10 @@ test-usersacl:
 test-regwalk:
 	WINE=$(PREFIX)/bin/wine test/regwalk-gate.sh
 
+# A program's crash is told in this system's words, not Wine's (0460).
+test-crashbrand:
+	WINE=$(PREFIX)/bin/wine test/crashbrand-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
