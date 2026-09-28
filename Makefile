@@ -178,6 +178,14 @@ test-netplaces:
 test-envblock:
 	WINE=$(PREFIX)/bin/wine test/envblock-gate.sh
 
+# A symlink opened as itself says REPARSE_POINT (0471): Office's staging.
+test-reparseinfo:
+	WINE=$(PREFIX)/bin/wine test/reparseinfo-gate.sh
+
+# ShellExecute of a long URL (a mailto: with a body) reaches its handler (0472).
+test-longurl:
+	WINE=$(PREFIX)/bin/wine test/longurl-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
