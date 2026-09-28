@@ -4,7 +4,8 @@
 # a message box's text on the window colour and its buttons on a strip of the
 # face colour; buttons flat -- the default one's border in the highlight
 # colour, no dark bevel, no dotted focus rectangle. They were Windows 95's
-# (field report 2: Setup's Next, installers' message boxes looked old).
+# (field report 2: Setup's Next, installers' message boxes looked old). Edit
+# boxes' edges and drop-down lists flat too (0455).
 #
 #   WINE=/opt/wine-sg/bin/wine test/flatbuttons-gate.sh
 set -u
@@ -29,6 +30,10 @@ cat > "$T/session.sh" <<EOF
 "$WINE" "$T/flatbuttons-probe.exe" > "$T/probe.out" 2>/dev/null &
 i=0; while ! grep -q highlight "$T/probe.out" 2>/dev/null && [ \$i -lt 60 ]; do sleep 0.5; i=\$((i + 1)); done
 import -window root "$T/shot.png"
+"$WINESERVER" -k; sleep 1
+"$WINE" "$T/flatbuttons-probe.exe" form > "$T/form.out" 2>/dev/null &
+i=0; while ! grep -q text "$T/form.out" 2>/dev/null && [ \$i -lt 60 ]; do sleep 0.5; i=\$((i + 1)); done
+sleep 2; import -window root "$T/form.png"
 "$WINESERVER" -k
 EOF
 chmod +x "$T/session.sh"
@@ -49,5 +54,21 @@ corner=$(px $((yr - 1)) $((yb - 1)))
 [ "$corner" = "$hi" ] && pass "the default button: flat, its border in the highlight colour" || fail "default button's corner $corner, not $hi (a bevel?)"
 inner=$(px $((yr - 3)) $((yb - 3)))
 [ "$inner" != "0,0,0" ] && [ "$inner" != "105,105,105" ] && pass "and no dark bevel inside it" || fail "bevel at $inner"
+# 0455: an edit box's edge and a drop-down list, flat
+tr -d '\r' < "$T/form.out" | sed 's/^/      /'
+f() { tr -d '\r' < "$T/form.out" | awk -v k="$1" -v n="$2" '$1 == k { print $(n + 1) }'; }
+fpx() { convert "$T/form.png" -format "%[fx:int(255*p{$1,$2}.r)],%[fx:int(255*p{$1,$2}.g)],%[fx:int(255*p{$1,$2}.b)]" info: 2>/dev/null; }
+if [ -n "$(f edit 1)" ]; then
+    fwin=$(rgb "$(f window 1)"); shadow=$(rgb "$(f shadow 1)")
+    el=$(f edit 1); et=$(f edit 2); eb=$(f edit 4)
+    ey=$(( (et + eb) / 2 ))
+    { [ "$(fpx "$el" "$ey")" = "$shadow" ] && [ "$(fpx $((el + 1)) "$ey")" = "$fwin" ]; } \
+        && pass "an edit box's edge: one line of the shadow colour, one of the window's" || fail "edit edge $(fpx "$el" "$ey") / $(fpx $((el + 1)) "$ey")"
+    cr=$(f combo 3); ct=$(f combo 2); cbm=$(f combo 4)
+    [ "$(fpx $((cr - 4)) $((ct + 4)))" = "$fwin" ] && pass "a drop-down list's button: flat, on the window colour" \
+        || fail "combo button corner $(fpx $((cr - 4)) $((ct + 4))), not $fwin (a raised button?)"
+    [ "$(fpx "$cr" $(( (ct + cbm) / 2 )))" != "0,0,0" ] || fail "a black edge on the drop-down list"
+else fail "no form"; fi
+
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

@@ -6,6 +6,7 @@
  */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 static DWORD WINAPI report(void *arg)
 {
@@ -24,8 +25,37 @@ static DWORD WINAPI report(void *arg)
     return 0;
 }
 
-int main(void)
+static LRESULT CALLBACK form_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_DESTROY) PostQuitMessage(0);
+    return DefWindowProcW(h, m, w, l);
+}
+
+/* "form": a drop-down list and an edit box (0455); prints their screen rects */
+static int form(void)
+{
+    WNDCLASSW wc = {0};
+    MSG msg;
+    HWND h, cb, ed;
+    RECT rc, re;
+    wc.lpfnWndProc = form_proc; wc.lpszClassName = L"SgFlatForm"; wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+    RegisterClassW(&wc);
+    h = CreateWindowW(L"SgFlatForm", L"SgFlatForm", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 50, 50, 460, 260, 0, 0, 0, 0);
+    cb = CreateWindowW(L"COMBOBOX", 0, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 20, 20, 300, 200, h, 0, 0, 0);
+    SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"English (United States)"); SendMessageW(cb, CB_SETCURSEL, 0, 0);
+    ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"live", WS_CHILD | WS_VISIBLE, 20, 70, 300, 26, h, 0, 0, 0);
+    UpdateWindow(h);
+    GetWindowRect(cb, &rc); GetWindowRect(ed, &re);
+    printf("combo %ld %ld %ld %ld\nedit %ld %ld %ld %ld\nwindow %lu\nshadow %lu\ntext %lu\n", rc.left, rc.top, rc.right, rc.bottom,
+           re.left, re.top, re.right, re.bottom, GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_BTNSHADOW), GetSysColor(COLOR_BTNTEXT));
+    fflush(stdout);
+    while (GetMessageW(&msg, 0, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && !strcmp(argv[1], "form")) return form();
     CloseHandle(CreateThread(NULL, 0, report, NULL, 0, NULL));
     MessageBoxW(NULL, L"Delete partition 2? Everything on it will be lost.", L"SgFlat", MB_YESNO | MB_ICONWARNING);
     return 0;
