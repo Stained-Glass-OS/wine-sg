@@ -135,6 +135,11 @@ test-regwalk:
 test-crashbrand:
 	WINE=$(PREFIX)/bin/wine test/crashbrand-gate.sh
 
+# Another thread's hidden window leaves the foreground where it is: Firefox
+# stays full screen (0461).
+test-fgthread:
+	WINE=$(PREFIX)/bin/wine test/fgthread-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
