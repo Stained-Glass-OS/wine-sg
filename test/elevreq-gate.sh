@@ -64,6 +64,7 @@ mkdir -m 777 "$W/out"
 cat > "$W/elevate" <<EOS
 #!/bin/sh
 printf '%s\n' "\$*" >> "$W/out/elevate.log"   # not echo: dash's eats Windows paths' backslashes
+case "\$*" in *wait-me*) sleep 2; exit 7 ;; esac
 EOS
 chmod 755 "$W/elevate"
 
@@ -122,6 +123,13 @@ log=$(cat "$W/out/elevate.log" 2>/dev/null)
 if [ "$out" = "SHELL ok" ] && grep -q 'highest\.exe' <<<"$log" && ! grep -qi '\.lnk' <<<"$log" && grep -q -- '-NoLogo' <<<"$log"; then
     pass "Run as administrator on a shortcut hands its target and arguments to the broker ($log)"
 else fail "runas on a shortcut: '$out', broker saw '$log'"; fi
+# the caller of an elevated program can wait for it and read its exit code
+# (Get a web browser waits for Edge's installer): Wine gives no handle for a
+# Unix program, so the broker's client runs inside rundll32 (0448)
+out=$(sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" HOME=/var/tmp \
+      SG_ELEVATE="$W/elevate" "$WINE" "$W/invoker.exe" runaswait "$(zp "$W/admin.exe")" 2>/dev/null | tr -d '\r' | grep '^WAIT ')
+case "$out" in "WAIT code 7 secs "[2-9]*) pass "Run as administrator: the caller waits for the elevated program and gets its code ($out)" ;;
+    *) fail "waiting on an elevated program: '$out'" ;; esac
 out=$(other env SG_IN_BROKER=1 "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "inside a program the broker started, it runs (no loop)" || fail "SG_IN_BROKER: '$out'"
 # no broker installed (a relative SG_ELEVATE is not a stand-in, and this

@@ -4,6 +4,8 @@
  *   elevreq-probe.exe runaslnk PROGRAM a shortcut to PROGRAM under a folder with spaces
  *                                      (C:\Stained Test\Start Menu\Power Shell 7.lnk),
  *                                      then ShellExecuteEx "runas" on it, print "SHELL ok|err N"
+ *   elevreq-probe.exe runaswait PROGRAM ShellExecuteEx "runas" PROGRAM "wait-me", wait on
+ *                                      its handle, print "WAIT code N secs S" (or "WAIT nohandle")
  * The PROGRAMs are this same source built with different manifests; run
  * without arguments they print "RAN" and exit 7. */
 #define COBJMACROS
@@ -46,6 +48,21 @@ int main(int argc, char **argv)
         sei.lpVerb = L"runas"; sei.lpFile = lnk; sei.nShow = SW_SHOWNORMAL;
         if (ShellExecuteExW(&sei)) { if (sei.hProcess) WaitForSingleObject(sei.hProcess, 20000); printf("SHELL ok\n"); }
         else printf("SHELL err %lu\n", GetLastError());
+    }
+    else if (!strcmp(argv[1], "runaswait"))
+    {
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        DWORD code = 0, t0 = GetTickCount();
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+        sei.lpVerb = L"runas"; sei.lpFile = prog; sei.lpParameters = L"wait-me"; sei.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&sei)) printf("WAIT err %lu\n", GetLastError());
+        else if (!sei.hProcess) printf("WAIT nohandle\n");
+        else
+        {
+            WaitForSingleObject(sei.hProcess, 30000);
+            GetExitCodeProcess(sei.hProcess, &code);
+            printf("WAIT code %lu secs %lu\n", code, (GetTickCount() - t0) / 1000);
+        }
     }
     else
     {
