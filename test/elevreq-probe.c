@@ -49,12 +49,14 @@ int main(int argc, char **argv)
         if (ShellExecuteExW(&sei)) { if (sei.hProcess) WaitForSingleObject(sei.hProcess, 20000); printf("SHELL ok\n"); }
         else printf("SHELL err %lu\n", GetLastError());
     }
-    else if (!strcmp(argv[1], "runaswait"))
+    else if (!strcmp(argv[1], "runaswait") || !strcmp(argv[1], "runasuac"))
     {
         SHELLEXECUTEINFOW sei = { sizeof(sei) };
         DWORD code = 0, t0 = GetTickCount();
         sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
-        sei.lpVerb = L"runas"; sei.lpFile = prog; sei.lpParameters = L"wait-me"; sei.nShow = SW_SHOWNORMAL;
+        sei.lpVerb = L"runas"; sei.lpFile = prog; sei.nShow = SW_SHOWNORMAL;
+        /* runasuac: as NSIS's UAC plugin starts its elevated copy (0457) */
+        sei.lpParameters = !strcmp(argv[1], "runasuac") ? L"/UAC:1a2b wait-me" : L"wait-me";
         if (!ShellExecuteExW(&sei)) printf("WAIT err %lu\n", GetLastError());
         else if (!sei.hProcess) printf("WAIT nohandle\n");
         else

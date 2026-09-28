@@ -130,6 +130,14 @@ out=$(sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRID
       SG_ELEVATE="$W/elevate" "$WINE" "$W/invoker.exe" runaswait "$(zp "$W/admin.exe")" 2>/dev/null | tr -d '\r' | grep '^WAIT ')
 case "$out" in "WAIT code 7 secs "[2-9]*) pass "Run as administrator: the caller waits for the elevated program and gets its code ($out)" ;;
     *) fail "waiting on an elevated program: '$out'" ;; esac
+# NSIS's UAC plugin: its /UAC:<window> switch is not passed on (0457) -- the
+# elevated copy could not reach the window and installed nothing
+rm -f "$W/out/elevate.log"
+sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" HOME=/var/tmp \
+    SG_ELEVATE="$W/elevate" "$WINE" "$W/invoker.exe" runasuac "$(zp "$W/admin.exe")" >/dev/null 2>&1
+log=$(cat "$W/out/elevate.log" 2>/dev/null)
+if grep -q 'wait-me' <<<"$log" && ! grep -qi '/UAC:' <<<"$log"; then pass "an NSIS installer's /UAC: switch is not passed to its elevated copy ($log)"
+else fail "/UAC: $log"; fi
 out=$(other env SG_IN_BROKER=1 "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "inside a program the broker started, it runs (no loop)" || fail "SG_IN_BROKER: '$out'"
 # no broker installed (a relative SG_ELEVATE is not a stand-in, and this
