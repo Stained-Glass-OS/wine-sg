@@ -122,6 +122,10 @@ test-newtext:
 test-flatbuttons:
 	WINE=$(PREFIX)/bin/wine test/flatbuttons-gate.sh
 
+# A grant to BUILTIN\\Users reaches the machine's users: the prefix's group (0456).
+test-usersacl:
+	WINE=$(PREFIX)/bin/wine test/usersacl-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
