@@ -166,6 +166,10 @@ test-sysfowner:
 test-logonvars:
 	WINE=$(PREFIX)/bin/wine test/logonvars-gate.sh
 
+# A drive's menu: Open first, Eject for discs and removable drives, no Cut/Delete (0468).
+test-drivemenu:
+	WINE=$(PREFIX)/bin/wine test/drivemenu-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
