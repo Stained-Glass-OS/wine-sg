@@ -174,6 +174,10 @@ test-drivemenu:
 test-netplaces:
 	WINE=$(PREFIX)/bin/wine test/netplaces-gate.sh
 
+# An environment block's USERPROFILE (ProfileImagePath) and no literal %variable% (0470).
+test-envblock:
+	WINE=$(PREFIX)/bin/wine test/envblock-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
