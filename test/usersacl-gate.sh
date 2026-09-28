@@ -47,6 +47,13 @@ sudo -n -u "$SG_OTHER" mkdir "$D/package" 2>/dev/null && pass "another user make
 [ "$(stat -c %G "$D/package" 2>/dev/null)" = "$SG_GROUP" ] && pass "and what is made there is the group's too" || fail "package's group $(stat -c %G "$D/package" 2>/dev/null)"
 sudo -n -u "$SG_OTHER" sh -c "echo y > '$D/bin/steamui.dll' && mkdir '$D/bin/new'" 2>/dev/null \
     && pass "and what was there before the grant is theirs too (an update replaces bin/)" || fail "bin/: $(stat -c '%A %G' "$D/bin" "$D/bin/steamui.dll" | tr '\n' ' ')"
-sudo -n -u "$SG_OTHER" rm -rf "$D/package" "$D/bin/new" 2>/dev/null
+# made after the grant by the administrator's program, whose umask is 022
+# (Steam as SYSTEM made package\ 0755): the folder's default ACL, not the
+# umask, decides -- the users may write in it
+(umask 022; mkdir "$D/logs"; : > "$D/logs/bootstrap_log.txt")
+sudo -n -u "$SG_OTHER" sh -c "echo z >> '$D/logs/bootstrap_log.txt' && mkdir '$D/logs/sub'" 2>/dev/null \
+    && pass "what the administrator's program makes later is the users' to write (inherited, as on Windows)" \
+    || fail "made after the grant: $(stat -c '%A %G' "$D/logs" "$D/logs/bootstrap_log.txt" | tr '\n' ' ')"
+sudo -n -u "$SG_OTHER" rm -rf "$D/package" "$D/bin/new" "$D/logs/sub" 2>/dev/null
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
