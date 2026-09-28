@@ -198,6 +198,10 @@ test-netlogon:
 test-msdelta:
 	WINE=$(PREFIX)/bin/wine test/msdelta-gate.sh
 
+# A window menu's Move and Size follow the pointer until a click (0476).
+test-movesize:
+	WINE=$(PREFIX)/bin/wine test/movesize-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
