@@ -5,7 +5,8 @@
 # Win+Left/Right snap the active window to half the work area and back,
 # Win+Up maximizes, Win+Down restores then minimizes, Win+D shows the
 # desktop and puts the windows back, dragging a window to the left/right
-# edge snaps it (with a preview) and to the top maximizes it (the move/size
+# edge snaps it (with a preview), into a corner to a quarter (0451), and to
+# the top maximizes it; Win+Up/Down turn a half into a quarter and back (the move/size
 # WinEvents, 0073), the Windows key alone opens Start, Win+H voice typing,
 # Win+R the Run dialog, Win+E File Explorer, Win+I Settings (0130), Win+X > Terminal (0133).
 #
@@ -66,7 +67,11 @@ P workarea; P rect Beta
 K super+Left; P rect Beta
 K super+Right; P rect Beta
 K super+Right; P rect Beta
+K super+Up; P rect Beta
 K super+Down; P rect Beta
+K super+Down; P rect Beta
+K super+Right; P rect Beta
+K super+Left; P rect Beta
 K super+Up; P rect Beta
 K super+Down; P rect Beta
 K super+Down; P rect Beta
@@ -78,6 +83,9 @@ K super+d; P rect Alpha
 xdotool mousemove 240 75 mousedown 1; sleep 0.3; xdotool mousemove 120 200; sleep 0.3; xdotool mousemove 0 300; sleep 1
 P find SgSnapPreview; xdotool mouseup 1; sleep 1.2; P rect Alpha
 P rect Alpha
+# and from there into the bottom-left corner: a quarter
+xdotool mousemove 200 "\$(( \$(sed -n 's/^rect=[0-9-]*,\([0-9-]*\),.*/\1/p' "$T/log.out" | tail -1) + 12 ))" mousedown 1; sleep 0.3
+xdotool mousemove 150 400; sleep 0.3; xdotool mousemove 0 650; sleep 1; xdotool mouseup 1; sleep 1.5; P rect Alpha
 xdotool mousemove 200 "\$(( \$(sed -n 's/^rect=[0-9-]*,\([0-9-]*\),.*/\1/p' "$T/log.out" | tail -1) + 12 ))" mousedown 1; sleep 0.3
 xdotool mousemove 400 150; sleep 0.3; xdotool mousemove 500 0; sleep 1; xdotool mouseup 1; sleep 1.5; P rect Alpha
 K super; P find '#32768'
@@ -103,15 +111,20 @@ orig=$(after 'rect Beta' 1)
 [ "$(after 'rect Beta' 2)" = "rect=$wl,$wt,$mid,$wb zoomed=0 iconic=0" ] && pass "Win+Left snaps the window to the left half" || fail "Win+Left: $(after 'rect Beta' 2) (work $work)"
 [ "$(after 'rect Beta' 3)" = "$orig" ] && pass "Win+Right from the left brings it back where it was" || fail "Win+Right back: $(after 'rect Beta' 3), was $orig"
 [ "$(after 'rect Beta' 4)" = "rect=$mid,$wt,$wr,$wb zoomed=0 iconic=0" ] && pass "Win+Right snaps it to the right half" || fail "Win+Right: $(after 'rect Beta' 4)"
-[ "$(after 'rect Beta' 5)" = "$orig" ] && pass "Win+Down restores a snapped window" || fail "Win+Down from snapped: $(after 'rect Beta' 5)"
-case "$(after 'rect Beta' 6)" in *",$(( wb + 4 )) zoomed=1 iconic=0") pass "Win+Up maximizes, above the taskbar" ;; *) fail "Win+Up: $(after 'rect Beta' 6)" ;; esac
-case "$(after 'rect Beta' 7)" in *"zoomed=0 iconic=0") pass "Win+Down restores a maximized window" ;; *) fail "Win+Down from maximized: $(after 'rect Beta' 7)" ;; esac
-case "$(after 'rect Beta' 8)" in *"iconic=1") pass "Win+Down again minimizes it" ;; *) fail "Win+Down minimize: $(after 'rect Beta' 8)" ;; esac
+midy=$(( (wt + wb) / 2 ))
+[ "$(after 'rect Beta' 5)" = "rect=$mid,$wt,$wr,$midy zoomed=0 iconic=0" ] && pass "Win+Up on a half: its top quarter" || fail "Win+Up from the right half: $(after 'rect Beta' 5)"
+[ "$(after 'rect Beta' 6)" = "rect=$mid,$wt,$wr,$wb zoomed=0 iconic=0" ] && pass "Win+Down on a top quarter: back to the half" || fail "Win+Down from the top quarter: $(after 'rect Beta' 6)"
+[ "$(after 'rect Beta' 7)" = "rect=$mid,$midy,$wr,$wb zoomed=0 iconic=0" ] && pass "Win+Down on a half: its bottom quarter" || fail "Win+Down from the right half: $(after 'rect Beta' 7)"
+[ "$(after 'rect Beta' 9)" = "$orig" ] && pass "Win+Left from the right side brings it back where it was" || fail "Win+Left back: $(after 'rect Beta' 9), was $orig"
+case "$(after 'rect Beta' 10)" in *",$(( wb + 4 )) zoomed=1 iconic=0") pass "Win+Up maximizes, above the taskbar" ;; *) fail "Win+Up: $(after 'rect Beta' 10)" ;; esac
+case "$(after 'rect Beta' 11)" in *"zoomed=0 iconic=0") pass "Win+Down restores a maximized window" ;; *) fail "Win+Down from maximized: $(after 'rect Beta' 11)" ;; esac
+case "$(after 'rect Beta' 12)" in *"iconic=1") pass "Win+Down again minimizes it" ;; *) fail "Win+Down minimize: $(after 'rect Beta' 12)" ;; esac
 case "$(after 'rect Alpha' 2)" in *"iconic=1") pass "Win+D minimizes the windows to show the desktop" ;; *) fail "Win+D: $(after 'rect Alpha' 2)" ;; esac
 case "$(after 'rect Alpha' 3)" in *"iconic=0") pass "and Win+D again puts them back" ;; *) fail "Win+D back: $(after 'rect Alpha' 3)" ;; esac
 [ "$(after 'find SgSnapPreview')" = "found=1" ] && pass "dragging a window to the screen's edge shows where it will snap" || fail "no snap preview: $(after 'find SgSnapPreview')"
 [ "$(after 'rect Alpha' 4)" = "rect=$wl,$wt,$mid,$wb zoomed=0 iconic=0" ] && pass "and letting go snaps it to that half" || fail "drag snap: $(after 'rect Alpha' 4)"
-case "$(after 'rect Alpha' 6)" in *"zoomed=1 iconic=0") pass "dragging it to the top edge maximizes it" ;; *) fail "drag to top: $(after 'rect Alpha' 6)" ;; esac
+[ "$(after 'rect Alpha' 6)" = "rect=$wl,$midy,$mid,$wb zoomed=0 iconic=0" ] && pass "dragging it into the bottom-left corner snaps it to that quarter" || fail "drag to a corner: $(after 'rect Alpha' 6)"
+case "$(after 'rect Alpha' 7)" in *"zoomed=1 iconic=0") pass "dragging it to the top edge maximizes it" ;; *) fail "drag to top: $(after 'rect Alpha' 7)" ;; esac
 [ "$(after "find #32768")" = "found=1" ] && pass "the Windows key alone opens Start" || fail "Start did not open: $(after "find #32768")"
 [ "$(after "find #32770 Run")" = "found=1" ] && pass "Win+R opens Run" || fail "Run: $(after "find #32770 Run")"
 [ "$(after 'find ExplorerWClass')" = "found=1" ] && pass "Win+E opens File Explorer" || fail "File Explorer: $(after 'find ExplorerWClass')"
