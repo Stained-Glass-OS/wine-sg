@@ -186,6 +186,18 @@ test-reparseinfo:
 test-longurl:
 	WINE=$(PREFIX)/bin/wine test/longurl-gate.sh
 
+# A program's taskbar button menu: its name, Report a problem, Close (0473).
+test-btnmenu:
+	WINE=$(PREFIX)/bin/wine test/btnmenu-gate.sh
+
+# Shares with a name and password: own connection first, net use /user (0474).
+test-netlogon:
+	WINE=$(PREFIX)/bin/wine test/netlogon-gate.sh
+
+# msdelta refuses instead of killing Click-to-Run (0475).
+test-msdelta:
+	WINE=$(PREFIX)/bin/wine test/msdelta-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
