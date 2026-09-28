@@ -110,6 +110,10 @@ test-vdpager:
 test-userroots:
 	WINE=$(PREFIX)/bin/wine test/userroots-gate.sh
 
+# A window focused before it is shown gets the keyboard (0449).
+test-focusmap:
+	WINE=$(PREFIX)/bin/wine test/focusmap-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
