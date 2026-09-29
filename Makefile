@@ -238,6 +238,14 @@ test-msxml-replace:
 test-sppc:
 	WINE=$(PREFIX)/bin/wine test/sppc-gate.sh
 
+# A process's activation filter (0493): Word.
+test-actfilter:
+	WINE=$(PREFIX)/bin/wine test/actfilter-gate.sh
+
+# SetFileShortName (0494): a helper Word starts.
+test-shortname:
+	WINE=$(PREFIX)/bin/wine test/shortname-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
