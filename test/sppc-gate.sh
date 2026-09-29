@@ -66,6 +66,8 @@ case "$(v key)" in "00000000 {"*) pass "SLInstallProofOfPurchase keeps a product
     && pass "FlsGetValue2 and TlsGetValue2 read the slot and leave the last error alone" || fail "fls2 / tls2: $(v fls2) / $(v tls2)"
 [ "$(v apc2)" = "1 1" ] && [ "$(v wer)" = 00000000 ] \
     && pass "QueueUserAPC2 queues (and refuses unknown flags); WerRegisterCustomMetadata succeeds" || fail "apc2 / wer: $(v apc2) / $(v wer)"
+[ "$(v skustatus)" = "00000000 1 0 c004f014 11111111" ] \
+    && pass "an installed license's product is reported, unlicensed for want of a product key (0502)" || fail "sku status: $(v skustatus)"
 [ "$(wc -l < "$T/files")" = 0 ] && pass "the store is empty again after uninstalling" || fail "store: $(cat "$T/files")"
 
 echo

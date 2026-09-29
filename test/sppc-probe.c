@@ -122,6 +122,21 @@ int main(void)
         }
         CloseHandle(ev);
     }
+    {
+        /* 0502: an installed license's product is reported, unlicensed for want of a product key */
+        static const char sku_lic[] = "<r:license><sl:productId name=\"applicationId\">{0ff1ce15-a989-479d-af46-f275c6370663}</sl:productId>"
+            "<tm:infoStr name=\"productSkuId\">{11111111-2222-3333-4444-555555555555}</tm:infoStr></r:license>";
+        static const GUID office = {0x0ff1ce15,0xa989,0x479d,{0xaf,0x46,0xf2,0x75,0xc6,0x37,0x06,0x63}};
+        struct { GUID sku; int state; DWORD grace, total; HRESULT reason; UINT64 expiry; } *st = NULL;
+        SLID s = {0};
+        UINT cnt = 0;
+        HRESULT hr;
+        SLInstallLicense(h, sizeof(sku_lic) - 1, (const BYTE *)sku_lic, &s);
+        hr = SLGetLicensingStatusInformation(h, &office, NULL, NULL, &cnt, (void **)&st);
+        printf("skustatus %08lx %u %d %08lx %08lx\n", hr, cnt, st ? st->state : -1, st ? st->reason : 0, st ? st->sku.Data1 : 0);
+        if (st) LocalFree(st);
+        SLUninstallLicense(h, &s);
+    }
     SLUninstallLicense(h, &c);
     SLClose(h);
     return 0;

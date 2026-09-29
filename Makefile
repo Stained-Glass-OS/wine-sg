@@ -258,6 +258,10 @@ test-avl:
 test-elevmin:
 	WINE=$(PREFIX)/bin/wine test/elevmin-gate.sh
 
+# DirectWrite: a collection's font set (0503): Office's text.
+test-dwfontset:
+	WINE=$(PREFIX)/bin/wine test/dwfontset-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
