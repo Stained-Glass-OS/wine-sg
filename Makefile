@@ -214,6 +214,10 @@ test-icons:
 test-savedesk:
 	WINE=$(PREFIX)/bin/wine test/savedesk-gate.sh
 
+# After a resolution change the taskbar is on the new screen, icons by the clock (0481).
+test-dispchange:
+	WINE=$(PREFIX)/bin/wine test/dispchange-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
