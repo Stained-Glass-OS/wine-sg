@@ -246,6 +246,10 @@ test-actfilter:
 test-shortname:
 	WINE=$(PREFIX)/bin/wine test/shortname-gate.sh
 
+# The session's Linux programs' windows on the taskbar (0496).
+test-xwin-taskbar:
+	WINE=$(PREFIX)/bin/wine test/xwin-taskbar-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
