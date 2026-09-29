@@ -262,6 +262,14 @@ test-elevmin:
 test-dwfontset:
 	WINE=$(PREFIX)/bin/wine test/dwfontset-gate.sh
 
+# The C++ library's time zone database (0504): Word.
+test-tzdb:
+	WINE=$(PREFIX)/bin/wine test/tzdb-gate.sh
+
+# RegRestoreKey restores binary and text hives (0506): Office's virtual registry.
+test-regrestore:
+	WINE=$(PREFIX)/bin/wine test/regrestore-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh

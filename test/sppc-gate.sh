@@ -29,7 +29,7 @@ T=$(mktemp -d /var/tmp/sg-sppc.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 # sppc's exports, as the probe links them (mingw has no import library for it)
-printf 'LIBRARY sppc.dll\nEXPORTS\nSLOpen\nSLClose\nSLInstallLicense\nSLUninstallLicense\nSLInstallProofOfPurchase\nSLUninstallProofOfPurchase\nSLGetLicensingStatusInformation\nSLGetLicenseFileId\nSLGetLicense\nSLGetPKeyId\nSLLoadApplicationPolicies\nSLGetApplicationPolicy\nSLUnloadApplicationPolicies\nSLGetPolicyInformationDWORD\nSLConsumeRight\nSLSetAuthenticationData\nSLGetAuthenticationResult\nSLRegisterEvent\nSLUnregisterEvent\nSLIsGenuineLocalEx\n' > "$T/sppc.def"
+printf 'LIBRARY sppc.dll\nEXPORTS\nSLOpen\nSLClose\nSLInstallLicense\nSLUninstallLicense\nSLInstallProofOfPurchase\nSLUninstallProofOfPurchase\nSLGetLicensingStatusInformation\nSLGetLicenseFileId\nSLGetLicense\nSLGetPKeyId\nSLLoadApplicationPolicies\nSLGetApplicationPolicy\nSLUnloadApplicationPolicies\nSLGetPolicyInformationDWORD\nSLConsumeRight\nSLSetAuthenticationData\nSLGetAuthenticationResult\nSLRegisterEvent\nSLUnregisterEvent\nSLIsGenuineLocalEx\nSLGetProductSkuInformation\n' > "$T/sppc.def"
 "${DLLTOOL:-x86_64-w64-mingw32-dlltool}" -d "$T/sppc.def" -l "$T/libsppc.a" || { fail "no import library"; exit 1; }
 "$MINGW" -O2 -o "$T/probe.exe" "$HERE/sppc-probe.c" "$T/libsppc.a" || { fail "probe did not build"; exit 1; }
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
@@ -55,8 +55,8 @@ case "$(v key)" in "00000000 {"*) pass "SLInstallProofOfPurchase keeps a product
 [ "$(v pkeyid)" = "00000000 1" ] && pass "SLGetPKeyId finds the installed key" || fail "pkeyid: $(v pkeyid)"
 [ "$(v loadpolicies)" = "00000000 1" ] && [ "$(v policy)" = "c004f012 0 0000000000000000" ] && [ "$(v unloadpolicies)" = 00000000 ] \
     && pass "application policies load, and hold none (SL_E_VALUE_NOT_FOUND)" || fail "policies: $(v loadpolicies) / $(v policy) / $(v unloadpolicies)"
-[ "$(v policydword)" = c004f012 ] && [ "$(v consume)" = c004f013 ] \
-    && pass "no policy value, and no right is granted (SL_E_RIGHT_NOT_GRANTED)" || fail "policy dword / consume: $(v policydword) / $(v consume)"
+[ "$(v policydword)" = c004f012 ] && [ "$(v consume)" = c004f014 ] \
+    && pass "no policy value, and no right is granted: no product key (SL_E_PKEY_NOT_INSTALLED)" || fail "policy dword / consume: $(v policydword) / $(v consume)"
 [ "$(v status)" = c004f002 ] && pass "and nothing is granted: the licensing status is unchanged (SL_E_RIGHT_NOT_CONSUMED)" || fail "status: $(v status)"
 [ "$(v setauth)" = 00000000 ] && [ "$(v authresult)" = "c004f012 0 0000000000000000" ] \
     && pass "SLSetAuthenticationData takes Office's data; there is no result to read (0501)" || fail "auth: $(v setauth) / $(v authresult)"
@@ -68,6 +68,10 @@ case "$(v key)" in "00000000 {"*) pass "SLInstallProofOfPurchase keeps a product
     && pass "QueueUserAPC2 queues (and refuses unknown flags); WerRegisterCustomMetadata succeeds" || fail "apc2 / wer: $(v apc2) / $(v wer)"
 [ "$(v skustatus)" = "00000000 1 0 c004f014 11111111" ] \
     && pass "an installed license's product is reported, unlicensed for want of a product key (0502)" || fail "sku status: $(v skustatus)"
+[ "$(v skuinfo)" = "00000000 1 0x0001F1BB" ] && [ "$(v skuname)" = "00000000 Test & Product" ] && [ "$(v skumissing)" = c004f012 ] \
+    && pass "SLGetProductSkuInformation reads the license's items (Name is productName); a missing one: not found (0505)" || fail "sku info: $(v skuinfo) / $(v skuname) / $(v skumissing)"
+[ "$(v consume-nokey)" = c004f014 ] && [ "$(v consume-key)" = c004f013 ] \
+    && pass "no right is granted: for want of a product key, or (with one) not granted" || fail "consume reasons: $(v consume-nokey) / $(v consume-key)"
 [ "$(wc -l < "$T/files")" = 0 ] && pass "the store is empty again after uninstalling" || fail "store: $(cat "$T/files")"
 
 echo

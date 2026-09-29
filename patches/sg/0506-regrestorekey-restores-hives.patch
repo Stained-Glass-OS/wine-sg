@@ -1,0 +1,472 @@
+From: Stained Glass OS <dev@stained-glass.example>
+Subject: ntdll, kernelbase: RegRestoreKey restores a hive over a key
+
+NtRestoreKey and RegRestoreKeyW were stubs reporting success. Windows
+replaces the key's values and subkeys with those of the hive's root key.
+Click-to-Run publishes Office's virtual registry with it (its MSI component
+paths, COM classes and file associations); with the stub the virtual
+registry stayed empty, Office could not find its own components ("this
+feature appears to be broken"), and its Windows App SDK sign-in page never
+loaded.
+
+A hive is a Windows binary hive ("regf": base block, hbins, nk/vk records,
+lf/lh/li/ri subkey lists, big data in db segments; compressed and UTF-16
+names) or a file in Wine's own text format, which NtSaveKey writes -- that
+one is loaded under a scratch key, copied, and the scratch key removed.
+REG_WHOLE_HIVE_VOLATILE makes the restored keys volatile. The file is
+untrusted: every offset, length and nesting depth is checked, and a file
+that is not a hive is refused (STATUS_REGISTRY_CORRUPT).
+
+Gate: test/regrestore-gate.sh (make test-regrestore), with test/regf-write.py.
+
+--- a/dlls/ntdll/unix/registry.c
++++ b/dlls/ntdll/unix/registry.c
+@@ -27,6 +27,10 @@
+ 
+ #include <stdarg.h>
+ #include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/stat.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -827,13 +831,395 @@
+ }
+ 
+ 
++/* Stained Glass OS: restoring a saved hive over a key (RegRestoreKey), as
++ * Windows does -- the key's values and subkeys are replaced by the hive's
++ * root key's. Click-to-Run publishes Office's virtual registry (its MSI
++ * component paths, COM classes, ...) with it; the stub left it empty, and
++ * Office could not find its own components. A hive is a Windows binary
++ * hive ("regf", as RegSaveKey and the offline registry library write them)
++ * or a file in Wine's own text format (what NtSaveKey writes here). The
++ * file is untrusted: every offset and length is checked. */
++
++#define HIVE_BIN_START 0x1000
++#define HIVE_MAX_DEPTH 512
++
++struct hive
++{
++    const unsigned char *data;
++    size_t size;
++    ULONG create_options;
++};
++
++static unsigned int hive_u16( const unsigned char *p ) { return p[0] | (p[1] << 8); }
++static unsigned int hive_u32( const unsigned char *p ) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned int)p[3] << 24); }
++
++/* the data of an allocated cell and its size, or NULL */
++static const unsigned char *hive_cell( const struct hive *hive, unsigned int offset, unsigned int *len )
++{
++    size_t pos = (size_t)HIVE_BIN_START + offset;
++    int size;
++
++    if (offset == 0xffffffff || pos + 4 > hive->size || pos < HIVE_BIN_START) return NULL;
++    size = (int)hive_u32( hive->data + pos );
++    if (size >= 0) return NULL;   /* free cell */
++    size = -size;
++    if (size < 4 || pos + size > hive->size) return NULL;
++    *len = size - 4;
++    return hive->data + pos + 4;
++}
++
++/* a name as the hive stores it: Latin-1 if compressed, else UTF-16 */
++static NTSTATUS hive_name( const unsigned char *src, unsigned int len, BOOL compressed, WCHAR *dst, unsigned int max,
++                           UNICODE_STRING *str )
++{
++    unsigned int i, n = compressed ? len : len / 2;
++
++    if (n >= max) return STATUS_REGISTRY_CORRUPT;
++    for (i = 0; i < n; i++) dst[i] = compressed ? src[i] : (WCHAR)hive_u16( src + 2 * i );
++    dst[n] = 0;
++    str->Buffer = dst;
++    str->Length = n * sizeof(WCHAR);
++    str->MaximumLength = str->Length + sizeof(WCHAR);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS hive_restore_key( const struct hive *hive, HANDLE key, unsigned int nk_offset, int depth );
++
++static NTSTATUS hive_restore_value( const struct hive *hive, HANDLE key, unsigned int vk_offset )
++{
++    const unsigned char *vk, *data = NULL;
++    unsigned char inline_data[4];
++    unsigned char *big = NULL;
++    unsigned int len, name_len, size, offset, type, flags;
++    WCHAR name[16384];
++    UNICODE_STRING str;
++    NTSTATUS status;
++
++    if (!(vk = hive_cell( hive, vk_offset, &len )) || len < 20 || vk[0] != 'v' || vk[1] != 'k')
++        return STATUS_REGISTRY_CORRUPT;
++    name_len = hive_u16( vk + 2 );
++    size = hive_u32( vk + 4 );
++    offset = hive_u32( vk + 8 );
++    type = hive_u32( vk + 12 );
++    flags = hive_u16( vk + 16 );
++    if (20 + name_len > len) return STATUS_REGISTRY_CORRUPT;
++    if ((status = hive_name( vk + 20, name_len, flags & 1, name, ARRAY_SIZE(name), &str ))) return status;
++
++    if (size & 0x80000000)
++    {
++        /* up to four bytes, held in the offset field itself */
++        size &= 0x7fffffff;
++        if (size > 4) return STATUS_REGISTRY_CORRUPT;
++        inline_data[0] = offset; inline_data[1] = offset >> 8; inline_data[2] = offset >> 16; inline_data[3] = offset >> 24;
++        data = inline_data;
++    }
++    else if (size)
++    {
++        unsigned int cell_len;
++        const unsigned char *cell = hive_cell( hive, offset, &cell_len );
++
++        if (!cell) return STATUS_REGISTRY_CORRUPT;
++        if (size > 16344 && cell_len >= 8 && cell[0] == 'd' && cell[1] == 'b')
++        {
++            /* big data: a list of segments of up to 16344 bytes */
++            unsigned int count = hive_u16( cell + 2 ), list_len, i, done = 0;
++            const unsigned char *list = hive_cell( hive, hive_u32( cell + 4 ), &list_len );
++
++            if (!list || count * 4 > list_len || size > 64 * 1024 * 1024) return STATUS_REGISTRY_CORRUPT;
++            if (!(big = malloc( size ))) return STATUS_NO_MEMORY;
++            for (i = 0; i < count && done < size; i++)
++            {
++                unsigned int seg_len, chunk;
++                const unsigned char *seg = hive_cell( hive, hive_u32( list + 4 * i ), &seg_len );
++
++                if (!seg) { free( big ); return STATUS_REGISTRY_CORRUPT; }
++                chunk = min( size - done, min( seg_len, 16344 ) );
++                memcpy( big + done, seg, chunk );
++                done += chunk;
++            }
++            if (done != size) { free( big ); return STATUS_REGISTRY_CORRUPT; }
++            data = big;
++        }
++        else
++        {
++            if (size > cell_len) return STATUS_REGISTRY_CORRUPT;
++            data = cell;
++        }
++    }
++    status = NtSetValueKey( key, &str, 0, type, data, size );
++    free( big );
++    return status;
++}
++
++/* the subkeys of a subkey list (lf, lh, li, or an ri list of lists) */
++static NTSTATUS hive_restore_subkeys( const struct hive *hive, HANDLE key, unsigned int list_offset, int depth )
++{
++    const unsigned char *list;
++    unsigned int len, count, i;
++    NTSTATUS status;
++
++    if (!(list = hive_cell( hive, list_offset, &len )) || len < 4) return STATUS_REGISTRY_CORRUPT;
++    count = hive_u16( list + 2 );
++    if ((list[0] == 'l' && (list[1] == 'f' || list[1] == 'h')))
++    {
++        if (4 + count * 8 > len) return STATUS_REGISTRY_CORRUPT;
++        for (i = 0; i < count; i++)
++            if ((status = hive_restore_key( hive, key, hive_u32( list + 4 + 8 * i ), depth ))) return status;
++    }
++    else if (list[0] == 'l' && list[1] == 'i')
++    {
++        if (4 + count * 4 > len) return STATUS_REGISTRY_CORRUPT;
++        for (i = 0; i < count; i++)
++            if ((status = hive_restore_key( hive, key, hive_u32( list + 4 + 4 * i ), depth ))) return status;
++    }
++    else if (list[0] == 'r' && list[1] == 'i')
++    {
++        if (4 + count * 4 > len || depth > HIVE_MAX_DEPTH) return STATUS_REGISTRY_CORRUPT;
++        for (i = 0; i < count; i++)
++            if ((status = hive_restore_subkeys( hive, key, hive_u32( list + 4 + 4 * i ), depth + 1 ))) return status;
++    }
++    else return STATUS_REGISTRY_CORRUPT;
++    return STATUS_SUCCESS;
++}
++
++/* the values and subkeys of an nk record into an open key */
++static NTSTATUS hive_restore_contents( const struct hive *hive, HANDLE key, const unsigned char *nk, int depth )
++{
++    unsigned int value_count = hive_u32( nk + 36 ), i, len;
++    NTSTATUS status;
++
++    if (value_count)
++    {
++        const unsigned char *values = hive_cell( hive, hive_u32( nk + 40 ), &len );
++        if (!values || value_count * 4 > len) return STATUS_REGISTRY_CORRUPT;
++        for (i = 0; i < value_count; i++)
++            if ((status = hive_restore_value( hive, key, hive_u32( values + 4 * i ) ))) return status;
++    }
++    if (hive_u32( nk + 20 ))
++        return hive_restore_subkeys( hive, key, hive_u32( nk + 28 ), depth + 1 );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS hive_restore_key( const struct hive *hive, HANDLE parent, unsigned int nk_offset, int depth )
++{
++    const unsigned char *nk;
++    unsigned int len, name_len;
++    WCHAR name[256];
++    UNICODE_STRING str;
++    OBJECT_ATTRIBUTES attr;
++    HANDLE key;
++    NTSTATUS status;
++
++    if (depth > HIVE_MAX_DEPTH) return STATUS_REGISTRY_CORRUPT;
++    if (!(nk = hive_cell( hive, nk_offset, &len )) || len < 76 || nk[0] != 'n' || nk[1] != 'k')
++        return STATUS_REGISTRY_CORRUPT;
++    name_len = hive_u16( nk + 72 );
++    if (76 + name_len > len) return STATUS_REGISTRY_CORRUPT;
++    if ((status = hive_name( nk + 76, name_len, hive_u16( nk + 2 ) & 0x20, name, ARRAY_SIZE(name), &str )))
++        return status;
++    InitializeObjectAttributes( &attr, &str, OBJ_CASE_INSENSITIVE, parent, NULL );
++    if ((status = NtCreateKey( &key, KEY_ALL_ACCESS, &attr, 0, NULL, hive->create_options, NULL ))) return status;
++    status = hive_restore_contents( hive, key, nk, depth );
++    NtClose( key );
++    return status;
++}
++
++/* empty a key: its values and, recursively, its subkeys */
++static NTSTATUS clear_key( HANDLE key, int depth )
++{
++    char buffer[sizeof(KEY_BASIC_INFORMATION) + 256 * sizeof(WCHAR)];
++    KEY_BASIC_INFORMATION *info = (KEY_BASIC_INFORMATION *)buffer;
++    char vbuffer[sizeof(KEY_VALUE_BASIC_INFORMATION) + 16384 * sizeof(WCHAR)];
++    KEY_VALUE_BASIC_INFORMATION *vinfo = (KEY_VALUE_BASIC_INFORMATION *)vbuffer;
++    ULONG len;
++    NTSTATUS status;
++
++    if (depth > HIVE_MAX_DEPTH) return STATUS_REGISTRY_CORRUPT;
++    while (!(status = NtEnumerateKey( key, 0, KeyBasicInformation, info, sizeof(buffer), &len )))
++    {
++        UNICODE_STRING str = { info->NameLength, info->NameLength, info->Name };
++        OBJECT_ATTRIBUTES attr;
++        HANDLE sub;
++
++        InitializeObjectAttributes( &attr, &str, OBJ_CASE_INSENSITIVE, key, NULL );
++        if ((status = NtOpenKey( &sub, KEY_ALL_ACCESS, &attr ))) return status;
++        if (!(status = clear_key( sub, depth + 1 ))) status = NtDeleteKey( sub );
++        NtClose( sub );
++        if (status) return status;
++    }
++    if (status != STATUS_NO_MORE_ENTRIES) return status;
++    while (!(status = NtEnumerateValueKey( key, 0, KeyValueBasicInformation, vinfo, sizeof(vbuffer), &len )))
++    {
++        UNICODE_STRING str = { vinfo->NameLength, vinfo->NameLength, vinfo->Name };
++        if ((status = NtDeleteValueKey( key, &str ))) return status;
++    }
++    return status == STATUS_NO_MORE_ENTRIES ? STATUS_SUCCESS : status;
++}
++
++/* copy a key's values and subkeys into another (for text-format hives) */
++static NTSTATUS copy_key( HANDLE from, HANDLE to, ULONG options, int depth )
++{
++    char buffer[sizeof(KEY_BASIC_INFORMATION) + 256 * sizeof(WCHAR)];
++    KEY_BASIC_INFORMATION *info = (KEY_BASIC_INFORMATION *)buffer;
++    KEY_VALUE_FULL_INFORMATION *vinfo;
++    ULONG len, size = 4096, index;
++    NTSTATUS status;
++
++    if (depth > HIVE_MAX_DEPTH) return STATUS_REGISTRY_CORRUPT;
++    if (!(vinfo = malloc( size ))) return STATUS_NO_MEMORY;
++    for (index = 0;; index++)
++    {
++        UNICODE_STRING str;
++
++        status = NtEnumerateValueKey( from, index, KeyValueFullInformation, vinfo, size, &len );
++        if (status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL)
++        {
++            void *grown = realloc( vinfo, len );
++            if (!grown) { status = STATUS_NO_MEMORY; break; }
++            vinfo = grown;
++            size = len;
++            index--;
++            continue;
++        }
++        if (status) break;
++        str.Buffer = vinfo->Name;
++        str.Length = str.MaximumLength = vinfo->NameLength;
++        if ((status = NtSetValueKey( to, &str, 0, vinfo->Type, (char *)vinfo + vinfo->DataOffset, vinfo->DataLength )))
++            break;
++    }
++    free( vinfo );
++    if (status != STATUS_NO_MORE_ENTRIES) return status;
++    for (index = 0; !(status = NtEnumerateKey( from, index, KeyBasicInformation, info, sizeof(buffer), &len )); index++)
++    {
++        UNICODE_STRING str = { info->NameLength, info->NameLength, info->Name };
++        OBJECT_ATTRIBUTES attr;
++        HANDLE src, dst;
++
++        InitializeObjectAttributes( &attr, &str, OBJ_CASE_INSENSITIVE, from, NULL );
++        if ((status = NtOpenKey( &src, KEY_READ, &attr ))) return status;
++        attr.RootDirectory = to;
++        if (!(status = NtCreateKey( &dst, KEY_ALL_ACCESS, &attr, 0, NULL, options, NULL )))
++        {
++            status = copy_key( src, dst, options, depth + 1 );
++            NtClose( dst );
++        }
++        NtClose( src );
++        if (status) return status;
++    }
++    return status == STATUS_NO_MORE_ENTRIES ? STATUS_SUCCESS : status;
++}
++
++/* a text-format file: loaded under a scratch key, copied, and the scratch key removed */
++static NTSTATUS restore_text_hive( HANDLE key, HANDLE file, ULONG options )
++{
++    static LONG counter;
++    WCHAR name[96];
++    char aname[96];
++    UNICODE_STRING str;
++    OBJECT_ATTRIBUTES attr;
++    struct object_attributes *objattr;
++    data_size_t len;
++    HANDLE temp;
++    NTSTATUS status;
++    int i;
++
++    HANDLE wine_key;
++    UNICODE_STRING wine_str;
++    OBJECT_ATTRIBUTES wine_attr;
++
++    /* the scratch key goes under HKLM\Software\Wine, named relative to it */
++    static const char wine_path[] = "\\Registry\\Machine\\Software\\Wine";
++    WCHAR wine_name[ARRAY_SIZE(wine_path)];
++
++    for (i = 0; wine_path[i]; i++) wine_name[i] = (unsigned char)wine_path[i];
++    wine_name[i] = 0;
++    init_unicode_string( &wine_str, wine_name );
++    InitializeObjectAttributes( &wine_attr, &wine_str, OBJ_CASE_INSENSITIVE, NULL, NULL );
++    if ((status = NtOpenKey( &wine_key, KEY_ALL_ACCESS, &wine_attr ))) return status;
++    snprintf( aname, sizeof(aname), "RestoreKey-%x-%x",
++              (int)GetCurrentProcessId(), (int)InterlockedIncrement( &counter ) );
++    for (i = 0; aname[i]; i++) name[i] = (unsigned char)aname[i];
++    name[i] = 0;
++    init_unicode_string( &str, name );
++    InitializeObjectAttributes( &attr, &str, OBJ_CASE_INSENSITIVE, wine_key, NULL );
++    if ((status = alloc_object_attributes( &attr, &objattr, &len ))) { NtClose( wine_key ); return status; }
++    objattr->attributes |= OBJ_OPENIF;
++    SERVER_START_REQ( load_registry )
++    {
++        req->file = wine_server_obj_handle( file );
++        wine_server_add_data( req, objattr, len );
++        status = wine_server_call( req );
++        if (status == STATUS_OBJECT_NAME_EXISTS) status = STATUS_SUCCESS;
++    }
++    SERVER_END_REQ;
++    free( objattr );
++    if (status) { NtClose( wine_key ); return status; }
++    if (!(status = NtOpenKey( &temp, KEY_ALL_ACCESS, &attr )))
++    {
++        if (!(status = clear_key( key, 0 ))) status = copy_key( temp, key, options, 0 );
++        clear_key( temp, 0 );
++        NtDeleteKey( temp );
++        NtClose( temp );
++    }
++    NtClose( wine_key );
++    return status;
++}
++
+ /******************************************************************************
+  *              NtRestoreKey  (NTDLL.@)
+  */
+ NTSTATUS WINAPI NtRestoreKey( HANDLE key, HANDLE file, ULONG flags )
+ {
+-    FIXME( "(%p,%p,0x%08x) stub\n", key, file, (int)flags );
+-    return STATUS_SUCCESS;
++    struct hive hive;
++    struct stat st;
++    unsigned char *data;
++    size_t done = 0;
++    int fd, needs_close;
++    ULONG options = (flags & REG_WHOLE_HIVE_VOLATILE) ? REG_OPTION_VOLATILE : 0;
++    NTSTATUS status;
++
++    TRACE( "(%p,%p,0x%08x)\n", key, file, (int)flags );
++
++    if ((status = server_get_unix_fd( file, FILE_READ_DATA, &fd, &needs_close, NULL, NULL ))) return status;
++    if (fstat( fd, &st ) || st.st_size < 4 || st.st_size > 512 * 1024 * 1024)
++    {
++        if (needs_close) close( fd );
++        return STATUS_REGISTRY_CORRUPT;
++    }
++    if (!(data = malloc( st.st_size )))
++    {
++        if (needs_close) close( fd );
++        return STATUS_NO_MEMORY;
++    }
++    while (done < (size_t)st.st_size)
++    {
++        ssize_t r = pread( fd, data + done, st.st_size - done, done );
++        if (r <= 0) break;
++        done += r;
++    }
++    if (needs_close) close( fd );
++
++    if (done >= HIVE_BIN_START + 4 && !memcmp( data, "regf", 4 ))
++    {
++        const unsigned char *root;
++        unsigned int len;
++
++        hive.data = data;
++        hive.size = done;
++        hive.create_options = options;
++        if (!(root = hive_cell( &hive, hive_u32( data + 0x24 ), &len )) || len < 76 || root[0] != 'n' || root[1] != 'k')
++            status = STATUS_REGISTRY_CORRUPT;
++        else if (!(status = clear_key( key, 0 )))
++            status = hive_restore_contents( &hive, key, root, 0 );
++    }
++    else if (done >= 13 && !memcmp( data, "WINE REGISTRY", 13 ))
++        status = restore_text_hive( key, file, options );
++    else
++        status = STATUS_REGISTRY_CORRUPT;
++
++    free( data );
++    if (status) WARN( "restore failed: %08x\n", (int)status );
++    return status;
+ }
+ 
+ 
+--- a/dlls/kernelbase/registry.c
++++ b/dlls/kernelbase/registry.c
+@@ -3180,17 +3180,32 @@
+  */
+ LSTATUS WINAPI RegRestoreKeyW( HKEY hkey, LPCWSTR lpFile, DWORD dwFlags )
+ {
++    UNICODE_STRING nameW;
++    OBJECT_ATTRIBUTES attr;
++    IO_STATUS_BLOCK io;
++    NTSTATUS status;
++    HANDLE handle;
++
+     TRACE("(%p,%s,%ld)\n",hkey,debugstr_w(lpFile),dwFlags);
+ 
+     /* It seems to do this check before the hkey check */
+     if (!lpFile || !*lpFile)
+         return ERROR_INVALID_PARAMETER;
++    if (!(hkey = get_special_root_hkey( hkey ))) return ERROR_INVALID_HANDLE;
+ 
+-    FIXME("(%p,%s,%ld): stub\n",hkey,debugstr_w(lpFile),dwFlags);
+-
+-    /* Check for file existence */
+-
+-    return ERROR_SUCCESS;
++    /* Stained Glass OS: the hive replaces the key's contents (NtRestoreKey) */
++    if ((status = RtlDosPathNameToNtPathName_U_WithStatus( lpFile, &nameW, NULL, NULL )))
++        return RtlNtStatusToDosError( status );
++    InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, 0, NULL );
++    status = NtOpenFile( &handle, GENERIC_READ | SYNCHRONIZE, &attr, &io, FILE_SHARE_READ,
++                         FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT );
++    RtlFreeUnicodeString( &nameW );
++    if (!status)
++    {
++        status = NtRestoreKey( hkey, handle, dwFlags );
++        CloseHandle( handle );
++    }
++    return RtlNtStatusToDosError( status );
+ }
+ 
+ 

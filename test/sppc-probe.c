@@ -25,6 +25,7 @@ HRESULT WINAPI SLGetAuthenticationResult(HSLC, UINT *, BYTE **);
 HRESULT WINAPI SLRegisterEvent(HSLC, const WCHAR *, const SLID *, HANDLE);
 HRESULT WINAPI SLUnregisterEvent(HSLC, const WCHAR *, const SLID *, HANDLE);
 HRESULT WINAPI SLIsGenuineLocalEx(const SLID *, const SLID *, int *);
+HRESULT WINAPI SLGetProductSkuInformation(HSLC, const SLID *, const WCHAR *, UINT *, UINT *, BYTE **);
 
 static void id(const char *name, HRESULT hr, const SLID *g)
 {
@@ -125,7 +126,10 @@ int main(void)
     {
         /* 0502: an installed license's product is reported, unlicensed for want of a product key */
         static const char sku_lic[] = "<r:license><sl:productId name=\"applicationId\">{0ff1ce15-a989-479d-af46-f275c6370663}</sl:productId>"
-            "<tm:infoStr name=\"productSkuId\">{11111111-2222-3333-4444-555555555555}</tm:infoStr></r:license>";
+            "<tm:infoStr name=\"productSkuId\">{11111111-2222-3333-4444-555555555555}</tm:infoStr>"
+            "<tm:infoStr name=\"productName\">Test &amp; Product</tm:infoStr>"
+            "<tm:infoStr name=\"ApplicationBitmap\">0x0001F1BB</tm:infoStr></r:license>";
+        static const GUID sku_id = {0x11111111,0x2222,0x3333,{0x44,0x44,0x55,0x55,0x55,0x55,0x55,0x55}};
         static const GUID office = {0x0ff1ce15,0xa989,0x479d,{0xaf,0x46,0xf2,0x75,0xc6,0x37,0x06,0x63}};
         struct { GUID sku; int state; DWORD grace, total; HRESULT reason; UINT64 expiry; } *st = NULL;
         SLID s = {0};
@@ -135,6 +139,29 @@ int main(void)
         hr = SLGetLicensingStatusInformation(h, &office, NULL, NULL, &cnt, (void **)&st);
         printf("skustatus %08lx %u %d %08lx %08lx\n", hr, cnt, st ? st->state : -1, st ? st->reason : 0, st ? st->sku.Data1 : 0);
         if (st) LocalFree(st);
+        {
+            /* 0505: what the license says about its product */
+            UINT type = 0, size = 0;
+            BYTE *value = NULL;
+            hr = SLGetProductSkuInformation(h, &sku_id, L"ApplicationBitmap", &type, &size, &value);
+            printf("skuinfo %08lx %u %ls\n", hr, type, value ? (WCHAR *)value : L"-");
+            if (value) LocalFree(value);
+            value = NULL;
+            hr = SLGetProductSkuInformation(h, &sku_id, L"Name", &type, &size, &value);
+            printf("skuname %08lx %ls\n", hr, value ? (WCHAR *)value : L"-");
+            if (value) LocalFree(value);
+            value = NULL;
+            hr = SLGetProductSkuInformation(h, &sku_id, L"NoSuchValue", &type, &size, &value);
+            printf("skumissing %08lx\n", hr);
+        }
+        {
+            /* no product key installed: that is the reason no right is granted */
+            SLID key = {0};
+            printf("consume-nokey %08lx\n", SLConsumeRight(h, &office, NULL, NULL, NULL));
+            SLInstallProofOfPurchase(h, L"msft:rm/algorithm/pkey/2009", L"FFFFF-GGGGG-HHHHH-JJJJJ-KKKKK", 0, NULL, &key);
+            printf("consume-key %08lx\n", SLConsumeRight(h, &office, NULL, NULL, NULL));
+            SLUninstallProofOfPurchase(h, &key);
+        }
         SLUninstallLicense(h, &s);
     }
     SLUninstallLicense(h, &c);
