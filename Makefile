@@ -291,6 +291,10 @@ test-noexcept:
 test-popuppos:
 	WINE=$(PREFIX)/bin/wine test/popuppos-gate.sh
 
+# Right-click Delete goes to the Recycle Bin without a hidden prompt (0514).
+test-recycle:
+	WINE=$(PREFIX)/bin/wine test/recycle-gate.sh
+
 # The Web Account Manager with no providers (0512): Office's sign-in.
 test-webauthcore:
 	WINE=$(PREFIX)/bin/wine test/webauthcore-gate.sh
