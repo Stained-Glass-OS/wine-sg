@@ -17,6 +17,7 @@
  *   vdesk-probe alttab             Alt down, Tab: is the switcher up? Alt up: which
  *                                  window is in front now?
  *   vdesk-probe foreground         the foreground window's title
+ *   vdesk-probe closewin TITLE     asks a "window" of this program to close (test/vdstay-gate.sh)
  *   vdesk-probe rect TITLE         rect=l,t,r,b zoomed= iconic=
  *   vdesk-probe workarea           work=l,t,r,b
  *   vdesk-probe find CLASS [TITLE] whether such a window exists (and is visible)
@@ -203,6 +204,14 @@ int main( int argc, char **argv )
         if (argc == 4) MultiByteToWideChar( CP_ACP, 0, argv[3], -1, title, 64 );
         hwnd = FindWindowW( cls, argc == 4 ? title : NULL );
         printf( "found=%d\n", hwnd && IsWindowVisible( hwnd ) );
+        return 0;
+    }
+    if (argc == 3 && !strcmp( argv[1], "closewin" ))
+    {
+        HWND hwnd;
+        MultiByteToWideChar( CP_ACP, 0, argv[2], -1, wtitle, 64 );
+        if ((hwnd = FindWindowW( L"SgVdeskProbe", wtitle ))) PostMessageW( hwnd, WM_CLOSE, 0, 0 );
+        printf( "closed=%d\n", hwnd != NULL );
         return 0;
     }
     if (argc == 2 && !strcmp( argv[1], "foreground" ))

@@ -202,6 +202,10 @@ test-msdelta:
 test-movesize:
 	WINE=$(PREFIX)/bin/wine test/movesize-gate.sh
 
+# Closing a desktop's last window stays on that desktop (0477).
+test-vdstay:
+	WINE=$(PREFIX)/bin/wine test/vdstay-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
