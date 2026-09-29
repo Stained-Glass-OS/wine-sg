@@ -50,5 +50,29 @@ r=$(rc -NoLogo)
 r=$(echo exit | "$WINE" "$PS" -Command - > /dev/null 2>&1; echo $?)
 [ "$r" = 0 ] && pass "-Command - reading 'exit' from stdin exits 0 ($r)" || fail "-Command - exited $r"
 
+# With PowerShell 7 installed (sg-session puts pwsh in every prefix) the stub
+# hands the command to it: "powershell -c irm ... | iex" runs for real (David
+# 2026-09-29: installing Claude Code, "irm is not recognized"). A stand-in
+# pwsh records its command line and exits 7.
+MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
+if command -v "$MINGW" >/dev/null; then
+    PW="$WINEPREFIX/drive_c/Program Files/PowerShell/7"
+    mkdir -p "$PW"
+    "$MINGW" -O2 -municode -o "$PW/pwsh.exe" "$(dirname "$0")/powershell-fakepwsh.c"
+    export SG_PWSH_LOG='C:\pwsh-args.txt'
+    r=$(rc -NoProfile -ExecutionPolicy Bypass -Command "irm https://example.invalid/install.ps1 | iex")
+    args=$(tr -d '\r' < "$WINEPREFIX/drive_c/pwsh-args.txt" 2>/dev/null)
+    [ "$r" = 7 ] && pass "with PowerShell 7 installed, powershell runs pwsh and returns its exit code ($r)" \
+        || fail "pwsh not run: exit $r"
+    case "$args" in
+        *'pwsh.exe" -NoProfile -ExecutionPolicy Bypass -Command "irm https://example.invalid/install.ps1 | iex"')
+            pass "pwsh gets the command line as given" ;;
+        *) fail "pwsh's command line: $args" ;;
+    esac
+    unset SG_PWSH_LOG
+else
+    echo "SKIP  PowerShell 7 hand-off (no $MINGW)"
+fi
+
 [ $RC = 0 ] && echo "powershell-gate: all passed" || echo "powershell-gate: FAILURES"
 exit $RC
