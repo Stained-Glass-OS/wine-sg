@@ -210,6 +210,10 @@ test-vdstay:
 test-icons:
 	WINE=$(PREFIX)/bin/wine test/icons-gate.sh
 
+# Save As > Desktop shows the desktop's files, not namespace links (0480).
+test-savedesk:
+	WINE=$(PREFIX)/bin/wine test/savedesk-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
