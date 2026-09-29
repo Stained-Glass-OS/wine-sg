@@ -270,6 +270,10 @@ test-tzdb:
 test-regrestore:
 	WINE=$(PREFIX)/bin/wine test/regrestore-gate.sh
 
+# chakra.dll, the JavaScript hosting API on QuickJS (0508): Office's React Native panes.
+test-chakra:
+	WINE=$(PREFIX)/bin/wine test/chakra-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
