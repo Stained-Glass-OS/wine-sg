@@ -45,7 +45,7 @@ series_fingerprint() {
     {
         cat "$HERE/wine-version"
         # the generated Dark colour scheme is part of the tree (0160)
-        cat "$HERE/theme/dark.py" "$HERE/theme/images.list"
+        cat "$HERE/theme/dark.py" "$HERE/theme/images.list" "$HERE/theme/icons.py"
         while read -r p; do
             [[ -z "$p" || "$p" == \#* ]] && continue
             echo "== $p"
@@ -64,6 +64,8 @@ prepare_tree() {
         log "  $p"
         patch -d "$tmp/wine-$WINE_VERSION" -p1 -s -i "$HERE/patches/$p"
     done < "$HERE/patches/series"
+    # our own file and folder icons' SVG sources (theme/icons.py), rendered next
+    python3 "$HERE/theme/icons.py" "$tmp/wine-$WINE_VERSION" >/dev/null
     regenerate_theme_images "$tmp/wine-$WINE_VERSION"
     generate_dark_scheme "$tmp/wine-$WINE_VERSION"
     mv "$tmp/wine-$WINE_VERSION" "$dest"

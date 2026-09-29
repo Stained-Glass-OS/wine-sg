@@ -206,6 +206,10 @@ test-movesize:
 test-vdstay:
 	WINE=$(PREFIX)/bin/wine test/vdstay-gate.sh
 
+# Our own folder, file, text file and Notepad icons (theme/icons.py, 0478).
+test-icons:
+	WINE=$(PREFIX)/bin/wine test/icons-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
