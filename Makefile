@@ -250,6 +250,10 @@ test-shortname:
 test-xwin-taskbar:
 	WINE=$(PREFIX)/bin/wine test/xwin-taskbar-gate.sh
 
+# AVL tables, RtlIsNameInExpression, FindNextFileNameW (0498, 0499): Office.
+test-avl:
+	WINE=$(PREFIX)/bin/wine test/avl-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
