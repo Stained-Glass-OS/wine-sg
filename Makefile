@@ -295,6 +295,10 @@ test-popuppos:
 test-recycle:
 	WINE=$(PREFIX)/bin/wine test/recycle-gate.sh
 
+# File Explorer's Sort, View and Refresh glyphs (0515), from a screenshot.
+test-explorer-glyphs:
+	WINE=$(PREFIX)/bin/wine test/explorer-glyphs-gate.sh
+
 # The Web Account Manager with no providers (0512): Office's sign-in.
 test-webauthcore:
 	WINE=$(PREFIX)/bin/wine test/webauthcore-gate.sh
