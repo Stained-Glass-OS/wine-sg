@@ -1,6 +1,8 @@
-/* xwin-taskbar-gate.sh's stand-in for sg-lockctl (0496): XWINDOWS [--out FILE]
- * copies the list file $SG_FAKE_DIR/list (to FILE, as sg-lockctl does, or
- * to its output); any other command is appended to $SG_FAKE_DIR/commands. */
+/* xwin-taskbar-gate.sh's and elevmin-gate.sh's stand-in for sg-lockctl
+ * (0496, 0500): XWINDOWS [--out FILE] copies the list file $SG_FAKE_DIR/list,
+ * WINDOWS [--out FILE] the file $SG_FAKE_DIR/windows (to FILE, as sg-lockctl
+ * does, or to its output); any other command is appended to
+ * $SG_FAKE_DIR/commands. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,14 +16,14 @@ int main(int argc, char **argv)
     int i;
 
     if (!dir || argc < 2) return 2;
-    if (!strcmp(argv[1], "XWINDOWS"))
+    if (!strcmp(argv[1], "XWINDOWS") || !strcmp(argv[1], "WINDOWS"))
     {
         if (argc == 4 && !strcmp(argv[2], "--out"))
         {
             snprintf(part, sizeof(part), "%s.part", argv[3]);
             if (!(out = fopen(part, "w"))) return 1;
         }
-        snprintf(path, sizeof(path), "%s/list", dir);
+        snprintf(path, sizeof(path), "%s/%s", dir, argv[1][0] == 'X' ? "list" : "windows");
         if ((f = fopen(path, "r")))
         {
             while ((n = fread(buf, 1, sizeof(buf), f))) fwrite(buf, 1, n, out);

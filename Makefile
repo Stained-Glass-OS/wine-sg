@@ -254,6 +254,10 @@ test-xwin-taskbar:
 test-avl:
 	WINE=$(PREFIX)/bin/wine test/avl-gate.sh
 
+# Elevated windows on the taskbar, minimizable (0500).
+test-elevmin:
+	WINE=$(PREFIX)/bin/wine test/elevmin-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
