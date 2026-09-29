@@ -81,6 +81,15 @@ xdotool mousemove 500 699; sleep 2; S shown; shot shown
 xdotool mousemove 500 300; sleep 3; S hiddenagain
 "$WINE" taskbar-probe.exe autohide 0 >/dev/null 2>&1; sleep 2; S setstate
 "$WINE" reg query "$TB" /v AutoHide 2>/dev/null | tr -d '\r' > "$T/reg.out"
+R "$TB" AutoHide 0; apply
+R "$TB" ShowDesktops 0; apply; S nopager
+R "$TB" ShowDesktops 1; apply; S pager
+R "$TB" Color 1; apply; shot cdark
+R "$TB" Color 2; apply; shot clight
+R "$TB" Color 3; apply; shot cblue
+R "$TB" Color 4; apply; shot caccent
+R "$TB" Color 0; apply
+R 'HKCU\Software\Stained Glass\Style' Rounded 1; "$WINE" taskbar-probe.exe mode >/dev/null 2>&1; sleep 2; S rounded; shot rounded
 EOF
 chmod +x "$T/session.sh"
 timeout -s KILL 400 xvfb-run -a -s '-screen 0 1024x700x24' "$T/session.sh"
@@ -132,6 +141,17 @@ case "$(v hidden appbar)" in "3 "*) [ "$(v hidden autohidebar)" = 1 ] && pass "S
 [ "$(v hiddenagain bar)" = "0,698,1024,738 topmost=1" ] && pass "and it hides again" || fail "hide again: $(v hiddenagain bar)"
 [ "$(v setstate bar)" = "0,660,1024,700 topmost=0" ] && [ "$(v setstate work)" = "0,0,1024,660" ] && grep -q 'AutoHide.*0x0' "$T/reg.out" \
     && pass "ABM_SETSTATE from a program turns auto-hide off (and Settings sees it)" || fail "ABM_SETSTATE: $(v setstate bar) $(v setstate work) $(cat "$T/reg.out")"
+[ "$(count pager pager)" = 1 ] && [ "$(count nopager pager)" = 0 ] \
+    && pass "ShowDesktops 0 hides the virtual desktops' pager, 1 shows it" || fail "pager: shown $(count pager pager), hidden $(count nopager pager)"
+[ "$(px cdark 600 690)" = "31,31,31" ] && pass "taskbar color Dark: #1F1F1F" || fail "dark: $(px cdark 600 690)"
+[ "$(px clight 600 690)" = "238,238,238" ] && pass "taskbar color Light" || fail "light: $(px clight 600 690)"
+[ "$(px cblue 600 690)" = "233,238,246" ] && pass "taskbar color Light blue (whitish blue)" || fail "light blue: $(px cblue 600 690)"
+[ "$(px caccent 600 690)" = "75,23,124" ] && pass "taskbar color Accent: the accent darkened" || fail "accent: $(px caccent 600 690)"
+[ "$(v rounded bar)" = "0,652,1024,700 topmost=0" ] && [ "$(v rounded work)" = "0,0,1024,652" ] \
+    && pass "the Rounded style: a 48 px bar, its space reserved" || fail "rounded bar: $(v rounded bar) / $(v rounded work)"
+b=$(v rounded button); bx=$(( ($(echo "$b" | cut -d, -f1) + $(echo "$b" | cut -d, -f3)) / 2 ))
+pill=$(px rounded $bx 696); edge=$(px rounded $((bx - 12)) 696)
+[ "$pill" != "$edge" ] && pass "a running program's button has a short pill at its foot ($pill on $edge)" || fail "pill: $pill / beside it $edge"
 
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

@@ -3,6 +3,7 @@
  *   taskbar-probe window NAME X Y     a plain top-level window (this program's)
  *   taskbar-probe apply               WM_SETTINGCHANGE "TraySettings", as Settings sends
  *   taskbar-probe state               the bar, the work area, SHAppBarMessage's view
+ *   taskbar-probe mode                announce a changed Windows mode or style (ImmersiveColorSet)
  *                                     and the bar's visible buttons
  *   taskbar-probe autohide 0|1        SHAppBarMessage(ABM_SETSTATE)
  *
@@ -68,6 +69,11 @@ static int do_state(void)
         WCHAR cls[32];
         LONG_PTR id = GetWindowLongPtrW(child, GWLP_ID);
         GetClassNameW(child, cls, 32);
+        if (!lstrcmpiW(cls, L"SgVirtualDesktopPager") && IsWindowVisible(child))
+        {
+            GetWindowRect(child, &rc);
+            printf("pager=%ld,%ld,%ld,%ld\n", rc.left, rc.top, rc.right, rc.bottom);
+        }
         if (lstrcmpiW(cls, L"Button") || !IsWindowVisible(child)) continue;
         GetWindowRect(child, &rc);
         buttons++;
@@ -85,6 +91,12 @@ int wmain(int argc, WCHAR **argv)
     DWORD_PTR res;
 
     if (argc >= 5 && !lstrcmpW(argv[1], L"window")) return do_window(argv[2], _wtoi(argv[3]), _wtoi(argv[4]));
+    if (argc >= 2 && !lstrcmpW(argv[1], L"mode"))
+    {
+        /* Settings > Personalization > Colors: the mode or the style changed */
+        SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"ImmersiveColorSet", SMTO_ABORTIFHUNG, 5000, &res);
+        return 0;
+    }
     if (argc >= 2 && !lstrcmpW(argv[1], L"apply"))
     {
         SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"TraySettings", SMTO_ABORTIFHUNG, 5000, &res);
