@@ -1,8 +1,12 @@
 /* rounded-gate.sh's hands (0483): windows to look at in the Rounded style.
  *   win TITLE X Y W H [plain|rgn|donot|small|max]   show one and wait
  *   resize TITLE W H                                 size it
- *   pref TITLE                                       print its DWMWA_WINDOW_CORNER_PREFERENCE */
+ *   pref TITLE                                       print its DWMWA_WINDOW_CORNER_PREFERENCE
+ *   rgn TITLE                                        print what GetWindowRgn says of it
+ *   menu X Y                                         a popup menu there, until killed
+ *   tip X Y                                          a tooltip window there, until killed */
 #include <windows.h>
+#include <commctrl.h>
 #include <dwmapi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +41,32 @@ int wmain(int argc, WCHAR **argv)
         DWORD pref = 99;
         HRESULT hr = DwmGetWindowAttribute(w, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
         printf("pref=%lu hr=%#lx\n", pref, hr);
+        return 0;
+    }
+    if (argc >= 3 && !lstrcmpW(argv[1], L"rgn") && (w = FindWindowW(L"STATIC", argv[2])))
+    {
+        HRGN r = CreateRectRgn(0, 0, 0, 0);
+        printf("rgn=%d\n", GetWindowRgn(w, r));
+        return 0;
+    }
+    if (argc >= 4 && !lstrcmpW(argv[1], L"menu"))
+    {
+        HMENU m = CreatePopupMenu();
+        int i;
+        w = CreateWindowW(L"STATIC", L"MenuOwner", WS_POPUP, 0, 0, 1, 1, 0, 0, 0, 0);
+        for (i = 0; i < 6; i++) AppendMenuW(m, MF_STRING, 100 + i, L"A menu item of some width");
+        SetForegroundWindow(w);
+        TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN, _wtoi(argv[2]), _wtoi(argv[3]), 0, w, NULL);
+        return 0;
+    }
+    if (argc >= 4 && !lstrcmpW(argv[1], L"tip"))
+    {
+        InitCommonControls();
+        w = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, L"A tooltip", WS_POPUP, _wtoi(argv[2]), _wtoi(argv[3]),
+                            160, 40, 0, 0, 0, 0);
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        SetWindowPos(w, HWND_TOPMOST, _wtoi(argv[2]), _wtoi(argv[3]), 160, 40, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        while (GetMessageW(&msg, 0, 0, 0)) DispatchMessageW(&msg);
         return 0;
     }
     return 1;

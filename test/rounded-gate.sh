@@ -1,14 +1,16 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# The Rounded style rounds windows' corners (patches/sg/0483). David asked for
-# a look like newer Windows beside the Windows 10 one. With
+# The Rounded style rounds windows' corners (patches/sg/0483, 0492). David
+# asked for a look like newer Windows beside the Windows 10 one. With
 # HKCU\Software\Stained Glass\Style "Rounded" = 1, win32u gives each
-# top-level window with a title bar a surface shape with 8 px rounded corners;
-# programs see no window region. Square corners stay: with the style off,
-# maximized, with the program's own region, and when the program asks
-# (DWMWA_WINDOW_CORNER_PREFERENCE DONOTROUND; ROUNDSMALL is 4 px). A resize
-# shapes the window again. The checks read the screen: a window's corner
-# pixel is the green desktop behind it when rounded.
+# top-level window with a title bar 8 px rounded corners -- a window region
+# the server clips by, so what is below paints the corners, but one
+# GetWindowRgn does not show. Popup menus are rounded too, tooltips by 4 px.
+# Square corners stay: with the style off, maximized, with the program's own
+# region, and when the program asks (DWMWA_WINDOW_CORNER_PREFERENCE
+# DONOTROUND; ROUNDSMALL is 4 px). A resize shapes the window again. The
+# checks read the screen: a window's corner pixel is the green desktop
+# behind it when rounded; a menu's, the window below it.
 #
 #   WINE=/opt/wine-sg/bin/wine test/rounded-gate.sh
 set -u
@@ -26,7 +28,7 @@ for t in xvfb-run import convert; do command -v $t >/dev/null || { echo "SKIP: n
 T=$(mktemp -d /var/tmp/sg-rounded.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 trap '"$WINESERVER" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"' EXIT INT TERM
-"$MINGW" -O2 -municode -o "$T/rounded-probe.exe" "$HERE/rounded-probe.c" -ldwmapi -lgdi32 || { fail "probe did not build"; exit 1; }
+"$MINGW" -O2 -municode -o "$T/rounded-probe.exe" "$HERE/rounded-probe.c" -ldwmapi -lgdi32 -lcomctl32 || { fail "probe did not build"; exit 1; }
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 cp "$T/rounded-probe.exe" "$WINEPREFIX/drive_c/"
@@ -55,11 +57,13 @@ shot one
 xwininfo -root -tree > "$T/tree.out" 2>&1
 for w in \$(awk '/"On"|"Small"/ {print \$1}' "$T/tree.out"); do xwininfo -shape -id \$w; done > "$T/shape.out" 2>&1
 P pref Donot > "$T/pref.out"; P pref On >> "$T/pref.out"
+P rgn On > "$T/rgn.out"; P rgn Rgn >> "$T/rgn.out"
 P resize On 320 240; shot resized
 style 0
 P resize On 300 200; shot off
 style 1
 "$WINE" rounded-probe.exe win Max 0 0 300 200 max & shot max
+"$WINE" rounded-probe.exe menu 600 100 & "$WINE" rounded-probe.exe tip 600 450 & shot popups
 EOF2
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s "-screen 0 1024x700x24" "$T/session.sh" > "$T/session.out" 2>&1
@@ -76,11 +80,20 @@ green one 530 40 || green one 380 140 || green one 384 44 \
 green one 41 301 && fail "DWMWCP_DONOTROUND is rounded" || pass "DWMWA_WINDOW_CORNER_PREFERENCE DONOTROUND keeps square corners"
 green one 381 301 && fail "a window with its own region was rounded" || pass "a program's own window region is its shape"
 green one 720 300 && ! green one 722 302 && pass "ROUNDSMALL: a smaller radius" || fail "ROUNDSMALL: $(px one 720 300) $(px one 722 302)"
+[ "$(sed -n 1p "$T/rgn.out")" = "rgn=0" ] && [ "$(sed -n 2p "$T/rgn.out")" = "rgn=2" ] \
+    && pass "GetWindowRgn: the rounded window has no region (ERROR), the program's region is its own" || fail "GetWindowRgn: $(cat "$T/rgn.out" | tr '\n' ' ')"
 grep -q "pref=1 hr=0" "$T/pref.out" && grep -q "pref=0 hr=0" "$T/pref.out" && pass "DwmGetWindowAttribute reads the preference back" || fail "pref: $(cat "$T/pref.out")"
 green resized 381 41 && green resized 699 279 && ! green resized 679 239 \
     && pass "a resized window is shaped again at its new size" || fail "resized: $(px resized 381 41) $(px resized 699 279) $(px resized 679 239)"
 green off 381 41 && fail "still rounded after the style was turned off" || pass "the style turned off: square again at the next change"
 [ -f "$T/max.png" ] && ! green max 1 1 && pass "a maximized window keeps square corners" || fail "maximized: $(px max 1 1)"
+# over the maximized window: its own colour shows through the corners (it
+# paints there), not the menu's edge -- nor black, which a shape the server
+# did not know of left
+[ "$(px popups 601 101)" = "$(px popups 596 96)" ] && [ "$(px popups 610 106)" != "$(px popups 596 96)" ] \
+    && pass "a popup menu has rounded corners, the window below showing through" || fail "menu corner: $(px popups 601 101) (below: $(px popups 596 96)) inside $(px popups 610 106)"
+[ "$(px popups 600 450)" = "$(px popups 596 446)" ] && [ "$(px popups 604 454)" != "$(px popups 596 446)" ] \
+    && pass "and a tooltip, a smaller radius" || fail "tooltip corner: $(px popups 600 450) (below: $(px popups 596 446)) inside $(px popups 604 454)"
 
 echo
 [ "$RC" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
