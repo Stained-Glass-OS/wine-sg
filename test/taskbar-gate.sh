@@ -103,6 +103,11 @@ case "$(v default appbar)" in "2 edge=3 rc=0,660,1024,700") pass "SHAppBarMessag
 [ "$(v combine windows)" = 2 ] && [ "$(width "$(v combine button)")" = 48 ] \
     && pass "combine buttons: one program's two windows share one icon button" || fail "combine: windows $(v combine windows) first $(v combine button)"
 s=$(v center start); [ "${s%%,*}" -gt 100 ] 2>/dev/null && pass "centred: Start moves in from the left ($s)" || fail "centre: start $s"
+# the group (Start to the last window button) is centred on the whole bar,
+# not in the room left of the notification area
+gr=$(awk '$0 == "== center" { on = 1; next } /^== / { on = 0 } on && /^(start|button)=/ { sub(/^[a-z]+=/, ""); split($0, r, ","); if (l == "" || r[1] < l) l = r[1]; if (r[3] > rr) rr = r[3] } END { print l "," rr }' "$T/log.out")
+mid=$(( (${gr%%,*} + ${gr##*,}) / 2 ))
+[ "$mid" -ge 508 ] && [ "$mid" -le 516 ] && pass "centred on the screen: Start and the buttons span $gr (middle $mid of 1024)" || fail "centred group: $gr (middle $mid, want 512)"
 [ "$(width "$(v searchbox search)")" = 280 ] && pass "search box shown" || fail "search box: $(v searchbox search)"
 [ "$(width "$(v searchicon search)")" = 48 ] && pass "search icon shown" || fail "search icon: $(v searchicon search)"
 [ "$(count notaskview taskview)" = 0 ] && pass "Task View button hidden" || fail "Task View still shown"
