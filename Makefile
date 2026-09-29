@@ -291,6 +291,14 @@ test-noexcept:
 test-popuppos:
 	WINE=$(PREFIX)/bin/wine test/popuppos-gate.sh
 
+# The Web Account Manager with no providers (0512): Office's sign-in.
+test-webauthcore:
+	WINE=$(PREFIX)/bin/wine test/webauthcore-gate.sh
+
+# A locale's sort looked up re-entrantly (0513): App-V's registry hooks.
+test-sortreenter:
+	WINE=$(PREFIX)/bin/wine test/sortreenter-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
