@@ -1,4 +1,4 @@
-/* noexcept-gate.sh's probe (0509): vcruntime140's __C_specific_handler_noexcept.
+/* noexcept-gate.sh's probe (0510): vcruntime140's __C_specific_handler_noexcept.
  *   probe unwind : an unwind passing the frame continues (no scope of ours)
  *   probe escape : an exception leaving the noexcept function ends the process */
 #include <windows.h>

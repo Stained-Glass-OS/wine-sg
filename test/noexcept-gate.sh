@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# vcruntime140's __C_specific_handler_noexcept (patches/sg/0509), the
+# vcruntime140's __C_specific_handler_noexcept (patches/sg/0510), the
 # exception handler of a noexcept function holding __try blocks. It was a
 # stub: each exception passing such a frame raised another into the same
 # frame until the stack overflowed -- Word died signing in to Office. An

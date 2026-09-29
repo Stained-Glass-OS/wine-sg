@@ -279,6 +279,18 @@ test-regrestore:
 test-chakra:
 	WINE=$(PREFIX)/bin/wine test/chakra-gate.sh
 
+# RtlValidRelativeSecurityDescriptor (0507): offreg opens Office's virtual registry hives.
+test-relsd:
+	WINE=$(PREFIX)/bin/wine test/relsd-gate.sh
+
+# vcruntime140's __C_specific_handler_noexcept (0510): Word's sign-in click.
+test-noexcept:
+	WINE=$(PREFIX)/bin/wine test/noexcept-gate.sh
+
+# CalculatePopupWindowPosition (0511): Word's "Sign in or create account".
+test-popuppos:
+	WINE=$(PREFIX)/bin/wine test/popuppos-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
