@@ -234,6 +234,10 @@ test-xsdpattern:
 test-msxml-replace:
 	WINE=$(PREFIX)/bin/wine test/msxml-replace-gate.sh
 
+# The Software Licensing client's store (0491): Office's installer.
+test-sppc:
+	WINE=$(PREFIX)/bin/wine test/sppc-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
