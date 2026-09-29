@@ -8,7 +8,10 @@
 # same content), and uninstalling removes them -- asking twice says they are
 # not installed; what is installed reads back (0495). Nothing is granted:
 # application policies hold nothing, no right is consumed, and the
-# licensing status is what it was.
+# licensing status is what it was. Office's licensing thread also sets
+# authentication data and registers licensing events at start, and Word
+# asks kernel32 for FlsGetValue2, QueueUserAPC2, WerRegisterCustomMetadata
+# (0501): a stub there ended Word.
 #
 #   WINE=/opt/wine-sg/bin/wine test/sppc-gate.sh
 set -u
@@ -26,7 +29,7 @@ T=$(mktemp -d /var/tmp/sg-sppc.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 # sppc's exports, as the probe links them (mingw has no import library for it)
-printf 'LIBRARY sppc.dll\nEXPORTS\nSLOpen\nSLClose\nSLInstallLicense\nSLUninstallLicense\nSLInstallProofOfPurchase\nSLUninstallProofOfPurchase\nSLGetLicensingStatusInformation\nSLGetLicenseFileId\nSLGetLicense\nSLGetPKeyId\nSLLoadApplicationPolicies\nSLGetApplicationPolicy\nSLUnloadApplicationPolicies\nSLGetPolicyInformationDWORD\nSLConsumeRight\n' > "$T/sppc.def"
+printf 'LIBRARY sppc.dll\nEXPORTS\nSLOpen\nSLClose\nSLInstallLicense\nSLUninstallLicense\nSLInstallProofOfPurchase\nSLUninstallProofOfPurchase\nSLGetLicensingStatusInformation\nSLGetLicenseFileId\nSLGetLicense\nSLGetPKeyId\nSLLoadApplicationPolicies\nSLGetApplicationPolicy\nSLUnloadApplicationPolicies\nSLGetPolicyInformationDWORD\nSLConsumeRight\nSLSetAuthenticationData\nSLGetAuthenticationResult\nSLRegisterEvent\nSLUnregisterEvent\nSLIsGenuineLocalEx\n' > "$T/sppc.def"
 "${DLLTOOL:-x86_64-w64-mingw32-dlltool}" -d "$T/sppc.def" -l "$T/libsppc.a" || { fail "no import library"; exit 1; }
 "$MINGW" -O2 -o "$T/probe.exe" "$HERE/sppc-probe.c" "$T/libsppc.a" || { fail "probe did not build"; exit 1; }
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
@@ -55,6 +58,14 @@ case "$(v key)" in "00000000 {"*) pass "SLInstallProofOfPurchase keeps a product
 [ "$(v policydword)" = c004f012 ] && [ "$(v consume)" = c004f013 ] \
     && pass "no policy value, and no right is granted (SL_E_RIGHT_NOT_GRANTED)" || fail "policy dword / consume: $(v policydword) / $(v consume)"
 [ "$(v status)" = c004f002 ] && pass "and nothing is granted: the licensing status is unchanged (SL_E_RIGHT_NOT_CONSUMED)" || fail "status: $(v status)"
+[ "$(v setauth)" = 00000000 ] && [ "$(v authresult)" = "c004f012 0 0000000000000000" ] \
+    && pass "SLSetAuthenticationData takes Office's data; there is no result to read (0501)" || fail "auth: $(v setauth) / $(v authresult)"
+[ "$(v event)" = "00000000 00000000" ] && [ "$(v genuine)" = "00000000 0" ] \
+    && pass "licensing events register; the machine is genuine locally" || fail "event / genuine: $(v event) / $(v genuine)"
+[ "$(v fls2)" = "1 42" ] && [ "$(v tls2)" = "1 42" ] \
+    && pass "FlsGetValue2 and TlsGetValue2 read the slot and leave the last error alone" || fail "fls2 / tls2: $(v fls2) / $(v tls2)"
+[ "$(v apc2)" = "1 1" ] && [ "$(v wer)" = 00000000 ] \
+    && pass "QueueUserAPC2 queues (and refuses unknown flags); WerRegisterCustomMetadata succeeds" || fail "apc2 / wer: $(v apc2) / $(v wer)"
 [ "$(wc -l < "$T/files")" = 0 ] && pass "the store is empty again after uninstalling" || fail "store: $(cat "$T/files")"
 
 echo

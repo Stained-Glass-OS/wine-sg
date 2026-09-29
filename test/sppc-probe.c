@@ -20,6 +20,11 @@ HRESULT WINAPI SLGetApplicationPolicy(void *, const WCHAR *, UINT *, UINT *, BYT
 HRESULT WINAPI SLUnloadApplicationPolicies(void *, DWORD);
 HRESULT WINAPI SLGetPolicyInformationDWORD(HSLC, const WCHAR *, DWORD *);
 HRESULT WINAPI SLConsumeRight(HSLC, const SLID *, const SLID *, const WCHAR *, void *);
+HRESULT WINAPI SLSetAuthenticationData(HSLC, UINT, const BYTE *);
+HRESULT WINAPI SLGetAuthenticationResult(HSLC, UINT *, BYTE **);
+HRESULT WINAPI SLRegisterEvent(HSLC, const WCHAR *, const SLID *, HANDLE);
+HRESULT WINAPI SLUnregisterEvent(HSLC, const WCHAR *, const SLID *, HANDLE);
+HRESULT WINAPI SLIsGenuineLocalEx(const SLID *, const SLID *, int *);
 
 static void id(const char *name, HRESULT hr, const SLID *g)
 {
@@ -78,6 +83,44 @@ int main(void)
         printf("unloadpolicies %08lx\n", SLUnloadApplicationPolicies(ctx, 0));
         printf("policydword %08lx\n", SLGetPolicyInformationDWORD(h, L"Kernel-Something", &d));
         printf("consume %08lx\n", SLConsumeRight(h, &app, NULL, NULL, NULL));
+    }
+    {
+        /* 0501: what Office's licensing thread calls at start */
+        static const BYTE auth[] = { 1, 2, 3, 4 };
+        UINT size = 99;
+        BYTE *data = (BYTE *)1;
+        int state = 99;
+        HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        printf("setauth %08lx\n", SLSetAuthenticationData(h, sizeof(auth), auth));
+        {
+            HRESULT hr = SLGetAuthenticationResult(h, &size, &data);
+            printf("authresult %08lx %u %p\n", hr, size, data);
+        }
+        printf("event %08lx %08lx\n", SLRegisterEvent(h, L"msft:rm/event/licensingstatechanged", &app, ev),
+               SLUnregisterEvent(h, L"msft:rm/event/licensingstatechanged", &app, ev));
+        {
+            HRESULT hr = SLIsGenuineLocalEx(&app, NULL, &state);
+            printf("genuine %08lx %d\n", hr, state);
+        }
+        {
+            /* and the newer kernel32 functions Office asks for */
+            void *(WINAPI *fls2)(DWORD) = (void *)GetProcAddress(k32, "FlsGetValue2");
+            void *(WINAPI *tls2)(DWORD) = (void *)GetProcAddress(k32, "TlsGetValue2");
+            BOOL (WINAPI *apc2)(PAPCFUNC, HANDLE, ULONG_PTR, DWORD) = (void *)GetProcAddress(k32, "QueueUserAPC2");
+            HRESULT (WINAPI *wer)(const WCHAR *, const WCHAR *) = (void *)GetProcAddress(k32, "WerRegisterCustomMetadata");
+            DWORD fi = FlsAlloc(NULL), ti = TlsAlloc();
+            FlsSetValue(fi, (void *)0x1234);
+            TlsSetValue(ti, (void *)0x5678);
+            SetLastError(42);
+            printf("fls2 %d %lu\n", fls2 && fls2(fi) == (void *)0x1234, GetLastError());
+            printf("tls2 %d %lu\n", tls2 && tls2(ti) == (void *)0x5678, GetLastError());
+            printf("apc2 %d %d\n", apc2 && apc2((PAPCFUNC)(void *)CloseHandle, GetCurrentThread(), 0, 2) == FALSE,
+                   apc2 && apc2((PAPCFUNC)(void *)SetLastError, GetCurrentThread(), 7, 0));
+            SleepEx(0, TRUE);
+            printf("wer %08lx\n", wer ? wer(L"key", L"value") : 0xdead);
+        }
+        CloseHandle(ev);
     }
     SLUninstallLicense(h, &c);
     SLClose(h);
