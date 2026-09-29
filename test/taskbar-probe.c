@@ -80,6 +80,7 @@ static int do_state(void)
         if (id == 0) printf("start=%ld,%ld,%ld,%ld\n", rc.left, rc.top, rc.right, rc.bottom);
         else if (id == 0x5654) printf("taskview=%ld,%ld,%ld,%ld\n", rc.left, rc.top, rc.right, rc.bottom);
         else if (id == 0x5345) printf("search=%ld,%ld,%ld,%ld\n", rc.left, rc.top, rc.right, rc.bottom);
+        else if (id >= 0x5700 && id < 0x5730) printf("pin=%ld,%ld,%ld,%ld\n", rc.left, rc.top, rc.right, rc.bottom);
         else { windows++; printf("button=%ld,%ld,%ld,%ld\n", rc.left, rc.top, rc.right, rc.bottom); }
     }
     printf("windows=%d\n", windows);

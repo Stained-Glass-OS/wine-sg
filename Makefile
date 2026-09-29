@@ -222,6 +222,10 @@ test-dispchange:
 test-rounded:
 	WINE=$(PREFIX)/bin/wine test/rounded-gate.sh
 
+# Programs pinned to the taskbar (0485).
+test-taskpins:
+	WINE=$(PREFIX)/bin/wine test/taskpins-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
