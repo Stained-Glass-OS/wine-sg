@@ -3045,6 +3045,16 @@ Settings > Personalization > Colors writes Windows' two modes,
 `SystemUsesLightTheme` (the shell), and broadcasts `WM_SETTINGCHANGE
 "ImmersiveColorSet"`. What follows:
 
+- **0486 "Rounded" and "RoundedDark" schemes** (the Rounded style, David's
+  newer-Windows look): `theme/rounded.py` derives `rounded_*.svg` from every
+  `blue_*.svg` (corner radii doubled, x1.25 for check boxes; the purple accent
+  hue-rotated to blue; mid greys -- edges -- lightened), renders them with
+  tools/buildimage, remaps them through dark.py for RoundedDark, and writes
+  `rounded.rc` (both INIs, all BITMAPs), which light.rc includes.
+  `build.sh generate_rounded_schemes` runs it after dark.py; the fingerprint
+  includes it. uxtheme's RefreshImmersiveColorPolicyState picks Rounded /
+  RoundedDark while HKCU\Software\Stained Glass\Style Rounded is 1. Edit
+  borders are 5 px 9-slice images and stay square.
 - **0160 light.msstyles gets a "Dark" colour scheme** beside "Blue" (Stained
   Glass Light), as a Windows style carries several (COLORNAMES,
   FILERESNAMES, display names). **Dark is generated, never drawn:**

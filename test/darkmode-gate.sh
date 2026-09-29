@@ -82,6 +82,16 @@ shot back
 P state
 P mode system dark
 shot sysdark
+# the Rounded style: its schemes, light and dark (0486)
+P style rounded
+shot rounded
+P state
+P mode apps dark
+shot roundeddark
+P state
+P mode apps light
+P style classic
+P state
 EOF
 chmod +x "$T/session.sh"
 timeout -s KILL 300 xvfb-run -a -s '-screen 0 1024x700x24' "$T/session.sh"
@@ -115,7 +125,8 @@ case "$(report dark Plain)" in *"window=202020 menubar=202020 scheme=Dark button
 case "$(after state 2)" in "window=202020 scheme=Dark"*) pass "a program started afterwards is dark" ;; *) fail "new process: $(after state 2)" ;; esac
 dark later 150 400 && pass "and its window is drawn dark" || fail "later window: $(px later 150 400)"
 
-light syslight 900 690 && pass "Windows mode light: the taskbar turns light" || fail "taskbar light: $(px syslight 900 690)"
+light syslight 700 690 && pass "Windows mode light: the taskbar turns light" || fail "taskbar light: $(px syslight 700 690)"
+light syslight 870 690 && pass "and the desktops pager's cells with it" || fail "pager cell on the light bar: $(px syslight 870 690)"
 dark syslight 150 $BG && pass "while the apps stay dark" || fail "apps after Windows mode: $(px syslight 150 $BG)"
 
 light back 150 $CAP && light back 150 $BG && light back 150 $MENU && pass "back to light: title bar, background and menu bar" || fail "back: $(px back 150 $CAP) $(px back 150 $BG) $(px back 150 $MENU)"
@@ -125,6 +136,12 @@ case "$(after state 3)" in "window=ffffff scheme=Blue"*) pass "a new process see
 dark sysdark 900 690 && pass "Windows mode dark: the taskbar is dark again" || fail "taskbar dark: $(px sysdark 900 690)"
 grep -q 'ColorName.*Blue' "$T/reg.out" && grep -q 'Window.*255 255 255' "$T/reg.out" \
     && pass "the light colours are saved (ThemeManager, Control Panel\\Colors)" || fail "registry: $(cat "$T/reg.out")"
+
+case "$(after state 4)" in *"scheme=Rounded"*) pass "the Rounded style: its Rounded scheme" ;; *) fail "rounded: $(after state 4)" ;; esac
+case "$(report rounded Plain)" in *"scheme=Rounded "*) pass "and a running program follows it" ;; *) fail "Plain in rounded: $(report rounded Plain)" ;; esac
+case "$(after state 5)" in *"scheme=RoundedDark"*) pass "dark mode with it: Rounded Dark" ;; *) fail "rounded dark: $(after state 5)" ;; esac
+dark roundeddark $BTNX $BTNY && pass "and its push button is dark" || fail "rounded dark button: $(px roundeddark $BTNX $BTNY)"
+case "$(after state 6)" in *"scheme=Blue"*) pass "the Classic style: the light scheme again" ;; *) fail "classic again: $(after state 6)" ;; esac
 
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

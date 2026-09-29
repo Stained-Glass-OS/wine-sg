@@ -132,6 +132,22 @@ static int do_mode(const WCHAR *which, const WCHAR *mode)
     return 0;
 }
 
+/* the Rounded style (Settings > Personalization > Colors > Window style) */
+static int do_style(const WCHAR *style)
+{
+    DWORD rounded = !lstrcmpW(style, L"rounded"), res;
+    HKEY key;
+
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Stained Glass\\Style", 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL))
+        return 1;
+    RegSetValueExW(key, L"Rounded", 0, REG_DWORD, (BYTE *)&rounded, sizeof(rounded));
+    RegCloseKey(key);
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"ImmersiveColorSet",
+                        SMTO_ABORTIFHUNG, 5000, (DWORD_PTR *)&res);
+    printf("style %ls\n", style);
+    return 0;
+}
+
 static int do_state(void)
 {
     WCHAR theme[MAX_PATH], color[64] = L"", size[64];
@@ -152,6 +168,7 @@ int wmain(int argc, WCHAR **argv)
         return do_window(argv[2], _wtoi(argv[3]), _wtoi(argv[4]), argc > 5 && !lstrcmpW(argv[5], L"dark"));
     if (argc >= 4 && !lstrcmpW(argv[1], L"mode")) return do_mode(argv[2], argv[3]);
     if (argc >= 2 && !lstrcmpW(argv[1], L"state")) return do_state();
+    if (argc >= 3 && !lstrcmpW(argv[1], L"style")) return do_style(argv[2]);
     fprintf(stderr, "usage: darkmode-probe window NAME X Y [dark] | mode apps|system light|dark | state\n");
     return 2;
 }
