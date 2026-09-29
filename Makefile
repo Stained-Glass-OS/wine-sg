@@ -266,6 +266,11 @@ test-dwfontset:
 test-tzdb:
 	WINE=$(PREFIX)/bin/wine test/tzdb-gate.sh
 
+# msvcp's _Sinh/_Cosh (0509): std::complex's sin/cos/sinh/cosh/tan -- SG
+# Office's (LibreOffice for Windows) IMSIN, IMSINH ...
+test-sinh:
+	WINE=$(PREFIX)/bin/wine test/sinh-gate.sh
+
 # RegRestoreKey restores binary and text hives (0506): Office's virtual registry.
 test-regrestore:
 	WINE=$(PREFIX)/bin/wine test/regrestore-gate.sh
