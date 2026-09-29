@@ -3,8 +3,10 @@
 # folders and files "look old", a text file showed Wine's notepad (a wine
 # glass). Checks the built modules: shell32's folder (IDI_SHELL_FOLDER, 4)
 # is our manila, its text file icon (IDI_SHELL_TEXT_FILE, 152) a page with
-# lines, Notepad's icon carries our accent band, every icon has the sizes
-# the desktop asks for (96, 48), and .txt files are registered with it.
+# lines, Notepad's icon carries our accent band, This PC is our monitor,
+# every icon has the sizes the desktop asks for (96, 48), .txt files are
+# registered with it, and the file dialogs' toolbar strip (comctl32
+# IDB_VIEW_SMALL) is our flat glyphs, not Wine's green arrow.
 #
 #   WINE=/opt/wine-sg/bin/wine test/icons-gate.sh
 set -u
@@ -74,6 +76,28 @@ r=$(printf '%s\n' "$out" | sed -n 's/^px 19,6 \([0-9]*\),\([0-9]*\),\([0-9]*\),.
 set -- $r
 [ "${3:-0}" -gt 150 ] && [ "${2:-255}" -lt 100 ] && pass "Notepad's icon carries our accent band ($1,$2,$3), not Wine's glass" \
     || fail "Notepad's icon is not ours (band: ${r:-none})"
+
+icon "$SHELL32" 16 "$T/pc.ico" || fail "shell32 has no This PC icon"
+out=$(python3 "$T/look.py" "$T/pc.ico" 48 30,18 2>&1)
+printf '%s\n' "$out" | sed 's/^/      this pc: /'
+r=$(printf '%s\n' "$out" | sed -n 's/^px 30,18 \([0-9]*\),\([0-9]*\),\([0-9]*\),.*/\1 \2 \3/p')
+set -- $r
+[ "${3:-0}" -gt 180 ] && [ "${1:-255}" -lt 120 ] && pass "This PC is our monitor, its screen blue ($1,$2,$3)" || fail "This PC is not ours (${r:-none})"
+
+COMCTL32=$(mod comctl32.dll)
+if [ -f "$COMCTL32" ] && wrestool -x -t 2 -n 124 "$COMCTL32" -o "$T/view.bmp" 2>/dev/null && [ -s "$T/view.bmp" ]; then
+    green=$(python3 - "$T/view.bmp" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGBA")
+# the up-one-level cell (the ninth): Wine's was a green arrow
+print(sum(1 for x in range(128, 144) for y in range(16) if im.getpixel((x, y))[1] > im.getpixel((x, y))[0] + 60))
+PY
+)
+    [ "${green:-99}" -eq 0 ] && pass "the file dialogs' toolbar is ours (no green arrow)" || fail "the file dialogs' toolbar still has Wine's green arrow ($green px)"
+else
+    echo "info  comctl32's view strip not found"
+fi
 
 if [ -f "$INF" ]; then
     grep -q 'HKCR,txtfile\\DefaultIcon,,2,"%11%\\shell32.dll,-152"' "$INF" && pass ".txt files are registered with it" \
