@@ -1,5 +1,5 @@
 /* rounded-gate.sh's hands (0483): windows to look at in the Rounded style.
- *   win TITLE X Y W H [plain|rgn|donot|small|max]   show one and wait
+ *   win TITLE X Y W H [plain|rgn|donot|small|max|popup|popupround]   show one and wait
  *   resize TITLE W H                                 size it
  *   pref TITLE                                       print its DWMWA_WINDOW_CORNER_PREFERENCE
  *   rgn TITLE                                        print what GetWindowRgn says of it
@@ -19,7 +19,15 @@ int wmain(int argc, WCHAR **argv)
     {
         int x = _wtoi(argv[3]), y = _wtoi(argv[4]), cx = _wtoi(argv[5]), cy = _wtoi(argv[6]);
         const WCHAR *how = argc > 7 ? argv[7] : L"plain";
-        w = CreateWindowW(L"STATIC", argv[2], WS_OVERLAPPEDWINDOW, x, y, cx, cy, 0, 0, 0, 0);
+        if (!lstrcmpW(how, L"popup") || !lstrcmpW(how, L"popupround"))
+            w = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", argv[2], WS_POPUP | WS_BORDER, x, y, cx, cy, 0, 0, 0, 0);
+        else
+            w = CreateWindowW(L"STATIC", argv[2], WS_OVERLAPPEDWINDOW, x, y, cx, cy, 0, 0, 0, 0);
+        if (!lstrcmpW(how, L"popupround"))
+        {
+            DWORD pref = DWMWCP_ROUND;
+            DwmSetWindowAttribute(w, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
+        }
         if (!lstrcmpW(how, L"rgn")) SetWindowRgn(w, CreateRectRgn(0, 0, cx, cy), FALSE);
         if (!lstrcmpW(how, L"donot") || !lstrcmpW(how, L"small"))
         {

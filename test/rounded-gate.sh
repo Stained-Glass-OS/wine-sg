@@ -64,6 +64,7 @@ P resize On 300 200; shot off
 style 1
 "$WINE" rounded-probe.exe win Max 0 0 300 200 max & shot max
 "$WINE" rounded-probe.exe menu 600 100 & "$WINE" rounded-probe.exe tip 600 450 & shot popups
+"$WINE" rounded-probe.exe win Fly 100 420 200 150 popupround & "$WINE" rounded-probe.exe win Plain 350 420 200 150 popup & shot flyouts
 EOF2
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s "-screen 0 1024x700x24" "$T/session.sh" > "$T/session.out" 2>&1
@@ -87,6 +88,11 @@ green resized 381 41 && green resized 699 279 && ! green resized 679 239 \
     && pass "a resized window is shaped again at its new size" || fail "resized: $(px resized 381 41) $(px resized 699 279) $(px resized 679 239)"
 green off 381 41 && fail "still rounded after the style was turned off" || pass "the style turned off: square again at the next change"
 [ -f "$T/max.png" ] && ! green max 1 1 && pass "a maximized window keeps square corners" || fail "maximized: $(px max 1 1)"
+# a window without a title bar that asks for round corners (a flyout, 0497):
+# over the maximized window, which shows through its corners; one that does
+# not ask stays square
+[ "$(px flyouts 100 420)" = "$(px flyouts 96 416)" ] && [ "$(px flyouts 350 420)" != "$(px flyouts 346 416)" ] \
+    && pass "a flyout that asks (DWMWCP_ROUND) is rounded; a plain popup is not" || fail "flyout: $(px flyouts 100 420) below $(px flyouts 96 416); plain $(px flyouts 350 420)"
 # over the maximized window: its own colour shows through the corners (it
 # paints there), not the menu's edge -- nor black, which a shape the server
 # did not know of left
