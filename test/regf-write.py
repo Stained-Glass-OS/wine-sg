@@ -79,4 +79,8 @@ base = bytearray(4096)
 base[0:4] = b'regf'
 struct.pack_into('<IIIIIIII', base, 4, 1, 1, 0, 0, 1, 5, 0, 1)
 struct.pack_into('<II', base, 0x24, root, len(hbin))
+# the base block's checksum: the XOR of its first 127 dwords
+x = 0
+for i in range(0, 0x1fc, 4): x ^= struct.unpack_from('<I', base, i)[0]
+struct.pack_into('<I', base, 0x1fc, x)
 open(sys.argv[1], 'wb').write(bytes(base) + bytes(hbin))
