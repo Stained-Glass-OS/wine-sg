@@ -218,6 +218,10 @@ test-savedesk:
 test-dispchange:
 	WINE=$(PREFIX)/bin/wine test/dispchange-gate.sh
 
+# The Rounded style rounds windows' corners (0483).
+test-rounded:
+	WINE=$(PREFIX)/bin/wine test/rounded-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
