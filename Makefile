@@ -230,6 +230,10 @@ test-taskpins:
 test-xsdpattern:
 	WINE=$(PREFIX)/bin/wine test/xsdpattern-gate.sh
 
+# removeChild of a node replaceChild took out (0490): Office's installer.
+test-msxml-replace:
+	WINE=$(PREFIX)/bin/wine test/msxml-replace-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
