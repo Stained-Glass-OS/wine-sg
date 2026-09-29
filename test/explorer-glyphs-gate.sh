@@ -1,6 +1,7 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
 # File Explorer's toolbar glyphs (patches/sg/0515), from a screenshot: the
+# arrows' heads are symmetric (drawn as lines, one arm came out longer), the
 # View grid's squares stand apart (the 1.25 pen ran them together into
 # blots), and Refresh turns clockwise with its head at the leading end, the
 # top (it sat at the arc's start, pointing back at the tail -- David,
@@ -50,10 +51,40 @@ if r:
     print("refresh_top_center", int(any(dark(x, y) for x in range(cx - 1, cx + 2) for y in range(r[1], r[1] + 3))))
 else:
     print("refresh_top_center none")
+def mirrored(x0, y0, w, h):
+    """a vertical arrow reads the same both sides of its shaft (the column
+    with the most dark pixels): every dark pixel has a dark mirror"""
+    pts = {(x, y) for x in range(x0, x0 + w) for y in range(y0, y0 + h) if dark(x, y)}
+    if not pts: return "none"
+    cols = {}
+    for x, y in pts: cols[x] = cols.get(x, 0) + 1
+    c = max(cols, key=cols.get)
+    return int(all((2 * c - x, y) in pts for x, y in pts))
+u = box(80, 86, 30, 30)
+print("up_mirrored", mirrored(80, 86, 30, 30))
+def head_sym(x0, y0, w, h, c, up):
+    """the head rows of the arrow whose shaft is column c: the pixel k to the
+    left matches the pixel k to the right"""
+    ys = [y for y in range(y0, y0 + h) if dark(c, y)]
+    if not ys: return "none"
+    tip = min(ys) if up else max(ys)
+    rows = range(tip + 1, tip + 5) if up else range(tip - 4, tip)
+    return int(all(dark(c - k, y) == dark(c + k, y) for y in rows for k in range(1, 5)))
+reg = (347, 40, 30, 30)
+cols = {}
+for x in range(reg[0], reg[0] + reg[2]):
+    cols[x] = sum(dark(x, y) for y in range(reg[1], reg[1] + reg[3]))
+shafts = sorted(sorted(cols, key=cols.get)[-2:])
+if len(shafts) == 2 and cols[shafts[0]] > 6:
+    print("sort_up_mirrored", head_sym(*reg, shafts[0], True))
+    print("sort_down_mirrored", head_sym(*reg, shafts[1], False))
 PY
 sed 's/^/      /' "$T/out"
 v() { sed -n "s/^$1 //p" "$T/out"; }
 [ "$(v view_gap_dark)" = 0 ] && pass "View: the grid's squares stand apart" || fail "View: squares run together ($(v view_gap_dark) dark px in the gap)"
 [ "$(v refresh_top_center)" = 1 ] && pass "Refresh: clockwise, the head at the leading end (top)" || fail "Refresh: head at the tail ($(v refresh_top_center))"
+[ "$(v up_mirrored)" = 1 ] && pass "Up: both sides of its head the same" || fail "Up: lopsided head ($(v up_mirrored))"
+[ "$(v sort_up_mirrored)" = 1 ] && [ "$(v sort_down_mirrored)" = 1 ] && pass "Sort: both arrows' heads symmetric" \
+    || fail "Sort: lopsided heads (up $(v sort_up_mirrored), down $(v sort_down_mirrored))"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
