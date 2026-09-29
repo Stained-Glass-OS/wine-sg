@@ -226,6 +226,10 @@ test-rounded:
 test-taskpins:
 	WINE=$(PREFIX)/bin/wine test/taskpins-gate.sh
 
+# XML Schema patterns with MSXML's \uXXXX escapes (0489): Office's installer.
+test-xsdpattern:
+	WINE=$(PREFIX)/bin/wine test/xsdpattern-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
