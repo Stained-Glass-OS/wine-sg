@@ -340,6 +340,10 @@ test-uisettings:
 test-notifyiconrect:
 	WINE=$(PREFIX)/bin/wine test/notifyiconrect-gate.sh
 
+# GetShellWindow() on the shell's desktop is explorer's (0526).
+test-shellwindow:
+	WINE=$(PREFIX)/bin/wine test/shellwindow-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
