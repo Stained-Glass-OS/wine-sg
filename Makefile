@@ -307,6 +307,12 @@ test-webauthcore:
 test-sortreenter:
 	WINE=$(PREFIX)/bin/wine test/sortreenter-gate.sh
 
+# cldapi.dll (Cloud Files API) and cryptxml.dll (XML digital signatures),
+# the two modules Microsoft OneDrive's sync client imports that Wine lacked;
+# without them OneDrive.exe cannot load its sync stack (0518).
+test-onedrive-dlls:
+	WINE=$(PREFIX)/bin/wine test/onedrive-dlls-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
