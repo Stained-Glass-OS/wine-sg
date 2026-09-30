@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-folderspeed test-shortcut
 
 all: build
 
@@ -366,6 +366,14 @@ test-mapdrive:
 # Open with (0594).
 test-openwith:
 	WINE=$(PREFIX)/bin/wine test/openwith-gate.sh
+
+# A big folder shows at once (0595).
+test-folderspeed:
+	WINE=$(PREFIX)/bin/wine test/folderspeed-gate.sh
+
+# Create shortcut (0596).
+test-shortcut:
+	WINE=$(PREFIX)/bin/wine test/shortcut-gate.sh
 
 # Task View's windows fly into place (0520).
 test-taskview-anim:
