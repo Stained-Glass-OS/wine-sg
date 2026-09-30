@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag
 
 all: build
 
@@ -583,6 +583,11 @@ test-desktop-icons:
 # The desktop: watched Desktop folders, selection, its menus, Alt+F4 asks (0261, 0262).
 test-desktop:
 	WINE=$(PREFIX)/bin/wine test/desktop-gate.sh
+
+# Selecting and dragging: the desktop's rubber band, icons dragged on the desktop,
+# into folders and File Explorer; File Explorer's rubber band and drags (0630-0632).
+test-drag:
+	WINE=$(PREFIX)/bin/wine test/drag-gate.sh
 
 # File Explorer: layout, This PC, search, address bar, file operations (0110-0112).
 test-explorer:
