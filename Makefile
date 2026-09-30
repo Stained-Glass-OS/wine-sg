@@ -325,6 +325,21 @@ test-sortreenter:
 test-onedrive-dlls:
 	WINE=$(PREFIX)/bin/wine test/onedrive-dlls-gate.sh
 
+# Service trigger info, ChangeServiceConfig2/QueryServiceConfig2 at
+# SERVICE_CONFIG_TRIGGER_INFO: OneDrive's per-machine install registers its
+# Updater Service with one (0523).
+test-svctrigger:
+	WINE=$(PREFIX)/bin/wine test/svctrigger-gate.sh
+
+# UISettings' values and Changed events, CoreWindow.GetForCurrentThread():
+# OneDrive ended at start on their stubs (0524).
+test-uisettings:
+	WINE=$(PREFIX)/bin/wine test/uisettings-gate.sh
+
+# Shell_NotifyIconGetRect: where a notification-area icon is (0525).
+test-notifyiconrect:
+	WINE=$(PREFIX)/bin/wine test/notifyiconrect-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
