@@ -29,6 +29,7 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include <objbase.h>
+#include <shlobj.h>
 #include <stdio.h>
 
 /* IVirtualDesktopManager, declared from its published IIDs */
@@ -102,6 +103,43 @@ int main( int argc, char **argv )
         CreateWindowExW( !strcmp( argv[1], "toolwindow" ) ? WS_EX_TOOLWINDOW : 0, wc.lpszClassName, wtitle,
                          WS_OVERLAPPEDWINDOW | WS_VISIBLE, atoi( argv[3] ), atoi( argv[4] ), 360, 260, NULL, NULL, NULL, NULL );
         while (GetMessageW( &msg, NULL, 0, 0 )) { TranslateMessage( &msg ); DispatchMessageW( &msg ); }
+        return 0;
+    }
+    if (argc == 2 && !strcmp( argv[1], "clip" ))   /* the files on the clipboard (0588) */
+    {
+        HGLOBAL drop;
+        DROPFILES *df;
+        UINT n = 0;
+        OpenClipboard( NULL );
+        if ((drop = GetClipboardData( CF_HDROP )) && (df = GlobalLock( drop )))
+        {
+            const WCHAR *p = (const WCHAR *)((const char *)df + df->pFiles);
+            if (df->fWide)
+                for (; *p; p += lstrlenW( p ) + 1, n++) printf( "file=%ls\n", p );
+            GlobalUnlock( drop );
+        }
+        CloseClipboard();
+        printf( "files=%u\n", n );
+        return 0;
+    }
+    if (argc == 3 && !strcmp( argv[1], "clipput" ))   /* a file on the clipboard, copied (0588) */
+    {
+        WCHAR path[MAX_PATH];
+        size_t len = MultiByteToWideChar( CP_ACP, 0, argv[2], -1, path, MAX_PATH );
+        HGLOBAL mem = GlobalAlloc( GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DROPFILES) + (len + 1) * sizeof(WCHAR) );
+        HGLOBAL effect = GlobalAlloc( GMEM_MOVEABLE, sizeof(DWORD) );
+        DROPFILES *df = GlobalLock( mem );
+        df->pFiles = sizeof(DROPFILES);
+        df->fWide = TRUE;
+        memcpy( df + 1, path, len * sizeof(WCHAR) );
+        GlobalUnlock( mem );
+        *(DWORD *)GlobalLock( effect ) = 1;   /* DROPEFFECT_COPY */
+        GlobalUnlock( effect );
+        OpenClipboard( NULL );
+        EmptyClipboard();
+        SetClipboardData( CF_HDROP, mem );
+        SetClipboardData( RegisterClipboardFormatW( L"Preferred DropEffect" ), effect );
+        CloseClipboard();
         return 0;
     }
     if (argc == 2 && !strcmp( argv[1], "query" ))

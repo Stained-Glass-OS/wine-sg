@@ -133,6 +133,24 @@ xdotool key Escape
 wait_for 10 gone '#32770' 'Shut Down' && pass "Escape closes the dialog" || fail "the dialog stayed"
 sleep 2
 kill -0 $SESSION 2>/dev/null && visible Shell_TrayWnd && pass "the session goes on, the taskbar shown" || fail "the session ended or the taskbar went"
+# --- the clipboard (0588) -------------------------------------------------------------------
+# Ctrl+C on an icon: another program finds the file on the clipboard (the
+# desktop's OLE was uninitialised under it and the copy was lost); Ctrl+V on the
+# desktop pastes into the Desktop folder
+has_clip() { probe clip | grep -q "file=.*before.txt"; }
+set -- $(at before.txt)
+if [ $# -eq 2 ]; then
+    xdotool mousemove "$1" "$2" click 1; sleep 1; xdotool key ctrl+c
+    wait_for 10 has_clip && pass "Ctrl+C on a desktop icon puts the file on the clipboard for other programs" \
+        || fail "clipboard after Ctrl+C: $(probe clip | tr '\n' ' ')"
+else fail "no before.txt icon for Ctrl+C"; fi
+echo pasted > "$T/pasteme.txt"
+probe clipput "$("$WINE" winepath -w "$T/pasteme.txt" 2>/dev/null | tr -d '\r')"
+empty_click; xdotool key ctrl+v
+wait_for 15 exists "$DESK/pasteme.txt" && pass "Ctrl+V on the desktop pastes into the Desktop folder" \
+    || fail "Ctrl+V: nothing pasted"
+rm -f "$DESK/pasteme.txt"
+
 # after the last window closes the taskbar is the foreground window: Alt+F4 there
 # asks too (it used to hide the taskbar for good)
 xdotool mousemove 946 396 click 1; wait_for 10 gone SgVdeskProbe Away
