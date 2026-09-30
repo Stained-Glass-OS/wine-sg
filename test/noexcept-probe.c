@@ -1,6 +1,7 @@
 /* noexcept-gate.sh's probe (0510): vcruntime140's __C_specific_handler_noexcept.
  *   probe unwind : an unwind passing the frame continues (no scope of ours)
- *   probe escape : an exception leaving the noexcept function ends the process */
+ *   probe escape : a C++ exception leaving the noexcept function ends the process
+ *   probe seh    : an SEH exception (not C++) passes the frame: the search goes on (0535) */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +33,13 @@ int main(int argc, char **argv)
         rec.ExceptionFlags = EXCEPTION_UNWINDING;
         ret = handler(&rec, (void *)0x1000, &ctx, &dispatch);
         printf("unwind %d\n", ret);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "seh"))
+    {
+        rec.ExceptionCode = 0xe0000002;   /* a program's own SEH code */
+        ret = handler(&rec, (void *)0x1000, &ctx, &dispatch);
+        printf("seh %d\n", ret);
         return 0;
     }
     ret = handler(&rec, (void *)0x1000, &ctx, &dispatch);

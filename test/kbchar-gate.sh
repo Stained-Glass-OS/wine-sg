@@ -66,6 +66,7 @@ sleep 1
 xdotool type --delay 150 'a5'; xdotool key Shift_L; xdotool key Return; sleep 2
 
 out=$(cat "$T/log.txt")
+[ -n "${KBCHAR_KEEPLOG:-}" ] && cp "$T/ie.log" "$KBCHAR_KEEPLOG"
 printf '%s\n' "$out" | sed 's/^/      /'
 check() { if printf '%s\n' "$out" | grep -qxF "$1"; then pass "$2"; else fail "$2 (wanted '$1')"; fi; }
 check "key=a char=[a]"     "a letter key: char is the letter"

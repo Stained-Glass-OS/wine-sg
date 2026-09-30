@@ -4,8 +4,11 @@
 # exception handler of a noexcept function holding __try blocks. It was a
 # stub: each exception passing such a frame raised another into the same
 # frame until the stack overflowed -- Word died signing in to Office. An
-# unwind passing the frame continues; an exception that would leave the
-# function ends the process (std::terminate: exit code 3), once.
+# unwind passing the frame continues; a C++ exception that would leave the
+# function ends the process (std::terminate: exit code 3), once. An SEH
+# exception that is not a C++ one passes the frame to the handlers outside it
+# (0535): noexcept is about C++ exceptions -- Word raised its own SEH code
+# through such a frame and hung in terminate.
 #
 #   WINE=/opt/wine-sg/bin/wine test/noexcept-gate.sh
 set -u
@@ -25,9 +28,11 @@ trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 U=$(timeout 60 "$WINE" "$T/probe.exe" unwind 2>/dev/null | tr -d '\r')
+S=$(timeout 60 "$WINE" "$T/probe.exe" seh 2>/dev/null | tr -d '\r')
 timeout 60 "$WINE" "$T/probe.exe" escape > "$T/escape" 2>&1
 E=$?
 echo "      $U / escape exit $E $(tr -d '\r' < "$T/escape" | grep -v '^[0-9a-f]*:' | head -2)"
+[ "$S" = "seh 1" ] && pass "an SEH exception passes the frame (ExceptionContinueSearch, no terminate)" || fail "seh: $S"
 [ "$U" = "unwind 1" ] && pass "an unwind passing the frame continues (ExceptionContinueSearch)" || fail "unwind: $U"
 [ "$E" = 3 ] && ! grep -q "escape returned" "$T/escape" \
     && pass "an exception leaving the noexcept function ends the process (terminate)" || fail "escape: exit $E, $(cat "$T/escape")"
