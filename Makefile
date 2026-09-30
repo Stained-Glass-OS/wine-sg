@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers
 
 all: build
 
@@ -342,6 +342,10 @@ test-firstpaint:
 # A folder the user may not write to asks for an administrator (0589).
 test-fileopadmin:
 	WINE=$(PREFIX)/bin/wine test/fileopadmin-gate.sh
+
+# A package for all users is installed as an administrator, its shortcuts for all (0590).
+test-msiallusers:
+	WINE=$(PREFIX)/bin/wine test/msiallusers-gate.sh
 
 # Task View's windows fly into place (0520).
 test-taskview-anim:
