@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dgraph test-advcolor test-focusactivate
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dgraph test-advcolor test-focusactivate test-drvkey
 
 all: build
 
@@ -306,6 +306,10 @@ test-blackflash:
 # A window activated from another process (the taskbar) gets the keyboard (0527).
 test-focusactivate:
 	WINE=$(PREFIX)/bin/wine test/focus-activate-gate.sh
+
+# A standard user reads a device's driver key (0580).
+test-drvkey:
+	WINE=$(PREFIX)/bin/wine test/drvkey-gate.sh
 
 # Task View's windows fly into place (0520).
 test-taskview-anim:
