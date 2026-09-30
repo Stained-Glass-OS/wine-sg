@@ -299,6 +299,10 @@ test-recycle:
 test-explorer-glyphs:
 	WINE=$(PREFIX)/bin/wine test/explorer-glyphs-gate.sh
 
+# Windows do not flash black when shown (0519).
+test-blackflash:
+	WINE=$(PREFIX)/bin/wine test/blackflash-gate.sh
+
 # The Web Account Manager with no providers (0512): Office's sign-in.
 test-webauthcore:
 	WINE=$(PREFIX)/bin/wine test/webauthcore-gate.sh
