@@ -348,6 +348,10 @@ test-notifyiconrect:
 test-shellwindow:
 	WINE=$(PREFIX)/bin/wine test/shellwindow-gate.sh
 
+# One Service Control Manager: a second services.exe leaves (0530).
+test-scmsingle:
+	WINE=$(PREFIX)/bin/wine test/scmsingle-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
