@@ -51,5 +51,17 @@ echo "      during: $during, after: $after, moved: $d px"
 P hotkey left >/dev/null
 sleep 1; off=$(P exists SgDesktopSlide)
 [ "$off" = "exists=0" ] && pass "SlideDesktops=0 switches without the slide" || fail "slide shown with SlideDesktops=0 ($off)"
+# Show animations off in Settings (another process, explorer keeps running):
+# UserPreferencesMask byte 4 bit 0x02 cleared -- the next switch does not slide
+"$WINE" reg add 'HKCU\Software\Stained Glass\Effects' /v SlideDesktops /t REG_DWORD /d 1 /f >/dev/null 2>&1
+m=$("$WINE" reg query 'HKCU\Control Panel\Desktop' /v UserPreferencesMask 2>/dev/null | tr -d '\r' | awk '/UserPreferencesMask/{print $3}')
+[ ${#m} -ge 10 ] || m=9e1e078012000000
+b=$(( 0x$(echo "$m" | cut -c9-10) & ~2 & 255 ))
+m=$(echo "$m" | cut -c1-8)$(printf '%02x' $b)$(echo "$m" | cut -c11-)
+"$WINE" reg add 'HKCU\Control Panel\Desktop' /v UserPreferencesMask /t REG_BINARY /d "$m" /f >/dev/null 2>&1
+P hotkey right >/dev/null
+sleep 1; noanim=$(P exists SgDesktopSlide)
+[ "$noanim" = "exists=0" ] && pass "animations turned off elsewhere: the running explorer switches without the slide" \
+    || fail "slide shown with animations off ($noanim)"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
