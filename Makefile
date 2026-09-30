@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks
 
 all: build
 
@@ -225,6 +225,10 @@ test-rounded:
 # Programs pinned to the taskbar (0485).
 test-taskpins:
 	WINE=$(PREFIX)/bin/wine test/taskpins-gate.sh
+
+# The taskbar's Horizon and Glass looks, beside the flat default (0600).
+test-taskbarlooks:
+	WINE=$(PREFIX)/bin/wine test/taskbarlooks-gate.sh
 
 # XML Schema patterns with MSXML's \uXXXX escapes (0489): Office's installer.
 test-xsdpattern:
