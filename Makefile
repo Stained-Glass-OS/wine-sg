@@ -226,6 +226,10 @@ test-rounded:
 test-taskpins:
 	WINE=$(PREFIX)/bin/wine test/taskpins-gate.sh
 
+# 0602: pinned programs show their own icons (File Explorer: the folder).
+test-pinicon:
+	WINE=$(PREFIX)/bin/wine test/pinicon-gate.sh
+
 # The taskbar's Horizon and Glass looks, beside the flat default (0600).
 test-taskbarlooks:
 	WINE=$(PREFIX)/bin/wine test/taskbarlooks-gate.sh
