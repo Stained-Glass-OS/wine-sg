@@ -3,7 +3,7 @@
 # The taskbar's looks (patches/sg/0600). Settings > Personalization >
 # Taskbar > Taskbar style writes HKCU\Software\Stained Glass\Taskbar Style
 # and sends WM_SETTINGCHANGE "TraySettings": 0 the flat bar (the default,
-# unchanged), 1 Horizon -- a 30 px bright blue gradient bar, a green Start
+# unchanged), 1 Horizon -- a 38 px bright blue gradient bar, a green Start
 # button with a round end, raised blue buttons, the notification icons and
 # clock on a lighter panel -- 2 Glass -- a 40 px dark glass bar with a light
 # rim, a round Start orb, 60 px icon buttons in glass frames. All drawn with
@@ -36,10 +36,29 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 "$MINGW" -municode -O2 -o "$T/taskbar-probe.exe" "$HERE/taskbar-probe.c" -lshell32 -lgdi32 -luser32 || { fail "probe did not build"; exit 1; }
+# a shortcut maker: Notepad pinned, for Horizon's Quick Launch
+cat > "$T/mklnk.c" <<'EOC'
+#define COBJMACROS
+#include <windows.h>
+#include <shlobj.h>
+int wmain(int argc, WCHAR **argv)
+{
+    IShellLinkW *l; IPersistFile *f;
+    if (argc < 3) return 2;
+    CoInitialize(NULL);
+    if (FAILED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (void **)&l))) return 1;
+    IShellLinkW_SetPath(l, argv[2]);
+    IShellLinkW_QueryInterface(l, &IID_IPersistFile, (void **)&f);
+    return FAILED(IPersistFile_Save(f, argv[1], TRUE));
+}
+EOC
+"$MINGW" -O2 -municode -o "$T/mklnk.exe" "$T/mklnk.c" -lole32 -luuid || { fail "mklnk did not build"; exit 1; }
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
-cp "$T/taskbar-probe.exe" "$WINEPREFIX/drive_c/"
+cp "$T/taskbar-probe.exe" "$T/mklnk.exe" "$WINEPREFIX/drive_c/"
+mkdir -p "$WINEPREFIX/drive_c/users/$(id -un)/AppData/Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar"
+"$WINE" 'C:\mklnk.exe' 'C:\users\'"$(id -un)"'\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Notepad.lnk' 'C:\windows\system32\notepad.exe' >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer\Desktops' /v shell /d 1024x700 /f >/dev/null 2>&1
 "$WINESERVER" -w
@@ -89,25 +108,33 @@ field() { echo "$1" | cut -d, -f"$2"; }
     && pass "the default look: the flat 40 px #1F1F1F bar" || fail "default: $(v flat bar) $(px flat 600 690)"
 
 # Horizon
-[ "$(v horizon bar)" = "0,670,1024,700 topmost=1" ] && [ "$(v horizon work)" = "0,0,1024,670" ] \
-    && pass "Horizon: a 30 px bar, its space reserved" || fail "Horizon bar: $(v horizon bar) / $(v horizon work)"
-b=$(px horizon 700 686); top=$(px horizon 700 670); foot=$(px horizon 700 699)
+[ "$(v horizon bar)" = "0,662,1024,700 topmost=1" ] && [ "$(v horizon work)" = "0,0,1024,662" ] \
+    && pass "Horizon: a 38 px bar, its space reserved" || fail "Horizon bar: $(v horizon bar) / $(v horizon work)"
+b=$(px horizon 700 681); top=$(px horizon 700 662); foot=$(px horizon 700 699)
 blue "$b" && [ "$top" != "$b" ] && [ "$foot" != "$b" ] && [ "$(field "$top" 3)" -gt "$(field "$foot" 3)" ] \
     && pass "a blue gradient bar, lit at the top ($top / $b / $foot)" || fail "Horizon bar colours: top $top mid $b foot $foot"
 s=$(v horizon start); sw=$(( $(field "$s" 3) - $(field "$s" 1) )); sx=$(( $(field "$s" 3) - 12 ))
 green "$(px horizon "$sx" 684)" && green "$(px horizon 40 697)" && [ "$sw" -ge 96 ] \
     && pass "a green Start button, $sw px wide ($(px horizon "$sx" 684))" || fail "Horizon Start: $s $(px horizon "$sx" 684) $(px horizon 40 697)"
 se=$(( $(field "$s" 3) - 2 ))
-[ "$(px horizon "$se" 671)" != "$(px horizon "$sx" 671)" ] \
-    && pass "with a round end (its corner is the bar: $(px horizon "$se" 671))" || fail "Start end not round: $(px horizon "$se" 671)"
-p=$(px horizon 1010 686)
+[ "$(px horizon "$se" 663)" != "$(px horizon "$sx" 663)" ] \
+    && pass "with a round end (its corner is the bar: $(px horizon "$se" 663))" || fail "Start end not round: $(px horizon "$se" 663)"
+p=$(px horizon 1010 667)
 blue "$p" && [ "$p" != "$b" ] && [ "$(field "$p" 2)" -gt "$(field "$b" 2)" ] \
     && pass "the notification area and clock on a lighter panel ($p)" || fail "Horizon panel: $p (bar $b)"
 bt=$(v horizon button); bx=$(( $(field "$bt" 1) + 4 ))
-bb=$(px horizon "$bx" 686); gap=$(px horizon $(( $(field "$bt" 1) )) 686)
+bb=$(px horizon "$bx" 681); gap=$(px horizon $(( $(field "$bt" 1) )) 681)
 [ "$bb" != "$b" ] && blue "$bb" && pass "a window's button is a raised blue button ($bb)" || fail "Horizon button: $bb (bar $b)"
-[ "$(v horizontop bar)" = "0,0,1024,30 topmost=1" ] && blue "$(px horizontop 700 16)" \
-    && pass "Horizon at the top edge" || fail "Horizon top: $(v horizontop bar) $(px horizontop 700 16)"
+[ "$(v horizontop bar)" = "0,0,1024,38 topmost=1" ] && blue "$(px horizontop 700 19)" \
+    && pass "Horizon at the top edge" || fail "Horizon top: $(v horizontop bar) $(px horizontop 700 19)"
+# Quick Launch: Notepad pinned and running -- in Horizon its pin stays, a
+# small icon of its own before the window buttons; the flat look puts the
+# running window in the pin's place instead
+pn=$(v horizon pin); pw=0; [ -n "$pn" ] && pw=$(( $(field "$pn" 3) - $(field "$pn" 1) ))
+[ -n "$pn" ] && [ "$pw" = 26 ] && [ "$(field "$pn" 3)" -le "$(field "$bt" 1)" ] \
+    && pass "Quick Launch: the pinned program keeps a 26 px icon while it runs, before the window buttons ($pn)" \
+    || fail "Quick Launch: pin '$pn' (width $pw) button $bt"
+[ -z "$(v flat pin)" ] && pass "the flat look: the running window takes its pin's place" || fail "flat pin: $(v flat pin)"
 
 # Glass
 [ "$(v glass bar)" = "0,660,1024,700 topmost=1" ] && pass "Glass: a 40 px bar" || fail "Glass bar: $(v glass bar)"
