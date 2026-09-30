@@ -307,6 +307,10 @@ test-blackflash:
 test-taskview-anim:
 	WINE=$(PREFIX)/bin/wine test/taskview-anim-gate.sh
 
+# Switching virtual desktops slides (0521).
+test-desktop-slide:
+	WINE=$(PREFIX)/bin/wine test/desktop-slide-gate.sh
+
 # The Web Account Manager with no providers (0512): Office's sign-in.
 test-webauthcore:
 	WINE=$(PREFIX)/bin/wine test/webauthcore-gate.sh
