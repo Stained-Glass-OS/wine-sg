@@ -185,6 +185,13 @@ else fail "installed files: location '$loc'"; fi
 [ -f "$C$uloc/AppxManifest.xml" ] && pass "with its manifest beside them" || fail "no AppxManifest.xml at $loc"
 lnk=$(find "$C/users" -path '*Start Menu/Programs/AppX test app.lnk' 2>/dev/null | head -1)
 [ -n "$lnk" ] && pass "a Start menu shortcut for its application" || fail "no Start menu shortcut"
+# a program repairs a package by registering it again by family name (0533)
+out=$(run deploy-probe.exe regfamily "StainedGlass.AppxTest_$PUBID")
+expect "$out" IPackageManager5 0x00000000 "the package manager answers IPackageManager5"
+expect "$out" RegisterStatus 1 "registering an installed package by family name completes"
+out=$(run deploy-probe.exe regfamily "StainedGlass.NotInstalled_$PUBID")
+expect "$out" RegisterStatus 3 "registering a package that is not installed ends in Error"
+expect "$out" RegisterError 0x80073cf1 "ERROR_INSTALL_PACKAGE_NOT_FOUND"
 out=$(run deploy-probe.exe remove "$FULL")
 expect "$out" RemoveStatus 1 "RemovePackageAsync completes"
 out=$(run deploy-probe.exe find StainedGlass.AppxTest 'CN=Stained Glass Test Publisher')

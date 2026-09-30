@@ -4,6 +4,7 @@
  *   deploy-probe add PATH       AddPackageAsync(file URI), then wait
  *   deploy-probe find NAME PUB  FindPackagesByNamePublisher: count, full name, location
  *   deploy-probe remove FULL    RemovePackageAsync, then wait
+ *   deploy-probe regfamily FAM  IPackageManager5::RegisterPackageByFamilyNameAndOptionalPackagesAsync, then wait
  *
  * Interfaces are declared here from their published IIDs.
  *
@@ -25,6 +26,9 @@ typedef struct { InspVtbl i;
                  HRESULT (WINAPI *RemovePackageAsync)(void *, HSTRING, void **);
                  void *StagePackageAsync, *RegisterPackageAsync, *FindPackages, *FindPackagesByUserSecurityId;
                  HRESULT (WINAPI *FindPackagesByNamePublisher)(void *, HSTRING, HSTRING, void **); } ManagerVtbl;
+typedef struct { InspVtbl i; void *AddToVolume, *StageToVolume;
+                 HRESULT (WINAPI *RegisterByFamilyName)(void *, HSTRING, void *, UINT32, void *, void *, void **);
+                 void *DebugSettings; } Manager5Vtbl;
 typedef struct { InspVtbl i; void *put_Progress, *get_Progress, *put_Completed, *get_Completed;
                  HRESULT (WINAPI *GetResults)(void *, void **); } OperationVtbl;
 typedef struct { InspVtbl i; void *get_Id; HRESULT (WINAPI *get_Status)(void *, int *); HRESULT (WINAPI *get_ErrorCode)(void *, HRESULT *); } AsyncInfoVtbl;
@@ -43,6 +47,7 @@ typedef struct { const void *vtbl; } Obj;
 static const GUID IID_IActivationFactory_ = {0x00000035,0,0,{0xc0,0,0,0,0,0,0,0x46}};
 static const GUID IID_IAsyncInfo_ = {0x00000036,0,0,{0xc0,0,0,0,0,0,0,0x46}};
 static const GUID IID_IPackageManager_ = {0x9a7d4b65,0x5e8f,0x4fc7,{0xa2,0xe5,0x7f,0x69,0x25,0xcb,0x8b,0x53}};
+static const GUID IID_IPackageManager5_ = {0x711f3117,0x1afd,0x4313,{0x97,0x8c,0x9b,0xb6,0xe1,0xb8,0x64,0xa7}};
 static const GUID IID_IUriRuntimeClassFactory_ = {0x44a9796f,0x723e,0x4fdf,{0xa2,0x18,0x03,0x3e,0x75,0xb0,0xc0,0x84}};
 static const GUID IID_IStorageItem_ = {0x4207a996,0xca2f,0x42f7,{0xbd,0xe8,0x8b,0x10,0x45,0x7a,0x7f,0x30}};
 
@@ -159,9 +164,20 @@ int main( int argc, char **argv )
         printf( "RemovePackageAsync=0x%08lx\n", (unsigned long)hr );
         if (SUCCEEDED(hr)) wait_op( "Remove", op );
     }
+    else if (argc == 3 && !strcmp( argv[1], "regfamily" ))
+    {
+        void *manager5 = NULL;
+
+        hr = VT(manager, InspVtbl)->QI( manager, &IID_IPackageManager5_, &manager5 );
+        printf( "IPackageManager5=0x%08lx\n", (unsigned long)hr );
+        if (FAILED(hr)) return 1;
+        hr = VT(manager5, Manager5Vtbl)->RegisterByFamilyName( manager5, hs( a1 ), NULL, 0, NULL, NULL, &op );
+        printf( "RegisterByFamilyName=0x%08lx\n", (unsigned long)hr );
+        if (SUCCEEDED(hr)) wait_op( "Register", op );
+    }
     else
     {
-        printf( "usage: deploy-probe add PATH | find NAME PUBLISHER | remove FULLNAME\n" );
+        printf( "usage: deploy-probe add PATH | find NAME PUBLISHER | remove FULLNAME | regfamily FAMILY\n" );
         return 2;
     }
     return 0;
