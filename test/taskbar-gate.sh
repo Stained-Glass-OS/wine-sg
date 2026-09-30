@@ -101,13 +101,13 @@ count() { awk -v s="== $1" -v k="$2" '$0 == s { on = 1; next } /^== / { on = 0 }
 width() { echo "$1" | awk -F, '{ print $3 - $1 }'; }
 px() { convert "$T/$1.png" -format "%[fx:int(255*p{$2,$3}.r)],%[fx:int(255*p{$2,$3}.g)],%[fx:int(255*p{$2,$3}.b)]" info: 2>/dev/null; }
 
-[ "$(v default bar)" = "0,660,1024,700 topmost=0" ] && [ "$(v default work)" = "0,0,1024,660" ] \
+[ "$(v default bar)" = "0,660,1024,700 topmost=1" ] && [ "$(v default work)" = "0,0,1024,660" ] \
     && pass "default: a 40 px bar at the bottom, its space reserved" || fail "default: $(v default bar) / $(v default work)"
 case "$(v default appbar)" in "2 edge=3 rc=0,660,1024,700") pass "SHAppBarMessage: bottom edge, always on top, not auto-hide" ;; *) fail "appbar: $(v default appbar)" ;; esac
 [ "$(v default windows)" = 3 ] && [ "$(count default search)" = 0 ] && [ "$(count default taskview)" = 1 ] \
     && pass "a labelled button per window, Task View shown, no search" || fail "default buttons: windows $(v default windows) search $(count default search) taskview $(count default taskview)"
 
-[ "$(v small bar)" = "0,670,1024,700 topmost=0" ] && [ "$(v small work)" = "0,0,1024,670" ] \
+[ "$(v small bar)" = "0,670,1024,700 topmost=1" ] && [ "$(v small work)" = "0,0,1024,670" ] \
     && pass "small taskbar buttons: a 30 px bar" || fail "small: $(v small bar) / $(v small work)"
 [ "$(v combine windows)" = 2 ] && [ "$(width "$(v combine button)")" = 48 ] \
     && pass "combine buttons: one program's two windows share one icon button" || fail "combine: windows $(v combine windows) first $(v combine button)"
@@ -121,15 +121,15 @@ mid=$(( (${gr%%,*} + ${gr##*,}) / 2 ))
 [ "$(width "$(v searchicon search)")" = 48 ] && pass "search icon shown" || fail "search icon: $(v searchicon search)"
 [ "$(count notaskview taskview)" = 0 ] && pass "Task View button hidden" || fail "Task View still shown"
 
-[ "$(v top bar)" = "0,0,1024,30 topmost=0" ] && [ "$(v top work)" = "0,30,1024,700" ] \
+[ "$(v top bar)" = "0,0,1024,30 topmost=1" ] && [ "$(v top work)" = "0,30,1024,700" ] \
     && pass "position top: the bar at the top, the work area below it" || fail "top: $(v top bar) / $(v top work)"
 case "$(v top appbar)" in "2 edge=1 "*) pass "SHAppBarMessage says the top edge" ;; *) fail "top appbar: $(v top appbar)" ;; esac
 [ "$(px top 1000 15)" != "$(px small 1000 15)" ] && pass "and it is drawn there" || fail "nothing drawn at the top: $(px top 1000 15)"
-[ "$(v left bar)" = "0,0,48,700 topmost=0" ] && [ "$(v left work)" = "48,0,1024,700" ] \
+[ "$(v left bar)" = "0,0,48,700 topmost=1" ] && [ "$(v left work)" = "48,0,1024,700" ] \
     && pass "position left: a vertical bar" || fail "left: $(v left bar) / $(v left work)"
 b=$(v left button); [ "$(echo "$b" | awk -F, '{ print $3 - $1 }')" = 48 ] && [ "$(echo "$b" | awk -F, '{ print $4 - $2 }')" = 48 ] \
     && pass "with square buttons down it" || fail "left buttons: $b"
-[ "$(v right bar)" = "976,0,1024,700 topmost=0" ] && [ "$(v right work)" = "0,0,976,700" ] \
+[ "$(v right bar)" = "976,0,1024,700 topmost=1" ] && [ "$(v right work)" = "0,0,976,700" ] \
     && pass "position right" || fail "right: $(v right bar) / $(v right work)"
 
 [ "$(v hidden bar)" = "0,698,1024,738 topmost=1" ] && pass "auto-hide: the bar tucks into the edge when the pointer is away" || fail "auto-hide: $(v hidden bar)"
@@ -139,7 +139,7 @@ case "$(v hidden appbar)" in "3 "*) [ "$(v hidden autohidebar)" = 1 ] && pass "S
 [ "$(v shown bar)" = "0,660,1024,700 topmost=1" ] && pass "the pointer at the bottom edge brings it back" || fail "shown: $(v shown bar)"
 [ "$(px shown 900 680)" = "$(px default 900 680)" ] && pass "and it is drawn" || fail "not drawn when shown: $(px shown 900 680)"
 [ "$(v hiddenagain bar)" = "0,698,1024,738 topmost=1" ] && pass "and it hides again" || fail "hide again: $(v hiddenagain bar)"
-[ "$(v setstate bar)" = "0,660,1024,700 topmost=0" ] && [ "$(v setstate work)" = "0,0,1024,660" ] && grep -q 'AutoHide.*0x0' "$T/reg.out" \
+[ "$(v setstate bar)" = "0,660,1024,700 topmost=1" ] && [ "$(v setstate work)" = "0,0,1024,660" ] && grep -q 'AutoHide.*0x0' "$T/reg.out" \
     && pass "ABM_SETSTATE from a program turns auto-hide off (and Settings sees it)" || fail "ABM_SETSTATE: $(v setstate bar) $(v setstate work) $(cat "$T/reg.out")"
 [ "$(count pager pager)" = 1 ] && [ "$(count nopager pager)" = 0 ] \
     && pass "ShowDesktops 0 hides the virtual desktops' pager, 1 shows it" || fail "pager: shown $(count pager pager), hidden $(count nopager pager)"
@@ -147,7 +147,7 @@ case "$(v hidden appbar)" in "3 "*) [ "$(v hidden autohidebar)" = 1 ] && pass "S
 [ "$(px clight 600 690)" = "238,238,238" ] && pass "taskbar color Light" || fail "light: $(px clight 600 690)"
 [ "$(px cblue 600 690)" = "233,238,246" ] && pass "taskbar color Light blue (whitish blue)" || fail "light blue: $(px cblue 600 690)"
 [ "$(px caccent 600 690)" = "75,23,124" ] && pass "taskbar color Accent: the accent darkened" || fail "accent: $(px caccent 600 690)"
-[ "$(v rounded bar)" = "0,652,1024,700 topmost=0" ] && [ "$(v rounded work)" = "0,0,1024,652" ] \
+[ "$(v rounded bar)" = "0,652,1024,700 topmost=1" ] && [ "$(v rounded work)" = "0,0,1024,652" ] \
     && pass "the Rounded style: a 48 px bar, its space reserved" || fail "rounded bar: $(v rounded bar) / $(v rounded work)"
 b=$(v rounded button); bx=$(( ($(echo "$b" | cut -d, -f1) + $(echo "$b" | cut -d, -f3)) / 2 ))
 pill=$(px rounded $bx 696); edge=$(px rounded $((bx - 12)) 696)

@@ -85,11 +85,11 @@ field() { echo "$1" | cut -d, -f"$2"; }
 [ -f "$T/flatagain.png" ] || { fail "the session did not finish"; echo "RESULT: FAIL"; exit 1; }
 
 # the default stays exactly as it was
-[ "$(v flat bar)" = "0,660,1024,700 topmost=0" ] && [ "$(px flat 600 690)" = "31,31,31" ] \
+[ "$(v flat bar)" = "0,660,1024,700 topmost=1" ] && [ "$(px flat 600 690)" = "31,31,31" ] \
     && pass "the default look: the flat 40 px #1F1F1F bar" || fail "default: $(v flat bar) $(px flat 600 690)"
 
 # Horizon
-[ "$(v horizon bar)" = "0,670,1024,700 topmost=0" ] && [ "$(v horizon work)" = "0,0,1024,670" ] \
+[ "$(v horizon bar)" = "0,670,1024,700 topmost=1" ] && [ "$(v horizon work)" = "0,0,1024,670" ] \
     && pass "Horizon: a 30 px bar, its space reserved" || fail "Horizon bar: $(v horizon bar) / $(v horizon work)"
 b=$(px horizon 700 686); top=$(px horizon 700 670); foot=$(px horizon 700 699)
 blue "$b" && [ "$top" != "$b" ] && [ "$foot" != "$b" ] && [ "$(field "$top" 3)" -gt "$(field "$foot" 3)" ] \
@@ -106,11 +106,11 @@ blue "$p" && [ "$p" != "$b" ] && [ "$(field "$p" 2)" -gt "$(field "$b" 2)" ] \
 bt=$(v horizon button); bx=$(( $(field "$bt" 1) + 4 ))
 bb=$(px horizon "$bx" 686); gap=$(px horizon $(( $(field "$bt" 1) )) 686)
 [ "$bb" != "$b" ] && blue "$bb" && pass "a window's button is a raised blue button ($bb)" || fail "Horizon button: $bb (bar $b)"
-[ "$(v horizontop bar)" = "0,0,1024,30 topmost=0" ] && blue "$(px horizontop 700 16)" \
+[ "$(v horizontop bar)" = "0,0,1024,30 topmost=1" ] && blue "$(px horizontop 700 16)" \
     && pass "Horizon at the top edge" || fail "Horizon top: $(v horizontop bar) $(px horizontop 700 16)"
 
 # Glass
-[ "$(v glass bar)" = "0,660,1024,700 topmost=0" ] && pass "Glass: a 40 px bar" || fail "Glass bar: $(v glass bar)"
+[ "$(v glass bar)" = "0,660,1024,700 topmost=1" ] && pass "Glass: a 40 px bar" || fail "Glass bar: $(v glass bar)"
 g=$(px glass 700 690); rim=$(px glass 700 660)
 dark "$g" && light "$rim" && pass "dark glass ($g) with a light rim ($rim)" || fail "Glass colours: $g rim $rim"
 s=$(v glass start); cx=$(( ($(field "$s" 1) + $(field "$s" 3)) / 2 )); corner=$(( $(field "$s" 1) + 1 ))
@@ -129,7 +129,7 @@ colours=$(convert "$T/glassicons.png" -crop 32x32+$((ncx - 16))+664 +repage -for
 [ "$fr" != "$(px glassicons 700 680)" ] && pass "a running program's button has a glass frame ($fr)" || fail "Glass frame: $fr"
 
 # and back
-[ "$(v flatagain bar)" = "0,660,1024,700 topmost=0" ] && [ "$(px flatagain 600 690)" = "31,31,31" ] \
+[ "$(v flatagain bar)" = "0,660,1024,700 topmost=1" ] && [ "$(px flatagain 600 690)" = "31,31,31" ] \
     && pass "Style 0: the flat bar again" || fail "back to flat: $(v flatagain bar) $(px flatagain 600 690)"
 
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
