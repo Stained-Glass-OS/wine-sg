@@ -352,6 +352,10 @@ test-shellwindow:
 test-scmsingle:
 	WINE=$(PREFIX)/bin/wine test/scmsingle-gate.sh
 
+# X stacking follows Wine's Z order in a virtual desktop (0531).
+test-xstack:
+	WINE=$(PREFIX)/bin/wine test/xstack-gate.sh
+
 # Wallpaper in any format, Windows' styles (0069).
 test-wallpaper:
 	WINE=$(PREFIX)/bin/wine test/wallpaper-gate.sh
