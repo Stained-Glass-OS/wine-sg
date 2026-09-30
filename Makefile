@@ -303,6 +303,10 @@ test-explorer-glyphs:
 test-blackflash:
 	WINE=$(PREFIX)/bin/wine test/blackflash-gate.sh
 
+# Task View's windows fly into place (0520).
+test-taskview-anim:
+	WINE=$(PREFIX)/bin/wine test/taskview-anim-gate.sh
+
 # The Web Account Manager with no providers (0512): Office's sign-in.
 test-webauthcore:
 	WINE=$(PREFIX)/bin/wine test/webauthcore-gate.sh
