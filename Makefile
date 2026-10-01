@@ -238,6 +238,10 @@ test-eraframes:
 test-eraschemes:
 	WINE=$(PREFIX)/bin/wine test/eraschemes-gate.sh
 
+# What the desktop's compositor (sg-deskcomp) is told: its picture, window shadows (0744).
+test-deskprops:
+	WINE=$(PREFIX)/bin/wine test/deskprops-gate.sh
+
 # A new user's first taskbar pins, from HKLM DefaultPins (0741).
 test-defaultpins:
 	WINE=$(PREFIX)/bin/wine test/defaultpins-gate.sh
