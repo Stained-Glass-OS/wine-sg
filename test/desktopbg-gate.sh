@@ -32,6 +32,8 @@ timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 cp "$T/desktopbg-probe.exe" "$WINEPREFIX/drive_c/"
 # a plain magenta desktop: no wallpaper, no icons
+"$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
+"$WINE" reg add 'HKCU\Software\Wine\Explorer\Desktops' /v shell /d 800x600 /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Control Panel\Colors' /v Background /d '255 0 255' /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Control Panel\Desktop' /v Wallpaper /d '' /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v HideIcons /t REG_DWORD /d 1 /f >/dev/null 2>&1

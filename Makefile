@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg test-layeredblend
 
 all: build
 
@@ -237,6 +237,10 @@ test-spooler:
 # 0610: where a window leaves the desktop, X shows the desktop at once.
 test-desktopbg:
 	WINE=$(PREFIX)/bin/wine test/desktopbg-gate.sh
+
+# 0611: an alpha-layered popup is blended over what is under it.
+test-layeredblend:
+	WINE=$(PREFIX)/bin/wine test/layeredblend-gate.sh
 
 # The taskbar's Horizon and Glass looks, beside the flat default (0600).
 test-taskbarlooks:
