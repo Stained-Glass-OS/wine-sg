@@ -7,7 +7,8 @@
 # Winamp: not in Start). In a program the broker started (SG_IN_BROKER) the
 # Programs, Startup and desktop folders -- by CSIDL and by known folder -- are
 # the all-users ones; its application data stays its own. Elsewhere, nothing
-# changes.
+# changes. And a user's own programs folder, FOLDERID_UserProgramFiles,
+# exists (0618).
 #
 #   WINE=/opt/wine-sg/bin/wine test/elevfolders-gate.sh
 set -u
@@ -46,4 +47,11 @@ case "$(v "$elev" startup)" in *ProgramData*) pass "elevated: Startup is all use
 [ "$(v "$elev" desktop)" != "$(v "$plain" desktop)" ] && case "$(v "$elev" desktop)" in *Public*|*ProgramData*) true ;; *) false ;; esac &&
     pass "elevated: the desktop is the shared one ($(v "$elev" desktop))" || fail "elevated desktop: $(v "$elev" desktop)"
 [ "$(v "$elev" appdata)" = "$(v "$plain" appdata)" ] && pass "its application data stays its own" || fail "appdata moved: $(v "$elev" appdata)"
+# a user's own programs folder (0618): %LOCALAPPDATA%\Programs -- it was
+# "disallowed" and Opera's installer stopped with code 103
+lad=$(v "$plain" localappdata)
+[ -n "$lad" ] && [ "$(v "$plain" user-program-files)" = "$lad\Programs" ] &&
+    [ "$(v "$plain" user-program-files-common)" = "$lad\Programs\Common" ] &&
+    pass "FOLDERID_UserProgramFiles is $(v "$plain" user-program-files) (and its Common)" ||
+    fail "FOLDERID_UserProgramFiles: '$(v "$plain" user-program-files)' common '$(v "$plain" user-program-files-common)' (local app data $lad)"
 exit $RC
