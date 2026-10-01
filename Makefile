@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg test-layeredblend test-linuxicon test-shellnew test-glassvk test-elevfolders test-displaycfg
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg test-layeredblend test-linuxicon test-shellnew test-glassvk test-elevfolders test-displaycfg test-pss test-pyimports test-ownerrights
 
 all: build
 
@@ -261,6 +261,18 @@ test-elevfolders:
 # 0619: the display devices a session records stay writable by its user.
 test-displaycfg:
 	WINE=$(PREFIX)/bin/wine test/displaycfg-gate.sh
+
+# 0620: kernel32's process snapshot API (BleachBit's packed python312.dll).
+test-pss:
+	WINE=$(PREFIX)/bin/wine test/pss-gate.sh
+
+# 0621: what pywin32 imports, exported and working (BleachBit's pythoncom).
+test-pyimports:
+	WINE=$(PREFIX)/bin/wine test/pyimports-gate.sh
+
+# 0622: OWNER RIGHTS ACEs are the owner's (CPython's os.mkdir(path, 0o700)).
+test-ownerrights:
+	WINE=$(PREFIX)/bin/wine test/ownerrights-gate.sh
 
 # The taskbar's Horizon and Glass looks, beside the flat default (0600).
 test-taskbarlooks:
