@@ -68,8 +68,12 @@ def rounded_svg(text, factor=2.0):
 
 def render(tree, svg, bmp):
     env = dict(os.environ, CONVERT="convert", ICOTOOL="icotool", RSVG="rsvg-convert")
-    subprocess.run(["perl", os.path.join(tree, "tools", "buildimage"), svg, bmp], env=env,
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    r = subprocess.run(["perl", os.path.join(tree, "tools", "buildimage"), svg, bmp], env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode != 0:
+        # say why: a quiet failure here stopped CI's image build with no reason
+        sys.stderr.write("rounded.py: buildimage %s -> %s failed (%d):\n%s\n" % (svg, bmp, r.returncode, r.stdout))
+        raise SystemExit(1)
 
 
 def rounded_ini(lines, prefix):
