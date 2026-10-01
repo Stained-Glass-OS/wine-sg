@@ -447,6 +447,11 @@ test-selflink:
 test-unixexec:
 	WINE=$(PREFIX)/bin/wine test/unixexec-gate.sh
 
+# Machine components found by an account that may only read the Installer
+# keys (0701): Word's "(6)" after Office's integrator ran.
+test-msireadonly:
+	WINE=$(PREFIX)/bin/wine test/msireadonly-gate.sh
+
 # Wine's windows come in front of Linux programs' windows (0700).
 test-desktopfront:
 	WINE=$(PREFIX)/bin/wine test/desktopfront-gate.sh
