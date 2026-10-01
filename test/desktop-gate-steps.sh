@@ -48,6 +48,16 @@ else fail "new items not shown: $(dump | cut -d' ' -f5- | tr '\n' '|')"; fi
 rm "$DESK/after.txt"
 wait_for 15 eval '! has_item after.txt' && pass "a file deleted from the Desktop folder goes away" || fail "after.txt still shown"
 cp "$DUMP" "$T/dump-b15.txt"
+# a type that never shows its extension (NeverShowExt -- a Linux app's .desktop
+# file) is named without it; others keep theirs (0608)
+"$WINE" reg add 'HKLM\Software\Classes\.sgnever' /ve /d SgNeverType /f >/dev/null 2>&1
+"$WINE" reg add 'HKLM\Software\Classes\SgNeverType' /v NeverShowExt /d '' /f >/dev/null 2>&1
+echo x > "$DESK/launchme.sgnever"
+if wait_for 15 has_item launchme; then
+    has_item launchme.sgnever && fail "both names shown" || pass "a NeverShowExt file is named without its extension (launchme)"
+else fail "launchme not shown as such: $(dump | cut -d' ' -f5- | tr '\n' '|')"; fi
+has_item before.txt && pass "and a .txt keeps its extension" || fail "before.txt lost its extension"
+rm "$DESK/launchme.sgnever"
 
 # --- B16: selection -----------------------------------------------------------------------------
 shot before-select
