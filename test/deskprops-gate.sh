@@ -8,7 +8,10 @@
 #     window names a pixmap that stays alive, showing the desktop (here a flat
 #     green);
 #   - _SG_SHADOW on each window: 1 for a window with a title bar, 2 for a
-#     popup menu (its class has CS_DROPSHADOW), 0 for the taskbar.
+#     popup menu (its class has CS_DROPSHADOW), 0 for the taskbar;
+#   - _SG_ACRYLIC (0745): the taskbar frosted, 85% opaque, while
+#     Personalization > Colors > Transparency effects is on (the default),
+#     and not once it is turned off.
 # The third part, no backdrop for alpha popups while the compositor runs, is
 # checked by sg-compositor's deskcomp gate (pixels change with what is below).
 #
@@ -31,9 +34,10 @@ export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;w
 trap '"$WINESERVER" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"' EXIT INT TERM
 "$MINGW" -O2 -municode -o "$T/rounded-probe.exe" "$HERE/rounded-probe.c" -ldwmapi -lgdi32 -lcomctl32 || { fail "probe did not build"; exit 1; }
 cc -O2 -o "$T/pixmap-pixel" "$HERE/pixmap-pixel.c" -lX11 2>/dev/null || { echo "SKIP: cannot build pixmap-pixel (libx11-dev)"; exit 77; }
+"$MINGW" -O2 -municode -o "$T/eraschemes-probe.exe" "$HERE/eraschemes-probe.c" -luxtheme -lgdi32 -luser32 || { fail "probe did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
-cp "$T/rounded-probe.exe" "$WINEPREFIX/drive_c/"
+cp "$T/rounded-probe.exe" "$T/eraschemes-probe.exe" "$WINEPREFIX/drive_c/"
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer\Desktops' /v shell /d 800x600 /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Control Panel\Colors' /v Background /d '0 255 0' /f >/dev/null 2>&1
@@ -58,6 +62,11 @@ for c in \$(xwininfo -id \$D -children | awk '/^ +0x/ { print \$1 }'); do
     printf '%s %s %s\\n' "\$c" "\$(xwininfo -id \$c | awk '/Map State/ { print \$3 }')" "\$(xprop -id \$c _SG_SHADOW WM_NAME 2>&1 | tr '\\n' ' ')"
 done > "$T/children.out"
 xwininfo -id \$D -children > "$T/tree.out"
+TB=\$(xwininfo -id \$D -children | awk '/800x[0-9]+\+0\+[0-9]+/ && \$0 !~ /800x600/ { print \$1; exit }')
+xprop -id \$TB _SG_ACRYLIC > "$T/acrylic.on" 2>&1
+"$WINE" reg add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize' /v EnableTransparency /t REG_DWORD /d 0 /f >/dev/null 2>&1
+"$WINE" eraschemes-probe.exe notify >/dev/null 2>&1; sleep 2
+xprop -id \$TB _SG_ACRYLIC > "$T/acrylic.off" 2>&1
 EOF2
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s "-screen 0 800x600x24" "$T/session.sh" > "$T/session.out" 2>&1
@@ -73,6 +82,10 @@ viewable | grep -q '_SG_SHADOW(CARDINAL) = 2' && pass "a popup menu: _SG_SHADOW 
 tb=$(awk '/800x[0-9]+\+0\+[0-9]+/ && $0 !~ /800x600/ { print $1; exit }' "$T/tree.out")
 grep "^$tb " "$T/children.out" | grep -q '_SG_SHADOW(CARDINAL) = 0' && pass "the taskbar: _SG_SHADOW 0" \
     || fail "taskbar ($tb): $(grep "^$tb " "$T/children.out")"
+
+grep -q '_SG_ACRYLIC(CARDINAL) = 85' "$T/acrylic.on" && pass "the taskbar is frosted (_SG_ACRYLIC 85) with Transparency effects on" \
+    || fail "taskbar acrylic: $(cat "$T/acrylic.on")"
+grep -q 'not found' "$T/acrylic.off" && pass "and not once they are turned off" || fail "after turning off: $(cat "$T/acrylic.off")"
 
 echo
 [ "$RC" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
