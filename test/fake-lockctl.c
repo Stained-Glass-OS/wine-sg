@@ -2,7 +2,9 @@
  * (0496, 0500): XWINDOWS [--out FILE] copies the list file $SG_FAKE_DIR/list,
  * WINDOWS [--out FILE] the file $SG_FAKE_DIR/windows (to FILE, as sg-lockctl
  * does, or to its output); any other command is appended to
- * $SG_FAKE_DIR/commands. */
+ * $SG_FAKE_DIR/commands. With SG_FAKE_FOCUS set it also acts on the list as
+ * the compositor would: XDESKTOP takes the focus from every window,
+ * XACTIVATE ID gives it to that one (desktopfront-gate.sh). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +33,36 @@ int main(int argc, char **argv)
         }
         if (out != stdout && (fclose(out) || rename(part, argv[3]))) return 1;
         return 0;
+    }
+    if (getenv("SG_FAKE_FOCUS") && (!strcmp(argv[1], "XDESKTOP") || (!strcmp(argv[1], "XACTIVATE") && argc > 2)))
+    {
+        char line[1024], out[16384] = "", id[32] = "";
+        size_t len = 0;
+        if (argc > 2) snprintf(id, sizeof(id), "%s ", argv[2]);
+        snprintf(path, sizeof(path), "%s/list", dir);
+        if ((f = fopen(path, "r")))
+        {
+            while (fgets(line, sizeof(line), f) && len < sizeof(out) - sizeof(line))
+            {
+                char *p = strstr(line, " focused "), *q = strstr(line, " - ");
+                if (p && (!id[0] || strncmp(line, id, strlen(id))))
+                {
+                    /* " focused " -> " - " */
+                    memmove(p + 3, p + 9, strlen(p + 9) + 1);
+                    memcpy(p, " - ", 3);
+                }
+                else if (q && id[0] && !strncmp(line, id, strlen(id)))
+                {
+                    char rest[1024];
+                    snprintf(rest, sizeof(rest), "%s", q + 3);
+                    snprintf(q, sizeof(line) - (q - line), " focused %s", rest);
+                }
+                len += snprintf(out + len, sizeof(out) - len, "%s", line);
+            }
+            fclose(f);
+            snprintf(part, sizeof(part), "%s.part", path);
+            if ((f = fopen(part, "w"))) { fputs(out, f); fclose(f); rename(part, path); }
+        }
     }
     snprintf(path, sizeof(path), "%s/commands", dir);
     if (!(f = fopen(path, "a"))) return 1;

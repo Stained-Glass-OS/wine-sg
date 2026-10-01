@@ -37,8 +37,44 @@ cat > "$T/fgwin.c" <<'EOF'
 #include <windows.h>
 #include <stdio.h>
 static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
+static HWND make_popup(void)
+{
+    WNDCLASSW wc = { 0 }; HWND h;
+    wc.lpfnWndProc = proc; wc.lpszClassName = L"SgFrontPopup"; wc.hbrBackground = GetStockObject(GRAY_BRUSH);
+    RegisterClassW(&wc);
+    h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"SgFrontPopup", L"Start-like", WS_POPUP, 0, 300, 300, 360, 0, 0, 0, 0);
+    ShowWindow(h, SW_SHOW); SetForegroundWindow(h);
+    return h;
+}
+static void pump(DWORD ms)
+{
+    MSG msg; DWORD end = GetTickCount() + ms;
+    while ((int)(end - GetTickCount()) > 0)
+    {
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT);
+        while (PeekMessageW(&msg, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+}
 int wmain(int argc, WCHAR **argv)
 {
+    if (argc > 1 && (!lstrcmpW(argv[1], L"popup") || !lstrcmpW(argv[1], L"popuplaunch")))
+    {
+        /* a Start menu: up, then gone (Esc) -- or gone, and a program's window after */
+        HWND p = make_popup();
+        pump(3000);
+        ShowWindow(p, SW_HIDE);
+        if (!lstrcmpW(argv[1], L"popuplaunch"))
+        {
+            WNDCLASSW wc = { 0 }; HWND h;
+            pump(600);
+            wc.lpfnWndProc = proc; wc.lpszClassName = L"SgFrontLaunched"; wc.hbrBackground = GetStockObject(WHITE_BRUSH);
+            RegisterClassW(&wc);
+            h = CreateWindowW(L"SgFrontLaunched", L"Launched", WS_OVERLAPPEDWINDOW, 200, 150, 400, 300, 0, 0, 0, 0);
+            ShowWindow(h, SW_SHOWNORMAL); SetForegroundWindow(h);
+        }
+        pump(6000);
+        return 0;
+    }
     if (argc > 1 && !lstrcmpW(argv[1], L"show"))
     {
         WNDCLASSW wc = { 0 }; MSG msg; HWND h;
@@ -74,7 +110,7 @@ cat > "$T/session.sh" <<EOF
 #!/bin/sh
 cd "$WINEPREFIX/drive_c"
 mkdir -p "$T/run"
-export SG_LOCK_CONTROL=/nonexistent SG_LOCKCTL="$T/fake-lockctl" SG_FAKE_DIR="$T" XDG_RUNTIME_DIR="$T/run"
+export SG_LOCK_CONTROL=/nonexistent SG_LOCKCTL="$T/fake-lockctl" SG_FAKE_DIR="$T" XDG_RUNTIME_DIR="$T/run" SG_FAKE_FOCUS=1
 mid() { echo "\$1" | awk -F, '{ printf "%d %d", (\$1 + \$3) / 2, (\$2 + \$4) / 2 }'; }
 "$WINE" explorer /desktop=shell,1024x700 > "$T/explorer.out" 2>&1 &
 i=0; while ! grep -q 'desktop message loop starting' "$T/explorer.out" 2>/dev/null && [ \$i -lt 60 ]; do sleep 0.5; i=\$((i + 1)); done
@@ -91,10 +127,21 @@ B=\$("$WINE" taskbar-probe.exe state 2>/dev/null | tr -d '\r' | sed -n 's/^butto
 echo "button \$B" > "$T/button"
 xdotool mousemove \$(mid "\$B") click 1; sleep 3
 "$WINE" fgwin.exe 2>/dev/null | tr -d '\r' > "$T/fg.clicked"
+cp "$T/commands" "$T/commands.button" 2>/dev/null
+# SG Office has the focus again (a click on it); a Start-like popup comes and goes (Esc)
+printf '%s\nEND\n' "$FOCUSED" > "$T/list"; sleep 5
+: > "$T/commands"
+"$WINE" fgwin.exe popup; sleep 3
+cp "$T/commands" "$T/commands.popup"
+# again, and this time it starts a program as it goes
+printf '%s\nEND\n' "$FOCUSED" > "$T/list"; sleep 5
+: > "$T/commands"
+"$WINE" fgwin.exe popuplaunch; sleep 3
+cp "$T/commands" "$T/commands.launch"
 EOF
 chmod +x "$T/session.sh"
 timeout -s KILL 300 xvfb-run -a -s '-screen 0 1024x700x24' "$T/session.sh"
-echo "      commands: $(tr '\n' '|' < "$T/commands" 2>/dev/null)"
+echo "      commands: $(tr '\n' '|' < "$T/commands.button" 2>/dev/null)"
 echo "      after SG Office got the focus: $(cat "$T/fg.deactivated" 2>/dev/null); $(cat "$T/button" 2>/dev/null)"
 echo "      after its button: $(cat "$T/fg.clicked" 2>/dev/null)"
 
@@ -104,11 +151,20 @@ echo "      after its button: $(cat "$T/fg.clicked" 2>/dev/null)"
 grep -q "fg=Front Probe" "$T/fg.deactivated" 2>/dev/null \
     && fail "SG Office has the focus, yet the Wine window is still Wine's active one" \
     || pass "SG Office has the focus: Wine's last active window is deactivated ($(cat "$T/fg.deactivated" 2>/dev/null))"
-[ "$(grep -c '^XDESKTOP$' "$T/commands" 2>/dev/null)" = 2 ] \
+[ "$(grep -c '^XDESKTOP$' "$T/commands.button" 2>/dev/null)" = 2 ] \
     && pass "its taskbar button puts the desktop in front again (XDESKTOP)" \
-    || fail "button: $(tr '\n' '|' < "$T/commands" 2>/dev/null)"
+    || fail "button: $(tr '\n' '|' < "$T/commands.button" 2>/dev/null)"
 grep -q "fg=Front Probe iconic=0" "$T/fg.clicked" 2>/dev/null \
     && pass "and brings the window forward, not minimized" || fail "after the button: $(cat "$T/fg.clicked" 2>/dev/null)"
+
+echo "      popup: $(tr '\n' '|' < "$T/commands.popup" 2>/dev/null)"
+echo "      popup + program: $(tr '\n' '|' < "$T/commands.launch" 2>/dev/null)"
+[ "$(tr '\n' '|' < "$T/commands.popup" 2>/dev/null)" = "XDESKTOP|XACTIVATE 4242|" ] \
+    && pass "a Start-like popup puts the desktop in front; gone without starting anything, SG Office comes back" \
+    || fail "popup: $(tr '\n' '|' < "$T/commands.popup" 2>/dev/null)"
+[ "$(tr '\n' '|' < "$T/commands.launch" 2>/dev/null)" = "XDESKTOP|" ] \
+    && pass "a popup that starts a program leaves the desktop (and the program) in front" \
+    || fail "popup + program: $(tr '\n' '|' < "$T/commands.launch" 2>/dev/null)"
 
 echo
 [ "$RC" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
