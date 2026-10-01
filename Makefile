@@ -230,6 +230,10 @@ test-roundedctl:
 test-taskpins:
 	WINE=$(PREFIX)/bin/wine test/taskpins-gate.sh
 
+# A new user's first taskbar pins, from HKLM DefaultPins (0741).
+test-defaultpins:
+	WINE=$(PREFIX)/bin/wine test/defaultpins-gate.sh
+
 # 0602: pinned programs show their own icons (File Explorer: the folder).
 test-pinicon:
 	WINE=$(PREFIX)/bin/wine test/pinicon-gate.sh
