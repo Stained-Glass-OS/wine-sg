@@ -234,6 +234,10 @@ test-taskpins:
 test-eraframes:
 	WINE=$(PREFIX)/bin/wine test/eraframes-gate.sh
 
+# The Horizon and Glass looks' controls: their colour schemes (0743, theme/eras.py).
+test-eraschemes:
+	WINE=$(PREFIX)/bin/wine test/eraschemes-gate.sh
+
 # A new user's first taskbar pins, from HKLM DefaultPins (0741).
 test-defaultpins:
 	WINE=$(PREFIX)/bin/wine test/defaultpins-gate.sh

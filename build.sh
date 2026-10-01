@@ -45,7 +45,7 @@ series_fingerprint() {
     {
         cat "$HERE/wine-version"
         # the generated Dark colour scheme is part of the tree (0160)
-        cat "$HERE/theme/dark.py" "$HERE/theme/images.list" "$HERE/theme/icons.py" "$HERE/theme/rounded.py"
+        cat "$HERE/theme/dark.py" "$HERE/theme/images.list" "$HERE/theme/icons.py" "$HERE/theme/rounded.py" "$HERE/theme/eras.py"
         while read -r p; do
             [[ -z "$p" || "$p" == \#* ]] && continue
             echo "== $p"
@@ -69,6 +69,7 @@ prepare_tree() {
     regenerate_theme_images "$tmp/wine-$WINE_VERSION"
     generate_dark_scheme "$tmp/wine-$WINE_VERSION"
     generate_rounded_schemes "$tmp/wine-$WINE_VERSION"
+    generate_era_schemes "$tmp/wine-$WINE_VERSION"
     mv "$tmp/wine-$WINE_VERSION" "$dest"
     rmdir "$tmp"
 }
@@ -131,6 +132,16 @@ generate_rounded_schemes() {
     [[ -f "$dir/light.rc" ]] && grep -q 'rounded.rc' "$dir/light.rc" || return 0
     log "  generating the Rounded colour schemes"
     python3 "$HERE/theme/rounded.py" "$dir" >/dev/null
+}
+
+# The Horizon and Glass colour schemes (patches/sg/0743): eras.rc and the
+# horizon_*/glass_* images, drawn or recoloured from Light's by
+# theme/eras.py. light.rc includes eras.rc; a failure stops here.
+generate_era_schemes() {
+    local dir="$1/dlls/light.msstyles"
+    [[ -f "$dir/light.rc" ]] && grep -q 'eras.rc' "$dir/light.rc" || return 0
+    log "  generating the Horizon and Glass colour schemes"
+    python3 "$HERE/theme/eras.py" "$dir" >/dev/null
 }
 
 FINGERPRINT=$(series_fingerprint)
