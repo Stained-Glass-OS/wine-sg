@@ -4,7 +4,8 @@
 # pixels (patches/sg/0611). In a virtual desktop every window is a child of the
 # desktop's X window and X does not blend a child's alpha: Chrome's ⋮ menu had
 # a thick black frame where its shadow is (David). A half-transparent red
-# popup over a magenta desktop must show the blend (255,0,127), not dark red.
+# popup over a magenta desktop must show the blend (255,0,127), not dark red;
+# so must one that is a sheet of glass (a swap chain with alpha: Chrome's bubbles).
 #
 #   WINE=/opt/wine-sg/bin/wine test/layeredblend-gate.sh
 set -u
@@ -25,7 +26,7 @@ unset DISPLAY WAYLAND_DISPLAY
 T=$(mktemp -d /var/tmp/sg-layeredblend.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 trap '"$WINESERVER" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"' EXIT INT TERM
-"$MINGW" -O2 -municode -mwindows -o "$T/layeredblend-probe.exe" "$HERE/layeredblend-probe.c" -lgdi32 -luser32 ||
+"$MINGW" -O2 -municode -mwindows -o "$T/layeredblend-probe.exe" "$HERE/layeredblend-probe.c" -lgdi32 -luser32 -ldwmapi ||
     { fail "probe did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
@@ -43,7 +44,8 @@ cd "$WINEPREFIX/drive_c"
 "$WINE" explorer /desktop=shell,800x600 > "$T/explorer.out" 2>&1 &
 sleep 6
 "$WINE" layeredblend-probe.exe &
-sleep 6
+"$WINE" layeredblend-probe.exe glass &
+sleep 8
 import -window root "$T/shot.png"
 EOF
 chmod +x "$T/session.sh"
@@ -57,5 +59,12 @@ if [ "${r:-0}" -ge 240 ] && [ "${g:-255}" -le 15 ] && [ "${b:-0}" -ge 110 ] && [
     pass "the half-transparent popup shows the desktop through it ($px)"
 else
     fail "the popup shows $px, not red over magenta (255,0,127): its alpha is dropped"
+fi
+px=$(convert "$T/shot.png" -format "%[fx:int(255*p{400,455}.r)],%[fx:int(255*p{400,455}.g)],%[fx:int(255*p{400,455}.b)]" info: 2>/dev/null)
+r=${px%%,*}; rest=${px#*,}; g=${rest%%,*}; b=${rest#*,}
+if [ "${r:-0}" -ge 240 ] && [ "${g:-255}" -le 15 ] && [ "${b:-0}" -ge 110 ] && [ "${b:-0}" -le 145 ]; then
+    pass "a popup that is a sheet of glass shows the desktop through it too ($px)"
+else
+    fail "the glass popup shows $px, not red over magenta (255,0,127)"
 fi
 exit $RC
