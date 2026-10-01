@@ -1,0 +1,171 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] server: the SYSTEM account's own processes may be traced
+
+An elevated program runs as the SYSTEM account with SYSTEM's group (the
+broker's); the machine's wineserver with the prefix's group. The kernel lets a
+process trace only those whose groups match its own, so the server could
+neither read nor write an elevated program's memory: ReadProcessMemory and
+WriteProcessMemory failed, a debugger could not attach (error 5), and
+MediaMonkey, reading its parent's PEB, crashed (runtime error 216) and hung
+its installer on the crash dialog. The server holds CAP_SYS_PTRACE as a
+permitted capability only (sg-wineserver.service) and makes it effective
+for the one attach or /proc/PID/mem open, and only for a process of its own
+account.
+---
+--- a/server/handle.h
++++ b/server/handle.h
+@@ -46,6 +46,7 @@
+ extern int sg_client_chmod;
+ extern int sg_set_unix_mode( int unix_fd, mode_t mode );
+ extern void sg_init_capabilities(void);
++extern int sg_capability( int cap, int raise );
+ extern struct object *get_handle_obj( struct process *process, obj_handle_t handle,
+                                       unsigned int access, const struct object_ops *ops );
+ extern unsigned int get_handle_access( struct process *process, obj_handle_t handle );
+--- a/server/file.c
++++ b/server/file.c
+@@ -631,22 +631,31 @@
+  * machine's folders (the .NET SDK's WiX Burn engine, its Package Cache) --
+  * which Windows' SYSTEM may always do. The Windows access check has already
+  * granted WRITE_DAC by then. */
+-static int sg_fowner( int raise )
++int sg_capability( int cap, int raise )
+ {
+ #ifdef __linux__
+     struct __user_cap_header_struct header = { _LINUX_CAPABILITY_VERSION_3, 0 };
+     struct __user_cap_data_struct data[2];
+ 
+     if (syscall( SYS_capget, &header, data )) return -1;
+-    if (raise && !(data[0].permitted & (1u << CAP_FOWNER))) return -1;
+-    if (raise) data[0].effective |= 1u << CAP_FOWNER;
+-    else data[0].effective &= ~(1u << CAP_FOWNER);
++    if (raise && !(data[0].permitted & (1u << cap))) return -1;
++    if (raise) data[0].effective |= 1u << cap;
++    else data[0].effective &= ~(1u << cap);
+     return syscall( SYS_capset, &header, data );
+ #else
+     return -1;
+ #endif
+ }
+ 
++static int sg_fowner( int raise )
++{
++#ifdef __linux__
++    return sg_capability( CAP_FOWNER, raise );
++#else
++    return -1;
++#endif
++}
++
+ /* at start: nothing effective, nothing handed on */
+ void sg_init_capabilities(void)
+ {
+@@ -654,6 +663,9 @@
+     prctl( PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0 );
+ #endif
+     sg_fowner( 0 );
++#ifdef __linux__
++    sg_capability( CAP_SYS_PTRACE, 0 );
++#endif
+ }
+ 
+ int sg_set_unix_mode( int unix_fd, mode_t mode )
+--- a/server/ptrace.c
++++ b/server/ptrace.c
+@@ -55,7 +55,11 @@
+ #include "thread.h"
+ #include "request.h"
+ #include "security.h"
++#include "handle.h"
+ #include <sys/socket.h>
++#ifdef __linux__
++#include <linux/capability.h>
++#endif
+ #include <sys/un.h>
+ 
+ #ifdef USE_PTRACE
+@@ -448,13 +452,57 @@
+ 
+ /* suspend a thread to allow using ptrace on it */
+ /* you must do a resume_after_ptrace when finished with the thread */
++/* Stained Glass OS: the SYSTEM account's own processes. An elevated program
++ * runs as SYSTEM with SYSTEM's group (the broker's), the server with the
++ * prefix's group: the kernel lets a process trace only those whose groups
++ * match its own, so the server could neither read nor write an elevated
++ * program's memory (ReadProcessMemory, a debugger: access denied; MediaMonkey
++ * read its parent's PEB as zeros and crashed). CAP_SYS_PTRACE, held as a
++ * permitted capability only (sg-wineserver.service), is made effective for
++ * the one access, and only to a process of the server's own account. */
++static int sg_ptrace_own( struct process *process, int raise )
++{
++#ifdef __linux__
++    if (!sg_system_prefix || process->peer_uid != getuid()) return -1;
++    return sg_capability( CAP_SYS_PTRACE, raise );
++#else
++    return -1;
++#endif
++}
++
++static int open_proc_mem( struct process *process, int flags )
++{
++    char procmem[24];
++    int fd, err;
++
++    snprintf( procmem, sizeof(procmem), "/proc/%u/mem", process->unix_pid );
++    if ((fd = open( procmem, flags )) != -1 || (errno != EACCES && errno != EPERM)) return fd;
++    if (sg_ptrace_own( process, 1 )) return -1;
++    fd = open( procmem, flags );
++    err = errno;
++    sg_ptrace_own( process, 0 );
++    errno = err;
++    return fd;
++}
++
+ static int suspend_for_ptrace( struct thread *thread )
+ {
++    int ret;
++
+     /* can't stop a thread while initialisation is in progress */
+     if (thread->unix_pid == -1 || !is_process_init_done(thread->process)) goto error;
+ 
+     /* this may fail if the client is already being debugged */
+-    if (ptrace( PTRACE_ATTACH, get_ptrace_pid(thread), 0, 0 ) == -1)
++    ret = ptrace( PTRACE_ATTACH, get_ptrace_pid(thread), 0, 0 );
++    if (ret == -1 && errno == EPERM && !sg_ptrace_own( thread->process, 1 ))
++    {
++        int err;
++        ret = ptrace( PTRACE_ATTACH, get_ptrace_pid(thread), 0, 0 );
++        err = errno;
++        sg_ptrace_own( thread->process, 0 );
++        errno = err;
++    }
++    if (ret == -1)
+     {
+         if (errno == ESRCH) thread->unix_pid = thread->unix_tid = -1;  /* thread got killed */
+         goto error;
+@@ -553,11 +601,9 @@
+     {
+         if (len > 3)  /* /proc/pid/mem should be faster for large sizes */
+         {
+-            char procmem[24];
+             int fd;
+ 
+-            snprintf( procmem, sizeof(procmem), "/proc/%u/mem", process->unix_pid );
+-            if ((fd = open( procmem, O_RDONLY )) != -1)
++            if ((fd = open_proc_mem( process, O_RDONLY )) != -1)
+             {
+                 ssize_t ret = pread( fd, dest, size, ptr );
+                 close( fd );
+@@ -661,11 +707,9 @@
+ 
+         if (len > 3)
+         {
+-            char procmem[24];
+             int fd;
+ 
+-            snprintf( procmem, sizeof(procmem), "/proc/%u/mem", process->unix_pid );
+-            if ((fd = open( procmem, O_WRONLY )) != -1)
++            if ((fd = open_proc_mem( process, O_WRONLY )) != -1)
+             {
+                 ssize_t r = pwrite( fd, src, size, ptr );
+                 close( fd );
