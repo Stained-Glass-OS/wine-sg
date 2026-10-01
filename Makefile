@@ -230,6 +230,10 @@ test-roundedctl:
 test-taskpins:
 	WINE=$(PREFIX)/bin/wine test/taskpins-gate.sh
 
+# The Horizon and Glass looks' window frames (0742).
+test-eraframes:
+	WINE=$(PREFIX)/bin/wine test/eraframes-gate.sh
+
 # A new user's first taskbar pins, from HKLM DefaultPins (0741).
 test-defaultpins:
 	WINE=$(PREFIX)/bin/wine test/defaultpins-gate.sh
