@@ -38,14 +38,20 @@ P() { "$WINE" vdesk-probe.exe "$@" 2>/dev/null | tr -d '\r'; }
 "$WINE" vdesk-probe.exe window Alpha 60 60 >/dev/null 2>&1 &
 sleep 3
 P hotkey right >/dev/null
-sleep 1;   during=$(P exists SgDesktopSlide); import -window root "$T/a.png"
-sleep 1.5; import -window root "$T/b.png"
+sleep 1;   during=$(P exists SgDesktopSlide); ra=$(P classrect SgDesktopSlide); import -window root "$T/a.png"
+sleep 1.5; rb=$(P classrect SgDesktopSlide); import -window root "$T/b.png"
 sleep 4;   after=$(P exists SgDesktopSlide)
+[ -n "${ARTIFACTS:-}" ] && cp "$T/a.png" "$ARTIFACTS/slide-a.png" && cp "$T/b.png" "$ARTIFACTS/slide-b.png"
 d=$(compare -metric AE "$T/a.png" "$T/b.png" /dev/null 2>&1 | cut -d' ' -f1)
 echo "      during: $during, after: $after, moved: $d px"
 [ "$during" = "exists=1" ] && [ "${d%.*}" -gt 2000 ] 2>/dev/null && pass "switching desktops slides: the desktop left moves off to the side" \
     || fail "no slide while switching (during $during, $d px)"
 [ "$after" = "exists=0" ] && pass "and the slide is gone when it has run" || fail "the slide stayed ($after)"
+# smooth (0607): the slide's window stays still -- the pictures move inside it;
+# moving a whole-screen window every step was what stuttered
+echo "      slide window: $ra then $rb"
+[ -n "$ra" ] && [ "$ra" = "$rb" ] && [ "$ra" != "classrect=none" ] && pass "the slide's window stays still while its picture moves" \
+    || fail "the slide's window moved ($ra -> $rb)"
 # off in Effects: no slide
 "$WINE" reg add 'HKCU\Software\Stained Glass\Effects' /v SlideDesktops /t REG_DWORD /d 0 /f >/dev/null 2>&1
 P hotkey left >/dev/null

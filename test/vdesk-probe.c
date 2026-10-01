@@ -216,6 +216,16 @@ int main( int argc, char **argv )
         printf( "exists=%d\n", FindWindowW( wtitle, NULL ) != NULL );
         return 0;
     }
+    if (argc == 3 && !strcmp( argv[1], "classrect" ))   /* a window by its class (the slide, 0607) */
+    {
+        HWND hwnd;
+        RECT rc;
+        MultiByteToWideChar( CP_ACP, 0, argv[2], -1, wtitle, 64 );
+        if (!(hwnd = FindWindowW( wtitle, NULL ))) { printf( "classrect=none\n" ); return 1; }
+        GetWindowRect( hwnd, &rc );
+        printf( "classrect=%ld,%ld,%ld,%ld\n", rc.left, rc.top, rc.right, rc.bottom );
+        return 0;
+    }
     if (argc == 3 && !strcmp( argv[1], "rect" ))
     {
         HWND hwnd;
