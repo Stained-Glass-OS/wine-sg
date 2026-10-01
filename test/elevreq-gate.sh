@@ -10,8 +10,9 @@
 # ERROR_ELEVATION_REQUIRED (740) for a caller that is not elevated, and
 # ShellExecuteEx -- Explorer, Start-Process -- hands them to the elevation
 # broker (0022's path; SG_ELEVATE names a stand-in here that records the
-# command). asInvoker and highestAvailable programs run as before, and so does
-# everything inside a program the broker started (SG_IN_BROKER).
+# command). asInvoker programs run as before, highestAvailable ones too for a
+# standard user (an administrator's session, SG_USER_ADMIN, asks: 0623), and
+# so does everything inside a program the broker started (SG_IN_BROKER).
 #
 # This user owns the prefix; SG_OTHER (default sgconf, in SG_GROUP) is the
 # standard user. Needs passwordless `sudo -u $SG_OTHER`.
@@ -83,7 +84,8 @@ chmod -R g+rwX "$PFX" 2>/dev/null
 
 other() {
     sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" \
-        HOME=/var/tmp SG_ELEVATE="$W/elevate" "$@" 2>/dev/null | tr -d '\r' | grep -E '^(CREATE|SHELL) '
+        HOME=/var/tmp SG_ELEVATE="$W/elevate" ${SG_USER_ADMIN:+SG_USER_ADMIN=$SG_USER_ADMIN} "$@" 2>/dev/null |
+        tr -d '\r' | grep -E '^(CREATE|SHELL) '
 }
 zp() { printf 'Z:%s' "${1//\//\\}"; }
 
@@ -105,6 +107,14 @@ out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/layered.exe")")
     || fail "Layers RUNASADMIN: '$out'"
 out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/highest.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "a highestAvailable program runs as the invoker" || fail "highestAvailable: '$out'"
+# ... for a standard user. An administrator's session (SG_USER_ADMIN, from
+# sg-session-start) asks, as Windows does: Geany's installer (NSIS
+# "highest") otherwise installed into the profile, unregistered (0623).
+out=$(SG_USER_ADMIN=1 other "$WINE" "$W/invoker.exe" create "$(zp "$W/highest.exe")")
+[ "$out" = "CREATE err 740" ] && pass "for an administrator a highestAvailable program needs elevation: ERROR_ELEVATION_REQUIRED" \
+    || fail "highestAvailable, administrator: '$out'"
+out=$(SG_USER_ADMIN=1 other "$WINE" "$W/invoker.exe" create "$(zp "$W/invoker.exe")")
+[ "$out" = "CREATE ok 7" ] && pass "and an asInvoker program still runs for an administrator" || fail "asInvoker, administrator: '$out'"
 rm -f "$W/out/elevate.log"
 out=$(other "$WINE" "$W/invoker.exe" shell "$(zp "$W/admin.exe")")
 sleep 1
@@ -144,6 +154,19 @@ sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRIDES="ms
 log=$(cat "$W/out/elevate.log" 2>/dev/null)
 if grep -q 'wait-me' <<<"$log" && ! grep -qi '/UAC:' <<<"$log"; then pass "an NSIS installer's /UAC: switch is not passed to its elevated copy ($log)"
 else fail "/UAC: $log"; fi
+# start (cmd's, Wine's start.exe) runs a program through CreateProcess; one
+# that needs an administrator goes on to ShellExecuteEx, which asks (0623):
+# it reported "could not be started" instead.
+rm -f "$W/out/elevate.log"
+other "$WINE" start /wait "$(zp "$W/admin.exe")" >/dev/null
+log=$(cat "$W/out/elevate.log" 2>/dev/null)
+case "$log" in *admin.exe*) pass "start of a requireAdministrator program goes to the elevation broker ($log)" ;;
+    *) fail "start /wait admin.exe: broker saw '$log'" ;; esac
+rm -f "$W/out/elevate.log"
+SG_USER_ADMIN=1 other "$WINE" start /wait "$(zp "$W/highest.exe")" >/dev/null
+log=$(cat "$W/out/elevate.log" 2>/dev/null)
+case "$log" in *highest.exe*) pass "an administrator's start of a highestAvailable program too ($log)" ;;
+    *) fail "start /wait highest.exe, administrator: broker saw '$log'" ;; esac
 out=$(other env SG_IN_BROKER=1 "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "inside a program the broker started, it runs (no loop)" || fail "SG_IN_BROKER: '$out'"
 # no broker installed (a relative SG_ELEVATE is not a stand-in, and this
