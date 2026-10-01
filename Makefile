@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha
 
 all: build
 
@@ -705,6 +705,10 @@ test-appcontainer:
 # Sheet-of-glass windows keep their alpha: Firefox popups had black frames (0435).
 test-glass:
 	WINE=$(PREFIX)/bin/wine test/glass-gate.sh
+
+# 0605: a composition swap chain with alpha shows its alpha (Chrome's menus).
+test-dcompalpha:
+	WINE=$(PREFIX)/bin/wine test/dcompalpha-gate.sh
 
 # Toast notifications and their XML documents (0436-0437): Firefox, Chrome,
 # Electron and .NET programs show them; clicks and dismissals reach the program.
