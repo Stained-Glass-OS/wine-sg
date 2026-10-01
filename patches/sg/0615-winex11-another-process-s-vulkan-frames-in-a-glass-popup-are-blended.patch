@@ -1,0 +1,278 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winex11: another process's Vulkan frames in a glass popup are blended
+
+Chromium's GPU process presents its bubbles (bookmark, download, permission,
+"Restore pages?") into the browser's popups with Vulkan (DXVK). In the
+virtual desktop they had a black frame where their shadow is: the Vulkan
+window had no alpha, and X drops a child window's alpha anyway.
+
+The process that shows a layered or glass popup publishes the backdrop it
+took (0611) as a pixmap the window names (_SG_BACKDROP). A Vulkan surface for
+a popup that is a sheet of glass gets an offscreen X window with alpha; each
+frame is blended over that backdrop and put into the popup opaque.
+---
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -34,6 +34,7 @@
+ #include <X11/Xlib.h>
+ #include <X11/Xresource.h>
+ #include <X11/Xutil.h>
++#include <X11/Xatom.h>
+ #ifdef HAVE_X11_EXTENSIONS_SHAPE_H
+ #include <X11/extensions/shape.h>
+ #endif
+@@ -1799,6 +1800,8 @@
+     Window      window;
+     int         width, height;
+     DWORD      *bits;           /* width x height, what was under the window */
++    Display    *display;
++    Pixmap      pixmap;         /* the same, for other processes (the window's _SG_BACKDROP) */
+ };
+ 
+ static struct list backdrops = LIST_INIT( backdrops );
+@@ -1824,6 +1827,13 @@
+     if ((bd = find_backdrop( window )))
+     {
+         list_remove( &bd->entry );
++        if (bd->pixmap)
++        {
++            X11DRV_expect_error( bd->display, backdrop_error, NULL );
++            XDeleteProperty( bd->display, window, XInternAtom( bd->display, "_SG_BACKDROP", False ) );
++            XFreePixmap( bd->display, bd->pixmap );
++            X11DRV_check_error();
++        }
+         free( bd->bits );
+         free( bd );
+     }
+@@ -1875,6 +1885,20 @@
+     for (j = cy0; j < cy1; j++)
+         for (i = cx0; i < cx1; i++)
+             bd->bits[(j - y) * width + (i - x)] = XGetPixel( image, i - cx0, j - cy0 ) & 0xffffff;
++    /* for another process drawing into the window (Chromium's GPU process
++     * presents into the browser's popups): the backdrop as a pixmap the
++     * window names */
++    bd->display = display;
++    if ((bd->pixmap = XCreatePixmap( display, root_window, width, height, image->depth )))
++    {
++        GC gc = XCreateGC( display, bd->pixmap, 0, NULL );
++        XFillRectangle( display, bd->pixmap, gc, 0, 0, width, height );
++        XPutImage( display, bd->pixmap, gc, image, 0, 0, cx0 - x, cy0 - y, cx1 - cx0, cy1 - cy0 );
++        XFreeGC( display, gc );
++        XChangeProperty( display, window, XInternAtom( display, "_SG_BACKDROP", False ), XA_PIXMAP, 32,
++                         PropModeReplace, (unsigned char *)&bd->pixmap, 1 );
++        XFlush( display );
++    }
+     XDestroyImage( image );
+     TRACE( "window %lx: backdrop %dx%d at %d,%d\n", window, width, height, x, y );
+     pthread_mutex_lock( &backdrop_mutex );
+--- a/dlls/winex11.drv/vulkan.c
++++ b/dlls/winex11.drv/vulkan.c
+@@ -36,6 +36,7 @@
+ #include "winbase.h"
+ 
+ #include "wine/debug.h"
++#include <X11/Xatom.h>
+ #include "x11drv.h"
+ #include "xcomposite.h"
+ 
+@@ -70,11 +71,123 @@
+     BOOL offscreen;
+     HDC hdc_src;
+     HDC hdc_dst;
++    BOOL blend;            /* a popup that is a sheet of glass: see glass_popup() */
++    Colormap colormap;
++    GC gc;
+ };
+ 
++/* Stained Glass OS: a popup that is a sheet of glass (Chromium's bubbles:
++ * its GPU process presents into the browser's window with Vulkan). In a
++ * virtual desktop it is a child of the desktop's X window, and X shows a
++ * child's alpha as black: the bubble had a black frame where its shadow is.
++ * Such a surface gets an X window with alpha, rendered offscreen; each frame
++ * is blended over what was under the popup when it was shown (the backdrop
++ * the browser's winex11 took, a pixmap its window names) and put opaque. */
++static BOOL glass_popup( HWND hwnd )
++{
++    static const WCHAR glassW[] = {'_','_','w','i','n','e','_','d','w','m','_','g','l','a','s','s',0};
++
++    if (!is_virtual_desktop() || !argb_visual.visualid || !usexcomposite) return FALSE;
++    if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow()) return FALSE;
++    if ((NtUserGetWindowLongW( hwnd, GWL_STYLE ) & (WS_POPUP | WS_CHILD)) != WS_POPUP) return FALSE;
++    return NtUserGetProp( hwnd, glassW ) != NULL;
++}
++
++static int blend_error( Display *display, XErrorEvent *event, void *arg )
++{
++    return 1;
++}
++
++/* the frame, blended over the window's backdrop, put into WINDOW at RECT */
++static BOOL blend_present( struct x11drv_vulkan_surface *surface, Window window, const RECT *rect )
++{
++    int width = rect->right - rect->left, height = rect->bottom - rect->top, x, y, depth;
++    XImage *src = NULL, *under = NULL, *out;
++    unsigned long count, after;
++    unsigned char *prop = NULL;
++    Pixmap backdrop = 0;
++    Window root;
++    unsigned int gw, gh, border, wdepth;
++    int gx, gy, format;
++    Atom type;
++    DWORD *buf;
++
++    TRACE( "blend %dx%d into %lx at %s, surface %s\n", width, height, window, wine_dbgstr_rect( rect ),
++           wine_dbgstr_rect( &surface->rect ) );
++    if (width != surface->rect.right || height != surface->rect.bottom || width <= 0 || height <= 0) return FALSE;
++    X11DRV_expect_error( gdi_display, blend_error, NULL );
++    if (XGetGeometry( gdi_display, window, &root, &gx, &gy, &gw, &gh, &border, &wdepth ))
++        depth = wdepth;
++    else
++        depth = 0;
++    src = XGetImage( gdi_display, surface->window, 0, 0, width, height, AllPlanes, ZPixmap );
++    if (!XGetWindowProperty( gdi_display, window, XInternAtom( gdi_display, "_SG_BACKDROP", False ), 0, 1, False,
++                             XA_PIXMAP, &type, &format, &count, &after, &prop ) && prop && count == 1)
++        backdrop = *(Pixmap *)prop;
++    if (prop) XFree( prop );
++    if (backdrop) under = XGetImage( gdi_display, backdrop, rect->left, rect->top, width, height, AllPlanes, ZPixmap );
++    if (X11DRV_check_error() || !src || src->bits_per_pixel != 32 || !depth || (under && under->bits_per_pixel != 32))
++    {
++        TRACE( "no blend: src %p depth %d under %p backdrop %lx\n", src, depth, under, backdrop );
++        if (src) XDestroyImage( src );
++        if (under) XDestroyImage( under );
++        return FALSE;
++    }
++    if (!(buf = malloc( (size_t)width * height * 4 )))
++    {
++        XDestroyImage( src );
++        if (under) XDestroyImage( under );
++        return FALSE;
++    }
++    for (y = 0; y < height; y++)
++    {
++        const DWORD *s = (const DWORD *)(src->data + y * src->bytes_per_line);
++        const DWORD *u = under ? (const DWORD *)(under->data + y * under->bytes_per_line) : NULL;
++        for (x = 0; x < width; x++)
++        {
++            DWORD p = s[x], a = p >> 24, b = u ? u[x] : 0;
++            if (a == 0xff) buf[y * width + x] = p;
++            else
++            {
++                /* premultiplied: out = src + under * (1 - alpha) */
++                DWORD r = min( 255, ((p >> 16) & 0xff) + ((b >> 16) & 0xff) * (255 - a) / 255 );
++                DWORD g = min( 255, ((p >> 8) & 0xff) + ((b >> 8) & 0xff) * (255 - a) / 255 );
++                DWORD bl = min( 255, (p & 0xff) + (b & 0xff) * (255 - a) / 255 );
++                buf[y * width + x] = 0xff000000 | (r << 16) | (g << 8) | bl;
++            }
++        }
++    }
++    XDestroyImage( src );
++    if (under) XDestroyImage( under );
++    out = XCreateImage( gdi_display, depth == 32 ? argb_visual.visual : default_visual.visual, depth, ZPixmap, 0,
++                        (char *)buf, width, height, 32, width * 4 );
++    if (!out)
++    {
++        free( buf );
++        return FALSE;
++    }
++    if (!surface->gc) surface->gc = XCreateGC( gdi_display, window, 0, NULL );
++    X11DRV_expect_error( gdi_display, blend_error, NULL );
++    XPutImage( gdi_display, window, surface->gc, out, 0, 0, rect->left, rect->top, width, height );
++    XFlush( gdi_display );
++    X11DRV_check_error();
++    TRACE( "blended: first pixel %08x, backdrop %lx\n", (unsigned int)buf[(height / 2) * width + width / 2], backdrop );
++    out->data = NULL;
++    XDestroyImage( out );
++    free( buf );
++    return TRUE;
++}
++
+ static void vulkan_surface_destroy( HWND hwnd, struct x11drv_vulkan_surface *surface )
+ {
+-    destroy_client_window( hwnd, surface->window );
++    if (surface->blend)
++    {
++        if (surface->window) XDestroyWindow( gdi_display, surface->window );
++        if (surface->gc) XFreeGC( gdi_display, surface->gc );
++        if (surface->colormap) XFreeColormap( gdi_display, surface->colormap );
++        surface->window = 0;
++    }
++    else destroy_client_window( hwnd, surface->window );
+     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
+     if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
+     free( surface );
+@@ -96,12 +209,35 @@
+         ERR("Failed to allocate vulkan surface for hwnd=%p\n", hwnd);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+     }
+-    if (!(surface->window = create_client_window( hwnd, &default_visual, default_colormap )))
++    if ((surface->blend = glass_popup( hwnd )))
++    {
++        /* an X window with alpha, offscreen (blend_present puts its frames) */
++        XSetWindowAttributes attr;
++        RECT client;
++        NtUserGetClientRect( hwnd, &client, NtUserGetDpiForWindow( hwnd ) );
++        surface->colormap = XCreateColormap( gdi_display, DefaultRootWindow( gdi_display ), argb_visual.visual, AllocNone );
++        attr.colormap = surface->colormap;
++        attr.border_pixel = 0;
++        attr.background_pixel = 0;
++        surface->window = XCreateWindow( gdi_display, get_dummy_parent(), 0, 0,
++                                         min( max( 1, client.right ), 65535 ), min( max( 1, client.bottom ), 65535 ),
++                                         0, 32, InputOutput, argb_visual.visual,
++                                         CWColormap | CWBorderPixel | CWBackPixel, &attr );
++        if (surface->window) XMapWindow( gdi_display, surface->window );
++        TRACE( "%p: a glass popup, offscreen window %lx with alpha\n", hwnd, surface->window );
++    }
++    else if (!(surface->window = create_client_window( hwnd, &default_visual, default_colormap )))
+     {
+         ERR("Failed to allocate client window for hwnd=%p\n", hwnd);
+         free( surface );
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+     }
++    if (surface->blend && !surface->window)
++    {
++        ERR("Failed to create the glass popup's window for hwnd=%p\n", hwnd);
++        vulkan_surface_destroy( hwnd, surface );
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
+     NtUserGetClientRect( hwnd, &surface->rect, NtUserGetDpiForWindow( hwnd ) );
+ 
+     info.window = surface->window;
+@@ -135,6 +271,7 @@
+ 
+     TRACE( "%p %p\n", hwnd, private );
+ 
++    if (surface->blend) return;
+     if ((data = get_win_data( hwnd )))
+     {
+         detach_client_window( data, client_window );
+@@ -158,7 +295,7 @@
+ 
+ static void vulkan_surface_update_offscreen( HWND hwnd, struct x11drv_vulkan_surface *surface )
+ {
+-    BOOL offscreen = needs_offscreen_rendering( hwnd, FALSE );
++    BOOL offscreen = surface->blend || needs_offscreen_rendering( hwnd, FALSE );
+     struct x11drv_win_data *data;
+ 
+     if (offscreen == surface->offscreen) return;
+@@ -192,7 +329,7 @@
+ #endif
+     }
+ 
+-    if ((data = get_win_data( hwnd )))
++    if (!surface->blend && (data = get_win_data( hwnd )))
+     {
+         if (surface->offscreen) detach_client_window( data, surface->window );
+         else attach_client_window( data, surface->window );
+@@ -252,6 +389,12 @@
+         }
+     }
+ 
++    if (surface->blend && blend_present( surface, window, &rect_dst ))
++    {
++        if (region) NtGdiDeleteObjectApp( region );
++        NtUserReleaseDC( hwnd, hdc );
++        return;
++    }
+     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
+         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
+     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
