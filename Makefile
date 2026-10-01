@@ -334,6 +334,10 @@ test-drivewatch:
 test-systemtemp:
 	WINE=$(PREFIX)/bin/wine test/systemtemp-gate.sh
 
+# IP_MULTICAST_IF by interface index (0639): DYMO Connect's web service.
+test-mcastif:
+	WINE=$(PREFIX)/bin/wine test/mcastif-gate.sh
+
 # The taskbar's Horizon and Glass looks, beside the flat default (0600).
 test-taskbarlooks:
 	WINE=$(PREFIX)/bin/wine test/taskbarlooks-gate.sh
