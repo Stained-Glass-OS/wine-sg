@@ -43,11 +43,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-build() { # name level
+build() { # name level [comment]
     cat > "$W/$1.manifest" <<EOM
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
 <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2"><security><requestedPrivileges>
+${3:-}
 <requestedExecutionLevel level="$2" uiAccess="false"/>
 </requestedPrivileges></security></trustInfo></assembly>
 EOM
@@ -58,6 +59,8 @@ EOM
 build admin requireAdministrator
 build highest highestAvailable
 build invoker asInvoker
+# HandBrake's: the level it does not use, commented out, before the one it does
+build commented asInvoker '<!-- <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/> -->'
 chmod 755 "$W"/*.exe
 mkdir -m 777 "$W/out"
 # the stand-in broker client: records its arguments
@@ -89,6 +92,9 @@ out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
     || fail "requireAdministrator CreateProcess: '$out'"
 out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/invoker.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "an asInvoker program runs" || fail "asInvoker: '$out'"
+out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/commented.exe")")
+[ "$out" = "CREATE ok 7" ] && pass "requireAdministrator inside a manifest's comment does not count (HandBrake): it runs" \
+    || fail "commented-out requireAdministrator: '$out'"
 # Its compatibility settings (the Compatibility tab: AppCompatFlags\Layers,
 # wine-sg 0420) say "run as an administrator": the same as requireAdministrator.
 cp "$W/invoker.exe" "$W/layered.exe"; chmod 755 "$W/layered.exe"
