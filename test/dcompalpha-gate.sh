@@ -47,6 +47,9 @@ tr -d '\r' <"$T/out" | sed 's/^/      /'
 grep -q '^NO' "$T/out" && { echo "SKIP: no d3d11 composition here ($(tr -d '\r' <"$T/out"))"; exit 77; }
 set -- $(tr -d '\r' <"$T/out" | grep '^GLASS')
 [ "${2:-0}" = 1 ] && pass "a swap chain with alpha makes its window a sheet of glass" || fail "glass prop: ${2:-?}"
+frame=$(tr -d '\r' <"$T/out" | sed -n 's/^FRAME //p')
+case "$frame" in "0 "[1-9]*) pass "its frame change comes after Commit, not into the window procedure during it ($frame)" ;;
+    *) fail "frame changes inside/after Commit: '$frame' (Qt 6 left its windows blank: 0626)" ;; esac
 if [ -n "${3:-}" ] && [ "${3:-0}" != 0 ]; then
     got=$(xwininfo -id "0x$3" | awk '/Depth:/{printf "depth %s ", $2}')
     px=$(xwd -silent -id "0x$3" | python3 -c '
