@@ -9,6 +9,7 @@
 #     green);
 #   - _SG_SHADOW on each window: 1 for a window with a title bar, 2 for a
 #     popup menu (its class has CS_DROPSHADOW), 0 for the taskbar;
+#   - Alt+Tab's switcher asks for a shadow too (0746, CS_DROPSHADOW);
 #   - _SG_ACRYLIC (0745): the taskbar frosted, 85% opaque, while
 #     Personalization > Colors > Transparency effects is on (the default),
 #     and not once it is turned off.
@@ -67,6 +68,14 @@ xprop -id \$TB _SG_ACRYLIC > "$T/acrylic.on" 2>&1
 "$WINE" reg add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize' /v EnableTransparency /t REG_DWORD /d 0 /f >/dev/null 2>&1
 "$WINE" eraschemes-probe.exe notify >/dev/null 2>&1; sleep 2
 xprop -id \$TB _SG_ACRYLIC > "$T/acrylic.off" 2>&1
+# Alt+Tab's switcher (0746): two windows, Alt held, Tab
+"$WINE" taskkill /f /im rounded-probe.exe >/dev/null 2>&1; sleep 1
+"$WINE" rounded-probe.exe win One 100 100 300 200 & sleep 2
+"$WINE" rounded-probe.exe win Two 200 150 300 200 & sleep 3
+xdotool keydown alt; sleep 0.3; xdotool key Tab; sleep 1.5
+S=\$(xwininfo -root -tree | awk '/"Task Switching"/ { print \$1; exit }')
+xprop -id \$S _SG_SHADOW > "$T/switcher.out" 2>&1
+xdotool keyup alt
 EOF2
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s "-screen 0 800x600x24" "$T/session.sh" > "$T/session.out" 2>&1
@@ -83,6 +92,8 @@ tb=$(awk '/800x[0-9]+\+0\+[0-9]+/ && $0 !~ /800x600/ { print $1; exit }' "$T/tre
 grep "^$tb " "$T/children.out" | grep -q '_SG_SHADOW(CARDINAL) = 0' && pass "the taskbar: _SG_SHADOW 0" \
     || fail "taskbar ($tb): $(grep "^$tb " "$T/children.out")"
 
+grep -q '_SG_SHADOW(CARDINAL) = 2' "$T/switcher.out" && pass "Alt+Tab's switcher asks for a shadow (_SG_SHADOW 2, CS_DROPSHADOW)" \
+    || fail "switcher: $(cat "$T/switcher.out")"
 grep -q '_SG_ACRYLIC(CARDINAL) = 85' "$T/acrylic.on" && pass "the taskbar is frosted (_SG_ACRYLIC 85) with Transparency effects on" \
     || fail "taskbar acrylic: $(cat "$T/acrylic.on")"
 grep -q 'not found' "$T/acrylic.off" && pass "and not once they are turned off" || fail "after turning off: $(cat "$T/acrylic.off")"
