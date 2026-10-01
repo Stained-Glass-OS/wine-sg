@@ -66,6 +66,14 @@ sleep 1
 i=0; while [ \$i -lt 60 ] && ! "$WINE" taskbar-probe.exe state 2>/dev/null | grep -q "^windows=3"; do sleep 1; i=\$((i + 1)); done
 sleep 1
 S default; shot default
+# the Task View button toggles: a click opens it, the next closes it (0606)
+tv=\$("$WINE" taskbar-probe.exe state 2>/dev/null | tr -d '\r' | sed -n 's/^taskview=//p' | head -1)
+set -- \$(echo "\$tv" | awk -F, '{ printf "%d %d", (\$1 + \$3) / 2, (\$2 + \$4) / 2 }')
+xdotool mousemove \$1 \$2 click 1; sleep 2.5
+xdotool search --onlyvisible --name '^Task View\$' >/dev/null 2>&1 && echo open >> "$T/tv.out" || echo closed >> "$T/tv.out"
+xdotool mousemove \$1 \$2 click 1; sleep 2.5
+xdotool search --onlyvisible --name '^Task View\$' >/dev/null 2>&1 && echo open >> "$T/tv.out" || echo closed >> "$T/tv.out"
+xdotool key Escape; sleep 1
 R "$ADV" TaskbarSmallIcons 1; apply; S small; shot small
 R "$ADV" TaskbarGlomLevel 0; apply; S combine
 R "$ADV" TaskbarAl 1; apply; S center; shot center
@@ -120,6 +128,8 @@ mid=$(( (${gr%%,*} + ${gr##*,}) / 2 ))
 [ "$(width "$(v searchbox search)")" = 280 ] && pass "search box shown" || fail "search box: $(v searchbox search)"
 [ "$(width "$(v searchicon search)")" = 48 ] && pass "search icon shown" || fail "search icon: $(v searchicon search)"
 [ "$(count notaskview taskview)" = 0 ] && pass "Task View button hidden" || fail "Task View still shown"
+[ "$(tr '\n' ' ' < "$T/tv.out" 2>/dev/null)" = "open closed " ] && pass "the Task View button toggles: open, then closed" \
+    || fail "Task View button: $(tr '\n' ' ' < "$T/tv.out" 2>/dev/null)"
 
 [ "$(v top bar)" = "0,0,1024,30 topmost=1" ] && [ "$(v top work)" = "0,30,1024,700" ] \
     && pass "position top: the bar at the top, the work area below it" || fail "top: $(v top bar) / $(v top work)"
