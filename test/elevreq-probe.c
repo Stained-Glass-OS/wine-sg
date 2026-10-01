@@ -6,6 +6,8 @@
  *                                      then ShellExecuteEx "runas" on it, print "SHELL ok|err N"
  *   elevreq-probe.exe runaswait PROGRAM ShellExecuteEx "runas" PROGRAM "wait-me", wait on
  *                                      its handle, print "WAIT code N secs S" (or "WAIT nohandle")
+ *   elevreq-probe.exe runastime PROGRAM ShellExecuteEx "runas" PROGRAM "slow-ready": how long
+ *                                      the call itself takes, "RUNASTIME ms N" (0625)
  * The PROGRAMs are this same source built with different manifests; run
  * without arguments they print "RAN" and exit 7. */
 #define COBJMACROS
@@ -48,6 +50,17 @@ int main(int argc, char **argv)
         sei.lpVerb = L"runas"; sei.lpFile = lnk; sei.nShow = SW_SHOWNORMAL;
         if (ShellExecuteExW(&sei)) { if (sei.hProcess) WaitForSingleObject(sei.hProcess, 20000); printf("SHELL ok\n"); }
         else printf("SHELL err %lu\n", GetLastError());
+    }
+    else if (!strcmp(argv[1], "runastime"))
+    {
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        DWORD t0 = GetTickCount();
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+        sei.lpVerb = L"runas"; sei.lpFile = prog; sei.nShow = SW_SHOWNORMAL;
+        sei.lpParameters = L"slow-ready";
+        if (!ShellExecuteExW(&sei)) printf("RUNASTIME err %lu\n", GetLastError());
+        else printf("RUNASTIME ms %lu\n", GetTickCount() - t0);
+        if (sei.hProcess) WaitForSingleObject(sei.hProcess, 30000);
     }
     else if (!strcmp(argv[1], "runaswait") || !strcmp(argv[1], "runasuac"))
     {

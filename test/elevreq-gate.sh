@@ -67,9 +67,16 @@ mkdir -m 777 "$W/out"
 # the stand-in broker client: records its arguments
 cat > "$W/elevate" <<EOS
 #!/bin/sh
+# --ready FILE (0625): the broker's answer, "0" launched; "slow-ready" -- as
+# a consent prompt and an elevated program's start take -- four seconds late
+ready=""
+if [ "\$1" = --ready ]; then ready=\$2; shift 2; printf 'ready\n' >> "$W/out/ready.log"; fi
 printf '%s\n' "\$*" >> "$W/out/elevate.log"   # not echo: dash's eats Windows paths' backslashes
-case "\$*" in *wait-me*) sleep 2; exit 7 ;; esac
+case "\$*" in *slow-ready*) sleep 4 ;; esac
+[ -n "\$ready" ] && printf 0 > "\$ready"
+case "\$*" in *wait-me*) sleep 2; exit 7 ;; *slow-ready*) sleep 6 ;; esac
 EOS
+printf 'ready\n' > "$W/elevate.features"
 chmod 755 "$W/elevate"
 
 mkdir "$PFX"
@@ -84,8 +91,9 @@ chmod -R g+rwX "$PFX" 2>/dev/null
 
 other() {
     sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" \
-        HOME=/var/tmp SG_ELEVATE="$W/elevate" ${SG_USER_ADMIN:+SG_USER_ADMIN=$SG_USER_ADMIN} "$@" 2>/dev/null |
-        tr -d '\r' | grep -E '^(CREATE|SHELL) '
+        HOME=/var/tmp SG_ELEVATE="$W/elevate" SG_ELEVATE_FEATURES="$W/elevate.features" \
+        ${SG_USER_ADMIN:+SG_USER_ADMIN=$SG_USER_ADMIN} "$@" 2>/dev/null |
+        tr -d '\r' | grep -E '^(CREATE|SHELL|RUNASTIME) '
 }
 zp() { printf 'Z:%s' "${1//\//\\}"; }
 
@@ -167,6 +175,16 @@ SG_USER_ADMIN=1 other "$WINE" start /wait "$(zp "$W/highest.exe")" >/dev/null
 log=$(cat "$W/out/elevate.log" 2>/dev/null)
 case "$log" in *highest.exe*) pass "an administrator's start of a highestAvailable program too ($log)" ;;
     *) fail "start /wait highest.exe, administrator: broker saw '$log'" ;; esac
+# ShellExecuteEx "runas" returns once the elevated program has started, as
+# Windows' does (0625): Total Commander's installer connects to its elevated
+# copy straight after, and gave up while the consent prompt was still up
+rm -f "$W/out/ready.log"
+out=$(other "$WINE" "$W/invoker.exe" runastime "$(zp "$W/invoker.exe")")
+ms=${out#RUNASTIME ms }
+case "$out" in "RUNASTIME ms "*) [ "$ms" -ge 3500 ] && [ "$ms" -lt 9000 ] && [ -s "$W/out/ready.log" ] \
+        && pass "ShellExecuteEx runas returns once the broker says launched (${ms} ms, not before)" \
+        || fail "runas returned after ${ms} ms (ready asked: $(cat "$W/out/ready.log" 2>/dev/null))" ;;
+    *) fail "runastime: '$out'" ;; esac
 out=$(other env SG_IN_BROKER=1 "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "inside a program the broker started, it runs (no loop)" || fail "SG_IN_BROKER: '$out'"
 # no broker installed (a relative SG_ELEVATE is not a stand-in, and this
