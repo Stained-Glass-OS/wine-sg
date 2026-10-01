@@ -222,6 +222,10 @@ test-dispchange:
 test-rounded:
 	WINE=$(PREFIX)/bin/wine test/rounded-gate.sh
 
+# The Rounded style's edit boxes, list boxes and views are round too; radio buttons whole (0740).
+test-roundedctl:
+	WINE=$(PREFIX)/bin/wine test/roundedctl-gate.sh
+
 # Programs pinned to the taskbar (0485).
 test-taskpins:
 	WINE=$(PREFIX)/bin/wine test/taskpins-gate.sh

@@ -10,13 +10,16 @@
 # Like theme/dark.py, the schemes are *derived* from Light, so every control
 # Light knows has a Rounded look and they never drift apart:
 #
-#   rounded_*.svg/.bmp   every blue_*.svg with its corners' radii doubled
-#                        (a quarter more for check boxes, which stay square),
+#   rounded_*.svg/.bmp   every blue_*.svg with its rectangles' corner radii
+#                        doubled (a quarter more for check boxes, which stay
+#                        square; square frames get round corners),
 #                        the purple accent turned to blue and the mid greys
 #                        (edges) lightened, rendered by tools/buildimage
 #   roundeddark_*.bmp    those, remapped onto the dark ramp by dark.py's rule
 #   rounded.rc           ROUNDED_INI and ROUNDEDDARK_INI -- BLUE_INI with its
-#                        images renamed and its colours moved the same way --
+#                        images renamed and its colours moved the same way,
+#                        its bordered fills round (BorderType = RoundRect,
+#                        0740) and a focused edit box's frame the accent --
 #                        and the BITMAP resources. light.rc #includes it.
 #
 # build.sh runs this after dark.py. Our own work; nothing is drawn by hand.
@@ -32,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dark  # noqa: E402  (the dark ramp, and the INI and bitmap helpers)
 
 ACCENT_HUE = 207.0 / 360.0    # newer Windows' default accent, #005FB8, is this blue
+LIGHT_ACCENT = (123, 47, 190)  # Light's purple accent (a default button's frame)
 
 
 def recolour(r, g, b):
@@ -51,6 +55,21 @@ def recolour(r, g, b):
 
 HEX = re.compile(r"#([0-9a-fA-F]{6})\b|#([0-9a-fA-F]{3})\b")
 RADIUS = re.compile(r'\b(rx|ry)="([0-9.]+)"')
+RECT = re.compile(r"<rect\b[^>]*>")
+# Only a rectangle's corner radii: an <ellipse>'s rx and ry are its size
+# (doubling them drew radio buttons as broken arcs).
+
+# The parts drawn as a bordered fill (BgType = BorderFill) whose corners are
+# round in the Rounded scheme, by uxtheme's BorderType = RoundRect (0740):
+# the frames of edit boxes, combo boxes, list boxes and list and tree views
+# (Explorer's too).
+ROUND_FILLS = ("Edit", "ComboBox", "ListBox", "ListView", "TreeView", "Explorer::ListView", "Explorer::TreeView")
+ROUND_FILL_PROPS = ["BorderType = RoundRect", "RoundCornerWidth = 8", "RoundCornerHeight = 8"]
+# Frames drawn from square images: their rectangles get the radius the
+# 2-pixel sizing margins hold (an edit box's EditBorder parts, a combo box's
+# border).
+SQUARE_FRAMES = ("edit_border_", "combobox_border")
+FRAME_RX = ".45"
 
 
 def rounded_svg(text, factor=2.0):
@@ -63,7 +82,30 @@ def rounded_svg(text, factor=2.0):
         return '%s="%s"' % (m.group(1), "%.5g" % (float(m.group(2)) * factor))
 
     text = HEX.sub(hexsub, text)
-    return RADIUS.sub(radsub, text)
+    return RECT.sub(lambda m: RADIUS.sub(radsub, m.group(0)), text)
+
+
+def round_frame_svg(text):
+    """A square frame's rectangles given round corners."""
+    def add(m):
+        r = m.group(0)
+        if "rx=" in r:
+            return r
+        return r[:5] + ' rx="%s" ry="%s"' % (FRAME_RX, FRAME_RX) + r[5:]
+    return RECT.sub(add, text)
+
+
+def round_fills(lines):
+    """The ROUND_FILLS sections, with round corners."""
+    out = []
+    for line in lines:
+        out.append(line)
+        m = re.match(r'^"\[([A-Za-z:]+)\]\\r\\n"$', line.strip())
+        if m and m.group(1) in ROUND_FILLS:
+            out += ['"%s\\r\\n"' % p for p in ROUND_FILL_PROPS]
+    # a focused edit box's frame in the accent colour, as newer Windows marks it
+    out += ['', '"[Edit.EditText(Focused)]\\r\\n"', '"BorderColor = %d %d %d\\r\\n"' % recolour(*LIGHT_ACCENT)]
+    return out
 
 
 def render(tree, svg, bmp):
@@ -92,7 +134,7 @@ def main(d):
     tree = os.path.normpath(os.path.join(d, "..", ".."))
     rc = open(os.path.join(d, "light.rc"), encoding="utf-8").read()
     blue = dark.ini_block(rc, "BLUE_INI")
-    light_body = rounded_ini(blue, "rounded")
+    light_body = round_fills(rounded_ini(blue, "rounded"))
     # Rounded Dark: the Rounded INI through dark.py's remapping, its images renamed
     dark_body = [line.replace("roundeddark_", "rounded_") for line in dark.dark_ini(light_body)]
     dark_body = [re.sub(r"rounded_([a-z0-9_]+)\.bmp", r"roundeddark_\1.bmp", line) for line in dark_body]
@@ -112,7 +154,10 @@ def main(d):
                 text = fh.read()
             with open(out_svg, "w", encoding="utf-8") as fh:
                 # a check box's small square stays a square with round corners
-                fh.write(rounded_svg(text, 1.25 if stem.startswith("checkbox") else 2.0))
+                text = rounded_svg(text, 1.25 if stem.startswith("checkbox") else 2.0)
+                if stem.startswith(SQUARE_FRAMES):
+                    text = round_frame_svg(text)
+                fh.write(text)
             render(tree, out_svg, out_bmp)
         else:
             # a pre-rendered image without a source: its colours, moved the same way
