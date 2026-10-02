@@ -88,6 +88,15 @@ xdotool mousemove 200 "\$(( \$(sed -n 's/^rect=[0-9-]*,\([0-9-]*\),.*/\1/p' "$T/
 xdotool mousemove 150 400; sleep 0.3; xdotool mousemove 0 650; sleep 1; xdotool mouseup 1; sleep 1.5; P rect Alpha
 xdotool mousemove 200 "\$(( \$(sed -n 's/^rect=[0-9-]*,\([0-9-]*\),.*/\1/p' "$T/log.out" | tail -1) + 12 ))" mousedown 1; sleep 0.3
 xdotool mousemove 400 150; sleep 0.3; xdotool mousemove 500 0; sleep 1; xdotool mouseup 1; sleep 1.5; P rect Alpha
+# maximized from the top edge, its caption was above the screen: a double-click
+# restores it with the caption on the screen (0750); maximized again, a click on
+# the caption leaves it, a drag down restores it under the pointer
+xdotool mousemove 300 8; sleep 0.3; xdotool click --repeat 2 --delay 90 1; sleep 1.5; P rect Alpha
+xdotool mousemove "\$(( (\$(sed -n 's/^rect=\([0-9-]*\),.*/\1/p' "$T/log.out" | tail -1) + \$(sed -n 's/^rect=[0-9-]*,[0-9-]*,\([0-9-]*\),.*/\1/p' "$T/log.out" | tail -1)) / 2 ))" \
+    "\$(( \$(sed -n 's/^rect=[0-9-]*,\([0-9-]*\),.*/\1/p' "$T/log.out" | tail -1) + 12 ))"; sleep 0.3
+xdotool click --repeat 2 --delay 90 1; sleep 1.5; P rect Alpha
+xdotool mousemove 300 8; sleep 0.3; xdotool click 1; sleep 1.5; P rect Alpha
+xdotool mousemove 300 8 mousedown 1; sleep 0.3; xdotool mousemove 305 60; sleep 0.3; xdotool mousemove 520 300; sleep 0.8; xdotool mouseup 1; sleep 1.5; P rect Alpha
 K super; P find '#32768'
 K Escape
 K super+r; P find '#32770' Run
@@ -125,6 +134,19 @@ case "$(after 'rect Alpha' 3)" in *"iconic=0") pass "and Win+D again puts them b
 [ "$(after 'rect Alpha' 4)" = "rect=$wl,$wt,$mid,$wb zoomed=0 iconic=0" ] && pass "and letting go snaps it to that half" || fail "drag snap: $(after 'rect Alpha' 4)"
 [ "$(after 'rect Alpha' 6)" = "rect=$wl,$midy,$mid,$wb zoomed=0 iconic=0" ] && pass "dragging it into the bottom-left corner snaps it to that quarter" || fail "drag to a corner: $(after 'rect Alpha' 6)"
 case "$(after 'rect Alpha' 7)" in *"zoomed=1 iconic=0") pass "dragging it to the top edge maximizes it" ;; *) fail "drag to top: $(after 'rect Alpha' 7)" ;; esac
+IFS=', ' read -r al at ar ab _ <<R
+$(after 'rect Alpha' 8 | sed 's/^rect=//; s/ zoomed=.*//')
+R
+case "$(after 'rect Alpha' 8)" in *"zoomed=0 iconic=0") [ "${at:--1}" -ge "$wt" ] && pass "double-clicked, it comes back with its caption on the screen" || fail "restored above the screen: $(after 'rect Alpha' 8)" ;; *) fail "double-click restore: $(after 'rect Alpha' 8)" ;; esac
+case "$(after 'rect Alpha' 10)" in *"zoomed=1 iconic=0") pass "a click on a maximized window's caption leaves it maximized" ;; *) fail "click on the caption: $(after 'rect Alpha' 10) (double-clicked again: $(after 'rect Alpha' 9))" ;; esac
+IFS=', ' read -r al at ar ab _ <<R
+$(after 'rect Alpha' 11 | sed 's/^rect=//; s/ zoomed=.*//')
+R
+case "$(after 'rect Alpha' 11)" in
+*"zoomed=0 iconic=0") [ "${al:-9999}" -lt 520 ] && [ "${ar:-0}" -gt 520 ] && [ "${at:-9999}" -lt 300 ] && [ "$((at + 40))" -gt 300 ] &&
+    pass "dragging a maximized window down restores it, under the pointer by its caption" || fail "restored, but not under the pointer: $(after 'rect Alpha' 11)" ;;
+*) fail "dragging the maximized window down: $(after 'rect Alpha' 11)" ;;
+esac
 [ "$(after "find #32768")" = "found=1" ] && pass "the Windows key alone opens Start" || fail "Start did not open: $(after "find #32768")"
 [ "$(after "find #32770 Run")" = "found=1" ] && pass "Win+R opens Run" || fail "Run: $(after "find #32770 Run")"
 [ "$(after 'find ExplorerWClass')" = "found=1" ] && pass "Win+E opens File Explorer" || fail "File Explorer: $(after 'find ExplorerWClass')"
