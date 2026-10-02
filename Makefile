@@ -290,6 +290,10 @@ test-shellrestart:
 test-batchcp:
 	WINE=$(PREFIX)/bin/wine test/batchcp-gate.sh
 
+# sysdm.cpl: System Properties opens the Control Panel's own (0757).
+test-sysdm:
+	WINE=$(PREFIX)/bin/wine test/sysdm-gate.sh
+
 # 0617: an elevated program's Start menu and desktop are all users'.
 test-elevfolders:
 	WINE=$(PREFIX)/bin/wine test/elevfolders-gate.sh
