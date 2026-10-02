@@ -56,6 +56,7 @@ xwininfo -root -tree > "$T/tree.txt"
 w=\$(sed -n 's/^ *\(0x[0-9a-f]*\) "glassvk".*/\1/p' "$T/tree.txt" | head -1)
 echo "\$w" > "$T/popup"
 [ -n "\$w" ] && "$T/backdrop-check" "\$w" > "$T/backdrop.out"
+[ -n "\$w" ] && xwininfo -id "\$w" | sed -n 's/^ *Depth: //p' > "$T/popupdepth"
 for c in \$(grep -o '0x[0-9a-f]* (has no name): ()  300x200' "$T/tree.txt" | cut -d' ' -f1); do
     xwininfo -id "\$c" | grep -q 'Depth: 32' && echo "\$c" >> "$T/argb.out"
 done
@@ -68,6 +69,10 @@ echo "      popup $(cat "$T/popup"): $(cat "$T/backdrop.out" 2>/dev/null)"
 grep -q 'pixmap=0x.* 300x200 pixel=ff00ff' "$T/backdrop.out" 2>/dev/null &&
     pass "the popup names its backdrop: a pixmap of the desktop under it (magenta)" ||
     fail "the popup names no backdrop of the desktop: $(cat "$T/backdrop.out" 2>/dev/null)"
+# with the desktop's compositor there is no backdrop: the frame keeps its
+# alpha for the compositor (0753), which needs the popup's window to have it
+[ "$(cat "$T/popupdepth" 2>/dev/null)" = 32 ] && pass "the popup's own X window has alpha (depth 32), for the desktop's compositor" ||
+    fail "the popup's X window: depth $(cat "$T/popupdepth" 2>/dev/null)"
 [ -s "$T/argb.out" ] && pass "the other process's swap chain is in a 32-bit window of the popup's size ($(head -1 "$T/argb.out"))" ||
     fail "no 32-bit window for the other process's swap chain"
 exit $RC

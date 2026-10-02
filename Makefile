@@ -274,6 +274,10 @@ test-shellnew:
 test-glassvk:
 	WINE=$(PREFIX)/bin/wine test/glassvk-gate.sh
 
+# A Vulkan glass popup keeps its see-through edge under the compositor (0753).
+test-glasspixel:
+	test/glasspixel-gate.sh
+
 # 0617: an elevated program's Start menu and desktop are all users'.
 test-elevfolders:
 	WINE=$(PREFIX)/bin/wine test/elevfolders-gate.sh
