@@ -13,14 +13,11 @@
 # started again: no X error, and a desktop X window with the shell's windows
 # (its taskbar) in it.
 #
-# The gate reaches the dead-window state (wine-sg 10.0-134, and the mutant
-# SG_MUTANT_STALE_DESKTOP, die there with BadWindow).
-#
-# KNOWN, printed not failed: the restarted shell still does not show the
-# desktop here. The old desktop window lives on, detached (no thread);
-# wineserver makes the new shell's desktop window a child of it, its
-# WM_NCCREATE refuses that, and the shell exits. Taking the detached
-# desktop window over needs a wineserver change (create_window).
+# The old desktop window lives on detached (no thread); wineserver made the
+# new shell's desktop window a child of it, its WM_NCCREATE refused that and
+# the shell exited -- now the new shell takes the detached window over
+# (patches/sg/0761). Mutants: SG_MUTANT_STALE_DESKTOP (BadWindow),
+# SG_MUTANT_NO_DESKTOP_TAKEOVER (no desktop after the restart).
 #
 #   WINE=/opt/wine-sg/bin/wine test/shellrestart-gate.sh
 set -u
@@ -76,6 +73,6 @@ grep -q 'BadWindow\|X Error' "$T/explorer2.out" && fail "the shell started again
     || pass "the shell started again takes no dead window (no X error)"
 [ -n "$(cat "$T/desk2" 2>/dev/null)" ] && [ "$(cat "$T/children2" 2>/dev/null || echo 0)" -ge 1 ] \
     && pass "the desktop shows again, with the shell's windows (the taskbar) in it ($(cat "$T/children2") windows)" \
-    || echo "KNOWN  no desktop after the restart: the detached desktop window is not taken over (see the top)"
+    || fail "no desktop after the restart: the detached desktop window was not taken over"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
