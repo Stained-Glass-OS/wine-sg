@@ -282,6 +282,10 @@ test-glasspixel:
 test-signin-startup:
 	WINE=$(PREFIX)/bin/wine test/signin-startup-gate.sh
 
+# A shell started again shows the desktop in its own X window (0755).
+test-shellrestart:
+	WINE=$(PREFIX)/bin/wine test/shellrestart-gate.sh
+
 # 0617: an elevated program's Start menu and desktop are all users'.
 test-elevfolders:
 	WINE=$(PREFIX)/bin/wine test/elevfolders-gate.sh
