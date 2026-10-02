@@ -286,6 +286,10 @@ test-signin-startup:
 test-shellrestart:
 	WINE=$(PREFIX)/bin/wine test/shellrestart-gate.sh
 
+# A batch file is read in the console's code page (0756).
+test-batchcp:
+	WINE=$(PREFIX)/bin/wine test/batchcp-gate.sh
+
 # 0617: an elevated program's Start menu and desktop are all users'.
 test-elevfolders:
 	WINE=$(PREFIX)/bin/wine test/elevfolders-gate.sh
