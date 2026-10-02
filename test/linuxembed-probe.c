@@ -20,6 +20,14 @@ int main( int argc, char **argv )
         printf( "foreground=%d\n", hwnd && GetForegroundWindow() == hwnd );
         return 0;
     }
+    if (!strcmp( argv[1], "zabove" ) && argc == 6)   /* is CLASS TITLE above CLASS2 TITLE2 in Wine's Z order */
+    {
+        HWND other = FindWindowA( argv[4], argv[5][0] ? argv[5] : NULL ), w;
+        int above = 0;
+        if (hwnd && other) for (w = GetWindow( hwnd, GW_HWNDNEXT ); w; w = GetWindow( w, GW_HWNDNEXT )) if (w == other) above = 1;
+        printf( "above=%d\n", above );
+        return 0;
+    }
     if (!hwnd) { printf( "none\n" ); return 1; }
     if (!strcmp( argv[1], "activate" ))
     {

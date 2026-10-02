@@ -83,8 +83,10 @@ p2=$(px)
 # 2b. a click into it, Notepad active: its frame comes forward
 "$WINE" probe.exe activate Notepad "" > /dev/null 2>&1; sleep 1
 xdotool mousemove 150 150; sleep 0.3; xdotool click 1; sleep 1.5
-"$WINE" probe.exe foreground SgLinuxWindow "Linux Terminal" | grep -q 'foreground=1' \
-    && pass "a click into it brings its frame forward" || fail "a click into it did not activate its frame"
+"$WINE" probe.exe foreground SgLinuxWindow "Linux Terminal" | grep -q 'foreground=1' && [ "$(px)" = "$COL" ] \
+    && "$WINE" probe.exe zabove SgLinuxWindow "Linux Terminal" Notepad "" | grep -q 'above=1' \
+    && pass "a click into it brings its frame forward: active, and over Notepad ($(px))" \
+    || fail "a click into it: active $("$WINE" probe.exe foreground SgLinuxWindow "Linux Terminal" | tr -d '\r'), where it overlaps Notepad $(px) (want $COL), $("$WINE" probe.exe zabove SgLinuxWindow "Linux Terminal" Notepad "" | tr -d '\r')"
 
 # 3. keys, the pointer away from it
 xdotool mousemove 900 650; sleep 0.3
@@ -94,10 +96,14 @@ xdotool type --delay 40 'touch typed-here'; xdotool key Return; sleep 1.5
 # 4. Alt+Tab to Notepad, released; again, back to it (it comes forward)
 fg() { "$WINE" probe.exe foreground "$1" "$2" | grep -q 'foreground=1'; }
 alttab() { xdotool keydown alt; sleep 0.3; xdotool key Tab; sleep 1; xdotool keyup alt; sleep 1.5; }
+# in front as drawn and in Wine's Z order, which the next Alt+Tab goes by
+above() { "$WINE" probe.exe zabove "$1" "$2" "$3" "$4" | grep -q 'above=1'; }
 alttab
-fg Notepad "" && [ "$(px)" != "$COL" ] && a1=ok || a1="Notepad foreground: $(fg Notepad "" && echo yes || echo no), pixel $(px)"
+fg Notepad "" && [ "$(px)" != "$COL" ] && above Notepad "" SgLinuxWindow "Linux Terminal" && a1=ok \
+    || a1="Notepad foreground: $(fg Notepad "" && echo yes || echo no), pixel $(px), above it: $(above Notepad "" SgLinuxWindow "Linux Terminal" && echo yes || echo no)"
 alttab
-fg SgLinuxWindow "Linux Terminal" && [ "$(px)" = "$COL" ] && a2=ok || a2="it foreground: $(fg SgLinuxWindow "Linux Terminal" && echo yes || echo no), pixel $(px)"
+fg SgLinuxWindow "Linux Terminal" && [ "$(px)" = "$COL" ] && above SgLinuxWindow "Linux Terminal" Notepad "" && a2=ok \
+    || a2="it foreground: $(fg SgLinuxWindow "Linux Terminal" && echo yes || echo no), pixel $(px), above Notepad: $(above SgLinuxWindow "Linux Terminal" Notepad "" && echo yes || echo no)"
 [ "$a1" = ok ] && [ "$a2" = ok ] && pass "Alt+Tab from it to Notepad, and back: each released switch made, the window chosen in front" \
     || fail "Alt+Tab: to Notepad: $a1; back: $a2"
 
