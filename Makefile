@@ -279,8 +279,8 @@ test-glasspixel:
 	test/glasspixel-gate.sh
 
 # The programs that start at sign-in: Run keys and Startup folders (0754).
-test-startup:
-	WINE=$(PREFIX)/bin/wine test/startup-gate.sh
+test-signin-startup:
+	WINE=$(PREFIX)/bin/wine test/signin-startup-gate.sh
 
 # 0617: an elevated program's Start menu and desktop are all users'.
 test-elevfolders:

@@ -1,73 +1,71 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# The programs that start at sign-in (patches/sg/0754): the shell runs the Run
-# keys (the machine's in both registry views, the person's), the person's
-# RunOnce (removed as it runs) and the Startup folders -- once per sign-in,
-# not those turned off in Task Manager (StartupApproved). Nothing ran them in
-# a session: AmbirScan's, athenaNet Device Manager's and DYMO's tray programs
-# never started (David 2026-10-01).
+# A startup item turned off in Task Manager does not start (patches/sg/0125).
 #
-# Each entry appends a line to its own file. Explorer started for sign-in 11:
-# each enabled entry once, the turned-off one never, RunOnce gone. Explorer
-# started again in sign-in 11: nothing more. Sign-in 12: the enabled ones again,
-# RunOnce not.
+# Windows keeps Task Manager's Startup tab choices in
+# Explorer\StartupApproved\{Run,Run32,StartupFolder}: a binary value per entry,
+# first byte odd when disabled. wineboot, starting the Run keys and the Startup
+# folder, must skip what is disabled there, start what is enabled or not listed,
+# and never apply it to RunOnce.
 #
 #   WINE=/opt/wine-sg/bin/wine test/startup-gate.sh
 set -u
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
+MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 RC=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
+command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW not installed"; exit 77; }
 command -v xvfb-run >/dev/null || { echo "SKIP: needs xvfb-run"; exit 77; }
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
-
 T=$(mktemp -d /var/tmp/sg-startup.XXXXXX)
-export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
-trap '"$WINESERVER" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"' EXIT INT TERM
+export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" WINESERVER
+cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
+trap cleanup EXIT INT TERM
+
+"$MINGW" -municode -O2 -o "$T/probe.exe" "$HERE/handoff-probe.c" || { fail "probe did not build"; exit 1; }
+mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
-M='C:\m'
-mkdir -p "$WINEPREFIX/drive_c/m"
+C="$WINEPREFIX/drive_c"
+cp "$T/probe.exe" "$C/standin.exe"
 R='Software\Microsoft\Windows\CurrentVersion'
-add() { "$WINE" reg add "$1" /v "$2" /d "cmd /c echo x>>$M\\$2.txt" /f ${3:-} >/dev/null 2>&1; }
-add "HKLM\\$R\\Run" hklm64 /reg:64
-add "HKLM\\$R\\Run" hklm32 /reg:32
-add "HKCU\\$R\\Run" hkcu
-add "HKCU\\$R\\Run" off
-add "HKCU\\$R\\RunOnce" once
-"$WINE" reg add "HKCU\\$R\\Explorer\\StartupApproved\\Run" /v off /t REG_BINARY /d 030000000000000000000000 /f >/dev/null 2>&1
-S="$WINEPREFIX/drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs/StartUp"
-mkdir -p "$S"
-printf 'echo x>>C:\\m\\folder.txt\r\n' > "$S/folder.bat"
-"$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
-"$WINE" reg add 'HKCU\Software\Wine\Explorer\Desktops' /v shell /d 800x600 /f >/dev/null 2>&1
+A="$R\\Explorer\\StartupApproved"
+reg() { "$WINE" reg add "$@" /f >/dev/null 2>&1; }
+reg "HKCU\\$R\\Run" /v UserOn /d 'C:\standin.exe user-on'
+reg "HKCU\\$R\\Run" /v UserOff /d 'C:\standin.exe user-off'
+reg "HKCU\\$R\\Run" /v UserApproved /d 'C:\standin.exe user-approved'
+reg "HKLM\\$R\\Run" /v MachineOff /d 'C:\standin.exe machine-off'
+reg "HKLM\\$R\\Run" /v MachineOn /d 'C:\standin.exe machine-on'
+reg "HKLM\\$R\\Run" /v Wow32Off /d 'C:\standin.exe wow32-off' /reg:32
+reg "HKLM\\$R\\RunOnce" /v OnceListed /d 'C:\standin.exe once'
+reg "HKCU\\$A\\Run" /v UserOff /t REG_BINARY /d 030000000000000000000000
+reg "HKCU\\$A\\Run" /v UserApproved /t REG_BINARY /d 020000000000000000000000
+reg "HKLM\\$A\\Run" /v OnceListed /t REG_BINARY /d 030000000000000000000000
+reg "HKLM\\$A\\Run" /v MachineOff /t REG_BINARY /d 070000000000000000000000
+reg "HKLM\\$A\\Run32" /v Wow32Off /t REG_BINARY /d 030000000000000000000000
+reg "HKCU\\$A\\StartupFolder" /v folder-off.exe /t REG_BINARY /d 030000000000000000000000
+S=$(find "$C/users" -path '*Start Menu/Programs/StartUp' -type d | grep -v Public | head -1)
+[ -n "$S" ] || { mkdir -p "$C/users/$(id -un)/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/StartUp"; S="$C/users/$(id -un)/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/StartUp"; }
+cp "$T/probe.exe" "$S/folder-on.exe"; cp "$T/probe.exe" "$S/folder-off.exe"
 "$WINESERVER" -w
-
-cat > "$T/session.sh" <<EOF2
-#!/bin/sh
-cd "$WINEPREFIX/drive_c"
-shell() {
-    XDG_SESSION_ID=\$1 "$WINE" explorer /desktop=shell,800x600 > "$T/explorer-\$2.out" 2>&1 &
-    sleep 12
-    pkill -f 'explorer.exe /desktop=shell' ; sleep 2
-    for f in hklm64 hklm32 hkcu off once folder; do printf '%s=%s ' \$f \$(cat "$WINEPREFIX/drive_c/m/\$f.txt" 2>/dev/null | wc -l); done > "$T/count-\$2"
-}
-shell 11 a
-shell 11 b
-shell 12 c
-"$WINE" reg query 'HKCU\\$R\\RunOnce' /v once > "$T/runonce" 2>&1
-EOF2
-chmod +x "$T/session.sh"
-timeout -s KILL 300 xvfb-run -a -s "-screen 0 800x600x24" "$T/session.sh" > "$T/session.out" 2>&1
-a=$(cat "$T/count-a" 2>/dev/null); b=$(cat "$T/count-b" 2>/dev/null); c=$(cat "$T/count-c" 2>/dev/null)
-echo "      sign-in 11: $a"; echo "      again in 11: $b"; echo "      sign-in 12: $c"
-[ "$a" = "hklm64=1 hklm32=1 hkcu=1 off=0 once=1 folder=1 " ] \
-    && pass "at sign-in: the machine's Run keys (both views), the person's Run and RunOnce, the Startup folder" \
-    || fail "at sign-in: $a"
-grep -q 'off=0' "$T/count-a" && pass "not an entry turned off in Task Manager (StartupApproved)" || fail "the turned-off entry ran: $a"
-grep -qi 'unable to find\|not find' "$T/runonce" && pass "RunOnce's value is gone once it ran" || fail "RunOnce kept: $(tr -d '\r' < "$T/runonce" | head -3)"
-[ "$b" = "$a" ] && pass "the shell started again in the same sign-in starts nothing again" || fail "explorer restarted: $b (was $a)"
-[ "$c" = "hklm64=2 hklm32=2 hkcu=2 off=0 once=1 folder=2 " ] && pass "the next sign-in: all again, RunOnce not" || fail "next sign-in: $c"
-[ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
-exit "$RC"
+# a session's start: wineboot runs the Run keys and the Startup folder
+(cd "$C" && timeout -s KILL 120 xvfb-run -a "$WINE" wineboot >/dev/null 2>&1)
+i=0; while [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+"$WINESERVER" -w
+log=$(tr -d '\r' < "$C/standin.log" 2>/dev/null)
+printf '%s\n' "$log" | sed 's/^/      /'
+has() { printf '%s\n' "$log" | grep -q -- "$1"; }
+has 'user-on'       && pass "an HKCU Run entry with no StartupApproved value starts" || fail "user-on did not start"
+has 'user-approved' && pass "one approved (02) starts" || fail "user-approved did not start"
+has 'machine-on'    && pass "an HKLM Run entry starts" || fail "machine-on did not start"
+has 'user-off'      && fail "a disabled (03) HKCU Run entry started" || pass "a disabled (03) HKCU Run entry does not start"
+has 'machine-off'   && fail "a disabled (07) HKLM Run entry started" || pass "a disabled (07) HKLM Run entry does not start"
+has 'wow32-off'     && fail "a disabled 32-bit Run entry (Run32) started" || pass "a disabled 32-bit Run entry (StartupApproved\\Run32) does not start"
+has ' once'         && pass "RunOnce ignores StartupApproved, as on Windows" || fail "RunOnce entry did not run"
+case "$log" in *folder-on.exe*) pass "a Startup folder item starts" ;; *) fail "folder-on.exe did not start" ;; esac
+case "$log" in *folder-off.exe*) fail "a disabled Startup folder item started" ;; *) pass "a disabled Startup folder item (StartupApproved\\StartupFolder) does not start" ;; esac
+[ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
+exit $RC
