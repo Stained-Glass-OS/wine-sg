@@ -3,7 +3,7 @@
 # The session's Linux programs' windows in Task View (patches/sg/0585).
 # A Linux terminal has a taskbar button (0496) but was missing from Task
 # View. Now it is a card there (its icon and title, on every desktop); a click
-# brings it forward (XACTIVATE). A stand-in sg-lockctl (SG_LOCKCTL) lists one
+# brings it forward (XACTIVATE); so does choosing it in Alt+Tab's switcher (0760). A stand-in sg-lockctl (SG_LOCKCTL) lists one
 # Linux window and records what it is asked; Task View is opened with Win+Tab
 # and its only card -- centred below the desktops strip -- is clicked.
 #
@@ -41,9 +41,20 @@ cd "$WINEPREFIX/drive_c"
 sleep 3
 xdotool mousemove 512 428 click 1
 sleep 2
-cmd=$(tr '\n' '|' < "$T/commands")
+cmd=$(tr '\n' '|' < "$T/commands"); RC=0
 echo "      asked: $cmd"
 case "$cmd" in
-*"XACTIVATE 4242"*) echo "PASS  the Linux window is a card in Task View, and a click brings it forward"; echo "RESULT: PASS"; exit 0 ;;
+*"XACTIVATE 4242"*) echo "PASS  the Linux window is a card in Task View, and a click brings it forward" ;;
+*) echo "FAIL  no Linux window card in Task View (asked: $cmd)"; RC=1 ;;
 esac
-echo "FAIL  no Linux window card in Task View (asked: $cmd)"; echo "RESULT: FAIL"; exit 1
+# Alt+Tab's switcher lists it too (0760): chosen, it comes forward
+: > "$T/commands"
+"$WINE" vdesk-probe.exe alttab > "$T/alttab.out" 2>&1
+sleep 2
+cmd=$(tr '\n' '|' < "$T/commands")
+case "$cmd" in
+*"XACTIVATE 4242"*) echo "PASS  Alt+Tab lists the Linux window, and choosing it brings it forward" ;;
+*) echo "FAIL  Alt+Tab did not bring the Linux window forward (asked: $cmd; $(cat "$T/alttab.out"))"; RC=1 ;;
+esac
+[ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
+exit "$RC"
