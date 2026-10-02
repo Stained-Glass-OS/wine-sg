@@ -5,6 +5,8 @@
 # in one frame (David 2026-09-29). The animation is stretched to 4 s
 # (SG_TASKVIEW_ANIM_MS) so screenshots can see it: at 1.2 s the windows are on
 # their way, at 6 s in place -- the two differ; drawn in one frame they do not.
+# Closing, they fly back (0752): at 1.2 s Task View is still there, unlike the
+# grid; at 6 s it is gone.
 #
 #   WINE=/opt/wine-sg/bin/wine test/taskview-anim-gate.sh
 set -u
@@ -42,10 +44,22 @@ sleep 3
 sleep 1.2; import -window root "$T/mid.png"
 sleep 5;   import -window root "$T/end.png"
 exists=$("$WINE" vdesk-probe.exe exists SgTaskView 2>/dev/null | tr -d '\r')
+# closing (0752): the windows fly back to their places, then Task View goes
+"$WINE" vdesk-probe.exe hotkey taskview >/dev/null 2>&1 &
+sleep 1.2; import -window root "$T/back.png"
+closing=$("$WINE" vdesk-probe.exe exists SgTaskView 2>/dev/null | tr -d '\r')
+sleep 5
+gone=$("$WINE" vdesk-probe.exe exists SgTaskView 2>/dev/null | tr -d '\r')
+db=$(compare -metric AE "$T/back.png" "$T/end.png" /dev/null 2>&1 | cut -d' ' -f1)
 d=$(compare -metric AE "$T/mid.png" "$T/end.png" /dev/null 2>&1 | cut -d' ' -f1)
 echo "      Task View: $exists; pixels differing between 1.2 s and 6 s: $d"
 [ "$exists" = "exists=1" ] && pass "Win+Tab opens Task View" || fail "Task View did not open ($exists)"
 [ "${d%.*}" -gt 2000 ] 2>/dev/null && pass "the windows are still on their way at 1.2 s (they fly into place)" \
     || fail "Task View is the same at 1.2 s and 6 s: no animation ($d px)"
+echo "      closing: $closing at 1.2 s, $gone at 6 s; pixels differing from the open grid at 1.2 s: $db"
+[ "$closing" = "exists=1" ] && [ "${db%.*}" -gt 2000 ] 2>/dev/null \
+    && pass "closing, the windows fly back to their places (still on their way at 1.2 s)" \
+    || fail "closing was not animated: $closing at 1.2 s, $db px from the grid"
+[ "$gone" = "exists=0" ] && pass "and then Task View is gone" || fail "Task View still there at 6 s ($gone)"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
