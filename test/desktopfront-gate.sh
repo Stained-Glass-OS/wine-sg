@@ -9,7 +9,10 @@
 #   * Wine's last active window is deactivated, so that coming forward again
 #     is noticed;
 #   * its taskbar button brings it forward (XDESKTOP), not minimized for
-#     being Wine's active window.
+#     being Wine's active window;
+#   * a Linux window brought forward by ITS button deactivates Wine's active
+#     window too, so a click on that Wine window brings it forward (0747;
+#     mutant SG_MUTANT_XWIN_BUTTON_KEEPS_ACTIVE fails it).
 # A stand-in sg-lockctl (SG_LOCKCTL) serves the list the gate writes and
 # records what it is asked.
 #
@@ -138,6 +141,20 @@ printf '%s\nEND\n' "$FOCUSED" > "$T/list"; sleep 5
 : > "$T/commands"
 "$WINE" fgwin.exe popuplaunch; sleep 3
 cp "$T/commands" "$T/commands.launch"
+# SG Office brought forward by ITS taskbar button (the bar's first) while a
+# Wine window ("Launched") is Wine's active one; then a click on that Wine
+# window must bring it -- and the desktop -- forward again (0747)
+printf '%s\nEND\n' "$AWAY" > "$T/list"; sleep 4
+xdotool mousemove 400 300 click 1; sleep 2
+"$WINE" fgwin.exe 2>/dev/null | tr -d '\r' > "$T/fg.before"
+: > "$T/commands"
+X=\$("$WINE" taskbar-probe.exe state 2>/dev/null | tr -d '\r' | sed -n 's/^button=//p' | head -1)
+xdotool mousemove \$(mid "\$X") click 1; sleep 1
+printf '%s\nEND\n' "$FOCUSED" > "$T/list"; sleep 4
+"$WINE" fgwin.exe 2>/dev/null | tr -d '\r' > "$T/fg.xbutton"
+: > "$T/commands"
+xdotool mousemove 400 300 click 1; sleep 3
+cp "$T/commands" "$T/commands.reclick"
 EOF
 chmod +x "$T/session.sh"
 timeout -s KILL 300 xvfb-run -a -s '-screen 0 1024x700x24' "$T/session.sh"
@@ -165,6 +182,18 @@ echo "      popup + program: $(tr '\n' '|' < "$T/commands.launch" 2>/dev/null)"
 [ "$(tr '\n' '|' < "$T/commands.launch" 2>/dev/null)" = "XDESKTOP|" ] \
     && pass "a popup that starts a program leaves the desktop (and the program) in front" \
     || fail "popup + program: $(tr '\n' '|' < "$T/commands.launch" 2>/dev/null)"
+
+echo "      before SG Office's own button: $(cat "$T/fg.before" 2>/dev/null)"
+echo "      after SG Office's own button: $(cat "$T/fg.xbutton" 2>/dev/null)"
+BEFORE=$(sed -n 's/^fg=\([^ ]*\).*/\1/p' "$T/fg.before" 2>/dev/null)
+[ -n "$BEFORE" ] && [ "$BEFORE" != "(none)" ] || fail "no Wine window was Wine's active one to begin with: $(cat "$T/fg.before" 2>/dev/null)"
+echo "      a click on the Wine window then: $(tr '\n' '|' < "$T/commands.reclick" 2>/dev/null)"
+[ -n "$BEFORE" ] && grep -q "fg=$BEFORE " "$T/fg.xbutton" 2>/dev/null \
+    && fail "SG Office came forward by its button, yet the Wine window is still Wine's active one" \
+    || pass "SG Office brought forward by its button: Wine's active window is deactivated ($(cat "$T/fg.xbutton" 2>/dev/null))"
+grep -q '^XDESKTOP$' "$T/commands.reclick" 2>/dev/null \
+    && pass "and a click on the Wine window behind it puts the desktop in front (XDESKTOP)" \
+    || fail "click on the Wine window: $(tr '\n' '|' < "$T/commands.reclick" 2>/dev/null)"
 
 echo
 [ "$RC" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
