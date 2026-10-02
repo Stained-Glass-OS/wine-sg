@@ -19,7 +19,7 @@ WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 RC=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
-command -v xvfb-run >/dev/null || { echo "SKIP: needs xvfb-run"; exit 77; }
+for t in xvfb-run xwininfo; do command -v $t >/dev/null || { echo "SKIP: needs $t"; exit 77; }; done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 
 T=$(mktemp -d /var/tmp/sg-signin-startup.XXXXXX)
@@ -49,13 +49,19 @@ cat > "$T/session.sh" <<EOF2
 cd "$WINEPREFIX/drive_c"
 shell() {
     XDG_SESSION_ID=\$1 "$WINE" explorer /desktop=shell,800x600 > "$T/explorer-\$2.out" 2>&1 &
-    sleep 12
-    pkill -f 'explorer.exe /desktop=shell' ; sleep 2
+    sleep \${3:-12}
+    # the shell still there once its programs started (a thread of its own for
+    # them took the shell down: a second explorer took over)
+    xwininfo -root -tree | grep -q '"shell - Wine Desktop"' && echo alive > "$T/alive-\$2" || echo gone > "$T/alive-\$2"
+    pkill -KILL -x explorer.exe ; sleep 2
     for f in hklm64 hklm32 hkcu off once folder; do printf '%s=%s ' \$f \$(cat "$WINEPREFIX/drive_c/m/\$f.txt" 2>/dev/null | wc -l); done > "$T/count-\$2"
 }
-shell 11 a
+shell 11 a 35
 shell 11 b
 shell 12 c
+# settings kept under Software\\Stained Glass still save: the sign-in's mark
+# (a volatile key) must not have made its parents volatile
+"$WINE" reg add 'HKCU\\Software\\Stained Glass\\Explorer\\Lasting' /v x /d 1 /f > "$T/lasting" 2>&1
 "$WINE" reg query 'HKCU\\$R\\RunOnce' /v once > "$T/runonce" 2>&1
 EOF2
 chmod +x "$T/session.sh"
@@ -69,5 +75,8 @@ grep -q 'off=0' "$T/count-a" && pass "not an entry turned off in Task Manager (S
 grep -qi 'unable to find\|not find' "$T/runonce" && pass "RunOnce's value is gone once it ran" || fail "RunOnce kept: $(tr -d '\r' < "$T/runonce" | head -3)"
 [ "$b" = "$a" ] && pass "the shell started again in the same sign-in starts nothing again" || fail "explorer restarted: $b (was $a)"
 [ "$c" = "hklm64=2 hklm32=2 hkcu=2 off=0 once=1 folder=2 " ] && pass "the next sign-in: all again, RunOnce not" || fail "next sign-in: $c"
+grep -qi 'success' "$T/lasting" && pass "settings under Software\\Stained Glass still save (its keys are not volatile)" \
+    || fail "a lasting key under Software\\Stained Glass\\Explorer: $(tr -d '\r' < "$T/lasting")"
+[ "$(cat "$T/alive-a" 2>/dev/null)" = alive ] && pass "and the shell is still there once they started" || fail "the shell went away after starting them ($(cat "$T/alive-a" 2>/dev/null))"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"

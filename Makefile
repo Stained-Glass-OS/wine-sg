@@ -294,6 +294,10 @@ test-batchcp:
 test-sysdm:
 	WINE=$(PREFIX)/bin/wine test/sysdm-gate.sh
 
+# A Linux window's stand-in answers close and restore (0759).
+test-linuxstandin:
+	WINE=$(PREFIX)/bin/wine test/linuxstandin-gate.sh
+
 # 0617: an elevated program's Start menu and desktop are all users'.
 test-elevfolders:
 	WINE=$(PREFIX)/bin/wine test/elevfolders-gate.sh
