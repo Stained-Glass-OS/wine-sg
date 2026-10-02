@@ -17,6 +17,9 @@
 #      its frame covers the screen, and is back where it was after; it is
 #      in NormalState (WM_STATE), or GTK takes it for withdrawn and asks
 #      nobody
+#   5b. it asks to be maximized, and restored: its frame is; its frame
+#      maximized, the program is told (_NET_WM_STATE); one maximized before
+#      it was framed (Firefox, restored maximized) gets a maximized frame
 #   6. it is on its own desktop: on the next one it is not shown
 #   7. Task View's card for it shows it, not a black picture
 #   8. WM_CLOSE to the frame (its close button, End task) closes it, and the
@@ -119,6 +122,20 @@ fg SgLinuxWindow "Linux Terminal" && [ "$(px)" = "$COL" ] && above SgLinuxWindow
 xprop -id "$XID" WM_STATE 2>/dev/null | grep -q 'window state: Normal' && pass "it is in NormalState (WM_STATE)" \
     || fail "WM_STATE: $(xprop -id "$XID" WM_STATE 2>&1 | tr '\n' ' ')"
 
+# 5b. maximized: asked by the program, and by its frame
+zoomed() { "$WINE" probe.exe zoomed SgLinuxWindow "$1" | grep -q 'zoomed=1'; }
+"$T/netwm-fullscreen" "$XID" 1 maximize; sleep 2; z1=$(zoomed "Linux Terminal" && echo yes || echo no)
+"$T/netwm-fullscreen" "$XID" 0 maximize; sleep 2; z2=$(zoomed "Linux Terminal" && echo yes || echo no)
+"$WINE" probe.exe rect SgLinuxWindow "Linux Terminal" 2>/dev/null | tr -d '\r' > "$T/rect3"
+[ "$z1" = yes ] && [ "$z2" = no ] && [ "$(cat "$T/rect3")" = "$(cat "$T/rect0")" ] \
+    && pass "maximized when it asks, restored when it asks ($(cat "$T/rect3"))" || fail "maximize: asked $z1, restored $z2, at $(cat "$T/rect3")"
+"$WINE" probe.exe maximize SgLinuxWindow "Linux Terminal" >/dev/null 2>&1; sleep 1.5
+m1=$(xprop -id "$XID" _NET_WM_STATE 2>/dev/null)
+"$WINE" probe.exe restore SgLinuxWindow "Linux Terminal" >/dev/null 2>&1; sleep 1.5
+m2=$(xprop -id "$XID" _NET_WM_STATE 2>/dev/null)
+case "$m1" in *_NET_WM_STATE_MAXIMIZED_VERT*_NET_WM_STATE_MAXIMIZED_HORZ*) case "$m2" in *MAXIMIZED*) ok=no ;; *) ok=yes ;; esac ;; *) ok=no ;; esac
+[ "$ok" = yes ] && pass "its frame maximized and restored, the program is told (_NET_WM_STATE)" || fail "told: maximized '$m1', restored '$m2'"
+
 # 6. the next desktop: it is not there; back, it is
 "$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1
 cpx() { import -window root -crop 1x1+150+150 -depth 8 txt:- 2>/dev/null | tail -1 | grep -o '#[0-9A-F]\{6\}'; }
@@ -147,13 +164,25 @@ kill -0 "$XT" 2>/dev/null && fail "its frame's close button did not close it" ||
 sleep 1
 xterm -geometry 50x12+120+120 -bg black -fg white -title 'Linux Terminal' & XT=$!
 i=0; while [ -z "$(xwininfo -root -children | awk '/"Linux Terminal"/ {print $1; exit}')" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
-printf '%d shown - XTerm\tLinux Terminal\nEND\n' "$(xwininfo -root -children | awk '/"Linux Terminal"/ {print $1; exit}')" > "$T/list"
+X2=$(xwininfo -root -children | awk '/"Linux Terminal"/ {print $1; exit}')
+"$T/netwm-fullscreen" "$X2" preset-maximized   # as the compositor's window manager leaves one it maximized
+printf '%d shown - XTerm\tLinux Terminal\nEND\n' "$X2" > "$T/list"
 sleep 4   # framed at the next tick
+zoomed "Linux Terminal" && pass "a window maximized before it was framed gets a maximized frame" \
+    || fail "maximized before framed: its frame $("$WINE" probe.exe rect SgLinuxWindow "Linux Terminal" | tr -d '\r')"
 "$WINE" probe.exe wmclose SgLinuxWindow "Linux Terminal" > /dev/null 2>&1
 i=0; while kill -0 "$XT" 2>/dev/null && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
 kill -0 "$XT" 2>/dev/null && fail "WM_CLOSE to its frame did not close it" || { pass "WM_CLOSE to its frame closes it"; XT=; }
 printf 'END\n' > "$T/list"   # gone from the compositor's list too
 i=0; while ! "$WINE" probe.exe exists SgLinuxWindow "" | grep -q 'exists=0' && [ $i -lt 24 ]; do sleep 0.5; i=$((i + 1)); done
 "$WINE" probe.exe exists SgLinuxWindow "" | grep -q 'exists=0' && pass "...and the frame goes" || fail "the frame stayed"
+# one bigger than the work area (Firefox at the size it had maximized): a maximized frame
+xterm -geometry 200x80+0+0 -title 'Big Terminal' & XT=$!
+i=0; while [ -z "$(xwininfo -root -children | awk '/"Big Terminal"/ {print $1; exit}')" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+printf '%d shown - XTerm\tBig Terminal\nEND\n' "$(xwininfo -root -children | awk '/"Big Terminal"/ {print $1; exit}')" > "$T/list"
+sleep 4
+zoomed "Big Terminal" && pass "a window bigger than the work area gets a maximized frame" \
+    || fail "bigger than the work area: its frame $("$WINE" probe.exe rect SgLinuxWindow "Big Terminal" | tr -d '\r')"
+"$WINE" probe.exe wmclose SgLinuxWindow "Big Terminal" > /dev/null 2>&1; sleep 1; kill "$XT" 2>/dev/null; XT=
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"

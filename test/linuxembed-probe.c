@@ -28,6 +28,7 @@ int main( int argc, char **argv )
         printf( "above=%d\n", above );
         return 0;
     }
+    if (!strcmp( argv[1], "zoomed" )) { printf( "zoomed=%d\n", hwnd && IsZoomed( hwnd ) ); return 0; }
     if (!hwnd) { printf( "none\n" ); return 1; }
     if (!strcmp( argv[1], "activate" ))
     {
@@ -36,6 +37,8 @@ int main( int argc, char **argv )
     }
     else if (!strcmp( argv[1], "move" ) && argc == 8)
         SetWindowPos( hwnd, 0, atoi( argv[4] ), atoi( argv[5] ), atoi( argv[6] ), atoi( argv[7] ), SWP_NOZORDER | SWP_NOACTIVATE );
+    else if (!strcmp( argv[1], "maximize" )) ShowWindow( hwnd, SW_MAXIMIZE );
+    else if (!strcmp( argv[1], "restore" )) ShowWindow( hwnd, SW_RESTORE );
     else if (!strcmp( argv[1], "wmclose" )) SendMessageW( hwnd, WM_CLOSE, 0, 0 );
     else if (!strcmp( argv[1], "rect" ))
     {
