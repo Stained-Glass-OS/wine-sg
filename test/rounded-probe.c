@@ -4,7 +4,8 @@
  *   pref TITLE                                       print its DWMWA_WINDOW_CORNER_PREFERENCE
  *   rgn TITLE                                        print what GetWindowRgn says of it
  *   menu X Y                                         a popup menu there, until killed
- *   tip X Y                                          a tooltip window there, until killed */
+ *   tip X Y                                          a tooltip window there, until killed
+ *   minimize TITLE                                   minimize it (0751: where it goes) */
 #include <windows.h>
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -42,6 +43,11 @@ int wmain(int argc, WCHAR **argv)
     if (argc >= 5 && !lstrcmpW(argv[1], L"resize") && (w = FindWindowW(L"STATIC", argv[2])))
     {
         SetWindowPos(w, 0, 0, 0, _wtoi(argv[3]), _wtoi(argv[4]), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
+    if (argc >= 3 && !lstrcmpW(argv[1], L"minimize") && (w = FindWindowW(L"STATIC", argv[2])))
+    {
+        ShowWindow(w, SW_MINIMIZE);
         return 0;
     }
     if (argc >= 3 && !lstrcmpW(argv[1], L"pref") && (w = FindWindowW(L"STATIC", argv[2])))

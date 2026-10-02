@@ -76,6 +76,12 @@ xdotool keydown alt; sleep 0.3; xdotool key Tab; sleep 1.5
 S=\$(xwininfo -root -tree | awk '/"Task Switching"/ { print \$1; exit }')
 xprop -id \$S _SG_SHADOW > "$T/switcher.out" 2>&1
 xdotool keyup alt
+# minimized, each says where its taskbar button is (0751): One's, then Two's
+sleep 1
+"$WINE" rounded-probe.exe minimize One; "$WINE" rounded-probe.exe minimize Two; sleep 2
+for n in One Two; do
+    xprop -id \$(xwininfo -root -tree | awk -v n="\"\$n\":" '\$2 == n { print \$1; exit }') _SG_MINRECT > "$T/minrect.\$n" 2>&1
+done
 EOF2
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s "-screen 0 800x600x24" "$T/session.sh" > "$T/session.out" 2>&1
@@ -97,6 +103,18 @@ grep -q '_SG_SHADOW(CARDINAL) = 2' "$T/switcher.out" && pass "Alt+Tab's switcher
 grep -q '_SG_ACRYLIC(CARDINAL) = 85' "$T/acrylic.on" && pass "the taskbar is frosted (_SG_ACRYLIC 85) with Transparency effects on" \
     || fail "taskbar acrylic: $(cat "$T/acrylic.on")"
 grep -q 'not found' "$T/acrylic.off" && pass "and not once they are turned off" || fail "after turning off: $(cat "$T/acrylic.off")"
+
+# _SG_MINRECT(CARDINAL) = x, y, w, h: on the taskbar (the 40 px at the bottom), One's button before Two's
+mr() { sed -n 's/.*= \([0-9-]*\), \([0-9-]*\), \([0-9-]*\), \([0-9-]*\)$/\1 \2 \3 \4/p' "$T/minrect.$1"; }
+read -r x1 y1 w1 h1 <<M
+$(mr One)
+M
+read -r x2 y2 w2 h2 <<M
+$(mr Two)
+M
+[ -n "${x1:-}" ] && [ -n "${x2:-}" ] && [ "$y1" -ge 560 ] && [ "$y2" -ge 560 ] && [ "$w1" -gt 0 ] && [ "$h1" -gt 0 ] && [ $((x1 + w1)) -le "$x2" ] \
+    && pass "a minimized window tells the compositor where its taskbar button is (_SG_MINRECT: One $x1,$y1 ${w1}x$h1, Two $x2,$y2)" \
+    || fail "_SG_MINRECT: One $(cat "$T/minrect.One"), Two $(cat "$T/minrect.Two")"
 
 echo
 [ "$RC" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
