@@ -88,6 +88,10 @@ R "$TB" Style 2; apply; S glass; shot glass
 R "$ADV" TaskbarGlomLevel 0; apply; S glassicons; shot glassicons
 R "$ADV" TaskbarGlomLevel 2; R "$TB" Style 1; R "$TB" Position 1; apply; S horizontop; shot horizontop
 R "$TB" Position 3; R "$TB" Style 0; apply; S flatagain; shot flatagain
+# the taskbar's own look (Taskbar Look, 0802), not the windows' style
+R 'HKCU\\Software\\Stained Glass\\Style' Rounded 1; R "$TB" Look 0; apply; S lookclassic
+R 'HKCU\\Software\\Stained Glass\\Style' Rounded 0; R "$TB" Look 1; apply; S lookrounded
+R "$TB" Look 2; apply; S lookhorizon
 EOF
 chmod +x "$T/session.sh"
 timeout -s KILL 400 xvfb-run -a -s '-screen 0 1024x700x24' "$T/session.sh"
@@ -158,6 +162,13 @@ colours=$(convert "$T/glassicons.png" -crop 32x32+$((ncx - 16))+664 +repage -for
 # and back
 [ "$(v flatagain bar)" = "0,660,1024,700 topmost=1" ] && [ "$(px flatagain 600 690)" = "31,31,31" ] \
     && pass "Style 0: the flat bar again" || fail "back to flat: $(v flatagain bar) $(px flatagain 600 690)"
+
+# mixed: each part its own look (David 2026-10-02) -- the taskbar goes by
+# Taskbar Look, whatever the windows' style
+[ "$(v lookclassic bar)" = "0,660,1024,700 topmost=1" ] && [ "$(v lookrounded bar)" = "0,652,1024,700 topmost=1" ] \
+    && [ "$(v lookhorizon bar)" = "0,662,1024,700 topmost=1" ] \
+    && pass "Taskbar Look: a Classic bar with round windows, a Rounded bar with square ones, Horizon by its Look alone" \
+    || fail "Taskbar Look: classic $(v lookclassic bar) rounded $(v lookrounded bar) horizon $(v lookhorizon bar)"
 
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

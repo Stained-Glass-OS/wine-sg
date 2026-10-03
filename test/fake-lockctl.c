@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 int main(int argc, char **argv)
 {
@@ -32,6 +33,13 @@ int main(int argc, char **argv)
             fclose(f);
         }
         if (out != stdout && (fclose(out) || rename(part, argv[3]))) return 1;
+        if (argv[1][0] == 'X' && getenv("SG_FAKE_XWLOG"))
+        {
+            /* when each list was asked for (ownframe-gate.sh: how soon after it a window is framed) */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            if ((f = fopen(getenv("SG_FAKE_XWLOG"), "a"))) { fprintf(f, "%ld.%03ld\n", (long)ts.tv_sec, ts.tv_nsec / 1000000); fclose(f); }
+        }
         return 0;
     }
     if (getenv("SG_FAKE_FOCUS") && (!strcmp(argv[1], "XDESKTOP") || (!strcmp(argv[1], "XACTIVATE") && argc > 2)))

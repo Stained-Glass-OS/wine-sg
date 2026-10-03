@@ -161,7 +161,11 @@ if [ $# = 4 ]; then
     i=0; while kill -0 "$XT" 2>/dev/null && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
 fi
 kill -0 "$XT" 2>/dev/null && fail "its frame's close button did not close it" || { pass "its frame's close button closes it"; XT=; }
-sleep 1
+# gone from the compositor's list too, as the compositor's own list is at
+# once: the next xterm's window may get the same X id, and a stale list
+# naming it had the taskbar frame it at once (0803 reads the list quickly)
+printf 'END\n' > "$T/list"
+sleep 1.5
 xterm -geometry 50x12+120+120 -bg black -fg white -title 'Linux Terminal' & XT=$!
 i=0; while [ -z "$(xwininfo -root -children | awk '/"Linux Terminal"/ {print $1; exit}')" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
 X2=$(xwininfo -root -children | awk '/"Linux Terminal"/ {print $1; exit}')

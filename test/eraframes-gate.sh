@@ -81,6 +81,22 @@ is glass 250 112 'b > r + 25 && r > 140 && b > 200' \
 green glass 100 100 && pass "its top corners round too" || fail "Glass corner: $(px glass 100 100)"
 rc=0; for x in $(seq 470 2 496); do is glass "$x" 112 'r > b + 60' && rc=1; done
 [ $rc = 1 ] && pass "and a red Close button" || fail "Glass Close: $(px glass 480 112)"
+# the caption buttons in the middle of the title bar as seen -- the frame's
+# top edge and the caption together (David 2026-10-02: they sat low): the
+# Close button's red rows, against the window's top (y 100) and the first
+# row of the white client area below the title bar
+for s in glass horizon; do
+    col=$(for x in $(seq 470 2 496); do is $s "$x" 112 'r > b + 60' && { echo "$x"; break; }; done)
+    col=$((${col:-480} + 4))
+    top=; bot=; for y in $(seq 100 140); do
+        if is $s "$col" "$y" 'r > b + 40'; then [ -z "$top" ] && top=$y; bot=$y; fi
+    done
+    band=$(for y in $(seq 105 150); do is $s 250 "$y" 'r > 230 && g > 230 && b > 230' && { echo "$y"; break; }; done)
+    gt=$(( ${top:-0} - 100 )); gb=$(( ${band:-0} - ${bot:-0} - 1 ))
+    [ -n "$top" ] && [ -n "$band" ] && [ $(( gt - gb )) -le 2 ] && [ $(( gb - gt )) -le 2 ] \
+        && pass "$s: the caption buttons are in the middle of the title bar ($gt px above Close, $gb below)" \
+        || fail "$s: Close at rows ${top:-?}-${bot:-?} in a title bar 100-${band:-?} ($gt px above, $gb below)"
+done
 ! is flat 250 112 'b > r + 25' && ! green flat 100 100 \
     && pass "Frame 0: the flat frame, unchanged ($(px flat 250 112), square corners)" || fail "flat: $(px flat 250 112) corner $(px flat 100 100)"
 

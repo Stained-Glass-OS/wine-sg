@@ -1062,3 +1062,8 @@ test-gdipfamily:
 
 test-dirshare:
 	WINE=$(PREFIX)/bin/wine test/dirshare-gate.sh
+
+# A Linux program drawing its own title bar gets a frame without one, moves
+# and sizes it itself, and a new Linux window is framed soon (0803).
+test-ownframe:
+	WINE=$(PREFIX)/bin/wine test/ownframe-gate.sh
