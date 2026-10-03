@@ -50,8 +50,28 @@ sleep 3
 "$WINE" vdesk-probe.exe window Away 600 380 >/dev/null 2>&1 &
 sleep 4
 import -window root "$T/desktop.png"
-# the first icon's middle: This PC
-xdotool mousemove 50 22 click --repeat 2 --delay 80 1; sleep 5
+# the icons, top to bottom (by name: This PC is the last): its middle
+y=\$(python3 - "$T/desktop.png" <<'PYEOF'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert('RGB')
+bg = im.getpixel((300, 600))
+rows = [sum(1 for x in range(4, 90) if im.getpixel((x, y)) != bg) for y in range(0, 600)]
+blobs, start = [], None
+for y, n in enumerate(rows + [0]):
+    if n and start is None: start = y
+    elif not n and start is not None:
+        if y - start > 8: blobs.append((start, y))
+        start = None
+# an icon and its title are two runs close together: join runs less than 16 px apart
+icons = []
+for b in blobs:
+    if icons and b[0] - icons[-1][1] < 16: icons[-1] = (icons[-1][0], b[1])
+    else: icons.append(b)
+print((icons[-1][0] + 20) if icons else 22)
+PYEOF
+)
+xdotool mousemove 50 \$y click --repeat 2 --delay 80 1; sleep 5
 "$WINE" vdesk-probe.exe find ExplorerWClass 2>/dev/null | tr -d '\r' > "$T/explorer-window.out"
 EOF
 chmod +x "$T/session.sh"
@@ -63,10 +83,20 @@ import sys
 from PIL import Image
 im = Image.open(sys.argv[1]).convert('RGB')
 bg = im.getpixel((300, 600))
-out = []
-for top in range(0, 700, 70):
-    n = sum(1 for x in range(4, 90) for y in range(top + 2, top + 44) if im.getpixel((x, y)) != bg)
-    out.append(n)
+# the icons: runs of rows with something drawn in the first column, an icon
+# and its title joined, less than 16 px apart (the grid's spacing follows the icon size and font)
+rows = [sum(1 for x in range(4, 90) if im.getpixel((x, y)) != bg) for y in range(0, 600)]
+blobs, start = [], None
+for y, n in enumerate(rows + [0]):
+    if n and start is None: start = y
+    elif not n and start is not None:
+        if y - start > 8: blobs.append((start, y))
+        start = None
+icons = []
+for b in blobs:
+    if icons and b[0] - icons[-1][1] < 16: icons[-1] = (icons[-1][0], b[1])
+    else: icons.append(b)
+out = [sum(rows[a:b]) for a, b in icons] + [0] * 5
 print(' '.join(str(n) for n in out[:5]))
 EOF
 )
@@ -77,7 +107,7 @@ dark=$(python3 - "$T/desktop.png" <<'EOF'
 import sys
 from PIL import Image
 im = Image.open(sys.argv[1]).convert('RGB')
-print(sum(1 for x in range(4, 90) for y in range(44, 68) if sum(im.getpixel((x, y))) < 60))
+print(sum(1 for x in range(4, 90) for y in range(44, 90) if sum(im.getpixel((x, y))) < 60))
 EOF
 )
 [ "${1:-0}" -gt 100 ] && [ "${dark:-0}" -gt 20 ] && [ "${dark:-0}" -lt 1500 ] && pass "their titles have a shadow" || fail "no title shadow ($dark dark pixels)"
