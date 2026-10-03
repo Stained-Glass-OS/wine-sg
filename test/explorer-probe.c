@@ -20,6 +20,7 @@
  *   explorer-probe thumb PATH SIZE        IShellItemImageFactory's picture: thumb=WxH top=RRGGBB bottom=RRGGBB
  *   explorer-probe recent PATH            SHAddToRecentDocs(SHARD_PATHW) of a path, in Unicode
  *   explorer-probe close-all              closes every File Explorer window and waits for them to go
+ *   explorer-probe tabs                   its tab strip's text: tabs=N current=K: title | title (0774)
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
@@ -367,6 +368,15 @@ int main( int argc, char **argv )
         MultiByteToWideChar( CP_ACP, 0, argv[2], -1, cls, 64 );
         hwnd = FindWindowExW( explorer(), NULL, cls, NULL );
         printf( "found=%d\n", hwnd && IsWindowVisible( hwnd ) );
+        return 0;
+    }
+    if (argc == 2 && !strcmp( argv[1], "tabs" ))
+    {
+        WCHAR text[1024] = L"";
+        HWND w = FindWindowW( L"ExplorerWClass", NULL ), t = w ? FindWindowExW( w, NULL, L"SGExplorerTabs", NULL ) : NULL;
+        if (t) GetWindowTextW( t, text, ARRAYSIZE(text) );
+        printf( "%s\n", t ? "" : "tabs=none" );
+        if (t) printf( "%ls\n", text );
         return 0;
     }
     if (argc == 2 && !strcmp( argv[1], "close-all" ))

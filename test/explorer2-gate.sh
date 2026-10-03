@@ -102,7 +102,8 @@ export SG_ZIP_NO_SHOW=1
 P() { "$WINE" explorer-probe.exe "\$@" 2>/dev/null | tr -d '\r'; }
 shot() { sleep 1; import -window root "$T/\$1.png"; }
 at() { set -- \$(P origin | sed 's/origin=//; s/,/ /'); ox=\$1; oy=\$2; }
-click() { at; xdotool mousemove \$((ox + \$1)) \$((oy + \$2)) click \${3:-1}; }
+# (y below the tab strip: 36 px, patches/sg/0774)
+click() { at; xdotool mousemove \$((ox + \$1)) \$((oy + 36 + \$2)) click \${3:-1}; }
 go() { at; xdotool mousemove \$((ox + 300)) \$((oy + 575)) click 1; sleep 0.3; xdotool key ctrl+l; sleep 0.5; xdotool key ctrl+a; xdotool type --delay 20 "\$1"; xdotool key Return; }
 WINEDEBUG=err+all,trace+explorer "$WINE" explorer /desktop=shell,1280x800 > "$T/desktop.out" 2>&1 &
 i=0; while ! grep -q 'desktop message loop starting' "$T/desktop.out" 2>/dev/null && [ \$i -lt 60 ]; do sleep 0.5; i=\$((i + 1)); done
@@ -122,9 +123,9 @@ sleep 3; shot thumbs-selected
 go '$WDOC\\DragSrc'
 echo "dragsrc: \$(P wait-title DragSrc 10)" >> "$T/log.out"
 sleep 1; click 600 400; sleep 0.5
-at; xdotool mousemove \$((ox + 270)) \$((oy + 119)); sleep 0.3; xdotool mousedown 1; sleep 0.3
+at; xdotool mousemove \$((ox + 270)) \$((oy + 36 + 119)); sleep 0.3; xdotool mousedown 1; sleep 0.3
 for step in 1 2 3 4 5 6 7 8; do xdotool mousemove_relative -- -20 30; sleep 0.15; done
-at; xdotool mousemove \$((ox + 100)) \$((oy + 92 + 10 * 26 + 13)); sleep 0.5
+at; xdotool mousemove \$((ox + 100)) \$((oy + 36 + 92 + 10 * 26 + 13)); sleep 0.5
 xdotool mousemove_relative 3 1; sleep 0.5; shot dragging; xdotool mouseup 1; sleep 3
 
 # Documents in Details: Sort > Group by > Type

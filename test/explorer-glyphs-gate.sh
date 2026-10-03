@@ -32,20 +32,21 @@ python3 - "$T/shot.png" > "$T/out" <<'PY'
 import sys
 from PIL import Image
 im = Image.open(sys.argv[1]).convert('L')
+TABS = 36   # File Explorer's tab strip above the bars (patches/sg/0774)
 def dark(x, y): return im.getpixel((x, y)) < 110
 def box(x0, y0, w, h):
     pts = [(x, y) for x in range(x0, x0 + w) for y in range(y0, y0 + h) if dark(x, y)]
     if not pts: return None
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
     return min(xs), min(ys), max(xs), max(ys)
-b = box(421, 40, 30, 30)            # View
+b = box(421, 40 + TABS, 30, 30)            # View
 if b:
     cx = (b[0] + b[2]) // 2
     gap = sum(dark(cx, y) for y in range(b[1], b[3] + 1)) + sum(dark(cx + (b[2]-b[0]) % 2, y) for y in range(b[1], b[3] + 1))
     print("view_gap_dark", gap)
 else:
     print("view_gap_dark none")
-r = box(700, 86, 30, 30)            # Refresh
+r = box(700, 86 + TABS, 30, 30)            # Refresh
 if r:
     cx = (r[0] + r[2]) // 2
     print("refresh_top_center", int(any(dark(x, y) for x in range(cx - 1, cx + 2) for y in range(r[1], r[1] + 3))))
@@ -60,8 +61,8 @@ def mirrored(x0, y0, w, h):
     for x, y in pts: cols[x] = cols.get(x, 0) + 1
     c = max(cols, key=cols.get)
     return int(all((2 * c - x, y) in pts for x, y in pts))
-u = box(80, 86, 30, 30)
-print("up_mirrored", mirrored(80, 86, 30, 30))
+u = box(80, 86 + TABS, 30, 30)
+print("up_mirrored", mirrored(80, 86 + TABS, 30, 30))
 def head_sym(x0, y0, w, h, c, up):
     """the head rows of the arrow whose shaft is column c: the pixel k to the
     left matches the pixel k to the right"""
@@ -70,7 +71,7 @@ def head_sym(x0, y0, w, h, c, up):
     tip = min(ys) if up else max(ys)
     rows = range(tip + 1, tip + 5) if up else range(tip - 4, tip)
     return int(all(dark(c - k, y) == dark(c + k, y) for y in rows for k in range(1, 5)))
-reg = (347, 40, 30, 30)
+reg = (347, 40 + TABS, 30, 30)
 cols = {}
 for x in range(reg[0], reg[0] + reg[2]):
     cols[x] = sum(dark(x, y) for y in range(reg[1], reg[1] + reg[3]))

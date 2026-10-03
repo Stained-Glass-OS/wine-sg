@@ -67,7 +67,8 @@ cd "$WINEPREFIX/drive_c"
 P() { "$WINE" explorer-probe.exe "\$@" 2>/dev/null | tr -d '\r'; }
 shot() { sleep 1; import -window root "$T/\$1.png"; }
 at() { set -- \$(P origin | sed 's/origin=//; s/,/ /'); ox=\$1; oy=\$2; }
-click() { at; xdotool mousemove \$((ox + \$1)) \$((oy + \$2)) click \${3:-1}; }
+# (y below the tab strip: 36 px, patches/sg/0774)
+click() { at; xdotool mousemove \$((ox + \$1)) \$((oy + 36 + \$2)) click \${3:-1}; }
 WINEDEBUG=err+all,trace+explorer "$WINE" explorer /desktop=shell,1280x800 > "$T/desktop.out" 2>&1 &
 i=0; while ! grep -q 'desktop message loop starting' "$T/desktop.out" 2>/dev/null && [ \$i -lt 60 ]; do sleep 0.5; i=\$((i + 1)); done
 sleep 2
