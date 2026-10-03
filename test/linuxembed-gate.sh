@@ -20,6 +20,7 @@
 #   5b. it asks to be maximized, and restored: its frame is; its frame
 #      maximized, the program is told (_NET_WM_STATE); one maximized before
 #      it was framed (Firefox, restored maximized) gets a maximized frame
+#   5c. dragged to the screen's edge it snaps to that half; Win+Right too
 #   6. it is on its own desktop: on the next one it is not shown
 #   7. Task View's card for it shows it, not a black picture
 #   8. WM_CLOSE to the frame (its close button, End task) closes it, and the
@@ -138,6 +139,38 @@ m1=$(xprop -id "$XID" _NET_WM_STATE 2>/dev/null)
 m2=$(xprop -id "$XID" _NET_WM_STATE 2>/dev/null)
 case "$m1" in *_NET_WM_STATE_MAXIMIZED_VERT*_NET_WM_STATE_MAXIMIZED_HORZ*) case "$m2" in *MAXIMIZED*) ok=no ;; *) ok=yes ;; esac ;; *) ok=no ;; esac
 [ "$ok" = yes ] && pass "its frame maximized and restored, the program is told (_NET_WM_STATE)" || fail "told: maximized '$m1', restored '$m2'"
+
+# 5c. snapped as any window (David 2026-10-03: "if you drag the window to the
+# edge it doesn't snap"): its title bar dragged to the left edge, held, let go
+# -- the left half; Win+Right -- the right half (the frames are explorer's,
+# and snapping took only other programs' windows)
+"$WINE" probe.exe restore SgLinuxWindow "Linux Terminal" >/dev/null 2>&1
+"$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1
+# Win+Right first, on a window not snapped (on a left-snapped one it un-snaps, as on Windows)
+read -r l t r b < "$T/rect0"
+"$WINE" probe.exe move SgLinuxWindow "Linux Terminal" "$l" "$t" $((r - l)) $((b - t)) >/dev/null 2>&1; sleep 1
+"$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1
+xdotool key super+Right; sleep 1.5
+"$WINE" probe.exe rect SgLinuxWindow "Linux Terminal" 2>/dev/null | tr -d '\r' > "$T/rect-winright"
+read -r sl st sr sb < "$T/rect-winright"
+[ "$sl" -ge 500 ] && [ "$sl" -le 524 ] && [ "$sr" -ge 1020 ] && [ "$sb" -ge 600 ] \
+    && pass "Win+Right snaps it to the right half ($(cat "$T/rect-winright"))" \
+    || fail "Win+Right: its frame at $(cat "$T/rect-winright") (want the right half)"
+read -r l t r b < "$T/rect0"
+"$WINE" probe.exe move SgLinuxWindow "Linux Terminal" "$l" "$t" $((r - l)) $((b - t)) >/dev/null 2>&1; sleep 1
+"$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1
+read -r l t r b < "$T/rect0"
+tx=$(( (l + r) / 2 )); ty=$((t + 10))
+xdotool mousemove "$tx" "$ty" mousedown 1; sleep 0.3
+for x in $((tx - 40)) $((tx - 120)) 200 80 20 0; do xdotool mousemove "$x" "$ty"; sleep 0.15; done
+sleep 0.8; xdotool mouseup 1; sleep 1.5
+"$WINE" probe.exe rect SgLinuxWindow "Linux Terminal" 2>/dev/null | tr -d '\r' > "$T/rect-snap"
+read -r sl st sr sb < "$T/rect-snap"
+[ "$sl" -le 0 ] && [ "$st" -le 0 ] && [ "$sr" -ge 500 ] && [ "$sr" -le 524 ] && [ "$sb" -ge 600 ] \
+    && pass "dragged to the left edge, it snaps to the left half ($(cat "$T/rect-snap"))" \
+    || fail "drag to the edge: its frame at $(cat "$T/rect-snap") (want the left half)"
+read -r l t r b < "$T/rect0"
+"$WINE" probe.exe move SgLinuxWindow "Linux Terminal" "$l" "$t" $((r - l)) $((b - t)) >/dev/null 2>&1; sleep 1
 
 # 6. the next desktop: it is not there; back, it is
 "$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1
