@@ -19,6 +19,12 @@
 # (patches/sg/0761). Mutants: SG_MUTANT_STALE_DESKTOP (BadWindow),
 # SG_MUTANT_NO_DESKTOP_TAKEOVER (no desktop after the restart).
 #
+# Restarted again with the spies still connected, the new shell gets the dead
+# one's client ids and its desktop window the dead one's id: it was taken for
+# alive and never shown (patches/sg/0770). Mutant: SG_MUTANT_REUSED_ID_ALIVE.
+# SG_MUTANT_RESTART_UNMAPPED (the new window not mapped) passes here: Xvfb,
+# with no window manager, shows it anyway; the compositor's did not (QA VM).
+#
 #   WINE=/opt/wine-sg/bin/wine test/shellrestart-gate.sh
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -64,6 +70,19 @@ i=0; while [ \$i -lt 40 ] && [ -z "\$(desk)" ]; do sleep 0.5; i=\$((i + 1)); don
 sleep 2
 d=\$(desk); echo "\$d" > "$T/desk2"
 [ -n "\$d" ] && xwininfo -id "\$d" -children | grep -c '^ *0x' > "$T/children2"
+[ -n "\$d" ] && xwininfo -id "\$d" | sed -n 's/.*Map State: //p' > "$T/mapped2"
+# again, with no other client between (the spies stay: the dead shell's
+# client slots are the lowest free ones): the X server gives the new shell
+# the dead one's ids, its desktop window the same id as the dead one's
+# (Xwayland did, in a session: patches/sg/0770)
+sleep 2
+pkill -KILL -x explorer.exe
+sleep 3
+"$WINE" explorer /desktop=shell,800x600 > "$T/explorer3.out" 2>&1 &
+i=0; while [ \$i -lt 40 ] && [ -z "\$(desk)" ]; do sleep 0.5; i=\$((i + 1)); done
+sleep 3
+d3=\$(desk); echo "\$d3" > "$T/desk3"
+[ -n "\$d3" ] && xwininfo -id "\$d3" | sed -n 's/.*Map State: //p' > "$T/mapped3"
 kill \$H 2>/dev/null
 EOF2
 chmod +x "$T/session.sh"
@@ -74,5 +93,14 @@ grep -q 'BadWindow\|X Error' "$T/explorer2.out" && fail "the shell started again
 [ -n "$(cat "$T/desk2" 2>/dev/null)" ] && [ "$(cat "$T/children2" 2>/dev/null || echo 0)" -ge 1 ] \
     && pass "the desktop shows again, with the shell's windows (the taskbar) in it ($(cat "$T/children2") windows)" \
     || fail "no desktop after the restart: the detached desktop window was not taken over"
+[ "$(cat "$T/mapped2" 2>/dev/null)" = IsViewable ] && pass "and it is on the screen (mapped: the new shell showed it)" \
+    || fail "the desktop after the restart is not on the screen: $(cat "$T/mapped2" 2>/dev/null) (only the backdrop showed)"
+if [ "$(cat "$T/desk3" 2>/dev/null)" = "$(cat "$T/desk2" 2>/dev/null)" ]; then
+    [ "$(cat "$T/mapped3" 2>/dev/null)" = IsViewable ] \
+        && pass "restarted again with the dead shell's ids (its desktop window the same id): on the screen" \
+        || fail "restarted with the dead shell's window id $(cat "$T/desk3"): $(cat "$T/mapped3" 2>/dev/null) -- the desktop never shown"
+else
+    echo "      (the second restart's desktop got another id, $(cat "$T/desk3" 2>/dev/null) after $(cat "$T/desk2" 2>/dev/null): the reused-id case not reached)"
+fi
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
