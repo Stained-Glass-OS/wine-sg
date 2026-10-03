@@ -41,11 +41,15 @@ cd "$WINEPREFIX/drive_c"
 sleep 2
 "$WINE" vdesk-probe.exe restore SgLinuxWindow "Linux Terminal" > "$T/restore.out" 2>&1
 sleep 2
+"$WINE" vdesk-probe.exe endtask SgLinuxWindow "Linux Terminal" > "$T/endtask.out" 2>&1
+sleep 2
 cmd=$(tr '\n' '|' < "$T/commands"); RC=0
 echo "      asked: $cmd"
 case "$cmd" in *"XCLOSE 4242"*) echo "PASS  WM_CLOSE to the stand-in (End task) asks the Linux window to close" ;;
     *) echo "FAIL  no XCLOSE: $(cat "$T/close.out")"; RC=1 ;; esac
 case "$cmd" in *"XACTIVATE 4242"*) echo "PASS  SC_RESTORE brings it forward" ;; *) echo "FAIL  no XACTIVATE: $(cat "$T/restore.out")"; RC=1 ;; esac
+# Task Manager's End task when it did not close (a hung one, 0772)
+case "$cmd" in *"XKILL 4242"*) echo "PASS  End task on one that did not close ends it (XKILL)" ;; *) echo "FAIL  no XKILL: $(cat "$T/endtask.out")"; RC=1 ;; esac
 "$WINE" vdesk-probe.exe exists SgLinuxWindow | grep -q 'exists=1' && echo "PASS  and the stand-in stays (until the window goes from the list)" \
     || { echo "FAIL  the stand-in was destroyed"; RC=1; }
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"

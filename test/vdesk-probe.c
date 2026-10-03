@@ -20,6 +20,8 @@
  *   vdesk-probe closewin TITLE     asks a "window" of this program to close (test/vdstay-gate.sh)
  *   vdesk-probe wmclose CLASS TITLE  sends WM_CLOSE to that window (test/linuxstandin-gate.sh)
  *   vdesk-probe restore CLASS TITLE  sends it SC_RESTORE
+ *   vdesk-probe endtask CLASS TITLE  sends it SgLinuxWindowEnd (Task Manager's
+ *                                  End task when it did not close, 0772)
  *   vdesk-probe rect TITLE         rect=l,t,r,b zoomed= iconic=
  *   vdesk-probe workarea           work=l,t,r,b
  *   vdesk-probe find CLASS [TITLE] whether such a window exists (and is visible)
@@ -212,7 +214,7 @@ int main( int argc, char **argv )
         printf( "buttons=%d\n", visible_buttons );
         return 0;
     }
-    if (argc == 4 && (!strcmp( argv[1], "wmclose" ) || !strcmp( argv[1], "restore" )))   /* a window by class and title (0758) */
+    if (argc == 4 && (!strcmp( argv[1], "wmclose" ) || !strcmp( argv[1], "restore" ) || !strcmp( argv[1], "endtask" )))   /* a window by class and title (0758) */
     {
         WCHAR wclass[64];
         HWND hwnd;
@@ -220,6 +222,7 @@ int main( int argc, char **argv )
         MultiByteToWideChar( CP_ACP, 0, argv[3], -1, wtitle, 64 );
         if (!(hwnd = FindWindowW( wclass, wtitle ))) { printf( "none\n" ); return 1; }
         if (!strcmp( argv[1], "wmclose" )) SendMessageW( hwnd, WM_CLOSE, 0, 0 );
+        else if (!strcmp( argv[1], "endtask" )) SendMessageW( hwnd, RegisterWindowMessageW( L"SgLinuxWindowEnd" ), 0, 0 );
         else SendMessageW( hwnd, WM_SYSCOMMAND, SC_RESTORE, 0 );
         printf( "sent\n" );
         return 0;

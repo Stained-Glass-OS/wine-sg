@@ -24,6 +24,9 @@
 #   7. Task View's card for it shows it, not a black picture
 #   8. WM_CLOSE to the frame (its close button, End task) closes it, and the
 #      frame goes
+#   9. a hung one (stopped) does not close when asked; Task Manager's End
+#      task then (SgLinuxWindowEnd) ends its process (patches/sg/0772; CPU-X
+#      could not be ended, David 2026-10-02)
 #
 #   WINE=/opt/wine-sg/bin/wine test/linuxembed-gate.sh
 set -u
@@ -187,6 +190,14 @@ printf '%d shown - XTerm\tBig Terminal\nEND\n' "$(xwininfo -root -children | awk
 sleep 4
 zoomed "Big Terminal" && pass "a window bigger than the work area gets a maximized frame" \
     || fail "bigger than the work area: its frame $("$WINE" probe.exe rect SgLinuxWindow "Big Terminal" | tr -d '\r')"
-"$WINE" probe.exe wmclose SgLinuxWindow "Big Terminal" > /dev/null 2>&1; sleep 1; kill "$XT" 2>/dev/null; XT=
+# hung: asked to close it stays; End task ends it (gone, or a zombie not yet reaped)
+alive() { [ -d "/proc/$1" ] && ! grep -q '^[0-9]* (.*) Z' "/proc/$1/stat" 2>/dev/null; }
+kill -STOP "$XT"
+"$WINE" probe.exe wmclose SgLinuxWindow "Big Terminal" > /dev/null 2>&1; sleep 2
+alive "$XT" && pass "a hung program asked to close stays (it does not answer)" || fail "the stopped xterm closed: test broken"
+"$WINE" probe.exe endtask SgLinuxWindow "Big Terminal" > /dev/null 2>&1
+i=0; while alive "$XT" && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
+alive "$XT" && fail "End task left the hung program running" || pass "End task ends the hung program (its process killed)"
+kill -9 "$XT" 2>/dev/null; wait "$XT" 2>/dev/null; XT=
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"

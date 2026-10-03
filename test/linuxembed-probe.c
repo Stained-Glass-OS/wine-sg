@@ -2,6 +2,8 @@
  *   activate CLASS TITLE      SetForegroundWindow (restored first)
  *   move CLASS TITLE X Y W H  SetWindowPos
  *   wmclose CLASS TITLE       SendMessage WM_CLOSE (End task, the close button)
+ *   endtask CLASS TITLE       SendMessage SgLinuxWindowEnd (Task Manager's End
+ *                             task when the program did not close)
  *   exists CLASS TITLE        exists=0|1
  *   rect CLASS TITLE          left top right bottom
  *   foreground CLASS TITLE    foreground=0|1 */
@@ -40,6 +42,7 @@ int main( int argc, char **argv )
     else if (!strcmp( argv[1], "maximize" )) ShowWindow( hwnd, SW_MAXIMIZE );
     else if (!strcmp( argv[1], "restore" )) ShowWindow( hwnd, SW_RESTORE );
     else if (!strcmp( argv[1], "wmclose" )) SendMessageW( hwnd, WM_CLOSE, 0, 0 );
+    else if (!strcmp( argv[1], "endtask" )) SendMessageW( hwnd, RegisterWindowMessageW( L"SgLinuxWindowEnd" ), 0, 0 );
     else if (!strcmp( argv[1], "rect" ))
     {
         RECT r;
