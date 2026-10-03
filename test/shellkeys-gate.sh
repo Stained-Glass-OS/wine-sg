@@ -101,7 +101,10 @@ K super; P find '#32768'
 K Escape
 K super+r; P find '#32770' Run
 K Escape
-K super+e; P find ExplorerWClass
+K super+e
+# File Explorer takes a moment to come up: up to 10 s
+i=0; while [ \$i -lt 20 ] && ! "$WINE" vdesk-probe.exe find ExplorerWClass 2>/dev/null | grep -q found=1; do sleep 0.5; i=\$((i + 1)); done
+P find ExplorerWClass
 K super+h; sleep 1
 K super+i; sleep 1
 K super+x; K t; sleep 1
