@@ -98,6 +98,21 @@ if [ $# = 4 ]; then
             && pass "and its corner sizes it ($(cat "$T/rect1") -> $(cat "$T/rect2"))" \
             || fail "size: $(cat "$T/rect1") -> $(cat "$T/rect2") (want about 60x40 larger)"
     fi
+    # a quick click on its title bar (pressed and let go at once, as a tap
+    # is): the frame must not then follow the pointer (David 2026-10-03:
+    # GNOME Secrets' window stuck to the pointer, clicks or not)
+    "$WINE" probe.exe rect SgLinuxWindow "Own Frame" 2>/dev/null | tr -d '\r' > "$T/rect3"
+    set -- $(cat "$T/rect3")
+    if [ $# = 4 ]; then
+        xdotool mousemove $(( $1 + 150 )) $(( $2 + 12 )); sleep 0.3; xdotool click 1; sleep 0.8
+        for k in 1 2 3 4 5 6; do xdotool mousemove_relative -- 25 15; sleep 0.1; done
+        sleep 0.8
+        "$WINE" probe.exe rect SgLinuxWindow "Own Frame" 2>/dev/null | tr -d '\r' > "$T/rect4"
+        [ "$(cat "$T/rect4")" = "$(cat "$T/rect3")" ] \
+            && pass "a quick click on its title bar leaves the frame where it is (it does not follow the pointer after)" \
+            || fail "after a quick click the frame followed the pointer: $(cat "$T/rect3") -> $(cat "$T/rect4")"
+        xdotool click 1; sleep 0.5    # (an old build's loop: end it)
+    fi
 fi
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
