@@ -26,6 +26,7 @@
 #   8. WM_CLOSE to the frame (its close button, End task) closes it, and the
 #      frame goes
 #  10. a request about a window already gone does not end the shell
+#  11. one opening while a Wine window is active is active and has the keys
 #   9. a hung one (stopped) does not close when asked; Task Manager's End
 #      task then (SgLinuxWindowEnd) ends its process (patches/sg/0772; CPU-X
 #      could not be ended, David 2026-10-02)
@@ -240,5 +241,23 @@ kill -9 "$XT" 2>/dev/null; wait "$XT" 2>/dev/null; XT=
 if xwininfo -root -tree 2>/dev/null | grep -q '"shell - Wine Desktop"' && pgrep -f 'explorer.exe /desktop=shell' >/dev/null; then
     pass "a request about a window already gone leaves the shell running"
 else fail "the shell ended after a request about a window that was gone"; fi
+# 11. one opening while a Wine window is active (a Linux Terminal opened over
+# PowerShell, David 2026-10-03): its frame is active and it has the keys,
+# with no click -- not hidden while it was taken in and shown again behind,
+# nor its frame given the X focus before the program was in it (0788)
+"$WINE" probe.exe activate Notepad "" > /dev/null 2>&1; sleep 1
+xterm -geometry 50x12+300+200 -bg '#3060a0' -fg white -title 'New Terminal' -e sh -c "cd '$T'; exec sh" & XT=$!
+i=0; while [ -z "$(xwininfo -root -children | awk '/"New Terminal"/ {print $1; exit}')" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+X3=$(xwininfo -root -children | awk '/"New Terminal"/ {print $1; exit}')
+printf '%d shown - XTerm\tNew Terminal\nEND\n' "$X3" > "$T/list"
+sleep 4   # framed at the next tick
+xdotool mousemove 900 650; sleep 0.3
+fg SgLinuxWindow "New Terminal" && pass "a Linux window opened over Notepad is the active window" \
+    || fail "opened over Notepad, not active: $("$WINE" probe.exe foreground SgLinuxWindow "New Terminal" | tr -d '\r')"
+[ "$(printf '%d' "$(xdotool getwindowfocus 2>/dev/null)")" = "$(printf '%d' "$X3")" ] && pass "...and has the X focus" \
+    || fail "...the X focus is on $(xdotool getwindowfocus 2>/dev/null), not $X3"
+xdotool type --delay 40 'touch typed-new'; xdotool key Return; sleep 1.5
+[ -e "$T/typed-new" ] && pass "...and keys reach it without a click" || fail "typed keys did not reach the new window"
+kill "$XT" 2>/dev/null; XT=
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
