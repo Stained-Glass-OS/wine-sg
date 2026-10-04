@@ -28,6 +28,11 @@ int wmain(void)
     printf("AND %08lx %s\n", hr, both ? "yes" : "no");
     if (root && both) hr = IUIAutomationElement_FindFirstBuildCache(root, TreeScope_Children, both, cache, &pm);
     printf("PROGMAN %08lx %s\n", hr, pm ? "found" : "none");
+    if (pm) {
+        BSTR cls = NULL;
+        hr = IUIAutomationElement_get_CurrentClassName(pm, &cls);
+        printf("CLASSNAME %08lx %ls\n", hr, cls ? cls : L"-");
+    }
     V_VT(&v) = VT_BSTR; V_BSTR(&v) = SysAllocString(L"SysListView32");
     IUIAutomation_CreatePropertyCondition(uia, UIA_ClassNamePropertyId, v, &listcond);
     if (pm && listcond) hr = IUIAutomationElement_FindFirstBuildCache(pm, TreeScope_Descendants, listcond, cache, &list);

@@ -4,12 +4,14 @@
 # (patches/sg/0799): "Progman" ("Program Manager") holding SHELLDLL_DefView
 # and its SysListView32. Opera's installer looks for them through UI
 # Automation and crashed without them (its shortcuts step, 2026-10-04 --
-# with the root UI Automation gave it: GetRootElementBuildCache was a stub);
+# with the root UI Automation gave it: GetRootElementBuildCache was a stub;
+# the desktop had no children, elements no class name);
 # wallpaper and desktop tools FindWindow("Progman") and send it 0x52C.
 # They are one transparent, click-through pixel: the desktop draws itself.
 #
 #   WINE=/opt/wine-sg/bin/wine test/progman-gate.sh
-# Mutants: SG_MUTANT_NO_PROGMAN (explorer), SG_MUTANT_UIA_STUBS (uiautomationcore).
+# Mutants: SG_MUTANT_NO_PROGMAN (explorer), SG_MUTANT_UIA_STUBS,
+# SG_MUTANT_UIA_NO_CHILDREN (uiautomationcore).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -48,8 +50,8 @@ timeout 60 "$WINE" "$T/uia.exe" 2>/dev/null | tr -d '\r' > "$T/u"
 u() { sed -n "s/^$1 //p" "$T/u" | head -1; }
 [ "$(u ROOT)" = "00000000 yes" ] && pass "UI Automation's root, with a cache request" || fail "root: '$(u ROOT)'"
 [ "$(u AND)" = "00000000 yes" ] && pass "an And condition" || fail "And condition: '$(u AND)'"
-# (UI Automation does not find Progman among the root's children yet --
-# walking other processes' windows blocks; Opera's installer copes with that)
-[ "$(u PROGMAN)" != "" ] && pass "FindFirstBuildCache on the root returns (${u_p:-$(u PROGMAN)})" || fail "FindFirstBuildCache on the root did not return"
+[ "$(u PROGMAN)" = "00000000 found" ] && pass "the root's Progman pane found by class name and control type (the desktop's children, their class names)" || fail "Progman by UIA: '$(u PROGMAN)'"
+[ "$(u CLASSNAME)" = "00000000 Progman" ] && pass "an element's class name read (get_CurrentClassName)" || fail "class name: '$(u CLASSNAME)'"
+[ "$(u LIST)" = "00000000 found" ] && pass "its SysListView32 found below it" || fail "list by UIA: '$(u LIST)'"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
