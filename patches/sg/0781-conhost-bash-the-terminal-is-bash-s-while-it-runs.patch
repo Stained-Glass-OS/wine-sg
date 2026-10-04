@@ -1,0 +1,201 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] conhost, bash: the terminal is bash's while it runs
+
+David 2026-10-03: "Getting a proper bash terminal by running bash inside
+powershell would be very useful". In a Unix terminal (ssh, a terminal
+window) conhost reads the terminal for its console all along and keeps it
+raw: bash run from PowerShell (0776) printed, but what was typed went half
+to conhost, and its line editing had a raw terminal.
+
+bash.exe now hands the terminal over: a private console request
+(IOCTL_CONDRV_SG_PAUSE_TTY, which the server passes to conhost as any
+console request it does not know) pauses conhost's reading of it and gives
+it back as it was (IOCTL_CONDRV_SETUP_INPUT 0), and after bash a second one
+resumes it -- raw again with the next console read. conhost's read blocks
+in the terminal itself and cannot be cancelled: a handshake (tty_state)
+lets the pause end the input thread while it is in that read, holding
+nothing, and a read that returns after the pause leaves without taking
+anything. Interactive bash takes the terminal's foreground for its own
+process group, so Ctrl+C stops its command, not the console's programs.
+
+Test: test/bashtty-gate.sh (cmd -> bash -> typed commands, Ctrl+C, exit ->
+cmd; mutant SG_MUTANT_TTY_NOT_PAUSED).
+---
+--- a/programs/conhost/conhost.c
++++ b/programs/conhost/conhost.c
+@@ -1759,12 +1759,21 @@
+ 
+     for (;;)
+     {
++        /* Stained Glass OS: the terminal handed to a Unix program (bash.exe):
++         * read no more. The read below blocks in the terminal itself, where it
++         * cannot be cancelled: the pause ends this thread while it is there
++         * (it holds nothing then), and a read that returns after the pause
++         * leaves without taking anything (tty_state, a handshake with it). */
++        if (console->tty_paused) goto paused;
++        InterlockedExchange( &console->tty_state, TTY_READING );
+         status = NtReadFile( console->tty_input, event, NULL, NULL, &io, read_buf, sizeof(read_buf), NULL, NULL );
+         if (status == STATUS_PENDING)
+         {
+             if ((status = NtWaitForSingleObject( event, FALSE, NULL ))) break;
+             status = io.Status;
+         }
++        if (InterlockedCompareExchange( &console->tty_state, TTY_PROCESSING, TTY_READING ) != TTY_READING)
++            goto paused;
+         /* a pseudo console's input may be the server end of a named pipe that
+          * nobody has connected to yet: node-pty (VS Code's terminal) creates
+          * the pseudo console first and connects afterwards. Wait for the
+@@ -1833,8 +1842,10 @@
+ 
+ done:
+     EnterCriticalSection( &console_section );
+-    if (console->read_ioctl) read_complete( console, status, NULL, 0, FALSE );
+-    if (console->is_unix)
++    /* paused (the terminal handed to a Unix program): a pending read waits
++     * for the terminal to come back, and the pause has restored it already */
++    if (console->read_ioctl && !console->tty_paused) read_complete( console, status, NULL, 0, FALSE );
++    if (console->is_unix && !console->tty_paused)
+     {
+         unsigned int h = 0;
+         status = NtDeviceIoControlFile( console->server, NULL, NULL, NULL, &io, IOCTL_CONDRV_SETUP_INPUT,
+@@ -1846,11 +1857,16 @@
+     LeaveCriticalSection( &console_section );
+ 
+     return 0;
++
++paused:
++    /* the pause has restored the terminal and forgotten this thread */
++    CloseHandle( event );
++    return 0;
+ }
+ 
+ static BOOL ensure_tty_input_thread( struct console *console )
+ {
+-    if (!console->tty_input) return TRUE;
++    if (!console->tty_input || console->tty_paused) return TRUE;
+     if (!console->input_thread)
+         console->input_thread = CreateThread( NULL, 0, tty_input, console, 0, NULL );
+     return console->input_thread != NULL;
+@@ -3025,6 +3041,43 @@
+     case IOCTL_CONDRV_IS_UNIX:
+         return console->is_unix ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+ 
++    case IOCTL_CONDRV_SG_PAUSE_TTY:
++        /* Stained Glass OS (David 2026-10-03: bash run from PowerShell could
++         * not be typed into -- this read the terminal too, and kept it raw):
++         * stop reading the terminal and give it back as it was, until the
++         * Unix program it was handed to is done */
++        TRACE( "pause tty %u (unix %d, input %p, thread %p)\n", in_size == sizeof(unsigned int) ? *(const unsigned int *)in_data : ~0u,
++               console->is_unix, console->tty_input, console->input_thread );
++        if (in_size != sizeof(unsigned int) || *out_size) return STATUS_INVALID_PARAMETER;
++        if (!console->is_unix || !console->tty_input) return STATUS_NOT_SUPPORTED;
++#ifdef SG_MUTANT_TTY_NOT_PAUSED
++        return STATUS_SUCCESS;
++#endif
++        if (*(const unsigned int *)in_data)
++        {
++            IO_STATUS_BLOCK io;
++            unsigned int h = 0;
++            if (console->tty_paused) return STATUS_SUCCESS;
++            console->tty_paused = TRUE;
++            if (console->input_thread)
++            {
++                /* in the terminal's read: it holds nothing, end it there; else it
++                 * is past it (waiting for this lock) and leaves at its next turn */
++                if (InterlockedCompareExchange( &console->tty_state, TTY_PAUSED, TTY_READING ) == TTY_READING)
++                    NtTerminateThread( console->input_thread, 0 );
++                CloseHandle( console->input_thread );
++                console->input_thread = NULL;
++            }
++            NtDeviceIoControlFile( console->server, NULL, NULL, NULL, &io, IOCTL_CONDRV_SETUP_INPUT,
++                                   &h, sizeof(h), NULL, 0 );
++        }
++        else
++        {
++            console->tty_paused = FALSE;
++            if (console->read_ioctl) ensure_tty_input_thread( console );
++        }
++        return STATUS_SUCCESS;
++
+     case IOCTL_CONDRV_READ_CONSOLE:
+         if (in_size || *out_size % sizeof(WCHAR)) return STATUS_INVALID_PARAMETER;
+         ensure_tty_input_thread( console );
+--- a/programs/conhost/conhost.h
++++ b/programs/conhost/conhost.h
+@@ -33,6 +33,11 @@
+ #include <winternl.h>
+ 
+ #include "wine/condrv.h"
++
++/* Stained Glass OS: a program of this console hands the terminal to a Unix
++ * program and back (bash.exe): unsigned int 1 to pause reading it, 0 to resume */
++#define IOCTL_CONDRV_SG_PAUSE_TTY CTL_CODE(FILE_DEVICE_CONSOLE, 2000, METHOD_BUFFERED, FILE_ANY_ACCESS)
++enum { TTY_IDLE, TTY_READING, TTY_PROCESSING, TTY_PAUSED };
+ #include "wine/rbtree.h"
+ 
+ struct history_line
+@@ -103,6 +108,8 @@
+     unsigned int           output_cp;           /* console output codepage */
+     HWND                   win;                 /* window handle if backend supports it */
+     HANDLE                 input_thread;        /* input thread handle */
++    BOOL                  tty_paused;   /* Stained Glass OS: a Unix program has the terminal (bash.exe) */
++    LONG                  tty_state;    /* the input thread: TTY_IDLE, _READING, _PROCESSING, _PAUSED */
+     HANDLE                 tty_input;           /* handle to tty input stream */
+     HANDLE                 tty_output;          /* handle to tty output stream */
+     char                   tty_buffer[4096];    /* tty output buffer */
+--- a/programs/bash/main.c
++++ b/programs/bash/main.c
+@@ -26,13 +26,26 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ #include <windows.h>
++#include <winioctl.h>
+ #include <stdio.h>
++
++/* conhost's own (programs/conhost/conhost.h): hand the terminal to the Unix
++ * program and back, so what is typed reaches bash and not the console */
++#define IOCTL_CONDRV_SG_PAUSE_TTY CTL_CODE(FILE_DEVICE_CONSOLE, 2000, METHOD_BUFFERED, FILE_ANY_ACCESS)
++
++static void pause_console_tty(HANDLE in, unsigned int pause)
++{
++    DWORD got;
++    if (in != INVALID_HANDLE_VALUE) DeviceIoControl(in, IOCTL_CONDRV_SG_PAUSE_TTY, &pause, sizeof(pause), NULL, 0, &got, NULL);
++}
++
+ int wmain(int argc, WCHAR **argv)
+ {
+     WCHAR cmd[32768], rcfile[64], dosrc[80], dospid[80];
+     STARTUPINFOW si = { sizeof(si) };
+     PROCESS_INFORMATION pi;
+     DWORD code = 1;
++    HANDLE conin;
+     int i;
+     /* bash's exit status: Wine gives a Unix program's process no exit code of
+      * its own, so sh writes it where this reads it back */
+@@ -62,7 +75,16 @@
+     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+     si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+-    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) { fwprintf(stderr, L"bash: %lu\n", GetLastError()); return 127; }
++    /* in a Unix terminal (ssh, a terminal window): the terminal is bash's
++     * while it runs; in a console window this does nothing */
++    conin = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                        OPEN_EXISTING, 0, NULL);
++    pause_console_tty(conin, 1);
++    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
++        pause_console_tty(conin, 0);
++        fwprintf(stderr, L"bash: %lu\n", GetLastError());
++        return 127;
++    }
+     WaitForSingleObject(pi.hProcess, INFINITE);
+ #ifndef SG_MUTANT_BASH_NO_STATUS
+     for (;;) {
+@@ -80,6 +102,8 @@
+         Sleep(50);
+     }
+ #endif
++    pause_console_tty(conin, 0);
++    if (conin != INVALID_HANDLE_VALUE) CloseHandle(conin);
+     DeleteFileW(dosrc);
+     DeleteFileW(dospid);
+     return (int)code;
