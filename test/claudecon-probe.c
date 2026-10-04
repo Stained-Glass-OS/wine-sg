@@ -85,6 +85,10 @@ static int child_vt(void)
     fprintf(f, "VTSI %c%c\n", (char)ch[0], (char)ch[1]);
     /* light grey on green, then light grey on black: the colour must end */
     put("\x1b[7;1H\x1b[37;42mG\x1b[37;40mW\x1b[0m\r\n");
+    /* true colours, as Claude Code draws (0795) */
+    put("\x1b[9;1H\x1b[38;2;10;20;30mT\x1b[48;2;200;100;50mU\x1b[0m\r\n");
+    /* a row with a background at the bottom, then a line feed that scrolls */
+    put("\x1b[25;1H\x1b[48;2;9;9;9mBGROW\x1b[49m\r\nNEXTROW\r\n");
     fclose(f);
     Sleep(800);
     return 0;
@@ -177,6 +181,29 @@ int main(int argc, char **argv)
             }
             printf("VTRESET %s\n", ok ? "yes" : "no");
         } else printf("VTRESET nog\n");
+        {
+            char *t = strstr(seen, "T"), *u;
+            int tc = 0;
+            /* the true colours reach the tab: 38;2;10;20;30 before T, 48;2;200;100;50 before U */
+            for (t = seen; (t = strstr(t, "38;2;10;20;30m")); t++) if (t[14] == 'T' || strstr(t, "T") - t < 40) { tc |= 1; break; }
+            u = strstr(seen, "48;2;200;100;50m");
+            if (u && strchr(u, 'U') && strchr(u, 'U') - u < 40) tc |= 2;
+            printf("TRUECOLOR %s\n", tc == 3 ? "yes" : tc == 1 ? "fg-only" : tc == 2 ? "bg-only" : "no");
+        }
+        {
+            /* no line feed while the row's background is in effect: from the last
+             * 48;2;9;9;9 before NEXTROW, a reset comes before any \r\n */
+            char *n = strstr(seen, "NEXTROW"), *b = NULL, *q, *lf;
+            for (q = seen; (q = strstr(q, "48;2;9;9;9m")) && (!n || q < n); q++) b = q;
+            if (!n || !b) printf("LFBG nobg\n");
+            else {
+                char *reset1, *reset2, *first_reset;
+                lf = strstr(b, "\r\n");
+                reset1 = strstr(b, "\x1b[49m"); reset2 = strstr(b, "\x1b[m");
+                first_reset = !reset1 ? reset2 : !reset2 ? reset1 : (reset1 < reset2 ? reset1 : reset2);
+                printf("LFBG %s\n", (!lf || lf > n || (first_reset && first_reset < lf)) ? "plain" : "colored");
+            }
+        }
         LeaveCriticalSection(&cs);
     }
 

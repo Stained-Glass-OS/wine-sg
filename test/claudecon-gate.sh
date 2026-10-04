@@ -15,7 +15,10 @@
 #     next line typed: the next reader (the shell) gets it.
 #
 #   WINE=/opt/wine-sg/bin/wine test/claudecon-gate.sh
-# Mutants: SG_MUTANT_VT_PRIVATE_AS_SGR, SG_MUTANT_VT_PRINTS_C0,
+#   - true colours (SGR 38;2, 48;2, 38;5) reach the tab, and a line feed
+#     never carries a row's background into a new line (0795).
+# Mutants: SG_MUTANT_NO_TRUECOLOR, SG_MUTANT_LF_KEEPS_BG (0795),
+# SG_MUTANT_VT_PRIVATE_AS_SGR, SG_MUTANT_VT_PRINTS_C0,
 # SG_MUTANT_TTY_BG_STICKS, SG_MUTANT_CTRLC_ENDS_INPUT (conhost),
 # SG_MUTANT_DEAD_READ_EATS_INPUT (wineserver).
 set -u
@@ -41,6 +44,8 @@ v() { sed -n "s/^$1 //p" "$T/o" | head -1; }
     || fail "private forms: '$(v VTCELL)' (want X at its place, attribute 0007)"
 [ "$(v VTSI)" = AB ] && pass "SI is not drawn (AB)" || fail "SI: '$(v VTSI)'"
 [ "$(v VTRESET)" = yes ] && pass "grey on green back to grey: the green ends in the tab" || fail "colour back to grey: '$(v VTRESET)'"
+[ "$(v TRUECOLOR)" = yes ] && pass "true colours reach the tab (38;2 and 48;2, as written)" || fail "true colour: '$(v TRUECOLOR)'"
+[ "$(v LFBG)" = plain ] && pass "no line feed while a row's background is in effect (no colour run into the next row)" || fail "line feed with a background: '$(v LFBG)'"
 [ "$(v RAW)" = key ] && pass "Ctrl+C in raw mode reaches the program as a key; the console goes on" || fail "raw Ctrl+C: '$(v RAW)'"
 [ "$(v ALIVE)" = yes ] && pass "the console takes another program after it" || fail "after Ctrl+C: '$(v ALIVE)'"
 [ "$(v LINE)" = hello ] && pass "a read left by a process that ended does not take the next line: the next reader gets it" \
