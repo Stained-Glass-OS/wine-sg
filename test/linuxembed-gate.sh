@@ -25,6 +25,7 @@
 #   7. Task View's card for it shows it, not a black picture
 #   8. WM_CLOSE to the frame (its close button, End task) closes it, and the
 #      frame goes
+#  10. a request about a window already gone does not end the shell
 #   9. a hung one (stopped) does not close when asked; Task Manager's End
 #      task then (SgLinuxWindowEnd) ends its process (patches/sg/0772; CPU-X
 #      could not be ended, David 2026-10-02)
@@ -232,5 +233,12 @@ alive "$XT" && pass "a hung program asked to close stays (it does not answer)" |
 i=0; while alive "$XT" && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
 alive "$XT" && fail "End task left the hung program running" || pass "End task ends the hung program (its process killed)"
 kill -9 "$XT" 2>/dev/null; wait "$XT" 2>/dev/null; XT=
+# 10. a request about a window that is gone (a program closing a popup as it
+# asks to be full screen): the shell stays (David's X1, 2026-10-03: the shell
+# ended -- the X error went to Xlib's own handler; patches/sg/0784)
+"$T/netwm-fullscreen" 0x7ffff01 1 2>/dev/null; sleep 2
+if xwininfo -root -tree 2>/dev/null | grep -q '"shell - Wine Desktop"' && pgrep -f 'explorer.exe /desktop=shell' >/dev/null; then
+    pass "a request about a window already gone leaves the shell running"
+else fail "the shell ended after a request about a window that was gone"; fi
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
