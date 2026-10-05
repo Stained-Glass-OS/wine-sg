@@ -5,7 +5,7 @@
  *   claudecon-probe raw         raw input: Ctrl+C is a key
  *   claudecon-probe deadread    a line read left waiting when its process ends
  *   claudecon-probe read        a line read: LINE=<what was typed>
- * The host prints what it saw: VTCELL, VTSI, VTRESET, RAW, ALIVE, LINE.
+ * The host prints what it saw: VTCELL, VTSI, VTRESET, RAW, ALIVE, LINE, ECHO.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
@@ -134,14 +134,25 @@ static int child_read(void)
     WCHAR buf[64];
     char a[64];
     DWORD n = 0;
-    put("READREADY\r\n");
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    WCHAR row[32];
+    COORD c;
+    DWORD got = 0;
+    /* a prompt, as the shell's: the line typed shows after it */
+    put("READREADY\r\nPROMPT>");
     if (!ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buf, 63, &n, NULL)) return 2;
     while (n && (buf[n - 1] == '\r' || buf[n - 1] == '\n')) n--;
     buf[n] = 0;
+    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info);
+    c.X = 0; c.Y = info.dwCursorPosition.Y ? info.dwCursorPosition.Y - 1 : 0;
+    ReadConsoleOutputCharacterW(GetStdHandle(STD_OUTPUT_HANDLE), row, 31, c, &got);
+    while (got && row[got - 1] == ' ') got--;
+    row[got] = 0;
     {
-        char line[128];
+        char line[160], r[64];
         WideCharToMultiByte(CP_ACP, 0, buf, -1, a, sizeof(a), NULL, NULL);
-        snprintf(line, sizeof(line), "LINE=%s=END\r\n", a);
+        WideCharToMultiByte(CP_ACP, 0, row, -1, r, sizeof(r), NULL, NULL);
+        snprintf(line, sizeof(line), "\r\nLINE=%s=END\r\nECHO=%s=END\r\n", a, r);
         put(line);
     }
     Sleep(500);
@@ -223,6 +234,7 @@ int main(int argc, char **argv)
         WriteFile(in_w, "hello\r", 6, &n, NULL);
         code = WaitForSingleObject(p, 8000);
         printf("LINE %s\n", code == WAIT_OBJECT_0 && saw("LINE=hello=END", 2000) ? "hello" : "lost");
+        printf("ECHO %s\n", saw("ECHO=PROMPT>hello=END", 1000) ? "after-prompt" : "elsewhere");
         if (code != WAIT_OBJECT_0) TerminateProcess(p, 9);
         CloseHandle(p);
     }

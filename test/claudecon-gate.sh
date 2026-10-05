@@ -12,7 +12,9 @@
 #   - Ctrl+C in raw mode is a key the program reads -- it ended the
 #     console's reading of keys (the tab took no typing, or closed);
 #   - a line read left waiting by a process that ended does not take the
-#     next line typed: the next reader (the shell) gets it.
+#     next line typed: the next reader (the shell) gets it, and the line
+#     shows where it is typed, after the shell's prompt (0811, mutant
+#     SG_MUTANT_EDIT_HOME_STALE).
 #
 #   WINE=/opt/wine-sg/bin/wine test/claudecon-gate.sh
 #   - true colours (SGR 38;2, 48;2, 38;5) reach the tab, and a line feed
@@ -50,5 +52,7 @@ v() { sed -n "s/^$1 //p" "$T/o" | head -1; }
 [ "$(v ALIVE)" = yes ] && pass "the console takes another program after it" || fail "after Ctrl+C: '$(v ALIVE)'"
 [ "$(v LINE)" = hello ] && pass "a read left by a process that ended does not take the next line: the next reader gets it" \
     || fail "line after a dead read: '$(v LINE)'"
+[ "$(v ECHO)" = after-prompt ] && pass "and it shows where it is typed, after the shell's prompt (not where the dead read began)" \
+    || fail "echo after a dead read: '$(v ECHO)'"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
