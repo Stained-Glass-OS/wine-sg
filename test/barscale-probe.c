@@ -14,6 +14,8 @@ int main( int argc, char **argv )
     RECT r, c;
     DWORD_PTR res;
 
+    /* the bar's real size, not one scaled for a program unaware of the DPI */
+    SetProcessDPIAware();
     if (argc > 2 && !strcmp( argv[1], "set" ))
     {
         DWORD v = atoi( argv[2] );

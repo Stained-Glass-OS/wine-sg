@@ -1,16 +1,16 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# The taskbar grows with the screen as the title bars do (wine-sg 0814):
-# sg-shell's looks write Style\Scale8, the screen's height in eighths of
-# 800 px (1080p 11, 1200p 12), and size the title bars by it; the bar stayed
-# 40 px whatever the screen, and looked small beside them. Under Xvfb, the
+# The taskbar is as large as the display scale makes it, as Windows' is
+# (wine-sg 0814, 0832): 40 px at 100% (LogPixels 96) whatever the
+# resolution, 60 px at 150% (LogPixels 144). 0814 first sized it by the
+# screen's height (sg-shell's Style\Scale8, which the title bars use): 55 px
+# at 1080p, larger than Windows' (David 2026-10-05). Under Xvfb, the
 # shell's taskbar:
-#   1. at scale 8 the bar is as before: 40 px
-#   2. set to 12 while it runs (the looks' SPI_SETNONCLIENTMETRICS), the bar
-#      is 60 px, and its buttons wider, without a restart
-#   3. started at 12, it is 60 px from the start
+#   1. at 100% the bar is 40 px
+#   2. the title bars' screen scale (Scale8 12) set while it runs leaves it 40 px
+#   3. started at 150% (LogPixels 144), it is 60 px, its buttons wider
 #
-#   WINE=/opt/wine-sg/bin/wine test/barscale-gate.sh   (mutant SG_MUTANT_BAR_NO_SCALE)
+#   WINE=/opt/wine-sg/bin/wine test/barscale-gate.sh   (mutants SG_MUTANT_BAR_NO_SCALE, SG_MUTANT_BAR_SCREEN_SCALE)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -40,15 +40,18 @@ val() { printf '%s\n' "$1" | sed -n "s/.*$2=\([0-9]*\).*/\1/p"; }
 
 shell
 b8=$(bar)
-[ "$(val "$b8" height)" = 40 ] && pass "at scale 8 the bar is 40 px, as before" || fail "scale 8: $b8 (want height 40)"
+[ "$(val "$b8" height)" = 40 ] && pass "at 100% the bar is 40 px" || fail "100%: $b8 (want height 40)"
 "$WINE" "$T/probe.exe" set 12 >/dev/null 2>&1; sleep 2
+b=$(bar)
+[ "$(val "$b" height)" = 40 ] && pass "the title bars' screen scale (12) leaves it 40 px, as Windows' at 100%" \
+    || fail "with Scale8 12: $b (want height 40: the bar follows the display scale, not the screen)"
+"$WINESERVER" -k; sleep 1
+"$WINE" reg add 'HKCU\Control Panel\Desktop' /v LogPixels /t REG_DWORD /d 144 /f >/dev/null 2>&1
+"$WINESERVER" -w
+shell
 b12=$(bar)
-[ "$(val "$b12" height)" = 60 ] && pass "set to 12 while it runs, the bar is 60 px" || fail "set to 12: $b12 (want height 60)"
+[ "$(val "$b12" height)" = 60 ] && pass "at 150% (LogPixels 144) the bar is 60 px" || fail "150%: $b12 (want height 60)"
 [ "$(val "$b12" widest)" -gt "$(val "$b8" widest)" ] 2>/dev/null \
     && pass "and its buttons are wider ($(val "$b8" widest) -> $(val "$b12" widest) px)" || fail "buttons: $b8 -> $b12"
-"$WINESERVER" -k; sleep 1
-shell
-b=$(bar)
-[ "$(val "$b" height)" = 60 ] && pass "started at 12, the bar is 60 px" || fail "started at 12: $b (want height 60)"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
