@@ -4,7 +4,9 @@
  * its top 30 px, gives the pointer up and asks the window manager to move it
  * (_NET_WM_MOVERESIZE, as Qt's startSystemMove does); pressed in its bottom
  * right corner, to size it. Filled orange, its "title bar" dark blue.
- * For ownframe-gate.sh. SPDX-License-Identifier: LGPL-2.1-or-later */
+ * With OWNFRAME_DBLCLICK set, a double-click on its title bar toggles it
+ * maximized itself (_NET_WM_STATE to the root), as Qt and GTK title bars do.
+ * For ownframe-gate.sh and embeddragmax-gate.sh. SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +22,8 @@ int main( int argc, char **argv )
     GC gc;
     unsigned long hints[5] = { 1 << 1, 0, 0, 0, 0 };   /* MWM_HINTS_DECORATIONS: none */
     int width, height;
+    int dblclick = getenv( "OWNFRAME_DBLCLICK" ) != NULL;
+    Time last_press = 0;
 
     if (argc < 6 || !(d = XOpenDisplay( NULL ))) return 2;
     width = atoi( argv[4] ); height = atoi( argv[5] );
@@ -27,7 +31,7 @@ int main( int argc, char **argv )
     XStoreName( d, w, argv[1] );
     XChangeProperty( d, w, XInternAtom( d, "_MOTIF_WM_HINTS", False ), XInternAtom( d, "_MOTIF_WM_HINTS", False ), 32,
                      PropModeReplace, (unsigned char *)hints, 5 );
-    XSelectInput( d, w, ExposureMask | ButtonPressMask | StructureNotifyMask );
+    XSelectInput( d, w, ExposureMask | ButtonPressMask | ButtonReleaseMask | StructureNotifyMask );   /* the release too, as Qt and GTK do */
     XMapWindow( d, w );
     gc = XCreateGC( d, w, 0, NULL );
     for (;;)
@@ -54,6 +58,18 @@ int main( int argc, char **argv )
             m.xclient.data.l[3] = 1;
             m.xclient.data.l[4] = 1;
             XSendEvent( d, DefaultRootWindow( d ), False, SubstructureRedirectMask | SubstructureNotifyMask, &m );
+            if (dblclick && ev.xbutton.y < 30 && last_press && ev.xbutton.time - last_press < 400)
+            {
+                m.xclient.message_type = XInternAtom( d, "_NET_WM_STATE", False );
+                m.xclient.data.l[0] = 2;   /* toggle */
+                m.xclient.data.l[1] = XInternAtom( d, "_NET_WM_STATE_MAXIMIZED_VERT", False );
+                m.xclient.data.l[2] = XInternAtom( d, "_NET_WM_STATE_MAXIMIZED_HORZ", False );
+                m.xclient.data.l[3] = 1;
+                m.xclient.data.l[4] = 0;
+                XSendEvent( d, DefaultRootWindow( d ), False, SubstructureRedirectMask | SubstructureNotifyMask, &m );
+                last_press = 0;
+            }
+            else if (ev.xbutton.y < 30) last_press = ev.xbutton.time;
             XFlush( d );
         }
     }

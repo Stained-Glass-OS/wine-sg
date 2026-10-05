@@ -4,12 +4,17 @@
  * for Firefox's F11 or its restored maximized window.
  * netwm-fullscreen WINDOW preset-maximized -- _NET_WM_STATE maximized on
  * the window, as a window manager leaves a window it maximized.
+ * netwm-fullscreen WINDOW iconify -- ask to be minimized, as a program's own
+ * minimize button does (XIconifyWindow: WM_CHANGE_STATE, ICCCM).
+ * netwm-fullscreen WINDOW activate -- ask to be the active window, as GTK's
+ * gtk_window_present does (_NET_ACTIVE_WINDOW, from an application).
  * For linuxembed-gate.sh. SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/Xutil.h>
 
 int main( int argc, char **argv )
 {
@@ -28,8 +33,24 @@ int main( int argc, char **argv )
         XCloseDisplay( d );
         return 0;
     }
+    if (!strcmp( argv[2], "iconify" ))
+    {
+        XIconifyWindow( d, w, DefaultScreen( d ) );
+        XCloseDisplay( d );
+        return 0;
+    }
     ev.xclient.type = ClientMessage;
     ev.xclient.window = w;
+    if (!strcmp( argv[2], "activate" ))
+    {
+        ev.xclient.message_type = XInternAtom( d, "_NET_ACTIVE_WINDOW", False );
+        ev.xclient.format = 32;
+        ev.xclient.data.l[0] = 1;   /* from an application */
+        ev.xclient.data.l[1] = CurrentTime;
+        XSendEvent( d, DefaultRootWindow( d ), False, SubstructureRedirectMask | SubstructureNotifyMask, &ev );
+        XCloseDisplay( d );
+        return 0;
+    }
     ev.xclient.message_type = XInternAtom( d, "_NET_WM_STATE", False );
     ev.xclient.format = 32;
     ev.xclient.data.l[0] = atoi( argv[2] ) ? 1 : 0;   /* _NET_WM_STATE_ADD / _REMOVE */

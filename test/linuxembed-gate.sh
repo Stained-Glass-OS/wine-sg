@@ -21,23 +21,43 @@
 #      maximized, the program is told (_NET_WM_STATE); one maximized before
 #      it was framed (Firefox, restored maximized) gets a maximized frame
 #   5c. dragged to the screen's edge it snaps to that half; Win+Right too
+#   5d. it asks to be minimized (its own minimize button: XIconifyWindow):
+#      its frame is, and it is told (WM_STATE Iconic), and Normal again
+#      when restored (0854)
+#   5e. minimized, Notepad active, it asks to be the active window
+#      (_NET_ACTIVE_WINDOW: gtk_window_present, Firefox given a link): its
+#      frame is restored and active (0854)
+#   4b. active, it is told it has the focus (_NET_WM_STATE_FOCUSED, which
+#      GTK draws itself active or greyed by); Notepad active, not (0854)
 #   6. it is on its own desktop: on the next one it is not shown
 #   7. Task View's card for it shows it, not a black picture
 #   8. WM_CLOSE to the frame (its close button, End task) closes it, and the
-#      frame goes
+#      frame goes; a list older than its going (the compositor's, asked for
+#      before) brings no stand-in or button back for it (0855)
 #  10. a request about a window already gone does not end the shell
-#  11. one opening while a Wine window is active is active and has the keys
+#  11. one opening while a Wine window is active is active and has the keys;
+#      the window that was active is not made active again meanwhile (its
+#      program, told late, took the X focus back: 0853)
 #   9. a hung one (stopped) does not close when asked; Task Manager's End
 #      task then (SgLinuxWindowEnd) ends its process (patches/sg/0772; CPU-X
 #      could not be ended, David 2026-10-02)
 #
 #   WINE=/opt/wine-sg/bin/wine test/linuxembed-gate.sh
+# Mutants (0853-0855, dlls/winex11.drv/sg_embed.c): SG_MUTANT_EMBED_REPARENT_HIDES
+# fails 11 (the window behind made active while it is framed; on a busy
+# machine the keys then go to it); SG_MUTANT_EMBED_NO_ICONIFY fails 5d;
+# SG_MUTANT_EMBED_NO_FOCUSED_STATE fails 4b; SG_MUTANT_EMBED_NO_ACTIVE_WINDOW
+# fails 5e; SG_MUTANT_GONE_XWIN_BUTTON (programs/explorer/systray.c) fails
+# 8's "nothing comes back".
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINE="$(cd "$(dirname "$WINE")" && pwd)/$(basename "$WINE")"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
+# xterm talks to the session manager the environment names (the real
+# session's): unanswered, its window came seconds late on a busy machine
+unset SESSION_MANAGER
 for t in Xvfb xdotool xterm xwininfo xprop import convert cc "$MINGW"; do command -v "$t" >/dev/null || { echo "SKIP: $t missing"; exit 77; }; done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-linuxembed.XXXXXX); XP=; XT=
@@ -64,9 +84,20 @@ printf '%d shown - XTerm\tLinux Terminal\nEND\n' "$XID" > "$T/list"
 mkdir -p "$T/run"
 export SG_LOCK_CONTROL=/nonexistent SG_LOCKCTL="$T/fake-lockctl" SG_FAKE_DIR="$T" XDG_RUNTIME_DIR="$T/run"
 WINEDEBUG="${EMBED_DEBUG:--all}" "$WINE" explorer /desktop=shell,1024x700 > "$T/explorer.out" 2>&1 &
-i=0; while ! grep -q 'desktop message loop starting' "$T/explorer.out" 2>/dev/null && [ $i -lt 60 ]; do sleep 0.5; i=$((i + 1)); done
+i=0; while ! xwininfo -root -children 2>/dev/null | grep -q '"shell - Wine Desktop"' && [ $i -lt 60 ]; do sleep 0.5; i=$((i + 1)); done
 sleep 5    # the taskbar reads the list
 cd "$WINEPREFIX/drive_c"
+
+# framed XID: wait until the window is in a Wine window (up to 20 s)
+framed() {
+    _k=0
+    while [ $_k -lt 80 ]; do
+        case "$(xwininfo -id "$1" -tree 2>/dev/null | sed -n 's/.*Parent window id: [^ ]* //p')" in
+            ""|"(the root window)"*) ;; *) return 0 ;; esac
+        sleep 0.25; _k=$((_k + 1))
+    done
+    return 1
+}
 
 # 1.
 parent=$(xwininfo -id "$XID" -tree 2>/dev/null | awk '/Parent window id:/ {print $5}')
@@ -115,6 +146,17 @@ fg SgLinuxWindow "Linux Terminal" && [ "$(px)" = "$COL" ] && above SgLinuxWindow
     || a2="it foreground: $(fg SgLinuxWindow "Linux Terminal" && echo yes || echo no), pixel $(px), above Notepad: $(above SgLinuxWindow "Linux Terminal" Notepad "" && echo yes || echo no)"
 [ "$a1" = ok ] && [ "$a2" = ok ] && pass "Alt+Tab from it to Notepad, and back: each released switch made, the window chosen in front" \
     || fail "Alt+Tab: to Notepad: $a1; back: $a2"
+
+# 4b. _NET_WM_STATE_FOCUSED as it is active or not (Alt+Tab left it active)
+netstate() { xprop -id "$XID" _NET_WM_STATE 2>/dev/null; }
+f1=$(netstate)
+"$WINE" probe.exe activate Notepad "" > /dev/null 2>&1; sleep 1.5; f2=$(netstate)
+"$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1.5; f3=$(netstate)
+case "$f1" in *_NET_WM_STATE_FOCUSED*) ok1=y ;; *) ok1=n ;; esac
+case "$f2" in *_NET_WM_STATE_FOCUSED*) ok2=n ;; *) ok2=y ;; esac
+case "$f3" in *_NET_WM_STATE_FOCUSED*) ok3=y ;; *) ok3=n ;; esac
+[ "$ok1$ok2$ok3" = yyy ] && pass "it is told when it has the focus and when not (_NET_WM_STATE_FOCUSED)" \
+    || fail "_NET_WM_STATE: active '$f1', Notepad active '$f2', active again '$f3' (want FOCUSED, not, FOCUSED)"
 
 # 5. full screen, asked by the program, and out of it
 "$WINE" probe.exe rect SgLinuxWindow "Linux Terminal" 2>/dev/null | tr -d '\r' > "$T/rect0"
@@ -174,6 +216,26 @@ read -r sl st sr sb < "$T/rect-snap"
 read -r l t r b < "$T/rect0"
 "$WINE" probe.exe move SgLinuxWindow "Linux Terminal" "$l" "$t" $((r - l)) $((b - t)) >/dev/null 2>&1; sleep 1
 
+# 5d. its own minimize button (XIconifyWindow)
+"$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1
+"$T/netwm-fullscreen" "$XID" iconify; sleep 2
+i1=$("$WINE" probe.exe iconic SgLinuxWindow "Linux Terminal" | tr -d '\r'); w1=$(xprop -id "$XID" WM_STATE 2>/dev/null | sed -n 's/.*window state: //p')
+"$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1.5
+i2=$("$WINE" probe.exe iconic SgLinuxWindow "Linux Terminal" | tr -d '\r'); w2=$(xprop -id "$XID" WM_STATE 2>/dev/null | sed -n 's/.*window state: //p')
+[ "$i1" = iconic=1 ] && [ "$w1" = Iconic ] && [ "$i2" = iconic=0 ] && [ "$w2" = Normal ] \
+    && pass "its own minimize request minimizes its frame (WM_STATE Iconic), restored it is Normal" \
+    || fail "minimize asked by it: $i1 ($w1), restored $i2 ($w2) (want iconic=1 Iconic, iconic=0 Normal)"
+# 5e. minimized, Notepad active: it asks to be the active window
+"$WINE" probe.exe minimize SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1
+"$WINE" probe.exe activate Notepad "" > /dev/null 2>&1; sleep 1
+"$T/netwm-fullscreen" "$XID" activate; sleep 2
+i3=$("$WINE" probe.exe iconic SgLinuxWindow "Linux Terminal" | tr -d '\r')
+fg SgLinuxWindow "Linux Terminal" && a3=active || a3="not active"
+[ "$i3" = iconic=0 ] && [ "$a3" = active ] && pass "minimized, it asks to be the active window (_NET_ACTIVE_WINDOW): restored and active" \
+    || fail "_NET_ACTIVE_WINDOW from it, minimized: $i3, $a3 (want restored and active)"
+read -r l t r b < "$T/rect0"
+"$WINE" probe.exe move SgLinuxWindow "Linux Terminal" "$l" "$t" $((r - l)) $((b - t)) >/dev/null 2>&1; sleep 1
+
 # 6. the next desktop: it is not there; back, it is
 "$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1
 cpx() { import -window root -crop 1x1+150+150 -depth 8 txt:- 2>/dev/null | tail -1 | grep -o '#[0-9A-F]\{6\}'; }
@@ -199,10 +261,18 @@ if [ $# = 4 ]; then
     i=0; while kill -0 "$XT" 2>/dev/null && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
 fi
 kill -0 "$XT" 2>/dev/null && fail "its frame's close button did not close it" || { pass "its frame's close button closes it"; XT=; }
+# the compositor's list read next may be older than its going (asked for
+# before), still naming it: no taskbar button, no stand-in comes back for it
+"$WINE" probe.exe watch SgLinuxWindow 3 > "$T/watch" 2>/dev/null &
+i=0; while ! grep -q watching "$T/watch" 2>/dev/null && [ $i -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
+sleep 0.7
 # gone from the compositor's list too, as the compositor's own list is at
 # once: the next xterm's window may get the same X id, and a stale list
 # naming it had the taskbar frame it at once (0803 reads the list quickly)
 printf 'END\n' > "$T/list"
+i=0; while ! grep -q seen= "$T/watch" 2>/dev/null && [ $i -lt 40 ]; do sleep 0.25; i=$((i + 1)); done
+grep -q 'seen=0' "$T/watch" && pass "...and nothing comes back for it from a list older than its going" \
+    || fail "after it closed a window came back for it from an older list ($(tr -d '\r' < "$T/watch" | tail -1); a taskbar button flickered)"
 sleep 1.5
 xterm -geometry 50x12+120+120 -bg black -fg white -title 'Linux Terminal' & XT=$!
 i=0; while [ -z "$(xwininfo -root -children | awk '/"Linux Terminal"/ {print $1; exit}')" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
@@ -217,7 +287,8 @@ i=0; while kill -0 "$XT" 2>/dev/null && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1
 kill -0 "$XT" 2>/dev/null && fail "WM_CLOSE to its frame did not close it" || { pass "WM_CLOSE to its frame closes it"; XT=; }
 printf 'END\n' > "$T/list"   # gone from the compositor's list too
 i=0; while ! "$WINE" probe.exe exists SgLinuxWindow "" | grep -q 'exists=0' && [ $i -lt 24 ]; do sleep 0.5; i=$((i + 1)); done
-"$WINE" probe.exe exists SgLinuxWindow "" | grep -q 'exists=0' && pass "...and the frame goes" || fail "the frame stayed"
+"$WINE" probe.exe exists SgLinuxWindow "" | grep -q 'exists=0' && pass "...and the frame goes" \
+    || fail "the frame stayed: $("$WINE" probe.exe list SgLinuxWindow - 2>/dev/null | tr -d '\r' | tr '\n' ';')"
 # one bigger than the work area (Firefox at the size it had maximized): a maximized frame
 xterm -geometry 200x80+0+0 -title 'Big Terminal' & XT=$!
 i=0; while [ -z "$(xwininfo -root -children | awk '/"Big Terminal"/ {print $1; exit}')" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
@@ -234,6 +305,10 @@ alive "$XT" && pass "a hung program asked to close stays (it does not answer)" |
 i=0; while alive "$XT" && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
 alive "$XT" && fail "End task left the hung program running" || pass "End task ends the hung program (its process killed)"
 kill -9 "$XT" 2>/dev/null; wait "$XT" 2>/dev/null; XT=
+# gone from the compositor's list too: the next xterm may get its X id, and a
+# list still naming it had the taskbar frame the new one at once -- before
+# this test found it -- and then let it go with the list naming none
+printf 'END\n' > "$T/list"; sleep 1.5
 # 10. a request about a window that is gone (a program closing a popup as it
 # asks to be full screen): the shell stays (David's X1, 2026-10-03: the shell
 # ended -- the X error went to Xlib's own handler; patches/sg/0784)
@@ -247,13 +322,27 @@ else fail "the shell ended after a request about a window that was gone"; fi
 # nor its frame given the X focus before the program was in it (0788)
 "$WINE" probe.exe activate Notepad "" > /dev/null 2>&1; sleep 1
 xterm -geometry 50x12+300+200 -bg '#3060a0' -fg white -title 'New Terminal' -e sh -c "cd '$T'; exec sh" & XT=$!
-i=0; while [ -z "$(xwininfo -root -children | awk '/"New Terminal"/ {print $1; exit}')" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+i=0; while [ -z "$(xwininfo -root -children | awk '/"New Terminal"/ {print $1; exit}')" ] && [ $i -lt 100 ]; do sleep 0.2; i=$((i + 1)); done
 X3=$(xwininfo -root -children | awk '/"New Terminal"/ {print $1; exit}')
-printf '%d shown - XTerm\tNew Terminal\nEND\n' "$X3" > "$T/list"
-sleep 4   # framed at the next tick
+if [ -z "$X3" ]; then
+    fail "the new xterm's window never showed (test broken)"
+else
+    fg Notepad "" || "$WINE" probe.exe activate Notepad "" > /dev/null 2>&1
+    "$WINE" probe.exe fglog 15 - - > "$T/fglog" 2>/dev/null &
+    i=0; while ! grep -q logging "$T/fglog" 2>/dev/null && [ $i -lt 40 ]; do sleep 0.25; i=$((i + 1)); done
+    printf '%d shown - XTerm\tNew Terminal\nEND\n' "$X3" > "$T/list"
+    framed "$X3" || fail "the new window was never framed"
+    i=0; while ! fg SgLinuxWindow "New Terminal" && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
+    sleep 2   # what the window behind would do, late
+fi
 xdotool mousemove 900 650; sleep 0.3
 fg SgLinuxWindow "New Terminal" && pass "a Linux window opened over Notepad is the active window" \
     || fail "opened over Notepad, not active: $("$WINE" probe.exe foreground SgLinuxWindow "New Terminal" | tr -d '\r')"
+# made active once: Notepad not again after it (0853)
+tr -d '\r' < "$T/fglog" 2>/dev/null | sed -n '/^fg SgLinuxWindow|New Terminal/,$p' > "$T/fgafter"
+[ -s "$T/fgafter" ] && ! grep -q '^fg Notepad' "$T/fgafter" \
+    && pass "...and the window behind it was not made active again while it was framed" \
+    || fail "the windows made active as it was framed: $(tr -d '\r' < "$T/fglog" | tr '\n' ' ')(Notepad active again after it: its program may take the keys)"
 [ "$(printf '%d' "$(xdotool getwindowfocus 2>/dev/null)")" = "$(printf '%d' "$X3")" ] && pass "...and has the X focus" \
     || fail "...the X focus is on $(xdotool getwindowfocus 2>/dev/null), not $X3"
 xdotool type --delay 40 'touch typed-new'; xdotool key Return; sleep 1.5
