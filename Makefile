@@ -1120,3 +1120,13 @@ test-netuse:
 # (0839). Needs sudo.
 test-mapcred:
 	WINE=$(PREFIX)/bin/wine test/mapcred-gate.sh
+
+# AnyDesk (0860-0862): a desktop says whether it takes input (UOI_IO); a
+# WinEvent hook skipping its own process skips the one that set it; the
+# taskbar is not made active when the active window goes away.
+test-inputdesk:
+	WINE=$(PREFIX)/bin/wine test/inputdesk-gate.sh
+test-winevskip:
+	WINE=$(PREFIX)/bin/wine test/winevskip-gate.sh
+test-noactnext:
+	WINE=$(PREFIX)/bin/wine test/noactnext-gate.sh
