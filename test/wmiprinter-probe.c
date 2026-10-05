@@ -3,6 +3,7 @@
  *   wmiprinter-probe wmi                        Win32_Printer: "wmi NAME|DRIVER|PORT" per printer
  *   wmiprinter-probe enum                       EnumPrinters 2: "enum NAME|DRIVER|PORT" per printer
  *   wmiprinter-probe papers NAME                the printer's paper names, "paper NAME" each
+ *   wmiprinter-probe hold SECONDS               loads winspool (as the desktop keeps it) and waits
  * then "count=N". */
 #define COBJMACROS
 #include <windows.h>
@@ -53,6 +54,15 @@ int wmain(int argc, WCHAR **argv)
             for (i = 0; i < n; i++, count++)
                 printf("enum %ls|%ls|%ls\n", pi[i].pPrinterName, pi[i].pDriverName, pi[i].pPortName);
         printf("count=%d\n", count);
+        return 0;
+    }
+    if (argc >= 3 && !wcscmp(argv[1], L"hold"))
+    {
+        DWORD needed = 0, n = 0;
+        EnumPrintersW(PRINTER_ENUM_LOCAL, NULL, 2, NULL, 0, &needed, &n);
+        printf("holding\n");
+        fflush(stdout);
+        Sleep(_wtoi(argv[2]) * 1000);
         return 0;
     }
     if (argc >= 3 && !wcscmp(argv[1], L"papers"))
