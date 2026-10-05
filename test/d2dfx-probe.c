@@ -829,6 +829,57 @@ static void check_drawing( ID3D11Device *d3d, ID2D1Factory1 *factory, ID2D1Devic
     printf( "draw_command_list_stroke=%d (%08lx)\n", list_stroke == 0xffff0000, list_stroke );
     printf( "draw_command_list_blur=%d (%08lx)\n", (list_blur & 0xff0000) >= 0xe00000, list_blur );
 
+    /* a Clear recorded into a list while a clip pushed before it became the
+     * target is in force covers that clip: the list's bounds, and what an
+     * effect of it draws (Paint.NET's History and Layers lists, 0810) */
+    {
+        D2D1_BITMAP_PROPERTIES1 tprops = { { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, 96, 96,
+                                           D2D1_BITMAP_OPTIONS_TARGET, NULL };
+        D2D1_RECT_F clip = { 0, 0, 12, 10 }, bounds = { 0, 0, 0, 0 };
+        D2D1_COLOR_F c = { 1, 0, 0, 1 };
+        DWORD clip_in = 0, clip_out = 0;
+        ID2D1Bitmap1 *tbm;
+
+        if (SUCCEEDED( SLOT( ctx, DC_CREATE_BITMAP1, HRESULT (WINAPI *)( void *, D2D1_SIZE_U, const void *, UINT32,
+                                                                       const D2D1_BITMAP_PROPERTIES1 *, ID2D1Bitmap1 ** ) )(
+                           ctx, size, NULL, 0, &tprops, &tbm ) ))
+        {
+            SET_TARGET( ctx, tbm );
+            ID2D1RenderTarget_BeginDraw( RT(ctx) );
+            ID2D1RenderTarget_PushAxisAlignedClip( RT(ctx), &clip, D2D1_ANTIALIAS_MODE_ALIASED );
+            if (SUCCEEDED( SLOT( ctx, DC_CREATE_COMMAND_LIST, HRESULT (WINAPI *)( void *, ID2D1CommandList ** ) )( ctx, &list ) ))
+            {
+                SET_TARGET( ctx, list );
+                ID2D1RenderTarget_Clear( RT(ctx), &c );
+                SET_TARGET( ctx, tbm );
+                ID2D1RenderTarget_PopAxisAlignedClip( RT(ctx) );
+                ID2D1RenderTarget_EndDraw( RT(ctx), NULL, NULL );
+                SET_TARGET( ctx, NULL );
+                SLOT( list, CMDLIST_CLOSE, HRESULT (WINAPI *)( void * ) )( list );
+                SLOT( ctx, DC_GET_IMAGE_LOCAL_BOUNDS, HRESULT (WINAPI *)( void *, ID2D1Image *, D2D1_RECT_F * ) )(
+                        ctx, (ID2D1Image *)list, &bounds );
+                if (SUCCEEDED( ID2D1DeviceContext_CreateEffect( ctx, &probe_CLSID_Swap, &effect ) ))
+                {
+                    SLOT( effect, EFFECT_SET_INPUT, void (WINAPI *)( void *, UINT32, ID2D1Image *, BOOL ) )(
+                            effect, 0, (ID2D1Image *)list, FALSE );
+                    SLOT( effect, EFFECT_GET_OUTPUT, void (WINAPI *)( void *, ID2D1Image ** ) )( effect, &output );
+                    clip_in = draw_and_read( d3d, ctx, output, 20, 20, 26, 25 );
+                    clip_out = draw_and_read( d3d, ctx, output, 20, 20, 34, 25 );
+                    IUnknown_Release( (IUnknown *)output );
+                    IUnknown_Release( (IUnknown *)effect );
+                }
+                IUnknown_Release( (IUnknown *)list );
+            }
+            else
+                ID2D1RenderTarget_EndDraw( RT(ctx), NULL, NULL );
+            IUnknown_Release( (IUnknown *)tbm );
+        }
+        printf( "cmdlist_clipped_clear_bounds=%d (%g,%g-%g,%g)\n", bounds.left == 0 && bounds.top == 0
+                && bounds.right == 12 && bounds.bottom == 10, bounds.left, bounds.top, bounds.right, bounds.bottom );
+        printf( "cmdlist_clipped_clear_effect=%d (%08lx %08lx)\n", clip_in == 0xff00ff00 && clip_out == 0xff000000,
+                clip_in, clip_out );
+    }
+
     IUnknown_Release( (IUnknown *)bitmap );
 }
 

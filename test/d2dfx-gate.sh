@@ -23,7 +23,10 @@
 #  - DrawImage draws effects (a custom pixel shader, a flood, a blur) and
 #    command lists, as images and as effects' inputs; ellipses, rounded
 #    rectangles and groups simplify and widen; path geometries stream
-#    (0229).
+#    (0229);
+#  - a Clear recorded into a command list under a clip pushed before the
+#    list became the target covers that clip, so an effect of the list
+#    draws it (0810, mutant SG_MUTANT_D2D_LIST_CLEAR_UNCLIPPED).
 #
 #   WINE=/opt/wine-sg/bin/wine test/d2dfx-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
@@ -117,6 +120,8 @@ checkp 'draw_blur=1'                   "a Gaussian blur keeps the middle and sof
 checkp 'draw_command_list=1'           "a command list is drawn as an image, where it is put"
 checkp 'draw_command_list_stroke=1'    "with the geometry it recorded for DrawGeometry"
 checkp 'draw_command_list_blur=1'      "and as an effect's input"
+checkp 'cmdlist_clipped_clear_bounds=1' "a Clear recorded under a clip pushed before the list became the target covers that clip (0810)"
+checkp 'cmdlist_clipped_clear_effect=1' "and an effect of that list draws it (Paint.NET's History and Layers lists)"
 checkp 'simplify_ellipse=1'            "an ellipse simplifies to lines (a circle of radius 10)"
 checkp 'widen_ellipse=1'               "and widens (a ring from 9 to 11)"
 checkp 'simplify_rounded=1'            "a rounded rectangle simplifies"
