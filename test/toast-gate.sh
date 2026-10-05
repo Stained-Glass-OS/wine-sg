@@ -8,6 +8,9 @@
 # its close button and its time running out. Under Xvfb, with the probe
 # playing the person.
 #
+# Every toast is kept in the notification history sg-shell's notification
+# centre lists (0815, mutant SG_MUTANT_NO_NOTIFICATION_HISTORY).
+#
 #   WINE=/opt/wine-sg/bin/wine test/toast-gate.sh
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -67,5 +70,12 @@ check 'sta_event=1 on_own_thread=1' "a single-threaded apartment gets its events
 check 'replaced=1'        "a toast with the same tag replaces the one on screen"
 check 'badxml=1'          "malformed XML is refused"
 check 'done=1'            "the probe ran to the end"
+# the notification centre's history (0815): every toast shown, newest 50
+hist=$("$WINE" reg query 'HKCU\Software\Stained Glass\Notifications\History' /s 2>/dev/null | tr -d '\r')
+printf '%s\n' "$hist" | grep -q 'Title.*REG_SZ.*Probe title' && printf '%s\n' "$hist" | grep -q 'Title.*REG_SZ.*Loaded title' \
+    && pass "the toasts shown are kept in the notification history (0815)" \
+    || fail "notification history: $(printf '%s\n' "$hist" | grep -c Title) titles"
+printf '%s\n' "$hist" | grep -q 'App.*REG_SZ' && printf '%s\n' "$hist" | grep -q 'Time.*REG_QWORD' \
+    && pass "each with its program and time" || fail "history entries lack App/Time"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
