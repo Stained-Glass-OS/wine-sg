@@ -259,7 +259,14 @@ run 'C:\probe64.exe' add "Unidrv Raw" "SG Test Unidrv Raw" "LPT3:" >/dev/null
 
 # the program's DC measures the driver's device
 for b in 64 32; do
-    out=$(run "C:\\probe$b.exe" caps "UMPD Printer")
+    out=$(run 'C:\probe64.exe' shellicons)
+[ "$out" = "shellicons 6/6" ] && pass "the shell's printer icons are there (1043; Epson's setup divided by zero without them)" ||
+    fail "shell32 printer icons: $out"
+all=$(run "C:\\probe$b.exe" caps "UMPD Printer")
+    out=$(printf '%s\n' "$all" | head -1)
+    desk=$(printf '%s\n' "$all" | sed -n 's/^desktop //p')
+    [ "$desk" = "210 110" ] && pass "$b-bit: a printer's DESKTOPHORZRES/VERTRES are the sheet, as makers' print processors size pages by them (1042)" ||
+        fail "$b-bit: DESKTOPHORZRES/VERTRES: '$desk'"
     [ "$out" = "caps 200 100 100 210 5" ] && pass "$b-bit: the DC measures the driver's device ($out)" ||
         fail "$b-bit: the DC does not measure the driver's device: $out"
 done

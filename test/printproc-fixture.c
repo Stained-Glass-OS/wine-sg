@@ -98,13 +98,11 @@ __declspec(dllexport) BOOL WINAPI PrintDocumentOnPrintProcessor( HANDLE handle, 
         RECT mark = { 10, 10, 60, 60 };
 
         if (!GdiStartPageEMF( spool )) { ret = FALSE; break; }
-        /* as HP's processor plays a page: into the whole sheet, around the
+        /* as HP's processor plays a page: into a sheet's size from the
          * printable area's origin; SG_PRINTPROC_NORECT: no rectangle */
         {
             RECT sheet;
-            SetRect( &sheet, -GetDeviceCaps( hdc, PHYSICALOFFSETX ), -GetDeviceCaps( hdc, PHYSICALOFFSETY ),
-                     GetDeviceCaps( hdc, PHYSICALWIDTH ) - GetDeviceCaps( hdc, PHYSICALOFFSETX ),
-                     GetDeviceCaps( hdc, PHYSICALHEIGHT ) - GetDeviceCaps( hdc, PHYSICALOFFSETY ) );
+            SetRect( &sheet, 0, 0, GetDeviceCaps( hdc, PHYSICALWIDTH ), GetDeviceCaps( hdc, PHYSICALHEIGHT ) );
             RECT empty = { 0, 0, -1, -1 };  /* Lexmark's processor passes these */
             if (GetEnvironmentVariableW( L"SG_PRINTPROC_EMPTYRECT", NULL, 0 ))
                 say( "page %lu played %d\n", i, GdiPlayPageEMF( spool, page, &empty, &empty, &empty ) );

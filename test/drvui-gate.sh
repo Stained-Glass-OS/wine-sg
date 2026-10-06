@@ -108,6 +108,13 @@ cat > "$S/sgdrvui.gpd" <<'EOF'
     *Option: NotInstalled { *Name: "Not Installed" }
     *Option: Installed { *Name: "Installed" }
 }
+*Feature: ReverseOrderPrinting
+{
+    *Name: "Page Order"
+    *DefaultOption: Standard
+    *Option: Standard { *Name: "Standard" }
+    *Option: Reverse { *Name: "Reverse" }
+}
 *Command: CmdSendBlockData { *Cmd : "<1B>*b" %d{NumOfDataBytes}"W" }
 *Command: CmdFF { *Cmd : "<0C>" }
 EOF
@@ -232,6 +239,13 @@ for kind in "UI Laser:SG Small:SG Big" "UI PS:Letter:A4"; do
 done
 
 # the driver's own settings and its custom size, for programs
+# what a maker's print processor asks of a job (1042): the driver answers;
+# a GPD with a page order feature orders pages itself
+out=$(run 'C:\drvui.exe' jobattr "UI Laser")
+[ "$out" = "jobattr pages 1/1 order 0/1 copies 1/1" ] &&
+    pass "a print processor gets the job's attributes from the driver (DrvQueryJobAttributes)" ||
+    fail "GetJobAttributes: $out"
+
 out=$(run 'C:\sgp64.exe' papers "UI Laser" | tr '\n' ';')
 [ "$out" = "paper 257 508x254 SG Small;paper 256 0x0 Custom Size;paper 259 1016x508 SG Big;" ] &&
     pass "the custom size is in every paper list, in the same place" || fail "papers: $out"

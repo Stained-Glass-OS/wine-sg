@@ -219,11 +219,23 @@ def main():
         elif lang in ("PCL 5", "PCL XL") or lang.startswith("PJL+"):
             if os.path.exists(GPCL6):
                 src = out
-                # Kyocera's PRESCRIBE commands (!R! ... EXIT;) are for its printers, not PCL
+                # Kyocera's PRESCRIBE commands (!R! ... EXIT;) are for its printers, not
+                # PCL; those outside the PCL XL streams go (inside, they are a comment's text)
                 if b"!R!" in data:
+                    inside = []
+                    for m in re.finditer(rb"\) HP-PCL XL;", data):
+                        end = data.find(b"\x1b%-12345X", m.start())
+                        inside.append((m.start(), end if end >= 0 else len(data)))
+                    out_parts, pos = [], 0
+                    for m in re.finditer(rb"!R![^\x1b]*?EXIT;", data):
+                        if any(a <= m.start() < b for a, b in inside):
+                            continue
+                        out_parts.append(data[pos:m.start()])
+                        pos = m.end()
+                    out_parts.append(data[pos:])
                     src = os.path.join(tmp, "noprescribe.prn")
                     with open(src, "wb") as f:
-                        f.write(re.sub(rb"!R![^\x1b]*?EXIT;", b"", data))
+                        f.write(b"".join(out_parts))
                 imgs, err = render([GPCL6, "-dNOPAUSE", "-dBATCH", "-sDEVICE=png16m", "-r%d" % dpi,
                                     "-sOutputFile=%s/p%%03d.png" % tmp, src], tmp)
                 if err and ("rror" in err):

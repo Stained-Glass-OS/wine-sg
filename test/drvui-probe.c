@@ -153,6 +153,22 @@ int wmain( int argc, WCHAR **argv )
     setvbuf( stdout, NULL, _IONBF, 0 );
     InitCommonControlsEx( &icc );
     if (argc < 3 || !OpenPrinterW( argv[2], &h, NULL )) return 1;
+    /* jobattr PRINTER: what a maker's print processor asks of the job
+     * (spoolss GetJobAttributes, answered by the driver) */
+    if (!wcscmp( argv[1], L"jobattr" ))
+    {
+        BOOL (WINAPI *get)( WCHAR *, DEVMODEW *, void * ) =
+            (void *)GetProcAddress( LoadLibraryW( L"spoolss.dll" ), "GetJobAttributes" );
+        DWORD attr[9] = { 0 };
+
+        size = DocumentPropertiesW( NULL, h, argv[2], NULL, NULL, 0 );
+        dm = calloc( 1, size );
+        DocumentPropertiesW( NULL, h, argv[2], dm, NULL, DM_OUT_BUFFER );
+        if (!get || !get( argv[2], dm, attr )) { printf( "jobattr failed\n" ); return 1; }
+        printf( "jobattr pages %lu/%lu order %lu/%lu copies %lu/%lu\n", attr[0], attr[1], attr[3], attr[4], attr[5],
+                attr[6] );
+        return 0;
+    }
     device = !wcscmp( argv[1], L"dev" );
     cancel = !wcscmp( argv[1], L"cancel" );
     CloseHandle( CreateThread( NULL, 0, work, NULL, 0, NULL ) );

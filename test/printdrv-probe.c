@@ -54,7 +54,19 @@ int wmain( int argc, WCHAR **argv )
         printf( "caps %d %d %d %d %d\n", GetDeviceCaps( hdc, HORZRES ), GetDeviceCaps( hdc, VERTRES ),
                 GetDeviceCaps( hdc, LOGPIXELSX ), GetDeviceCaps( hdc, PHYSICALWIDTH ),
                 GetDeviceCaps( hdc, PHYSICALOFFSETX ) );
+        printf( "desktop %d %d\n", GetDeviceCaps( hdc, DESKTOPHORZRES ), GetDeviceCaps( hdc, DESKTOPVERTRES ) );
         DeleteDC( hdc );
+        return 0;
+    }
+    /* shellicons: the shell's printer icons makers' setup programs show
+     * (Epson's divides by how many it loaded) */
+    if (argc >= 2 && !wcscmp( argv[1], L"shellicons" ))
+    {
+        static const int ids[] = { 17, 140, 168, 169, 177, 184 };
+        HMODULE shell = LoadLibraryW( L"shell32.dll" );
+        unsigned int i, n = 0;
+        for (i = 0; i < ARRAYSIZE(ids); i++) if (LoadIconW( shell, MAKEINTRESOURCEW(ids[i]) )) n++;
+        printf( "shellicons %u/%u\n", n, (unsigned int)ARRAYSIZE(ids) );
         return 0;
     }
     if (argc >= 3 && !wcscmp( argv[1], L"papers" ))
