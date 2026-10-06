@@ -7,7 +7,8 @@
  *       of a settings change before the taskbar does). Twice a second it writes to LOG its state:
  *         state sys=GetDpiForSystem caps=LOGPIXELSY win=GetDpiForWindow
  *               icon=SM_CXICON menu=SM_CYMENU item=<menu bar item height>
- *       On WM_DPICHANGED it moves to the suggested rectangle, as asked.
+ *       On WM_DPICHANGED it moves to the suggested rectangle, as asked;
+ *       WM_DISPLAYCHANGE: "displaychange WxH".
  *       "popup" (below) opens its File menu as a popup menu: it writes
  *         popup WxH        (the menu's window, in its own pixels)
  *   dpifollow-probe.exe popup TITLE
@@ -61,6 +62,9 @@ static LRESULT CALLBACK wnd_proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         SetWindowPos( hwnd, 0, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE );
         return 0;
     }
+    case WM_DISPLAYCHANGE:
+        say( "displaychange %ux%u", LOWORD(lp), HIWORD(lp) );
+        return 0;
     case WM_PROBE_POPUP:
     {
         POINT pt = {20, 20};

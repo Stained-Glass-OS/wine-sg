@@ -27,6 +27,9 @@
 #      new size, its columns) 1.75 times; as before back at 100%
 #   6. Notepad (ours, per-monitor v2) the same: the window, its tab strip,
 #      its text and menus at the new scale
+#   7. every program is told the display changed (WM_DISPLAYCHANGE, 1125):
+#      Chrome laid itself out at the new DPI but drew at the old one until
+#      it read the displays again
 #   5. at 100% nothing changes: the windows' state as before the first change
 #
 #   WINE=/opt/wine-sg/bin/wine test/dpifollow-gate.sh
@@ -39,7 +42,8 @@
 #   SG_MUTANT_FE_SYSTEM_AWARE (explorer fileexplorer.c),
 #   SG_MUTANT_DEFVIEW_DPI_IGNORED (shell32 shlview.c),
 #   SG_MUTANT_SHELL_ICONS_FIXED (shell32 iconcache.c): 5 fails;
-#   SG_MUTANT_NOTEPAD_DPI_IGNORED (notepad main.c): 6 fails.
+#   SG_MUTANT_NOTEPAD_DPI_IGNORED (notepad main.c): 6 fails;
+#   SG_MUTANT_NO_DISPLAYCHANGE (win32u sysparams.c): 7 fails.
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -148,6 +152,11 @@ s=$(state unaware); ss=$(state system)
 echo "$s" | grep -q 'sys=96 caps=96 win=96 icon=32' && echo "$ss" | grep -q 'sys=96 caps=96 win=96 icon=32' \
     && pass "DPI unaware and system aware at 175%: their own DPI kept ('$s'; '$ss'), Wine scales them" \
     || fail "unaware/system at 175%: '$s'; '$ss' (want 96 kept)"
+# 7. each program told the display changed (1125): Chromium reads the
+# displays' scale again only then
+dc=0; for n in v2 unaware system; do grep -q '^displaychange 2736x1824' "$T/$n.log" && dc=$((dc + 1)); done
+[ $dc = 3 ] && pass "per-monitor v2, unaware and system-aware programs are told the display changed (WM_DISPLAYCHANGE)" \
+    || fail "WM_DISPLAYCHANGE reached $dc of 3 programs"
 # 3. the desktop's icons
 d2=$(desk)
 if echo "$d2" | grep -q 'icon=84 .*dpi=168' && ratio "$(field "$d1" grid)" "$(field "$d2" grid)" 1.5 2.0; then
