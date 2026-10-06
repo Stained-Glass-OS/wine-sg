@@ -21,9 +21,13 @@
 #   4. a disabled task (put_Enabled) is not started by Run
 #   5. a daily calendar trigger begun yesterday runs at today's time
 #   6. a task of a particular user is not run by the service (it is theirs)
+#   7. the shell (explorer, at sign-in) starts the person's task host
+#   8. the host runs that person's tasks (a log-on task at once)
+#   9. Run on a person's task: the service asks their host, which runs it
 #
 #   WINE=/opt/wine-sg/bin/wine test/taskrun-gate.sh
-#   mutants: SG_MUTANT_TASK_NO_RUNNER (schedsvc/taskrun.c),
+#   mutants: SG_MUTANT_TASK_NO_RUNNER, SG_MUTANT_TASK_NO_USER_HOST (schedsvc/taskrun.c),
+#            SG_MUTANT_NO_USER_TASKS (explorer/startup.c),
 #            SG_MUTANT_TASK_DROP_TRIGGERS (taskschd/trigger.c),
 #            SG_MUTANT_TASK_REWRITE_XML (taskschd/regtask.c)
 set -u
@@ -136,6 +140,39 @@ probe register SgUser 'C:\SgUser.xml' >/dev/null
 waitfile "$C/daily.txt" 45 && pass "a daily trigger runs it at today's time" || fail "the daily trigger did not run it"
 sleep 3
 [ ! -e "$C/user.txt" ] && pass "a particular user's task is left to them" || fail "the service ran a user's task"
+
+# 7. the shell starts the person's task host at sign-in (explorer's startup)
+cat > "$T/run-explorer.sh" <<EOF2
+#!/bin/sh
+cd "$C" && XDG_SESSION_ID=91 WINEDEBUG=+process exec "$WINE" explorer /desktop=shell,800x600
+EOF2
+chmod +x "$T/run-explorer.sh"
+"$T/run-explorer.sh" > "$T/explorer.log" 2>&1 & EP=$!
+i=0; while ! grep -q 'SgUserTaskHost' "$T/explorer.log" 2>/dev/null && [ $i -lt 30 ]; do sleep 1; i=$((i + 1)); done
+grep -q 'rundll32.exe schedsvc.dll,SgUserTaskHost' "$T/explorer.log" \
+    && pass "the shell starts the person's task host at sign-in" || fail "the shell did not start the task host"
+kill "$EP" 2>/dev/null
+
+# 8. the person's host runs their tasks as them: a log-on task at once (the
+#    gate's account is the system's, so the host is told whose tasks to take)
+U=S-1-5-21-0-0-0-2000
+task_xml SgULogon "" "<LogonTrigger><UserId>$U</UserId></LogonTrigger>" $U ulogon.txt
+probe register SgULogon 'C:\SgULogon.xml' >/dev/null
+cat > "$T/run-host.sh" <<EOF2
+#!/bin/sh
+cd "$C" && exec "$WINE" rundll32.exe schedsvc.dll,SgUserTaskHost --as $U
+EOF2
+chmod +x "$T/run-host.sh"
+"$T/run-host.sh" > "$T/host.log" 2>&1 & HP=$!
+waitfile "$C/ulogon.txt" 30 && pass "the person's host runs their log-on task" || fail "the person's host did not run their log-on task"
+[ ! -e "$C/user.txt" ] && pass "and not their time task before its time came" || :
+
+# 9. Run on a person's task: the service asks their host
+rm -f "$C/user.txt"
+out=$(probe run SgUser)
+case "$out" in *run=0*) ;; *) fail "Run of a person's task: $out";; esac
+waitfile "$C/user.txt" 20 && pass "Run on a person's task runs it in their host" || fail "Run on a person's task did not run it"
+kill "$HP" 2>/dev/null
 
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"

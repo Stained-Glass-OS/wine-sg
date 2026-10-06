@@ -1,0 +1,452 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] schedsvc, explorer: a person's scheduled tasks run in their session
+
+The Task Scheduler service runs as SYSTEM (patch 1172), so it left alone
+the tasks registered for a particular person -- what programs installed
+for one person register: an updater set to run at that person's log-on
+or every day, a browser installed without administrator rights. Those
+never ran.
+
+A person's tasks now run in their own session, as them. The shell starts
+"rundll32 schedsvc.dll,SgUserTaskHost" at each sign-in (once, with the
+other programs that start at sign-in): the same scheduler, taking the
+tasks whose principal is that person's account (its SID, name or
+DOMAIN\name) or a group every person is in (Users, INTERACTIVE,
+Authenticated Users, Everyone). Their log-on triggers fire at that
+sign-in, time and calendar triggers when due; their last run times are
+kept in the person's HKCU. One host per account in a session. Run on such
+a task (asked of the service) is passed on to the person's host: the
+service notes the request under HKLM\Software\Wine\Task Scheduler\Requests
+and sets the event Global\SgTaskHostWake for two seconds; each host takes
+the requests for its own tasks once. --as ACCOUNT names the account whose
+tasks the host takes (they still run as whoever runs it), for tests.
+
+Also: a log-on, boot or registration trigger that fired while its time
+was already past (the host starts at the sign-in it reacts to) is now run
+instead of being skipped.
+
+Test: test/taskrun-gate.sh (mutants SG_MUTANT_TASK_NO_USER_HOST in
+taskrun.c, SG_MUTANT_NO_USER_TASKS in explorer's startup.c).
+---
+--- a/dlls/schedsvc/schedsvc.spec
++++ b/dlls/schedsvc/schedsvc.spec
+@@ -1 +1,2 @@
+ @ stdcall -private ServiceMain(long ptr)
++@ stdcall SgUserTaskHostW(long long wstr long)
+--- a/dlls/schedsvc/taskrun.c
++++ b/dlls/schedsvc/taskrun.c
+@@ -21,11 +21,16 @@
+  */
+ 
+ /*
+- * What runs here: tasks whose principal is the system's own accounts (SYSTEM,
+- * LOCAL SERVICE, NETWORK SERVICE) -- the service runs as SYSTEM. That is
+- * what browsers' and other programs' machine-wide updaters register (their
+- * installers run elevated), so they keep themselves up to date. A task of a
+- * particular user is that user's to run, in their session; it is left alone.
++ * What runs where: the service (SYSTEM) runs the tasks whose principal is
++ * the system's own accounts (SYSTEM, LOCAL SERVICE, NETWORK SERVICE) or
++ * names none -- what machine-wide installers register: browsers' and other
++ * programs' updaters. A person's tasks (their account, or the Users,
++ * INTERACTIVE, Authenticated Users or Everyone group) run in that person's
++ * session, as them: the shell starts "rundll32 schedsvc.dll,SgUserTaskHost"
++ * at each sign-in, which is this same scheduler for that person's tasks
++ * (their last runs kept in their HKCU). Run on such a task asks the
++ * person's host through HKLM\Software\Wine\Task Scheduler\Requests and
++ * the event SgTaskHostWake.
+  *
+  * Triggers: a time (once, or repeating every Interval for Duration), daily
+  * and weekly calendars (with their repetitions), at start (boot; the
+@@ -48,6 +53,7 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winreg.h"
++#include "sddl.h"
+ #include "objbase.h"
+ #include "xmllite.h"
+ #include "taskschd.h"
+@@ -74,6 +80,8 @@
+     ULONGLONG delay;
+     ULONGLONG event;                /* when a boot, log-on or registration trigger fired (+ delay); 0 = not */
+     int days_interval, weeks_interval, days_of_week;
++    BOOL someone_else;              /* a log-on trigger for an account not this scheduler's */
++    BOOL pending;                   /* fired and not run yet: due even when its time is past */
+ };
+ 
+ struct run_action
+@@ -120,6 +128,40 @@
+ static ULONGLONG service_start;
+ 
+ static const WCHAR state_key[] = L"Software\\Wine\\Task Scheduler\\State";
++static const WCHAR requests_key[] = L"Software\\Wine\\Task Scheduler\\Requests";
++
++/* the person's host (SgUserTaskHost), not the service: their tasks, their state */
++static BOOL user_mode;
++static WCHAR user_sid[256], user_name[256], user_domain[256];
++static HANDLE host_wake;           /* the service's "a Run is asked of a person's task" */
++static ULONGLONG host_woken;       /* when a host last took it */
++static PTP_TIMER host_wake_reset;  /* the service's: the event is set for two seconds */
++
++static void CALLBACK reset_host_wake(PTP_CALLBACK_INSTANCE instance, void *context, PTP_TIMER timer)
++{
++    ResetEvent(host_wake);
++}
++
++/* the service: every person's host looks at the requests */
++static void wake_hosts(void)
++{
++    LARGE_INTEGER due;
++    FILETIME ft;
++
++    if (!host_wake) return;
++    SetEvent(host_wake);
++    if (!host_wake_reset) host_wake_reset = CreateThreadpoolTimer(reset_host_wake, NULL, NULL);
++    if (!host_wake_reset) return;
++    due.QuadPart = -2000 * 10000;
++    ft.dwLowDateTime = due.LowPart;
++    ft.dwHighDateTime = due.HighPart;
++    SetThreadpoolTimer(host_wake_reset, &ft, 0, 0);
++}
++
++static HKEY state_root(void)
++{
++    return user_mode ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
++}
+ 
+ struct saved_state
+ {
+@@ -144,7 +186,7 @@
+     state.last_run.dwHighDateTime = (DWORD)(task->last_run >> 32);
+     state.last_result = task->last_result;
+     state.disabled = task->disabled;
+-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, state_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL)) return;
++    if (RegCreateKeyExW(state_root(), state_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL)) return;
+     RegSetValueExW(key, task->path, 0, REG_BINARY, (const BYTE *)&state, sizeof(state));
+     RegCloseKey(key);
+ }
+@@ -157,7 +199,7 @@
+     task->last_run = 0;
+     task->last_result = SCHED_S_TASK_HAS_NOT_RUN;
+     task->disabled = FALSE;
+-    if (RegGetValueW(HKEY_LOCAL_MACHINE, state_key, task->path, RRF_RT_REG_BINARY, NULL, &state, &size) ||
++    if (RegGetValueW(state_root(), state_key, task->path, RRF_RT_REG_BINARY, NULL, &state, &size) ||
+         size != sizeof(state))
+         return;
+     task->last_run = ((ULONGLONG)state.last_run.dwHighDateTime << 32) | state.last_run.dwLowDateTime;
+@@ -317,6 +359,7 @@
+     case TRIGGER_LOGON:
+     case TRIGGER_REGISTRATION:
+         if (!t->event) return NEVER;
++        if (t->pending) return t->event;
+         when = repeat_after(t, t->event, after);
+         break;
+     }
+@@ -419,6 +462,29 @@
+     return FALSE;
+ }
+ 
++/* an account or group this scheduler runs the tasks of */
++static BOOL is_ours(const WCHAR *id, BOOL group)
++{
++    static const WCHAR *const person_groups[] =
++    {
++        L"S-1-5-32-545", L"Users", L"BUILTIN\\Users", L"S-1-5-4", L"INTERACTIVE", L"NT AUTHORITY\\INTERACTIVE",
++        L"S-1-5-11", L"Authenticated Users", L"NT AUTHORITY\\Authenticated Users", L"S-1-1-0", L"Everyone",
++    };
++    const WCHAR *slash;
++    unsigned int i;
++
++    if (!user_mode) return !group && is_system_account(id);
++    if (group)
++    {
++        for (i = 0; i < ARRAY_SIZE(person_groups); i++) if (!wcsicmp(id, person_groups[i])) return TRUE;
++        return FALSE;
++    }
++    if (!wcsicmp(id, user_sid) || !wcsicmp(id, user_name)) return TRUE;
++    /* DOMAIN\name, any domain the account is known by */
++    if ((slash = wcsrchr(id, '\\')) && !wcsicmp(slash + 1, user_name)) return TRUE;
++    return FALSE;
++}
++
+ struct parse
+ {
+     struct run_task *task;
+@@ -464,6 +530,7 @@
+         else if (!wcscmp(name, L"Delay")) t->delay = parse_duration(text);
+         else if (!wcscmp(name, L"DaysInterval")) t->days_interval = max(1, wcstol(text, NULL, 10));
+         else if (!wcscmp(name, L"WeeksInterval")) t->weeks_interval = max(1, wcstol(text, NULL, 10));
++        else if (!wcscmp(name, L"UserId")) t->someone_else = !is_ours(text, FALSE);
+         free(text);
+         return;
+     }
+@@ -519,8 +586,10 @@
+         {
+             if ((text = element_text(reader)))
+             {
+-                if (!p->user_seen) task->ours = is_system_account(text);
+-                else task->ours = task->ours && is_system_account(text);
++                BOOL ours = is_ours(text, !wcscmp(name, L"GroupId"));
++
++                if (!p->user_seen) task->ours = ours;
++                else task->ours = task->ours || ours;
+                 p->user_seen = TRUE;
+             }
+             free(text);
+@@ -606,7 +675,7 @@
+     WCHAR *xml;
+ 
+     free_task_definition(task);
+-    task->ours = TRUE;   /* no principal: the registering account, the system's here */
++    task->ours = !user_mode;   /* no principal: the registering account -- the system's here */
+     task->enabled = TRUE;
+     task->allow_demand = TRUE;
+     task->start_when_available = FALSE;
+@@ -878,9 +947,14 @@
+ {
+     unsigned int i;
+ 
++    /* a person's host starts at their sign-in, after the system's start */
++    if (user_mode && kind == TRIGGER_BOOT) return;
+     for (i = 0; i < task->trigger_count; i++)
+-        if (task->triggers[i].kind == kind && task->triggers[i].enabled)
++        if (task->triggers[i].kind == kind && task->triggers[i].enabled && !task->triggers[i].someone_else)
++        {
+             task->triggers[i].event = when + task->triggers[i].delay;
++            task->triggers[i].pending = TRUE;
++        }
+ }
+ 
+ static void scan_dir(const WCHAR *dir, const WCHAR *rel, ULONGLONG now, BOOL first)
+@@ -1004,7 +1078,11 @@
+ #ifndef SG_MUTANT_TASK_NO_RUNNER
+         if (task->next != NEVER && task->next <= now)
+         {
++            unsigned int i;
++
+             start_task(task, FALSE);
++            for (i = 0; i < task->trigger_count; i++)
++                if (task->triggers[i].pending && task->triggers[i].event <= now) task->triggers[i].pending = FALSE;
+             compute_next(task, now);
+         }
+ #endif
+@@ -1017,6 +1095,42 @@
+     return (DWORD)min((soonest - now) / 10000 + 1, running ? 5000 : 60000);
+ }
+ 
++/* a person's host: the Run requests for their tasks, newer than the last it took */
++static void take_requests(void)
++{
++    WCHAR name[1024];
++    DWORD index, len, type, size;
++    ULONGLONG when, taken;
++    struct run_task *task;
++    HKEY key, mine;
++
++    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, requests_key, 0, KEY_READ, &key)) return;
++    if (RegCreateKeyExW(HKEY_CURRENT_USER, requests_key, 0, NULL, 0, KEY_READ | KEY_SET_VALUE, NULL, &mine, NULL))
++    {
++        RegCloseKey(key);
++        return;
++    }
++    for (index = 0; ; index++)
++    {
++        len = ARRAY_SIZE(name);
++        size = sizeof(when);
++        if (RegEnumValueW(key, index, name, &len, NULL, &type, (BYTE *)&when, &size)) break;
++        if (type != REG_QWORD) continue;
++        size = sizeof(taken);
++        if (!RegGetValueW(mine, NULL, name, RRF_RT_REG_QWORD, NULL, &taken, &size) && taken >= when) continue;
++        EnterCriticalSection(&cs);
++        if ((task = find_task(name)) && task->ours && task->enabled && !task->disabled)
++        {
++            TRACE("Run asked for %s\n", debugstr_w(name));
++            start_task(task, TRUE);
++        }
++        LeaveCriticalSection(&cs);
++        RegSetValueExW(mine, name, 0, REG_QWORD, (const BYTE *)&when, sizeof(when));
++    }
++    RegCloseKey(mine);
++    RegCloseKey(key);
++}
++
+ static DWORD WINAPI scheduler_proc(void *arg)
+ {
+     HANDLE done = arg, change;
+@@ -1030,21 +1144,31 @@
+     change = FindFirstChangeNotificationW(dir, TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                                           FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+     rescan(TRUE);
++    if (user_mode) take_requests();
+     for (;;)
+     {
+         timeout = run_due();
+         handles[0] = done;
+         handles[1] = wake_event;
+         count = 2;
++        /* the service's event stays set for a moment: once each time */
++        if (user_mode && host_wake && GetTickCount64() - host_woken > 3000) handles[count++] = host_wake;
++        else if (user_mode && host_wake) timeout = min(timeout, 1000);
+         if (change != INVALID_HANDLE_VALUE) handles[count++] = change;
+         ret = WaitForMultipleObjects(count, handles, FALSE, timeout);
+         if (ret == WAIT_OBJECT_0) break;
+-        if (ret == WAIT_OBJECT_0 + 2)
++        if (ret < WAIT_OBJECT_0 + count && handles[ret - WAIT_OBJECT_0] == change)
+         {
+             Sleep(200);   /* the writer finishes */
+             rescan(FALSE);
+             FindNextChangeNotification(change);
+         }
++        else if (ret < WAIT_OBJECT_0 + count && handles[ret - WAIT_OBJECT_0] == host_wake)
++        {
++            host_woken = GetTickCount64();
++            rescan(FALSE);
++            take_requests();
++        }
+         else if (ret == WAIT_OBJECT_0 + 1)
+             rescan(FALSE);
+     }
+@@ -1052,13 +1176,91 @@
+     return 0;
+ }
+ 
++/* the event that asks the people's hosts to look at the Run requests: open
++ * to everyone (a host runs as the person) */
++static HANDLE create_host_wake(void)
++{
++    SECURITY_ATTRIBUTES sa = { sizeof(sa) };
++    SECURITY_DESCRIPTOR sd;
++
++    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
++    SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
++    sa.lpSecurityDescriptor = &sd;
++    return CreateEventW(&sa, TRUE, FALSE, L"Global\\SgTaskHostWake");
++}
++
+ void taskrun_start(HANDLE done_event)
+ {
+     service_start = now_utc();
+     wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    host_wake = create_host_wake();
+     scheduler_thread = CreateThread(NULL, 0, scheduler_proc, done_event, 0, NULL);
+ }
+ 
++static void identify_user(const WCHAR *as)
++{
++    TOKEN_USER *user;
++    WCHAR *sid;
++    HANDLE token;
++    DWORD size = 0, name_len = ARRAY_SIZE(user_name), domain_len = ARRAY_SIZE(user_domain);
++    SID_NAME_USE use;
++
++    if (as && *as)
++    {
++        lstrcpynW(user_sid, as, ARRAY_SIZE(user_sid));
++        lstrcpynW(user_name, as, ARRAY_SIZE(user_name));
++        return;
++    }
++    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return;
++    GetTokenInformation(token, TokenUser, NULL, 0, &size);
++    if ((user = malloc(size)) && GetTokenInformation(token, TokenUser, user, size, &size))
++    {
++        if (ConvertSidToStringSidW(user->User.Sid, &sid))
++        {
++            lstrcpynW(user_sid, sid, ARRAY_SIZE(user_sid));
++            LocalFree(sid);
++        }
++        LookupAccountSidW(NULL, user->User.Sid, user_name, &name_len, user_domain, &domain_len, &use);
++    }
++    free(user);
++    CloseHandle(token);
++}
++
++/* rundll32 schedsvc.dll,SgUserTaskHost [--as ACCOUNT]: the signed-in
++ * person's tasks, for as long as their session lasts. The shell starts it at
++ * each sign-in; one per session. --as names the account whose tasks it
++ * takes (they still run as whoever runs it): for tests. */
++void WINAPI SgUserTaskHostW(HWND hwnd, HINSTANCE instance, WCHAR *cmdline, int show)
++{
++    const WCHAR *as = NULL;
++    HANDLE mutex, never;
++    WCHAR name[300];
++
++#ifdef SG_MUTANT_TASK_NO_USER_HOST
++    return;
++#endif
++    if (cmdline && !wcsncmp(cmdline, L"--as ", 5)) as = cmdline + 5;
++    identify_user(as);
++    if (!user_sid[0]) return;
++    /* the system's tasks are the service's */
++    if (!as && (!wcscmp(user_sid, L"S-1-5-18") || !wcscmp(user_sid, L"S-1-5-19") || !wcscmp(user_sid, L"S-1-5-20")))
++    {
++        TRACE("not for the system's accounts\n");
++        return;
++    }
++    /* one host per account in a session */
++    swprintf(name, ARRAY_SIZE(name), L"Local\\SgUserTaskHost-%s", user_sid);
++    mutex = CreateMutexW(NULL, TRUE, name);
++    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) return;
++    TRACE("the tasks of %s (%s)\n", debugstr_w(user_name), debugstr_w(user_sid));
++    user_mode = TRUE;
++    service_start = now_utc();
++    wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    host_wake = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\SgTaskHostWake");
++    never = CreateEventW(NULL, TRUE, FALSE, NULL);
++    scheduler_proc(never);
++}
++
+ void taskrun_finish(void)
+ {
+     if (!scheduler_thread) return;
+@@ -1087,11 +1289,22 @@
+         hr = SCHED_E_TASK_DISABLED;
+     else if (!(flags & RUN_IGNORE_CONSTRAINTS) && !task->allow_demand)
+         hr = SCHED_E_START_ON_DEMAND;
+-    else if (!task->ours)
++    else if (!task->ours && !user_mode)
+     {
+-        FIXME("%s runs as a user: not run by the service\n", debugstr_w(path));
+-        hr = E_ACCESSDENIED;
++        /* a person's task: their host runs it, as them */
++        HKEY key;
++        ULONGLONG now = now_utc();
++
++        TRACE("%s is a person's task: their host is asked\n", debugstr_w(path));
++        if (!RegCreateKeyExW(HKEY_LOCAL_MACHINE, requests_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL))
++        {
++            RegSetValueExW(key, task->path, 0, REG_QWORD, (const BYTE *)&now, sizeof(now));
++            RegCloseKey(key);
++        }
++        wake_hosts();
+     }
++    else if (!task->ours)
++        hr = E_ACCESSDENIED;
+     else
+     {
+         for (i = 0; i < n_args && i < ARRAY_SIZE(task->run_args); i++)
+--- a/programs/explorer/startup.c
++++ b/programs/explorer/startup.c
+@@ -232,6 +232,24 @@
+         }
+     }
+ #endif
++#ifndef SG_MUTANT_NO_USER_TASKS
++    /* Stained Glass OS: the person's scheduled tasks (their own account's,
++     * their groups') run in their session, as them: the Task Scheduler's
++     * host for this sign-in, for as long as it lasts (schedsvc) */
++    {
++        STARTUPINFOW si = { sizeof(si) };
++        PROCESS_INFORMATION pi;
++        WCHAR cmd[] = L"rundll32.exe schedsvc.dll,SgUserTaskHost";
++
++        si.dwFlags = STARTF_USESHOWWINDOW;
++        si.wShowWindow = SW_HIDE;
++        if (CreateProcessW( NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
++        {
++            CloseHandle( pi.hThread );
++            CloseHandle( pi.hProcess );
++        }
++    }
++#endif
+     run_once();
+     run_key( HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, L"Run" );
+     if (sizeof(void *) == 8 || (IsWow64Process( GetCurrentProcess(), &wow64 ) && wow64))
