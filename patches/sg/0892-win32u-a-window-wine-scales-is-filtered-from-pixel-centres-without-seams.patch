@@ -1,0 +1,203 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] win32u: a window Wine scales to the display scale is filtered from pixel centres, without seams
+
+Programs that do not scale themselves (DPI unaware, or aware of the system
+DPI and shown at another scale, 0890) are drawn by Wine at the display
+scale. Each update was stretched on its own with StretchBlt's HALFTONE:
+sampled from the update's corner, not the pixels' centres (the picture
+shifted by half a pixel), clamped at the update's edge (seams where two
+updates met), bilinear when shrinking too (fine lines and text aliased
+from 175% back to 100%), and a layered window with per-pixel alpha was not
+filtered at all ("FIXME: implement HALFTONE with alpha"): stepped edges.
+Now each pixel is sampled at its centre from the whole surface: bilinear
+when growing, the average of the pixels it covers when shrinking;
+premultiplied alpha is filtered with the colours, and a colour-keyed
+surface is sampled nearest so its key stays exact. A new target (a new
+scale) gets the window's shape and layering at once -- an X window kept
+the old size's shape. At 100% nothing is scaled and nothing changes.
+
+Test: test/dpilive-gate.sh, the layered window's red and blue halves at
+175% (mutant SG_MUTANT_DPI_STRETCH_HALFTONE).
+---
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -146,6 +146,7 @@
+     struct window_surface *target_surface;
+     UINT dpi_from;
+     UINT dpi_to;
++    struct window_surface *shaped;  /* Stained Glass OS: the target given the shape and layering */
+ };
+ 
+ static struct scaled_surface *get_scaled_surface( struct window_surface *window_surface )
+@@ -161,6 +162,106 @@
+     if (hrgn) NtGdiDeleteObjectApp( hrgn );
+ }
+ 
++/* Stained Glass OS: a window that does not scale itself, drawn at another
++ * DPI (Wine's DPI scaling of unaware and system-aware programs, at a scale
++ * other than the one they started at). Each pixel is sampled at its
++ * centre from the whole surface -- bilinear when growing, the average of
++ * the pixels it covers when shrinking -- so the picture is neither shifted
++ * by half a pixel, nor seamed where two updates meet, nor aliased when made
++ * smaller (StretchBlt's HALFTONE sampled from each update alone, from its
++ * corner). Premultiplied alpha is filtered with the colours; a colour-keyed
++ * surface is sampled nearest, its key kept exact. */
++struct scale_axis
++{
++    int first, last;       /* source pixels: the span (shrinking) or the pair (growing) */
++    UINT weight;           /* growing: the second pixel's share, in 256ths */
++};
++
++static void scale_axis_init( struct scale_axis *axis, int dst, UINT from, UINT to, int src_size, BOOL nearest )
++{
++    if (nearest)
++    {
++        int s = (int)(((INT64)dst * 2 + 1) * from / (2 * to));
++        axis->first = axis->last = min( max( s, 0 ), src_size - 1 );
++        axis->weight = 0;
++    }
++    else if (to >= from)  /* growing: bilinear between the two nearest centres */
++    {
++        INT64 c = (((INT64)dst * 2 + 1) * from * 256) / (2 * to) - 128;  /* in 256ths of a source pixel */
++        if (c < 0) c = 0;
++        axis->first = min( (int)(c >> 8), src_size - 1 );
++        axis->last = min( axis->first + 1, src_size - 1 );
++        axis->weight = axis->last == axis->first ? 0 : (UINT)(c & 0xff);
++    }
++    else  /* shrinking: the source pixels this one covers */
++    {
++        axis->first = min( (int)((INT64)dst * from / to), src_size - 1 );
++        axis->last = min( max( (int)(((INT64)(dst + 1) * from + to - 1) / to) - 1, axis->first ), src_size - 1 );
++        axis->weight = 0;
++    }
++}
++
++static inline UINT lerp_pixel( UINT a, UINT b, UINT w )
++{
++    UINT rb = (((a & 0xff00ff) * (256 - w) + (b & 0xff00ff) * w) >> 8) & 0xff00ff;
++    UINT ag = ((((a >> 8) & 0xff00ff) * (256 - w) + ((b >> 8) & 0xff00ff) * w)) & 0xff00ff00;
++    return rb | ag;
++}
++
++static void scale_surface_bits( UINT *dst_bits, int dst_stride, const RECT *dst_rect, int dst_w, int dst_h,
++                                const UINT *src_bits, int src_stride, int src_w, int src_h,
++                                UINT from, UINT to, BOOL nearest )
++{
++    struct scale_axis *cols, row;
++    int x, y, sx, sy, w = dst_rect->right - dst_rect->left;
++    BOOL grow = to >= from;
++
++    if (w <= 0 || dst_rect->bottom <= dst_rect->top || !src_w || !src_h) return;
++    if (!(cols = malloc( w * sizeof(*cols) ))) return;
++    for (x = 0; x < w; x++) scale_axis_init( &cols[x], dst_rect->left + x, from, to, src_w, nearest );
++
++    for (y = dst_rect->top; y < dst_rect->bottom && y < dst_h; y++)
++    {
++        UINT *out = dst_bits + y * dst_stride + dst_rect->left;
++        scale_axis_init( &row, y, from, to, src_h, nearest );
++
++        if (nearest || grow)
++        {
++            const UINT *r0 = src_bits + row.first * src_stride, *r1 = src_bits + row.last * src_stride;
++            for (x = 0; x < w && dst_rect->left + x < dst_w; x++)
++            {
++                const struct scale_axis *c = &cols[x];
++                UINT top = lerp_pixel( r0[c->first], r0[c->last], c->weight );
++                UINT bottom = lerp_pixel( r1[c->first], r1[c->last], c->weight );
++                out[x] = lerp_pixel( top, bottom, row.weight );
++            }
++        }
++        else
++        {
++            for (x = 0; x < w && dst_rect->left + x < dst_w; x++)
++            {
++                const struct scale_axis *c = &cols[x];
++                UINT sum[4] = {0}, n = 0;
++                for (sy = row.first; sy <= row.last; sy++)
++                {
++                    const UINT *r = src_bits + sy * src_stride;
++                    for (sx = c->first; sx <= c->last; sx++, n++)
++                    {
++                        UINT p = r[sx];
++                        sum[0] += p & 0xff;
++                        sum[1] += (p >> 8) & 0xff;
++                        sum[2] += (p >> 16) & 0xff;
++                        sum[3] += p >> 24;
++                    }
++                }
++                out[x] = ((sum[0] + n / 2) / n) | (((sum[1] + n / 2) / n) << 8) |
++                         (((sum[2] + n / 2) / n) << 16) | (((sum[3] + n / 2) / n) << 24);
++            }
++        }
++    }
++    free( cols );
++}
++
+ static BOOL scaled_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
+                                   const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
+                                   const BITMAPINFO *shape_info, const void *shape_bits )
+@@ -168,6 +269,11 @@
+     struct scaled_surface *surface = get_scaled_surface( window_surface );
+     RECT src = *dirty, dst;
+     HDC hdc_dst, hdc_src;
++#ifndef SG_MUTANT_DPI_STRETCH_HALFTONE
++    char target_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *target_info = (BITMAPINFO *)target_buf;
++    UINT *target_bits;
++#endif
+ 
+     src.left &= ~7;
+     src.top &= ~7;
+@@ -176,6 +282,31 @@
+ 
+     dst = map_dpi_rect( src, surface->dpi_from, surface->dpi_to );
+ 
++#ifndef SG_MUTANT_DPI_STRETCH_HALFTONE
++    /* one source pixel more on each side: the filter reaches into it */
++    InflateRect( &dst, (surface->dpi_to + surface->dpi_from - 1) / surface->dpi_from,
++                 (surface->dpi_to + surface->dpi_from - 1) / surface->dpi_from );
++    window_surface_lock( surface->target_surface );
++    if (color_info->bmiHeader.biBitCount == 32 && color_info->bmiHeader.biHeight < 0 &&
++        (target_bits = window_surface_get_color( surface->target_surface, target_info )) &&
++        target_info->bmiHeader.biBitCount == 32 && target_info->bmiHeader.biHeight < 0)
++    {
++        int src_w = color_info->bmiHeader.biWidth, src_h = abs( color_info->bmiHeader.biHeight );
++        int dst_w = target_info->bmiHeader.biWidth, dst_h = abs( target_info->bmiHeader.biHeight );
++
++        dst.left = max( dst.left, 0 );
++        dst.top = max( dst.top, 0 );
++        dst.right = min( dst.right, dst_w );
++        dst.bottom = min( dst.bottom, dst_h );
++        scale_surface_bits( target_bits, dst_w, &dst, dst_w, dst_h, color_bits, src_w, src_w, src_h,
++                            surface->dpi_from, surface->dpi_to, window_surface->color_key != CLR_INVALID );
++        add_bounds_rect( &surface->target_surface->bounds, &dst );
++        window_surface_unlock( surface->target_surface );
++    }
++    else
++    {
++        window_surface_unlock( surface->target_surface );
++#endif
+     hdc_dst = NtGdiCreateCompatibleDC( 0 );
+     hdc_src = NtGdiCreateCompatibleDC( 0 );
+ 
+@@ -195,10 +326,18 @@
+     window_surface_lock( surface->target_surface );
+     add_bounds_rect( &surface->target_surface->bounds, &dst );
+     window_surface_unlock( surface->target_surface );
+-
+-    if (shape_changed)
++#ifndef SG_MUTANT_DPI_STRETCH_HALFTONE
++    }
++#endif
++
++    /* a new target (a new DPI) has the shape and layering too: an X window
++     * kept the old size's shape, cut off at its old width */
++    if (shape_changed || surface->shaped != surface->target_surface)
+     {
+         HRGN hrgn = map_dpi_region( window_surface->shape_region, surface->dpi_from, surface->dpi_to );
++#ifndef SG_MUTANT_DPI_STRETCH_HALFTONE
++        surface->shaped = surface->target_surface;
++#endif
+         window_surface_set_shape( surface->target_surface, hrgn );
+         if (hrgn) NtGdiDeleteObjectApp( hrgn );
+ 
