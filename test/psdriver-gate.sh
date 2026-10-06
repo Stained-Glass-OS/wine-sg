@@ -19,6 +19,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINE="$(cd "$(dirname "$WINE")" && pwd)/$(basename "$WINE")"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
+[ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 MINGW32="${MINGW32:-i686-w64-mingw32-gcc}"
 for t in "$MINGW" "$MINGW32"; do command -v "$t" >/dev/null || { echo "SKIP: $t missing"; exit 77; }; done

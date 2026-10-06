@@ -25,6 +25,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINE="$(cd "$(dirname "$WINE")" && pwd)/$(basename "$WINE")"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
+[ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 MINGW32="${MINGW32:-i686-w64-mingw32-gcc}"
 for t in "$MINGW" "$MINGW32" python3; do command -v "$t" >/dev/null || { echo "SKIP: $t missing"; exit 77; }; done
@@ -60,6 +61,10 @@ printf 'SG data v1\r\nmore\r\n' > "$T/sgmaker.dat"
 python3 "$HERE/drvpkg-pack.py" szdd "$T/sgmaker.dat" "$S/sgmaker.da_"
 printf 'SG extra from the cabinet\r\n' > "$T/sgextra.txt"
 python3 "$HERE/drvpkg-pack.py" cab "$S/sgfiles.cab" "$T/sgextra.txt"
+# a file installed under another name from a cabinet of that one file (OKI's)
+mkdir -p "$T/one"
+printf 'SG from a one-file cabinet\r\n' > "$T/one/inner.txt"
+python3 "$HERE/drvpkg-pack.py" cab "$S/sgsingle.tx_" "$T/one/inner.txt"
 printf 'SG system file\r\n' > "$S/sgsys.dat"
 # a maker's own copies of the core driver: never ours to load
 printf 'not a DLL\r\n' > "$S/UNIDRV.DLL"
@@ -124,6 +129,10 @@ ConfigFile=UNIDRVUI.DLL
 [SGM_INSTALL]
 CopyFiles=SGM_FILES, SGM_SYS
 DataSection=SGM_DATA
+AddReg=SGM_REG
+
+[SGM_REG]
+HKLM,"Software\SG Test Maker","Installed",,"yes"
 
 [SGM_DATA]
 DriverFile=sgmaker.dll
@@ -134,6 +143,7 @@ DataFile=sgmaker.dat
 sgmaker.dll,sgtestdrv.dll
 sgmaker.dat
 sgextra.txt
+sgrenamed.txt,sgsingle.tx_
 
 [SGM_SYS]
 sgsys.dat
@@ -157,6 +167,7 @@ SGM_SYS=66002
 sgtestdrv.dll = 1
 sgmaker.dat = 2
 sgextra.txt = 3
+sgsingle.tx_ = 2
 sgsys.dat = 2
 sgcore.gpd = 2
 UNIDRV.DLL = 2
@@ -183,6 +194,11 @@ head -c 2 "$D/sgmaker.dll" 2>/dev/null | grep -q MZ && pass "a file installed un
     fail "sgmaker.dat not expanded: $(head -c 20 "$D/sgmaker.dat" 2>/dev/null | od -c | head -1)"
 [ "$(tr -d '\r' < "$D/sgextra.txt" 2>/dev/null)" = "SG extra from the cabinet" ] && pass "a file from the source disk's cabinet" ||
     fail "sgextra.txt not taken from the cabinet"
+timeout 60 "$WINE" reg query 'HKLM\Software\SG Test Maker' /v Installed 2>/dev/null | tr -d '\r' | grep -q "Installed.*REG_SZ.*yes" &&
+    pass "the install section's AddReg entries are made" || fail "no AddReg entry"
+[ "$(tr -d '\r' < "$D/sgrenamed.txt" 2>/dev/null)" = "SG from a one-file cabinet" ] &&
+    pass "a file installed under another name from a compressed source is expanded" ||
+    fail "sgrenamed.txt: $(head -c 8 "$D/sgrenamed.txt" 2>/dev/null | od -c | head -1)"
 [ -f "$C/windows/system32/sgsys.dat" ] && pass "a file for the system directory (66002) lands there" ||
     fail "sgsys.dat not in system32"
 head -c 2 "$D/UNIDRV.DLL" 2>/dev/null | grep -q MZ && pass "the core driver's files are ours, not the package's copies" ||

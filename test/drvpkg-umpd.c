@@ -95,8 +95,15 @@ static void out( struct pdev *p, const char *s )
 static void *WINAPI enable_pdev( DEVMODEW *dm, WCHAR *addr, ULONG npat, void **pats, ULONG cjcaps, GDIINFO *gi,
                                  ULONG cjdev, DEVINFO *di, void *hdev, WCHAR *name, HANDLE driver )
 {
-    struct pdev *p = calloc( 1, sizeof(*p) );
+    struct pdev *p;
     ULONG colors[2] = { 0xffffff, 0 };  /* 0 paper, 1 ink */
+    ULONG i;
+
+    /* GDI asks for the six hatch brushes; makers' drivers fill the array in
+     * without looking (OKI's) */
+    if (npat < 6 || !pats) return NULL;
+    for (i = 0; i < npat; i++) pats[i] = NULL;
+    p = calloc( 1, sizeof(*p) );
 
     p->printer = driver;
     p->hdev = hdev;

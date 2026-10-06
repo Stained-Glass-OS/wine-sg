@@ -24,6 +24,12 @@
 #include <windows.h>
 #include <winspool.h>
 #include <setupapi.h>
+#include <commctrl.h>
+#include <prsht.h>
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 HRESULT WINAPI InstallPrinterDriverFromPackageW( LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, DWORD );
 
@@ -395,6 +401,80 @@ static int status( const WCHAR *name )
     return 0;
 }
 
+/* SG_PROPS_WAIT=N: N seconds after the sheet shows, its tabs are listed
+ * and OK is pressed (a screenshot can be taken meanwhile) */
+static BOOL CALLBACK find_sheet( HWND hwnd, LPARAM lparam )
+{
+    DWORD pid;
+    WCHAR cls[32];
+    GetWindowThreadProcessId( hwnd, &pid );
+    GetClassNameW( hwnd, cls, ARRAY_SIZE(cls) );
+    RECT rect, best;
+    HWND *found = (HWND *)lparam;
+
+    if (pid != GetCurrentProcessId() || wcscmp( cls, L"#32770" ) || !IsWindowVisible( hwnd )) return TRUE;
+    /* the biggest: some drivers show a dialog of their own over the sheet */
+    GetWindowRect( hwnd, &rect );
+    if (*found)
+    {
+        GetWindowRect( *found, &best );
+        if ((rect.right - rect.left) * (rect.bottom - rect.top) <= (best.right - best.left) * (best.bottom - best.top))
+            return TRUE;
+    }
+    *found = hwnd;
+    return TRUE;
+}
+
+static DWORD WINAPI press_ok( void *arg )
+{
+    WCHAR wait[16], text[128], title[256];
+    HWND sheet = NULL, tab;
+    TCITEMW item;
+    int i, count;
+
+    if (!GetEnvironmentVariableW( L"SG_PROPS_WAIT", wait, ARRAY_SIZE(wait) )) return 0;
+    for (i = 0; i < 600 && !sheet; i++)
+    {
+        Sleep( 100 );
+        EnumWindows( find_sheet, (LPARAM)&sheet );
+    }
+    if (!sheet) { printf( "sheet none\n" ); return 0; }
+    if (GetEnvironmentVariableW( L"SG_PROPS_PAGE", text, ARRAY_SIZE(text) ))
+        PostMessageW( sheet, PSM_SETCURSEL, _wtoi( text ), 0 );
+    Sleep( _wtoi( wait ) * 1000 );
+    sheet = NULL;
+    EnumWindows( find_sheet, (LPARAM)&sheet );
+    GetWindowTextW( sheet, title, ARRAY_SIZE(title) );
+    tab = (HWND)SendMessageW( sheet, PSM_GETTABCONTROL, 0, 0 );
+    count = tab ? SendMessageW( tab, TCM_GETITEMCOUNT, 0, 0 ) : 0;
+    printf( "sheet %ls tabs %d:", title, count );
+    for (i = 0; i < count; i++)
+    {
+        item.mask = TCIF_TEXT;
+        item.pszText = text;
+        item.cchTextMax = ARRAY_SIZE(text);
+        SendMessageW( tab, TCM_GETITEMW, i, (LPARAM)&item );
+        printf( " [%ls]", text );
+    }
+    printf( "\n" );
+    if (GetDlgItem( sheet, IDOK )) PostMessageW( GetDlgItem( sheet, IDOK ), BM_CLICK, 0, 0 );
+    else PostMessageW( sheet, PSM_PRESSBUTTON, PSBTN_OK, 0 );
+    return 0;
+}
+
+static int devprops( const WCHAR *name )
+{
+    HANDLE h;
+    BOOL ret;
+
+    if (!OpenPrinterW( (WCHAR *)name, &h, NULL )) return 1;
+    CloseHandle( CreateThread( NULL, 0, press_ok, NULL, 0, NULL ) );
+    ret = PrinterProperties( NULL, h );
+    printf( "devprops %d %lu\n", ret, ret ? 0 : GetLastError() );
+    ClosePrinter( h );
+    return 0;
+}
+
 static int props( const WCHAR *name )
 {
     HANDLE h;
@@ -404,6 +484,7 @@ static int props( const WCHAR *name )
     if (!OpenPrinterW( (WCHAR *)name, &h, NULL )) return 1;
     size = DocumentPropertiesW( NULL, h, (WCHAR *)name, NULL, NULL, 0 );
     dm = calloc( 1, size > 0 ? size : sizeof(DEVMODEW) );
+    CloseHandle( CreateThread( NULL, 0, press_ok, NULL, 0, NULL ) );
     ret = DocumentPropertiesW( NULL, h, (WCHAR *)name, dm, NULL, DM_OUT_BUFFER | DM_IN_PROMPT );
     printf( "props %ld\n", ret );
     ClosePrinter( h );
@@ -442,6 +523,7 @@ int wmain( int argc, WCHAR **argv )
     if (argc >= 6 && !wcscmp( argv[1], L"ref" )) return ref( argv[2], _wtoi( argv[3] ), _wtoi( argv[4] ), _wtoi( argv[5] ) );
     if (argc >= 3 && !wcscmp( argv[1], L"status" )) return status( argv[2] );
     if (argc >= 3 && !wcscmp( argv[1], L"props" )) return props( argv[2] );
+    if (argc >= 3 && !wcscmp( argv[1], L"devprops" )) return devprops( argv[2] );
     if (argc >= 2 && !wcscmp( argv[1], L"enum" ))
     {
         DWORD needed = 0, count = 0, i;
