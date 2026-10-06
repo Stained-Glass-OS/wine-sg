@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <commctrl.h>
+#include <shellapi.h>
 
 #define WM_PROBE_POPUP (WM_APP + 1)
 #define POPUP_TIMER 7
@@ -243,6 +244,46 @@ int main( int argc, char **argv )
         RegSetValueExW( key, L"LogPixels", 0, REG_DWORD, (BYTE *)&dpi, sizeof(dpi) );
         RegCloseKey( key );
         SendMessageTimeoutW( to, WM_SETTINGCHANGE, 0, (LPARAM)L"WindowMetrics", SMTO_ABORTIFHUNG, 2000, &r );
+        return 0;
+    }
+    if (argc >= 2 && !strcmp( argv[1], "busy" ))
+    {
+        /* a window whose thread does not answer for a while (a program at work) */
+        MSG msg;
+        CreateWindowExW( WS_EX_TOOLWINDOW, L"STATIC", L"dpifollow busy", WS_POPUP | WS_VISIBLE, 0, 0, 50, 50,
+                         NULL, NULL, NULL, NULL );
+        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
+        Sleep( 120000 );
+        return 0;
+    }
+    if (argc >= 4 && !strcmp( argv[1], "appbar" ))
+    {
+        /* dock a left appbar WIDTH pixels wide as a touch keyboard does: how
+         * long the dock took ("appbar ms=N"); kept for SECONDS, then removed */
+        APPBARDATA abd = {sizeof(abd)};
+        LARGE_INTEGER f, a, b;
+        DWORD end;
+        MSG msg;
+        SetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 );
+        abd.hWnd = CreateWindowExW( WS_EX_TOOLWINDOW, L"STATIC", L"dpifollow appbar", WS_POPUP | WS_VISIBLE, 0, 0,
+                                    atoi( argv[2] ), 200, NULL, NULL, NULL, NULL );
+        abd.uEdge = ABE_LEFT;
+        SHAppBarMessage( ABM_NEW, &abd );
+        SetRect( &abd.rc, 0, 0, atoi( argv[2] ), GetSystemMetrics( SM_CYSCREEN ) );
+        QueryPerformanceFrequency( &f );
+        QueryPerformanceCounter( &a );
+        SHAppBarMessage( ABM_QUERYPOS, &abd );
+        SHAppBarMessage( ABM_SETPOS, &abd );
+        QueryPerformanceCounter( &b );
+        printf( "appbar ms=%ld\n", (long)((b.QuadPart - a.QuadPart) * 1000 / f.QuadPart) );
+        fflush( stdout );
+        end = GetTickCount() + atoi( argv[3] ) * 1000;
+        while ((LONG)(end - GetTickCount()) > 0)
+        {
+            MsgWaitForMultipleObjects( 0, NULL, FALSE, 100, QS_ALLINPUT );
+            while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
+        }
+        SHAppBarMessage( ABM_REMOVE, &abd );
         return 0;
     }
     return 2;

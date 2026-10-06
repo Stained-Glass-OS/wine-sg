@@ -31,6 +31,8 @@
 #      Chrome laid itself out at the new DPI but drew at the old one until
 #      it read the displays again
 #   5. at 100% nothing changes: the windows' state as before the first change
+#   8. an appbar docked while programs are busy docks at once (1126), and
+#      the maximized window still moves beside it
 #
 #   WINE=/opt/wine-sg/bin/wine test/dpifollow-gate.sh
 #   Mutants: SG_MUTANT_WORKAREA_NOT_TOLD, SG_MUTANT_WORKAREA_STALE_SERIAL
@@ -43,7 +45,8 @@
 #   SG_MUTANT_DEFVIEW_DPI_IGNORED (shell32 shlview.c),
 #   SG_MUTANT_SHELL_ICONS_FIXED (shell32 iconcache.c): 5 fails;
 #   SG_MUTANT_NOTEPAD_DPI_IGNORED (notepad main.c): 6 fails;
-#   SG_MUTANT_NO_DISPLAYCHANGE (win32u sysparams.c): 7 fails.
+#   SG_MUTANT_NO_DISPLAYCHANGE (win32u sysparams.c): 7 fails;
+#   SG_MUTANT_WORKAREA_SYNC_BROADCAST (explorer appbar.c): 8 fails.
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -61,7 +64,7 @@ T=$(mktemp -d /var/tmp/sg-dpifollow.XXXXXX); XP=
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 export XCURSOR_THEME=Adwaita XCURSOR_SIZE=24
 trap '"$WINESERVER" -k 2>/dev/null; [ -n "$XP" ] && kill "$XP" 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"' EXIT INT TERM
-"$MINGW" -O2 -o "$T/probe.exe" "$HERE/dpifollow-probe.c" -lgdi32 -lcomctl32 || { fail "probe did not build"; exit 1; }
+"$MINGW" -O2 -o "$T/probe.exe" "$HERE/dpifollow-probe.c" -lgdi32 -lcomctl32 -lshell32 || { fail "probe did not build"; exit 1; }
 "$CC" -O2 -o "$T/xcur" "$HERE/dpifollow-xcursor.c" -lX11 -lXfixes 2>/dev/null || { echo "SKIP: no libXfixes headers"; exit 77; }
 mkdir -p "$T/run"; export XDG_RUNTIME_DIR="$T/run" SG_LOCK_CONTROL=/nonexistent
 W=2736 H=1824
@@ -207,6 +210,27 @@ n3=$("$WINE" "$T/probe.exe" app Notepad SgNotepadTabs 2>/dev/null | tr -d '\r')
     && pass "back at 100%: per-monitor v2 as before the change ('$s')" || fail "back at 100%: v2 '$s' (was '$s_v2')"
 [ "$d3" = "$d1" ] && pass "back at 100%: the desktop's icons as before ($d3)" || fail "back at 100%: the desktop '$d3' (was '$d1')"
 [ "$c3" = 24x24 ] && pass "back at 100%: the pointer $c3" || fail "back at 100%: the pointer '$c3' (want 24x24)"
+
+# 8. an appbar docked while a program is at work (its window not answering)
+# docks at once (1126): explorer told every window of the new work area
+# inside the appbar's own request, waiting up to 2 s for each busy window
+# (a docked touch keyboard took ~4.5 s); a thread of its own tells them now.
+# The maximized window still hears of it and moves right of the appbar.
+"$WINE" "$T/probe.exe" busy >/dev/null 2>&1 &
+"$WINE" "$T/probe.exe" busy >/dev/null 2>&1 &
+sleep 3
+"$WINE" "$T/probe.exe" appbar 300 8 > "$T/appbar.out" 2>/dev/null &
+sleep 6
+ab=$(tr -d '\r' < "$T/appbar.out"); r_ab=$(rect 'dpifollow pmv2 max')
+ms=$(echo "$ab" | sed -n 's/^appbar ms=//p')
+[ -n "$ms" ] && [ "$ms" -lt 1000 ] && pass "an appbar docks at once beside busy programs ($ab)" \
+    || fail "an appbar dock beside busy programs: '$ab' (want under 1000 ms)"
+echo "$r_ab" | awk '{ for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+    split(v["rect"], r, ","); split(v["work"], w, ",");
+    exit !(v["max"] == 1 && w[1] == 300 && r[1] - w[1] <= 0 && r[1] - w[1] >= -12) }' \
+    && pass "the maximized window moves right of the docked appbar ($r_ab)" \
+    || fail "with the appbar docked: '$r_ab' (want the work area from x=300, the maximized window on it)"
+sleep 4
 
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
