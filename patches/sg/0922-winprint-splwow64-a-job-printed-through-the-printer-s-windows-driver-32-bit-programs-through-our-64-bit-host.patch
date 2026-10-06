@@ -1,0 +1,1297 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winprint, splwow64: a job printed through the printer's Windows driver; 32-bit programs through our 64-bit host
+
+A program's pages reach the spooler as metafiles (NT EMF), and winprint
+handled only RAW and TEXT jobs: a printer with a Windows driver could not
+print. winprint now plays an EMF job through the printer's graphics driver
+as GDI does -- DrvEnableDriver, DrvEnablePDEV, DrvEnableSurface, per page
+DrvStartPage, the page drawn into the driver's surface by GDI's engine,
+DrvSendPage (or band by band, DrvStartBanding/DrvNextBand), DrvEndDoc --
+and the driver's EngWritePrinter output goes to the printer's port as the
+job's raw data. Drivers are 64-bit on a 64-bit system; a 32-bit program
+(DYMO Connect's helpers, most label software) cannot load them. As Windows
+does with its splwow64, such a job is run by splwow64.exe, our 64-bit host,
+on a copy of the job, and winprint sends what it wrote. splwow64 also
+measures a page for a 32-bit program's DC; run by the Windows system, it
+readies every printer's driver for every user and installs the makers'
+staged packages (splwow64 drivers); and for Linux programs printing through
+a Windows driver (sg-session's sgwindrv CUPS backend) it lists such
+printers, makes a PPD from a driver's capabilities (its papers with their
+printable areas, resolutions, colour) and prints page images through it.
+
+Test: test/printdrv-gate.sh, 64- and 32-bit (mutants SG_MUTANT_EMFPROC,
+SG_MUTANT_WOWHOST); test/linuxdrv-gate.sh, a Linux program's PDF through a
+CUPS queue of its own and the sgwindrv backend (mutant SG_MUTANT_HOSTPRINT).
+---
+--- a/configure
++++ b/configure
+@@ -1746,6 +1746,7 @@ enable_setx
+ enable_shutdown
+ enable_snippingtool
+ enable_sort
++enable_splwow64
+ enable_spoolsv
+ enable_start
+ enable_subst
+@@ -23224,6 +23225,7 @@ wine_fn_config_makefile programs/setx enable_setx
+ wine_fn_config_makefile programs/shutdown enable_shutdown
+ wine_fn_config_makefile programs/snippingtool enable_snippingtool
+ wine_fn_config_makefile programs/sort enable_sort
++wine_fn_config_makefile programs/splwow64 enable_splwow64
+ wine_fn_config_makefile programs/spoolsv enable_spoolsv
+ wine_fn_config_makefile programs/start enable_start
+ wine_fn_config_makefile programs/subst enable_subst
+--- a/configure.ac
++++ b/configure.ac
+@@ -3538,6 +3538,7 @@ WINE_CONFIG_MAKEFILE(programs/setx)
+ WINE_CONFIG_MAKEFILE(programs/shutdown)
+ WINE_CONFIG_MAKEFILE(programs/snippingtool)
+ WINE_CONFIG_MAKEFILE(programs/sort)
++WINE_CONFIG_MAKEFILE(programs/splwow64)
+ WINE_CONFIG_MAKEFILE(programs/spoolsv)
+ WINE_CONFIG_MAKEFILE(programs/start)
+ WINE_CONFIG_MAKEFILE(programs/subst)
+--- a/dlls/winprint/Makefile.in
++++ b/dlls/winprint/Makefile.in
+@@ -1,5 +1,6 @@
+ MODULE    = winprint.dll
+-IMPORTS   = winspool
++IMPORTS   = winspool gdi32 user32
+ 
+ SOURCES = \
++	emf.c \
+ 	printproc.c
+--- /dev/null
++++ b/dlls/winprint/emf.c
+@@ -0,0 +1,640 @@
++/*
++ * Print processor: EMF jobs through the printer's graphics driver
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * A program prints to a printer DC; gdi32 records each page as an enhanced
++ * metafile in the job.  For a printer whose driver is a printer graphics DLL
++ * (the printer maker's own, or Unidrv for GPD printers), we load that DLL
++ * here, as GDI would: DrvEnableDriver, DrvEnablePDEV, DrvEnableSurface, then
++ * per page DrvStartPage, draw the page's metafile into the driver's surface,
++ * DrvSendPage (or band by band with DrvStartBanding and DrvNextBand), and at
++ * the end DrvEndDoc.  What the driver writes with EngWritePrinter goes to the
++ * printer's port as the job's raw data.
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "windows.h"
++#include "winspool.h"
++#include "ddk/winsplp.h"
++#include "ddk/winddi.h"
++#include "wine/printdrv.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(winprint);
++
++BOOL WINAPI SeekPrinter( HANDLE, LARGE_INTEGER, LARGE_INTEGER *, DWORD, BOOL );
++
++enum
++{
++    EMRI_METAFILE = 1,
++    EMRI_DEVMODE = 3,
++    EMRI_METAFILE_DATA = 12,
++    EMRI_METAFILE_EXT = 13,
++    EMRI_BW_METAFILE_EXT = 14,
++};
++
++struct spool_page
++{
++    BYTE     *emf;
++    DWORD     size;
++    DEVMODEW *devmode;   /* the devmode in force for this page */
++};
++
++struct driver
++{
++    HMODULE module;
++    DHPDEV  (WINAPI *enable_pdev)( DEVMODEW *, WCHAR *, ULONG, HSURF *, ULONG, ULONG *, ULONG, DEVINFO *,
++                                   HDEV, WCHAR *, HANDLE );
++    void    (WINAPI *complete_pdev)( DHPDEV, HDEV );
++    void    (WINAPI *disable_pdev)( DHPDEV );
++    HSURF   (WINAPI *enable_surface)( DHPDEV );
++    void    (WINAPI *disable_surface)( DHPDEV );
++    BOOL    (WINAPI *start_doc)( SURFOBJ *, WCHAR *, DWORD );
++    BOOL    (WINAPI *end_doc)( SURFOBJ *, FLONG );
++    BOOL    (WINAPI *start_page)( SURFOBJ * );
++    BOOL    (WINAPI *send_page)( SURFOBJ * );
++    BOOL    (WINAPI *start_banding)( SURFOBJ *, POINTL * );
++    BOOL    (WINAPI *next_band)( SURFOBJ *, POINTL * );
++    BOOL    (WINAPI *copy_bits)( SURFOBJ *, SURFOBJ *, CLIPOBJ *, XLATEOBJ *, RECTL *, POINTL * );
++    void    (WINAPI *disable_driver)( void );
++};
++
++static void free_pages( struct spool_page *pages, unsigned int count )
++{
++    unsigned int i;
++    for (i = 0; i < count; i++)
++    {
++        free( pages[i].emf );
++        /* devmodes are shared between pages; freed through the last owner */
++    }
++    free( pages );
++}
++
++/* reads the job's pages: each is a metafile, with the devmode that was in
++ * force when it was drawn */
++/* the job's data, from the spooler or from a file our 64-bit host was given */
++struct spool_reader
++{
++    HANDLE handle;
++    BOOL   file;
++};
++
++static BOOL spool_read( struct spool_reader *r, void *buf, DWORD size, DWORD *got )
++{
++    if (r->file) return ReadFile( r->handle, buf, size, got, NULL );
++    return ReadPrinter( r->handle, buf, size, got );
++}
++
++static BOOL spool_seek( struct spool_reader *r, LONGLONG offset, DWORD origin )
++{
++    LARGE_INTEGER pos;
++    pos.QuadPart = offset;
++    if (r->file) return SetFilePointerEx( r->handle, pos, NULL, origin );
++    return SeekPrinter( r->handle, pos, NULL, origin, FALSE );
++}
++
++static struct spool_page *read_spool( struct spool_reader *spool, unsigned int *count, DEVMODEW ***devmodes,
++                                      unsigned int *dm_count )
++{
++    struct { DWORD version, size, doc_name, output; } header;
++    struct { DWORD id, size; } record;
++    struct spool_page *pages = NULL;
++    DEVMODEW *current = NULL;
++    DWORD r;
++
++    *count = 0;
++    *dm_count = 0;
++    *devmodes = NULL;
++    if (!spool_read( spool, &header, sizeof(header), &r ) || r != sizeof(header)) return NULL;
++    if (header.version != 0x10000)
++    {
++        FIXME( "spool file version %#lx\n", header.version );
++        return NULL;
++    }
++    if (!spool_seek( spool, header.size, FILE_BEGIN )) return NULL;
++
++    while (spool_read( spool, &record, sizeof(record), &r ) && r == sizeof(record))
++    {
++        switch (record.id)
++        {
++        case EMRI_METAFILE:
++        case EMRI_METAFILE_DATA:
++        {
++            BYTE *emf = malloc( record.size );
++            if (!emf || !spool_read( spool, emf, record.size, &r ) || r != record.size)
++            {
++                free( emf );
++                return pages;
++            }
++            pages = realloc( pages, (*count + 1) * sizeof(*pages) );
++            pages[*count].emf = emf;
++            pages[*count].size = record.size;
++            pages[*count].devmode = current;
++            (*count)++;
++            break;
++        }
++        case EMRI_DEVMODE:
++        {
++            DEVMODEW *dm = NULL;
++            if (record.size)
++            {
++                dm = malloc( record.size );
++                if (!dm || !spool_read( spool, dm, record.size, &r ) || r != record.size)
++                {
++                    free( dm );
++                    return pages;
++                }
++                *devmodes = realloc( *devmodes, (*dm_count + 1) * sizeof(**devmodes) );
++                (*devmodes)[(*dm_count)++] = dm;
++            }
++            /* written after the page it was set for */
++            if (*count) pages[*count - 1].devmode = dm;
++            current = dm;
++            break;
++        }
++        default:
++            if (!spool_seek( spool, record.size, FILE_CURRENT )) return pages;
++            break;
++        }
++    }
++    return pages;
++}
++
++static BOOL load_driver( struct driver *drv, HANDLE printer )
++{
++    BOOL (WINAPI *enable_driver)( ULONG, ULONG, DRVENABLEDATA * );
++    DRIVER_INFO_3W *info;
++    DRVENABLEDATA ded;
++    DWORD needed = 0;
++    ULONG i;
++
++    GetPrinterDriverW( printer, NULL, 3, NULL, 0, &needed );
++    if (!needed || !(info = malloc( needed ))) return FALSE;
++    if (!GetPrinterDriverW( printer, NULL, 3, (BYTE *)info, needed, &needed ) || !info->pDriverPath)
++    {
++        free( info );
++        return FALSE;
++    }
++    drv->module = LoadLibraryW( info->pDriverPath );
++    if (!drv->module)
++    {
++        /* our own drivers are found by their plain names */
++        const WCHAR *base = wcsrchr( info->pDriverPath, '\\' );
++        drv->module = LoadLibraryW( base ? base + 1 : info->pDriverPath );
++    }
++    TRACE( "driver %s -> %p\n", debugstr_w(info->pDriverPath), drv->module );
++    free( info );
++    if (!drv->module) return FALSE;
++
++    enable_driver = (void *)GetProcAddress( drv->module, "DrvEnableDriver" );
++    drv->disable_driver = (void *)GetProcAddress( drv->module, "DrvDisableDriver" );
++    memset( &ded, 0, sizeof(ded) );
++    if (!enable_driver || !enable_driver( DDI_DRIVER_VERSION_NT5_01, sizeof(ded), &ded ))
++    {
++        WARN( "DrvEnableDriver failed\n" );
++        FreeLibrary( drv->module );
++        return FALSE;
++    }
++    for (i = 0; i < ded.c; i++)
++    {
++        PFN fn = ded.pdrvfn[i].pfn;
++        switch (ded.pdrvfn[i].iFunc)
++        {
++        case INDEX_DrvEnablePDEV: drv->enable_pdev = (void *)fn; break;
++        case INDEX_DrvCompletePDEV: drv->complete_pdev = (void *)fn; break;
++        case INDEX_DrvDisablePDEV: drv->disable_pdev = (void *)fn; break;
++        case INDEX_DrvEnableSurface: drv->enable_surface = (void *)fn; break;
++        case INDEX_DrvDisableSurface: drv->disable_surface = (void *)fn; break;
++        case INDEX_DrvStartDoc: drv->start_doc = (void *)fn; break;
++        case INDEX_DrvEndDoc: drv->end_doc = (void *)fn; break;
++        case INDEX_DrvStartPage: drv->start_page = (void *)fn; break;
++        case INDEX_DrvSendPage: drv->send_page = (void *)fn; break;
++        case INDEX_DrvStartBanding: drv->start_banding = (void *)fn; break;
++        case INDEX_DrvNextBand: drv->next_band = (void *)fn; break;
++        case INDEX_DrvCopyBits: drv->copy_bits = (void *)fn; break;
++        }
++    }
++    return drv->enable_pdev && drv->enable_surface;
++}
++
++static int format_bpp( ULONG format )
++{
++    switch (format)
++    {
++    case BMF_1BPP: return 1;
++    case BMF_4BPP: return 4;
++    case BMF_8BPP: return 8;
++    case BMF_16BPP: return 16;
++    case BMF_24BPP: return 24;
++    case BMF_32BPP: return 32;
++    }
++    return 0;
++}
++
++/* draws a page's metafile into a bitmap laid out as the driver's surface,
++ * with the band's origin at (origin.x, origin.y) of the page */
++static BOOL render_page( const struct spool_page *page, SURFOBJ *so, const DEVINFO *devinfo, POINTL origin )
++{
++    const ENHMETAHEADER *emh = (const ENHMETAHEADER *)page->emf;
++    int bpp = format_bpp( so->iBitmapFormat ), y;
++    int w = so->sizlBitmap.cx, h = so->sizlBitmap.cy;
++    struct { BITMAPINFOHEADER hdr; RGBQUAD colors[256]; } bmi;
++    HENHMETAFILE hemf;
++    HBITMAP dib, old;
++    BYTE *bits;
++    HDC hdc;
++    RECT rect;
++    int stride;
++    BOOL ret = FALSE;
++
++    if (!bpp || !so->pvScan0)
++    {
++        FIXME( "surface type %u format %lu not drawn\n", so->iType, so->iBitmapFormat );
++        return FALSE;
++    }
++    memset( &bmi, 0, sizeof(bmi) );
++    bmi.hdr.biSize = sizeof(bmi.hdr);
++    bmi.hdr.biWidth = w;
++    bmi.hdr.biHeight = -h;
++    bmi.hdr.biPlanes = 1;
++    bmi.hdr.biBitCount = bpp;
++    bmi.hdr.biCompression = BI_RGB;
++    if (bpp <= 8)
++    {
++        const struct wine_eng_palette *pal = (const struct wine_eng_palette *)devinfo->hpalDefault;
++        unsigned int i, n = 1u << bpp;
++        if (pal && pal->mode == PAL_INDEXED && pal->count)
++        {
++            for (i = 0; i < n && i < pal->count; i++)
++            {
++                bmi.colors[i].rgbRed = pal->colors[i] & 0xff;
++                bmi.colors[i].rgbGreen = (pal->colors[i] >> 8) & 0xff;
++                bmi.colors[i].rgbBlue = (pal->colors[i] >> 16) & 0xff;
++            }
++        }
++        else if (bpp == 1)
++        {
++            bmi.colors[1].rgbRed = bmi.colors[1].rgbGreen = bmi.colors[1].rgbBlue = 0xff;
++        }
++        else for (i = 0; i < n; i++)
++            bmi.colors[i].rgbRed = bmi.colors[i].rgbGreen = bmi.colors[i].rgbBlue = i * 255 / (n - 1);
++        bmi.hdr.biClrUsed = n;
++    }
++
++    hdc = CreateCompatibleDC( NULL );
++    dib = CreateDIBSection( hdc, (BITMAPINFO *)&bmi, DIB_RGB_COLORS, (void **)&bits, NULL, 0 );
++    if (!dib)
++    {
++        DeleteDC( hdc );
++        return FALSE;
++    }
++    old = SelectObject( hdc, dib );
++    stride = ((w * bpp + 31) / 32) * 4;
++
++    /* the page starts as paper */
++    rect.left = rect.top = 0;
++    rect.right = w;
++    rect.bottom = h;
++    FillRect( hdc, &rect, GetStockObject( WHITE_BRUSH ) );
++
++    if ((hemf = SetEnhMetaFileBits( page->size, page->emf )))
++    {
++        /* the metafile was recorded on the printer DC: one of its device units
++         * is one of the surface's pixels, and (0,0) is the printable origin */
++        double px = (double)emh->szlDevice.cx / (emh->szlMillimeters.cx * 100.0);
++        double py = (double)emh->szlDevice.cy / (emh->szlMillimeters.cy * 100.0);
++
++        rect.left = (int)(emh->rclFrame.left * px + 0.5) - origin.x;
++        rect.top = (int)(emh->rclFrame.top * py + 0.5) - origin.y;
++        rect.right = (int)(emh->rclFrame.right * px + 0.5) - origin.x;
++        rect.bottom = (int)(emh->rclFrame.bottom * py + 0.5) - origin.y;
++        TRACE( "emf bounds (%ld,%ld)-(%ld,%ld) frame (%ld,%ld)-(%ld,%ld) device %ldx%ld mm %ldx%ld\n",
++               emh->rclBounds.left, emh->rclBounds.top, emh->rclBounds.right, emh->rclBounds.bottom,
++               emh->rclFrame.left, emh->rclFrame.top, emh->rclFrame.right, emh->rclFrame.bottom,
++               emh->szlDevice.cx, emh->szlDevice.cy, emh->szlMillimeters.cx, emh->szlMillimeters.cy );
++        TRACE( "page frame %s on band %ld,%ld %dx%d\n", wine_dbgstr_rect(&rect), origin.x, origin.y, w, h );
++        SetGraphicsMode( hdc, GM_ADVANCED );
++        if (emh->rclFrame.right > emh->rclFrame.left && emh->rclFrame.bottom > emh->rclFrame.top)
++            ret = PlayEnhMetaFile( hdc, hemf, &rect );
++        else ret = TRUE;  /* nothing drawn */
++        DeleteEnhMetaFile( hemf );
++    }
++    GdiFlush();
++
++    /* into the driver's surface, whichever way up it is */
++    for (y = 0; y < h; y++)
++        memcpy( (BYTE *)so->pvScan0 + (LONG_PTR)y * so->lDelta, bits + (SIZE_T)y * stride,
++                min( stride, abs( so->lDelta ) ) );
++
++    SelectObject( hdc, old );
++    DeleteObject( dib );
++    DeleteDC( hdc );
++    return ret;
++}
++
++/* runs the job through the driver in this process; FALSE with
++ * ERROR_BAD_EXE_FORMAT when the driver (or a part of it) cannot load here */
++static BOOL render_job( HANDLE printer, const WCHAR *printer_name, DEVMODEW *job_devmode, const WCHAR *doc_name,
++                        const WCHAR *out_file, DWORD job_id, struct spool_page *pages, unsigned int page_count,
++                        HANDLE hport, HANDLE file )
++{
++    struct wine_eng_device dev;
++    unsigned int i, copy, copies;
++    DEVMODEW *devmode;
++    struct driver drv;
++    DOC_INFO_1W info;
++    GDIINFO gdiinfo;
++    DEVINFO devinfo;
++    SURFOBJ *so;
++    HSURF hsurf;
++    BOOL ret = FALSE;
++
++    memset( &drv, 0, sizeof(drv) );
++    if (!load_driver( &drv, printer ))
++    {
++        WARN( "the printer driver of %s did not load here\n", debugstr_w(printer_name) );
++        SetLastError( ERROR_BAD_EXE_FORMAT );
++        return FALSE;
++    }
++
++    devmode = page_count && pages[0].devmode ? pages[0].devmode : job_devmode;
++    copies = devmode && (devmode->dmFields & DM_COPIES) && devmode->dmCopies > 1 ? devmode->dmCopies : 1;
++
++    memset( &dev, 0, sizeof(dev) );
++    dev.magic = WINE_ENG_DEVICE_MAGIC;
++    dev.printer = printer;
++    dev.output = hport;
++    dev.file = file;
++    __wine_eng_register_device( &dev, TRUE );
++
++    memset( &gdiinfo, 0, sizeof(gdiinfo) );
++    memset( &devinfo, 0, sizeof(devinfo) );
++    dev.dhpdev = drv.enable_pdev( devmode, (WCHAR *)printer_name, 0, NULL, sizeof(gdiinfo), (ULONG *)&gdiinfo,
++                                  sizeof(devinfo), &devinfo, (HDEV)&dev, (WCHAR *)printer_name, printer );
++    if (!dev.dhpdev)
++    {
++        if (GetLastError() != ERROR_BAD_EXE_FORMAT) ERR( "DrvEnablePDEV failed\n" );
++        goto done;
++    }
++
++    if (hport)
++    {
++        info.pDocName = (WCHAR *)doc_name;
++        info.pOutputFile = (WCHAR *)out_file;
++        info.pDatatype = (WCHAR *)L"RAW";
++        if (!StartDocPrinterW( hport, 1, (BYTE *)&info ))
++        {
++            if (drv.disable_pdev) drv.disable_pdev( dev.dhpdev );
++            goto done;
++        }
++    }
++
++    if (drv.complete_pdev) drv.complete_pdev( dev.dhpdev, (HDEV)&dev );
++    hsurf = drv.enable_surface( dev.dhpdev );
++    if (!hsurf || !(so = EngLockSurface( hsurf )))
++    {
++        ERR( "DrvEnableSurface failed\n" );
++        goto done_pdev;
++    }
++    if (!so->dhpdev) so->dhpdev = dev.dhpdev;
++    TRACE( "surface %ldx%ld format %lu banding %d\n", so->sizlBitmap.cx, so->sizlBitmap.cy,
++           so->iBitmapFormat, dev.banding );
++
++    ret = !drv.start_doc || drv.start_doc( so, (WCHAR *)doc_name, job_id );
++    for (copy = 0; ret && copy < copies; copy++)
++    {
++        for (i = 0; ret && i < page_count; i++)
++        {
++            POINTL origin = { 0, 0 };
++
++            if (drv.start_page && !drv.start_page( so ))
++            {
++                ret = FALSE;
++                break;
++            }
++            if (dev.banding && drv.start_banding && drv.next_band)
++            {
++                if (!drv.start_banding( so, &origin )) { ret = FALSE; break; }
++                while (origin.x != -1)
++                {
++                    render_page( &pages[i], so, &devinfo, origin );
++                    if (!drv.next_band( so, &origin )) { ret = FALSE; break; }
++                }
++            }
++            else
++            {
++                render_page( &pages[i], so, &devinfo, origin );
++                if (drv.send_page && !drv.send_page( so )) ret = FALSE;
++            }
++        }
++    }
++    if (drv.end_doc) drv.end_doc( so, ret ? 0 : ED_ABORTDOC );
++    EngUnlockSurface( so );
++    if (drv.disable_surface) drv.disable_surface( dev.dhpdev );
++
++done_pdev:
++    if (drv.disable_pdev) drv.disable_pdev( dev.dhpdev );
++    if (hport) EndDocPrinter( hport );
++done:
++    __wine_eng_register_device( &dev, FALSE );
++    if (drv.disable_driver) drv.disable_driver();
++    FreeLibrary( drv.module );
++    return ret;
++}
++
++static WCHAR *temp_file( const WCHAR *prefix )
++{
++    WCHAR dir[MAX_PATH], *name = malloc( MAX_PATH * sizeof(WCHAR) );
++    GetTempPathW( MAX_PATH, dir );
++    if (!GetTempFileNameW( dir, prefix, 0, name ))
++    {
++        free( name );
++        return NULL;
++    }
++    return name;
++}
++
++/* a 32-bit program printing through a 64-bit driver: our 64-bit host runs
++ * the driver on a copy of the job, and we send what it wrote */
++static BOOL render_in_host( const WCHAR *printer_name, DEVMODEW *devmode, const WCHAR *doc_name,
++                            const WCHAR *out_file, const WCHAR *spool_name, DWORD job_id, HANDLE hport )
++{
++    WCHAR *spool_copy = temp_file( L"spl" ), *dm_file = temp_file( L"sdm" ), *output = temp_file( L"sout" );
++    WCHAR host[MAX_PATH], *cmd = NULL;
++    STARTUPINFOW si = { sizeof(si) };
++    PROCESS_INFORMATION pi;
++    HANDLE spool = NULL, file = INVALID_HANDLE_VALUE;
++    DOC_INFO_1W info;
++    DWORD r, w, code = 1;
++    BYTE buf[0x10000];
++    BOOL ret = FALSE;
++    size_t len;
++
++    if (!spool_copy || !dm_file || !output) goto done;
++
++    /* the job, as it is */
++    if (!OpenPrinterW( (WCHAR *)spool_name, &spool, NULL )) goto done;
++    file = CreateFileW( spool_copy, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) goto done;
++    while (ReadPrinter( spool, buf, sizeof(buf), &r ) && r)
++        if (!WriteFile( file, buf, r, &w, NULL ) || w != r) goto done;
++    CloseHandle( file );
++    file = CreateFileW( dm_file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) goto done;
++    if (devmode) WriteFile( file, devmode, devmode->dmSize + devmode->dmDriverExtra, &w, NULL );
++    CloseHandle( file );
++    file = INVALID_HANDLE_VALUE;
++
++    GetWindowsDirectoryW( host, MAX_PATH );
++    lstrcatW( host, L"\\sysnative\\splwow64.exe" );
++    len = wcslen( host ) + wcslen( printer_name ) + wcslen( spool_copy ) + wcslen( dm_file ) + wcslen( output ) +
++          (doc_name ? wcslen( doc_name ) : 0) + 64;
++    cmd = malloc( len * sizeof(WCHAR) );
++    swprintf( cmd, len, L"\"%s\" render \"%s\" \"%s\" \"%s\" \"%s\" %lu \"%s\"", host, printer_name, spool_copy,
++              dm_file, output, job_id, doc_name ? doc_name : L"" );
++    TRACE( "%s\n", debugstr_w(cmd) );
++    if (!CreateProcessW( host, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi ))
++    {
++        ERR( "the 64-bit print host did not start: %lu\n", GetLastError() );
++        goto done;
++    }
++    WaitForSingleObject( pi.hProcess, INFINITE );
++    GetExitCodeProcess( pi.hProcess, &code );
++    CloseHandle( pi.hProcess );
++    CloseHandle( pi.hThread );
++    if (code)
++    {
++        ERR( "the 64-bit print host failed (%lu)\n", code );
++        goto done;
++    }
++
++    /* what the driver wrote goes to the port */
++    file = CreateFileW( output, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) goto done;
++    info.pDocName = (WCHAR *)doc_name;
++    info.pOutputFile = (WCHAR *)out_file;
++    info.pDatatype = (WCHAR *)L"RAW";
++    if (!StartDocPrinterW( hport, 1, (BYTE *)&info )) goto done;
++    ret = TRUE;
++    while (ReadFile( file, buf, sizeof(buf), &r, NULL ) && r)
++        if (!WritePrinter( hport, buf, r, &w ) || w != r) { ret = FALSE; break; }
++    EndDocPrinter( hport );
++
++done:
++    if (file != INVALID_HANDLE_VALUE) CloseHandle( file );
++    if (spool) ClosePrinter( spool );
++    if (spool_copy) { DeleteFileW( spool_copy ); free( spool_copy ); }
++    if (dm_file) { DeleteFileW( dm_file ); free( dm_file ); }
++    if (output) { DeleteFileW( output ); free( output ); }
++    free( cmd );
++    return ret;
++}
++
++BOOL print_emf_job( HANDLE hport, const WCHAR *printer_name, DEVMODEW *job_devmode, const WCHAR *doc_name,
++                    const WCHAR *out_file, const WCHAR *spool_name, DWORD job_id )
++{
++    struct spool_reader reader = { NULL, FALSE };
++    struct spool_page *pages;
++    unsigned int page_count, dm_count, i;
++    DEVMODEW **devmodes;
++    HANDLE printer;
++    BOOL ret = FALSE;
++
++    TRACE( "%s %s\n", debugstr_w(printer_name), debugstr_w(spool_name) );
++
++    if (!OpenPrinterW( (WCHAR *)spool_name, &reader.handle, NULL )) return FALSE;
++    pages = read_spool( &reader, &page_count, &devmodes, &dm_count );
++    ClosePrinter( reader.handle );
++    TRACE( "%u pages\n", page_count );
++
++    if (OpenPrinterW( (WCHAR *)printer_name, &printer, NULL ))
++    {
++        ret = render_job( printer, printer_name, job_devmode, doc_name, out_file, job_id, pages, page_count,
++                          hport, NULL );
++        if (!ret && GetLastError() == ERROR_BAD_EXE_FORMAT)
++        {
++            BOOL wow64 = FALSE;
++#ifndef SG_MUTANT_WOWHOST
++            if (IsWow64Process( GetCurrentProcess(), &wow64 ) && wow64)
++#else
++            if (FALSE)
++#endif
++                ret = render_in_host( printer_name, page_count && pages[0].devmode ? pages[0].devmode : job_devmode,
++                                      doc_name, out_file, spool_name, job_id, hport );
++            else ERR( "the printer driver of %s does not load\n", debugstr_w(printer_name) );
++        }
++        ClosePrinter( printer );
++    }
++    free_pages( pages, page_count );
++    for (i = 0; i < dm_count; i++) free( devmodes[i] );
++    free( devmodes );
++    return ret;
++}
++
++/***********************************************************************
++ *           __wine_render_spool_file    (WINPRINT.@)
++ *
++ * Our 64-bit print host runs a 32-bit program's job through the printer's
++ * 64-bit driver: the job's data is in spool_file, the output goes to out_file.
++ */
++BOOL WINAPI __wine_render_spool_file( const WCHAR *printer_name, const WCHAR *spool_file, const WCHAR *dm_file,
++                                      const WCHAR *out_file, const WCHAR *doc_name, DWORD job_id )
++{
++    struct spool_reader reader = { NULL, TRUE };
++    struct spool_page *pages;
++    unsigned int page_count, dm_count, i;
++    DEVMODEW **devmodes, *devmode = NULL;
++    HANDLE printer, out, file;
++    DWORD size;
++    BOOL ret = FALSE;
++
++    reader.handle = CreateFileW( spool_file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (reader.handle == INVALID_HANDLE_VALUE) return FALSE;
++    pages = read_spool( &reader, &page_count, &devmodes, &dm_count );
++    CloseHandle( reader.handle );
++
++    file = CreateFileW( dm_file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file != INVALID_HANDLE_VALUE)
++    {
++        size = GetFileSize( file, NULL );
++        if (size >= FIELD_OFFSET(DEVMODEW, dmFields) && (devmode = malloc( size )) &&
++            (!ReadFile( file, devmode, size, &size, NULL ) || devmode->dmSize + devmode->dmDriverExtra > size))
++        {
++            free( devmode );
++            devmode = NULL;
++        }
++        CloseHandle( file );
++    }
++
++    out = CreateFileW( out_file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    if (out != INVALID_HANDLE_VALUE && OpenPrinterW( (WCHAR *)printer_name, &printer, NULL ))
++    {
++        ret = render_job( printer, printer_name, devmode, doc_name, NULL, job_id, pages, page_count, NULL, out );
++        ClosePrinter( printer );
++    }
++    if (out != INVALID_HANDLE_VALUE) CloseHandle( out );
++    free_pages( pages, page_count );
++    for (i = 0; i < dm_count; i++) free( devmodes[i] );
++    free( devmodes );
++    free( devmode );
++    return ret;
++}
+--- a/dlls/winprint/printproc.c
++++ b/dlls/winprint/printproc.c
+@@ -47,8 +47,28 @@ struct pp_data
+     HANDLE hport;
+     WCHAR *doc_name;
+     WCHAR *out_file;
++    WCHAR *printer_name;
++    DEVMODEW *devmode;
++    DWORD job_id;
++    BOOL emf;
+ };
+ 
++BOOL print_emf_job( HANDLE hport, const WCHAR *printer_name, DEVMODEW *job_devmode, const WCHAR *doc_name,
++                    const WCHAR *out_file, const WCHAR *spool_name, DWORD job_id );
++
++static const WCHAR *datatypes[] =
++{
++    L"RAW", L"TEXT", L"NT EMF 1.008", L"NT EMF 1.007", L"NT EMF 1.006", L"NT EMF 1.003",
++};
++
++static BOOL is_emf( const WCHAR *datatype )
++{
++#ifdef SG_MUTANT_EMFPROC
++    return FALSE;
++#endif
++    return !wcsncmp( datatype, L"NT EMF ", 7 );
++}
++
+ static struct pp_data* get_handle_data(HANDLE pp)
+ {
+     struct pp_data *ret = (struct pp_data *)pp;
+@@ -62,15 +82,14 @@ static struct pp_data* get_handle_data(HANDLE pp)
+ }
+ 
+ BOOL WINAPI EnumPrintProcessorDatatypesW(WCHAR *server, WCHAR *name, DWORD level,
+-        BYTE *datatypes, DWORD size, DWORD *needed, DWORD *no)
++        BYTE *buf, DWORD size, DWORD *needed, DWORD *no)
+ {
+-    static const WCHAR raw[] = L"RAW";
+-    static const WCHAR text[] = L"TEXT";
+-
+-    DATATYPES_INFO_1W *info = (DATATYPES_INFO_1W *)datatypes;
++    DATATYPES_INFO_1W *info = (DATATYPES_INFO_1W *)buf;
++    WCHAR *str;
++    unsigned int i;
+ 
+     TRACE("%s, %s, %ld, %p, %ld, %p, %p\n", debugstr_w(server), debugstr_w(name),
+-            level, datatypes, size, needed, no);
++            level, buf, size, needed, no);
+ 
+     if (!needed || !no)
+     {
+@@ -79,9 +98,11 @@ BOOL WINAPI EnumPrintProcessorDatatypesW(WCHAR *server, WCHAR *name, DWORD level
+     }
+ 
+     *no = 0;
+-    *needed = 2 * sizeof(*info) + sizeof(raw) + sizeof(text);
++    *needed = ARRAY_SIZE(datatypes) * sizeof(*info);
++    for (i = 0; i < ARRAY_SIZE(datatypes); i++)
++        *needed += (wcslen(datatypes[i]) + 1) * sizeof(WCHAR);
+ 
+-    if (level != 1 || (size && !datatypes))
++    if (level != 1 || (size && !buf))
+     {
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return FALSE;
+@@ -93,11 +114,14 @@ BOOL WINAPI EnumPrintProcessorDatatypesW(WCHAR *server, WCHAR *name, DWORD level
+         return FALSE;
+     }
+ 
+-    *no = 2;
+-    info[0].pName = (WCHAR*)(info + 2);
+-    info[1].pName = info[0].pName + sizeof(raw) / sizeof(WCHAR);
+-    memcpy(info[0].pName, raw, sizeof(raw));
+-    memcpy(info[1].pName, text, sizeof(text));
++    *no = ARRAY_SIZE(datatypes);
++    str = (WCHAR *)(info + ARRAY_SIZE(datatypes));
++    for (i = 0; i < ARRAY_SIZE(datatypes); i++)
++    {
++        info[i].pName = str;
++        wcscpy(str, datatypes[i]);
++        str += wcslen(datatypes[i]) + 1;
++    }
+     return TRUE;
+ }
+ 
+@@ -113,7 +137,8 @@ HANDLE WINAPI OpenPrintProcessor(WCHAR *port, PRINTPROCESSOROPENDATA *open_data)
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return NULL;
+     }
+-    if (wcscmp(open_data->pDatatype, L"RAW") && wcscmp(open_data->pDatatype, L"TEXT"))
++    if (wcscmp(open_data->pDatatype, L"RAW") && wcscmp(open_data->pDatatype, L"TEXT") &&
++        !is_emf(open_data->pDatatype))
+     {
+         SetLastError(ERROR_INVALID_DATATYPE);
+         return NULL;
+@@ -129,6 +154,14 @@ HANDLE WINAPI OpenPrintProcessor(WCHAR *port, PRINTPROCESSOROPENDATA *open_data)
+     data->hport = hport;
+     data->doc_name = wcsdup(open_data->pDocumentName);
+     data->out_file = wcsdup(open_data->pOutputFile);
++    data->emf = is_emf(open_data->pDatatype);
++    data->job_id = open_data->JobId;
++    if (open_data->pPrinterName) data->printer_name = wcsdup(open_data->pPrinterName);
++    if (open_data->pDevMode)
++    {
++        DWORD dm_size = open_data->pDevMode->dmSize + open_data->pDevMode->dmDriverExtra;
++        if ((data->devmode = malloc(dm_size))) memcpy(data->devmode, open_data->pDevMode, dm_size);
++    }
+     return (HANDLE)data;
+ }
+ 
+@@ -145,6 +178,10 @@ BOOL WINAPI PrintDocumentOnPrintProcessor(HANDLE pp, WCHAR *doc_name)
+     if (!data)
+         return FALSE;
+ 
++    if (data->emf)
++        return print_emf_job(data->hport, data->printer_name, data->devmode, data->doc_name,
++                             data->out_file, doc_name, data->job_id);
++
+     if (!OpenPrinterW(doc_name, &spool_data, NULL))
+         return FALSE;
+ 
+@@ -190,6 +227,8 @@ BOOL WINAPI ClosePrintProcessor(HANDLE pp)
+     ClosePrinter(data->hport);
+     free(data->doc_name);
+     free(data->out_file);
++    free(data->printer_name);
++    free(data->devmode);
+ 
+     memset(data, 0, sizeof(*data));
+     LocalFree(data);
+--- a/dlls/winprint/winprint.spec
++++ b/dlls/winprint/winprint.spec
+@@ -5,3 +5,6 @@
+ @ stub GetPrintProcessorCapabilities
+ @ stdcall OpenPrintProcessor(ptr ptr)
+ @ stdcall PrintDocumentOnPrintProcessor(ptr ptr)
++
++# for our 64-bit print host
++@ stdcall __wine_render_spool_file(wstr wstr wstr wstr wstr long)
+--- /dev/null
++++ b/programs/splwow64/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE    = splwow64.exe
++IMPORTS   = winspool gdi32
++
++EXTRADLLFLAGS = -mwindows -municode
++
++SOURCES = \
++	main.c
+--- /dev/null
++++ b/programs/splwow64/main.c
+@@ -0,0 +1,438 @@
++/*
++ * The 64-bit host of printer drivers for 32-bit programs
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Printer drivers are 64-bit on a 64-bit system; a 32-bit program cannot
++ * load them.  Its printing runs them here instead:
++ *
++ *   splwow64 render PRINTER SPOOLFILE DEVMODEFILE OUTFILE JOBID DOCNAME
++ *       runs a job's pages through the printer's driver into OUTFILE;
++ *   splwow64 caps PRINTER DEVMODEFILE OUTFILE
++ *       writes what the driver says the device measures.
++ *
++ * It also serves Linux programs printing to a Windows driver's CUPS queue
++ * (the sgwindrv backend):
++ *   splwow64 drivers              (SYSTEM) readies every printer's driver and
++ *                                 installs the makers' staged packages
++ *   splwow64 list [OUTFILE]       the printers that have a Windows driver
++ *   splwow64 ppd PRINTER OUTFILE  a PPD from the driver's capabilities
++ *   splwow64 print PRINTER PAPER COPIES TITLE PAGE.ppm...
++ *       prints page images (whole sheets) through the driver
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "wingdi.h"
++#include "winspool.h"
++#include "winerror.h"
++#include "ddk/winddi.h"
++#include "wine/printdrv.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(splwow64);
++
++static DEVMODEW *read_devmode( const WCHAR *path )
++{
++    HANDLE file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    DEVMODEW *dm = NULL;
++    DWORD size;
++
++    if (file == INVALID_HANDLE_VALUE) return NULL;
++    size = GetFileSize( file, NULL );
++    if (size >= FIELD_OFFSET(DEVMODEW, dmFields) && (dm = malloc( size )) &&
++        (!ReadFile( file, dm, size, &size, NULL ) || dm->dmSize + dm->dmDriverExtra > size))
++    {
++        free( dm );
++        dm = NULL;
++    }
++    CloseHandle( file );
++    return dm;
++}
++
++static int caps( const WCHAR *name, const WCHAR *dm_file, const WCHAR *out_file )
++{
++    BOOL (WINAPI *enable_driver)( ULONG, ULONG, DRVENABLEDATA * );
++    DHPDEV (WINAPI *enable_pdev)( DEVMODEW *, WCHAR *, ULONG, HSURF *, ULONG, ULONG *, ULONG, DEVINFO *,
++                                  HDEV, WCHAR *, HANDLE ) = NULL;
++    void (WINAPI *disable_pdev)( DHPDEV ) = NULL;
++    struct wine_eng_device dev;
++    DRIVER_INFO_3W *info;
++    DRVENABLEDATA ded;
++    DEVMODEW *dm = read_devmode( dm_file );
++    HMODULE module;
++    HANDLE printer;
++    GDIINFO gi;
++    DEVINFO di;
++    DWORD needed = 0, i;
++    DHPDEV dhpdev;
++    FILE *out;
++
++    if (!OpenPrinterW( (WCHAR *)name, &printer, NULL )) return 1;
++    GetPrinterDriverW( printer, NULL, 3, NULL, 0, &needed );
++    if (!needed || !(info = malloc( needed )) || !GetPrinterDriverW( printer, NULL, 3, (BYTE *)info, needed, &needed ))
++        return 1;
++    if (!(module = LoadLibraryW( info->pDriverPath ))) return 1;
++    enable_driver = (void *)GetProcAddress( module, "DrvEnableDriver" );
++    memset( &ded, 0, sizeof(ded) );
++    if (!enable_driver || !enable_driver( DDI_DRIVER_VERSION_NT5_01, sizeof(ded), &ded )) return 1;
++    for (i = 0; i < ded.c; i++)
++    {
++        if (ded.pdrvfn[i].iFunc == INDEX_DrvEnablePDEV) enable_pdev = (void *)ded.pdrvfn[i].pfn;
++        if (ded.pdrvfn[i].iFunc == INDEX_DrvDisablePDEV) disable_pdev = (void *)ded.pdrvfn[i].pfn;
++    }
++    if (!enable_pdev) return 1;
++    memset( &dev, 0, sizeof(dev) );
++    dev.magic = WINE_ENG_DEVICE_MAGIC;
++    dev.printer = printer;
++    memset( &gi, 0, sizeof(gi) );
++    memset( &di, 0, sizeof(di) );
++    if (!(dhpdev = enable_pdev( dm, (WCHAR *)name, 0, NULL, sizeof(gi), (ULONG *)&gi, sizeof(di), &di, (HDEV)&dev,
++                                (WCHAR *)name, printer )))
++        return 1;
++    if (!(out = _wfopen( out_file, L"w" ))) return 1;
++    fprintf( out, "%ld %ld %lu %lu %lu %lu %ld %ld %ld %ld %lu %lu %lu %lu %lu %lu %lu\n",
++             (LONG)gi.ulHorzSize, (LONG)gi.ulVertSize, gi.ulHorzRes, gi.ulVertRes, gi.ulLogPixelsX,
++             gi.ulLogPixelsY, gi.szlPhysSize.cx, gi.szlPhysSize.cy, gi.ptlPhysOffset.x, gi.ptlPhysOffset.y,
++             gi.cBitsPixel * gi.cPlanes, gi.ulNumColors, gi.flTextCaps, gi.flRaster, gi.ulAspectX,
++             gi.ulAspectY, gi.ulAspectXY );
++    fclose( out );
++    if (disable_pdev) disable_pdev( dhpdev );
++    ClosePrinter( printer );
++    return 0;
++}
++
++
++/* ---- printing from Linux programs (the CUPS backend's side) ---- */
++
++static void ppd_string( FILE *out, const WCHAR *str )
++{
++    char buf[256];
++    WideCharToMultiByte( CP_UTF8, 0, str, -1, buf, sizeof(buf), NULL, NULL );
++    for (char *p = buf; *p; p++) if (*p == '"' || *p == '/' || *p == ':' || *p < ' ') *p = ' ';
++    fputs( buf, out );
++}
++
++/* a PPD for CUPS from what the Windows driver offers: its papers (with the
++ * printable area of each), resolutions and colour */
++static int make_ppd( const WCHAR *name, const WCHAR *out_file )
++{
++    int count = DeviceCapabilitiesW( name, NULL, DC_PAPERS, NULL, NULL ), i, def = 0;
++    LONG size = DocumentPropertiesW( NULL, NULL, (WCHAR *)name, NULL, NULL, 0 );
++    WORD *ids;
++    POINT *sizes;
++    WCHAR *names;
++    DEVMODEW *dm;
++    FILE *out;
++
++    if (count <= 0 || size <= 0) return 1;
++    ids = calloc( count, sizeof(*ids) );
++    sizes = calloc( count, sizeof(*sizes) );
++    names = calloc( count, 64 * sizeof(WCHAR) );
++    dm = calloc( 1, size );
++    DeviceCapabilitiesW( name, NULL, DC_PAPERS, (WCHAR *)ids, NULL );
++    DeviceCapabilitiesW( name, NULL, DC_PAPERSIZE, (WCHAR *)sizes, NULL );
++    DeviceCapabilitiesW( name, NULL, DC_PAPERNAMES, names, NULL );
++    DocumentPropertiesW( NULL, NULL, (WCHAR *)name, dm, NULL, DM_OUT_BUFFER );
++    for (i = 0; i < count; i++) if (ids[i] == dm->dmPaperSize) def = i;
++
++    if (!(out = _wfopen( out_file, L"w" ))) return 1;
++    fprintf( out, "*PPD-Adobe: \"4.3\"\n*FormatVersion: \"4.3\"\n*FileVersion: \"1.0\"\n*LanguageVersion: English\n"
++             "*LanguageEncoding: ISOLatin1\n*PCFileName: \"SGWINDRV.PPD\"\n*Manufacturer: \"Stained Glass OS\"\n" );
++    fputs( "*ModelName: \"", out ); ppd_string( out, name ); fputs( " (maker's driver)\"\n", out );
++    fputs( "*NickName: \"", out ); ppd_string( out, name ); fputs( " (maker's driver)\"\n", out );
++    fputs( "*ShortNickName: \"", out ); ppd_string( out, name ); fputs( "\"\n", out );
++    fprintf( out, "*PSVersion: \"(3010.000) 0\"\n*LanguageLevel: \"3\"\n*ColorDevice: %s\n*DefaultColorSpace: %s\n"
++             "*FileSystem: False\n*Throughput: \"1\"\n*LandscapeOrientation: Plus90\n*TTRasterizer: Type42\n",
++             DeviceCapabilitiesW( name, NULL, DC_COLORDEVICE, NULL, NULL ) == 1 ? "True" : "False",
++             DeviceCapabilitiesW( name, NULL, DC_COLORDEVICE, NULL, NULL ) == 1 ? "RGB" : "Gray" );
++    /* the job reaches our backend as PDF, untouched by CUPS' filters */
++    fprintf( out, "*cupsFilter2: \"application/pdf application/vnd.cups-pdf 0 -\"\n" );
++    fprintf( out, "*OpenUI *PageSize/Media Size: PickOne\n*OrderDependency: 10 AnySetup *PageSize\n"
++             "*DefaultPageSize: P%u\n", ids[def] );
++    for (i = 0; i < count; i++)
++    {
++        if (!sizes[i].x || !sizes[i].y) continue;
++        fprintf( out, "*PageSize P%u/", ids[i] ); ppd_string( out, names + i * 64 );
++        fprintf( out, ": \"<</PageSize[%.2f %.2f]/ImagingBBox null>>setpagedevice\"\n",
++                 sizes[i].x * 72.0 / 254, sizes[i].y * 72.0 / 254 );
++    }
++    fprintf( out, "*CloseUI: *PageSize\n*OpenUI *PageRegion: PickOne\n*OrderDependency: 10 AnySetup *PageRegion\n"
++             "*DefaultPageRegion: P%u\n", ids[def] );
++    for (i = 0; i < count; i++)
++    {
++        if (!sizes[i].x || !sizes[i].y) continue;
++        fprintf( out, "*PageRegion P%u/", ids[i] ); ppd_string( out, names + i * 64 );
++        fprintf( out, ": \"<</PageSize[%.2f %.2f]/ImagingBBox null>>setpagedevice\"\n",
++                 sizes[i].x * 72.0 / 254, sizes[i].y * 72.0 / 254 );
++    }
++    fprintf( out, "*CloseUI: *PageRegion\n*DefaultImageableArea: P%u\n", ids[def] );
++    for (i = 0; i < count; i++)
++    {
++        HDC hdc;
++        double l = 0, b = 0, r = sizes[i].x * 72.0 / 254, t = sizes[i].y * 72.0 / 254;
++
++        if (!sizes[i].x || !sizes[i].y) continue;
++        dm->dmFields = (dm->dmFields & ~DM_FORMNAME) | DM_PAPERSIZE;
++        dm->dmPaperSize = ids[i];
++        if ((hdc = CreateICW( NULL, name, NULL, dm )))
++        {
++            /* the printable area, in points from the sheet's lower left */
++            double dx = GetDeviceCaps( hdc, LOGPIXELSX ), dy = GetDeviceCaps( hdc, LOGPIXELSY );
++            double ph = GetDeviceCaps( hdc, PHYSICALHEIGHT );
++            l = GetDeviceCaps( hdc, PHYSICALOFFSETX ) * 72.0 / dx;
++            r = l + GetDeviceCaps( hdc, HORZRES ) * 72.0 / dx;
++            t = (ph - GetDeviceCaps( hdc, PHYSICALOFFSETY )) * 72.0 / dy;
++            b = t - GetDeviceCaps( hdc, VERTRES ) * 72.0 / dy;
++            DeleteDC( hdc );
++        }
++        fprintf( out, "*ImageableArea P%u: \"%.2f %.2f %.2f %.2f\"\n", ids[i], l, b, r, t );
++    }
++    fprintf( out, "*DefaultPaperDimension: P%u\n", ids[def] );
++    for (i = 0; i < count; i++)
++        if (sizes[i].x && sizes[i].y)
++            fprintf( out, "*PaperDimension P%u: \"%.2f %.2f\"\n", ids[i], sizes[i].x * 72.0 / 254,
++                     sizes[i].y * 72.0 / 254 );
++    count = DeviceCapabilitiesW( name, NULL, DC_ENUMRESOLUTIONS, NULL, NULL );
++    if (count > 0)
++    {
++        LONG *res = calloc( count, 2 * sizeof(LONG) );
++        DeviceCapabilitiesW( name, NULL, DC_ENUMRESOLUTIONS, (WCHAR *)res, NULL );
++        fprintf( out, "*OpenUI *Resolution/Resolution: PickOne\n*OrderDependency: 20 AnySetup *Resolution\n"
++                 "*DefaultResolution: %ldx%lddpi\n", res[0], res[1] );
++        for (i = 0; i < count; i++)
++            fprintf( out, "*Resolution %ldx%lddpi: \"\"\n", res[i * 2], res[i * 2 + 1] );
++        fprintf( out, "*CloseUI: *Resolution\n" );
++    }
++    fprintf( out, "*DefaultFont: Courier\n*Font Courier: Standard \"(002.004S)\" Standard ROM\n" );
++    fclose( out );
++    return 0;
++}
++
++/* reads a binary PPM (P6) page */
++static BYTE *read_ppm( const WCHAR *path, int *w, int *h )
++{
++    FILE *f = _wfopen( path, L"rb" );
++    int max, c;
++    BYTE *rgb;
++
++    if (!f) return NULL;
++    if (fscanf( f, "P6 %d %d %d", w, h, &max ) != 3 || *w <= 0 || *h <= 0 || max != 255)
++    {
++        fclose( f );
++        return NULL;
++    }
++    c = fgetc( f );  /* the one blank after the header */
++    (void)c;
++    rgb = malloc( (size_t)*w * *h * 3 );
++    if (fread( rgb, 3, (size_t)*w * *h, f ) != (size_t)*w * *h)
++    {
++        free( rgb );
++        rgb = NULL;
++    }
++    fclose( f );
++    return rgb;
++}
++
++/* prints page images (the PDF a Linux program sent, rendered by the backend
++ * at the printer's resolution) through the Windows driver */
++static int print_pages( const WCHAR *name, const WCHAR *paper, const WCHAR *copies, const WCHAR *title,
++                        int count, WCHAR **files )
++{
++    LONG size = DocumentPropertiesW( NULL, NULL, (WCHAR *)name, NULL, NULL, 0 );
++    DOCINFOW doc = { sizeof(doc) };
++    DEVMODEW *dm = NULL;
++    int i, ret = 0;
++    HDC hdc;
++
++    if (size > 0)
++    {
++        dm = calloc( 1, size );
++        DocumentPropertiesW( NULL, NULL, (WCHAR *)name, dm, NULL, DM_OUT_BUFFER );
++        if (paper && paper[0] == 'P' && iswdigit( paper[1] ))
++        {
++            dm->dmFields = (dm->dmFields & ~DM_FORMNAME) | DM_PAPERSIZE;
++            dm->dmPaperSize = wcstoul( paper + 1, NULL, 10 );
++        }
++        dm->dmFields |= DM_COPIES;
++        dm->dmCopies = max( 1, wcstoul( copies, NULL, 10 ) );
++        DocumentPropertiesW( NULL, NULL, (WCHAR *)name, dm, dm, DM_IN_BUFFER | DM_OUT_BUFFER );
++    }
++    if (!(hdc = CreateDCW( NULL, name, NULL, dm ))) return 1;
++    doc.lpszDocName = title && title[0] ? title : L"Linux print job";
++    if (StartDocW( hdc, &doc ) <= 0)
++    {
++        DeleteDC( hdc );
++        return 1;
++    }
++    for (i = 0; i < count; i++)
++    {
++        BITMAPINFO bmi = { { sizeof(BITMAPINFOHEADER) } };
++        int w, h, x, y;
++        BYTE *rgb = read_ppm( files[i], &w, &h ), *bgr;
++
++        if (!rgb) { ret = 1; continue; }
++        /* rows to the bottom-up BGR a DIB is */
++        bgr = malloc( (size_t)((w * 3 + 3) & ~3) * h );
++        for (y = 0; y < h; y++)
++        {
++            BYTE *dst = bgr + (size_t)(h - 1 - y) * ((w * 3 + 3) & ~3), *src = rgb + (size_t)y * w * 3;
++            for (x = 0; x < w; x++) { dst[x * 3] = src[x * 3 + 2]; dst[x * 3 + 1] = src[x * 3 + 1]; dst[x * 3 + 2] = src[x * 3]; }
++        }
++        bmi.bmiHeader.biWidth = w;
++        bmi.bmiHeader.biHeight = h;
++        bmi.bmiHeader.biPlanes = 1;
++        bmi.bmiHeader.biBitCount = 24;
++        bmi.bmiHeader.biCompression = BI_RGB;
++        StartPage( hdc );
++        /* the image is the whole sheet; the DC's origin is the printable area's */
++        SetStretchBltMode( hdc, COLORONCOLOR );
++#ifdef SG_MUTANT_HOSTPRINT
++        StretchDIBits( hdc, 0, 0,
++#else
++        StretchDIBits( hdc, -GetDeviceCaps( hdc, PHYSICALOFFSETX ), -GetDeviceCaps( hdc, PHYSICALOFFSETY ),
++#endif
++                       GetDeviceCaps( hdc, PHYSICALWIDTH ), GetDeviceCaps( hdc, PHYSICALHEIGHT ), 0, 0, w, h, bgr,
++                       &bmi, DIB_RGB_COLORS, SRCCOPY );
++        EndPage( hdc );
++        free( bgr );
++        free( rgb );
++    }
++    if (EndDoc( hdc ) <= 0) ret = 1;
++    DeleteDC( hdc );
++    free( dm );
++    return ret;
++}
++
++/* the printers that print through a Windows driver, for the CUPS side:
++ * "name<TAB>driver" per line */
++static int list_printers( const WCHAR *out_file )
++{
++    DWORD needed = 0, count = 0, i;
++    PRINTER_INFO_2W *pi;
++    FILE *out = out_file ? _wfopen( out_file, L"w" ) : stdout;
++
++    if (!out) return 1;
++    EnumPrintersW( PRINTER_ENUM_LOCAL, NULL, 2, NULL, 0, &needed, &count );
++    pi = malloc( needed ? needed : 1 );
++    if (!EnumPrintersW( PRINTER_ENUM_LOCAL, NULL, 2, (BYTE *)pi, needed, &needed, &count )) count = 0;
++    for (i = 0; i < count; i++)
++    {
++        HANDLE printer;
++        DRIVER_INFO_3W *info;
++        const WCHAR *base;
++        DWORD size = 0;
++
++        if (!OpenPrinterW( pi[i].pPrinterName, &printer, NULL )) continue;
++        GetPrinterDriverW( printer, NULL, 3, NULL, 0, &size );
++        if (size && (info = malloc( size )) && GetPrinterDriverW( printer, NULL, 3, (BYTE *)info, size, &size ))
++        {
++            base = wcsrchr( info->pDriverPath, '\\' );
++            base = base ? base + 1 : info->pDriverPath;
++            if (wcsicmp( base, L"wineps.drv" ))
++            {
++                char n[512], d[512];
++                WideCharToMultiByte( CP_UTF8, 0, pi[i].pPrinterName, -1, n, sizeof(n), NULL, NULL );
++                WideCharToMultiByte( CP_UTF8, 0, pi[i].pDriverName, -1, d, sizeof(d), NULL, NULL );
++                fprintf( out, "%s\t%s\n", n, d );
++            }
++            free( info );
++        }
++        ClosePrinter( printer );
++    }
++    if (out_file) fclose( out );
++    return 0;
++}
++
++/* run as SYSTEM, point-and-print style: every printer's driver is made
++ * ready for every user, and a printer whose model has a maker's package in
++ * the driver store gets its Windows driver (the package was staged by the
++ * maker's installer; a standard user's programs never install drivers) */
++static int install_drivers( void )
++{
++    DWORD needed = 0, count = 0, i;
++    PRINTER_INFO_2W *pi;
++
++    EnumPrintersW( PRINTER_ENUM_LOCAL, NULL, 2, NULL, 0, &needed, &count );
++    pi = malloc( needed ? needed : 1 );
++    if (!EnumPrintersW( PRINTER_ENUM_LOCAL, NULL, 2, (BYTE *)pi, needed, &needed, &count )) count = 0;
++    for (i = 0; i < count; i++)
++    {
++        HANDLE printer;
++        PRINTER_INFO_2W *info;
++        DWORD size = 0;
++
++        /* opened here, a printer's driver is brought up to date as SYSTEM
++         * (its PostScript driver from the queue's PPD), which a standard
++         * user may not do: every user then finds it ready */
++        if (OpenPrinterW( pi[i].pPrinterName, &printer, NULL )) ClosePrinter( printer );
++        if (!wcsicmp( pi[i].pPrintProcessor, L"winprint" )) continue;  /* has its Windows driver */
++        if (FAILED(InstallPrinterDriverFromPackageW( NULL, NULL, pi[i].pDriverName, NULL, 0 ))) continue;
++        WINE_TRACE( "%s: the maker's driver %s installed\n", debugstr_w(pi[i].pPrinterName), debugstr_w(pi[i].pDriverName) );
++        if (!OpenPrinterW( pi[i].pPrinterName, &printer, NULL )) continue;
++        GetPrinterW( printer, 2, NULL, 0, &size );
++        if (size && (info = malloc( size )) && GetPrinterW( printer, 2, (BYTE *)info, size, &size ))
++        {
++            info->pPrintProcessor = (WCHAR *)L"winprint";
++            info->pDevMode = NULL;
++            SetPrinterW( printer, 2, (BYTE *)info, 0 );
++            free( info );
++        }
++        ClosePrinter( printer );
++        printf( "%ls\n", pi[i].pPrinterName );
++    }
++    return 0;
++}
++
++int __cdecl wmain( int argc, WCHAR *argv[] )
++{
++    BOOL (WINAPI *render)( const WCHAR *, const WCHAR *, const WCHAR *, const WCHAR *, const WCHAR *, DWORD );
++    HMODULE winprint;
++
++    if (argc >= 8 && !wcscmp( argv[1], L"render" ))
++    {
++        WCHAR path[MAX_PATH];
++        DWORD size;
++
++        /* the print processor lives in its own directory */
++        if (!GetPrintProcessorDirectoryW( NULL, NULL, 1, (BYTE *)path, sizeof(path) - 32, &size ))
++            path[0] = 0;
++        lstrcatW( path, L"\\winprint.dll" );
++        if (!(winprint = LoadLibraryW( path )) && !(winprint = LoadLibraryW( L"winprint.dll" ))) return 2;
++        if (!(render = (void *)GetProcAddress( winprint, "__wine_render_spool_file" ))) return 2;
++        TRACE( "render %s\n", debugstr_w(argv[2]) );
++        return render( argv[2], argv[3], argv[4], argv[5], argv[7], wcstoul( argv[6], NULL, 10 ) ) ? 0 : 1;
++    }
++    if (argc >= 5 && !wcscmp( argv[1], L"caps" )) return caps( argv[2], argv[3], argv[4] );
++    if (argc >= 4 && !wcscmp( argv[1], L"ppd" )) return make_ppd( argv[2], argv[3] );
++    if (argc >= 7 && !wcscmp( argv[1], L"print" )) return print_pages( argv[2], argv[3], argv[4], argv[5], argc - 6, argv + 6 );
++    if (argc >= 2 && !wcscmp( argv[1], L"drivers" )) return install_drivers();
++    if (argc >= 2 && !wcscmp( argv[1], L"list" )) return list_printers( argc > 2 ? argv[2] : NULL );
++    WINE_MESSAGE( "usage: splwow64 render PRINTER SPOOLFILE DEVMODEFILE OUTFILE JOBID DOCNAME\n"
++                  "       splwow64 caps PRINTER DEVMODEFILE OUTFILE\n"
++                  "       splwow64 drivers\n"
++                  "       splwow64 list [OUTFILE]\n"
++                  "       splwow64 ppd PRINTER OUTFILE\n"
++                  "       splwow64 print PRINTER PAPER COPIES TITLE PAGE.ppm...\n" );
++    return 2;
++}
