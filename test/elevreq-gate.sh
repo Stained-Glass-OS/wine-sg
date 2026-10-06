@@ -73,8 +73,11 @@ ready=""
 if [ "\$1" = --ready ]; then ready=\$2; shift 2; printf 'ready\n' >> "$W/out/ready.log"; fi
 printf '%s\n' "\$*" >> "$W/out/elevate.log"   # not echo: dash's eats Windows paths' backslashes
 case "\$*" in *slow-ready*) sleep 4 ;; esac
+# "decline-me": the person said no (or let the prompt time out) -- the
+# broker's answer "1", and sg-elevate's own exit 1
+case "\$*" in *decline-me*) sleep 1; [ -n "\$ready" ] && printf 1 > "\$ready"; exit 1 ;; esac
 [ -n "\$ready" ] && printf 0 > "\$ready"
-case "\$*" in *wait-me*) sleep 2; exit 7 ;; *slow-ready*) sleep 6 ;; esac
+case "\$*" in *wait-me*) sleep 2; exit 7 ;; *slow-ready*) sleep 6 ;; *exit-one*) sleep 1; exit 1 ;; esac
 EOS
 printf 'ready\n' > "$W/elevate.features"
 chmod 755 "$W/elevate"
@@ -96,6 +99,11 @@ other() {
         tr -d '\r' | grep -E '^(CREATE|SHELL|RUNASTIME) '
 }
 zp() { printf 'Z:%s' "${1//\//\\}"; }
+other_wait() {   # MODE: the runas probe with the --ready stand-in
+    sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" HOME=/var/tmp \
+        SG_ELEVATE="$W/elevate" SG_ELEVATE_FEATURES="$W/elevate.features" \
+        "$WINE" "$W/invoker.exe" "$1" "$(zp "$W/admin.exe")" 2>/dev/null | tr -d '\r' | grep '^WAIT '
+}
 
 out=$(other "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
 [ "$out" = "CREATE err 740" ] && pass "CreateProcess of a requireAdministrator program: ERROR_ELEVATION_REQUIRED, as on Windows" \
@@ -154,6 +162,17 @@ out=$(sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRID
       SG_ELEVATE="$W/elevate" "$WINE" "$W/invoker.exe" runaswait "$(zp "$W/admin.exe")" 2>/dev/null | tr -d '\r' | grep '^WAIT ')
 case "$out" in "WAIT code 7 secs "[2-9]*) pass "Run as administrator: the caller waits for the elevated program and gets its code ($out)" ;;
     *) fail "waiting on an elevated program: '$out'" ;; esac
+# Consent not given (No, or no answer before the prompt gave up): ShellExecuteEx
+# fails with ERROR_CANCELLED (1223), as Windows' does -- it "succeeded" and the
+# handle ended with 1, so SG Store said "msvbvm60.dll could not be put in place
+# (code 1)". A program that was launched and itself ended with 1 still reads
+# as code 1. Mutant SG_MUTANT_CONSENT_CODE1 (dlls/shell32/shlexec.c).
+out=$(other_wait runasdecline)
+[ "$out" = "WAIT err 1223" ] && pass "consent not given: ShellExecuteEx runas fails with ERROR_CANCELLED ($out)" \
+    || fail "consent not given: '$out' (want WAIT err 1223)"
+out=$(other_wait runasone)
+case "$out" in "WAIT code 1 "*) pass "a launched program that ends with 1 still gives code 1 ($out)" ;;
+    *) fail "launched, exit 1: '$out'" ;; esac
 # NSIS's UAC plugin: its /UAC:<window> switch is not passed on (0457) -- the
 # elevated copy could not reach the window and installed nothing
 rm -f "$W/out/elevate.log"

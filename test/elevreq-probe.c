@@ -6,6 +6,8 @@
  *                                      then ShellExecuteEx "runas" on it, print "SHELL ok|err N"
  *   elevreq-probe.exe runaswait PROGRAM ShellExecuteEx "runas" PROGRAM "wait-me", wait on
  *                                      its handle, print "WAIT code N secs S" (or "WAIT nohandle")
+ *   elevreq-probe.exe runasdecline PROGRAM  as runaswait, the stand-in told to decline
+ *   elevreq-probe.exe runasone PROGRAM  as runaswait, the program launched and ending with 1
  *   elevreq-probe.exe runastime PROGRAM ShellExecuteEx "runas" PROGRAM "slow-ready": how long
  *                                      the call itself takes, "RUNASTIME ms N" (0625)
  * The PROGRAMs are this same source built with different manifests; run
@@ -62,14 +64,17 @@ int main(int argc, char **argv)
         else printf("RUNASTIME ms %lu\n", GetTickCount() - t0);
         if (sei.hProcess) WaitForSingleObject(sei.hProcess, 30000);
     }
-    else if (!strcmp(argv[1], "runaswait") || !strcmp(argv[1], "runasuac"))
+    else if (!strcmp(argv[1], "runaswait") || !strcmp(argv[1], "runasuac") ||
+             !strcmp(argv[1], "runasdecline") || !strcmp(argv[1], "runasone"))
     {
         SHELLEXECUTEINFOW sei = { sizeof(sei) };
         DWORD code = 0, t0 = GetTickCount();
         sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
         sei.lpVerb = L"runas"; sei.lpFile = prog; sei.nShow = SW_SHOWNORMAL;
         /* runasuac: as NSIS's UAC plugin starts its elevated copy (0457) */
-        sei.lpParameters = !strcmp(argv[1], "runasuac") ? L"/UAC:1a2b wait-me" : L"wait-me";
+        sei.lpParameters = !strcmp(argv[1], "runasuac") ? L"/UAC:1a2b wait-me" :
+                           !strcmp(argv[1], "runasdecline") ? L"decline-me" :
+                           !strcmp(argv[1], "runasone") ? L"exit-one" : L"wait-me";
         if (!ShellExecuteExW(&sei)) printf("WAIT err %lu\n", GetLastError());
         else if (!sei.hProcess) printf("WAIT nohandle\n");
         else
