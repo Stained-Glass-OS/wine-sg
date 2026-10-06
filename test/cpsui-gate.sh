@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# CPSUI as printer drivers' UI DLLs use it (patches/sg/1026): a property
+# CPSUI as printer drivers' UI DLLs use it (patches/sg/1026, 1039): a property
 # sheet built by a PFNPROPSHEETUI function that adds another (which gets a
 # group handle of its own), pages, a group parent, a page inserted before
 # another, a COMPROPSHEETUI on the treeview page and one on a page of its
@@ -44,6 +44,7 @@ OUT=$( (cd "$C" && timeout 120 "$WINE" 'C:\cpsui.exe' </dev/null 2>>"$T/stderr.l
 has() { printf '%s\n' "$OUT" | grep -qxF "$1"; }
 check() { if has "$2"; then pass "$1"; else fail "$1 (wanted '$2')"; fi; }
 
+check "a page procedure starts with its COMPROPSHEETUI's UserData as its CPSUI user data (1039)" "own page userdata 4242"
 check "an added PFNPROPSHEETUI function gets a group of its own" "child init lparam $(printf '%s\n' "$OUT" | sed -n 's/^child init lparam \([0-9]*\).*/\1/p') own group 1"
 check "a COMPROPSHEETUI on the treeview page" "tree compropsheetui 1 pages 1"
 check "a page inserted before another (CPSFUNC_INSERT_PSUIPAGE)" "inserted before 1"

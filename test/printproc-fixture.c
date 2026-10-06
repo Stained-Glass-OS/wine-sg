@@ -83,6 +83,8 @@ __declspec(dllexport) BOOL WINAPI PrintDocumentOnPrintProcessor( HANDLE handle, 
     DWORD count, i, type;
     BOOL ret = TRUE;
 
+    /* SG_PRINTPROC_QUIT: gives up without reading the job, as Samsung's does here */
+    if (GetEnvironmentVariableW( L"SG_PRINTPROC_QUIT", NULL, 0 )) { say( "quit\n" ); return FALSE; }
     if (!(spool = GdiGetSpoolFileHandle( pp->printer, pp->devmode, doc_name ))) { say( "no spool handle\n" ); return FALSE; }
     hdc = GdiGetDC( spool );
     count = GdiGetPageCount( spool );
@@ -96,7 +98,20 @@ __declspec(dllexport) BOOL WINAPI PrintDocumentOnPrintProcessor( HANDLE handle, 
         RECT mark = { 10, 10, 60, 60 };
 
         if (!GdiStartPageEMF( spool )) { ret = FALSE; break; }
-        say( "page %lu played %d\n", i, GdiPlayPageEMF( spool, page, NULL, NULL, NULL ) );
+        /* as HP's processor plays a page: into the whole sheet, around the
+         * printable area's origin; SG_PRINTPROC_NORECT: no rectangle */
+        {
+            RECT sheet;
+            SetRect( &sheet, -GetDeviceCaps( hdc, PHYSICALOFFSETX ), -GetDeviceCaps( hdc, PHYSICALOFFSETY ),
+                     GetDeviceCaps( hdc, PHYSICALWIDTH ) - GetDeviceCaps( hdc, PHYSICALOFFSETX ),
+                     GetDeviceCaps( hdc, PHYSICALHEIGHT ) - GetDeviceCaps( hdc, PHYSICALOFFSETY ) );
+            RECT empty = { 0, 0, -1, -1 };  /* Lexmark's processor passes these */
+            if (GetEnvironmentVariableW( L"SG_PRINTPROC_EMPTYRECT", NULL, 0 ))
+                say( "page %lu played %d\n", i, GdiPlayPageEMF( spool, page, &empty, &empty, &empty ) );
+            else
+                say( "page %lu played %d\n", i, GdiPlayPageEMF( spool, page,
+                     GetEnvironmentVariableW( L"SG_PRINTPROC_NORECT", NULL, 0 ) ? NULL : &sheet, NULL, NULL ) );
+        }
         FillRect( hdc, &mark, brush );    /* the processor's own mark */
         DeleteObject( brush );
         if (!GdiEndPageEMF( spool, 0 )) ret = FALSE;

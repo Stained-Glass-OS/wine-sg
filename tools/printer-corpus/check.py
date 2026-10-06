@@ -17,7 +17,10 @@ import subprocess
 import sys
 import tempfile
 
-GPCL6 = os.environ.get("GPCL6", "/var/tmp/pr-gpdl/ghostpdl-10.05.1/bin/gpcl6")
+# GhostPCL: Debian does not package it; build it for testing only with
+#   tar xzf ghostpdl-10.05.1.tar.gz && cd ghostpdl-10.05.1 &&
+#   ./configure --without-x --disable-cups --disable-gtk && make -j4 gpcl6
+GPCL6 = os.environ.get("GPCL6", "/var/tmp/pr-gpcl/ghostpdl-10.05.1/bin/gpcl6")
 GS = os.environ.get("GS", "gs")
 
 
@@ -215,8 +218,14 @@ def main():
                 valid = "no"
         elif lang in ("PCL 5", "PCL XL") or lang.startswith("PJL+"):
             if os.path.exists(GPCL6):
+                src = out
+                # Kyocera's PRESCRIBE commands (!R! ... EXIT;) are for its printers, not PCL
+                if b"!R!" in data:
+                    src = os.path.join(tmp, "noprescribe.prn")
+                    with open(src, "wb") as f:
+                        f.write(re.sub(rb"!R![^\x1b]*?EXIT;", b"", data))
                 imgs, err = render([GPCL6, "-dNOPAUSE", "-dBATCH", "-sDEVICE=png16m", "-r%d" % dpi,
-                                    "-sOutputFile=%s/p%%03d.png" % tmp, out], tmp)
+                                    "-sOutputFile=%s/p%%03d.png" % tmp, src], tmp)
                 if err and ("rror" in err):
                     print("gpcl6: " + err.strip().replace("\n", " | ")[:300])
                     valid = "no"

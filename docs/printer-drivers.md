@@ -16,7 +16,7 @@ ours, written from Microsoft's public driver documentation (clean room):
 | TCPMON.DLL (Standard TCP/IP Port: RAW, LPR; IPP by URL) | `dlls/tcpmon` (1029) |
 | language monitors, port status | `dlls/localspl` (1029), winspool SetPort/GetPrinter |
 | makers' print processors (GdiPlayPageEMF...) | gdi32 `dc.c`, localspl (1030) |
-| document and printer events (DrvDocumentEvent, DrvPrinterEvent) | gdi32 `dc.c`, winspool (1032, 1035) |
+| document, printer and driver events (DrvDocumentEvent, DrvPrinterEvent, DrvDriverEvent) | gdi32 `dc.c`, winspool (1032, 1035, 1040) |
 | a 64-bit driver's configuration DLL for 32-bit programs | winspool -> splwow64 (1032) |
 | monitors' MONITORINIT and registry functions (MONITORREG) | `dlls/localspl` (1034) |
 | v4 PostScript class drivers (manifest.ini) | winspool `install.c` (1037) |
@@ -43,27 +43,27 @@ first page matches the page as GDI draws it (1.00 = the same ink).
 `imports.py` lists what a package's DLLs import that Wine lacks;
 `pclxl.py` lists a PCL XL stream's operators.
 
-Status 2026-10-06 (wine-sg 1020-1037). "Prefs" is the driver's
+Status 2026-10-06 (wine-sg 1020-1041). "Renders" is check.py's match of the first page against the page as drawn, PCL through GhostPCL (gpcl6, built from source for testing: see check.py). "Prefs" is the driver's
 Printing Preferences (DocumentProperties with a prompt) through our CPSUI.
 
 | Package (source)                         | Arch | Core / kind            | Installs | 64-bit print | 32-bit print | Output valid | Renders | Prefs | Notes |
 |------------------------------------------|------|------------------------|----------|--------------|--------------|--------------|---------|-------|-------|
-| HP Universal Printing PCL 6 (catalog)    | x64  | Unidrv + HP plug-ins   | yes      | yes          | yes          | PCL XL, gpcl6 clean | 0.98 | HP's own (asks for the printer's address: dynamic mode) | HP's print processor (hpcpp160) and language monitor run (1029-1030) |
-| Lexmark Universal v2 (catalog)           | x64  | Unidrv + plug-ins      | yes      | yes          | yes          | PCL 5 + HP-GL/2 | 0.98 | ours (Layout, Paper/Quality, Advanced) | its print processor runs (1030); its UI plug-in's own pages fail inside it (E_OUTOFMEMORY at PROPSHEETUI_REASON_INIT, after it asks for IPrintOemDriverUI and makes no further helper calls; its CommonUIProp adds no options): open |
+| HP Universal Printing PCL 6 (catalog)    | x64  | Unidrv + HP plug-ins   | yes      | yes          | yes          | PCL XL, gpcl6 clean | 0.98 | HP's own (asks for the printer's address: dynamic mode) | HP's print processor (hpcpp160) and language monitor run (1029-1030); through HP's processor 0.96 (1041: it was 0.41, the page stretched over the sheet) |
+| Lexmark Universal v2 (catalog)           | x64  | Unidrv + plug-ins      | yes      | yes          | yes          | PCL 5 + HP-GL/2 | 0.98 | ours (Layout, Paper/Quality, Advanced) | its print processor (LMUD1O4C) prints its pages since 1041 (they were blank), last page first and about 0.4 in to the right of where winprint puts them: open (0.15); its UI plug-in's own pages fail inside it (E_OUTOFMEMORY at PROPSHEETUI_REASON_INIT, after it asks for IPrintOemDriverUI and makes no further helper calls; its CommonUIProp adds no options): open |
 | Toshiba e-STUDIO PS3 (catalog)           | x64  | PScript (PPD)          | yes      | yes          | yes          | PostScript, gs clean | 0.98 | ours | |
 | Xerox Global Print Driver PS (catalog)   | x64  | PScript (PPD)          | yes      | yes          | yes          | PostScript, gs clean | 0.98 | ours | |
 | Ricoh Aficio SP C420DN PS (catalog)      | x64  | PScript + plug-ins     | yes      | yes          | yes          | PostScript, gs clean | 0.97 | ours + Ricoh's Job/Log page | render plug-in's job code in the PostScript; its print processor runs (1030) |
 | DYMO LabelWriter 550 (DYMO Connect's package) | x64 | Unidrv + DYMO plug-ins + LM | yes | yes (DYMO agent's QA) | - | DYMO raster | label | ours (density, quality in Advanced) | custom size listed; density/quality in print tickets (1031) |
 | Brother HL-3070CW BR-Script3 (catalog)   | x64  | PScript (PPD only)     | yes (1025) | yes        | yes          | PostScript, gs clean | 0.97 | ours (Chinese PPD strings) | INF lists models only for x86 |
 | Zebra ZDesigner 8.6 (catalog)            | x64  | own UMPD               | yes      | yes          | yes          | ZPL (^GFA Z64) | label | Zebra's own | |
-| Brother HL-L2310D (catalog)              | x64  | own UMPD               | yes      | yes          | yes (1032)   | Brother PCL (mode 1030 raster) | not checked | Brother's own (full), also from 32-bit programs through our host (1032) | gpcl6 does not read Brother's raster mode |
-| Brother QL-800 (catalog)                 | x64  | own UMPD               | yes      | yes          | yes (1032)   | Brother QL raster | not checked | crashes in Brother's UI DLL (64- and 32-bit): open | its printer event (1032) writes its timeouts; its driver needs its own settings (merged, 1032) |
+| Brother HL-L2310D (catalog)              | x64  | own UMPD               | yes      | yes          | yes (1032)   | Brother PCL (mode 1030 raster) | not readable | Brother's own (full), also from 32-bit programs through our host (1032) | gpcl6 does not read Brother's raster compression (gpcl6 reads it as PCL 5 and draws nothing) |
+| Brother QL-800 (catalog)                 | x64  | own UMPD               | yes      | yes          | yes (1032)   | Brother QL raster | not checked | Brother's own (1039; the corpus package is Brother's Arabic one, so its pages are in Arabic) | its printer event (1032) writes its timeouts; its driver needs its own settings (merged, 1032) |
 | OKI B930 PS (catalog)                    | x64  | own PS driver (Monotype) | yes (1028) | yes (1035) | -          | PostScript, gs clean | page as drawn | not tried | prepares its pages in its document events (1035) |
 | Zebra ZDesigner 8.6 on a network port    | x64  | own UMPD + Zebra LM    | yes      | yes (RAW 9100) | -          | ZPL | - | - | its language monitor runs (1034: it keeps its MONITORINIT) |
 | Zebra ZDesigner 5.x (catalog)            | x64  | own UMPD               | yes      | yes (1033)   | not tried    | ZPL | label | not tried | needed EngComputeGlyphSet (1033) |
-| Epson XP-230 (catalog)                   | x64  | own UMPD (ESC/P-R)     | yes      | no           | no           | - | - | crashes in E_YASKPCE | its printer event (1032) makes its own keys; the crash wants HKLM\Software\EPSON\STM3\Driver\<model> (Profile), which Epson's status monitor installer (an EXE) makes: open |
-| Samsung Universal Print Driver 3         | x64  | own driver + PP + LM   | yes      | no           | no           | - | - | - | hears document events (1035); its print processor gives up when the printer data "EndDoc<job>" is missing, which nothing we run writes: open |
-| Kyocera KX (TASKalfa 3510i)              | x64  | own driver + PJL LM    | yes      | yes (1034)   | not tried    | PJL + Kyocera raster | not checked | not tried | its language monitor's thread crashed once the monitor was unloaded (1034) |
+| Epson XP-230 (catalog)                   | x64  | own UMPD (ESC/P-R)     | yes      | no           | no           | - | - | crashes in E_YASKPCE | its driver event (1040) makes its HKLM\Software\EPSON keys; the crash wants HKLM\Software\EPSON\STM3\Driver\<model> (Profile), made only by Epson's full setup bundle, not in the catalog package: open |
+| Samsung Universal Print Driver 3         | x64  | own driver + PP + LM   | yes      | yes (1038)   | not tried    | PCL XL, gpcl6 clean | 0.98 | not tried | its driver needed the job's datatype (GetJob, 1038); its print processor gives up without reading the job, so winprint prints it (1038) |
+| Kyocera KX (TASKalfa 3510i)              | x64  | own driver + PJL LM    | yes      | yes (1034)   | not tried    | PRESCRIBE + PCL XL 3.0 | - | not tried | gpcl6 stops at its PCL XL 3.0 operator 0x4e (it reads XL 2.1); the stream's structure is sound (pclxl.py: pages of images) |
 | v4 PostScript class (Konica Minolta, HP inbox PS) | arm64 in the corpus | PScript (PPD) via manifest | yes (1037, own x64 fixture) | yes (fixture) | - | PostScript | - | ours | the corpus packages are ARM64-only |
 | v4 XPS-filter packages (Canon inbox, Epson inbox, HP Smart Universal) | x64 | GPD + XPS filters | refused (1037) | - | - | - | - | - | need the XPSDrv filter pipeline: see "v4 drivers" |
 | x86-only packages (Xerox GPD 2009 x86, Dell PS, Sharp PS, OKI PS 2009, Lexmark E120, Canon BJ, HP UPD x86) | x86 | | refused on 64-bit, as Windows does | | | | | | |
@@ -146,7 +146,30 @@ backend prints a Linux program's job: a PDF page drawn at 300 dpi
 (pdftoppm), its PPD from the driver (`splwow64 ppd`), the page printed
 through the driver (`splwow64 print`). PostScript: Brother BR-Script3,
 Ricoh SP C420DN PS and OKI B930 print the page as drawn (ghostscript);
-PCL: HP Universal PCL 6 (PCL XL), Lexmark Universal (PCL 5), Kyocera KX
-(PJL + raster) and Brother HL-L2310D write their jobs (not rendered here:
-no PCL reader on the test machine). The gate with our own driver is
+PCL: HP Universal PCL 6 (PCL XL) and Lexmark Universal (PCL 5) print the
+page as drawn (GhostPCL); Kyocera KX and Brother HL-L2310D write their jobs
+in languages GhostPCL does not read (PCL XL 3.0, Brother's raster). The gate with our own driver is
 test/linuxdrv-gate.sh.
+
+## Makers' installers and their registry
+
+Makers' drivers set themselves up through the events Windows' spooler sends
+them: DrvDriverEvent when the driver is installed (1040), DrvPrinterEvent
+when a printer is added or deleted (1032). Both run here, so what a driver
+makes for itself is made. What a maker's setup program (an EXE outside the
+driver package) makes is not: we install driver packages from their INFs
+and run none of their programs. Epson's status monitor key
+(HKLM\Software\EPSON\STM3\Driver\<model>) is the case in the corpus;
+the catalog package has the status monitor's programs as driver files but
+no installer for them, so neither running an installer nor making the key
+generically (its contents are Epson's own) is possible.
+
+## Makers' print processors
+
+A maker's print processor plays the job's pages itself (GdiPlayPageEMF).
+A spooled page's frame is the whole sheet around the printable origin, as
+Windows records it, and a processor's rectangle is honoured, or the sheet
+when it gives none or an empty one (1041). A processor that gives up on a
+job without reading it (Samsung's) does not lose the job: winprint prints
+it through the driver (1038). The printproc gate checks that a processor's
+page lands where winprint puts it.

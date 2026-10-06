@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# A printer maker's own print processor (patches/sg/1030), as Canon's and
+# A printer maker's own print processor (patches/sg/1030, 1038, 1041), as Canon's and
 # HP's packages carry: our own (test/printproc-fixture.c) installed by a
 # package's PrintProcessor= line, on a PostScript printer:
 #   - an EMF job is handed to it; through GDI's print processor functions
@@ -130,6 +130,61 @@ if command -v gs >/dev/null; then
     errs=$(gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=nullpage "$F" 2>&1 >/dev/null | grep -c -i error)
     [ "$errs" = 0 ] && pass "ghostscript reads the job" || fail "ghostscript found errors"
 fi
+# the page lands where winprint puts it (1041): the same driver on winprint
+# prints the reference; the processor plays into the sheet's rectangle and
+# into none; the two pages' ink must agree (its red mark aside)
+if command -v gs >/dev/null; then
+    run 'C:\sgp64.exe' add "Plain Printer" "SG Proc PS" "LPT2:" winprint >/dev/null
+    timeout 60 "$WINE" reg add 'HKCU\Software\Wine\Printing\Spooler' /v "LPT2:" /d "$T/LPT2.out" /f >/dev/null 2>&1
+    timeout 60 "$WINE" reg add 'HKLM\System\CurrentControlSet\Control\Print\Printers\Plain Printer' /v "Print Processor" /d winprint /f >/dev/null 2>&1
+    run 'C:\sgp64.exe' print "Plain Printer" >/dev/null
+    gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=pgmraw -r20 -dFirstPage=1 -dLastPage=1 -sOutputFile="$T/ref.pgm" "$T/LPT2.out" 2>/dev/null
+    for mode in rect norect emptyrect; do
+        rm -f "$T/LPT1.out"
+        case $mode in
+        norect) SG_PRINTPROC_NORECT=1 run 'C:\sgp64.exe' print "Proc Printer" >/dev/null ;;
+        emptyrect) SG_PRINTPROC_EMPTYRECT=1 run 'C:\sgp64.exe' print "Proc Printer" >/dev/null ;;
+        *) run 'C:\sgp64.exe' print "Proc Printer" >/dev/null ;;
+        esac
+        gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=pgmraw -r20 -dFirstPage=1 -dLastPage=1 -sOutputFile="$T/$mode.pgm" "$T/LPT1.out" 2>/dev/null
+        m=$(python3 - "$T/ref.pgm" "$T/$mode.pgm" <<'PY'
+import sys
+def load(p):
+    d = open(p, 'rb').read()
+    head, pos = [], 0
+    while len(head) < 4:
+        while d[pos:pos + 1].isspace(): pos += 1
+        if d[pos:pos + 1] == b'#':
+            pos = d.index(b'\n', pos) + 1
+            continue
+        end = pos
+        while not d[end:end + 1].isspace(): end += 1
+        head.append(d[pos:end]); pos = end
+    w, h = int(head[1]), int(head[2])
+    return w, h, d[-w * h:]
+w1, h1, a = load(sys.argv[1]); w2, h2, b = load(sys.argv[2])
+if (w1, h1) != (w2, h2): print(0); sys.exit()
+ink = [i for i in range(w1 * h1) if a[i] < 160 or b[i] < 160]
+same = sum(1 for i in ink if (a[i] < 160) == (b[i] < 160))
+print(round(same / max(1, len(ink)), 2))
+PY
+)
+        ok=$(python3 -c "print(1 if float('${m:-0}') >= 0.9 else 0)")
+        [ "$ok" = 1 ] && pass "the processor's page ($mode) lands where winprint puts it ($m)" ||
+            fail "the processor's page ($mode) is not where winprint puts it ($m)"
+    done
+fi
+
+# a maker's processor that gives up without reading the job (1038): the job
+# is printed by winprint, through the driver
+rm -f "$T/LPT1.out" "$C/printproc.log"
+out=$(SG_PRINTPROC_QUIT=1 run 'C:\sgp64.exe' print "Proc Printer")
+L=$(tr -d '\r' < "$C/printproc.log" 2>/dev/null | tr '\n' ';')
+p=$(grep -a -c '^%%Page:' "$T/LPT1.out" 2>/dev/null)
+[ "$L" = "open NT EMF 1.008;quit;" ] && [ "${p:-0}" = 2 ] &&
+    pass "a processor that gives up without reading the job: winprint prints it" ||
+    fail "after the processor gave up: log '$L', pages '$p'"
+
 if [ $RC != 0 ]; then echo "--- Wine's errors:"; grep -v "^$" "$T/stderr.log" 2>/dev/null | grep -iv "fixme" | tail -15; fi
 [ $RC = 0 ] && echo "printproc gate: PASS" || echo "printproc gate: FAIL"
 exit $RC

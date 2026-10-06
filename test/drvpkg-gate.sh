@@ -199,6 +199,9 @@ head -c 2 "$D/sgmaker.dll" 2>/dev/null | grep -q MZ && pass "a file installed un
     fail "sgmaker.dat not expanded: $(head -c 20 "$D/sgmaker.dat" 2>/dev/null | od -c | head -1)"
 [ "$(tr -d '\r' < "$D/sgextra.txt" 2>/dev/null)" = "SG extra from the cabinet" ] && pass "a file from the source disk's cabinet" ||
     fail "sgextra.txt not taken from the cabinet"
+drv=$(timeout 60 "$WINE" reg query 'HKLM\Software\SG Test Maker' /v Driver 2>/dev/null | tr -d '\r' | sed -n 's/.*REG_SZ *//p')
+case "$drv" in *'\spool\drivers\x64\3\sgmaker.dll'|*'\spool\drivers\x64\3\sgtestdrv.dll') pass "the installed driver is told so (DrvDriverEvent) with its installed files (1040)" ;;
+    *) fail "DrvDriverEvent: '$drv'" ;; esac
 timeout 60 "$WINE" reg query 'HKLM\Software\SG Test Maker' /v Installed 2>/dev/null | tr -d '\r' | grep -q "Installed.*REG_SZ.*yes" &&
     pass "the install section's AddReg entries are made" || fail "no AddReg entry"
 [ "$(tr -d '\r' < "$D/sgrenamed.txt" 2>/dev/null)" = "SG from a one-file cabinet" ] &&

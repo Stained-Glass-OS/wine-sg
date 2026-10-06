@@ -28,6 +28,7 @@ static int applied, sel_changed, child_results, top_results;
 static PSPINFO plain_info;
 static BYTE template_plain[512], template_own[1024], template_before[512];
 
+static INT_PTR CALLBACK own_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam );
 static void say( const char *fmt, ... )
 {
     va_list args;
@@ -296,6 +297,7 @@ static void setup_items(void)
     own_page.cbSize = sizeof(own_page);
     own_page.Flags = DPF_USE_HDLGTEMPLATE;
     own_page.pTabName = (WCHAR *)L"SG Custom";
+    own_page.DlgProc = own_proc;
     own_page.hDlgTemplate = (HANDLE)template_own;
     own_ui = tree_ui;
     own_ui.pfnCallBack = own_callback;
@@ -308,6 +310,14 @@ static void setup_items(void)
         make_template( template_plain, plain, 1 );
         make_template( template_before, plain, 1 );
     }
+}
+
+/* a maker's page procedure reads its CPSUI user data at once, as Brother's
+ * label driver's does: it is the COMPROPSHEETUI's UserData */
+static INT_PTR CALLBACK own_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    if (msg == WM_INITDIALOG) say( "own page userdata %Iu\n", GetCPSUIUserData( hwnd ) );
+    return FALSE;
 }
 
 static LONG CALLBACK child( PROPSHEETUI_INFO *info, LPARAM lparam )

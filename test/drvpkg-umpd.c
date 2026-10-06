@@ -15,7 +15,7 @@
  *     document starts, as makers' do.
  * Its report, written to the printer:
  *   SGM START <document> data=<first line of the data file> time=<ok|bad>
- *             density=<its own setting> job=<ok|missing>
+ *             density=<its own setting> job=<ok|missing: GetJob with its EMF datatype and user>
  *             glyphs=<ok|bad|none: EngComputeGlyphSet's answer for 1252>
  *   PAGE <n> <width>x<height> dark=<pixels> box=<l>,<t>-<r>,<b>
  *   SGM END
@@ -274,6 +274,15 @@ static BOOL WINAPI start_doc( SURFOBJ *so, WCHAR *doc, DWORD job )
     EngQueryLocalTime( &t );
     snprintf( density, sizeof(density), "%d", p->density );
     GetJobW( p->printer, job, 1, NULL, 0, &needed );
+    /* like Samsung's, it renders only an EMF job: the job's datatype says so */
+    if (needed)
+    {
+        JOB_INFO_1W *info = malloc( needed );
+        if (!info || !GetJobW( p->printer, job, 1, (BYTE *)info, needed, &needed ) || !info->pDatatype ||
+            !wcsstr( info->pDatatype, L"EMF" ) || !info->pUserName)
+            needed = 0;
+        free( info );
+    }
     snprintf( buf, sizeof(buf), "SGM START %ls data=%s time=%s density=%s job=%s glyphs=%s\n", doc ? doc : L"",
               p->data, t.y >= 2020 && t.mo >= 1 && t.mo <= 12 ? "ok" : "bad", density, needed ? "ok" : "missing",
               p->glyphs );
@@ -426,4 +435,20 @@ int WINAPI DrvDocumentEvent( HANDLE printer, HDC hdc, int esc, ULONG cb_in, void
     if (esc == 1 /* DOCUMENTEVENT_CREATEDCPRE */ && in && wcsstr( ((WCHAR **)in)[1], L"Quiet" ))
         return -1; /* DOCUMENTEVENT_FAILURE */
     return 1; /* DOCUMENTEVENT_SUCCESS */
+}
+
+/* the driver installed: it records where its configuration DLL is, as makers'
+ * drivers set themselves up (Epson's writes its URLs) */
+BOOL WINAPI DrvDriverEvent( DWORD event, DWORD level, BYTE *info, LPARAM lparam )
+{
+    const DRIVER_INFO_3W *di = (const DRIVER_INFO_3W *)info;
+    HKEY key;
+
+    if (event != 1 /* DRIVER_EVENT_INITIALIZE */ || level < 3 || !di || !di->pConfigFile) return FALSE;
+    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"Software\\SG Test Maker", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key,
+                         NULL )) return FALSE;
+    RegSetValueExW( key, L"Driver", 0, REG_SZ, (BYTE *)di->pConfigFile,
+                    (lstrlenW( di->pConfigFile ) + 1) * sizeof(WCHAR) );
+    RegCloseKey( key );
+    return TRUE;
 }
