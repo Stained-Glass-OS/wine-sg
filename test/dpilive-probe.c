@@ -1,6 +1,6 @@
 /* dpilive-gate.sh's probe (0890): a window of each kind of DPI awareness
  * while the display scale changes, and the hand that changes it.
- *   dpilive-probe.exe win pmv2|pmv1|unaware|system X Y RRGGBB LOG
+ *   dpilive-probe.exe win pmv2|pmv1|unaware|system X Y RRGGBB LOG [W H]
  *       a top-level window at X,Y (in its own DPI's pixels) whose client
  *       area, 400x300 at 100%, is the colour RRGGBB; with a child window.
  *       It writes what it hears to LOG: WM_DPICHANGED (and moves to the
@@ -96,10 +96,10 @@ static LRESULT CALLBACK wnd_proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
     return DefWindowProcW( hwnd, msg, wp, lp );
 }
 
-static int run_window( const char *mode, int x, int y, const char *rgb, const char *path )
+static int run_window( const char *mode, int x, int y, const char *rgb, const char *path, int cw, int ch )
 {
     WNDCLASSW wc = {0};
-    RECT rc = {0, 0, 400, 300};
+    RECT rc = {0, 0, 0, 0};
     DPI_AWARENESS_CONTEXT ctx = DPI_AWARENESS_CONTEXT_UNAWARE;
     unsigned int c = strtoul( rgb, NULL, 16 );
     WCHAR title[64];
@@ -127,8 +127,8 @@ static int run_window( const char *mode, int x, int y, const char *rgb, const ch
     /* 400x300 at 100%: an aware window sizes itself for the DPI it starts at
      * (an unaware one is told 96) */
     dpi = GetDpiForSystem();
-    rc.right = MulDiv( 400, dpi, 96 );
-    rc.bottom = MulDiv( 300, dpi, 96 );
+    rc.right = MulDiv( cw, dpi, 96 );
+    rc.bottom = MulDiv( ch, dpi, 96 );
     AdjustWindowRectExForDpi( &rc, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi );
     swprintf( title, 64, L"dpi probe %hs", mode );
     hwnd = CreateWindowExW( 0, L"SGDpiProbe", title, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y,
@@ -178,7 +178,8 @@ int main( int argc, char **argv )
 {
     if (argc >= 4 && !strcmp( argv[1], "layered" )) return run_layered( atoi( argv[2] ), atoi( argv[3] ) );
     if (argc >= 7 && !strcmp( argv[1], "win" ))
-        return run_window( argv[2], atoi( argv[3] ), atoi( argv[4] ), argv[5], argv[6] );
+        return run_window( argv[2], atoi( argv[3] ), atoi( argv[4] ), argv[5], argv[6],
+                           argc >= 9 ? atoi( argv[7] ) : 400, argc >= 9 ? atoi( argv[8] ) : 300 );
     if (argc >= 3 && !strcmp( argv[1], "rect" ))
     {
         WCHAR cls[128];

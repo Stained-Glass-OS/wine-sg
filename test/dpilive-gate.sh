@@ -33,7 +33,8 @@
 #   SG_MUTANT_DPI_V2_FRAME in dlls/win32u/defwnd.c: a v2 frame not scaled;
 #   SG_MUTANT_DPI_V1_ONLY in server/window.c: v2 made v1, no child messages;
 #   SG_MUTANT_FE_PM in programs/explorer/fileexplorer.c: File Explorer not
-#   scaled; SG_MUTANT_DPI_STRETCH_HALFTONE in dlls/win32u/dce.c: StretchBlt
+#   scaled; SG_MUTANT_DPI_RECT_UNCLAMPED in dlls/win32u/window.c: a large
+#   window's suggested rectangle off the screen; SG_MUTANT_DPI_STRETCH_HALFTONE in dlls/win32u/dce.c: StretchBlt
 #   as before, a layered window stretched unfiltered)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -181,5 +182,17 @@ near "$(size_of "$m" unaware)" 400 300 1 && near "$(size_of "$m" later)" 400 300
     && pass "back at 100%: the unaware window $(size_of "$m" unaware), the one started at 175% scaled down to $(size_of "$m" later)" \
     || fail "back at 100%: unaware $(size_of "$m" unaware), started at 175% $(size_of "$m" later) (want 400x300)"
 [ "${b3:-0}" = 40 ] && pass "the taskbar back at 100%: 40 px" || fail "the taskbar back at 100%: ${b3:-none} px (want 40)"
+# a per-monitor v2 window that fit at 100% fits at 175%: the suggested
+# rectangle is no larger than the work area, on the screen (2736x1824)
+"$WINE" "$T/probe.exe" win pmv2 0 0 a050a0 'Z:'"$T/big.log" 1800 1100 >/dev/null 2>&1 &
+sleep 4
+"$WINE" "$T/probe.exe" set 168 >/dev/null 2>&1; sleep 4
+set -- $(grep '^dpichanged' "$T/big.log" | tail -1)
+if [ "${2:-}" = 168 ] && [ "${5:-9999}" -le 2736 ] && [ "${6:-9999}" -le 1824 ]; then
+    pass "a large per-monitor v2 window at 175%: suggested ${5}x$6, within the work area"
+else
+    fail "a large per-monitor v2 window at 175%: '$*' (want 168 and at most 2736x1824)"
+fi
+
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
