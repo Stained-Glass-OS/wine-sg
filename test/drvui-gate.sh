@@ -13,6 +13,9 @@
 #   - choosing a paper size and the plug-in's option, then OK: IDOK, the
 #     devmode has the paper, the plug-in got APPLYNOW with the paper chosen,
 #     and (Unidrv) its part of the devmode keeps its option;
+#   - the custom size is in every paper list; the driver's own settings
+#     are in the print capabilities, and a ticket's choice of one reaches
+#     the driver's devmode and comes back (prntvpt);
 #   - the printer's sheet (PrinterProperties) shows the printer's own
 #     features (*FeatureType: PRINTER_PROPERTY, PPD InstallableOptions)
 #     and the plug-in's page; a choice there is kept with the printer.
@@ -39,11 +42,12 @@ pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
 "$MINGW" -DUNICODE -shared -O2 -o "$T/sgdrvui.dll" "$HERE/drvui-plugin.c" -lole32 -luuid || { echo "FAIL  plug-in did not build"; exit 1; }
 "$MINGW" -municode -O2 -o "$T/drvui.exe" "$HERE/drvui-probe.c" -lwinspool -lcomctl32 || { echo "FAIL  probe did not build"; exit 1; }
+"$MINGW" -municode -O1 -o "$T/ptc.exe" "$HERE/ptcaps-probe.c" -lprntvpt -lole32 -lwinspool || { echo "FAIL  ptcaps probe did not build"; exit 1; }
 "$MINGW" -municode -O2 -o "$T/sgp64.exe" "$HERE/../tools/printer-corpus/sgprint.c" -lwinspool -lgdi32 -lsetupapi ||
     { echo "FAIL  sgprint did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >"$T/wineboot.log" 2>&1; "$WINESERVER" -w
 C="$WINEPREFIX/drive_c"
-cp "$T/drvui.exe" "$T/sgp64.exe" "$C/"
+cp "$T/drvui.exe" "$T/sgp64.exe" "$T/ptc.exe" "$C/"
 
 S="$C/windows/system32/DriverStore/FileRepository/sgdrvui.inf_1"
 mkdir -p "$S/amd64"
@@ -69,6 +73,12 @@ cat > "$S/sgdrvui.gpd" <<'EOF'
         *PrintableArea: PAIR(200, 100)
         *PrintableOrigin: PAIR(0, 0)
     }
+    *Option: CUSTOMSIZE
+    {
+        *MinSize: PAIR(100, 100)
+        *MaxSize: PAIR(800, 3000)
+        *MaxPrintableWidth: 800
+    }
     *Option: SGBIG
     {
         *Name: "SG Big"
@@ -76,6 +86,14 @@ cat > "$S/sgdrvui.gpd" <<'EOF'
         *PrintableArea: PAIR(400, 200)
         *PrintableOrigin: PAIR(0, 0)
     }
+}
+*Feature: SGDensity
+{
+    *Name: "SG Density"
+    *DefaultOption: Normal
+    *Option: Light { *Name: "Light" }
+    *Option: Normal { *Name: "Normal" }
+    *Option: Dark { *Name: "Dark" }
 }
 *Feature: ColorMode
 {
@@ -212,6 +230,21 @@ for kind in "UI Laser:SG Small:SG Big" "UI PS:Letter:A4"; do
     check "$p: PrinterProperties succeeds" "$OUT" "printerproperties 1"
     [ "$p" = "UI Laser" ] && check "$p: the printer's feature is kept with the printer" "$OUT" "printer feature Installed"
 done
+
+# the driver's own settings and its custom size, for programs
+out=$(run 'C:\sgp64.exe' papers "UI Laser" | tr '\n' ';')
+[ "$out" = "paper 257 508x254 SG Small;paper 256 0x0 Custom Size;paper 259 1016x508 SG Big;" ] &&
+    pass "the custom size is in every paper list, in the same place" || fail "papers: $out"
+caps=$(run 'C:\ptc.exe' caps "UI Laser")
+printf '%s' "$caps" | grep -q 'name="ns0000:DF_SGDensity"' && printf '%s' "$caps" | grep -q 'name="ns0000:Dark"' &&
+    pass "the print capabilities list the driver's own setting and its options" || fail "no driver setting in the capabilities"
+printf '%s' "$caps" | grep -q 'DF_SGTray' && fail "a printer property is in the document capabilities" ||
+    pass "the printer's own properties are not document settings"
+out=$(run 'C:\ptc.exe' dticket "UI Laser" SGDensity Dark | tr '\n' ';')
+[ "$out" = "devmode extra 1;back ns0000:Dark;" ] && pass "a ticket's driver setting reaches the driver's devmode and comes back" ||
+    fail "driver setting round trip: $out"
+out=$(run 'C:\ptc.exe' dticket "UI PS" SGTrayNo True | tr '\n' ';')
+case "$out" in "devmode extra 1;"*) pass "a PostScript printer's ticket becomes its driver's whole devmode" ;; *) fail "PS ticket: $out" ;; esac
 
 if [ $RC != 0 ]; then echo "--- last output:"; printf '%s\n' "$OUT" | tail -20; echo "--- Wine's errors:"; grep -v "^$" "$T/stderr.log" 2>/dev/null | grep -iv "fixme" | tail -15; fi
 [ $RC = 0 ] && echo "drvui gate: PASS" || echo "drvui gate: FAIL"

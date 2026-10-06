@@ -150,6 +150,55 @@ static int ticket(const WCHAR *printer, const WCHAR *option, int width, int heig
     return 0;
 }
 
+/* a driver's own setting through a ticket, a devmode and back */
+static int dticket(const WCHAR *printer, const WCHAR *feature, const WCHAR *option)
+{
+    static const char fmt[] =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<psf:PrintTicket xmlns:psf=\"http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework\" "
+        "xmlns:psk=\"http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords\" "
+        "xmlns:my=\"urn:stained-glass-os:printing:driver\" version=\"1\">"
+        "<psf:Feature name=\"my:DF_%ls\"><psf:Option name=\"my:%ls\"/></psf:Feature></psf:PrintTicket>";
+    char xml[2048], *p, *q;
+    HPTPROVIDER prov;
+    IStream *in, *out;
+    DEVMODEW *dm;
+    ULONG size;
+    HRESULT hr;
+    HGLOBAL mem;
+    STATSTG st;
+    LARGE_INTEGER zero = {{0}};
+    char key[160];
+
+    hr = PTOpenProvider(printer, 1, &prov);
+    if (hr != S_OK) { printf("open=0x%08lx\n", hr); return 1; }
+    snprintf(xml, sizeof(xml), fmt, feature, option);
+    CreateStreamOnHGlobal(NULL, TRUE, &in);
+    IStream_Write(in, xml, strlen(xml), NULL);
+    IStream_Seek(in, zero, STREAM_SEEK_SET, NULL);
+    hr = PTConvertPrintTicketToDevMode(prov, in, kUserDefaultDevmode, kPTJobScope, &size, &dm, NULL);
+    if (hr != S_OK) { printf("convert=0x%08lx\n", hr); return 1; }
+    printf("devmode extra %d\n", dm->dmDriverExtra > 0);
+    CreateStreamOnHGlobal(NULL, TRUE, &out);
+    hr = PTConvertDevModeToPrintTicket(prov, size, dm, kPTJobScope, out);
+    if (hr != S_OK) { printf("back=0x%08lx\n", hr); return 1; }
+    IStream_Stat(out, &st, STATFLAG_NONAME);
+    GetHGlobalFromStream(out, &mem);
+    p = GlobalLock(mem);
+    p[st.cbSize.LowPart - 1] = 0;
+    snprintf(key, sizeof(key), "DF_%ls\"", feature);
+    if ((q = strstr(p, key)) && (q = strstr(q, "Option name=\"")))
+    {
+        char *e = strchr(q + 13, '"');
+        printf("back %.*s\n", (int)(e - q - 13), q + 13);
+    }
+    else printf("back none\n");
+    GlobalUnlock(mem);
+    PTReleaseMemory(dm);
+    PTCloseProvider(prov);
+    return 0;
+}
+
 static int status(const WCHAR *printer)
 {
     HANDLE h;
@@ -172,6 +221,7 @@ int wmain(int argc, WCHAR **argv)
     if (argc >= 3 && !wcscmp(argv[1], L"devcaps")) return devcaps(argv[2]);
     if (argc >= 3 && !wcscmp(argv[1], L"caps")) return caps(argv[2]);
     if (argc >= 3 && !wcscmp(argv[1], L"status")) return status(argv[2]);
+    if (argc >= 5 && !wcscmp(argv[1], L"dticket")) return dticket(argv[2], argv[3], argv[4]);
     if (argc >= 6 && !wcscmp(argv[1], L"ticket")) return ticket(argv[2], argv[3], _wtoi(argv[4]), _wtoi(argv[5]));
     printf("usage\n");
     return 2;

@@ -508,7 +508,7 @@ int wmain( int argc, WCHAR **argv )
         pi.pPrinterName = argv[2];
         pi.pDriverName = argv[3];
         pi.pPortName = argv[4];
-        pi.pPrintProcessor = (WCHAR *)L"winprint";
+        pi.pPrintProcessor = argc >= 6 ? argv[5] : (WCHAR *)L"winprint";
         pi.pDatatype = (WCHAR *)L"RAW";
         if (!(h = AddPrinterW( NULL, 2, (BYTE *)&pi ))) { printf( "add failed %lu\n", GetLastError() ); return 1; }
         ClosePrinter( h );

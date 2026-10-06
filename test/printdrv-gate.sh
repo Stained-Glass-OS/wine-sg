@@ -22,6 +22,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINE="$(cd "$(dirname "$WINE")" && pwd)/$(basename "$WINE")"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
+[ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 MINGW32="${MINGW32:-i686-w64-mingw32-gcc}"
 for t in "$MINGW" "$MINGW32"; do command -v "$t" >/dev/null || { echo "SKIP: $t missing"; exit 77; }; done
@@ -126,7 +127,7 @@ cat > "$S/sgtestuni.inf_1/sgtest.gpd" <<'EOF'
     *Option: L3x1
     {
         *Name: "SG Label 3 x 1"
-        *OptionID: 258
+        *OptionID: 259
         *PageDimensions: PAIR(300, 100)
         *PrintableArea: PAIR(300, 100)
         *PrintableOrigin: PAIR(0, 0)
@@ -268,7 +269,7 @@ out=$(run 'C:\probe64.exe' papers "UMPD Printer")
 out=$(run 'C:\probe64.exe' papers "Unidrv Printer" | tr '\n' ';')
 # a paper without an OptionID gets one no other paper has (lw5xx.gpd's
 # seventh paper met its 262)
-[ "$out" = "paper 300 508x254 SG Label 2 x 1;paper 258 762x254 SG Label 3 x 1;paper 261 1016x254 SG Label 4 x 1;" ] &&
+[ "$out" = "paper 300 508x254 SG Label 2 x 1;paper 259 762x254 SG Label 3 x 1;paper 262 1016x254 SG Label 4 x 1;" ] &&
     pass "Unidrv lists the GPD's papers, each with its own id" || fail "Unidrv papers: $out"
 
 expect_umpd='SGTD START printdrv probe

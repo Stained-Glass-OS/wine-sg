@@ -1,6 +1,6 @@
 /* The drvui gate's program (patches/sg/1027): opens a printer's
  * preferences (DocumentProperties with DM_IN_PROMPT) or its properties
- * (PrinterProperties) and works them like a user: picks the second paper
+ * (PrinterProperties) and works them like a user: picks the last paper
  * size on Paper/Quality, the plug-in's "SG Stamp" option in the Advanced
  * tree (or the printer's tray option in Device Settings), and presses OK.
  * One fact a line.  Our own code.
@@ -132,7 +132,7 @@ static DWORD WINAPI work( void *arg )
         if ((combo = combo_after( page, L"Paper Size:" )))
         {
             printf( "paper sizes %d\n", (int)SendMessageW( combo, CB_GETCOUNT, 0, 0 ) );
-            choose( page, combo, 1 );
+            choose( page, combo, SendMessageW( combo, CB_GETCOUNT, 0, 0 ) - 1 );   /* the last */
         }
         else printf( "paper size missing\n" );
         SendMessageW( sheet, PSM_SETCURSEL, 2, 0 );

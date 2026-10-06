@@ -13,6 +13,10 @@ ours, written from Microsoft's public driver documentation (clean room):
 | COMPSTUI.DLL (the drivers' property sheets) | `dlls/compstui` (1026) |
 | render plug-ins (IPrintOemUni, IPrintOemPS/PS2) | unidrv `oem.c` (0923, 1022), wineps `oemps.c` (1024) |
 | UI plug-ins (IPrintOemUI/UI2, IPrintCoreUI2) | `dlls/unidrvui/drvui.c`, shared with wineps (1027) |
+| TCPMON.DLL (Standard TCP/IP Port: RAW, LPR; IPP by URL) | `dlls/tcpmon` (1029) |
+| language monitors, port status | `dlls/localspl` (1029), winspool SetPort/GetPrinter |
+| makers' print processors (GdiPlayPageEMF...) | gdi32 `dc.c`, localspl (1030) |
+| print schema (driver settings, custom size) | `dlls/prntvpt` (1221, 1031) |
 | winprint (EMF print processor)           | `dlls/winprint` (0922, 1020-1021)                  |
 | GDI engine services (Eng*, XLATEOBJ...)  | `dlls/gdi32/umpd.c`, `engblt.c` (0920, 1020)       |
 | spooler router (spoolss)                 | `dlls/spoolss` -> winspool (1020)                  |
@@ -35,21 +39,23 @@ first page matches the page as GDI draws it (1.00 = the same ink).
 `imports.py` lists what a package's DLLs import that Wine lacks;
 `pclxl.py` lists a PCL XL stream's operators.
 
-Status 2026-10-06 (wine-sg 1020-1028). "Prefs" is the driver's
+Status 2026-10-06 (wine-sg 1020-1031). "Prefs" is the driver's
 Printing Preferences (DocumentProperties with a prompt) through our CPSUI.
 
 | Package (source)                         | Arch | Core / kind            | Installs | 64-bit print | 32-bit print | Output valid | Renders | Prefs | Notes |
 |------------------------------------------|------|------------------------|----------|--------------|--------------|--------------|---------|-------|-------|
-| HP Universal Printing PCL 6 (catalog)    | x64  | Unidrv + HP plug-ins   | yes      | yes          | yes          | PCL XL, gpcl6 clean | 0.98 | HP's own (asks for the printer's address: dynamic mode) | |
-| Lexmark Universal v2 (catalog)           | x64  | Unidrv + plug-ins      | yes      | yes          | yes          | PCL 5 + HP-GL/2 | 0.98 | ours (Layout, Paper/Quality, Advanced) | its UI plug-in's own pages fail inside it (E_OUTOFMEMORY): open |
+| HP Universal Printing PCL 6 (catalog)    | x64  | Unidrv + HP plug-ins   | yes      | yes          | yes          | PCL XL, gpcl6 clean | 0.98 | HP's own (asks for the printer's address: dynamic mode) | HP's print processor (hpcpp160) and language monitor run (1029-1030) |
+| Lexmark Universal v2 (catalog)           | x64  | Unidrv + plug-ins      | yes      | yes          | yes          | PCL 5 + HP-GL/2 | 0.98 | ours (Layout, Paper/Quality, Advanced) | its print processor runs (1030); its UI plug-in's own pages fail inside it (E_OUTOFMEMORY): open |
 | Toshiba e-STUDIO PS3 (catalog)           | x64  | PScript (PPD)          | yes      | yes          | yes          | PostScript, gs clean | 0.98 | ours | |
 | Xerox Global Print Driver PS (catalog)   | x64  | PScript (PPD)          | yes      | yes          | yes          | PostScript, gs clean | 0.98 | ours | |
-| Ricoh Aficio SP C420DN PS (catalog)      | x64  | PScript + plug-ins     | yes      | yes          | yes          | PostScript, gs clean | 0.97 | ours + Ricoh's Job/Log page | render plug-in's job code in the PostScript |
+| Ricoh Aficio SP C420DN PS (catalog)      | x64  | PScript + plug-ins     | yes      | yes          | yes          | PostScript, gs clean | 0.97 | ours + Ricoh's Job/Log page | render plug-in's job code in the PostScript; its print processor runs (1030) |
+| DYMO LabelWriter 550 (DYMO Connect's package) | x64 | Unidrv + DYMO plug-ins + LM | yes | yes (DYMO agent's QA) | - | DYMO raster | label | ours (density, quality in Advanced) | custom size listed; density/quality in print tickets (1031) |
 | Brother HL-3070CW BR-Script3 (catalog)   | x64  | PScript (PPD only)     | yes (1025) | yes        | yes          | PostScript, gs clean | 0.97 | ours (Chinese PPD strings) | INF lists models only for x86 |
 | Zebra ZDesigner 8.6 (catalog)            | x64  | own UMPD               | yes      | yes          | yes          | ZPL (^GFA Z64) | label | Zebra's own | |
 | Brother HL-L2310D (catalog)              | x64  | own UMPD               | yes      | yes          | no (host)    | Brother PCL (mode 1030 raster) | not checked | Brother's own (full) | gpcl6 does not read Brother's compression |
 | Brother QL-800 (catalog)                 | x64  | own UMPD               | yes      | yes          | no           | Brother QL raster | not checked | not tried | |
 | OKI B930 PS (catalog)                    | x64  | own PS driver (Monotype) | yes (1028) | header only | -          | PostScript header, no pages | - | not tried | pages not emitted: open |
+| Zebra ZDesigner 8.6 on a network port    | x64  | own UMPD + Zebra LM    | yes      | yes (RAW 9100) | -          | ZPL | - | - | its language monitor fails starting a job; the job goes past it (1029) |
 | Zebra ZDesigner 5.x (catalog)            | x64  | own UMPD               | yes      | no           | no           | - | - | - | open |
 | Epson XP-230 (catalog)                   | x64  | own UMPD (ESC/P-R)     | yes      | no           | no           | - | - | crashes in E_YASKPCE (wants Epson Status Monitor's registry, made by Epson's installer) | open |
 | Samsung Universal Print Driver 3         | x64  | own driver + PP + LM   | yes      | no           | no           | - | - | - | open |
@@ -78,3 +84,12 @@ printer's language. Two kinds are in the corpus:
   document; they need the XPSDrv filter pipeline (IPrintPipelineFilter,
   IXpsDocumentProvider/Consumer, the XPS object model), which Wine does not
   have.
+
+## Network printers
+
+A Windows driver prints to a printer on the network through the Standard
+TCP/IP Port monitor (`tcpmon.dll`, 1029): RAW on port 9100 or LPR, ports
+made through its Xcv interface (as makers' installers and our Settings do),
+or to an IPP printer by naming the port by its URL (`ipp://host/ipp/print`).
+Jobs go through the driver's language monitor; what it reports (SetPort) is
+the printer's status. WSD ports are not done.
