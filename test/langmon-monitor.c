@@ -2,7 +2,11 @@
  * built as printer makers build theirs (MONITOR2 with OpenPortEx): it
  * opens the port through the port monitor it is given, wraps each job in
  * "<SGLM job N>" ... "</SGLM>", and tells the system the printer's state
- * (SetPort: toner low).  Our own code. */
+ * (SetPort: toner low).  Like Kyocera's, it keeps a thread of its own
+ * running in the DLL, so it must stay loaded (1034); it counts its
+ * initializations in HKCU\Software\SG Test LM, value Inits.  It keeps the
+ * MONITORINIT it is given and reads its own settings through it when a job
+ * starts ("reg=ok" in its wrap), as Zebra's does.  Our own code. */
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
@@ -31,6 +35,20 @@ static BOOL WINAPI lm_OpenPortEx( HANDLE hmon, HANDLE hmon_port, LPWSTR port_nam
     return TRUE;
 }
 
+static MONITORINIT *lm_init;  /* kept, as makers' monitors keep it (Zebra's) */
+
+/* its own settings, through the spooler's registry functions */
+static const char *lm_settings( void )
+{
+    WCHAR driver[MAX_PATH];
+    DWORD type, size = sizeof(driver);
+
+    if (!lm_init || !lm_init->pMonitorReg || !lm_init->pMonitorReg->fpQueryValue) return "none";
+    if (lm_init->pMonitorReg->fpQueryValue( lm_init->hckRegistryRoot, L"Driver", &type, (BYTE *)driver, &size,
+                                            lm_init->hSpooler )) return "bad";
+    return wcsstr( driver, L"sglm" ) || wcsstr( driver, L"SGLM" ) ? "ok" : "bad";
+}
+
 static BOOL WINAPI lm_StartDocPort( HANDLE h, LPWSTR printer, DWORD job, DWORD level, LPBYTE info )
 {
     struct lm_port *p = h;
@@ -38,7 +56,7 @@ static BOOL WINAPI lm_StartDocPort( HANDLE h, LPWSTR printer, DWORD job, DWORD l
     DWORD w;
 
     if (!p->mon->pfnStartDocPort( p->hport, printer, job, level, info )) return FALSE;
-    snprintf( buf, sizeof(buf), "<SGLM job %lu>\n", job );
+    snprintf( buf, sizeof(buf), "<SGLM job %lu reg=%s>\n", job, lm_settings() );
     return p->mon->pfnWritePort( p->hport, (BYTE *)buf, strlen( buf ), &w );
 }
 
@@ -82,8 +100,32 @@ static MONITOR2 lm =
     lm_ClosePort, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, lm_Shutdown,
 };
 
+static volatile LONG heartbeat;
+
+static DWORD WINAPI watch_printer( void *arg )
+{
+    for (;;)
+    {
+        Sleep( 1 );
+        InterlockedIncrement( &heartbeat );
+    }
+    return 0;
+}
+
 __declspec(dllexport) LPMONITOR2 WINAPI InitializePrintMonitor2( PMONITORINIT init, PHANDLE hmon )
 {
+    DWORD inits = 0, size = sizeof(inits);
+    HKEY key;
+
+    if (!RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\SG Test LM", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL ))
+    {
+        RegQueryValueExW( key, L"Inits", NULL, NULL, (BYTE *)&inits, &size );
+        inits++;
+        RegSetValueExW( key, L"Inits", 0, REG_DWORD, (BYTE *)&inits, sizeof(inits) );
+        RegCloseKey( key );
+    }
+    CloseHandle( CreateThread( NULL, 0, watch_printer, NULL, 0, NULL ) );
+    lm_init = init;
     *hmon = (HANDLE)&lm;
     return &lm;
 }

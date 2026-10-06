@@ -74,6 +74,46 @@ int wmain( int argc, WCHAR **argv )
             printf( "paper %u %ldx%ld %ls\n", ids[i], sizes[i].x, sizes[i].y, names + i * 64 );
         return 0;
     }
+    /* printd PRINTER DENSITY: prints with the driver's own setting (the DWORD
+     * after its marker) changed; printd PRINTER: with only public settings */
+    if (argc >= 3 && !wcscmp( argv[1], L"printd" ))
+    {
+        DOCINFOW doc = { sizeof(doc), L"printdrv probe" };
+        LONG size = DocumentPropertiesW( NULL, NULL, argv[2], NULL, NULL, 0 );
+        RECT box = { 20, 10, 120, 60 };
+        DEVMODEW *dm;
+        HDC hdc;
+
+        if (argc > 3)
+        {
+            if (size <= (LONG)sizeof(DEVMODEW)) { printf( "printd: devmode size %ld\n", size ); return 1; }
+            dm = calloc( 1, size );
+            dm->dmSize = size;
+            if (DocumentPropertiesW( NULL, NULL, argv[2], dm, NULL, DM_OUT_BUFFER ) != IDOK ||
+                dm->dmDriverExtra < 8) { printf( "printd: no settings of the driver's own\n" ); return 1; }
+            ((DWORD *)((BYTE *)dm + dm->dmSize))[1] = wcstoul( argv[3], NULL, 10 );
+            DocumentPropertiesW( NULL, NULL, argv[2], dm, dm, DM_IN_BUFFER | DM_OUT_BUFFER );
+            printf( "devmode %u+%u\n", dm->dmSize, dm->dmDriverExtra );
+        }
+        else
+        {
+            dm = calloc( 1, sizeof(*dm) );
+            dm->dmSize = sizeof(*dm);
+            dm->dmSpecVersion = DM_SPECVERSION;
+            lstrcpynW( dm->dmDeviceName, argv[2], CCHDEVICENAME );
+            dm->dmFields = DM_COPIES;
+            dm->dmCopies = 1;
+        }
+        if (!(hdc = CreateDCW( NULL, argv[2], NULL, dm ))) { printf( "printd: no DC %lu\n", GetLastError() ); return 1; }
+        if (StartDocW( hdc, &doc ) <= 0) { printf( "printd: StartDoc %lu\n", GetLastError() ); return 1; }
+        StartPage( hdc );
+        FillRect( hdc, &box, GetStockObject( BLACK_BRUSH ) );
+        EndPage( hdc );
+        if (EndDoc( hdc ) <= 0) { printf( "printd: EndDoc %lu\n", GetLastError() ); return 1; }
+        DeleteDC( hdc );
+        printf( "printd ok\n" );
+        return 0;
+    }
     if (argc >= 3 && !wcscmp( argv[1], L"print" ))
     {
         DOCINFOW doc = { sizeof(doc), L"printdrv probe" };

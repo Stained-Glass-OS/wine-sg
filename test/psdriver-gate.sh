@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# A printer maker's PostScript driver (patches/sg/1021): a PPD on the
+# A printer maker's PostScript driver (patches/sg/1021, 1037): a PPD on the
 # system's PostScript driver (the INF needs PSCRIPT.OEM from NTPRINT.INF).
 # Our own package and PPD; the package also carries a file named
 # PSCRIPT5.DLL, as some makers ship the system's, which must not be used.
@@ -199,6 +199,71 @@ fi
 out=$(run 'C:\sgp32.exe' print "PS Printer 32" mediatype=257)
 grep -a -q '%%BeginFeature: \*ColorModel' "$T/LPT2.out" 2>/dev/null && pass "32-bit: the job printed through the PPD" ||
     fail "32-bit: $out"
+
+# a v4 package (1037): no driver named in the INF, a manifest per model; the
+# PostScript class one prints from its PPD on our PostScript driver, the one
+# rendered by its maker's XPS filters is not installed
+V="$C/windows/system32/DriverStore/FileRepository/sgv4.inf_1"
+mkdir -p "$V"
+sed 's/SG Test PS/SG V4 PS/; s/SGPS.PPD/SGV4.PPD/' "$S/sgps.ppd" > "$V/sgv4.ppd"
+printf '[DriverConfig]\r\nDataFile=sgv4.ppd\r\nDriverFile=PSCRIPT5.DLL\r\nRequiredFiles=V3HOSTINGFILTER.DLL,PSCRIPT.NTF\r\nDriverCategory=PrintFax.Printer\r\n' > "$V/sgv4-manifest.ini"
+printf '<?xml version="1.0"?>\r\n<Filters/>\r\n' > "$V/sgv4-pipelineconfig.xml"
+printf '*GPDFileVersion: "1.0"\r\n' > "$V/sgxps.gpd"
+printf '[DriverConfig]\r\nDataFile=sgxps.gpd\r\nDriverCategory=PrintFax.Printer\r\n' > "$V/sgxps-manifest.ini"
+cat > "$V/sgv4.inf" <<'EOF2'
+[Version]
+Signature="$Windows NT$"
+Provider=Stained Glass OS
+ClassGUID={4D36E979-E325-11CE-BFC1-08002BE10318}
+Class=Printer
+ClassVer=4.0
+
+[Manufacturer]
+"SG Test" = SGV4, NTamd64
+
+[SGV4.NTamd64]
+"SG V4 PS" = SGV4_PS
+"SG V4 XPS" = SGV4_XPS
+
+[SGV4_PS]
+CopyFiles=SGV4_PS_FILES
+
+[SGV4_XPS]
+CopyFiles=SGV4_XPS_FILES
+
+[SGV4_PS_FILES]
+sgv4.ppd
+sgv4-pipelineconfig.xml
+sgv4-manifest.ini
+
+[SGV4_XPS_FILES]
+sgxps.gpd
+sgxps-manifest.ini
+
+[DestinationDirs]
+DefaultDestDir=66000
+
+[SourceDisksNames]
+1 = "SG test disk",,,
+
+[SourceDisksFiles]
+sgv4.ppd = 1
+sgv4-pipelineconfig.xml = 1
+sgv4-manifest.ini = 1
+sgxps.gpd = 1
+sgxps-manifest.ini = 1
+EOF2
+out=$(run 'C:\sgp64.exe' install "SG V4 PS" 'C:\windows\system32\DriverStore\FileRepository\sgv4.inf_1\sgv4.inf')
+out2=$(run 'C:\sgp64.exe' install "SG V4 XPS" 'C:\windows\system32\DriverStore\FileRepository\sgv4.inf_1\sgv4.inf')
+[ "$out" = "install 0" ] && [ "$out2" != "install 0" ] &&
+    pass "a v4 package: the PostScript class model installs from its manifest, an XPS-filter one does not ($out2)" ||
+    fail "v4 install: $out / $out2"
+timeout 60 "$WINE" reg add 'HKCU\Software\Wine\Printing\Spooler' /v "LPT3:" /d "$T/LPT3.out" /f >/dev/null 2>&1
+run 'C:\sgp64.exe' add "V4 Printer" "SG V4 PS" "LPT3:" >/dev/null
+out=$(run 'C:\sgp64.exe' print "V4 Printer" color=1)
+grep -a -q '%%BeginFeature: \*ColorModel Gray' "$T/LPT3.out" 2>/dev/null && head -c 40 "$T/LPT3.out" | grep -a -q '@PJL JOB NAME' &&
+    pass "the v4 PostScript printer prints through its PPD on our PostScript driver" ||
+    fail "v4 print: $out"
 
 diagnose
 [ $RC = 0 ] && echo "psdriver gate: PASS" || echo "psdriver gate: FAIL"

@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# Printer makers' driver packages as they ship (patches/sg/1020-1022).
+# Printer makers' driver packages as they ship (patches/sg/1020-1022, 1032).
 #
 # Our own package, laid out as makers lay theirs out, must install and
 # print through Wine's spooler as on Windows:
@@ -17,7 +17,12 @@
 #   - the driver (drvpkg-umpd.c) draws on a surface of its own, takes the
 #     page through DrvCopyBits and EngCopyBits, reads its data file with
 #     EngLoadModule, writes with WritePrinter on its printer handle, and its
-#     configuration DLL reads the printer through the handle it is given.
+#     configuration DLL reads the printer through the handle it is given;
+#     it keeps a setting of its own behind the public ones and looks its job
+#     up when the document starts, and asks the engine for a code page's
+#     glyph set (EngComputeGlyphSet, 1033).  A 32-bit program gets its
+#     papers and its settings through our 64-bit print host, and prints
+#     with them (1032). It hears GDI's document events (1035).
 #
 #   WINE=/opt/wine-sg/bin/wine test/drvpkg-gate.sh
 set -u
@@ -41,7 +46,7 @@ fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
 # on a failure, what Wine said (a gate that fails only now and then)
 diagnose() { [ $RC = 0 ] && return; echo "--- wineboot: rc $BOOT_RC, ${BOOT_TIME}s; drive_c: $(ls "$C" 2>&1 | tr '\n' ' ')"; tail -3 "$T/wineboot.log"; echo "--- printers:"; run 'C:\probe64.exe' enum 2>/dev/null; echo "--- Wine's errors:"; grep -v "^$" "$T/stderr.log" 2>/dev/null | grep -iv "fixme\|wayland" | tail -15; }
 
-printf 'LIBRARY gdi32.dll\nEXPORTS\nEngCreateBitmap\nEngCreateDeviceSurface\nEngAssociateSurface\nEngDeleteSurface\nEngLockSurface\nEngUnlockSurface\nEngCopyBits\nEngCreatePalette\nEngDeletePalette\nEngGetPrinterDataFileName\nEngLoadModule\nEngMapModule\nEngFreeModule\nEngQueryLocalTime\nEngCreateSemaphore\nEngAcquireSemaphore\nEngReleaseSemaphore\nEngDeleteSemaphore\n' > "$T/eng.def"
+printf 'LIBRARY gdi32.dll\nEXPORTS\nEngCreateBitmap\nEngCreateDeviceSurface\nEngAssociateSurface\nEngDeleteSurface\nEngLockSurface\nEngUnlockSurface\nEngCopyBits\nEngCreatePalette\nEngDeletePalette\nEngGetPrinterDataFileName\nEngLoadModule\nEngMapModule\nEngFreeModule\nEngQueryLocalTime\nEngComputeGlyphSet\nEngCreateSemaphore\nEngAcquireSemaphore\nEngReleaseSemaphore\nEngDeleteSemaphore\n' > "$T/eng.def"
 "${MINGW%-gcc}-dlltool" -d "$T/eng.def" -l "$T/libeng.a" || { echo "SKIP: no dlltool"; exit 77; }
 "$MINGW" -shared -O2 -o "$T/sgtestdrv.dll" "$HERE/drvpkg-umpd.c" "$T/libeng.a" -lgdi32 -lwinspool || { echo "FAIL  driver did not build"; exit 1; }
 "$MINGW" -municode -O2 -o "$T/probe64.exe" "$HERE/printdrv-probe.c" -lwinspool -lgdi32 || { echo "FAIL  probe did not build"; exit 1; }
@@ -209,20 +214,58 @@ for p in LPT1 LPT2 LPT3; do
 done
 run 'C:\probe64.exe' add "Maker Printer" "SG Test Maker" "LPT1:" >/dev/null
 run 'C:\probe64.exe' add "Core Printer" "SG Test Core" "LPT2:" >/dev/null
+timeout 60 "$WINE" reg query 'HKLM\Software\SG Test Maker\Printers' /v "Maker Printer" 2>/dev/null | tr -d '\r' |
+    grep -q "REG_SZ *initialized" && pass "a new printer's driver is told so (DrvPrinterEvent) and sets itself up" ||
+    fail "the driver was not told of its new printer"
 
 out=$(run 'C:\probe64.exe' papers "Maker Printer")
 [ "$out" = "paper 257 533x279 SG Maker 2x1" ] && pass "the maker's configuration DLL reads the printer through its handle" ||
     fail "DeviceCapabilities through the maker's configuration DLL: $out"
 
-expect='SGM START printdrv probe data=SG data v1 time=ok
-PAGE 1 200x100 dark=5000 box=20,10-119,59
-SGM END'
+timeout 60 "$WINE" reg delete 'HKCU\Software\SG Test Maker' /f >/dev/null 2>&1
+rm -f "$T/LPT1.out"
+run 'C:\probe64.exe' print "Maker Printer" >/dev/null
+events=$(timeout 60 "$WINE" reg query 'HKCU\Software\SG Test Maker' /v Events 2>/dev/null | tr -d '\r' | awk '/Events/ {print $3}')
+[ "$events" = "14,1,2,5,13,6,7,8,12,R,10" ] &&
+    pass "the driver hears GDI's document events, the end before its job is printed (1035)" ||
+    fail "document events: $events (want the filter query 14, CreateDC 1,2, StartDoc 5,13, page 6,7, EndDoc 8,12, rendering, DeleteDC 10)"
+
+run 'C:\probe64.exe' add "Quiet Printer" "SG Test Maker" "LPT3:" >/dev/null
+timeout 60 "$WINE" reg delete 'HKCU\Software\SG Test Maker' /f >/dev/null 2>&1
+run 'C:\probe64.exe' print "Quiet Printer" >/dev/null
+events=$(timeout 60 "$WINE" reg query 'HKCU\Software\SG Test Maker' /v Events 2>/dev/null | tr -d '\r' | awk '/Events/ {print $3}')
+[ "$events" = "14,1,R" ] && pass "a driver that answers the DC's creation with failure hears nothing more, and prints" ||
+    fail "after failure at CreateDC: $events"
+
+page() { printf 'SGM START printdrv probe data=SG data v1 time=ok density=%s job=ok glyphs=ok\nPAGE 1 200x100 dark=5000 box=20,10-119,59\nSGM END' "$1"; }
 for b in 64 32; do
     rm -f "$T/LPT1.out" "$T/LPT2.out"
     run "C:\\probe$b.exe" print "Maker Printer" >/dev/null
     out=$(tr -d '\r' < "$T/LPT1.out" 2>/dev/null)
-    [ "$out" = "$expect" ] && pass "$b-bit: the page reached the driver's own surface, its WritePrinter reached the port" ||
+    [ "$out" = "$(page 3)" ] &&
+        pass "$b-bit: the page reached the driver's own surface, its WritePrinter reached the port, it found its job" ||
         { fail "$b-bit: the maker-style driver's output is not the page"; printf '      %s\n' "$out"; }
+done
+
+# a 32-bit program and the 64-bit driver: our print host answers for its
+# configuration DLL (settings, papers) and gives it its job
+out=$(run 'C:\probe32.exe' papers "Maker Printer")
+[ "$out" = "paper 257 533x279 SG Maker 2x1" ] && pass "32-bit: the 64-bit configuration DLL's papers, through the print host" ||
+    fail "32-bit DeviceCapabilities: $out"
+rm -f "$T/LPT1.out"
+out=$(run 'C:\probe32.exe' printd "Maker Printer" 7)
+pages=$(tr -d '\r' < "$T/LPT1.out" 2>/dev/null)
+[ "$out" = "devmode 220+8
+printd ok" ] && [ "$pages" = "$(page 7)" ] &&
+    pass "32-bit: the driver's own settings, from the print host, reach the driver" ||
+    { fail "32-bit: the driver's own settings: $out"; printf '      %s\n' "$pages"; }
+for b in 64 32; do
+    rm -f "$T/LPT1.out"
+    out=$(run "C:\\probe$b.exe" printd "Maker Printer")
+    pages=$(tr -d '\r' < "$T/LPT1.out" 2>/dev/null)
+    [ "$out" = "printd ok" ] && [ "$pages" = "$(page 3)" ] &&
+        pass "$b-bit: a program's public settings alone are merged into the driver's own" ||
+        { fail "$b-bit: public settings alone: $out"; printf '      %s\n' "$pages"; }
 done
 
 run 'C:\probe64.exe' print "Core Printer" >/dev/null

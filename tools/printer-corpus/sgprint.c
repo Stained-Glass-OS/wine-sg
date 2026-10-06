@@ -412,7 +412,9 @@ static BOOL CALLBACK find_sheet( HWND hwnd, LPARAM lparam )
     RECT rect, best;
     HWND *found = (HWND *)lparam;
 
-    if (pid != GetCurrentProcessId() || wcscmp( cls, L"#32770" ) || !IsWindowVisible( hwnd )) return TRUE;
+    /* a 32-bit program's sheet for a 64-bit driver is shown by the print host */
+    if ((pid != GetCurrentProcessId() && !GetEnvironmentVariableW( L"SG_PROPS_ANY", NULL, 0 )) ||
+        wcscmp( cls, L"#32770" ) || !IsWindowVisible( hwnd )) return TRUE;
     /* the biggest: some drivers show a dialog of their own over the sheet */
     GetWindowRect( hwnd, &rect );
     if (*found)
@@ -431,6 +433,7 @@ static DWORD WINAPI press_ok( void *arg )
     HWND sheet = NULL, tab;
     TCITEMW item;
     int i, count;
+    DWORD pid;
 
     if (!GetEnvironmentVariableW( L"SG_PROPS_WAIT", wait, ARRAY_SIZE(wait) )) return 0;
     for (i = 0; i < 600 && !sheet; i++)
@@ -448,7 +451,9 @@ static DWORD WINAPI press_ok( void *arg )
     tab = (HWND)SendMessageW( sheet, PSM_GETTABCONTROL, 0, 0 );
     count = tab ? SendMessageW( tab, TCM_GETITEMCOUNT, 0, 0 ) : 0;
     printf( "sheet %ls tabs %d:", title, count );
-    for (i = 0; i < count; i++)
+    GetWindowThreadProcessId( sheet, &pid );
+    if (pid != GetCurrentProcessId()) printf( " (host)" );
+    for (i = 0; i < count && pid == GetCurrentProcessId(); i++)
     {
         item.mask = TCIF_TEXT;
         item.pszText = text;

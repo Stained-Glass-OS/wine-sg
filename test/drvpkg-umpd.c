@@ -8,9 +8,15 @@
  *   - reads its data file with EngGetPrinterDataFileName, EngLoadModule and
  *     EngMapModule, and asks the time (EngQueryLocalTime);
  *   - is its own configuration DLL and, like makers' ones, reads the printer
- *     through the handle DocumentProperties gives it.
+ *     through the handle DocumentProperties gives it;
+ *   - hears GDI's document events (DrvDocumentEvent) and notes them;
+ *   - keeps a setting of its own (a density) behind the public settings,
+ *     refuses a DEVMODE without it, and looks its job up (GetJob) when the
+ *     document starts, as makers' do.
  * Its report, written to the printer:
  *   SGM START <document> data=<first line of the data file> time=<ok|bad>
+ *             density=<its own setting> job=<ok|missing>
+ *             glyphs=<ok|bad|none: EngComputeGlyphSet's answer for 1252>
  *   PAGE <n> <width>x<height> dark=<pixels> box=<l>,<t>-<r>,<b>
  *   SGM END
  * Our own code. */
@@ -48,6 +54,8 @@ typedef struct
 typedef struct { ULONG iUniq; RECTL rclBounds; BYTE iDComplexity, iFComplexity, iMode, fjOptions; } CLIPOBJ;
 typedef struct { ULONG iUniq; ULONG flXlate; USHORT iSrcType, iDstType; ULONG cEntries; ULONG *pulXlate; } XLATEOBJ;
 typedef struct { USHORT y, mo, d, h, mi, s, ms, wd; } ENG_TIME_FIELDS;
+typedef struct { WCHAR wcLow; USHORT cGlyphs; ULONG *phg; } WCRUN;
+typedef struct { ULONG cjThis, flAccel, cGlyphsSupported, cRuns; WCRUN awcrun[1]; } FD_GLYPHSET;
 
 #define BMF_1BPP 1
 #define BMF_TOPDOWN 1
@@ -69,6 +77,7 @@ HANDLE WINAPI EngLoadModule( WCHAR * );
 void *WINAPI EngMapModule( HANDLE, ULONG * );
 void WINAPI EngFreeModule( HANDLE );
 void WINAPI EngQueryLocalTime( ENG_TIME_FIELDS * );
+FD_GLYPHSET *WINAPI EngComputeGlyphSet( INT, INT, INT );
 HANDLE WINAPI EngCreateSemaphore( void );
 void WINAPI EngAcquireSemaphore( HANDLE );
 void WINAPI EngReleaseSemaphore( HANDLE );
@@ -84,7 +93,65 @@ struct pdev
     HANDLE sem;
     char data[64];
     int page;
+    int density;
+    const char *glyphs;
 };
+
+/* its device font's characters, from a code page, as Zebra's driver asks:
+ * the euro sign is 0x80 and 'A' 0x41 in code page 1252 */
+static const char *check_glyphs( void )
+{
+    FD_GLYPHSET *set = EngComputeGlyphSet( 1252, 32, 224 );
+    ULONG i, j, total = 0, euro = 0, a = 0;
+
+    if (!set) return "none";
+    for (i = 0; i < set->cRuns; i++)
+    {
+        for (j = 0; j < set->awcrun[i].cGlyphs; j++)
+        {
+            WCHAR wc = set->awcrun[i].wcLow + j;
+            if (wc == 0x20ac) euro = set->awcrun[i].phg[j];
+            if (wc == 'A') a = set->awcrun[i].phg[j];
+        }
+        total += set->awcrun[i].cGlyphs;
+    }
+    return total == set->cGlyphsSupported && total > 200 && euro == 0x80 && a == 0x41 ? "ok" : "bad";
+}
+
+/* the driver's own settings, after the public ones */
+struct sgpriv
+{
+    DWORD magic;
+    DWORD density;
+};
+#define SGPRIV_MAGIC 0x4b4d4753 /* SGMK */
+
+static const struct sgpriv *private_settings( const DEVMODEW *dm )
+{
+    const struct sgpriv *priv;
+
+    if (!dm || dm->dmDriverExtra < sizeof(*priv)) return NULL;
+    priv = (const struct sgpriv *)((const BYTE *)dm + dm->dmSize);
+    return priv->magic == SGPRIV_MAGIC ? priv : NULL;
+}
+
+/* what happens, in order, in HKCU\Software\SG Test Maker, value Events:
+ * GDI's document events (DrvDocumentEvent, their numbers) and R when the
+ * job is rendered */
+static void note_event( const WCHAR *what )
+{
+    WCHAR events[512] = L"";
+    DWORD size = sizeof(events) - 64;
+    HKEY key;
+
+    if (RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\SG Test Maker", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key,
+                         NULL )) return;
+    if (RegQueryValueExW( key, L"Events", NULL, NULL, (BYTE *)events, &size )) events[0] = 0;
+    if (events[0]) lstrcatW( events, L"," );
+    lstrcatW( events, what );
+    RegSetValueExW( key, L"Events", 0, REG_SZ, (BYTE *)events, (lstrlenW( events ) + 1) * sizeof(WCHAR) );
+    RegCloseKey( key );
+}
 
 static void out( struct pdev *p, const char *s )
 {
@@ -102,11 +169,16 @@ static void *WINAPI enable_pdev( DEVMODEW *dm, WCHAR *addr, ULONG npat, void **p
     /* GDI asks for the six hatch brushes; makers' drivers fill the array in
      * without looking (OKI's) */
     if (npat < 6 || !pats) return NULL;
+    /* like Brother's label printers' driver, it cannot work without its own
+     * settings: GDI hands it a DEVMODE the driver has merged them into */
+    if (!private_settings( dm )) return NULL;
     for (i = 0; i < npat; i++) pats[i] = NULL;
     p = calloc( 1, sizeof(*p) );
 
     p->printer = driver;
     p->hdev = hdev;
+    p->density = private_settings( dm )->density;
+    p->glyphs = check_glyphs();
     memset( gi, 0, cjcaps );
     gi->ulVersion = 0x5000;
     gi->ulTechnology = DT_RASPRINTER;
@@ -195,11 +267,16 @@ static BOOL WINAPI start_doc( SURFOBJ *so, WCHAR *doc, DWORD job )
 {
     struct pdev *p = so->dhpdev;
     ENG_TIME_FIELDS t;
-    char buf[300];
+    char buf[300], density[16];
+    DWORD needed = 0;
 
+    note_event( L"R" );
     EngQueryLocalTime( &t );
-    snprintf( buf, sizeof(buf), "SGM START %ls data=%s time=%s\n", doc ? doc : L"", p->data,
-              t.y >= 2020 && t.mo >= 1 && t.mo <= 12 ? "ok" : "bad" );
+    snprintf( density, sizeof(density), "%d", p->density );
+    GetJobW( p->printer, job, 1, NULL, 0, &needed );
+    snprintf( buf, sizeof(buf), "SGM START %ls data=%s time=%s density=%s job=%s glyphs=%s\n", doc ? doc : L"",
+              p->data, t.y >= 2020 && t.mo >= 1 && t.mo <= 12 ? "ok" : "bad", density, needed ? "ok" : "missing",
+              p->glyphs );
     out( p, buf );
     return TRUE;
 }
@@ -282,7 +359,7 @@ DWORD WINAPI DrvDeviceCapabilities( HANDLE printer, WCHAR *name, WORD cap, void 
     case DC_PAPERSIZE: if (output) { ((POINT *)output)->x = 533; ((POINT *)output)->y = 279; } return 1;
     case DC_PAPERNAMES: if (output) lstrcpyW( output, L"SG Maker 2x1" ); return 1;
     case DC_SIZE: return sizeof(DEVMODEW);
-    case DC_EXTRA: return 0;
+    case DC_EXTRA: return sizeof(struct sgpriv);
     }
     return 0;
 }
@@ -293,7 +370,9 @@ typedef struct { WORD cbSize, Reserved; HANDLE hPrinter; LPCWSTR pszPrinterName;
 LONG WINAPI DrvDocumentPropertySheets( void *info, LPARAM lparam )
 {
     DOCPROPHDR *dph = (DOCPROPHDR *)lparam;
-    DEVMODEW dm;
+    struct { DEVMODEW dm; struct sgpriv priv; } full;
+    const struct sgpriv *in;
+#define dm full.dm
 
     if (info || !dph) return 1;
     if (!printer_readable( dph->hPrinter )) return -1;
@@ -304,13 +383,47 @@ LONG WINAPI DrvDocumentPropertySheets( void *info, LPARAM lparam )
     dm.dmPaperSize = 257;
     dm.dmCopies = 1;
     lstrcpynW( dm.dmDeviceName, dph->pszPrinterName, CCHDEVICENAME );
+    dm.dmDriverExtra = sizeof(full.priv);
+    full.priv.magic = SGPRIV_MAGIC;
+    full.priv.density = 3;
     if (!dph->fMode || !dph->pdmOut)
     {
-        dph->cbOut = sizeof(dm);
-        return sizeof(dm);
+        dph->cbOut = sizeof(full);
+        return sizeof(full);
     }
     if ((dph->fMode & DM_IN_BUFFER) && dph->pdmIn && (dph->pdmIn->dmFields & DM_COPIES))
         dm.dmCopies = dph->pdmIn->dmCopies;
-    memcpy( dph->pdmOut, &dm, sizeof(dm) );
+    if ((dph->fMode & DM_IN_BUFFER) && (in = private_settings( dph->pdmIn ))) full.priv.density = in->density;
+    memcpy( dph->pdmOut, &full, sizeof(full) );
     return 1;
+#undef dm
+}
+
+/* a new printer: the driver makes its own registry entry, as makers'
+ * drivers do (Epson's); a deleted one: it takes it away */
+BOOL WINAPI DrvPrinterEvent( WCHAR *name, INT event, DWORD flags, LPARAM lparam )
+{
+    HKEY key;
+
+    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"Software\\SG Test Maker\\Printers", 0, NULL, 0, KEY_ALL_ACCESS, NULL,
+                         &key, NULL )) return FALSE;
+    if (event == 3 /* PRINTER_EVENT_INITIALIZE */)
+        RegSetValueExW( key, name, 0, REG_SZ, (BYTE *)L"initialized", sizeof(L"initialized") );
+    else if (event == 4 /* PRINTER_EVENT_DELETE */)
+        RegDeleteValueW( key, name );
+    RegCloseKey( key );
+    return TRUE;
+}
+
+int WINAPI DrvDocumentEvent( HANDLE printer, HDC hdc, int esc, ULONG cb_in, void *in, ULONG cb_out, void *out )
+{
+    WCHAR num[16];
+
+    wsprintfW( num, L"%d", esc );
+    note_event( num );
+    /* like Brother's and HP's, for a printer it has nothing to do for it
+     * answers the DC's creation with failure: it hears nothing more */
+    if (esc == 1 /* DOCUMENTEVENT_CREATEDCPRE */ && in && wcsstr( ((WCHAR **)in)[1], L"Quiet" ))
+        return -1; /* DOCUMENTEVENT_FAILURE */
+    return 1; /* DOCUMENTEVENT_SUCCESS */
 }

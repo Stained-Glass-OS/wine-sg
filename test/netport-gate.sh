@@ -1,7 +1,7 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
 # Printers on the network through a Windows driver, and what the printer
-# says back (patches/sg/1029): printers of our own on 127.0.0.1
+# says back (patches/sg/1029, 1034): printers of our own on 127.0.0.1
 # (test/netport-server.py: raw TCP, LPR, IPP) and a PostScript package
 # with a language monitor of our own (test/langmon-monitor.c):
 #   - Standard TCP/IP ports are made through the monitor's Xcv interface
@@ -138,10 +138,15 @@ run 'C:\sgp64.exe' add "Net Raw" "SG Net PS" IP_SGRAW >/dev/null
 run 'C:\sgp64.exe' add "Net LPR" "SG Net PS" IP_SGLPR >/dev/null
 run 'C:\sgp64.exe' add "Net IPP" "SG Net PS" "ipp://127.0.0.1:$IPP/ipp/print" >/dev/null
 
+timeout 60 "$WINE" reg delete 'HKCU\Software\SG Test LM' /f >/dev/null 2>&1
 out=$(run 'C:\sgp64.exe' print "Net Raw")
 case "$out" in "print ok"*) pass "a job to the raw printer" ;; *) fail "raw print: $out" ;; esac
-head -1 "$T/net/raw.bin" 2>/dev/null | grep -q "^<SGLM job [0-9]*>$" && pass "the job went through the language monitor" ||
-    fail "no language monitor wrap: $(head -c 30 "$T/net/raw.bin" 2>/dev/null | od -c | head -1)"
+inits=$(timeout 60 "$WINE" reg query 'HKCU\Software\SG Test LM' /v Inits 2>/dev/null | tr -d '\r' | awk '/Inits/ {print $3}')
+[ "$inits" = 0x1 ] && pass "the language monitor stays loaded once loaded, as Windows keeps it" ||
+    fail "the language monitor was initialized $inits times for one job"
+head -1 "$T/net/raw.bin" 2>/dev/null | grep -q "^<SGLM job [0-9]* reg=ok>$" &&
+    pass "the job went through the language monitor, which read its settings through its MONITORINIT" ||
+    fail "no language monitor wrap: $(head -1 "$T/net/raw.bin" 2>/dev/null | head -c 60)"
 grep -a -q '%!PS-Adobe' "$T/net/raw.bin" 2>/dev/null && tail -c 9 "$T/net/raw.bin" | grep -q "</SGLM>" &&
     pass "the raw printer got the whole PostScript job" || fail "the raw printer's data"
 out=$(run 'C:\sgp64.exe' status "Net Raw")
