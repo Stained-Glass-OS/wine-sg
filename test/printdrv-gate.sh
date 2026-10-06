@@ -126,11 +126,19 @@ cat > "$S/sgtestuni.inf_1/sgtest.gpd" <<'EOF'
     *Option: L3x1
     {
         *Name: "SG Label 3 x 1"
-        *OptionID: 301
+        *OptionID: 258
         *PageDimensions: PAIR(300, 100)
         *PrintableArea: PAIR(300, 100)
         *PrintableOrigin: PAIR(0, 0)
         *Command: CmdSelect { *Order: DOC_SETUP.5 *Cmd: "<1B>P2" }
+    }
+    *Option: L4x1
+    {
+        *Name: "SG Label 4 x 1"
+        *PageDimensions: PAIR(400, 100)
+        *PrintableArea: PAIR(400, 100)
+        *PrintableOrigin: PAIR(0, 0)
+        *Command: CmdSelect { *Order: DOC_SETUP.5 *Cmd: "<1B>P3" }
     }
 }
 *Feature: ColorMode
@@ -258,8 +266,10 @@ out=$(run 'C:\probe64.exe' papers "UMPD Printer")
 [ "$out" = "paper 256 533x279 SG Test 2x1" ] && pass "the driver's configuration DLL answers DeviceCapabilities" ||
     fail "DeviceCapabilities: $out"
 out=$(run 'C:\probe64.exe' papers "Unidrv Printer" | tr '\n' ';')
-[ "$out" = "paper 300 508x254 SG Label 2 x 1;paper 301 762x254 SG Label 3 x 1;" ] &&
-    pass "Unidrv lists the GPD's papers" || fail "Unidrv papers: $out"
+# a paper without an OptionID gets one no other paper has (lw5xx.gpd's
+# seventh paper met its 262)
+[ "$out" = "paper 300 508x254 SG Label 2 x 1;paper 258 762x254 SG Label 3 x 1;paper 261 1016x254 SG Label 4 x 1;" ] &&
+    pass "Unidrv lists the GPD's papers, each with its own id" || fail "Unidrv papers: $out"
 
 expect_umpd='SGTD START printdrv probe
 PAGE 1 200x100 dark=5000 box=20,10-119,59

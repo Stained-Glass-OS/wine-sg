@@ -143,13 +143,15 @@ EOF
 cp "$T/win.ppd" "$T/root/ppd/SGLabel_Windows.ppd"
 start_cups
 
-# a Linux program's PDF: a 2 x 1 inch page, a black box 0.2,0.1-1.2,0.6 inch
-python3 - "$T/job.pdf" <<'EOF'
+# a Linux program's PDF: one page W x H points with a black rectangle
+mkpdf() {
+    python3 - "$@" <<'EOF'
 import sys
-content = b"0 g 14.4 35.89 72 36 re f\n"
+out_file, w, h, rect = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+content = b"0 g " + rect.encode() + b" re f\n"
 objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 151.09 79.09] /Contents 4 0 R >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %s %s] /Contents 4 0 R >>" % (w.encode(), h.encode()),
         b"<< /Length %d >>\nstream\n" % len(content) + content + b"endstream"]
 out = b"%PDF-1.4\n"; offs = []
 for i, o in enumerate(objs):
@@ -157,25 +159,48 @@ for i, o in enumerate(objs):
 x = len(out)
 out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1) + b"".join(b"%010d 00000 n \n" % o for o in offs)
 out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, x)
-open(sys.argv[1], "wb").write(out)
+open(out_file, "wb").write(out)
 EOF
-lp -d SGLabel_Windows -o PageSize=P256 "$T/job.pdf" >/dev/null 2>&1 || fail "lp refused the job"
-i=0; while [ $i -lt 90 ]; do
-    grep -q 'SGLabel_Windows.*Job [0-9]* completed\|Job [0-9]*\] Job completed' "$T/log/error_log" 2>/dev/null &&
-        [ "$(grep -c 'Job completed' "$T/log/error_log")" -ge 2 ] && break
-    sleep 1; i=$((i + 1))
-done
-raw=""
-for f in "$T/spool"/d*-001; do head -1 "$f" 2>/dev/null | grep -q '^SGTD START' && raw=$f; done
-page=$(grep -a '^PAGE' "$raw" 2>/dev/null | tr -d '\r')
-dark=$(printf '%s' "$page" | sed -n 's/.*dark=\([0-9]*\).*/\1/p')
-box=$(printf '%s' "$page" | sed -n 's/.* box=\(.*\)/\1/p')
+}
+# prints a PDF on the queue and leaves the driver's page report in $page
+lpjob() {
+    _done=$(grep -c 'Job completed' "$T/log/error_log" 2>/dev/null)
+    rm -f "$T/spool"/d*-001
+    lp -d SGLabel_Windows "$@" >/dev/null 2>&1 || fail "lp refused the job"
+    i=0; while [ $i -lt 90 ]; do
+        [ "$(grep -c 'Job completed' "$T/log/error_log" 2>/dev/null)" -ge $((_done + 2)) ] && break
+        sleep 1; i=$((i + 1))
+    done
+    raw=""
+    for f in "$T/spool"/d*-001; do head -1 "$f" 2>/dev/null | grep -q '^SGTD START' && raw=$f; done
+    page=$(grep -a '^PAGE' "$raw" 2>/dev/null | tr -d '\r')
+    dark=$(printf '%s' "$page" | sed -n 's/.*dark=\([0-9]*\).*/\1/p')
+    box=$(printf '%s' "$page" | sed -n 's/.* box=\(.*\)/\1/p')
+}
+
+# a 2 x 1 inch page, a black box 0.2,0.1-1.2,0.6 inch, on the PPD's paper
+mkpdf "$T/job.pdf" 151.09 79.09 "14.4 35.89 72 36"
+lpjob -o PageSize=P256 "$T/job.pdf"
 if [ -n "$raw" ] && [ -n "$dark" ] && [ "$dark" -ge 4700 ] && [ "$dark" -le 5300 ] &&
+   case "$page" in "PAGE 1 200x100 "*) true ;; *) false ;; esac &&
    case "$box" in 1[4-6],[4-6]-11[3-5],5[3-5]) true ;; *) false ;; esac; then
     pass "the Linux program's page came out of the Windows driver: $page"
 else
     fail "the Windows driver's output for the Linux job: '${page:-none}'"
     grep -a 'Job [0-9]' "$T/log/error_log" 2>/dev/null | grep -v 'argv\|envp' | tail -12 | sed 's/^/      /'
+fi
+
+# the label laid out across (1 x 2 inch, a box 0.1,0.2-0.6,1.2 inch), the
+# paper named by size alone (Firefox's PageSize=Custom.WxH): the driver's
+# paper of that size, turned
+mkpdf "$T/across.pdf" 79.09 151.09 "7.2 64.69 36 72"
+lpjob -o PageSize=Custom.79.09x151.09 "$T/across.pdf"
+if [ -n "$raw" ] && [ -n "$dark" ] && [ "$dark" -ge 4700 ] && [ "$dark" -le 5300 ] &&
+   case "$page" in "PAGE 1 100x200 "*) true ;; *) false ;; esac &&
+   case "$box" in [4-6],1[4-6]-5[3-5],11[3-5]) true ;; *) false ;; esac; then
+    pass "a page laid out across prints on the driver's paper of its size, turned: $page"
+else
+    fail "the page laid out across: '${page:-none}'"
 fi
 
 [ $RC = 0 ] && echo "linuxdrv gate: PASS" || echo "linuxdrv gate: FAIL"

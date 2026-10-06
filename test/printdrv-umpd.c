@@ -1,5 +1,6 @@
 /* A tiny user-mode printer graphics driver of our own, for the printdrv gate
- * (patches/sg/0920-0925).  It describes a 2 x 1 inch device at 100 dpi,
+ * (patches/sg/0920-0925).  It describes a 2 x 1 inch device at 100 dpi
+ * (1 x 2 turned, landscape),
  * draws nothing itself (GDI's engine draws the pages into its surface), and
  * writes a text report of each page to the printer with EngWritePrinter:
  *   SGTD START <document>
@@ -53,6 +54,7 @@ struct pdev
     void *hdev;
     void *surface;
     int page;
+    BOOL turned;
 };
 
 static void out( struct pdev *p, const char *s )
@@ -70,6 +72,7 @@ static void *WINAPI enable_pdev( DEVMODEW *dm, WCHAR *addr, ULONG npat, void **p
     memset( gi, 0, cjcaps );
     gi->ulVersion = 0x5000;
     gi->ulTechnology = DT_RASPRINTER;
+    p->turned = dm && (dm->dmFields & DM_ORIENTATION) && dm->dmOrientation == DMORIENT_LANDSCAPE;
     gi->ulHorzSize = 51; gi->ulVertSize = 25;
     gi->ulHorzRes = 200; gi->ulVertRes = 100;
     gi->cBitsPixel = 24; gi->cPlanes = 1; gi->ulNumColors = (ULONG)-1;
@@ -78,6 +81,12 @@ static void *WINAPI enable_pdev( DEVMODEW *dm, WCHAR *addr, ULONG npat, void **p
     gi->ulAspectX = gi->ulAspectY = 100; gi->ulAspectXY = 141;
     gi->szlPhysSize.cx = 210; gi->szlPhysSize.cy = 110;
     gi->ptlPhysOffset.x = 5; gi->ptlPhysOffset.y = 5;
+    if (p->turned)
+    {
+        gi->ulHorzSize = 25; gi->ulVertSize = 51;
+        gi->ulHorzRes = 100; gi->ulVertRes = 200;
+        gi->szlPhysSize.cx = 110; gi->szlPhysSize.cy = 210;
+    }
     memset( di, 0, cjdev );
     di->iDitherFormat = BMF_24BPP;
     return p;
@@ -88,7 +97,7 @@ static void WINAPI disable_pdev( struct pdev *p ) { free( p ); }
 
 static void *WINAPI enable_surface( struct pdev *p )
 {
-    SIZEL size = { 200, 100 };
+    SIZEL size = { p->turned ? 100 : 200, p->turned ? 200 : 100 };
     p->surface = EngCreateBitmap( size, 600, BMF_24BPP, BMF_TOPDOWN, NULL );
     EngAssociateSurface( p->surface, p->hdev, 0 );
     return p->surface;
@@ -197,6 +206,8 @@ LONG WINAPI DrvDocumentPropertySheets( void *info, LPARAM lparam )
     }
     if (dph->pdmIn && (dph->fMode & DM_IN_BUFFER) && (dph->pdmIn->dmFields & DM_COPIES))
         dm.dmCopies = dph->pdmIn->dmCopies;
+    if (dph->pdmIn && (dph->fMode & DM_IN_BUFFER) && (dph->pdmIn->dmFields & DM_ORIENTATION))
+        dm.dmOrientation = dph->pdmIn->dmOrientation;
     memcpy( dph->pdmOut, &dm, sizeof(dm) );
     return 1;
 }
