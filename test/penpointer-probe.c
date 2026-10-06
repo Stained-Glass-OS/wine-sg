@@ -7,7 +7,8 @@
  *   wintab devices=N pressure-max=M   Wintab's device (WTInfo)
  *   wintab packet pressure=P          WT_PACKET
  *   wheel delta=D | hwheel delta=D | ctrl-wheel delta=D
- * then "ready". It runs until killed. */
+ * then "ready". It runs until killed. PENPROBE_TOUCH_DEFPROC: touches' pointer
+ * messages go on to DefWindowProc. */
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <stdio.h>
@@ -84,6 +85,9 @@ static LRESULT CALLBACK wndproc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
                  GetPointerDeviceRects( pen.pointerInfo.sourceDevice, &dev, &disp ), pen.pointerInfo.ptPixelLocation.x );
         fflush( out );
         moves_after_pointer = 1;
+        /* PENPROBE_TOUCH_DEFPROC: touches left to DefWindowProc, as most
+         * programs leave them (wine-sg 1150: the mouse, the wheel) */
+        if (type == PT_TOUCH && GetEnvironmentVariableA( "PENPROBE_TOUCH_DEFPROC", NULL, 0 )) break;
         return 0;
     }
     case WM_LBUTTONDOWN:

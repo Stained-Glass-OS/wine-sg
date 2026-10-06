@@ -12,14 +12,16 @@
 #        a full-screen program's (whose cursor clipping grabs the pointer).
 #        Before: no pointer message, GetPointerPenInfo failed -- no pressure.
 #  1001: two fingers scroll (the mouse wheel) and pinch (Ctrl+wheel); one
-#        finger still clicks. Before: a second finger did nothing.
+#        finger still clicks. Before: a second finger did nothing. (Since
+#        1150 for a program leaving touches to DefWindowProc: the probe does
+#        so here, PENPROBE_TOUCH_DEFPROC; test/touch-gate.sh tests the rest.)
 #
 #   WINE=<build>/wine WINESERVER=<build>/server/wineserver test/pentouch-gate.sh
 #   SG_COMPOSITOR_SRC=<sg-compositor checkout> (default: beside this repo)
 #
 # Mutants (each must fail it): SG_MUTANT_NO_PEN_POINTER (winex11 mouse.c),
 # SG_MUTANT_NO_POINTER_INFO (win32u message.c), SG_MUTANT_NO_PEN_QUEUE
-# (server queue.c), SG_MUTANT_NO_TOUCH_SCROLL (winex11 mouse.c).
+# (server queue.c), SG_MUTANT_NO_GESTURE (win32u input.c, since 1150).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -123,7 +125,7 @@ grep '^pointer update' "$L" | grep -q 'type=3 ok=1 pressure=717 tiltx=20 tilty=-
 # --- 1001: one finger clicks, two scroll, a pinch zooms ---
 start
 L=$T/touch.log
-probe "$L" PENPROBE_WINDOWED=1 PENPROBE_NOWINTAB=1
+probe "$L" PENPROBE_WINDOWED=1 PENPROBE_NOWINTAB=1 PENPROBE_TOUCH_DEFPROC=1
 feed "tdown 1 0.5 0.5" "tup 1"
 cp "$L" "$T/tap.log"
 steps=""
@@ -143,7 +145,7 @@ feed "tdown 1 0.45 0.5" "tdown 2 0.55 0.5"
 IFS='|'; set -- $steps; unset IFS; shift; feed "$@"
 feed "tup 1" "tup 2"
 finish
-grep -q '^mouse ldown' "$T/tap.log" && grep -q '^mouse lup' "$T/tap.log" && pass "a tap is a click (the X server's pointer, wine-sg 0783)" \
+grep -q '^mouse ldown' "$T/tap.log" && grep -q '^mouse lup' "$T/tap.log" && pass "a tap is a click (the server's promotion of a touch, wine-sg 1150)" \
     || fail "a tap did not click: $(grep -c '^mouse' "$T/tap.log") mouse messages"
 n=$(grep -c '^wheel delta=120.\?$' "$T/pan.log")
 [ "$n" -ge 3 ] && pass "two fingers moving down scroll the page up: $n wheel notches" \
