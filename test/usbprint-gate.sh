@@ -21,13 +21,17 @@
 #   0877 kernelbase: the user's country by name (GEO_NAME, GEO_FRIENDLYNAME)
 #   0878 prntvpt, wineps: a print ticket's custom size (a label's printable
 #        area, landscape) prints on the PPD's page of that label
+#   0879 winspool: a printer whose driver needs an update, opened by a user
+#        who may not clear its Status (the key read-only, as the machine's
+#        printer keys are to a standard user), opens -- the update, which
+#        opens the printer again, recursed until the stack ran out
 #
 #   WINE=/opt/wine-sg/bin/wine test/usbprint-gate.sh
 # Mutation (each makes its check fail): -DSG_MUTANT_USBCLAIM (wineusb.sys),
 # -DSG_MUTANT_USBPRINT_SHARE (usbprint.sys), -DSG_MUTANT_CMDEVNODEPROP and
 # -DSG_MUTANT_CMGETPARENT (setupapi, ntoskrnl), -DSG_MUTANT_PNPDATA and
 # -DSG_MUTANT_USERDEVICES (winspool), -DSG_MUTANT_GEONAME (kernelbase),
-# -DSG_MUTANT_PAPERMATCH (prntvpt, wineps).
+# -DSG_MUTANT_PAPERMATCH (prntvpt, wineps), -DSG_MUTANT_DRIVERLOOP (winspool).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -57,7 +61,7 @@ cc -O2 -shared -fPIC -Wl,-soname,libusb-1.0.so.0 -o "$T/lib/libusb-1.0.so.0" "$H
     { echo "FAIL  the simulated printer did not build"; exit 1; }
 for m in "$MINGW:64" "$MINGW32:32"; do
     "${m%:*}" -municode -O2 -o "$T/probe${m#*:}.exe" "$HERE/usbprint-probe.c" \
-        -lsetupapi -lcfgmgr32 -lwinspool -lprntvpt -lole32 -lgdi32 || { echo "FAIL  probe did not build"; exit 1; }
+        -lsetupapi -lcfgmgr32 -lwinspool -lprntvpt -lole32 -lgdi32 -ladvapi32 || { echo "FAIL  probe did not build"; exit 1; }
 done
 
 # a CUPS server of the gate's own, with the printer's queue on its USB URI
@@ -140,12 +144,6 @@ EOF
 "$CUPSD" -f -c "$T/root/cupsd.conf" -s "$T/root/cups-files.conf" > "$T/cupsd.out" 2>&1 & CP=$!
 i=0; while [ ! -S "$T/cups.sock" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
 [ -S "$T/cups.sock" ] || { echo "SKIP: the gate's CUPS server did not start"; cat "$T/cupsd.out"; exit 77; }
-Q=Test_Label_Printer
-"$LPADMIN" -p $Q -E -v 'usb://Stained%20Glass/Test%20Label%20Printer?serial=SG0001' -P "$T/label.ppd" 2>"$T/lpadmin.err"
-lpstat -v $Q >/dev/null 2>&1 || { echo "SKIP: the gate's CUPS server did not take the queue: $(cat "$T/lpadmin.err")"; exit 77; }
-# the queue on disk before Wine starts: winspool remakes the printers when
-# CUPS's printers.conf changes (0873), and a remake mid-test is not the test
-i=0; while ! grep -q "<Printer $Q>" "$T/root/printers.conf" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.2; i=$((i + 1)); done
 
 # the prefix's server, and the drivers it starts, stay up for the whole
 # test: started by a probe, they would hold the probe's output open
@@ -153,7 +151,18 @@ mkdir -p "$WINEPREFIX"
 "$WINESERVER" -p >/dev/null 2>&1
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 cp "$T/probe64.exe" "$T/probe32.exe" "$WINEPREFIX/drive_c/"
-run() { (cd "$WINEPREFIX/drive_c" && timeout 120 "$WINE" "$@" > "$T/run.out" 2>"$T/run.err"); [ -n "${SG_WINEDEBUG:-}" ] && grep -v "^$" "$T/run.err" | tail -n 40 >&2; tr -d '\r' < "$T/run.out"; }
+
+# the queues, added once the prefix is made (as a printer plugged in during a
+# session; the first program after makes them Windows printers, 0873)
+Q=Test_Label_Printer
+"$LPADMIN" -p $Q -E -v 'usb://Stained%20Glass/Test%20Label%20Printer?serial=SG0001' -P "$T/label.ppd" 2>"$T/lpadmin.err"
+lpstat -v $Q >/dev/null 2>&1 || { echo "SKIP: the gate's CUPS server did not take the queue: $(cat "$T/lpadmin.err")"; exit 77; }
+# two more, one for each run of the driver update check (it locks the queue's key)
+for b in 64 32; do "$LPADMIN" -p Loop_$b -E -v file:///dev/null -P "$T/label.ppd" 2>/dev/null; done
+# on disk, so that no later write remakes the printers mid-test
+i=0; while ! grep -q "<Printer Loop_32>" "$T/root/printers.conf" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.2; i=$((i + 1)); done
+sleep 1.1
+run() { (cd "$WINEPREFIX/drive_c" && timeout 120 "$WINE" "$@" > "$T/run.out" 2>"$T/run.err"); [ -n "${SG_WINEDEBUG:-}" ] && { echo "=== $*"; cat "$T/run.err"; } >> "${SG_GATE_LOG:-/dev/null}"; tr -d '\r' < "$T/run.out"; }
 v() { printf '%s\n' "$out" | sed -n "s/^$1=//p" | head -n 1; }
 
 for b in 64 32; do
@@ -213,6 +222,17 @@ for b in 64 32; do
         pass "$b-bit: printed on the label's page (PageSize w72h154, landscape)"
     else
         fail "$b-bit: the page printed: $(grep -a -m3 'PageSize\|media=\|PageOrientation' "$ps" 2>/dev/null | tr '\n' ' ') $out"
+    fi
+done
+# a standard user opening a printer whose driver needs an update: the update
+# opens the printer again, and the Status asking for it cannot be cleared
+for b in 64 32; do
+    out=$(run "C:\\probe$b.exe" driverloop Loop_$b)
+    printf '%s\n' "$out" | sed 's/^/      /'
+    if [ "$(v locked)" = ok ] && [ "$(v open)" = ok ] && [ "$(v reopen)" = ok ]; then
+        pass "$b-bit: a printer whose driver update cannot be recorded opens, twice, without recursing"
+    else
+        fail "$b-bit: opening a printer whose driver update cannot be recorded: '$(printf '%s' "$out" | tr '\n' ' ')'"
     fi
 done
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"

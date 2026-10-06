@@ -10,6 +10,9 @@
  *   pnp NAME     GetPrinterDataEx(NAME, "PnPData", DeviceInstanceId/HardwareID)
  *   geo          GetGeoInfo of the user's location: GEO_NAME, GEO_FRIENDLYNAME
  *   devices NAME the [Devices] entry of NAME for this user
+ *   driverloop NAME  NAME's Status asking a driver update, its key then made
+ *                read-only (as the machine's printer keys are to a standard
+ *                user), opened twice: returns, does not recurse (0879)
  *   dc NAME FILE a print ticket asking a custom size (a label's printable
  *                area, landscape) made a DEVMODE (PTConvertPrintTicketToDevMode),
  *                merged by the driver (DocumentProperties), then CreateDC(NULL,
@@ -23,10 +26,14 @@
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <prntvpt.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <string.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#ifndef PRINTER_STATUS_DRIVER_UPDATE_NEEDED
+#define PRINTER_STATUS_DRIVER_UPDATE_NEEDED 0x04000000
+#endif
 #ifndef GEO_NAME
 #define GEO_NAME 17
 #endif
@@ -211,6 +218,42 @@ static int dc(const WCHAR *name, const WCHAR *file)
     return 0;
 }
 
+/* a printer whose driver needs updating, opened by a user who may not write
+ * the machine's printer keys (its key locked read-only, as HKLM is to a
+ * standard user): the open must return, not recurse */
+static int driverloop(const WCHAR *name)
+{
+    WCHAR path[300];
+    HKEY key;
+    DWORD status = 0, size = sizeof(status);
+    PSECURITY_DESCRIPTOR sd;
+    HANDLE h;
+    LONG need;
+
+    swprintf(path, ARRAY_SIZE(path), L"System\\CurrentControlSet\\Control\\Print\\Printers\\%ls", name);
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_ALL_ACCESS, &key)) { printf("key=error\n"); return 1; }
+    RegQueryValueExW(key, L"Status", NULL, NULL, (BYTE *)&status, &size);
+    status |= PRINTER_STATUS_DRIVER_UPDATE_NEEDED;
+    RegSetValueExW(key, L"Status", 0, REG_DWORD, (BYTE *)&status, sizeof(status));
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;KR;;;WD)", SDDL_REVISION_1, &sd, NULL) ||
+        RegSetKeySecurity(key, DACL_SECURITY_INFORMATION, sd)) { printf("lock=error\n"); return 1; }
+    RegCloseKey(key);
+    printf("locked=ok\n");
+
+    if (!OpenPrinterW((WCHAR *)name, &h, NULL)) { printf("open=error %lu\n", GetLastError()); return 1; }
+    printf("open=ok\n");
+    need = DocumentPropertiesW(NULL, h, (WCHAR *)name, NULL, NULL, 0);
+    printf("devmode=%ld\n", need);
+    ClosePrinter(h);
+    if (!OpenPrinterW((WCHAR *)name, &h, NULL)) { printf("reopen=error %lu\n", GetLastError()); return 1; }
+    ClosePrinter(h);
+    printf("reopen=ok\n");
+    status = 0; size = sizeof(status);
+    RegGetValueW(HKEY_LOCAL_MACHINE, path, L"Status", RRF_RT_REG_DWORD, NULL, &status, &size);
+    printf("status=%#lx\n", status);
+    return 0;
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -219,6 +262,7 @@ int wmain(int argc, WCHAR **argv)
     if (argc > 1 && !wcscmp(argv[1], L"geo")) return geo();
     if (argc > 2 && !wcscmp(argv[1], L"devices")) return devices(argv[2]);
     if (argc > 3 && !wcscmp(argv[1], L"dc")) return dc(argv[2], argv[3]);
-    printf("usage: usbprint-probe usb | pnp NAME | geo | devices NAME | dc NAME FILE\n");
+    if (argc > 2 && !wcscmp(argv[1], L"driverloop")) return driverloop(argv[2]);
+    printf("usage: usbprint-probe usb | pnp NAME | geo | devices NAME | dc NAME FILE | driverloop NAME\n");
     return 2;
 }
