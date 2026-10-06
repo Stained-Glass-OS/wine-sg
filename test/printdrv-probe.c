@@ -4,7 +4,8 @@
  *   printdrv-probe enum                        "enum NAME|DRIVER|PORT|PROCESSOR" per printer
  *   printdrv-probe caps NAME                   "caps HORZRES VERTRES LOGPIXELSX PHYSICALWIDTH OFFSETX"
  *   printdrv-probe papers NAME                 "paper ID WxH NAME" per paper
- *   printdrv-probe print NAME [FORM]           one page: a black box at (20,10)-(120,60), "print ok" */
+ *   printdrv-probe print NAME [FORM [COLOR]]   one page: a black (or COLOR, hex RGB) box at (20,10)-(120,60),
+ *                                              "print ok" */
 #include <stdio.h>
 #include <windows.h>
 #include <winspool.h>
@@ -81,7 +82,7 @@ int wmain( int argc, WCHAR **argv )
         RECT box = { 20, 10, 120, 60 };
         HDC hdc;
 
-        if (size > 0 && argc > 3)
+        if (size > 0 && argc > 3 && argv[3][0])
         {
             dm = calloc( 1, size );
             DocumentPropertiesW( NULL, NULL, argv[2], dm, NULL, DM_OUT_BUFFER );
@@ -92,7 +93,14 @@ int wmain( int argc, WCHAR **argv )
         if (!(hdc = CreateDCW( NULL, argv[2], NULL, dm ))) { printf( "print: no DC %lu\n", GetLastError() ); return 1; }
         if (StartDocW( hdc, &doc ) <= 0) { printf( "print: StartDoc %lu\n", GetLastError() ); return 1; }
         StartPage( hdc );
-        FillRect( hdc, &box, GetStockObject( BLACK_BRUSH ) );
+        if (argc > 4)
+        {
+            DWORD rgb = wcstoul( argv[4], NULL, 16 );
+            HBRUSH brush = CreateSolidBrush( RGB( rgb >> 16, (rgb >> 8) & 0xff, rgb & 0xff ) );
+            FillRect( hdc, &box, brush );
+            DeleteObject( brush );
+        }
+        else FillRect( hdc, &box, GetStockObject( BLACK_BRUSH ) );
         EndPage( hdc );
         if (EndDoc( hdc ) <= 0) { printf( "print: EndDoc %lu\n", GetLastError() ); return 1; }
         DeleteDC( hdc );

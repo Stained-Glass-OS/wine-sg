@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# Unidrv for makers' PCL XL drivers (patches/sg/1024), such as HP's universal
+# Unidrv for makers' PCL XL drivers (patches/sg/1022), such as HP's universal
 # PCL 6 driver: a GPD whose commands are built of value macros from
 # included files (=NAME tokens, a % written in hex as <2525>), more than
 # 128 features, *Personality PCLXL, and a render plug-in that writes the
@@ -28,10 +28,14 @@ trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 RC=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
+# on a failure, what Wine said (a gate that fails only now and then)
+diagnose() { [ $RC = 0 ] && return; echo "--- wineboot: rc $BOOT_RC, ${BOOT_TIME}s; drive_c: $(ls "$C" 2>&1 | tr '\n' ' ')"; tail -3 "$T/wineboot.log"; echo "--- printers:"; run 'C:\probe64.exe' enum 2>/dev/null; echo "--- Wine's errors:"; grep -v "^$" "$T/stderr.log" 2>/dev/null | grep -iv "fixme\|wayland" | tail -15; }
 
 "$MINGW" -shared -O2 -o "$T/sgxlplug.dll" "$HERE/unidrvxl-plugin.c" -lole32 -luuid || { echo "FAIL  plug-in did not build"; exit 1; }
 "$MINGW" -municode -O2 -o "$T/probe64.exe" "$HERE/printdrv-probe.c" -lwinspool -lgdi32 || { echo "FAIL  probe did not build"; exit 1; }
-timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
+BOOT_START=$(date +%s)
+timeout -s KILL 300 "$WINE" wineboot -i >"$T/wineboot.log" 2>&1; BOOT_RC=$?; "$WINESERVER" -w
+BOOT_TIME=$(( $(date +%s) - BOOT_START ))
 C="$WINEPREFIX/drive_c"
 cp "$T/probe64.exe" "$C/"
 
@@ -153,7 +157,7 @@ sgxlr.gpd = 2
 sgxlmac.gpd = 2
 EOF
 
-run() { (cd "$C" && timeout 120 "$WINE" "$@" 2>/dev/null | tr -d '\r'); }
+run() { (cd "$C" && timeout 120 "$WINE" "$@" </dev/null 2>>"$T/stderr.log" | tr -d '\r'); }
 for m in "SG XL Plugin" "SG XL Raster"; do
     out=$(run 'C:\probe64.exe' install "$m")
     [ "$out" = "install 0" ] && pass "\"$m\" installs" || fail "\"$m\" did not install: $out"
@@ -196,5 +200,6 @@ EOF
 [ "$res" = "RASTER 28x100 2800 5000 True" ] && pass "a PCL XL GPD without a drawing plug-in gets the page as one raster block" ||
     fail "the raster block: $res"
 
+diagnose
 [ $RC = 0 ] && echo "unidrvxl gate: PASS" || echo "unidrvxl gate: FAIL"
 exit $RC

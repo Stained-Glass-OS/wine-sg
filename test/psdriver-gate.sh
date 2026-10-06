@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# A printer maker's PostScript driver (patches/sg/1023): a PPD on the
+# A printer maker's PostScript driver (patches/sg/1021): a PPD on the
 # system's PostScript driver (the INF needs PSCRIPT.OEM from NTPRINT.INF).
 # Our own package and PPD; the package also carries a file named
 # PSCRIPT5.DLL, as some makers ship the system's, which must not be used.
@@ -31,11 +31,15 @@ trap '"$WINESERVER" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"' EXIT INT 
 RC=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
+# on a failure, what Wine said (a gate that fails only now and then)
+diagnose() { [ $RC = 0 ] && return; echo "--- wineboot: rc $BOOT_RC, ${BOOT_TIME}s; drive_c: $(ls "$C" 2>&1 | tr '\n' ' ')"; tail -3 "$T/wineboot.log"; echo "--- printers:"; run 'C:\sgp64.exe' enum 2>/dev/null; echo "--- Wine's errors:"; grep -v "^$" "$T/stderr.log" 2>/dev/null | grep -iv "fixme\|wayland" | tail -15; }
 
 SGP="$HERE/../tools/printer-corpus/sgprint.c"
 "$MINGW" -municode -O2 -o "$T/sgp64.exe" "$SGP" -lwinspool -lgdi32 -lsetupapi || { echo "FAIL  probe did not build"; exit 1; }
 "$MINGW32" -municode -O2 -o "$T/sgp32.exe" "$SGP" -lwinspool -lgdi32 -lsetupapi || { echo "FAIL  probe did not build"; exit 1; }
-timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
+BOOT_START=$(date +%s)
+timeout -s KILL 300 "$WINE" wineboot -i >"$T/wineboot.log" 2>&1; BOOT_RC=$?; "$WINESERVER" -w
+BOOT_TIME=$(( $(date +%s) - BOOT_START ))
 C="$WINEPREFIX/drive_c"
 cp "$T/sgp64.exe" "$T/sgp32.exe" "$C/"
 
@@ -152,7 +156,7 @@ sgps.ppd = 1
 PSCRIPT5.DLL = 1
 EOF
 
-run() { (cd "$C" && timeout 120 "$WINE" "$@" 2>/dev/null | tr -d '\r'); }
+run() { (cd "$C" && timeout 120 "$WINE" "$@" </dev/null 2>>"$T/stderr.log" | tr -d '\r'); }
 out=$(run 'C:\sgp64.exe' install "SG Test PS")
 [ "$out" = "install 0" ] && pass "the PostScript package installs" || fail "the PostScript package did not install: $out"
 "$WINESERVER" -w
@@ -195,5 +199,6 @@ out=$(run 'C:\sgp32.exe' print "PS Printer 32" mediatype=257)
 grep -a -q '%%BeginFeature: \*ColorModel' "$T/LPT2.out" 2>/dev/null && pass "32-bit: the job printed through the PPD" ||
     fail "32-bit: $out"
 
+diagnose
 [ $RC = 0 ] && echo "psdriver gate: PASS" || echo "psdriver gate: FAIL"
 exit $RC

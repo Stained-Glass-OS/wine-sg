@@ -8,7 +8,10 @@
 #     another name ("destination,source"), a file compressed for setup
 #     (sgmaker.da_), a file inside the source disk's cabinet, a file for
 #     the system directory (DestinationDirs 66002);
-#   - an undecorated (32-bit Windows) model list is not installed on 64-bit;
+#   - a model an undecorated (32-bit Windows) list names is not installed
+#     on 64-bit when the package carries its own code, is when it is all
+#     data on the core drivers (old makers' PPD packages), and the
+#     decorated list wins when both name a model;
 #   - a package carrying its own copies of the core drivers (UNIDRV.DLL)
 #     gets ours;
 #   - the driver (drvpkg-umpd.c) draws on a surface of its own, takes the
@@ -34,6 +37,8 @@ trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 RC=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
+# on a failure, what Wine said (a gate that fails only now and then)
+diagnose() { [ $RC = 0 ] && return; echo "--- wineboot: rc $BOOT_RC, ${BOOT_TIME}s; drive_c: $(ls "$C" 2>&1 | tr '\n' ' ')"; tail -3 "$T/wineboot.log"; echo "--- printers:"; run 'C:\probe64.exe' enum 2>/dev/null; echo "--- Wine's errors:"; grep -v "^$" "$T/stderr.log" 2>/dev/null | grep -iv "fixme\|wayland" | tail -15; }
 
 printf 'LIBRARY gdi32.dll\nEXPORTS\nEngCreateBitmap\nEngCreateDeviceSurface\nEngAssociateSurface\nEngDeleteSurface\nEngLockSurface\nEngUnlockSurface\nEngCopyBits\nEngCreatePalette\nEngDeletePalette\nEngGetPrinterDataFileName\nEngLoadModule\nEngMapModule\nEngFreeModule\nEngQueryLocalTime\nEngCreateSemaphore\nEngAcquireSemaphore\nEngReleaseSemaphore\nEngDeleteSemaphore\n' > "$T/eng.def"
 "${MINGW%-gcc}-dlltool" -d "$T/eng.def" -l "$T/libeng.a" || { echo "SKIP: no dlltool"; exit 77; }
@@ -41,7 +46,9 @@ printf 'LIBRARY gdi32.dll\nEXPORTS\nEngCreateBitmap\nEngCreateDeviceSurface\nEng
 "$MINGW" -municode -O2 -o "$T/probe64.exe" "$HERE/printdrv-probe.c" -lwinspool -lgdi32 || { echo "FAIL  probe did not build"; exit 1; }
 "$MINGW32" -municode -O2 -o "$T/probe32.exe" "$HERE/printdrv-probe.c" -lwinspool -lgdi32 || { echo "FAIL  probe did not build"; exit 1; }
 
-timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
+BOOT_START=$(date +%s)
+timeout -s KILL 300 "$WINE" wineboot -i >"$T/wineboot.log" 2>&1; BOOT_RC=$?; "$WINESERVER" -w
+BOOT_TIME=$(( $(date +%s) - BOOT_START ))
 C="$WINEPREFIX/drive_c"
 cp "$T/probe64.exe" "$T/probe32.exe" "$C/"
 
@@ -96,8 +103,8 @@ ClassGUID={4D36E979-E325-11CE-BFC1-08002BE10318}
 Class=Printer
 
 [Manufacturer]
-"SG Test" = SGTEST, NTamd64
 "SG Old" = SGOLD
+"SG Test" = SGTEST, NTamd64
 
 [SGTEST.NTamd64]
 "SG Test Maker" = SGM_INSTALL
@@ -105,6 +112,14 @@ Class=Printer
 
 [SGOLD]
 "SG Old Model" = SGM_INSTALL
+"SG Test Core" = SGM_INSTALL
+"SG Data Only" = SGD_INSTALL
+
+[SGD_INSTALL]
+CopyFiles=@sgcore.gpd
+DataFile=sgcore.gpd
+DriverFile=UNIDRV.DLL
+ConfigFile=UNIDRVUI.DLL
 
 [SGM_INSTALL]
 CopyFiles=SGM_FILES, SGM_SYS
@@ -148,12 +163,15 @@ UNIDRV.DLL = 2
 UNIDRVUI.DLL = 2
 EOF
 
-run() { (cd "$C" && timeout 120 "$WINE" "$@" 2>/dev/null | tr -d '\r'); }
+run() { (cd "$C" && timeout 120 "$WINE" "$@" </dev/null 2>>"$T/stderr.log" | tr -d '\r'); }
 out=$(run 'C:\probe64.exe' install "SG Test Maker")
 [ "$out" = "install 0" ] && pass "the maker's package installs" || fail "the maker's package did not install: $out"
 out=$(run 'C:\probe64.exe' install "SG Old Model")
 [ "$out" != "install 0" ] && pass "a model listed only for 32-bit Windows is not installed ($out)" ||
     fail "a 32-bit-only model was installed on 64-bit"
+out=$(run 'C:\probe64.exe' install "SG Data Only")
+[ "$out" = "install 0" ] && pass "a model listed only for 32-bit Windows installs when it is all data on the core drivers" ||
+    fail "a data-only 32-bit-listed model did not install: $out"
 out=$(run 'C:\probe64.exe' install "SG Test Core")
 [ "$out" = "install 0" ] && pass "the core driver package installs" || fail "the core driver package did not install: $out"
 "$WINESERVER" -w
@@ -196,5 +214,6 @@ blocks=$(grep -a -o "$(printf '\033')\*b[0-9]*W" "$T/LPT2.out" 2>/dev/null | wc 
 [ "$blocks" = 50 ] && pass "the core driver prints although the package carried its own copies" ||
     fail "Unidrv from the core package: $blocks rows"
 
+diagnose
 [ $RC = 0 ] && echo "drvpkg gate: PASS" || echo "drvpkg gate: FAIL"
 exit $RC

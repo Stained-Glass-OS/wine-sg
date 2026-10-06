@@ -16,6 +16,7 @@
  *                                         (tenths of a millimetre) at DPI, for comparing
  *   sgprint status NAME                   the printer's status and its jobs
  *   sgprint props NAME                    shows the driver's printing preferences
+ *   sgprint enum                          "enum NAME|DRIVER|PORT|PROCESSOR" per printer
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -441,6 +442,18 @@ int wmain( int argc, WCHAR **argv )
     if (argc >= 6 && !wcscmp( argv[1], L"ref" )) return ref( argv[2], _wtoi( argv[3] ), _wtoi( argv[4] ), _wtoi( argv[5] ) );
     if (argc >= 3 && !wcscmp( argv[1], L"status" )) return status( argv[2] );
     if (argc >= 3 && !wcscmp( argv[1], L"props" )) return props( argv[2] );
+    if (argc >= 2 && !wcscmp( argv[1], L"enum" ))
+    {
+        DWORD needed = 0, count = 0, i;
+        PRINTER_INFO_2W *pi;
+        EnumPrintersW( PRINTER_ENUM_LOCAL, NULL, 2, NULL, 0, &needed, &count );
+        pi = malloc( needed ? needed : 1 );
+        if (!EnumPrintersW( PRINTER_ENUM_LOCAL, NULL, 2, (BYTE *)pi, needed, &needed, &count )) count = 0;
+        for (i = 0; i < count; i++)
+            printf( "enum %ls|%ls|%ls|%ls\n", pi[i].pPrinterName, pi[i].pDriverName, pi[i].pPortName,
+                    pi[i].pPrintProcessor );
+        return 0;
+    }
     printf( "usage: see the source\n" );
     return 2;
 }
