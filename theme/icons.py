@@ -21,6 +21,8 @@ import os
 import sys
 
 SIZES = [256, 128, 96, 64, 48, 40, 32, 24, 20, 16]
+if os.environ.get("SG_MUTANT_ICON_FRAMES"):   # test/iconframes-gate.sh's mutant: four sizes
+    SIZES = [256, 48, 32, 16]
 GAP = 8
 
 FOLDER_BACK = "#E3A92E"
@@ -144,6 +146,35 @@ def fixed_drive(size):
             f'<circle cx="82" cy="65.5" r="4" fill="#3CB371"/>')
 
 
+
+# ---- user32's own window icons -------------------------------------------
+# IDI_WINLOGO: our mark, four panes of coloured glass round a point (0441's
+# drawing, now at every size). IDI_APPLICATION (OIC_SAMPLE): the icon of a
+# program that has none of its own -- Wine's was a wine glass, which showed
+# in title bars and on the taskbar; ours is a plain program window, as
+# Windows' generic one is (our own drawing).
+
+MARK = (("50,2 72,24 50,46 28,24", "#7B3FD0"), ("76,28 98,50 76,72 54,50", "#E0409A"),
+        ("50,54 72,76 50,98 28,76", "#F0A030"), ("24,28 46,50 24,72 2,50", "#1FB0A0"))
+
+
+def winlogo(size):
+    return "".join(f'<polygon points="{p}" fill="{c}"/>' for p, c in MARK)
+
+
+def application(size):
+    sw = px(size, stroke_px(size))
+    top, band = 14, (30 if size >= 24 else 34)
+    frame = (f'<rect x="6" y="{top}" width="88" height="74" rx="{px(size, 1.5):.2f}" fill="{PAGE}" '
+             f'stroke="{PAGE_EDGE}" stroke-width="{sw:.2f}"/>')
+    bar = f'<path d="M6 {top} H94 V{band} H6 Z" fill="{ACCENT}"/>'
+    dots = ""
+    if size >= 32:
+        r = px(size, max(1.0, size / 32.0))
+        for x in (72, 80, 88):
+            dots += f'<circle cx="{x}" cy="{(top + band) / 2:.2f}" r="{r:.2f}" fill="{PAGE}"/>'
+    return frame + bar + dots
+
 ICONS = {
     "dlls/shell32/resources/folder.svg": lambda s: folder(s),
     "dlls/shell32/resources/folder_open.svg": lambda s: folder(s, True),
@@ -154,6 +185,8 @@ ICONS = {
     "dlls/shell32/resources/desktop.svg": desktop_folder,
     "dlls/shell32/resources/mydocs.svg": documents_folder,
     "dlls/shell32/resources/drive.svg": fixed_drive,
+    "dlls/user32/resources/oic_winlogo.svg": winlogo,
+    "dlls/user32/resources/oic_sample.svg": application,
 }
 
 # ---- the file dialogs' toolbar strip (comctl32 IDB_VIEW_SMALL/LARGE) ----
