@@ -277,9 +277,9 @@ for b in 64 32; do
     rows=$(printf '%s\n' "$out" | grep -c '^ROW [0-9]* 100$')
     first=$(printf '%s\n' "$out" | grep -m1 '^ROW')
     last=$(printf '%s\n' "$out" | tail -1)
-    if [ "$head" = "HOOK START;SGU START;$(printf '\033')P1SGU PAGE;IP 200x100 id 100;" ] && [ "$rows" = 50 ] &&
+    if [ "$head" = "HOOK START;SGU START;$(printf '\033')P1SGU PAGE;IP 224x100 id 100 dark 5000;" ] && [ "$rows" = 50 ] &&
        [ "$first" = "ROW 10 100" ] && [ "$last" = "SGU END" ]; then
-        pass "$b-bit: Unidrv ran the GPD's commands and the plug-in's hook, band and rows"
+        pass "$b-bit: Unidrv ran the GPD's commands and the plug-in's hook, band (padded with paper) and rows (as ink)"
     else
         fail "$b-bit: Unidrv with the plug-in: head '$head', $rows rows, first '$first', last '$last'"
     fi

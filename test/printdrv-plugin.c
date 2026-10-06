@@ -1,7 +1,8 @@
 /* A Unidrv render plug-in of our own, for the printdrv gate (patches/sg/0921):
  * it hooks DrvStartDoc (writing "HOOK START" before Unidrv's own start),
- * turns each band to one bit per pixel in ImageProcessing and reports each
- * row with ink from FilterGraphics as "ROW <y> <ink pixels>".  Our own code. */
+ * turns each band to one bit per pixel in ImageProcessing (a DIB, a set bit
+ * white) and reports each row with ink from FilterGraphics (the device's
+ * bits, a set bit ink) as "ROW <y> <ink pixels>".  Our own code. */
 #define COBJMACROS
 #include <stdio.h>
 #include <string.h>
@@ -111,17 +112,21 @@ static HRESULT STDMETHODCALLTYPE image_processing( uni *u, DEVOBJ *dev, BYTE *bi
                                                    BYTE *colors, DWORD id, IPPARAMS *ip, BYTE **result )
 {
     int w = bih->biWidth, h = abs( bih->biHeight ), stride = (w * 3 + 3) & ~3, ostride = ((w + 31) / 32) * 4, x, y;
+    int dark = 0;
     char buf[64];
 
+    /* the band comes back as a DIB, a set bit white, as a maker's plug-in
+     * returns it */
     free( band );
     band = calloc( ostride, h );
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++)
         {
             BYTE *p = bits + y * stride + x * 3;
-            if (p[0] + p[1] + p[2] < 3 * 128) band[y * ostride + x / 8] |= 0x80 >> (x % 8);
+            if (p[0] + p[1] + p[2] < 3 * 128) dark++;
+            else band[y * ostride + x / 8] |= 0x80 >> (x % 8);
         }
-    snprintf( buf, sizeof(buf), "IP %dx%d id %lu\n", w, h, id );
+    snprintf( buf, sizeof(buf), "IP %dx%d id %lu dark %d\n", w, h, id, dark );
     say( dev, buf );
     row = 0;
     *result = band;
