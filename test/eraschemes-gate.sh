@@ -7,8 +7,10 @@
 # (0742) is 1 or 2: Horizon's beige face, dark blue button edges, green
 # check marks and radio dots, lavender-blue scroll bar thumbs; Glass's grey
 # glossy buttons, blue radio dots, sky-blue selection. Frame 0 keeps the
-# Classic scheme. The probe draws the parts on a green window; the checks
-# read the screen and the system colours.
+# Classic scheme. In dark mode the controls take the Dark scheme whatever
+# the frames' look (1177): the era schemes are light only. The probe draws
+# the parts on a green window; the checks read the screen and the system
+# colours.
 #
 #   WINE=/opt/wine-sg/bin/wine test/eraschemes-gate.sh
 set -u
@@ -58,6 +60,11 @@ look horizon
 look glass
 "$WINE" reg add 'HKCU\\Software\\Stained Glass\\Style' /v Frame /t REG_DWORD /d 0 /f >/dev/null 2>&1; P notify; sleep 2
 look classic
+# Horizon in dark mode: the controls are dark (the era schemes are light only)
+"$WINE" reg add 'HKCU\\Software\\Stained Glass\\Style' /v Frame /t REG_DWORD /d 1 /f >/dev/null 2>&1
+"$WINE" reg add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize' /v AppsUseLightTheme /t REG_DWORD /d 0 /f >/dev/null 2>&1
+P notify; sleep 2
+P colour > "$T/horizondark.colour"
 EOF2
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s "-screen 0 800x600x24" "$T/session.sh" > "$T/session.out" 2>&1
@@ -84,6 +91,8 @@ some horizon 220 20 233 33 'g > r + 60 && g > b + 60' && pass "a green radio dot
 is horizon 268 50 'b > r + 25 && b > 200' && pass "a lavender-blue scroll bar thumb ($(px horizon 268 50))" || fail "Horizon thumb: $(px horizon 268 50)"
 
 [ "$(val glass colour)" = Glass ] && pass "Frame 2: the Glass scheme" || fail "Frame 2: scheme $(val glass colour)"
+[ "$(val horizondark colour)" = Dark ] && pass "Frame 1 in dark mode: the Dark scheme for the controls (wine-sg 1177)" \
+    || fail "Frame 1 in dark mode: scheme $(val horizondark colour) (mutant SG_MUTANT_ERA_LIGHT_IN_DARK keeps Horizon)"
 [ "$(val glass btnface)" = 240,240,240 ] && [ "$(val glass highlight)" = 51,153,255 ] \
     && pass "Glass's system colours: a grey face, a sky-blue selection" || fail "Glass colours: face $(val glass btnface) highlight $(val glass highlight)"
 is glass 80 20 'r < 140 && r > 80 && b - r < 15 && r - b < 15' && is glass 80 26 'r > 225' && is glass 80 44 'r < 222 && r > 190' \
