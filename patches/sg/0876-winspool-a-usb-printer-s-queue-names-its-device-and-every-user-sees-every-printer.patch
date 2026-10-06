@@ -1,0 +1,311 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winspool: a USB printer's queue names its device, and every user sees every printer
+
+A printer's queue names the device it prints to in its PnPData key
+(DeviceInstanceId, HardwareID, Manufacturer); DYMO Connect matches the queue
+to its LabelWriter so. A CUPS queue on a USB printer (usb://MFG/MDL?serial=X)
+is now answered from its device-uri: the USBPRINT device of that serial
+number (0874), or the only one when the URI has none.
+
+The printers of the machine are made by whoever loads winspool first, and
+AddPrinter writes [Devices] and [PrinterPorts] for that user only -- on a
+shared machine SYSTEM, not the signed-in user. CreateDC without a driver name
+finds a printer through [Devices] only: DYMO Connect's
+CreateDC(NULL, "DYMO_LabelWriter_550") failed ("no device found") and
+nothing printed. Every printer of the machine missing from this user's
+[Devices] and [PrinterPorts] is put there as winspool loads.
+
+Test: test/usbprint-gate.sh (mutants SG_MUTANT_PNPDATA,
+SG_MUTANT_USERDEVICES).
+---
+--- a/dlls/winspool.drv/Makefile.in
++++ b/dlls/winspool.drv/Makefile.in
+@@ -2,6 +2,7 @@
+ UNIXLIB   = winspool.so
+ IMPORTLIB = winspool
+ IMPORTS   = user32 gdi32 advapi32 compstui
++DELAYIMPORTS = setupapi
+ UNIX_CFLAGS  = $(CUPS_CFLAGS)
+ UNIX_LIBS    = $(APPLICATIONSERVICES_LIBS)
+ 
+--- a/dlls/winspool.drv/wspool.h
++++ b/dlls/winspool.drv/wspool.h
+@@ -71,6 +71,14 @@
+     ULONGLONG *stamp;
+ };
+ 
++/* Stained Glass OS: a CUPS queue's device-uri */
++struct get_device_uri_params
++{
++    const WCHAR *printer;
++    WCHAR *uri;
++    unsigned int size;   /* in WCHARs */
++};
++
+ #define UNIX_CALL( func, params ) WINE_UNIX_CALL( unix_ ## func, params )
+ 
+ enum cups_funcs
+@@ -80,5 +88,6 @@
+     unix_get_default_page_size,
+     unix_get_ppd,
+     unix_get_printers_stamp,
++    unix_get_device_uri,
+     unix_funcs_count,
+ };
+--- a/dlls/winspool.drv/cups.c
++++ b/dlls/winspool.drv/cups.c
+@@ -458,6 +458,39 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS get_device_uri( void *args )
++{
++    const struct get_device_uri_params *params = args;
++#ifdef SONAME_LIBCUPS
++    char name[512];
++    cups_dest_t *dests;
++    int num, i;
++    NTSTATUS status = STATUS_NOT_FOUND;
++
++    if (!pcupsGetDests) return STATUS_NOT_SUPPORTED;
++    if (ntdll_wcstoumbs( params->printer, wcslen( params->printer ) + 1, name, sizeof(name), FALSE ) <= 0)
++        return STATUS_INVALID_PARAMETER;
++    num = pcupsGetDests( &dests );
++    for (i = 0; i < num; i++)
++    {
++        const char *uri;
++        if (strcmp( dests[i].name, name )) continue;
++        if (!(uri = pcupsGetOption( "device-uri", dests[i].num_options, dests[i].options ))) break;
++        if (strlen( uri ) + 1 > params->size) status = STATUS_BUFFER_OVERFLOW;
++        else
++        {
++            ntdll_umbstowcs( uri, strlen( uri ) + 1, params->uri, params->size );
++            status = STATUS_SUCCESS;
++        }
++        break;
++    }
++    pcupsFreeDests( num, dests );
++    return status;
++#else
++    return STATUS_NOT_SUPPORTED;
++#endif
++}
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     process_attach,
+@@ -465,6 +498,7 @@
+     get_default_page_size,
+     get_ppd,
+     get_printers_stamp,
++    get_device_uri,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+@@ -564,6 +598,19 @@
+     return get_printers_stamp( &params );
+ }
+ 
++static NTSTATUS wow64_get_device_uri( void *args )
++{
++    struct
++    {
++        PTR32 printer;
++        PTR32 uri;
++        unsigned int size;
++    } const *params32 = args;
++    struct get_device_uri_params params = { ULongToPtr( params32->printer ), ULongToPtr( params32->uri ), params32->size };
++
++    return get_device_uri( &params );
++}
++
+ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+     process_attach,
+@@ -571,6 +618,7 @@
+     wow64_get_default_page_size,
+     wow64_get_ppd,
+     wow64_get_printers_stamp,
++    wow64_get_device_uri,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
+--- a/dlls/winspool.drv/info.c
++++ b/dlls/winspool.drv/info.c
+@@ -48,6 +48,8 @@
+ #include "wine/heap.h"
+ #include <wine/unixlib.h>
+ 
++#include "setupapi.h"
++#include "cfgmgr32.h"
+ #include "ddk/compstui.h"
+ #include "ddk/winsplp.h"
+ #include "wspool.h"
+@@ -1138,6 +1140,45 @@
+     RegCloseKey( key );
+ }
+ 
++#ifndef SG_MUTANT_USERDEVICES
++/* Stained Glass OS: this user's [Devices] and [PrinterPorts] have every
++ * printer of the machine. AddPrinter writes them for the user who adds the
++ * printer -- on a shared machine SYSTEM, not the signed-in user -- and
++ * CreateDC without a driver name finds a printer through them only: DYMO
++ * Connect's CreateDC(NULL, "DYMO_LabelWriter_550") failed ("no device
++ * found") and nothing printed. Only missing entries are added. */
++static void sync_user_devices(void)
++{
++    HKEY printers_key, printer_key, devices_key = 0, ports_key = 0;
++    WCHAR name[256], port[256], line[300];
++    DWORD i, size, type;
++
++    if (create_printers_reg_key( system_printers_key, &printers_key )) return;
++    if (create_printers_reg_key( user_printers_key, &devices_key ) ||
++        create_printers_reg_key( user_ports_key, &ports_key ))
++        goto done;
++    for (i = 0; !RegEnumKeyW( printers_key, i, name, ARRAY_SIZE(name) ); i++)
++    {
++        if (!RegQueryValueExW( devices_key, name, NULL, NULL, NULL, NULL )) continue;
++        if (RegOpenKeyW( printers_key, name, &printer_key )) continue;
++        size = sizeof(port);
++        if (!RegQueryValueExW( printer_key, L"Port", NULL, &type, (BYTE *)port, &size ) && type == REG_SZ)
++        {
++            swprintf( line, ARRAY_SIZE(line), L"wineps.drv,%s", port );
++            RegSetValueExW( devices_key, name, 0, REG_SZ, (BYTE *)line, (wcslen( line ) + 1) * sizeof(WCHAR) );
++            wcscat( line, L",15,45" );
++            RegSetValueExW( ports_key, name, 0, REG_SZ, (BYTE *)line, (wcslen( line ) + 1) * sizeof(WCHAR) );
++            TRACE( "added %s to this user's devices\n", debugstr_w(name) );
++        }
++        RegCloseKey( printer_key );
++    }
++done:
++    if (ports_key) RegCloseKey( ports_key );
++    if (devices_key) RegCloseKey( devices_key );
++    RegCloseKey( printers_key );
++}
++#endif
++
+ void WINSPOOL_LoadSystemPrinters(void)
+ {
+     HKEY printers_key, printer_key;
+@@ -1171,6 +1212,9 @@
+             set_seen_stamp( stamp );
+         }
+ #endif
++#ifndef SG_MUTANT_USERDEVICES
++        sync_user_devices();
++#endif
+         ReleaseMutex( init_mutex );
+         TRACE( "Init already done\n" );
+         return;
+@@ -1198,6 +1242,9 @@
+     init_unix_printers();
+     old_printer_check( TRUE );
+     set_seen_stamp( stamp );
++#ifndef SG_MUTANT_USERDEVICES
++    sync_user_devices();
++#endif
+ 
+     ReleaseMutex( init_mutex );
+     return;
+@@ -5710,6 +5757,82 @@
+     return ret;
+ }
+ 
++#ifndef SG_MUTANT_PNPDATA
++/* Stained Glass OS: a CUPS queue on a USB printer has the PnPData a printer
++ * installed by Plug and Play has on Windows -- DeviceInstanceId, the printer
++ * device (usbprint's USBPRINT\<model>\<serial>) the queue prints to;
++ * HardwareID; Manufacturer. A printer maker's software pairs the queue with
++ * the printer's USB interface so (DYMO Connect reads the LabelWriter 5xx's
++ * label roll through it; without, the printer showed "Empty" and did not
++ * print). Answered from the queue's CUPS device-uri (usb://MFG/MDL?serial=X)
++ * and the printer devices present; nothing is stored. */
++static DWORD get_pnp_data( const WCHAR *printer, const WCHAR *value, DWORD *type, BYTE *data,
++                           DWORD size, DWORD *needed )
++{
++    static const GUID printer_class = {0x4d36e979,0xe325,0x11ce,{0xbf,0xc1,0x08,0x00,0x2b,0xe1,0x03,0x18}};
++    struct get_device_uri_params params;
++    WCHAR uri[1024], serial[128] = {0}, id[MAX_DEVICE_ID_LEN], found[MAX_DEVICE_ID_LEN] = {0};
++    WCHAR hwids[512] = {0}, mfg[128] = {0}, answer[MAX_DEVICE_ID_LEN];
++    SP_DEVINFO_DATA dev = {sizeof(dev)};
++    const WCHAR *p, *src = NULL;
++    HDEVINFO set;
++    DWORD i, count = 0, len;
++
++    params.printer = printer;
++    params.uri = uri;
++    params.size = ARRAY_SIZE(uri);
++    if (UNIX_CALL( get_device_uri, &params ) || wcsnicmp( uri, L"usb://", 6 )) return ERROR_FILE_NOT_FOUND;
++    if ((p = wcsstr( uri, L"serial=" )))
++    {
++        for (i = 0, p += 7; *p && *p != '&' && *p != '?' && i < ARRAY_SIZE(serial) - 1; p++)
++            serial[i++] = (*p <= ' ' || *p == '\\' || *p == '&') ? '_' : *p;
++    }
++    lstrcpynW( mfg, uri + 6, ARRAY_SIZE(mfg) );
++    if ((p = wcschr( mfg, '/' ))) mfg[p - mfg] = 0;
++
++    set = SetupDiGetClassDevsW( &printer_class, L"USBPRINT", NULL, DIGCF_PRESENT );
++    if (set == INVALID_HANDLE_VALUE) return ERROR_FILE_NOT_FOUND;
++    for (i = 0; SetupDiEnumDeviceInfo( set, i, &dev ); i++)
++    {
++        const WCHAR *instance;
++        if (!SetupDiGetDeviceInstanceIdW( set, &dev, id, ARRAY_SIZE(id), NULL )) continue;
++        if (!(instance = wcsrchr( id, '\\' ))) continue;
++        count++;
++        if ((serial[0] && !wcsicmp( instance + 1, serial )) || (!serial[0] && !found[0]))
++        {
++            lstrcpyW( found, id );
++            SetupDiGetDeviceRegistryPropertyW( set, &dev, SPDRP_HARDWAREID, NULL, (BYTE *)hwids, sizeof(hwids) - 2 * sizeof(WCHAR), NULL );
++            if (serial[0]) break;
++        }
++    }
++    SetupDiDestroyDeviceInfoList( set );
++    /* without a serial number, only a printer that is the only one */
++    if (!found[0] || (!serial[0] && count != 1)) return ERROR_FILE_NOT_FOUND;
++
++    if (!wcsicmp( value, L"DeviceInstanceId" )) src = found;
++    else if (!wcsicmp( value, L"HardwareID" )) src = hwids;
++    else if (!wcsicmp( value, L"Manufacturer" ))
++    {
++        for (i = 0, p = mfg; *p; p++)  /* %20 */
++        {
++            if (p[0] == '%' && p[1] == '2' && p[2] == '0') { answer[i++] = ' '; p += 2; }
++            else answer[i++] = *p;
++        }
++        answer[i] = 0;
++        src = answer;
++    }
++    if (!src) return ERROR_FILE_NOT_FOUND;
++    TRACE( "%s: %s = %s\n", debugstr_w(printer), debugstr_w(value), debugstr_w(src) );
++    len = (wcslen( src ) + 1) * sizeof(WCHAR);
++    if (type) *type = REG_SZ;
++    *needed = len;
++    if (!data) return ERROR_MORE_DATA;
++    if (size < len) return ERROR_MORE_DATA;
++    memcpy( data, src, len );
++    return ERROR_SUCCESS;
++}
++#endif
++
+ /******************************************************************************
+  *		GetPrinterDataExW   (WINSPOOL.@)
+  */
+@@ -5742,6 +5865,18 @@
+         }
+         if ((ret = RegOpenKeyW(hkeyPrinter, pKeyName, &hkeySubkey)) != ERROR_SUCCESS)
+         {
++#ifndef SG_MUTANT_PNPDATA
++            if (pKeyName && pValueName && !wcsicmp( pKeyName, L"PnPData" ) && pcbNeeded)
++            {
++                DWORD r = get_pnp_data( printer->name, pValueName, pType, pData, nSize, pcbNeeded );
++                if (r != ERROR_FILE_NOT_FOUND)
++                {
++                    RegCloseKey(hkeyPrinter);
++                    RegCloseKey( printers_key );
++                    return r;
++                }
++            }
++#endif
+             WARN("Can't open subkey %s: %ld\n", debugstr_w(pKeyName), ret);
+             RegCloseKey(hkeyPrinter);
+             RegCloseKey( printers_key );
