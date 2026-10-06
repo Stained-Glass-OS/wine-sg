@@ -12,7 +12,8 @@
 #      - per-monitor v2: WM_DPICHANGED with 168 and a suggested rectangle
 #        whose client area is 700x525; its child hears
 #        WM_DPICHANGED_BEFOREPARENT before and _AFTERPARENT after; it is
-#        700x525 on the screen; its window and monitor DPI 168
+#        700x525 on the screen; its window and monitor DPI 168, and its
+#        system DPI (Wine's menus, dialogs, icons for it: 1121)
 #      - per-monitor v1: WM_DPICHANGED with 168, no child messages; about
 #        700x525 (the suggested rectangle scales the whole window)
 #      - DPI unaware, and system aware started at 100%: no WM_DPICHANGED,
@@ -22,8 +23,8 @@
 #      - a layered window (per-pixel alpha) is scaled with a filter: its
 #        red and blue halves meet in blended pixels, not stepped ones
 #      - the taskbar is the new scale's: 70 px
-#      - File Explorer (laid out at the system DPI) open at the change:
-#        1.75 times its size
+#      - File Explorer open at the change: 1.75 times its size (per-monitor
+#        v2 since 1122: its client area scaled, its frame the new DPI's)
 #   3. back to 100%: per-monitor v2 told 96 and 400x300; the unaware window
 #      400x300; the one started at 175% scaled down to 400x300; the
 #      taskbar 40 px
@@ -117,7 +118,7 @@ v2=$(grep '^dpichanged' "$T/v2.log" | tail -1)
 order=$(grep -E '^(dpichanged|child)' "$T/v2.log" | awk '{print $1 ($1 == "child" ? "-" $2 : "")}' | tr '\n' ' ')
 set -- $v2
 if [ "${2:-}" = 168 ] && [ "$order" = "child-before dpichanged child-after " ] && near "$(size_of "$m" v2)" 700 525 1 &&
-   last_state v2 | grep -q 'win=168 sys=96 mon=168 caps=96 client=700x525 v2=1'; then
+   last_state v2 | grep -q 'win=168 sys=168 mon=168 caps=168 client=700x525 v2=1'; then
     pass "per-monitor v2 at 175%: WM_DPICHANGED 168, suggested ${5:-?}x${6:-?} at ${3:-?},${4:-?}; its child before and after ($order); $(size_of "$m" v2) on the screen; $(last_state v2)"
 else
     fail "per-monitor v2 at 175%: '$v2', messages '$order', $(size_of "$m" v2) on the screen (want 700x525), $(last_state v2)"
@@ -166,8 +167,8 @@ near "$(size_of "$m" later)" 700 525 0 && last_state later | grep -q 'win=168 sy
     || fail "a system-aware program started at 175%: $(last_state later), $(size_of "$m" later) (want 700x525 at 168)"
 [ "${b2:-0}" = 70 ] && pass "the taskbar at 175%: 70 px" || fail "the taskbar at 175%: ${b2:-none} px (want 70)"
 fe2=$("$WINE" "$T/probe.exe" rect ExplorerWClass 2>/dev/null | tr -d '\r')
-near "$fe2" "$(( ${fe1%x*} * 7 / 4 ))" "$(( ${fe1#*x} * 7 / 4 ))" 3 2>/dev/null \
-    && pass "File Explorer, open at the change: $fe1 -> $fe2 on the screen (Wine scales it, as Windows does a program aware of the system DPI)" \
+near "$fe2" "$(( ${fe1%x*} * 7 / 4 ))" "$(( ${fe1#*x} * 7 / 4 ))" 6 2>/dev/null \
+    && pass "File Explorer, open at the change: $fe1 -> $fe2 on the screen (per-monitor v2, laid out again at the new scale: 1122)" \
     || fail "File Explorer, open at the change: ${fe1:-none} -> ${fe2:-none} (want 1.75 times)"
 
 # --- and back to 100% --------------------------------------------------------------------
