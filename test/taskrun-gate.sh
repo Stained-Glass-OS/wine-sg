@@ -20,6 +20,7 @@
 #   3. Run starts it at once; the last run time and result are kept
 #   4. a disabled task (put_Enabled) is not started by Run
 #   5. a daily calendar trigger begun yesterday runs at today's time
+#   2b. the folder lists its tasks; idle settings are kept (Chromium's updater)
 #   6. a task of a particular user is not run by the service (it is theirs)
 #   7. the shell (explorer, at sign-in) starts the person's task host
 #   8. the host runs that person's tasks (a log-on task at once)
@@ -27,6 +28,7 @@
 #
 #   WINE=/opt/wine-sg/bin/wine test/taskrun-gate.sh
 #   mutants: SG_MUTANT_TASK_NO_RUNNER, SG_MUTANT_TASK_NO_USER_HOST (schedsvc/taskrun.c),
+#            SG_MUTANT_TASK_NO_IDLE (taskschd/task.c), SG_MUTANT_TASK_NO_LIST (taskschd/regtask.c),
 #            SG_MUTANT_NO_USER_TASKS (explorer/startup.c),
 #            SG_MUTANT_TASK_DROP_TRIGGERS (taskschd/trigger.c),
 #            SG_MUTANT_TASK_REWRITE_XML (taskschd/regtask.c)
@@ -115,6 +117,21 @@ else
     fail "object model XML: $(printf '%s' "$out" | tr '\n' ' ' | head -c 600)"
 fi
 waitfile "$C/om.txt" 25 && pass "it ran at its next repetition" || fail "the repeating trigger did not run it"
+
+# 2b. the folder lists its tasks (GetTasks: Count and Item), and the idle
+#     settings the definition was given are written (Chromium's updater asks
+#     for them and stopped when it could not have them)
+out=$(probe list x)
+if printf '%s\n' "$out" | grep -q '^count=[2-9]' && printf '%s\n' "$out" | grep -qx 'name=SgTime' &&
+   printf '%s\n' "$out" | grep -qx 'name=SgModel'; then
+    pass "the root folder lists its tasks (Count, Item)"
+else
+    fail "GetTasks: $(printf '%s' "$out" | tr '\n' ' ')"
+fi
+out=$(probe xml SgModel)
+printf '%s\n' "$out" | grep -q '<StopOnIdleEnd>false</StopOnIdleEnd>' \
+    && pass "the idle settings set through the object model are written" \
+    || fail "idle settings: $(printf '%s' "$out" | grep -A4 IdleSettings | tr '\n' ' ')"
 
 # 3. Run
 rm -f "$C/time.txt"

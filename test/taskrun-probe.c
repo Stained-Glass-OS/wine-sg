@@ -7,6 +7,8 @@
  *   taskrun-probe delete NAME
  *   taskrun-probe xml NAME                the registered task's XML (IRegisteredTask::get_Xml)
  *   taskrun-probe disable NAME            IRegisteredTask::put_Enabled(FALSE)
+ *   taskrun-probe list NAME               the root folder's tasks (GetTasks: Count, Item):
+ *                                         count=N and name=... lines
  *   taskrun-probe newtask NAME START COMMAND ARGS
  *       through the object model, as Chromium's updater registers its task:
  *       a time trigger at START repeating every minute, an Exec action, run
@@ -90,6 +92,17 @@ int main(int argc, char **argv)
         CoCreateInstance(&probe_CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER, &probe_IID_ITaskService, (void **)&svc);
         ITaskService_Connect(svc, empty, empty, empty, empty);
         if (FAILED(hr = ITaskService_NewTask(svc, 0, &def))) { printf("newtask=%#lx\n", hr); return 1; }
+        {
+            /* as Chromium's updater: the idle settings are asked for and set */
+            ITaskSettings *settings;
+            IIdleSettings *idle;
+
+            ITaskDefinition_get_Settings(def, &settings);
+            if (FAILED(hr = ITaskSettings_get_IdleSettings(settings, &idle))) { printf("idle=%#lx\n", hr); return 1; }
+            IIdleSettings_put_StopOnIdleEnd(idle, VARIANT_FALSE);
+            IIdleSettings_Release(idle);
+            ITaskSettings_Release(settings);
+        }
         ITaskDefinition_get_RegistrationInfo(def, &info);
         IRegistrationInfo_put_Description(info, SysAllocString(L"probe & <test>"));
         ITaskDefinition_get_Triggers(def, &triggers);
@@ -126,6 +139,28 @@ int main(int argc, char **argv)
         xml = SysAllocString(wide(buf));
         hr = ITaskFolder_RegisterTask(root, name, xml, TASK_CREATE_OR_UPDATE, empty, empty, TASK_LOGON_NONE, empty, &task);
         printf("register=%#lx\n", hr);
+        return FAILED(hr);
+    }
+    if (!strcmp(argv[1], "list"))
+    {
+        IRegisteredTaskCollection *tasks;
+        LONG count = 0, i;
+
+        if (FAILED(hr = ITaskFolder_GetTasks(root, TASK_ENUM_HIDDEN, &tasks))) { printf("gettasks=%#lx\n", hr); return 1; }
+        hr = IRegisteredTaskCollection_get_Count(tasks, &count);
+        printf("count=%ld (%#lx)\n", count, hr);
+        for (i = 1; i <= count; i++)
+        {
+            VARIANT index;
+            BSTR tname = NULL;
+
+            V_VT(&index) = VT_I4;
+            V_I4(&index) = i;
+            if (FAILED(IRegisteredTaskCollection_get_Item(tasks, index, &task))) { printf("item %ld failed\n", i); continue; }
+            IRegisteredTask_get_Name(task, &tname);
+            printf("name=%ls\n", tname);
+            IRegisteredTask_Release(task);
+        }
         return FAILED(hr);
     }
     if (FAILED(hr = ITaskFolder_GetTask(root, name, &task)))
