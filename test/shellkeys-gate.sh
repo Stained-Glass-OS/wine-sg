@@ -97,6 +97,14 @@ xdotool mousemove "\$(( (\$(sed -n 's/^rect=\([0-9-]*\),.*/\1/p' "$T/log.out" | 
 xdotool click --repeat 2 --delay 90 1; sleep 1.5; P rect Alpha
 xdotool mousemove 300 8; sleep 0.3; xdotool click 1; sleep 1.5; P rect Alpha
 xdotool mousemove 300 8 mousedown 1; sleep 0.3; xdotool mousemove 305 60; sleep 0.3; xdotool mousemove 520 300; sleep 0.8; xdotool mouseup 1; sleep 1.5; P rect Alpha
+# a snapped window dragged away by its caption gets back its size from
+# before the snap, under the pointer (0983)
+"$WINE" vdesk-probe.exe window Gamma 520 160 >/dev/null 2>&1 &
+sleep 3
+P rect Gamma
+K super+Left; P rect Gamma
+xdotool mousemove 200 12 mousedown 1; sleep 0.3; xdotool mousemove 210 30; sleep 0.3; xdotool mousemove 600 300; sleep 0.8; xdotool mouseup 1; sleep 1.5; P rect Gamma
+K super+Right; P rect Gamma
 K super; P find '#32768'
 K Escape
 K super+r; P find '#32770' Run
@@ -150,6 +158,20 @@ case "$(after 'rect Alpha' 11)" in
     pass "dragging a maximized window down restores it, under the pointer by its caption" || fail "restored, but not under the pointer: $(after 'rect Alpha' 11)" ;;
 *) fail "dragging the maximized window down: $(after 'rect Alpha' 11)" ;;
 esac
+gorig=$(after 'rect Gamma' 1 | sed 's/^rect=//; s/ zoomed=.*//')
+IFS=, read -r gl gt gr gb <<R
+$gorig
+R
+gsnap=$(after 'rect Gamma' 2)
+IFS=', ' read -r dl dt dr db _ <<R
+$(after 'rect Gamma' 3 | sed 's/^rect=//; s/ zoomed=.*//')
+R
+if [ "$gsnap" != "rect=$wl,$wt,$mid,$wb zoomed=0 iconic=0" ]; then fail "Win+Left on Gamma: $gsnap"
+elif [ "$((dr - dl))x$((db - dt))" = "$((gr - gl))x$((gb - gt))" ] && [ "${dl:-9999}" -lt 600 ] && [ "${dr:-0}" -gt 600 ] && [ "${dt:-9999}" -lt 300 ] && [ "$((dt + 40))" -gt 300 ]; then
+    pass "a snapped window dragged away by its caption gets back its size from before the snap, under the pointer ($(after 'rect Gamma' 3))"
+else fail "dragged off its half: $(after 'rect Gamma' 3), size before the snap $((gr - gl))x$((gb - gt)) (mutant SG_MUTANT_SNAP_DRAG_KEEPS_SIZE keeps the half)"; fi
+[ "$(after 'rect Gamma' 4)" = "rect=$mid,$wt,$wr,$wb zoomed=0 iconic=0" ] && pass "...and is no longer snapped: Win+Right snaps it to the right half" \
+    || fail "Win+Right after the drag: $(after 'rect Gamma' 4)"
 [ "$(after "find #32768")" = "found=1" ] && pass "the Windows key alone opens Start" || fail "Start did not open: $(after "find #32768")"
 [ "$(after "find #32770 Run")" = "found=1" ] && pass "Win+R opens Run" || fail "Run: $(after "find #32770 Run")"
 [ "$(after 'find ExplorerWClass')" = "found=1" ] && pass "Win+E opens File Explorer" || fail "File Explorer: $(after 'find ExplorerWClass')"
