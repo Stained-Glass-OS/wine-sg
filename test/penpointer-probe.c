@@ -142,7 +142,14 @@ int main( void )
     GetPointerDevices( &n, NULL );
     if (n > 8) n = 8;
     if (n && GetPointerDevices( &n, devs ))
-        fprintf( out, "devices count=%u type=%d\n", n, devs[0].pointerDeviceType );
+    {
+        UINT32 i;
+        /* every device's type (1 integrated pen, 2 external pen, 3 touch,
+         * 4 touchpad): a pen listed after a touch screen counts too */
+        fprintf( out, "devices count=%u type=%d types=", n, devs[0].pointerDeviceType );
+        for (i = 0; i < n; i++) fprintf( out, "%s%d", i ? "," : "", devs[i].pointerDeviceType );
+        fprintf( out, "\n" );
+    }
     else
         fprintf( out, "devices count=%u\n", n );
 

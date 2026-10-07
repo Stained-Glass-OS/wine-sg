@@ -309,7 +309,7 @@ L=$T/pen.log
 export PENPROBE_WINDOWED=1 PENPROBE_NOWINTAB=1
 probe "$L" "$T/penpointer-probe.exe"
 unset PENPROBE_WINDOWED PENPROBE_NOWINTAB
-grep -q '^devices count=[0-9]* type=1' "$L" && fail "a pen before the tablet: $(grep '^devices' "$L")" \
+grep -q '^devices count=[0-9]* .*types=\([0-9,]*,\)\?[12]\(,\|$\)' "$L" && fail "a pen before the tablet: $(grep '^devices' "$L")" \
     || pass "before the pen comes, no pen device ($(grep '^devices' "$L"))"
 feed plug
 sleep 2
