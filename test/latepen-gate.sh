@@ -17,6 +17,8 @@
 #     Wintab has the tablet: a context opens and WT_PACKETs carry the pressure.
 #  3. Unplugged in the middle of a stroke: the pen's pointer goes up and
 #     leaves (WM_POINTERUP, WM_POINTERLEAVE), PDC_REMOVAL, no pen listed.
+#     The pen in and out of range is WM_POINTERDEVICEINRANGE / OUTOFRANGE
+#     (1470) to a window registered for range, not to one without.
 #  4. Plugged in again: the pen and its pressure are back.
 #
 #   WINE=<build>/wine WINESERVER=<build>/server/wineserver test/latepen-gate.sh
@@ -27,7 +29,8 @@
 # WM_POINTERDEVICECHANGE; win32u input.c), LATEPEN_WINTAB_ONCE (Wintab's
 # tablet read once; wintab32 context.c), LATEPEN_NO_LEAVE (a pen gone stays
 # in range over its window; winex11 mouse.c), NO_PEN_HOTPLUG (wine-sg 1150's
-# late pen; winex11 mouse.c). LATEPEN_KEEP=1 keeps the logs.
+# late pen; winex11 mouse.c), NO_PEN_RANGE_MSG (no WM_POINTERDEVICEINRANGE /
+# OUTOFRANGE, wine-sg 1470; win32u input.c). LATEPEN_KEEP=1 keeps the logs.
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -142,6 +145,15 @@ run() {
     grep -q '^wintab packet pressure=[1-9]' "$T/$where.stroke1" \
         && pass "$where: and Wintab's packets carry its pressure ($(grep -o '^wintab packet pressure=[0-9]*' "$T/$where.stroke1" | sort -u | tail -1))" \
         || fail "$where: no Wintab packet with pressure: $(grep -c '^wintab packet' "$T/$where.stroke1") packets"
+    # the pen came into range and went out (1470): to the window registered
+    # for it, of the pen device that arrived; not to one registered without
+    dev=$(grep '^devchange arrival' "$L" | tail -1 | tr -d '\r' | sed 's/.* device=//')
+    grep -q "^range in device=$dev\$" "$T/$where.stroke1" && grep -q "^range out device=$dev\$" "$T/$where.stroke1" \
+        && sed -n '/^range in/,$p' "$T/$where.stroke1" | grep -q '^range out' \
+        && pass "$where: WM_POINTERDEVICEINRANGE, then OUTOFRANGE, of the pen ($dev)" \
+        || fail "$where: the pen's range messages: $(grep 'range' "$T/$where.stroke1" | tr '\n' ' ') (pen ${dev:-none})"
+    grep -q '^quiet range' "$L" && fail "$where: a window registered without range heard it: $(grep '^quiet' "$L" | head -2 | tr '\n' ' ')" \
+        || pass "$where: and not a window registered without range"
 
     # 3. unplugged in the middle of a stroke
     mark "$L"

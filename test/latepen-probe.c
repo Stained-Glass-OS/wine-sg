@@ -7,6 +7,10 @@
  *   devchange arrival|removal device=D
  *                                   WM_POINTERDEVICECHANGE (registered with
  *                                   RegisterPointerDeviceNotifications)
+ *   range in|out device=D           WM_POINTERDEVICEINRANGE / OUTOFRANGE
+ *                                   (registered with range TRUE; 1470)
+ *   quiet range ...                 the same to a second window registered
+ *                                   with range FALSE (it must hear none)
  *   wintab devices=N                Wintab's devices (WTInfo), at the start
  *                                   and whenever it changes (polled)
  *   wintab open=0|1                 a context opened (once Wintab has a device)
@@ -17,6 +21,12 @@
 #include <stdio.h>
 
 static FILE *out;
+static HWND quiet;
+
+#ifndef WM_POINTERDEVICEINRANGE
+#define WM_POINTERDEVICEINRANGE    0x0239
+#define WM_POINTERDEVICEOUTOFRANGE 0x023a
+#endif
 
 /* Wintab (the public Wintab 1.4 specification's structures) */
 typedef DWORD FIX32;
@@ -135,6 +145,12 @@ static LRESULT CALLBACK wndproc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
                  (void *)lp );
         fflush( out );
         return 0;
+    case WM_POINTERDEVICEINRANGE:
+    case WM_POINTERDEVICEOUTOFRANGE:
+        fprintf( out, "%srange %s device=%p\n", hwnd == quiet ? "quiet " : "",
+                 msg == WM_POINTERDEVICEINRANGE ? "in" : "out", (void *)wp );
+        fflush( out );
+        return 0;
     case WM_TIMER:
         poll_devices( hwnd );
         return 0;
@@ -174,7 +190,10 @@ int main( void )
                             w / 8, h / 8, w * 3 / 4, h * 3 / 4, NULL, NULL, wc.hInstance, NULL );
     SetForegroundWindow( hwnd );
     SetFocus( hwnd );
-    RegisterPointerDeviceNotifications( hwnd, FALSE );
+    RegisterPointerDeviceNotifications( hwnd, TRUE );
+    quiet = CreateWindowExW( 0, wc.lpszClassName, L"latepen-quiet", WS_POPUP, 0, 0, 10, 10, NULL, NULL,
+                             wc.hInstance, NULL );
+    RegisterPointerDeviceNotifications( quiet, FALSE );
     if (GetEnvironmentVariableA( "LATEPEN_WINTAB", NULL, 0 ) && (wintab = LoadLibraryW( L"wintab32.dll" )))
     {
         pWTInfoW = (void *)GetProcAddress( wintab, "WTInfoW" );
