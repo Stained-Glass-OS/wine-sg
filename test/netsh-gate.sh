@@ -93,8 +93,9 @@ printf '%s' "$calls" | grep -qF 'CALL [wifi] [connect] [--ssid] [My Cafe "5G"]' 
 # refusals, and what is not ours
 FAKE_DENY=1 run netsh interface ip set address eth0 dhcp
 case "$out" in *"requires elevation"*) [ $code = 1 ] && pass "a refusal reads as Windows' elevation message, exit 1" || fail "denied exit $code" ;; *) fail "denied: $out" ;; esac
-run netsh advfirewall set allprofiles state off
-[ $code = 0 ] && [ -z "$calls" ] && pass "commands netsh does not know still succeed quietly" || fail "advfirewall ($code): $calls"
+# (advfirewall is the firewall's now: test/fwnetsh-gate.sh)
+run netsh http add urlacl url=http://+:8080/ user=Everyone
+[ $code = 0 ] && [ -z "$calls" ] && pass "commands netsh does not know still succeed quietly" || fail "http add urlacl ($code): $calls"
 
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
