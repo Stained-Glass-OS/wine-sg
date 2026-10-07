@@ -63,7 +63,10 @@ if [ -n "$w" ]; then
     xdotool mousemove $((X + WIDTH / 2)) $((Y + HEIGHT * 3 / 4)) click 1
 fi
 sleep 1
-xdotool type --delay 150 'a5'; xdotool key Shift_L; xdotool key Return; sleep 2
+# a key at a time: the page reports each keydown with a synchronous request,
+# and a key that arrives while one is under way is lost (Wine's mshtml; it
+# made this gate fail at random, 2026-10-07) -- that is not what is tested here
+for k in a 5 Shift_L Return; do xdotool key "$k"; sleep 1; done; sleep 1
 
 out=$(cat "$T/log.txt")
 [ -n "${KBCHAR_KEEPLOG:-}" ] && cp "$T/ie.log" "$KBCHAR_KEEPLOG"

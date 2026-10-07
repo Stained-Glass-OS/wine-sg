@@ -16,6 +16,9 @@ RC=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
 command -v strings >/dev/null || { echo "SKIP: no strings (binutils)"; exit 77; }
+# a build tree (WINE=build/obj/wine, as the gates run in a dev tree) keeps
+# winedbg.exe under programs/winedbg/<arch>-windows
+[ -d "$LIB" ] || LIB="$(dirname "$WINE")/programs/winedbg"
 set -- ${WINEDBG:-"$LIB/x86_64-windows/winedbg.exe" "$LIB/i386-windows/winedbg.exe"}
 for exe; do
     [ -f "$exe" ] || { fail "no $exe"; continue; }

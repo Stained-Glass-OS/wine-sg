@@ -138,13 +138,16 @@ timeout -s KILL 400 xvfb-run -a -s '-screen 0 1280x800x24' "$T/session.sh"
 cat "$T/log.out" 2>/dev/null | sed 's/^/  /'
 
 grep -q '^thispc: title=This PC$' "$T/log.out" && pass "File Explorer opens on This PC" || fail "no This PC window"
-# This PC's capacity bars: the accent purple in the content area, under the folders
+# This PC's capacity bars: the accent purple in the content area, under the
+# folders -- or red, as Windows draws a drive that is nearly full (the
+# machine running the gate may be: C: and Z: are its own disk)
 bars=$(python3 - "$T/thispc.png" <<'PYEOF'
 import sys
 from PIL import Image
 im = Image.open(sys.argv[1]).convert('RGB')
 w, h = im.size
-print(sum(1 for x in range(230, min(w, 1000)) for y in range(300, min(h, 600)) if im.getpixel((x, y)) == (0x7b, 0x2f, 0xbe)))
+bar = ((0x7b, 0x2f, 0xbe), (0xda, 0x26, 0x26))
+print(sum(1 for x in range(230, min(w, 1000)) for y in range(300, min(h, 600)) if im.getpixel((x, y)) in bar))
 PYEOF
 )
 [ "${bars:-0}" -gt 200 ] && pass "This PC shows drives with capacity bars" || fail "no capacity bars ($bars accent pixels)"

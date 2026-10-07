@@ -61,8 +61,17 @@ done
 if [ -n "$WINE" ] && command -v wrestool >/dev/null; then
     lib="$(dirname "$WINE")/../lib/wine/x86_64-windows"
     [ -d "$lib" ] || lib="$(dirname "$WINE")"
+    # a build tree (WINE=build/obj/wine) keeps each module in its own
+    # directory: dlls/user32/x86_64-windows/user32.dll, programs/mmc/...
+    at() {
+        for _f in "$lib/$1" "$(dirname "$WINE")/dlls/${1%.*}/x86_64-windows/$1" \
+                  "$(dirname "$WINE")/programs/${1%.*}/x86_64-windows/$1"; do
+            [ -f "$_f" ] && { echo "$_f"; return; }
+        done
+        echo "$lib/$1"
+    }
     one() {  # one FILE NAME WHAT
-        wrestool -x --type=14 --name="$2" "$lib/$1" > "$W/i.ico" 2>/dev/null
+        wrestool -x --type=14 --name="$2" "$(at "$1")" > "$W/i.ico" 2>/dev/null
         got=$(frames "$W/i.ico")
         [ "$got" = "$WANT" ] && pass "installed $3: $got px" || fail "installed $3 has [$got] px"
     }
@@ -70,7 +79,7 @@ if [ -n "$WINE" ] && command -v wrestool >/dev/null; then
     one user32.dll 32517 "IDI_WINLOGO"
     for p in mmc eventvwr resmon cleanmgr; do one $p.exe 1 "$p.exe's icon"; done
     # ours, not a wine glass: the window's title band is our purple
-    wrestool -x --type=14 --name=32512 "$lib/user32.dll" > "$W/app.ico" 2>/dev/null
+    wrestool -x --type=14 --name=32512 "$(at user32.dll)" > "$W/app.ico" 2>/dev/null
     idx=$(identify "$W/app.ico" 2>/dev/null | awk '/ 32x32 /{print NR-1; exit}')
     c=$(convert "$W/app.ico[${idx:-0}]" -format "%[fx:int(255*p{16,6}.r)],%[fx:int(255*p{16,6}.g)],%[fx:int(255*p{16,6}.b)]" info: 2>/dev/null)
     echo "$c" | awk -F, '{ exit !($3 > 150 && $1 < 160 && $2 < 110) }' && pass "IDI_APPLICATION is ours: a program window under our purple band ($c)" \
