@@ -637,7 +637,8 @@ test-taskview-anim:
 test-desktop-slide:
 	WINE=$(PREFIX)/bin/wine test/desktop-slide-gate.sh
 
-# The Web Account Manager with no providers (0512): Office's sign-in.
+# The Web Account Manager: a work account's sign-in through sg-wam-msal (0512,
+# 1475), with a stub program standing in for it.
 test-webauthcore:
 	WINE=$(PREFIX)/bin/wine test/webauthcore-gate.sh
 
