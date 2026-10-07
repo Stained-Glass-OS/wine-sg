@@ -25,13 +25,15 @@
 #   7. the shell (explorer, at sign-in) starts the person's task host
 #   8. the host runs that person's tasks (a log-on task at once)
 #   9. Run on a person's task: the service asks their host, which runs it
+#  10. another host of the same account does not take the person's request
 #
 #   WINE=/opt/wine-sg/bin/wine test/taskrun-gate.sh
 #   mutants: SG_MUTANT_TASK_NO_RUNNER, SG_MUTANT_TASK_NO_USER_HOST (schedsvc/taskrun.c),
 #            SG_MUTANT_TASK_NO_IDLE (taskschd/task.c), SG_MUTANT_TASK_NO_LIST (taskschd/regtask.c),
 #            SG_MUTANT_NO_USER_TASKS (explorer/startup.c),
 #            SG_MUTANT_TASK_DROP_TRIGGERS (taskschd/trigger.c),
-#            SG_MUTANT_TASK_REWRITE_XML (taskschd/regtask.c)
+#            SG_MUTANT_TASK_REWRITE_XML (taskschd/regtask.c),
+#            SG_MUTANT_TAKEN_BY_OTHER_HOST (schedsvc/taskrun.c; step 10, 1445)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -190,6 +192,25 @@ out=$(probe run SgUser)
 case "$out" in *run=0*) ;; *) fail "Run of a person's task: $out";; esac
 waitfile "$C/user.txt" 20 && pass "Run on a person's task runs it in their host" || fail "Run on a person's task did not run it"
 kill "$HP" 2>/dev/null
+
+# 10. another host of the same account (another person's tasks, --as; the
+#     shell's own host of step 7) sees the request too: it must not mark it
+#     taken for the owner (1445) -- asked while the owner's host is not
+#     running, the request is run when that host starts
+rm -f "$C/user.txt"
+cat > "$T/run-other.sh" <<EOF2
+#!/bin/sh
+cd "$C" && exec "$WINE" rundll32.exe schedsvc.dll,SgUserTaskHost --as S-1-5-21-0-0-0-3000
+EOF2
+chmod +x "$T/run-other.sh"
+"$T/run-other.sh" > "$T/other.log" 2>&1 & OP=$!
+sleep 5
+out=$(probe run SgUser)
+sleep 6   # the other host takes the requests (woken, the event set two seconds)
+"$T/run-host.sh" >> "$T/host.log" 2>&1 & HP=$!
+waitfile "$C/user.txt" 20 && pass "another host of the account leaves the person's Run to their host" \
+    || fail "another host took the person's Run request: never run"
+kill "$HP" "$OP" 2>/dev/null
 
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
