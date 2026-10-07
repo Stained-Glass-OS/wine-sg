@@ -9,7 +9,10 @@
 # shell's desktop with Notepad open (another process), forwards and back.
 #
 #   WINE=/opt/wine-sg/bin/wine test/uiaview-gate.sh
-# Mutant: SG_MUTANT_UIA_NO_VIEW_NAV (uiautomationcore uia_client.c).
+# The taskbar's buttons have names (1473): Start, and a program's button its
+# window's title -- they were nameless, a screen reader's "button".
+# Mutants: SG_MUTANT_UIA_NO_VIEW_NAV (uiautomationcore uia_client.c),
+# SG_MUTANT_TASKBAR_NAMELESS (explorer systray.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -58,6 +61,12 @@ sed -n '/class=Progman /,/^  \[/p' "$T/fwd" | grep -q '^      \[FolderView\] cla
 grep -q '^done' "$T/rev" && [ "$(grep '^ ' "$T/fwd" | sed 's/ hwnd=.*//' | sort)" = "$(grep '^ ' "$T/rev" | sed 's/ hwnd=.*//' | sort)" ] \
     && pass "backwards (last child, previous sibling) the same elements" \
     || fail "backwards: $(grep -c '^ ' "$T/rev") elements, forwards $(grep -c '^ ' "$T/fwd")"
+ntitle=$(sed -n 's/^  \[\(.*Notepad\)\] class=Notepad .*/\1/p' "$T/fwd" | head -1)
+sed -n '/class=Shell_TrayWnd /,/^  \[/p' "$T/fwd" | grep -q '^    \[Start\] class=Button ' \
+    && pass "the taskbar's Start button is named Start" || fail "the Start button's name: $(sed -n '/class=Shell_TrayWnd /,/^  \[/p' "$T/fwd" | grep -m1 'class=Button' | cut -c1-40)"
+[ -n "$ntitle" ] && sed -n '/class=Shell_TrayWnd /,/^  \[/p' "$T/fwd" | grep -qF "    [$ntitle] class=Button " \
+    && pass "Notepad's taskbar button is named its window's title ($ntitle)" \
+    || fail "Notepad's taskbar button: $(sed -n '/class=Shell_TrayWnd /,/^  \[/p' "$T/fwd" | grep 'class=Button' | cut -c1-40 | tr '\n' ' ')"
 # a view that leaves out the taskbar and SHELLDLL_DefView: their children
 # are seen through, in their places
 timeout 120 "$WINE" "$T/walk.exe" 3 skip:Shell_TrayWnd 2>/dev/null | tr -d '\r' > "$T/notray"
