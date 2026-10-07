@@ -1,7 +1,9 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
 # Save As > Desktop (the places bar) shows what is on the desktop -- its
-# folder's files -- not the namespace root (patches/sg/0480). David: in
+# folder's files -- not the namespace root (patches/sg/0480), in the older
+# dialog (ClassicLook=1); GetSaveFileName's default dialog is titled
+# "Save As" (1443, mutant SG_MUTANT_SAVE_TITLE in itemdlg.c). David: in
 # Notepad's Save As, Desktop showed "Documents" and "This PC" links among the
 # files, though saving there went to the right folder.
 #
@@ -22,6 +24,17 @@ export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;w
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 "$MINGW" -O2 -o "$T/savedesk-probe.exe" "$HERE/savedesk-probe.c" -lcomdlg32 -lshell32 -lcomctl32 || { fail "probe did not build"; exit 1; }
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
+"$WINESERVER" -w
+# GetSaveFileName shows the item dialog since 0582: titled "Save As", as on
+# Windows (1443; its button says "Save" -- it was titled "Save" too, and
+# the probe, waiting for "Save As", found no dialog)
+timeout -s KILL 120 xvfb-run -a "$WINE" "$T/savedesk-probe.exe" 2>/dev/null | tr -d '\r' > "$T/item.out"
+sed 's/^/      /' "$T/item.out"
+grep -q '^no dialog' "$T/item.out" || ! grep -q '^made 1' "$T/item.out" \
+    && fail "GetSaveFileName's dialog is not titled \"Save As\"" || pass "GetSaveFileName's dialog is titled \"Save As\""
+"$WINESERVER" -w
+# the older dialog (ClassicLook=1) keeps the places bar 0480 is about
+"$WINE" reg add 'HKCU\Software\Stained Glass\FileDialogs' /v ClassicLook /t REG_DWORD /d 1 /f >/dev/null 2>&1
 "$WINESERVER" -w
 timeout -s KILL 120 xvfb-run -a "$WINE" "$T/savedesk-probe.exe" 2>/dev/null | tr -d '\r' > "$T/out"
 sed 's/^/      /' "$T/out"
