@@ -20,6 +20,9 @@ T=$(mktemp -d /var/tmp/sg-batchcp.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
+# wineboot ran without a display (scratch-home.sh unsets DISPLAY): let its
+# wineserver and desktop go, or the console below inherits a driverless desktop
+"$WINESERVER" -w
 printf '@echo off\r\nchcp 65001 >nul\r\nchcp >C:\\cp.txt\r\necho \303\251\342\224\200>C:\\out.txt\r\n' > "$WINEPREFIX/drive_c/t.bat"
 # in a console of its own: without one, chcp changes nothing
 timeout -s KILL 120 xvfb-run -a "$WINE" start /wait cmd /c 'C:\t.bat' < /dev/null > /dev/null 2>&1
