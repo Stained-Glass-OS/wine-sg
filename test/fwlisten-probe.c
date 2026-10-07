@@ -55,6 +55,27 @@ int main(int argc, char **argv)
     make(AF_INET, SOCK_DGRAM, "127.0.0.1", uport + 1, 0);
     /* a TCP socket bound but not listening: nothing to tell */
     make(AF_INET, SOCK_STREAM, "0.0.0.0", tport + 3, 0);
+    /* looking for devices (SSDP): a UDP socket never bound sends to a
+     * multicast group -- told, with the port the system gave it; one that
+     * sends to an ordinary address is not */
+    {
+        SOCKET m = socket(AF_INET, SOCK_DGRAM, 0), u = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in to = { 0 }, me = { 0 };
+        int len = sizeof(me);
+        const char msg[] = "M-SEARCH * HTTP/1.1\r\n\r\n";
+        to.sin_family = AF_INET;
+        to.sin_port = htons(1900);
+        inet_pton(AF_INET, "239.255.255.250", &to.sin_addr);
+        sendto(m, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));
+        sendto(m, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));   /* told once */
+        getsockname(m, (struct sockaddr *)&me, &len);
+        printf("MULTICAST %d\n", ntohs(me.sin_port));
+        inet_pton(AF_INET, "192.0.2.1", &to.sin_addr);
+        sendto(u, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&to, sizeof(to));
+        len = sizeof(me);
+        getsockname(u, (struct sockaddr *)&me, &len);
+        printf("UNICAST %d\n", ntohs(me.sin_port));
+    }
     fflush(stdout);
     Sleep(1500);
     printf("DONE\n");

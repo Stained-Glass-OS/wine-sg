@@ -8,8 +8,9 @@
 # Windows path and the socket itself (SCM_RIGHTS), the kernel adding the
 # sender's uid. Here a stand-in for the firewall receives them: the probe's
 # TCP listeners (IPv4 and IPv6) and its UDP socket are told, with the right
-# ports and C:\fwprobe.exe; its loopback ones and a TCP socket that never
-# listens are not.
+# ports and C:\fwprobe.exe, and so is a UDP socket it never bound that
+# sends to a multicast group (device discovery: SSDP); its loopback ones, a
+# TCP socket that never listens and a unicast sender are not.
 #
 #   WINE=/opt/wine-sg/bin/wine test/fwlisten-gate.sh   (mutant SG_MUTANT_FW_LISTEN_NOTIFY)
 set -u
@@ -79,7 +80,11 @@ got() { grep -c "^SGFW1|C:\\\\fwprobe.exe|$1|$2|$(id -u)\$" "$T/got"; }
 [ "$(got udp "$UP")" = 1 ] && pass "a bound UDP socket too" || fail "UDP $UP: $(tr '\n' ' ' < "$T/got")"
 [ "$(got tcp $((TP + 1)))" = 0 ] && [ "$(got udp $((UP + 1)))" = 0 ] && pass "nothing about the loopback's" || fail "told about a loopback socket"
 [ "$(got tcp $((TP + 3)))" = 0 ] && pass "nothing about a TCP socket that does not listen" || fail "told about a bound, not listening, TCP socket"
-[ "$(wc -l < "$T/got")" = 3 ] && pass "three notices, no more" || fail "$(wc -l < "$T/got") notices: $(tr '\n' ' ' < "$T/got")"
+MP=$(sed -n 's/^MULTICAST //p' "$T/o"); UCP=$(sed -n 's/^UNICAST //p' "$T/o")
+[ -n "$MP" ] && [ "$(got udp "$MP")" = 1 ] && pass "a UDP socket never bound that looks for devices (multicast): told once, with the port it was given" \
+    || fail "multicast $MP: $(tr '\n' ' ' < "$T/got")"
+[ -n "$UCP" ] && [ "$(got udp "$UCP")" = 0 ] && pass "nothing about one that sends to an ordinary address" || fail "told about a unicast sender"
+[ "$(wc -l < "$T/got")" = 4 ] && pass "four notices, no more" || fail "$(wc -l < "$T/got") notices: $(tr '\n' ' ' < "$T/got")"
 # no firewall running: a program still listens (nothing waits for it)
 kill "$RPID" 2>/dev/null; RPID=""
 rm -f "$T/notify"
