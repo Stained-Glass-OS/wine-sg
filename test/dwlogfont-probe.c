@@ -27,7 +27,7 @@ int main( int argc, char **argv )
     for (i = 1; i < argc; i++)
     {
         LOGFONTW lf = { 0 };
-        WCHAR gdi[LF_FACESIZE] = L"", dw[LF_FACESIZE] = L"";
+        WCHAR gdi[LF_FACESIZE] = L"", dw[LF_FACESIZE] = L"", path[MAX_PATH] = L"";
         IDWriteFont *font;
         HRESULT hr;
 
@@ -43,8 +43,24 @@ int main( int argc, char **argv )
             IDWriteFont_GetFontFamily( font, &family );
             IDWriteFontFamily_GetFamilyNames( family, &names );
             IDWriteLocalizedStrings_GetString( names, 0, dw, LF_FACESIZE );
+            /* the file the font comes from: what decides it is GDI's font,
+             * whatever name either side reports for a substitute */
+            {
+                IDWriteFontFace *face;
+                IDWriteFontFile *file;
+                IDWriteFontFileLoader *loader;
+                IDWriteLocalFontFileLoader *local;
+                const void *key;
+                UINT32 n = 1, keysize;
+                if (SUCCEEDED(IDWriteFont_CreateFontFace( font, &face )) &&
+                    SUCCEEDED(IDWriteFontFace_GetFiles( face, &n, &file )) &&
+                    SUCCEEDED(IDWriteFontFile_GetReferenceKey( file, &key, &keysize )) &&
+                    SUCCEEDED(IDWriteFontFile_GetLoader( file, &loader )) &&
+                    SUCCEEDED(IDWriteFontFileLoader_QueryInterface( loader, &IID_IDWriteLocalFontFileLoader, (void **)&local )))
+                    IDWriteLocalFontFileLoader_GetFilePathFromKey( local, key, keysize, path, MAX_PATH );
+            }
         }
-        printf( "%s=%ls,%ls,%#lx\n", argv[i], gdi, dw, hr );
+        printf( "%s=%ls,%ls,%#lx,%ls\n", argv[i], gdi, dw, hr, path );
     }
     return 0;
 }

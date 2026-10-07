@@ -28,9 +28,11 @@ out=$(timeout -s KILL 60 "$WINE" "$T/dwlogfont-probe.exe" "Segoe UI" "MS Shell D
 printf '%s\n' "$out" | sed 's/^/      /'
 v() { printf '%s\n' "$out" | sed -n "s/^$1=//p"; }
 seg=$(v 'Segoe UI'); msd=$(v 'MS Shell Dlg'); tah=$(v Tahoma); none=$(v 'No Such Font Xyz')
-case "$seg" in *",Liberation Sans,0") pass "Segoe UI (substituted): the font GDI uses, Liberation Sans" ;; *) fail "Segoe UI: $seg" ;; esac
-g=${msd%%,*}; case "$msd" in *",0") pass "MS Shell Dlg: found (GDI: $g)" ;; *) fail "MS Shell Dlg: $msd" ;; esac
-case "$tah" in *",Tahoma,0") pass "a real family is still itself" ;; *) fail "Tahoma: $tah" ;; esac
-case "$none" in *",0x88985002") pass "an unknown name is still DWRITE_E_NOFONT (not GDI's default font)" ;; *) fail "unknown: $none" ;; esac
+# the substitute's own file (since 1220 a substituted name is a DirectWrite
+# family of its own, so both sides report "Segoe UI": the file decides)
+case "$seg" in *",0,"*[Ll]iberation[Ss]ans-Regular*) pass "Segoe UI (substituted): the font GDI uses, Liberation Sans ($seg)" ;; *) fail "Segoe UI: $seg" ;; esac
+g=${msd%%,*}; case "$msd" in *",0,"*) pass "MS Shell Dlg: found (GDI: $g)" ;; *) fail "MS Shell Dlg: $msd" ;; esac
+case "$tah" in *",Tahoma,0,"*) pass "a real family is still itself" ;; *) fail "Tahoma: $tah" ;; esac
+case "$none" in *",0x88985002,"*) pass "an unknown name is still DWRITE_E_NOFONT (not GDI's default font)" ;; *) fail "unknown: $none" ;; esac
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
