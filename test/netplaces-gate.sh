@@ -7,6 +7,11 @@
 # sg-session's sg-netbrowse; here a stand-in (SG_NETBROWSE) names two
 # computers and two shares.
 #
+# A share's comment is in the Comments column (1471): sg-netbrowse's shares2
+# gives "name<tab>comment"; an older helper (no shares2: exit 2) still lists
+# the names. Mutant: SG_MUTANT_NO_SHARE_COMMENT (shell32
+# shfldr_netplaces.c) must fail it.
+#
 #   WINE=/opt/wine-sg/bin/wine test/netplaces-gate.sh
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -28,6 +33,8 @@ cat > "$T/netbrowse" <<'EOS'
 case "$1" in
 computers) printf 'SERVER1\nNAS2\n' > "$2" ;;
 shares) [ "$3" = SERVER1 ] && printf 'Public\nMusic\n' > "$2" || : > "$2" ;;
+shares2) [ -n "${NETPLACES_OLD:-}" ] && exit 2
+    [ "$3" = SERVER1 ] && printf 'Public\tShared files for everyone\nMusic\t\n' > "$2" || : > "$2" ;;
 esac
 EOS
 chmod 755 "$T/netbrowse"
@@ -41,5 +48,12 @@ printf '%s\n' "$out" | grep -qF '    SERVER1  [\\SERVER1]' && printf '%s\n' "$ou
 printf '%s\n' "$out" | grep -qF 'parse \\SERVER1: 00000000' && pass "\\\\computer parses" || fail "\\\\computer does not parse"
 printf '%s\n' "$out" | grep -qF '    Public  [\\SERVER1\Public]' && printf '%s\n' "$out" | grep -qF '    Music  [\\SERVER1\Music]' \
     && pass "a computer lists its shares, each at \\\\computer\\share" || fail "no shares"
+printf '%s\n' "$out" | grep -qF '    Public  [\\SERVER1\Public]  {Shared files for everyone}' \
+    && printf '%s\n' "$out" | grep -qF '    Music  [\\SERVER1\Music]  {}' \
+    && pass "a share's comment is in the Comments column (none when it has none)" || fail "the shares' comments"
+old=$(NETPLACES_OLD=1 "$WINE" "$T/netplaces-probe.exe" 2>/dev/null | tr -d '\r')
+printf '%s\n' "$old" | grep -qF '    Public  [\\SERVER1\Public]' && printf '%s\n' "$old" | grep -qF '    Music  [\\SERVER1\Music]' \
+    && pass "an older sg-netbrowse (no shares2) still lists the shares" \
+    || fail "with an older sg-netbrowse: $(printf '%s\n' "$old" | grep '^    ' | tr '\n' ' ')"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
