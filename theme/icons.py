@@ -175,6 +175,96 @@ def application(size):
             dots += f'<circle cx="{x}" cy="{(top + band) / 2:.2f}" r="{r:.2f}" fill="{PAGE}"/>'
     return frame + bar + dots
 
+# ---- the message box icons (IDI_ERROR, IDI_WARNING, IDI_INFORMATION,
+# IDI_QUESTION; comctl32's task dialogs show the same; shell32's stock
+# icons too) ----------------------------------------------------------------
+# Wine's were its own painted art. Ours are flat shapes in the Windows 10
+# manner: a red disc with a white cross, an amber triangle with a dark "!",
+# a blue disc with a white "i", a blue disc with a white "?". Each shape has
+# a one-pixel edge a shade darker than its fill, so it holds its outline on a
+# white dialog and on a dark one alike. Strokes are at least two pixels wide
+# at the small sizes, so the glyph does not thin out at 16 px.
+
+ERROR_FILL, ERROR_EDGE = "#D83A3F", "#A3242B"
+WARN_FILL, WARN_EDGE, WARN_INK = "#F7C326", "#B98A00", "#1E1E1E"
+INFO_FILL, INFO_EDGE = "#2C7BD3", "#1A579D"
+GLYPH = "#FFFFFF"
+
+if os.environ.get("SG_MUTANT_MSGBOX_ICONS"):   # test/msgboxicons-gate.sh's mutant: the shapes swap colours
+    ERROR_FILL, INFO_FILL = INFO_FILL, ERROR_FILL
+
+
+def glyph_px(size, pixels, units):
+    """a glyph stroke: so many units of the drawing, but never under so many pixels"""
+    return max(units, px(size, pixels))
+
+
+def disc(size, fill, edge):
+    sw = px(size, 1.0 if size <= 48 else size / 48.0)
+    return (f'<circle cx="50" cy="50" r="{47 - sw / 2:.2f}" fill="{fill}" stroke="{edge}" '
+            f'stroke-width="{sw:.2f}"/>')
+
+
+def error_icon(size):
+    w = glyph_px(size, 2.0, 9.0)
+    a, b = 33, 67
+    return (disc(size, ERROR_FILL, ERROR_EDGE) +
+            f'<path d="M{a} {a} L{b} {b} M{b} {a} L{a} {b}" stroke="{GLYPH}" stroke-width="{w:.2f}" '
+            f'stroke-linecap="round" fill="none"/>')
+
+
+def info_icon(size):
+    w = glyph_px(size, 2.0, 10.0)
+    r = max(6.5, w * 0.68)
+    return (disc(size, INFO_FILL, INFO_EDGE) +
+            f'<circle cx="50" cy="28" r="{r:.2f}" fill="{GLYPH}"/>'
+            f'<path d="M50 46 V74" stroke="{GLYPH}" stroke-width="{w:.2f}" stroke-linecap="round" fill="none"/>')
+
+
+def question_icon(size):
+    w = glyph_px(size, 2.0, 9.5)
+    r = max(6.0, w * 0.66)
+    return (disc(size, INFO_FILL, INFO_EDGE) +
+            f'<path d="M36.5 37 A13.5 13.5 0 1 1 57 49 C52 52.5 50 55 50 60" stroke="{GLYPH}" '
+            f'stroke-width="{w:.2f}" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
+            f'<circle cx="50" cy="75" r="{r:.2f}" fill="{GLYPH}"/>')
+
+
+def rounded_polygon(points, radius):
+    """a closed path through points with each corner rounded by radius"""
+    n, d = len(points), []
+    for i in range(n):
+        (x0, y0), (x1, y1), (x2, y2) = points[i - 1], points[i], points[(i + 1) % n]
+        l0 = ((x0 - x1) ** 2 + (y0 - y1) ** 2) ** 0.5
+        l2 = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+        ax, ay = x1 + (x0 - x1) * radius / l0, y1 + (y0 - y1) * radius / l0
+        bx, by = x1 + (x2 - x1) * radius / l2, y1 + (y2 - y1) * radius / l2
+        d.append(f'{"M" if i == 0 else "L"}{ax:.2f} {ay:.2f} Q{x1} {y1} {bx:.2f} {by:.2f}')
+    return " ".join(d) + " Z"
+
+
+def warning_icon(size):
+    sw = px(size, 1.0 if size <= 48 else size / 48.0)
+    w = glyph_px(size, 2.0, 9.5)
+    r = max(5.8, w * 0.64)
+    tri = rounded_polygon([(50, 5), (97, 90), (3, 90)], 9)
+    return (f'<path d="{tri}" fill="{WARN_FILL}" stroke="{WARN_EDGE}" stroke-width="{sw:.2f}" '
+            f'stroke-linejoin="round"/>'
+            f'<path d="M50 36 V60" stroke="{WARN_INK}" stroke-width="{w:.2f}" stroke-linecap="round" fill="none"/>'
+            f'<circle cx="50" cy="75" r="{r:.2f}" fill="{WARN_INK}"/>')
+
+
+MSGBOX_ICONS = {
+    "dlls/user32/resources/oic_hand.svg": error_icon,
+    "dlls/user32/resources/oic_bang.svg": warning_icon,
+    "dlls/user32/resources/oic_note.svg": info_icon,
+    "dlls/user32/resources/oic_ques.svg": question_icon,
+    "dlls/shell32/resources/sg_error.svg": error_icon,
+    "dlls/shell32/resources/sg_warning.svg": warning_icon,
+    "dlls/shell32/resources/sg_info.svg": info_icon,
+    "dlls/shell32/resources/sg_question.svg": question_icon,
+}
+
 ICONS = {
     "dlls/shell32/resources/folder.svg": lambda s: folder(s),
     "dlls/shell32/resources/folder_open.svg": lambda s: folder(s, True),
@@ -187,6 +277,7 @@ ICONS = {
     "dlls/shell32/resources/drive.svg": fixed_drive,
     "dlls/user32/resources/oic_winlogo.svg": winlogo,
     "dlls/user32/resources/oic_sample.svg": application,
+    **MSGBOX_ICONS,
 }
 
 # ---- the file dialogs' toolbar strip (comctl32 IDB_VIEW_SMALL/LARGE) ----
