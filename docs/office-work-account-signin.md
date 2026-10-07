@@ -52,14 +52,27 @@ Office writes its own trace, readable text, to
 reason a token was refused). Grep it for `Invalid`, `Missing`, `expired`, `gmtime`.
 `Licensing.*` events (`LoadIdentityTicketInSignInProvider`, `GetEntitlements`) show how far licensing got.
 
-## Open: Word crashes in its React Native UI
+## After sign-in: Word's crashes and the black font boxes (1490-1492)
 
-With sign-in and licensing working, Word crashes shortly after it draws its UI: on the first-run
-dialogs (license agreement, privacy notice) and on the Start screen, and within seconds of opening a
-document (`HKCU\Software\Microsoft\Office\16.0\Word\Options\DisableBootToOfficeStart=1` skips the Start
-screen). It is an Office fail-fast (`mso20win32client`, called through `react-native-win32` /
-`mso40uiwin32client`; the exception code is an assertion tag that differs per crash), not part of the
-sign-in. Not yet diagnosed.
+With sign-in and licensing working, Word crashed as it drew its React Native UI (start screen,
+first-run dialogs, a new document) and again about a minute after a document opened, and the
+ribbon's font name and size boxes were black. Three Wine-side causes, each with a gate:
+
+* **1490 riched20**: Wine's riched20 is loaded in place of Office's own `RICHED20.DLL` (builtin is
+  preferred). The React Native text box ("Describe the document you'd like to write") looks up
+  `IID_ITextServices2` in it, asks the text services for `ITextServices2` and `ITextDocument2`, and
+  draws with `TxDrawD2D`; any missing one was an Office fail-fast (`0x02784198`). Found with `+seh`:
+  `LdrGetProcedureAddress("IID_ITextServices2")` failed, then the `ITextDocument2` QueryInterface.
+* **1491 d2d1**: the ribbon draws each text box's content through a view of its atlas made by
+  `CreateSharedBitmap(IID_ID2D1Bitmap, ..., properties)`; Wine made such views "cannot draw" targets,
+  which drew transparent black.
+* **1492 combase**: `RoTransformError` was an unimplemented stub; a `Windows.Web.Http` request's
+  E_NOTIMPL reached it a minute after a document opened and ended Word (`0xe0000002`).
+
+Still open: `ITextDocument2::Range2`, `GetSelection2` and `GetMainStory` are stubs, so the React
+Native text boxes cannot read their own text: the start screen's box keeps its placeholder when typed
+into, and the document's Copilot bar shows no placeholder. With Office's own RichEdit
+(`HKCU\Software\Wine\AppDefaults\WINWORD.EXE\DllOverrides`, `riched20=native`) both look right.
 
 ## Not done
 
