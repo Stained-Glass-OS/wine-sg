@@ -11,6 +11,7 @@
 # control-gate.sh) recording what it was asked for.
 #
 #   WINE=/opt/wine-sg/bin/wine test/sysdm-gate.sh
+# Mutant: SG_MUTANT_SYSDM_LOOPS (sysdm.c, 1512).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -41,8 +42,18 @@ grep -q 'cmdline=.*EditEnvironmentVariables' "$L" 2>/dev/null \
 rm -f "$L"
 (cd "$WINEPREFIX/drive_c" && timeout -s KILL 120 xvfb-run -a "$WINE" rundll32 shell32.dll,Control_RunDLL sysdm.cpl >/dev/null 2>&1)
 "$WINESERVER" -w
-grep -q 'cmdline=.*Microsoft.System' "$L" 2>/dev/null \
-    && pass "sysdm.cpl opened as a Control Panel item (Run \"sysdm.cpl\") opens its System page" \
+# System Properties is the Control Panel's own page (control sysdm.cpl), not
+# "/name Microsoft.System" -- Settings > About in Windows 10 (1512)
+grep -q 'cmdline=.*sysdm\.cpl' "$L" 2>/dev/null && ! grep -q 'Microsoft.System' "$L" 2>/dev/null \
+    && pass "sysdm.cpl opened as a Control Panel item (Run \"sysdm.cpl\") asks for System Properties (control sysdm.cpl)" \
     || fail "sysdm.cpl: $(tr -d '\r' < "$L" 2>/dev/null)"
+# with Wine's own control.exe (no Stained Glass Control Panel), that would host
+# sysdm.cpl again, which would start it again: once is enough (1512)
+"$WINE" reg delete 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\control.exe' /f >/dev/null 2>&1
+"$WINESERVER" -w
+(cd "$WINEPREFIX/drive_c" && timeout -s KILL 60 xvfb-run -a "$WINE" rundll32 shell32.dll,Control_RunDLL sysdm.cpl >/dev/null 2>&1); rc=$?
+[ "$rc" != 137 ] && pass "with Wine's own control.exe it ends (rc $rc) -- no endless control.exe/sysdm.cpl loop" \
+    || fail "sysdm.cpl and Wine's control.exe started each other until killed (60 s)"
+"$WINESERVER" -k 2>/dev/null
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
