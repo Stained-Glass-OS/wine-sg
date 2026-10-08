@@ -1,0 +1,721 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] iphlpapi, nsiproxy: IP interface table, and change notifications that call back
+
+- GetIpInterfaceTable failed with ERROR_NOT_SUPPORTED, and
+  GetIpInterfaceEntry and InitializeIpInterfaceEntry were missing. Each
+  link gives an IPv4 row, and an IPv6 row when the host has IPv6: index,
+  LUID, MTU, connected state, the automatic metric by link speed (75 for
+  loopback), and Windows' defaults for the settings the host does not
+  keep per family. InitializeIpInterfaceEntry marks every setting
+  "unchanged".
+- NotifyIpInterfaceChange and NotifyRouteChange2 never called back, and
+  NotifyUnicastIpAddressChange gave only its initial notification. A
+  registration now has a thread that waits for the NSI tables' change
+  notifications, takes the table again and calls back with each instance
+  added, deleted or changed (lifetimes counting down are not changes). The
+  initial notification still comes before the call returns.
+  CancelMibChangeNotify2 stops the thread, waiting for a callback in
+  progress unless called from one.
+- NotifyRouteChange failed: it waits for the IPv4 route table.
+- NotifyStableUnicastIpAddressTable was missing: addresses are never left
+  tentative here, so the table comes back at once.
+- nsiproxy listens for link and route netlink messages too, and signals
+  the NDIS interface and IP forward tables.
+
+Wine's iphlpapi tests: GetIpInterfaceTable/GetIpInterfaceEntry test added;
+no failures, as before.
+
+Gate: test/ipnotify-gate.sh (a network namespace of its own; adds an
+address, a route and a link). Mutants SG_MUTANT_NO_MIB_NOTIFY,
+SG_MUTANT_NO_IP_INTERFACES (iphlpapi_main.c), SG_MUTANT_NO_LINK_ROUTE_EVENTS
+(nsiproxy.sys/nsi.c).
+---
+--- a/dlls/iphlpapi/iphlpapi.spec
++++ b/dlls/iphlpapi/iphlpapi.spec
+@@ -106,7 +106,7 @@
+ @ stdcall GetIpForwardTable( ptr ptr long )
+ @ stdcall GetIpForwardTable2( long ptr )
+ @ stub GetIpForwardTableFromStack
+-#@ stub GetIpInterfaceEntry
++@ stdcall GetIpInterfaceEntry( ptr )
+ @ stdcall GetIpInterfaceTable( long ptr )
+ #@ stub GetIpNetEntry2
+ @ stdcall GetIpNetTable( ptr ptr long )
+@@ -164,7 +164,7 @@
+ @ stdcall if_indextoname(long ptr) IPHLP_if_indextoname
+ @ stdcall if_nametoindex(str) IPHLP_if_nametoindex
+ #@ stub InitializeIpForwardEntry
+-#@ stub InitializeIpInterfaceEntry
++@ stdcall InitializeIpInterfaceEntry( ptr )
+ #@ stub InitializeUnicastIpAddressEntry
+ #@ stub InternalCleanupPersistentStore
+ #@ stub InternalCreateAnycastIpAddressEntry
+@@ -239,7 +239,7 @@
+ @ stdcall NotifyRouteChange( ptr ptr )
+ @ stdcall NotifyRouteChange2( long ptr ptr long ptr )
+ @ stub NotifyRouteChangeEx
+-#@ stub NotifyStableUnicastIpAddressTable
++@ stdcall NotifyStableUnicastIpAddressTable( long ptr ptr ptr ptr )
+ #@ stub NotifyTeredoPortChange
+ @ stdcall NotifyUnicastIpAddressChange(long ptr ptr long ptr)
+ #@ stub NTPTimeToNTFileTime
+--- a/dlls/iphlpapi/iphlpapi_main.c
++++ b/dlls/iphlpapi/iphlpapi_main.c
+@@ -143,10 +143,12 @@ BOOL WINAPI CancelIPChangeNotify(LPOVERLAPPED overlapped)
+ /******************************************************************
+  *    CancelMibChangeNotify2 (IPHLPAPI.@)
+  */
++static DWORD cancel_mib_notification( HANDLE handle );
++
+ DWORD WINAPI CancelMibChangeNotify2(HANDLE handle)
+ {
+-    FIXME("(handle %p): stub\n", handle);
+-    return NO_ERROR;
++    TRACE("(handle %p)\n", handle);
++    return cancel_mib_notification( handle );
+ }
+ 
+ 
+@@ -3886,16 +3888,305 @@ DWORD WINAPI NotifyAddrChange(PHANDLE Handle, LPOVERLAPPED overlapped)
+ }
+ 
+ 
++/* Stained Glass OS: change notifications with callbacks. A thread a
++ * registration waits for the NSI tables' change notifications, takes the
++ * table again and tells the caller what was added, deleted or changed. */
++enum mib_notify_kind { notify_unicast, notify_interface, notify_route };
++
++struct mib_notification
++{
++    enum mib_notify_kind kind;
++    ADDRESS_FAMILY family;
++    void *callback;
++    void *context;
++    HANDLE thread, stop;
++    DWORD thread_id;
++    LONG cancelled;
++    LONG self_free;  /* cancelled from a callback: the thread frees it */
++    void *table;   /* the last table seen */
++};
++
++static CRITICAL_SECTION mib_notify_cs;
++static CRITICAL_SECTION_DEBUG mib_notify_cs_debug =
++{
++    0, 0, &mib_notify_cs,
++    { &mib_notify_cs_debug.ProcessLocksList, &mib_notify_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": mib_notify_cs") }
++};
++static CRITICAL_SECTION mib_notify_cs = { &mib_notify_cs_debug, -1, 0, 0, 0, 0 };
++
++static DWORD mib_get_table( struct mib_notification *n, void **table )
++{
++    switch (n->kind)
++    {
++    case notify_unicast:   return GetUnicastIpAddressTable( n->family, (MIB_UNICASTIPADDRESS_TABLE **)table );
++    case notify_interface: return GetIpInterfaceTable( n->family, (MIB_IPINTERFACE_TABLE **)table );
++    case notify_route:     return GetIpForwardTable2( n->family, (MIB_IPFORWARD_TABLE2 **)table );
++    }
++    return ERROR_INVALID_PARAMETER;
++}
++
++static ULONG mib_table_count( struct mib_notification *n, void *table )
++{
++    return table ? *(ULONG *)table : 0;
++}
++
++static void *mib_table_row( struct mib_notification *n, void *table, ULONG i )
++{
++    switch (n->kind)
++    {
++    case notify_unicast:   return ((MIB_UNICASTIPADDRESS_TABLE *)table)->Table + i;
++    case notify_interface: return ((MIB_IPINTERFACE_TABLE *)table)->Table + i;
++    case notify_route:     return ((MIB_IPFORWARD_TABLE2 *)table)->Table + i;
++    }
++    return NULL;
++}
++
++static BOOL sockaddr_inet_equal( const SOCKADDR_INET *a, const SOCKADDR_INET *b )
++{
++    if (a->si_family != b->si_family) return FALSE;
++    if (a->si_family == AF_INET) return a->Ipv4.sin_addr.s_addr == b->Ipv4.sin_addr.s_addr;
++    if (a->si_family == AF_INET6)
++        return !memcmp( &a->Ipv6.sin6_addr, &b->Ipv6.sin6_addr, sizeof(a->Ipv6.sin6_addr) ) &&
++               a->Ipv6.sin6_scope_id == b->Ipv6.sin6_scope_id;
++    return TRUE;
++}
++
++/* whether two rows are the same instance (the table's key) */
++static BOOL mib_same_instance( struct mib_notification *n, const void *a, const void *b )
++{
++    switch (n->kind)
++    {
++    case notify_unicast:
++    {
++        const MIB_UNICASTIPADDRESS_ROW *x = a, *y = b;
++        return x->InterfaceLuid.Value == y->InterfaceLuid.Value && sockaddr_inet_equal( &x->Address, &y->Address );
++    }
++    case notify_interface:
++    {
++        const MIB_IPINTERFACE_ROW *x = a, *y = b;
++        return x->Family == y->Family && x->InterfaceLuid.Value == y->InterfaceLuid.Value;
++    }
++    case notify_route:
++    {
++        const MIB_IPFORWARD_ROW2 *x = a, *y = b;
++        return x->InterfaceLuid.Value == y->InterfaceLuid.Value &&
++               x->DestinationPrefix.PrefixLength == y->DestinationPrefix.PrefixLength &&
++               sockaddr_inet_equal( &x->DestinationPrefix.Prefix, &y->DestinationPrefix.Prefix ) &&
++               sockaddr_inet_equal( &x->NextHop, &y->NextHop );
++    }
++    }
++    return FALSE;
++}
++
++/* whether an instance's parameters changed: times that only count down
++ * (address lifetimes, route ages) are not changes */
++static BOOL mib_parameters_changed( struct mib_notification *n, const void *a, const void *b )
++{
++    switch (n->kind)
++    {
++    case notify_unicast:
++    {
++        const MIB_UNICASTIPADDRESS_ROW *x = a, *y = b;
++        return x->PrefixOrigin != y->PrefixOrigin || x->SuffixOrigin != y->SuffixOrigin ||
++               x->OnLinkPrefixLength != y->OnLinkPrefixLength || x->SkipAsSource != y->SkipAsSource ||
++               x->DadState != y->DadState || x->ScopeId.Value != y->ScopeId.Value;
++    }
++    case notify_interface:
++    {
++        const MIB_IPINTERFACE_ROW *x = a, *y = b;
++        return x->Connected != y->Connected || x->NlMtu != y->NlMtu || x->Metric != y->Metric ||
++               x->ForwardingEnabled != y->ForwardingEnabled;
++    }
++    case notify_route:
++    {
++        const MIB_IPFORWARD_ROW2 *x = a, *y = b;
++        return x->Metric != y->Metric || x->Protocol != y->Protocol || x->Loopback != y->Loopback;
++    }
++    }
++    return FALSE;
++}
++
++static void mib_call( struct mib_notification *n, void *row, MIB_NOTIFICATION_TYPE type )
++{
++    if (n->cancelled) return;
++    switch (n->kind)
++    {
++    case notify_unicast:   ((PUNICAST_IPADDRESS_CHANGE_CALLBACK)n->callback)( n->context, row, type ); break;
++    case notify_interface: ((PIPINTERFACE_CHANGE_CALLBACK)n->callback)( n->context, row, type ); break;
++    case notify_route:     ((PIPFORWARD_CHANGE_CALLBACK)n->callback)( n->context, row, type ); break;
++    }
++}
++
++static void mib_compare( struct mib_notification *n, void *old, void *new )
++{
++    ULONG i, j, old_count = mib_table_count( n, old ), new_count = mib_table_count( n, new );
++
++    for (i = 0; i < old_count; i++)
++    {
++        for (j = 0; j < new_count; j++)
++            if (mib_same_instance( n, mib_table_row( n, old, i ), mib_table_row( n, new, j ) )) break;
++        if (j == new_count) mib_call( n, mib_table_row( n, old, i ), MibDeleteInstance );
++    }
++    for (j = 0; j < new_count; j++)
++    {
++        for (i = 0; i < old_count; i++)
++            if (mib_same_instance( n, mib_table_row( n, old, i ), mib_table_row( n, new, j ) )) break;
++        if (i == old_count) mib_call( n, mib_table_row( n, new, j ), MibAddInstance );
++        else if (mib_parameters_changed( n, mib_table_row( n, old, i ), mib_table_row( n, new, j ) ))
++            mib_call( n, mib_table_row( n, new, j ), MibParameterNotification );
++    }
++}
++
++/* the NSI tables whose changes matter to a registration */
++static void mib_tables( struct mib_notification *n, const NPI_MODULEID **modules, DWORD *tables, int *count )
++{
++    *count = 0;
++    if (n->kind == notify_interface)
++    {
++        modules[*count] = &NPI_MS_NDIS_MODULEID;
++        tables[(*count)++] = NSI_NDIS_IFINFO_TABLE;
++    }
++    if (n->family != AF_INET6)
++    {
++        modules[*count] = &NPI_MS_IPV4_MODULEID;
++        tables[(*count)++] = n->kind == notify_route ? NSI_IP_FORWARD_TABLE : NSI_IP_UNICAST_TABLE;
++    }
++    if (n->family != AF_INET)
++    {
++        modules[*count] = &NPI_MS_IPV6_MODULEID;
++        tables[(*count)++] = n->kind == notify_route ? NSI_IP_FORWARD_TABLE : NSI_IP_UNICAST_TABLE;
++    }
++}
++
++static void free_mib_notification( struct mib_notification *n );
++
++static DWORD WINAPI mib_notification_thread( void *arg )
++{
++    struct mib_notification *n = arg;
++    const NPI_MODULEID *modules[3];
++    OVERLAPPED ovr[3];
++    HANDLE handles[4], nsi_handles[3];
++    DWORD tables[3], ret;
++    int count, i;
++    void *table;
++
++    mib_tables( n, modules, tables, &count );
++    memset( ovr, 0, sizeof(ovr) );
++    handles[0] = n->stop;
++    for (i = 0; i < count; i++)
++    {
++        handles[i + 1] = ovr[i].hEvent = CreateEventW( NULL, TRUE, FALSE, NULL );
++        nsi_handles[i] = NULL;
++    }
++
++    while (!n->cancelled)
++    {
++        /* ask first, then look: a change between the two is not lost */
++        for (i = 0; i < count; i++)
++        {
++            if (nsi_handles[i]) continue;
++            ResetEvent( ovr[i].hEvent );
++            if (NsiRequestChangeNotification( 0, modules[i], tables[i], &ovr[i], &nsi_handles[i] ) != ERROR_IO_PENDING)
++                nsi_handles[i] = NULL;
++        }
++        if (!mib_get_table( n, &table ))
++        {
++            mib_compare( n, n->table, table );
++            FreeMibTable( n->table );
++            n->table = table;
++        }
++        ret = WaitForMultipleObjects( count + 1, handles, FALSE, INFINITE );
++        if (ret == WAIT_OBJECT_0 || ret == WAIT_FAILED) break;
++        i = ret - WAIT_OBJECT_0 - 1;
++        if (i >= 0 && i < count) nsi_handles[i] = NULL;
++        Sleep( 50 );  /* a burst of changes is taken as one */
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        /* the cancelled request completes into ovr: wait for it */
++        if (nsi_handles[i] && !NsiCancelChangeNotification( &ovr[i] ))
++            WaitForSingleObject( ovr[i].hEvent, INFINITE );
++        CloseHandle( ovr[i].hEvent );
++    }
++    if (n->self_free) free_mib_notification( n );
++    return 0;
++}
++
++static void free_mib_notification( struct mib_notification *n )
++{
++    if (n->thread) CloseHandle( n->thread );
++    if (n->stop) CloseHandle( n->stop );
++    FreeMibTable( n->table );
++    heap_free( n );
++}
++
++static DWORD register_mib_notification( enum mib_notify_kind kind, ADDRESS_FAMILY family, void *callback,
++                                        void *context, BOOLEAN init_notify, HANDLE *handle )
++{
++    struct mib_notification *n;
++    DWORD err;
++
++    if (!handle || !callback || (family != AF_UNSPEC && family != AF_INET && family != AF_INET6))
++        return ERROR_INVALID_PARAMETER;
++    *handle = NULL;
++    if (!(n = heap_alloc_zero( sizeof(*n) ))) return ERROR_NOT_ENOUGH_MEMORY;
++    n->kind = kind;
++    n->family = family;
++    n->callback = callback;
++    n->context = context;
++#ifndef SG_MUTANT_NO_MIB_NOTIFY
++    if ((err = mib_get_table( n, &n->table )) && err != ERROR_NOT_FOUND)
++    {
++        free_mib_notification( n );
++        return err;
++    }
++    if (!(n->stop = CreateEventW( NULL, TRUE, FALSE, NULL )) ||
++        !(n->thread = CreateThread( NULL, 0, mib_notification_thread, n, CREATE_SUSPENDED, &n->thread_id )))
++    {
++        err = GetLastError();
++        free_mib_notification( n );
++        return err;
++    }
++#endif
++    /* the initial notification comes before the call returns */
++    if (init_notify) mib_call( n, NULL, MibInitialNotification );
++    if (n->thread) ResumeThread( n->thread );
++    *handle = n;
++    return NO_ERROR;
++}
++
++static DWORD cancel_mib_notification( HANDLE handle )
++{
++    struct mib_notification *n = handle;
++
++    if (!n) return ERROR_INVALID_HANDLE;
++    EnterCriticalSection( &mib_notify_cs );
++    InterlockedExchange( &n->cancelled, 1 );
++    if (n->stop) SetEvent( n->stop );
++    LeaveCriticalSection( &mib_notify_cs );
++    /* callbacks running are waited for, unless this is one */
++    if (n->thread && GetCurrentThreadId() != n->thread_id)
++    {
++        WaitForSingleObject( n->thread, INFINITE );
++        free_mib_notification( n );
++    }
++    /* from a callback: the thread frees it as it ends */
++    else if (n->thread) n->self_free = 1;
++    else free_mib_notification( n );
++    return NO_ERROR;
++}
++
+ /******************************************************************
+  *    NotifyIpInterfaceChange (IPHLPAPI.@)
+  */
+ DWORD WINAPI NotifyIpInterfaceChange(ADDRESS_FAMILY family, PIPINTERFACE_CHANGE_CALLBACK callback,
+                                      PVOID context, BOOLEAN init_notify, PHANDLE handle)
+ {
+-    FIXME("(family %d, callback %p, context %p, init_notify %d, handle %p): stub\n",
++    TRACE("(family %d, callback %p, context %p, init_notify %d, handle %p)\n",
+           family, callback, context, init_notify, handle);
+-    if (handle) *handle = NULL;
+-    return NO_ERROR;
++    return register_mib_notification( notify_interface, family, callback, context, init_notify, handle );
+ }
+ 
+ /******************************************************************
+@@ -3904,10 +4195,9 @@ DWORD WINAPI NotifyIpInterfaceChange(ADDRESS_FAMILY family, PIPINTERFACE_CHANGE_
+ DWORD WINAPI NotifyRouteChange2(ADDRESS_FAMILY family, PIPFORWARD_CHANGE_CALLBACK callback, VOID* context,
+                                 BOOLEAN init_notify, HANDLE* handle)
+ {
+-    FIXME("(family %d, callback %p, context %p, init_notify %d, handle %p): stub\n",
++    TRACE("(family %d, callback %p, context %p, init_notify %d, handle %p)\n",
+         family, callback, context, init_notify, handle);
+-    if (handle) *handle = NULL;
+-    return NO_ERROR;
++    return register_mib_notification( notify_route, family, callback, context, init_notify, handle );
+ }
+ 
+ 
+@@ -3929,8 +4219,9 @@ DWORD WINAPI NotifyRouteChange2(ADDRESS_FAMILY family, PIPFORWARD_CHANGE_CALLBAC
+  */
+ DWORD WINAPI NotifyRouteChange(PHANDLE Handle, LPOVERLAPPED overlapped)
+ {
+-  FIXME("(Handle %p, overlapped %p): stub\n", Handle, overlapped);
+-  return ERROR_NOT_SUPPORTED;
++    TRACE("Handle %p, overlapped %p.\n", Handle, overlapped);
++
++    return NsiRequestChangeNotification(0, &NPI_MS_IPV4_MODULEID, NSI_IP_FORWARD_TABLE, overlapped, Handle);
+ }
+ 
+ 
+@@ -3940,14 +4231,27 @@ DWORD WINAPI NotifyRouteChange(PHANDLE Handle, LPOVERLAPPED overlapped)
+ DWORD WINAPI NotifyUnicastIpAddressChange(ADDRESS_FAMILY family, PUNICAST_IPADDRESS_CHANGE_CALLBACK callback,
+                                           PVOID context, BOOLEAN init_notify, PHANDLE handle)
+ {
+-    FIXME("(family %d, callback %p, context %p, init_notify %d, handle %p): semi-stub\n",
++    TRACE("(family %d, callback %p, context %p, init_notify %d, handle %p)\n",
+           family, callback, context, init_notify, handle);
+-    if (handle) *handle = NULL;
++    return register_mib_notification( notify_unicast, family, callback, context, init_notify, handle );
++}
+ 
+-    if (init_notify)
+-        callback(context, NULL, MibInitialNotification);
++/******************************************************************
++ *    NotifyStableUnicastIpAddressTable (IPHLPAPI.@)
++ *
++ * Addresses here are never left tentative (duplicate address detection is
++ * the host's), so the table is stable now and comes back at once.
++ */
++DWORD WINAPI NotifyStableUnicastIpAddressTable(ADDRESS_FAMILY family, PMIB_UNICASTIPADDRESS_TABLE *table,
++                                               PSTABLE_UNICAST_IPADDRESS_TABLE_CALLBACK callback,
++                                               PVOID context, HANDLE *handle)
++{
++    TRACE("(family %d, table %p, callback %p, context %p, handle %p)\n", family, table, callback, context, handle);
+ 
+-    return NO_ERROR;
++    if (!table || !callback || !handle || (family != AF_UNSPEC && family != AF_INET && family != AF_INET6))
++        return ERROR_INVALID_PARAMETER;
++    *handle = NULL;
++    return GetUnicastIpAddressTable( family, table );
+ }
+ 
+ /******************************************************************
+@@ -4530,13 +4834,158 @@ char *WINAPI IPHLP_if_indextoname( NET_IFINDEX index, char *name )
+     return name;
+ }
+ 
++/******************************************************************
++ *    GetIpInterfaceTable (IPHLPAPI.@)
++ */
++/* Stained Glass OS: an interface's IP settings, from its link (the host
++ * keeps no per-family settings that Windows programs could change) */
++static ULONG ip_interface_metric( const MIB_IF_ROW2 *ifrow )
++{
++    ULONG64 speed = ifrow->ReceiveLinkSpeed;
++
++    /* the automatic metric, by link speed */
++    if (ifrow->Type == IF_TYPE_SOFTWARE_LOOPBACK) return 75;
++    if (speed >= 2000000000) return 5;
++    if (speed >= 200000000) return 10;
++    if (speed > 80000000) return 20;
++    if (speed > 20000000) return 25;
++    if (speed > 4000000) return 30;
++    if (speed > 500000) return 40;
++    return 50;
++}
++
++static void ip_interface_row_fill( MIB_IPINTERFACE_ROW *row, ADDRESS_FAMILY family, const MIB_IF_ROW2 *ifrow )
++{
++    BOOL loopback = ifrow->Type == IF_TYPE_SOFTWARE_LOOPBACK;
++    int i;
++
++    memset( row, 0, sizeof(*row) );
++    row->Family = family;
++    row->InterfaceLuid = ifrow->InterfaceLuid;
++    row->InterfaceIndex = ifrow->InterfaceIndex;
++    row->MaxReassemblySize = 0xffff;
++    row->MinRouterAdvertisementInterval = 200000;
++    row->MaxRouterAdvertisementInterval = 600000;
++    row->UseAutomaticMetric = TRUE;
++    row->UseNeighborUnreachabilityDetection = TRUE;
++    row->RouterDiscoveryBehavior = family == AF_INET ? RouterDiscoveryDhcp : RouterDiscoveryEnabled;
++    row->DadTransmits = family == AF_INET ? 3 : 1;
++    row->BaseReachableTime = 30000;
++    row->ReachableTime = 30000;
++    row->RetransmitTime = 1000;
++    row->PathMtuDiscoveryTimeout = 600000;
++    row->LinkLocalAddressBehavior = family == AF_INET ? LinkLocalDelayed : LinkLocalAlwaysOn;
++    row->LinkLocalAddressTimeout = 6000;
++    for (i = 0; i < ScopeLevelCount; i++)
++        row->ZoneIndices[i] = i <= ScopeLevelSubnet ? ifrow->InterfaceIndex : i == ScopeLevelGlobal ? 0 : 1;
++    row->SitePrefixLength = family == AF_INET6 ? 64 : 0;
++    row->Metric = ip_interface_metric( ifrow );
++    row->NlMtu = ifrow->Mtu;
++    row->Connected = loopback || ifrow->OperStatus == IfOperStatusUp;
++    row->SupportsNeighborDiscovery = !loopback;
++    row->SupportsRouterDiscovery = !loopback;
++}
++
++/* whether the host has IPv6 at all: a family without addresses anywhere
++ * has no interfaces */
++static BOOL ip_family_enabled( ADDRESS_FAMILY family )
++{
++    MIB_UNICASTIPADDRESS_TABLE *addrs;
++    BOOL ret;
++
++    if (family == AF_INET) return TRUE;
++    if (GetUnicastIpAddressTable( family, &addrs )) return FALSE;
++    ret = addrs->NumEntries != 0;
++    FreeMibTable( addrs );
++    return ret;
++}
++
+ /******************************************************************
+  *    GetIpInterfaceTable (IPHLPAPI.@)
+  */
+ DWORD WINAPI GetIpInterfaceTable(ADDRESS_FAMILY family, PMIB_IPINTERFACE_TABLE *table)
+ {
+-    FIXME("(%u %p): stub\n", family, table);
++    static const ADDRESS_FAMILY families[] = { AF_INET, AF_INET6 };
++    MIB_IF_TABLE2 *ifs;
++    ULONG f, i, count = 0;
++    BOOL enabled[2];
++    DWORD err;
++
++    TRACE("(%u %p)\n", family, table);
++
++    if (!table || (family != AF_UNSPEC && family != AF_INET && family != AF_INET6))
++        return ERROR_INVALID_PARAMETER;
++    *table = NULL;
++#ifdef SG_MUTANT_NO_IP_INTERFACES
+     return ERROR_NOT_SUPPORTED;
++#endif
++    if ((err = GetIfTable2( &ifs ))) return err;
++    for (f = 0; f < 2; f++)
++        enabled[f] = (family == AF_UNSPEC || family == families[f]) && ip_family_enabled( families[f] );
++    if (!(*table = heap_alloc_zero( FIELD_OFFSET( MIB_IPINTERFACE_TABLE, Table[ifs->NumEntries * 2 + 1] ) )))
++    {
++        FreeMibTable( ifs );
++        return ERROR_NOT_ENOUGH_MEMORY;
++    }
++    for (f = 0; f < 2; f++)
++    {
++        if (!enabled[f]) continue;
++        for (i = 0; i < ifs->NumEntries; i++)
++            ip_interface_row_fill( (*table)->Table + count++, families[f], ifs->Table + i );
++    }
++    (*table)->NumEntries = count;
++    FreeMibTable( ifs );
++    return NO_ERROR;
++}
++
++/******************************************************************
++ *    GetIpInterfaceEntry (IPHLPAPI.@)
++ */
++DWORD WINAPI GetIpInterfaceEntry( MIB_IPINTERFACE_ROW *row )
++{
++    MIB_IF_ROW2 ifrow;
++    DWORD err;
++
++    TRACE( "%p\n", row );
++
++    if (!row || (row->Family != AF_INET && row->Family != AF_INET6)) return ERROR_INVALID_PARAMETER;
++    memset( &ifrow, 0, sizeof(ifrow) );
++    ifrow.InterfaceLuid = row->InterfaceLuid;
++    ifrow.InterfaceIndex = row->InterfaceIndex;
++    if ((err = GetIfEntry2( &ifrow ))) return err == ERROR_FILE_NOT_FOUND ? ERROR_NOT_FOUND : err;
++    if (!ip_family_enabled( row->Family )) return ERROR_NOT_FOUND;
++    ip_interface_row_fill( row, row->Family, &ifrow );
++    return NO_ERROR;
++}
++
++/******************************************************************
++ *    InitializeIpInterfaceEntry (IPHLPAPI.@)
++ *
++ * Every setting is "leave as it is" for SetIpInterfaceEntry.
++ */
++void WINAPI InitializeIpInterfaceEntry( MIB_IPINTERFACE_ROW *row )
++{
++    TRACE( "%p\n", row );
++
++    memset( row, 0, sizeof(*row) );
++    row->Family = AF_UNSPEC;
++    row->MinRouterAdvertisementInterval = ~0u;
++    row->MaxRouterAdvertisementInterval = ~0u;
++    row->AdvertisingEnabled = row->ForwardingEnabled = row->WeakHostSend = row->WeakHostReceive = 0xff;
++    row->UseAutomaticMetric = row->UseNeighborUnreachabilityDetection = 0xff;
++    row->ManagedAddressConfigurationSupported = row->OtherStatefulConfigurationSupported = 0xff;
++    row->AdvertiseDefaultRoute = 0xff;
++    row->RouterDiscoveryBehavior = RouterDiscoveryUnchanged;
++    row->DadTransmits = ~0u;
++    row->BaseReachableTime = ~0u;
++    row->RetransmitTime = ~0u;
++    row->PathMtuDiscoveryTimeout = ~0u;
++    row->LinkLocalAddressBehavior = LinkLocalUnchanged;
++    row->LinkLocalAddressTimeout = ~0u;
++    row->SitePrefixLength = ~0u;
++    row->Metric = ~0u;
++    row->NlMtu = ~0u;
++    row->DisableDefaultRoutes = 0xff;
+ }
+ 
+ /******************************************************************
+--- a/dlls/iphlpapi/tests/iphlpapi.c
++++ b/dlls/iphlpapi/tests/iphlpapi.c
+@@ -3071,6 +3071,41 @@ static void test_NotifyUnicastIpAddressChange(void)
+     ok(!CloseHandle(handle), "CloseHandle() succeeded.\n");
+ }
+ 
++static void test_GetIpInterfaceTable(void)
++{
++    MIB_IPINTERFACE_TABLE *table;
++    MIB_IPINTERFACE_ROW row;
++    DWORD ret, i;
++
++    ret = GetIpInterfaceTable(AF_INET, &table);
++    ok(ret == NO_ERROR, "got %lu\n", ret);
++    if (ret) return;
++    ok(table->NumEntries > 0, "no interfaces\n");
++    for (i = 0; i < table->NumEntries; i++)
++    {
++        ok(table->Table[i].Family == AF_INET, "got family %u\n", table->Table[i].Family);
++        memset(&row, 0, sizeof(row));
++        row.Family = AF_INET;
++        row.InterfaceLuid = table->Table[i].InterfaceLuid;
++        ret = GetIpInterfaceEntry(&row);
++        ok(ret == NO_ERROR, "got %lu\n", ret);
++        ok(row.InterfaceIndex == table->Table[i].InterfaceIndex, "got index %lu, expected %lu\n",
++           row.InterfaceIndex, table->Table[i].InterfaceIndex);
++        ok(row.NlMtu == table->Table[i].NlMtu, "got mtu %lu, expected %lu\n", row.NlMtu, table->Table[i].NlMtu);
++    }
++    FreeMibTable(table);
++
++    ret = GetIpInterfaceTable(AF_INET6 + 1, &table);
++    ok(ret == ERROR_INVALID_PARAMETER, "got %lu\n", ret);
++    memset(&row, 0, sizeof(row));
++    ret = GetIpInterfaceEntry(&row);
++    ok(ret == ERROR_INVALID_PARAMETER, "got %lu\n", ret);
++    row.Family = AF_INET;
++    row.InterfaceIndex = 0xdead;
++    ret = GetIpInterfaceEntry(&row);
++    ok(ret == ERROR_NOT_FOUND, "got %lu\n", ret);
++}
++
+ static void test_ConvertGuidToString( void )
+ {
+     DWORD err;
+@@ -3145,6 +3180,7 @@ START_TEST(iphlpapi)
+     test_GetUdp6Table();
+     test_ParseNetworkString();
+     test_NotifyUnicastIpAddressChange();
++    test_GetIpInterfaceTable();
+     test_ConvertGuidToString();
+     test_compartments();
+     freeIPHlpApi();
+--- a/dlls/nsiproxy.sys/nsi.c
++++ b/dlls/nsiproxy.sys/nsi.c
+@@ -203,6 +203,11 @@ static NTSTATUS poll_netlink(void)
+         memset( &addr, 0, sizeof(addr) );
+         addr.nl_family = AF_NETLINK;
+         addr.nl_groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
++#ifndef SG_MUTANT_NO_LINK_ROUTE_EVENTS
++        /* Stained Glass OS: links and routes too (interface and route change
++         * notifications) */
++        addr.nl_groups |= RTMGRP_LINK | RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE;
++#endif
+         if (bind( netlink_fd, (struct sockaddr *)&addr, sizeof(addr) ) == -1)
+         {
+             close( netlink_fd );
+@@ -238,6 +243,21 @@ static NTSTATUS poll_netlink(void)
+                 }
+                 if ((status = add_notification( module, NSI_IP_UNICAST_TABLE))) return status;
+             }
++            else if (nlh->nlmsg_type == RTM_NEWLINK || nlh->nlmsg_type == RTM_DELLINK)
++            {
++                if ((status = add_notification( &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE ))) return status;
++            }
++            else if (nlh->nlmsg_type == RTM_NEWROUTE || nlh->nlmsg_type == RTM_DELROUTE)
++            {
++                struct rtmsg *rtmsg = (struct rtmsg *)(nlh + 1);
++
++                if (rtmsg->rtm_family == AF_INET)
++                    status = add_notification( &NPI_MS_IPV4_MODULEID, NSI_IP_FORWARD_TABLE );
++                else if (rtmsg->rtm_family == AF_INET6)
++                    status = add_notification( &NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE );
++                else continue;
++                if (status) return status;
++            }
+         }
+         if (queued_notification_count) break;
+     }
+--- a/include/netioapi.h
++++ b/include/netioapi.h
+@@ -255,6 +255,7 @@ typedef VOID (WINAPI *PUNICAST_IPADDRESS_CHANGE_CALLBACK)(PVOID, PMIB_UNICASTIPA
+                                                           MIB_NOTIFICATION_TYPE);
+ 
+ typedef VOID (WINAPI *PIPFORWARD_CHANGE_CALLBACK)(VOID*,MIB_IPFORWARD_ROW2*,MIB_NOTIFICATION_TYPE);
++typedef VOID (WINAPI *PSTABLE_UNICAST_IPADDRESS_TABLE_CALLBACK)(PVOID,PMIB_UNICASTIPADDRESS_TABLE);
+ 
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI ConvertInterfaceAliasToLuid(const WCHAR*,NET_LUID*);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI ConvertInterfaceGuidToLuid(const GUID*,NET_LUID*);
+@@ -276,11 +277,17 @@ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetIfTable2(MIB_IF_TABLE2**);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetIfTable2Ex(MIB_IF_TABLE_LEVEL,MIB_IF_TABLE2**);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetIpForwardEntry2(MIB_IPFORWARD_ROW2*);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetIpForwardTable2(ADDRESS_FAMILY,MIB_IPFORWARD_TABLE2**);
++IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetIpInterfaceEntry(MIB_IPINTERFACE_ROW*);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetIpInterfaceTable(ADDRESS_FAMILY,MIB_IPINTERFACE_TABLE**);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetIpNetEntry2(MIB_IPNET_ROW2*);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetIpNetTable2(ADDRESS_FAMILY,MIB_IPNET_TABLE2**);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetUnicastIpAddressEntry(MIB_UNICASTIPADDRESS_ROW*);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetUnicastIpAddressTable(ADDRESS_FAMILY,MIB_UNICASTIPADDRESS_TABLE**);
++IPHLPAPI_DLL_LINKAGE VOID WINAPI InitializeIpInterfaceEntry(MIB_IPINTERFACE_ROW*);
++IPHLPAPI_DLL_LINKAGE DWORD WINAPI NotifyIpInterfaceChange(ADDRESS_FAMILY,PIPINTERFACE_CHANGE_CALLBACK,PVOID,BOOLEAN,HANDLE*);
++IPHLPAPI_DLL_LINKAGE DWORD WINAPI NotifyRouteChange2(ADDRESS_FAMILY,PIPFORWARD_CHANGE_CALLBACK,PVOID,BOOLEAN,HANDLE*);
++IPHLPAPI_DLL_LINKAGE DWORD WINAPI NotifyStableUnicastIpAddressTable(ADDRESS_FAMILY,PMIB_UNICASTIPADDRESS_TABLE*,PSTABLE_UNICAST_IPADDRESS_TABLE_CALLBACK,PVOID,HANDLE*);
++IPHLPAPI_DLL_LINKAGE DWORD WINAPI NotifyUnicastIpAddressChange(ADDRESS_FAMILY,PUNICAST_IPADDRESS_CHANGE_CALLBACK,PVOID,BOOLEAN,HANDLE*);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI SetCurrentThreadCompartmentId(NET_IF_COMPARTMENT_ID);
+ IPHLPAPI_DLL_LINKAGE PCHAR WINAPI if_indextoname(NET_IFINDEX,PCHAR);
+ IPHLPAPI_DLL_LINKAGE NET_IFINDEX WINAPI if_nametoindex(PCSTR);
