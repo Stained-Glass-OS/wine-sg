@@ -1,0 +1,382 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] server, ntdll, kernelbase: LockFileEx on overlapped files waits asynchronously and completes
+
+On a file opened for overlapped I/O, a LockFileEx that had to wait returned
+ERROR_IO_PENDING and then never completed ("Async I/O lock wait not
+implemented, might deadlock"): its event was never signalled and
+GetOverlappedResult waited forever. A lock granted at once posted nothing
+to the file's completion port ("I/O completion on lock not implemented
+yet"), and LockFileEx did not use the OVERLAPPED as the status block.
+NtLockFile refused an IO_STATUS_BLOCK, an APC or a key outright.
+
+- NtLockFile on a file opened for overlapped I/O is an asynchronous
+  request to the server (a private ioctl): granted at once when it can be,
+  otherwise kept with the file's inode and granted, first come first
+  served, when a lock in the way goes -- unlocked, its handle closed, its
+  process ended -- or, for a Unix lock held outside Wine, when a retry
+  finds it free. Completion goes through the usual asynchronous I/O path:
+  the IOSB, the event, the APC and the completion port (also for a lock
+  granted at once, unless FILE_SKIP_COMPLETION_PORT_ON_SUCCESS). CancelIoEx
+  cancels a waiting lock, which is then never granted.
+- LockFileEx passes the OVERLAPPED as the status block, as ReadFile does.
+- On a synchronous handle NtLockFile waits in the call as before, and now
+  fills the status block it is given.
+
+Wine's kernel32 and ntdll file tests: no change.
+
+Gate: test/asynclock-gate.sh (64- and 32-bit: a contended lock pends and
+is granted on unlock, on the holder's handle closing and on its process
+ending; the completion port gets packets; CancelIoEx; fail-immediately; a
+synchronous handle still waits). Mutants SG_MUTANT_LOCK_NEVER_GRANTED
+(server/fd.c), SG_MUTANT_LOCK_SYNC_ONLY (ntdll/unix/file.c).
+---
+--- a/dlls/kernelbase/file.c
++++ b/dlls/kernelbase/file.c
+@@ -3921,8 +3921,11 @@ BOOL WINAPI DECLSPEC_HOTPATCH LockFileEx( HANDLE file, DWORD flags, DWORD reserv
+ 
+     if (((ULONG_PTR)overlapped->hEvent & 1) == 0) cvalue = overlapped;
+ 
++    /* the OVERLAPPED is the I/O status block, as for ReadFile */
++    overlapped->Internal = STATUS_PENDING;
++    overlapped->InternalHigh = 0;
+     return set_ntstatus( NtLockFile( file, overlapped->hEvent, NULL, cvalue,
+-                                     NULL, &offset, &count, NULL,
++                                     (IO_STATUS_BLOCK *)overlapped, &offset, &count, NULL,
+                                      flags & LOCKFILE_FAIL_IMMEDIATELY,
+                                      flags & LOCKFILE_EXCLUSIVE_LOCK ));
+ }
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -7613,21 +7613,50 @@ NTSTATUS WINAPI NtCancelSynchronousIoFile( HANDLE handle, IO_STATUS_BLOCK *io, I
+ /******************************************************************
+  *           NtLockFile   (NTDLL.@)
+  */
++#define IOCTL_WINE_LOCK_FILE CTL_CODE( FILE_DEVICE_FILE_SYSTEM, 0xe00, METHOD_BUFFERED, FILE_ANY_ACCESS )  /* as server/fd.c */
++
++struct lock_file_params  /* as server/fd.c's */
++{
++    ULONGLONG    offset;
++    ULONGLONG    count;
++    unsigned int shared;
++    unsigned int wait;
++};
++
+ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void* apc_user,
+                             IO_STATUS_BLOCK *io_status, LARGE_INTEGER *offset,
+                             LARGE_INTEGER *count, ULONG *key, BOOLEAN dont_wait, BOOLEAN exclusive )
+ {
+-    static int warn;
++    FILE_MODE_INFORMATION mode;
++    IO_STATUS_BLOCK io;
+     unsigned int ret;
+     HANDLE handle;
+-    BOOLEAN async;
+ 
+-    if (apc || io_status || key)
++    TRACE( "%p %p %p %p %p %s %s %d %d\n", file, event, apc, apc_user, io_status,
++           wine_dbgstr_longlong( offset->QuadPart ), wine_dbgstr_longlong( count->QuadPart ), dont_wait, exclusive );
++
++#ifndef SG_MUTANT_LOCK_SYNC_ONLY
++    /* a file opened for overlapped I/O: the lock is an asynchronous request,
++     * completed (IOSB, event, APC, completion port) when it is granted */
++    if (!NtQueryInformationFile( file, &io, &mode, sizeof(mode), FileModeInformation ) &&
++        !(mode.Mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)))
+     {
+-        FIXME("Unimplemented yet parameter\n");
+-        return STATUS_NOT_IMPLEMENTED;
++        struct lock_file_params params;
++
++        if (!io_status)
++        {
++            /* LockFile: nothing to report a wait in, and it does not wait */
++            if (!dont_wait) return STATUS_INVALID_PARAMETER;
++            io_status = &io;
++        }
++        params.offset = offset->QuadPart;
++        params.count  = count->QuadPart;
++        params.shared = !exclusive;
++        params.wait   = !dont_wait;
++        return server_ioctl_file( file, event, apc, apc_user, io_status, IOCTL_WINE_LOCK_FILE,
++                                  &params, sizeof(params), NULL, 0 );
+     }
+-    if (apc_user && !warn++) FIXME("I/O completion on lock not implemented yet\n");
++#endif
+ 
+     for (;;)
+     {
+@@ -7640,20 +7669,18 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
+             req->wait        = !dont_wait;
+             ret = wine_server_call( req );
+             handle = wine_server_ptr_handle( reply->handle );
+-            async  = reply->overlapped;
+         }
+         SERVER_END_REQ;
+         if (ret != STATUS_PENDING)
+         {
++            if (io_status)
++            {
++                io_status->Status = ret;
++                io_status->Information = 0;
++            }
+             if (!ret && event) NtSetEvent( event, NULL );
+             return ret;
+         }
+-        if (async)
+-        {
+-            FIXME( "Async I/O lock wait not implemented, might deadlock\n" );
+-            if (handle) NtClose( handle );
+-            return STATUS_PENDING;
+-        }
+         if (handle)
+         {
+             NtWaitForSingleObject( handle, FALSE, NULL );
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -236,6 +236,8 @@ struct inode
+     struct list         open;       /* list of open file descriptors */
+     struct list         locks;      /* list of file locks */
+     struct list         closed;     /* list of file descriptors to close at destroy time */
++    struct list         pending_locks; /* locks waited for asynchronously (Stained Glass 1643) */
++    struct timeout_user *lock_timeout; /* when to try to grant them */
+ };
+ 
+ static void inode_dump( struct object *obj, int verbose );
+@@ -1197,6 +1199,8 @@ static void inode_destroy( struct object *obj )
+     struct inode *inode = (struct inode *)obj;
+     struct list *ptr;
+ 
++    if (inode->lock_timeout) remove_timeout_user( inode->lock_timeout );
++
+     assert( list_empty(&inode->open) );
+     assert( list_empty(&inode->locks) );
+ 
+@@ -1240,6 +1244,8 @@ static struct inode *get_inode( dev_t dev, ino_t ino, int unix_fd )
+         inode->ino    = ino;
+         list_init( &inode->open );
+         list_init( &inode->locks );
++        list_init( &inode->pending_locks );
++        inode->lock_timeout = NULL;
+         list_init( &inode->closed );
+         list_add_head( &device->inode_hash[hash], &inode->entry );
+     }
+@@ -1484,7 +1490,8 @@ static void remove_unix_locks( struct fd *fd, file_pos_t start, file_pos_t end )
+ }
+ 
+ /* create a new lock on a fd */
+-static struct file_lock *add_lock( struct fd *fd, int shared, file_pos_t start, file_pos_t end )
++static struct file_lock *add_lock_for( struct fd *fd, int shared, file_pos_t start, file_pos_t end,
++                                       struct process *process )
+ {
+     struct file_lock *lock;
+ 
+@@ -1493,7 +1500,7 @@ static struct file_lock *add_lock( struct fd *fd, int shared, file_pos_t start,
+     lock->start   = start;
+     lock->end     = end;
+     lock->fd      = fd;
+-    lock->process = current->process;
++    lock->process = process;
+ 
+     /* now try to set a Unix lock */
+     if (!set_unix_lock( lock->fd, lock->start, lock->end, lock->shared ? F_RDLCK : F_WRLCK ))
+@@ -1507,6 +1514,13 @@ static struct file_lock *add_lock( struct fd *fd, int shared, file_pos_t start,
+     return lock;
+ }
+ 
++static struct file_lock *add_lock( struct fd *fd, int shared, file_pos_t start, file_pos_t end )
++{
++    return add_lock_for( fd, shared, start, end, current->process );
++}
++
++static void schedule_pending_locks( struct inode *inode, timeout_t when );
++
+ /* remove an existing lock */
+ static void remove_lock( struct file_lock *lock, int remove_unix )
+ {
+@@ -1520,6 +1534,9 @@ static void remove_lock( struct file_lock *lock, int remove_unix )
+     lock->process = NULL;
+     wake_up( &lock->obj, 0 );
+     release_object( lock );
++    /* a lock waited for may be granted now (not here: the caller may be
++     * walking the lists) */
++    if (!list_empty( &inode->pending_locks )) schedule_pending_locks( inode, 0 );
+ }
+ 
+ /* remove all locks owned by a given process */
+@@ -1552,6 +1569,157 @@ static void remove_fd_locks( struct fd *fd )
+ 
+ /* add a lock on an fd */
+ /* returns handle to wait on */
++/* Stained Glass OS (1643): a lock on a file opened for overlapped I/O that
++ * must wait does not block: NtLockFile asks by IOCTL_WINE_LOCK_FILE, and the
++ * request's async completes when the lock is granted -- its IOSB, event,
++ * APC and completion port, as for any asynchronous I/O. Waiting locks are
++ * kept with the inode and granted, first come first served, whenever a lock
++ * on it goes away. */
++struct pending_lock
++{
++    struct list         entry;      /* in the inode's pending_locks */
++    struct async       *async;
++    struct fd          *fd;
++    file_pos_t          start;
++    file_pos_t          end;
++    int                 shared;
++    int                 done;       /* granted; the async is completing */
++};
++
++struct lock_file_params  /* as NtLockFile's */
++{
++    file_pos_t   offset;
++    file_pos_t   count;
++    unsigned int shared;
++    unsigned int wait;
++};
++
++/* whether a lock on this fd would overlap another that excludes it */
++static int lock_conflicts( struct fd *fd, file_pos_t start, file_pos_t end, int shared )
++{
++    struct file_lock *lock;
++
++    LIST_FOR_EACH_ENTRY( lock, &fd->inode->locks, struct file_lock, inode_entry )
++    {
++        if (!lock_overlaps( lock, start, end )) continue;
++        if (shared && (lock->shared || lock->fd == fd)) continue;
++        return 1;
++    }
++    return 0;
++}
++
++static void pending_lock_completed( void *private )
++{
++    struct pending_lock *pending = private;
++
++    list_remove( &pending->entry );
++    release_object( pending->async );
++    release_object( pending->fd );
++    free( pending );
++}
++
++static void grant_pending_locks( void *private )
++{
++    struct inode *inode = private;
++    struct pending_lock *pending, *next;
++    int retry = 0;
++
++    inode->lock_timeout = NULL;
++    grab_object( inode );
++    LIST_FOR_EACH_ENTRY_SAFE( pending, next, &inode->pending_locks, struct pending_lock, entry )
++    {
++        struct iosb *iosb;
++        unsigned int status;
++        struct thread *thread;
++
++        if (pending->done) continue;
++        iosb = async_get_iosb( pending->async );
++        status = iosb->status;
++        release_object( iosb );
++        if (status != STATUS_PENDING) continue;   /* cancelled */
++        if (lock_conflicts( pending->fd, pending->start, pending->end, pending->shared )) continue;
++        thread = async_get_thread( pending->async );
++        clear_error();
++        if (!add_lock_for( pending->fd, pending->shared, pending->start, pending->end, thread->process ))
++        {
++            /* a Unix lock held outside: try again in a moment */
++            if (get_error() == STATUS_FILE_LOCK_CONFLICT) retry = 1;
++            else
++            {
++                pending->done = 1;
++                async_request_complete( pending->async, get_error(), 0, 0, NULL );
++            }
++            clear_error();
++            continue;
++        }
++        pending->done = 1;
++        async_request_complete( pending->async, STATUS_SUCCESS, 0, 0, NULL );
++    }
++    if (retry) schedule_pending_locks( inode, -100 * 10000 /* 100 ms */ );
++    release_object( inode );
++}
++
++static void schedule_pending_locks( struct inode *inode, timeout_t when )
++{
++    if (inode->lock_timeout) return;
++    inode->lock_timeout = add_timeout_user( when, grant_pending_locks, inode );
++}
++
++/* NtLockFile on a file opened for overlapped I/O */
++static void lock_fd_async( struct fd *fd, struct async *async )
++{
++    const struct lock_file_params *params = get_req_data();
++    struct pending_lock *pending;
++    file_pos_t start, end;
++
++    if (get_req_data_size() < sizeof(*params))
++    {
++        set_error( STATUS_INVALID_PARAMETER );
++        return;
++    }
++    if (!fd->inode)  /* not a regular file */
++    {
++        set_error( STATUS_INVALID_DEVICE_REQUEST );
++        return;
++    }
++    start = params->offset;
++    end = start + params->count;
++    if (end && end < start)
++    {
++        set_error( STATUS_INVALID_PARAMETER );
++        return;
++    }
++
++    if (!lock_conflicts( fd, start, end, params->shared ))
++    {
++        if (add_lock( fd, params->shared, start, end )) return;   /* granted: the async completes now */
++        if (get_error() != STATUS_FILE_LOCK_CONFLICT || !params->wait) return;
++        clear_error();   /* a Unix lock held outside: wait, trying again */
++    }
++    else if (!params->wait)
++    {
++        set_error( STATUS_FILE_LOCK_CONFLICT );
++        return;
++    }
++
++#ifdef SG_MUTANT_LOCK_NEVER_GRANTED
++    set_error( STATUS_PENDING );
++    return;
++#endif
++    if (!(pending = mem_alloc( sizeof(*pending) ))) return;
++    pending->async  = (struct async *)grab_object( async );
++    pending->fd     = (struct fd *)grab_object( fd );
++    pending->start  = start;
++    pending->end    = end;
++    pending->shared = params->shared;
++    pending->done   = 0;
++    list_add_tail( &fd->inode->pending_locks, &pending->entry );
++    async_set_completion_callback( async, pending_lock_completed, pending );
++    if (!list_empty( &fd->inode->locks ) && !lock_conflicts( fd, start, end, params->shared ))
++        schedule_pending_locks( fd->inode, -100 * 10000 );   /* the Unix lock */
++    set_error( STATUS_PENDING );
++}
++
+ obj_handle_t lock_fd( struct fd *fd, file_pos_t start, file_pos_t count, int shared, int wait )
+ {
+     struct list *ptr;
+@@ -2583,6 +2751,8 @@ void no_fd_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+ }
+ 
+ /* default ioctl() routine */
++#define IOCTL_WINE_LOCK_FILE CTL_CODE( FILE_DEVICE_FILE_SYSTEM, 0xe00, METHOD_BUFFERED, FILE_ANY_ACCESS )  /* as ntdll's */
++
+ void default_fd_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+ {
+     switch(code)
+@@ -2591,6 +2761,10 @@ void default_fd_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+         unmount_device( fd );
+         break;
+ 
++    case IOCTL_WINE_LOCK_FILE:
++        lock_fd_async( fd, async );
++        break;
++
+     default:
+         set_error( STATUS_NOT_SUPPORTED );
+     }
