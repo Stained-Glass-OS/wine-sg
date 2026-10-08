@@ -1,0 +1,1013 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] qmgr: BITS job properties kept and honoured; errors retried; notifications
+
+Updaters and installers drive downloads through BITS; most of a job's
+properties were stubs and its error handling was missing:
+
+- GetTimes (creation, modification, completion), GetOwner (the creator's
+  SID, through the caller's token), TakeOwnership, the owner's integrity
+  level and elevation, SetDisplayName.
+- Priority (kept and used: the transfer thread takes the highest-priority
+  queued job, the oldest among equals), minimum retry delay, no-progress
+  timeout, maximum download time (default 90 days), error count.
+- Proxy settings, checked as BITS checks them and used for the transfer
+  (no proxy, the named proxies with their bypass list, auto-detection, or
+  the machine's).
+- The notify command line (program and its command line) kept and run
+  when the job is transferred or fails for good and no callback interface
+  takes the notification.
+- Errors: a refused or failed connection, a timeout, an unresolved name
+  and HTTP 503/504 are transient: the job waits the retry delay and is
+  queued again, until it has gone the no-progress timeout (or past the
+  maximum download time) without progress, then it is in error. A job in
+  error tells its callback (JobError, never called before) or runs the
+  notify command line. Each error is counted.
+- Suspend stops a transfer under way and keeps the job; a finished job is
+  BG_E_INVALID_STATE.
+- Added files are checked: http(s), file and local or UNC paths, full
+  local names (BG_E_PROTOCOL_NOT_AVAILABLE, E_INVALIDARG).
+- ReplaceRemotePrefix, file ACL flags and peer caching flags (kept; there
+  are no peers here), EnumJobs lists the caller's own jobs unless
+  BG_JOB_ENUM_ALL_USERS.
+
+Wine's qmgr tests: no failures, as before.
+
+Gate: test/bitsjob-gate.sh (64- and 32-bit; a local copy with its notify
+command line, a refused connection retried then failed with the error
+command line). Mutants SG_MUTANT_NO_SUSPEND, SG_MUTANT_NO_BITS_RETRY
+(qmgr/job.c). The priority order is not gated (a race to stage).
+---
+--- a/dlls/qmgr/enum_jobs.c
++++ b/dlls/qmgr/enum_jobs.c
+@@ -174,8 +174,11 @@ static const IEnumBackgroundCopyJobsVtbl EnumBackgroundCopyJobsVtbl =
+     EnumBackgroundCopyJobs_GetCount
+ };
+ 
+-HRESULT enum_copy_job_create(BackgroundCopyManagerImpl *qmgr, IEnumBackgroundCopyJobs **enumjob)
++HRESULT enum_copy_job_create(BackgroundCopyManagerImpl *qmgr, DWORD flags, IEnumBackgroundCopyJobs **enumjob)
+ {
++    WCHAR *caller = NULL;
++    ULONG il;
++    BOOL elevated;
+     EnumBackgroundCopyJobsImpl *This;
+     BackgroundCopyJobImpl *job;
+     ULONG i;
+@@ -207,13 +210,18 @@ HRESULT enum_copy_job_create(BackgroundCopyManagerImpl *qmgr, IEnumBackgroundCop
+     else
+         This->jobs = NULL;
+ 
++    /* the caller's own jobs, unless all users' are asked for */
++    if (!(flags & BG_JOB_ENUM_ALL_USERS)) job_caller_owner(&caller, &il, &elevated);
+     i = 0;
+     LIST_FOR_EACH_ENTRY(job, &qmgr->jobs, BackgroundCopyJobImpl, entryFromQmgr)
+     {
++        if (caller && job->owner && wcscmp(caller, job->owner)) continue;
+         IBackgroundCopyJob4_AddRef(&job->IBackgroundCopyJob4_iface);
+         This->jobs[i++] = &job->IBackgroundCopyJob4_iface;
+     }
++    This->numJobs = i;
+     LeaveCriticalSection(&qmgr->cs);
++    free(caller);
+ 
+     *enumjob = &This->IEnumBackgroundCopyJobs_iface;
+     return S_OK;
+--- a/dlls/qmgr/file.c
++++ b/dlls/qmgr/file.c
+@@ -372,7 +372,25 @@ static BOOL transfer_file_http(BackgroundCopyFileImpl *file, URL_COMPONENTSW *uc
+ 
+     transitionJobState(job, BG_JOB_STATE_QUEUED, BG_JOB_STATE_CONNECTING);
+ 
+-    if (!(ses = WinHttpOpen(NULL, 0, NULL, NULL, WINHTTP_FLAG_ASYNC))) return FALSE;
++    /* the job's proxy settings */
++    switch (job->proxy_usage)
++    {
++    case BG_JOB_PROXY_USAGE_NO_PROXY:
++        ses = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, WINHTTP_FLAG_ASYNC);
++        break;
++    case BG_JOB_PROXY_USAGE_OVERRIDE:
++        ses = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_NAMED_PROXY, job->proxy_list,
++                          job->proxy_bypass ? job->proxy_bypass : WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
++        break;
++    case BG_JOB_PROXY_USAGE_AUTODETECT:
++        ses = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, NULL, NULL, WINHTTP_FLAG_ASYNC);
++        if (!ses) ses = WinHttpOpen(NULL, 0, NULL, NULL, WINHTTP_FLAG_ASYNC);
++        break;
++    default:
++        ses = WinHttpOpen(NULL, 0, NULL, NULL, WINHTTP_FLAG_ASYNC);
++        break;
++    }
++    if (!ses) return FALSE;
+     WinHttpSetStatusCallback(ses, progress_callback_http, WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS, 0);
+     if (!WinHttpSetOption(ses, WINHTTP_OPTION_CONTEXT_VALUE, &file, sizeof(file))) goto done;
+ 
+@@ -406,7 +424,15 @@ static BOOL transfer_file_http(BackgroundCopyFileImpl *file, URL_COMPONENTSW *uc
+         EnterCriticalSection(&job->cs);
+         file->fileProgress.BytesTransferred += file->read_size;
+         job->jobProgress.BytesTransferred += file->read_size;
++        job->last_progress = GetTickCount64();
+         LeaveCriticalSection(&job->cs);
++        if (job->max_download_time && job->transfer_start &&
++            GetTickCount64() - job->transfer_start >= job->max_download_time * 1000ull)
++        {
++            job->error.code = BG_E_MAXDOWNLOAD_TIMEOUT;
++            ret = FALSE;
++            break;
++        }
+     }
+ 
+     CloseHandle(handle);
+@@ -480,6 +506,7 @@ BOOL processFile(BackgroundCopyFileImpl *file, BackgroundCopyJobImpl *job)
+         ERR("Couldn't create temp file name: %ld\n", GetLastError());
+         /* Guessing on what state this should give us */
+         transitionJobState(job, BG_JOB_STATE_QUEUED, BG_JOB_STATE_TRANSIENT_ERROR);
++        job_failed(job);
+         return FALSE;
+     }
+ 
+@@ -488,6 +515,7 @@ BOOL processFile(BackgroundCopyFileImpl *file, BackgroundCopyJobImpl *job)
+         ERR("Couldn't create temp file: %ld\n", GetLastError());
+         /* Guessing on what state this should give us */
+         transitionJobState(job, BG_JOB_STATE_QUEUED, BG_JOB_STATE_TRANSIENT_ERROR);
++        job_failed(job);
+         return FALSE;
+     }
+ 
+@@ -540,6 +568,18 @@ BOOL processFile(BackgroundCopyFileImpl *file, BackgroundCopyJobImpl *job)
+     else
+     {
+         DeleteFileW(tmpName);
++        /* a failed transfer: retried later, or the job is in error */
++        if (job->state == BG_JOB_STATE_ERROR || job->state == BG_JOB_STATE_TRANSIENT_ERROR)
++        {
++            EnterCriticalSection(&job->cs);
++            if (!job->error.file)
++            {
++                job->error.file = &file->IBackgroundCopyFile2_iface;
++                IBackgroundCopyFile2_AddRef(job->error.file);
++            }
++            LeaveCriticalSection(&job->cs);
++            job_failed(job);
++        }
+         return FALSE;
+     }
+ }
+--- a/dlls/qmgr/job.c
++++ b/dlls/qmgr/job.c
+@@ -22,6 +22,8 @@
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winhttp.h"
++#include "sddl.h"
+ #include "qmgr.h"
+ #include "wine/debug.h"
+ 
+@@ -35,12 +37,197 @@ BOOL transitionJobState(BackgroundCopyJobImpl *job, BG_JOB_STATE from, BG_JOB_ST
+     if (job->state == from)
+     {
+         job->state = to;
++        GetSystemTimeAsFileTime(&job->modified);
++        if (from == BG_JOB_STATE_QUEUED && to == BG_JOB_STATE_CONNECTING && !job->transfer_start)
++            job->transfer_start = GetTickCount64();
+         ret = TRUE;
+     }
+     LeaveCriticalSection(&globalMgr.cs);
+     return ret;
+ }
+ 
++/* Stained Glass OS: the job was changed */
++void job_touch(BackgroundCopyJobImpl *job)
++{
++    GetSystemTimeAsFileTime(&job->modified);
++}
++
++/* the caller's account, integrity level and elevation, for a job it makes
++ * or takes */
++HRESULT job_caller_owner(WCHAR **sid, ULONG *il, BOOL *elevated)
++{
++    BYTE buf[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER)], label[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_MANDATORY_LABEL)];
++    TOKEN_ELEVATION elevation;
++    BOOL impersonating;
++    HANDLE token;
++    WCHAR *str;
++    DWORD len;
++    BOOL ret;
++
++    *sid = NULL;
++    *il = SECURITY_MANDATORY_MEDIUM_RID;
++    *elevated = FALSE;
++    impersonating = SUCCEEDED(CoImpersonateClient());
++    ret = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token);
++    if (impersonating) CoRevertToSelf();
++    if (!ret && !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return HRESULT_FROM_WIN32(GetLastError());
++    if (GetTokenInformation(token, TokenUser, buf, sizeof(buf), &len) &&
++        ConvertSidToStringSidW(((TOKEN_USER *)buf)->User.Sid, &str))
++    {
++        *sid = wcsdup(str);
++        LocalFree(str);
++    }
++    if (GetTokenInformation(token, TokenIntegrityLevel, label, sizeof(label), &len))
++    {
++        PSID ilsid = ((TOKEN_MANDATORY_LABEL *)label)->Label.Sid;
++        *il = *GetSidSubAuthority(ilsid, *GetSidSubAuthorityCount(ilsid) - 1);
++    }
++    if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &len))
++        *elevated = elevation.TokenIsElevated;
++    CloseHandle(token);
++    return *sid ? S_OK : E_OUTOFMEMORY;
++}
++
++static void run_notify_cmdline(BackgroundCopyJobImpl *job)
++{
++    STARTUPINFOW si = { sizeof(si) };
++    PROCESS_INFORMATION pi;
++    WCHAR *line;
++
++    if (!job->notify_prog) return;
++    /* the parameters begin with the program's name, as a command line does */
++    line = wcsdup(job->notify_params ? job->notify_params : job->notify_prog);
++    TRACE("running %s %s\n", debugstr_w(job->notify_prog), debugstr_w(line));
++    if (line && CreateProcessW(job->notify_prog, line, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
++    {
++        CloseHandle(pi.hThread);
++        CloseHandle(pi.hProcess);
++    }
++    else WARN("could not run %s, error %lu\n", debugstr_w(job->notify_prog), GetLastError());
++    free(line);
++}
++
++static HRESULT create_copy_error(BG_ERROR_CONTEXT context, HRESULT code, IBackgroundCopyFile2 *file,
++                                 IBackgroundCopyError **obj);
++
++/* errors a retry may get past: the network, a busy server */
++static BOOL is_transient_error(HRESULT hr)
++{
++    static const DWORD win32[] = { ERROR_WINHTTP_TIMEOUT, ERROR_WINHTTP_NAME_NOT_RESOLVED, ERROR_WINHTTP_CANNOT_CONNECT,
++                                   ERROR_WINHTTP_CONNECTION_ERROR, ERROR_WINHTTP_RESEND_REQUEST };
++    unsigned int i;
++
++    if (hr == BG_E_HTTP_ERROR_503 || hr == BG_E_HTTP_ERROR_504 || hr == BG_E_NETWORK_DISCONNECTED) return TRUE;
++    for (i = 0; i < ARRAY_SIZE(win32); i++)
++        if (hr == HRESULT_FROM_WIN32(win32[i])) return TRUE;
++    return FALSE;
++}
++
++static void job_error_final(BackgroundCopyJobImpl *job)
++{
++    IBackgroundCopyError *error;
++
++    if (job->notify_flags & BG_NOTIFY_DISABLE) return;
++    if (!(job->notify_flags & BG_NOTIFY_JOB_ERROR)) return;
++    if (job->callback && SUCCEEDED(create_copy_error(job->error.context, job->error.code, job->error.file, &error)))
++    {
++        TRACE("Calling JobError -->\n");
++        IBackgroundCopyCallback2_JobError(job->callback, (IBackgroundCopyJob *)&job->IBackgroundCopyJob4_iface, error);
++        TRACE("Called JobError <--\n");
++        IBackgroundCopyError_Release(error);
++    }
++    else run_notify_cmdline(job);
++}
++
++/* a transfer failed: retried later when the error may pass, else the job
++ * is in error and its owner is told */
++void job_failed(BackgroundCopyJobImpl *job)
++{
++    BOOL transient;
++
++    EnterCriticalSection(&globalMgr.cs);
++    if (job->state != BG_JOB_STATE_ERROR && job->state != BG_JOB_STATE_TRANSIENT_ERROR)
++    {
++        LeaveCriticalSection(&globalMgr.cs);
++        return;
++    }
++    job->error_count++;
++    if (!job->error.context) job->error.context = BG_ERROR_CONTEXT_REMOTE_FILE;
++    transient = job->state == BG_JOB_STATE_TRANSIENT_ERROR || is_transient_error(job->error.code);
++#ifdef SG_MUTANT_NO_BITS_RETRY
++    transient = FALSE;
++#endif
++    if (transient)
++    {
++        job->state = BG_JOB_STATE_TRANSIENT_ERROR;
++        job->retry_at = GetTickCount64() + job->retry_delay * 1000ull;
++        TRACE("job %p: transient error %#lx, retried in %lu s\n", job, job->error.code, job->retry_delay);
++    }
++    else job->state = BG_JOB_STATE_ERROR;
++    GetSystemTimeAsFileTime(&job->modified);
++    LeaveCriticalSection(&globalMgr.cs);
++    if (!transient) job_error_final(job);
++}
++
++/* transient errors due for a retry go back in the queue, unless the job has
++ * gone without progress (or past its download time) too long; the time
++ * until the next one is due */
++ULONGLONG job_due_retries(void)
++{
++    BackgroundCopyJobImpl *job, *failed[64];
++    ULONGLONG now = GetTickCount64(), next = ~0ull;
++    unsigned int n = 0, i;
++
++    EnterCriticalSection(&globalMgr.cs);
++    LIST_FOR_EACH_ENTRY(job, &globalMgr.jobs, BackgroundCopyJobImpl, entryFromQmgr)
++    {
++        if (job->state != BG_JOB_STATE_TRANSIENT_ERROR) continue;
++        if ((job->max_download_time && job->transfer_start &&
++             now - job->transfer_start >= job->max_download_time * 1000ull) ||
++            (job->last_progress && now - job->last_progress >= job->no_progress_timeout * 1000ull))
++        {
++            if (job->max_download_time && job->transfer_start &&
++                now - job->transfer_start >= job->max_download_time * 1000ull)
++                job->error.code = BG_E_MAXDOWNLOAD_TIMEOUT;
++            job->state = BG_JOB_STATE_ERROR;
++            if (n < ARRAY_SIZE(failed))
++            {
++                IBackgroundCopyJob4_AddRef(&job->IBackgroundCopyJob4_iface);
++                failed[n++] = job;
++            }
++        }
++        else if (job->retry_at <= now)
++        {
++            job->state = BG_JOB_STATE_QUEUED;
++            SetEvent(globalMgr.jobEvent);
++        }
++        else if (job->retry_at - now < next) next = job->retry_at - now;
++    }
++    LeaveCriticalSection(&globalMgr.cs);
++    for (i = 0; i < n; i++)
++    {
++        job_error_final(failed[i]);
++        IBackgroundCopyJob4_Release(&failed[i]->IBackgroundCopyJob4_iface);
++    }
++    return next;
++}
++
++/* the job is transferred: its owner is told */
++void job_notify_transferred(BackgroundCopyJobImpl *job)
++{
++    GetSystemTimeAsFileTime(&job->completed);
++    job->modified = job->completed;
++    if (job->notify_flags & BG_NOTIFY_DISABLE) return;
++    if (!(job->notify_flags & BG_NOTIFY_JOB_TRANSFERRED)) return;
++    if (job->callback)
++    {
++        TRACE("Calling JobTransferred -->\n");
++        IBackgroundCopyCallback2_JobTransferred(job->callback, (IBackgroundCopyJob*)&job->IBackgroundCopyJob4_iface);
++        TRACE("Called JobTransferred <--\n");
++    }
++    else run_notify_cmdline(job);
++}
++
+ struct copy_error
+ {
+     IBackgroundCopyError  IBackgroundCopyError_iface;
+@@ -277,6 +464,11 @@ static ULONG WINAPI BackgroundCopyJob_Release(IBackgroundCopyJob4 *iface)
+         CloseHandle(job->wait);
+         CloseHandle(job->cancel);
+         CloseHandle(job->done);
++        free(job->proxy_list);
++        free(job->proxy_bypass);
++        free(job->notify_prog);
++        free(job->notify_params);
++        free(job->owner);
+         free(job);
+     }
+ 
+@@ -300,7 +492,22 @@ static HRESULT WINAPI BackgroundCopyJob_AddFileSet(IBackgroundCopyJob4 *iface, U
+         BackgroundCopyFileImpl *file;
+ 
+         /* We should return E_INVALIDARG in these cases. */
+-        FIXME("Check for valid filenames and supported protocols\n");
++        /* what BITS takes: http(s), file and UNC or full local paths; the
++         * local name a full path */
++        const WCHAR *remote = pFileSet[i].RemoteName, *local = pFileSet[i].LocalName;
++
++        if (!remote || !local || !*remote || !*local) { hr = E_INVALIDARG; break; }
++        if (wcsnicmp(remote, L"http://", 7) && wcsnicmp(remote, L"https://", 8) && wcsnicmp(remote, L"file://", 7) &&
++            !(remote[0] == '\\' && remote[1] == '\\') && !(iswalpha(remote[0]) && remote[1] == ':'))
++        {
++            hr = wcschr(remote, ':') && wcsstr(remote, L"://") ? BG_E_PROTOCOL_NOT_AVAILABLE : E_INVALIDARG;
++            break;
++        }
++        if (!(iswalpha(local[0]) && local[1] == ':' && local[2] == '\\') && !(local[0] == '\\' && local[1] == '\\'))
++        {
++            hr = E_INVALIDARG;
++            break;
++        }
+ 
+         hr = BackgroundCopyFileConstructor(job, pFileSet[i].RemoteName, pFileSet[i].LocalName, &file);
+         if (hr != S_OK) break;
+@@ -310,6 +517,7 @@ static HRESULT WINAPI BackgroundCopyJob_AddFileSet(IBackgroundCopyJob4 *iface, U
+         job->jobProgress.BytesTotal = BG_SIZE_UNKNOWN;
+         ++job->jobProgress.FilesTotal;
+     }
++    job_touch(job);
+ 
+     LeaveCriticalSection(&job->cs);
+ 
+@@ -336,8 +544,30 @@ static HRESULT WINAPI BackgroundCopyJob_EnumFiles(IBackgroundCopyJob4 *iface, IE
+ 
+ static HRESULT WINAPI BackgroundCopyJob_Suspend(IBackgroundCopyJob4 *iface)
+ {
+-    FIXME("(%p): stub\n", iface);
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    BOOL running;
++    HRESULT hr = S_OK;
++
++    TRACE("%p.\n", iface);
++
++    EnterCriticalSection(&globalMgr.cs);
++    running = job->state == BG_JOB_STATE_CONNECTING || job->state == BG_JOB_STATE_TRANSFERRING;
++    if (is_job_done(job)) hr = BG_E_INVALID_STATE;
++    else if (job->state != BG_JOB_STATE_SUSPENDED)
++    {
++#ifndef SG_MUTANT_NO_SUSPEND
++        job->state = BG_JOB_STATE_SUSPENDED;
++        job_touch(job);
++#endif
++    }
++    LeaveCriticalSection(&globalMgr.cs);
++    /* a transfer under way stops; the job keeps its files */
++    if (hr == S_OK && running)
++    {
++        SetEvent(job->cancel);
++        WaitForSingleObject(job->done, 30000);
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_Resume(IBackgroundCopyJob4 *iface)
+@@ -360,6 +590,9 @@ static HRESULT WINAPI BackgroundCopyJob_Resume(IBackgroundCopyJob4 *iface)
+              && job->state != BG_JOB_STATE_TRANSFERRING)
+     {
+         job->state = BG_JOB_STATE_QUEUED;
++        job->last_progress = GetTickCount64();
++        job->retry_at = 0;
++        job_touch(job);
+         job->error.context = 0;
+         job->error.code = S_OK;
+         if (job->error.file)
+@@ -505,8 +738,17 @@ static HRESULT WINAPI BackgroundCopyJob_GetProgress(IBackgroundCopyJob4 *iface,
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetTimes(IBackgroundCopyJob4 *iface, BG_JOB_TIMES *pVal)
+ {
+-    FIXME("%p, %p: stub\n", iface, pVal);
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++
++    TRACE("%p, %p.\n", iface, pVal);
++
++    if (!pVal) return E_INVALIDARG;
++    EnterCriticalSection(&job->cs);
++    pVal->CreationTime = job->created;
++    pVal->ModificationTime = job->modified;
++    pVal->TransferCompletionTime = job->completed;
++    LeaveCriticalSection(&job->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetState(IBackgroundCopyJob4 *iface, BG_JOB_STATE *state)
+@@ -536,14 +778,31 @@ static HRESULT WINAPI BackgroundCopyJob_GetError(IBackgroundCopyJob4 *iface, IBa
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetOwner(IBackgroundCopyJob4 *iface, LPWSTR *owner)
+ {
+-    FIXME("%p, %p: stub\n", iface, owner);
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++
++    TRACE("%p, %p.\n", iface, owner);
++
++    if (!owner) return E_INVALIDARG;
++    return return_strval(job->owner, owner);
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetDisplayName(IBackgroundCopyJob4 *iface, LPCWSTR name)
+ {
+-    FIXME("%p, %s: stub\n", iface, debugstr_w(name));
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    WCHAR *str;
++
++    TRACE("%p, %s.\n", iface, debugstr_w(name));
++
++    if (!name) return E_INVALIDARG;
++    if (wcslen(name) > 256) return BG_E_STRING_TOO_LONG;
++    if (is_job_done(job)) return BG_E_INVALID_STATE;
++    if (!(str = wcsdup(name))) return E_OUTOFMEMORY;
++    EnterCriticalSection(&job->cs);
++    free(job->displayName);
++    job->displayName = str;
++    job_touch(job);
++    LeaveCriticalSection(&job->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetDisplayName(IBackgroundCopyJob4 *iface, LPWSTR *name)
+@@ -599,14 +858,24 @@ static HRESULT WINAPI BackgroundCopyJob_GetDescription(IBackgroundCopyJob4 *ifac
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetPriority(IBackgroundCopyJob4 *iface, BG_JOB_PRIORITY priority)
+ {
+-    FIXME("%p, %d: stub\n", iface, priority);
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++
++    TRACE("%p, %d.\n", iface, priority);
++
++    if (priority < BG_JOB_PRIORITY_FOREGROUND || priority > BG_JOB_PRIORITY_LOW) return E_NOTIMPL;
++    if (is_job_done(job)) return BG_E_INVALID_STATE;
++    job->priority = priority;
++    job_touch(job);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetPriority(IBackgroundCopyJob4 *iface, BG_JOB_PRIORITY *priority)
+ {
+-    FIXME("%p, %p: stub\n", iface, priority);
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, priority);
++
++    if (!priority) return E_INVALIDARG;
++    *priority = impl_from_IBackgroundCopyJob4(iface)->priority;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetNotifyFlags(IBackgroundCopyJob4 *iface, ULONG flags)
+@@ -684,66 +953,183 @@ static HRESULT WINAPI BackgroundCopyJob_GetNotifyInterface(IBackgroundCopyJob4 *
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetMinimumRetryDelay(IBackgroundCopyJob4 *iface, ULONG delay)
+ {
+-    FIXME("%p, %lu.\n", iface, delay);
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++
++    TRACE("%p, %lu.\n", iface, delay);
++
++    if (is_job_done(job)) return BG_E_INVALID_STATE;
++    job->retry_delay = delay;
++    job_touch(job);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetMinimumRetryDelay(IBackgroundCopyJob4 *iface, ULONG *delay)
+ {
+-    FIXME("%p, %p: stub\n", iface, delay);
+-    *delay = 30;
++    TRACE("%p, %p.\n", iface, delay);
++
++    if (!delay) return E_INVALIDARG;
++    *delay = impl_from_IBackgroundCopyJob4(iface)->retry_delay;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetNoProgressTimeout(IBackgroundCopyJob4 *iface, ULONG timeout)
+ {
+-    FIXME("%p, %lu.: stub\n", iface, timeout);
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++
++    TRACE("%p, %lu.\n", iface, timeout);
++
++    if (is_job_done(job)) return BG_E_INVALID_STATE;
++    job->no_progress_timeout = timeout;
++    job_touch(job);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetNoProgressTimeout(IBackgroundCopyJob4 *iface, ULONG *timeout)
+ {
+-    FIXME("%p, %p: stub\n", iface, timeout);
+-    *timeout = 900;
++    TRACE("%p, %p.\n", iface, timeout);
++
++    if (!timeout) return E_INVALIDARG;
++    *timeout = impl_from_IBackgroundCopyJob4(iface)->no_progress_timeout;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetErrorCount(IBackgroundCopyJob4 *iface, ULONG *count)
+ {
+-    FIXME("%p, %p: stub\n", iface, count);
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, count);
++
++    if (!count) return E_INVALIDARG;
++    *count = impl_from_IBackgroundCopyJob4(iface)->error_count;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetProxySettings(IBackgroundCopyJob4 *iface, BG_JOB_PROXY_USAGE proxy_usage,
+         const WCHAR *proxy_list, const WCHAR *proxy_bypass_list)
+ {
+-    FIXME("%p, %d, %s, %s: stub\n", iface, proxy_usage, debugstr_w(proxy_list), debugstr_w(proxy_bypass_list));
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    WCHAR *list = NULL, *bypass = NULL;
++
++    TRACE("%p, %d, %s, %s.\n", iface, proxy_usage, debugstr_w(proxy_list), debugstr_w(proxy_bypass_list));
++
++    if (is_job_done(job)) return BG_E_INVALID_STATE;
++    switch (proxy_usage)
++    {
++    case BG_JOB_PROXY_USAGE_PRECONFIG:
++    case BG_JOB_PROXY_USAGE_NO_PROXY:
++    case BG_JOB_PROXY_USAGE_AUTODETECT:
++        /* only the override names proxies */
++        if (proxy_list || proxy_bypass_list) return E_INVALIDARG;
++        break;
++    case BG_JOB_PROXY_USAGE_OVERRIDE:
++        if (!proxy_list || !*proxy_list) return E_INVALIDARG;
++        if (wcslen(proxy_list) > 4000 || (proxy_bypass_list && wcslen(proxy_bypass_list) > 4000))
++            return BG_E_PROXY_LIST_TOO_LARGE;
++        if (!(list = wcsdup(proxy_list))) return E_OUTOFMEMORY;
++        if (proxy_bypass_list && !(bypass = wcsdup(proxy_bypass_list)))
++        {
++            free(list);
++            return E_OUTOFMEMORY;
++        }
++        break;
++    default:
++        return E_INVALIDARG;
++    }
++    EnterCriticalSection(&job->cs);
++    job->proxy_usage = proxy_usage;
++    free(job->proxy_list);
++    free(job->proxy_bypass);
++    job->proxy_list = list;
++    job->proxy_bypass = bypass;
++    job_touch(job);
++    LeaveCriticalSection(&job->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetProxySettings(IBackgroundCopyJob4 *iface, BG_JOB_PROXY_USAGE *proxy_usage,
+         LPWSTR *proxy_list, LPWSTR *proxy_bypass_list)
+ {
+-    FIXME("%p, %p, %p, %p: stub\n", iface, proxy_usage, proxy_list, proxy_bypass_list);
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    HRESULT hr;
++
++    TRACE("%p, %p, %p, %p.\n", iface, proxy_usage, proxy_list, proxy_bypass_list);
++
++    if (!proxy_usage || !proxy_list || !proxy_bypass_list) return E_INVALIDARG;
++    EnterCriticalSection(&job->cs);
++    *proxy_usage = job->proxy_usage;
++    *proxy_list = *proxy_bypass_list = NULL;
++    if (job->proxy_list && FAILED(hr = return_strval(job->proxy_list, proxy_list))) goto done;
++    if (job->proxy_bypass && FAILED(hr = return_strval(job->proxy_bypass, proxy_bypass_list)))
++    {
++        CoTaskMemFree(*proxy_list);
++        *proxy_list = NULL;
++        goto done;
++    }
++    hr = S_OK;
++done:
++    LeaveCriticalSection(&job->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_TakeOwnership(IBackgroundCopyJob4 *iface)
+ {
+-    FIXME("%p: stub\n", iface);
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    WCHAR *sid;
++    ULONG il;
++    BOOL elevated;
++    HRESULT hr;
++
++    TRACE("%p.\n", iface);
++
++    if (FAILED(hr = job_caller_owner(&sid, &il, &elevated))) return hr;
++    EnterCriticalSection(&job->cs);
++    free(job->owner);
++    job->owner = sid;
++    job->owner_il = il;
++    job->owner_elevated = elevated;
++    job_touch(job);
++    LeaveCriticalSection(&job->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetNotifyCmdLine(IBackgroundCopyJob4 *iface, LPCWSTR prog, LPCWSTR params)
+ {
+-    FIXME("%p, %s, %s: stub\n", iface, debugstr_w(prog), debugstr_w(params));
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    WCHAR *p = NULL, *a = NULL;
++
++    TRACE("%p, %s, %s.\n", iface, debugstr_w(prog), debugstr_w(params));
++
++    if (is_job_done(job)) return BG_E_INVALID_STATE;
++    if (!prog && params) return E_INVALIDARG;
++    if ((prog && wcslen(prog) >= MAX_PATH) || (params && wcslen(params) > 4000)) return BG_E_STRING_TOO_LONG;
++    if (prog && !(p = wcsdup(prog))) return E_OUTOFMEMORY;
++    if (params && !(a = wcsdup(params)))
++    {
++        free(p);
++        return E_OUTOFMEMORY;
++    }
++    EnterCriticalSection(&job->cs);
++    free(job->notify_prog);
++    free(job->notify_params);
++    job->notify_prog = p;
++    job->notify_params = a;
++    job_touch(job);
++    LeaveCriticalSection(&job->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetNotifyCmdLine(IBackgroundCopyJob4 *iface, LPWSTR *prog, LPWSTR *params)
+ {
+-    FIXME("%p, %p, %p: stub\n", iface, prog, params);
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %p, %p.\n", iface, prog, params);
++
++    if (!prog || !params) return E_INVALIDARG;
++    *prog = *params = NULL;
++    EnterCriticalSection(&job->cs);
++    if (job->notify_prog) hr = return_strval(job->notify_prog, prog);
++    if (SUCCEEDED(hr) && job->notify_params) hr = return_strval(job->notify_params, params);
++    LeaveCriticalSection(&job->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetReplyProgress(IBackgroundCopyJob4 *iface, BG_JOB_REPLY_PROGRESS *progress)
+@@ -847,8 +1233,37 @@ static HRESULT WINAPI BackgroundCopyJob_ReplaceRemotePrefix(
+     LPCWSTR OldPrefix,
+     LPCWSTR NewPrefix)
+ {
+-    FIXME("%p, %s, %s: stub\n", iface, debugstr_w(OldPrefix), debugstr_w(NewPrefix));
+-    return S_OK;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    BackgroundCopyFileImpl *file;
++    size_t old_len;
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %s, %s.\n", iface, debugstr_w(OldPrefix), debugstr_w(NewPrefix));
++
++    if (!OldPrefix || !NewPrefix || !*OldPrefix || !*NewPrefix) return E_INVALIDARG;
++    if (is_job_done(job)) return BG_E_INVALID_STATE;
++    /* the files whose remote name starts so take the new start */
++    old_len = wcslen(OldPrefix);
++    EnterCriticalSection(&job->cs);
++    LIST_FOR_EACH_ENTRY(file, &job->files, BackgroundCopyFileImpl, entryFromJob)
++    {
++        WCHAR *name;
++        size_t len;
++
++        if (file->fileProgress.Completed || wcsnicmp(file->info.RemoteName, OldPrefix, old_len)) continue;
++        len = wcslen(NewPrefix) + wcslen(file->info.RemoteName + old_len) + 1;
++        if (!(name = malloc(len * sizeof(WCHAR))))
++        {
++            hr = E_OUTOFMEMORY;
++            break;
++        }
++        swprintf(name, len, L"%s%s", NewPrefix, file->info.RemoteName + old_len);
++        free(file->info.RemoteName);
++        file->info.RemoteName = name;
++    }
++    job_touch(job);
++    LeaveCriticalSection(&job->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_AddFileWithRanges(
+@@ -864,50 +1279,86 @@ static HRESULT WINAPI BackgroundCopyJob_AddFileWithRanges(
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetFileACLFlags(IBackgroundCopyJob4 *iface, DWORD flags)
+ {
+-    FIXME("%p, %#lx: stub\n", iface, flags);
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++
++    TRACE("%p, %#lx.\n", iface, flags);
++
++    if (flags & ~(BG_COPY_FILE_OWNER | BG_COPY_FILE_GROUP | BG_COPY_FILE_DACL | BG_COPY_FILE_SACL)) return E_INVALIDARG;
++    if (is_job_done(job)) return BG_E_INVALID_STATE;
++    job->acl_flags = flags;
++    job_touch(job);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetFileACLFlags(IBackgroundCopyJob4 *iface, DWORD *flags)
+ {
+-    FIXME("%p, %p: stub\n", iface, flags);
++    TRACE("%p, %p.\n", iface, flags);
++
++    if (!flags) return E_INVALIDARG;
++    *flags = impl_from_IBackgroundCopyJob4(iface)->acl_flags;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetPeerCachingFlags(IBackgroundCopyJob4 *iface, DWORD flags)
+ {
+-    FIXME("%p, %#lx.\n", iface, flags);
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++
++    TRACE("%p, %#lx.\n", iface, flags);
++
++    /* kept: there are no peers to share with here */
++    if (flags & ~(BG_JOB_ENABLE_PEERCACHING_CLIENT | BG_JOB_ENABLE_PEERCACHING_SERVER | BG_JOB_DISABLE_BRANCH_CACHE))
++        return E_INVALIDARG;
++    job->peer_flags = flags;
++    job_touch(job);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetPeerCachingFlags(IBackgroundCopyJob4 *iface, DWORD *flags)
+ {
+-    FIXME("%p, %p.\n", iface, flags);
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, flags);
++
++    if (!flags) return E_INVALIDARG;
++    *flags = impl_from_IBackgroundCopyJob4(iface)->peer_flags;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetOwnerIntegrityLevel(IBackgroundCopyJob4 *iface, ULONG *level)
+ {
+-    FIXME("%p, %p.\n", iface, level);
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, level);
++
++    if (!level) return E_INVALIDARG;
++    *level = impl_from_IBackgroundCopyJob4(iface)->owner_il;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetOwnerElevationState(IBackgroundCopyJob4 *iface, BOOL *elevated)
+ {
+-    FIXME("%p, %p.\n", iface, elevated);
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, elevated);
++
++    if (!elevated) return E_INVALIDARG;
++    *elevated = impl_from_IBackgroundCopyJob4(iface)->owner_elevated;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetMaximumDownloadTime(IBackgroundCopyJob4 *iface, ULONG timeout)
+ {
+-    FIXME("%p, %lu.\n", iface, timeout);
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++
++    TRACE("%p, %lu.\n", iface, timeout);
++
++    if (is_job_done(job)) return BG_E_INVALID_STATE;
++    job->max_download_time = timeout;
++    job_touch(job);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetMaximumDownloadTime(IBackgroundCopyJob4 *iface, ULONG *timeout)
+ {
+-    FIXME("%p, %p.\n", iface, timeout);
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, timeout);
++
++    if (!timeout) return E_INVALIDARG;
++    *timeout = impl_from_IBackgroundCopyJob4(iface)->max_download_time;
++    return S_OK;
+ }
+ 
+ static const IBackgroundCopyJob4Vtbl BackgroundCopyJobVtbl =
+@@ -1193,6 +1644,23 @@ HRESULT BackgroundCopyJobConstructor(LPCWSTR displayName, BG_JOB_TYPE type, GUID
+     This->cancel = CreateEventW(NULL, FALSE, FALSE, NULL);
+     This->done   = CreateEventW(NULL, FALSE, FALSE, NULL);
+ 
++    /* Windows' defaults: normal priority, a retry every ten minutes, two
++     * weeks without progress, ninety days to download */
++    This->priority = BG_JOB_PRIORITY_NORMAL;
++    This->retry_delay = 600;
++    This->no_progress_timeout = 1209600;
++    This->max_download_time = 7776000;
++    This->error_count = 0;
++    This->proxy_usage = BG_JOB_PROXY_USAGE_PRECONFIG;
++    This->proxy_list = This->proxy_bypass = NULL;
++    This->notify_prog = This->notify_params = NULL;
++    This->acl_flags = This->peer_flags = 0;
++    job_caller_owner(&This->owner, &This->owner_il, &This->owner_elevated);
++    GetSystemTimeAsFileTime(&This->created);
++    This->modified = This->created;
++    memset(&This->completed, 0, sizeof(This->completed));
++    This->last_progress = This->retry_at = This->transfer_start = 0;
++
+     *job = This;
+ 
+     TRACE("created job %s:%p\n", debugstr_guid(&This->jobId), This);
+@@ -1217,13 +1685,8 @@ void processJob(BackgroundCopyJobImpl *job)
+         LeaveCriticalSection(&job->cs);
+         if (done)
+         {
+-            transitionJobState(job, BG_JOB_STATE_QUEUED, BG_JOB_STATE_TRANSFERRED);
+-            if (job->callback && (job->notify_flags & BG_NOTIFY_JOB_TRANSFERRED))
+-            {
+-                TRACE("Calling JobTransferred -->\n");
+-                IBackgroundCopyCallback2_JobTransferred(job->callback, (IBackgroundCopyJob*)&job->IBackgroundCopyJob4_iface);
+-                TRACE("Called JobTransferred <--\n");
+-            }
++            if (transitionJobState(job, BG_JOB_STATE_QUEUED, BG_JOB_STATE_TRANSFERRED))
++                job_notify_transferred(job);
+             return;
+         }
+ 
+--- a/dlls/qmgr/qmgr.c
++++ b/dlls/qmgr/qmgr.c
+@@ -109,7 +109,8 @@ static HRESULT WINAPI BackgroundCopyManager_EnumJobs(IBackgroundCopyManager *ifa
+         DWORD flags, IEnumBackgroundCopyJobs **ppEnum)
+ {
+     TRACE("(0x%lx %p)\n", flags, ppEnum);
+-    return enum_copy_job_create(&globalMgr, ppEnum);
++    if (flags & ~BG_JOB_ENUM_ALL_USERS) return E_INVALIDARG;
++    return enum_copy_job_create(&globalMgr, flags, ppEnum);
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyManager_GetErrorDescription(IBackgroundCopyManager *iface,
+@@ -158,8 +159,11 @@ DWORD WINAPI fileTransfer(void *param)
+         BackgroundCopyJobImpl *job, *jobCur;
+         BOOL haveJob = FALSE;
+ 
+-        /* Check if it's the stop_event */
+-        if (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0)
++        ULONGLONG next = job_due_retries();
++        DWORD wait = next > 0x7fffffff ? INFINITE : (DWORD)next;
++
++        /* Check if it's the stop_event; transient errors are retried when due */
++        if (WaitForMultipleObjects(2, events, FALSE, wait) == WAIT_OBJECT_0)
+         {
+             LIST_FOR_EACH_ENTRY_SAFE(job, jobCur, &qmgr->jobs, BackgroundCopyJobImpl, entryFromQmgr)
+             {
+@@ -174,6 +178,9 @@ DWORD WINAPI fileTransfer(void *param)
+            magically disappearing from the list.  */
+         EnterCriticalSection(&qmgr->cs);
+ 
++        {
++            BackgroundCopyJobImpl *best = NULL;
++
+         LIST_FOR_EACH_ENTRY_SAFE(job, jobCur, &qmgr->jobs, BackgroundCopyJobImpl, entryFromQmgr)
+         {
+             if (job->state == BG_JOB_STATE_ACKNOWLEDGED || job->state == BG_JOB_STATE_CANCELLED)
+@@ -183,8 +190,10 @@ DWORD WINAPI fileTransfer(void *param)
+             }
+             else if (job->state == BG_JOB_STATE_QUEUED)
+             {
++                /* the highest priority first; among equals, the oldest (the
++                 * list has the newest first) */
++                if (!best || job->priority <= best->priority) best = job;
+                 haveJob = TRUE;
+-                break;
+             }
+             else if (job->state == BG_JOB_STATE_CONNECTING
+                      || job->state == BG_JOB_STATE_TRANSFERRING)
+@@ -193,6 +202,9 @@ DWORD WINAPI fileTransfer(void *param)
+             }
+         }
+ 
++        if (best) job = best;
++        }
++
+         if (!haveJob)
+             ResetEvent(qmgr->jobEvent);
+ 
+--- a/dlls/qmgr/qmgr.h
++++ b/dlls/qmgr/qmgr.h
+@@ -66,6 +66,23 @@ typedef struct
+     HANDLE wait;
+     HANDLE cancel;
+     HANDLE done;
++    /* Stained Glass OS: the job's settings and bookkeeping */
++    BG_JOB_PRIORITY priority;
++    ULONG retry_delay;              /* seconds */
++    ULONG no_progress_timeout;      /* seconds */
++    ULONG max_download_time;        /* seconds, 0 for none */
++    ULONG error_count;
++    BG_JOB_PROXY_USAGE proxy_usage;
++    WCHAR *proxy_list, *proxy_bypass;
++    WCHAR *notify_prog, *notify_params;
++    WCHAR *owner;                   /* the owner's SID */
++    ULONG owner_il;                 /* its integrity level */
++    BOOL owner_elevated;
++    DWORD acl_flags, peer_flags;
++    FILETIME created, modified, completed;
++    ULONGLONG last_progress;        /* tick of the last transfer progress */
++    ULONGLONG retry_at;             /* tick a transient error is retried at */
++    ULONGLONG transfer_start;       /* tick the transfer started, for the maximum download time */
+ } BackgroundCopyJobImpl;
+ 
+ /* Background copy file vtbl and related data */
+@@ -103,8 +120,13 @@ extern BackgroundCopyManagerImpl globalMgr;
+ HRESULT BackgroundCopyManagerConstructor(LPVOID *ppObj);
+ HRESULT BackgroundCopyJobConstructor(LPCWSTR displayName, BG_JOB_TYPE type,
+                                      GUID *pJobId, BackgroundCopyJobImpl **job);
+-HRESULT enum_copy_job_create(BackgroundCopyManagerImpl *qmgr,
++HRESULT enum_copy_job_create(BackgroundCopyManagerImpl *qmgr, DWORD flags,
+         IEnumBackgroundCopyJobs **enumjob);
++void job_touch(BackgroundCopyJobImpl *job);
++void job_failed(BackgroundCopyJobImpl *job);
++void job_notify_transferred(BackgroundCopyJobImpl *job);
++ULONGLONG job_due_retries(void);
++HRESULT job_caller_owner(WCHAR **sid, ULONG *il, BOOL *elevated);
+ HRESULT BackgroundCopyFileConstructor(BackgroundCopyJobImpl *owner,
+                                       LPCWSTR remoteName, LPCWSTR localName,
+                                       BackgroundCopyFileImpl **file);
