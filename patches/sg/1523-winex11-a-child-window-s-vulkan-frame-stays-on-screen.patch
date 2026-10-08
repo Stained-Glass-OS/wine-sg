@@ -1,0 +1,207 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winex11: a child window's Vulkan frame stays on screen
+
+A child window that presents with Vulkan (DXVK's Direct3D) is rendered
+into an offscreen, redirected X window, and each frame is copied into its
+top-level's X window. The top-level's window surface -- what GDI painted
+there, for Office's panes a white background -- was put over those frames
+whenever it was flushed: an expose (a dialog, menu or flyout closing over
+the window) or painting nearby. On Windows the compositor keeps a child
+swap chain's last frame on screen whatever GDI does, and programs do not
+present again. Office draws its panes that way: Excel's formula bar, sheet
+tabs and status bar turned into white boxes after any dialog, its start
+screen stayed white until the mouse moved, Outlook's ribbon, message list
+and reading pane went white as one clicked around, and Word's window went
+white behind the account flyout (David's field report, 2026-10-08).
+
+Each frame copied as it is (no scaling) is remembered -- the top-level's
+X window, where it went and its visible part -- and copied again from the
+offscreen window, which keeps it, after any flush of the surface that
+covers it.
+
+Gate: test/vkchild-gate.sh (a child cleared red with Vulkan, a window over
+it for a second, then the pixels; lavapipe under Xvfb). Mutant
+SG_MUTANT_VK_NO_RESHOW.
+---
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -2013,6 +2013,13 @@
+                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
+                    dirty->right - dirty->left, dirty->bottom - dirty->top );
+ 
++    {
++        /* Stained Glass OS (wine-sg 1523): child windows' Vulkan frames over it */
++        RECT shown = *dirty;
++        OffsetRect( &shown, rect->left, rect->top );
++        vulkan_surfaces_reshow( surface->window, &shown );
++    }
++
+     if (shape_changed)
+     {
+ #ifdef HAVE_LIBXSHAPE
+--- a/dlls/winex11.drv/vulkan.c
++++ b/dlls/winex11.drv/vulkan.c
+@@ -74,8 +74,114 @@
+     BOOL blend;            /* a popup that is a sheet of glass: see glass_popup() */
+     Colormap colormap;
+     GC gc;
++    /* the last frame shown in a top-level's X window (see vulkan_surfaces_reshow) */
++    struct list shown_entry;
++    Window shown_on;
++    RECT shown_rect;
++    XRectangle *shown_clip;
++    int shown_clip_count;
+ };
+ 
++/* Stained Glass OS (wine-sg 1523): a child window's frames are rendered
++ * offscreen and copied into its top-level's X window; the top-level's
++ * window surface (what GDI painted, a white background for Office's panes)
++ * was then put over them each time it was flushed -- an expose (a dialog
++ * closed over the window) or any painting nearby. Windows' compositor keeps
++ * a child swap chain's last frame on screen whatever GDI does: Excel's
++ * formula bar, sheet tabs and status bar, Outlook's panes and the whole of
++ * Office's windows turned white until they presented again. The last frame
++ * (kept by the redirected offscreen window) is copied again after each flush
++ * that covers it. */
++static pthread_mutex_t shown_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct list shown_surfaces = LIST_INIT( shown_surfaces );
++
++static void surface_forget_shown( struct x11drv_vulkan_surface *surface )
++{
++    pthread_mutex_lock( &shown_mutex );
++    if (surface->shown_on) list_remove( &surface->shown_entry );
++    surface->shown_on = 0;
++    free( surface->shown_clip );
++    surface->shown_clip = NULL;
++    surface->shown_clip_count = 0;
++    pthread_mutex_unlock( &shown_mutex );
++}
++
++/* remember where the frame was put: window, rectangle, and the visible part
++ * (REGION, relative to RECT's origin; NULL for all of it) */
++static void surface_remember_shown( struct x11drv_vulkan_surface *surface, Window window,
++                                    const RECT *rect, HRGN region )
++{
++    XRectangle *clip = NULL;
++    int count = 0;
++
++    if (region)
++    {
++        DWORD size = NtGdiGetRegionData( region, 0, NULL );
++        RGNDATA *data;
++
++        if (size && (data = malloc( size )))
++        {
++            if (NtGdiGetRegionData( region, size, data ) && (clip = malloc( max( 1, data->rdh.nCount ) * sizeof(*clip) )))
++            {
++                const RECT *r = (const RECT *)data->Buffer;
++                DWORD i;
++                for (i = 0; i < data->rdh.nCount; i++)
++                {
++                    clip[count].x = r[i].left + rect->left;
++                    clip[count].y = r[i].top + rect->top;
++                    clip[count].width = r[i].right - r[i].left;
++                    clip[count].height = r[i].bottom - r[i].top;
++                    count++;
++                }
++            }
++            free( data );
++        }
++        if (!clip) return;
++    }
++
++    TRACE( "window %lx rect %s, %d clip rectangles, first %d,%d %ux%u\n", window, wine_dbgstr_rect( rect ),
++           region ? count : -1, count ? clip[0].x : 0, count ? clip[0].y : 0, count ? clip[0].width : 0,
++           count ? clip[0].height : 0 );
++    pthread_mutex_lock( &shown_mutex );
++    if (!surface->shown_on) list_add_tail( &shown_surfaces, &surface->shown_entry );
++    surface->shown_on = window;
++    surface->shown_rect = *rect;
++    free( surface->shown_clip );
++    surface->shown_clip = clip;
++    surface->shown_clip_count = region ? count : -1;
++    pthread_mutex_unlock( &shown_mutex );
++}
++
++/* called after a window surface was put into WINDOW at RECT (window coordinates) */
++void vulkan_surfaces_reshow( Window window, const RECT *rect )
++{
++    struct x11drv_vulkan_surface *surface;
++    GC gc = 0;
++
++#ifdef SG_MUTANT_VK_NO_RESHOW
++    return;
++#endif
++    pthread_mutex_lock( &shown_mutex );
++    LIST_FOR_EACH_ENTRY( surface, &shown_surfaces, struct x11drv_vulkan_surface, shown_entry )
++    {
++        RECT inter;
++        if (surface->shown_on != window) continue;
++        if (!intersect_rect( &inter, &surface->shown_rect, rect )) continue;
++        if (!gc && !(gc = XCreateGC( gdi_display, window, 0, NULL ))) break;
++        XSetGraphicsExposures( gdi_display, gc, False );
++        if (surface->shown_clip_count >= 0)
++            XSetClipRectangles( gdi_display, gc, 0, 0, surface->shown_clip, surface->shown_clip_count, YXBanded );
++        else
++            XSetClipMask( gdi_display, gc, None );
++        XCopyArea( gdi_display, surface->window, window, gc, 0, 0,
++                   surface->shown_rect.right - surface->shown_rect.left,
++                   surface->shown_rect.bottom - surface->shown_rect.top,
++                   surface->shown_rect.left, surface->shown_rect.top );
++    }
++    pthread_mutex_unlock( &shown_mutex );
++    if (gc) XFreeGC( gdi_display, gc );
++}
++
+ /* Stained Glass OS: a popup that is a sheet of glass (Chromium's bubbles:
+  * its GPU process presents into the browser's window with Vulkan). In a
+  * virtual desktop it is a child of the desktop's X window, and X shows a
+@@ -189,6 +295,7 @@
+ 
+ static void vulkan_surface_destroy( HWND hwnd, struct x11drv_vulkan_surface *surface )
+ {
++    surface_forget_shown( surface );
+     if (surface->blend)
+     {
+         if (surface->window) XDestroyWindow( gdi_display, surface->window );
+@@ -280,6 +387,7 @@
+ 
+     TRACE( "%p %p\n", hwnd, private );
+ 
++    surface_forget_shown( surface );
+     if (surface->blend) return;
+     if ((data = get_win_data( hwnd )))
+     {
+@@ -312,6 +420,7 @@
+ 
+     if (!surface->offscreen)
+     {
++        surface_forget_shown( surface );
+ #ifdef SONAME_LIBXCOMPOSITE
+         if (usexcomposite) pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+ #endif
+@@ -411,6 +520,14 @@
+     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
+                      surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
+ 
++    /* a frame copied as it is (no scaling) from a redirected window, which
++     * keeps it, can be shown again */
++    if (usexcomposite && rect_dst.right - rect_dst.left == surface->rect.right &&
++        rect_dst.bottom - rect_dst.top == surface->rect.bottom)
++        surface_remember_shown( surface, window, &rect_dst, region );
++    else
++        surface_forget_shown( surface );
++
+     if (region) NtGdiDeleteObjectApp( region );
+     if (hdc) NtUserReleaseDC( hwnd, hdc );
+ }
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -752,6 +752,7 @@
+ extern void make_window_embedded( struct x11drv_win_data *data );
+ extern Window create_client_window( HWND hwnd, const XVisualInfo *visual, Colormap colormap );
+ extern void detach_client_window( struct x11drv_win_data *data, Window client_window );
++extern void vulkan_surfaces_reshow( Window window, const RECT *rect );
+ extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
+ extern void destroy_client_window( HWND hwnd, Window client_window );
+ extern void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha );
