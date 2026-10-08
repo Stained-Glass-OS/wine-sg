@@ -7,7 +7,10 @@
  * (an expose: a dialog closed over the window): white boxes where Excel's
  * formula bar and sheet tabs were, a white window until the mouse moved.
  *
- * Usage: vkchild-probe.exe   -- opens "vkchild" (400x300 white) with a child
+ * With "nest" a window inside the child presents green before the child
+ * presents red (patches/sg/1524): the inner frame stays over the outer one.
+ *
+ * Usage: vkchild-probe.exe [nest] -- opens "vkchild" (400x300 white) with a child
  * (200x150 at 50,50) cleared red once by Vulkan, prints "presented=<0|1>",
  * then keeps running (the gate covers and uncovers it, and reads pixels). */
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -24,7 +27,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static int present_red(HWND child)
+static int present_color(HWND child, float red_c, float green_c, float blue_c)
 {
     HMODULE vk = LoadLibraryA("vulkan-1.dll");
     PFN_vkGetInstanceProcAddr pvkGetInstanceProcAddr;
@@ -44,7 +47,7 @@ static int present_red(HWND child)
     VkCommandBufferAllocateInfo cbai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     VkCommandBufferBeginInfo cbbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     VkImageMemoryBarrier bar = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    VkClearColorValue red = {{ 1.0f, 0.0f, 0.0f, 1.0f }};
+    VkClearColorValue red = {{ red_c, green_c, blue_c, 1.0f }};
     VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
@@ -138,7 +141,15 @@ int main(int argc, char **argv)
     UpdateWindow(top);
     while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
     Sleep(500);
-    ok = present_red(child);
+    if (argc > 1 && !strcmp(argv[1], "nest"))
+    {
+        /* a window inside the child (60x40 at 20,20) presents green first,
+         * then the child red: the inner frame must stay over the outer one */
+        HWND inner = CreateWindowW(L"vkchild", L"inner", WS_CHILD | WS_VISIBLE, 20, 20, 60, 40, child, NULL, NULL, NULL);
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        present_color(inner, 0.0f, 1.0f, 0.0f);
+    }
+    ok = present_color(child, 1.0f, 0.0f, 0.0f);
     printf("presented=%d\n", ok); fflush(stdout);
     while (GetMessageW(&msg, NULL, 0, 0)) DispatchMessageW(&msg);
     return 0;

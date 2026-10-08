@@ -1,0 +1,226 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winex11: child windows' frames are shown again in their order, while in place
+
+1523 copies child windows' last Vulkan frames back after their top-level's
+window surface is flushed over them. Two gaps: frames were put back in the
+order the windows first presented, so a parent that presents a frame of
+its own size (Word's document area, Outlook's panes) could cover its
+children's frames; and a window that had moved, changed size or been
+hidden still had its old frame put back where it had been (Outlook showed
+a line of the previous message over the next one). On Windows the
+compositor stacks child swap chains as the windows are stacked, and shows
+only windows that are there.
+
+Frames are now put back the deepest windows' first, each leaving out what
+deeper ones showed; and a window's kept frame (and those of the windows in
+it) is dropped when it moves, is resized, restacked, shown or hidden,
+until it presents again.
+
+Gate: test/vkchild-gate.sh (a window inside the child presents green
+before the child presents red; after an expose green is over red). Mutant
+SG_MUTANT_VK_RESHOW_UNORDERED.
+---
+--- a/dlls/winex11.drv/vulkan.c
++++ b/dlls/winex11.drv/vulkan.c
+@@ -76,10 +76,12 @@
+     GC gc;
+     /* the last frame shown in a top-level's X window (see vulkan_surfaces_reshow) */
+     struct list shown_entry;
++    HWND shown_hwnd;
+     Window shown_on;
+     RECT shown_rect;
+     XRectangle *shown_clip;
+     int shown_clip_count;
++    int shown_depth;       /* how many windows it is below its top-level */
+ };
+ 
+ /* Stained Glass OS (wine-sg 1523): a child window's frames are rendered
+@@ -108,11 +110,14 @@
+ 
+ /* remember where the frame was put: window, rectangle, and the visible part
+  * (REGION, relative to RECT's origin; NULL for all of it) */
+-static void surface_remember_shown( struct x11drv_vulkan_surface *surface, Window window,
++static void surface_remember_shown( HWND hwnd, struct x11drv_vulkan_surface *surface, Window window,
+                                     const RECT *rect, HRGN region )
+ {
++    HWND desktop = NtUserGetDesktopWindow(), parent = hwnd;
+     XRectangle *clip = NULL;
+-    int count = 0;
++    int count = 0, depth = 0;
++
++    while ((parent = NtUserGetAncestor( parent, GA_PARENT )) && parent != desktop) depth++;
+ 
+     if (region)
+     {
+@@ -139,7 +144,7 @@
+         if (!clip) return;
+     }
+ 
+-    TRACE( "window %lx rect %s, %d clip rectangles, first %d,%d %ux%u\n", window, wine_dbgstr_rect( rect ),
++    TRACE( "%p depth %d window %lx rect %s, %d clip rectangles, first %d,%d %ux%u\n", hwnd, depth, window, wine_dbgstr_rect( rect ),
+            region ? count : -1, count ? clip[0].x : 0, count ? clip[0].y : 0, count ? clip[0].width : 0,
+            count ? clip[0].height : 0 );
+     pthread_mutex_lock( &shown_mutex );
+@@ -149,13 +154,58 @@
+     free( surface->shown_clip );
+     surface->shown_clip = clip;
+     surface->shown_clip_count = region ? count : -1;
++    surface->shown_depth = depth;
++    surface->shown_hwnd = hwnd;
++    pthread_mutex_unlock( &shown_mutex );
++}
++
++/* HWND moved, was resized, shown, hidden or restacked: the frames kept for
++ * it and the windows in it are not where they were any more (a pane that
++ * went away showed its last frame again) */
++void vulkan_surfaces_window_changed( HWND hwnd )
++{
++    struct x11drv_vulkan_surface *surface;
++    HWND *hwnds = NULL, *gone;
++    unsigned int count = 0, i, n = 0;
++
++    pthread_mutex_lock( &shown_mutex );
++    LIST_FOR_EACH_ENTRY( surface, &shown_surfaces, struct x11drv_vulkan_surface, shown_entry ) count++;
++    if (count && (hwnds = malloc( count * sizeof(*hwnds) )))
++        LIST_FOR_EACH_ENTRY( surface, &shown_surfaces, struct x11drv_vulkan_surface, shown_entry )
++            hwnds[n++] = surface->shown_hwnd;
+     pthread_mutex_unlock( &shown_mutex );
++    if (!hwnds) return;
++
++    /* NtUserIsChild takes the user lock: not under shown_mutex */
++    for (i = 0, gone = hwnds, count = 0; i < n; i++)
++        if (hwnds[i] == hwnd || NtUserIsChild( hwnd, hwnds[i] )) gone[count++] = hwnds[i];
++
++    if (count)
++    {
++        struct x11drv_vulkan_surface *next;
++        pthread_mutex_lock( &shown_mutex );
++        LIST_FOR_EACH_ENTRY_SAFE( surface, next, &shown_surfaces, struct x11drv_vulkan_surface, shown_entry )
++        {
++            for (i = 0; i < count; i++) if (surface->shown_hwnd == gone[i]) break;
++            if (i == count) continue;
++            TRACE( "%p changed: the frame of %p is not shown again\n", hwnd, surface->shown_hwnd );
++            list_remove( &surface->shown_entry );
++            surface->shown_on = 0;
++        }
++        pthread_mutex_unlock( &shown_mutex );
++    }
++    free( hwnds );
+ }
+ 
+-/* called after a window surface was put into WINDOW at RECT (window coordinates) */
++/* called after a window surface was put into WINDOW at RECT (window coordinates):
++ * the frames shown there are put back, the deepest windows' first, each one
++ * leaving out what deeper ones show -- a child's frame is over its parent's
++ * (Word's page, a child of a window that presents a frame of its own size) */
+ void vulkan_surfaces_reshow( Window window, const RECT *rect )
+ {
+     struct x11drv_vulkan_surface *surface;
++    Region covered = 0;
++    int depth, max_depth = -1;
+     GC gc = 0;
+ 
+ #ifdef SG_MUTANT_VK_NO_RESHOW
+@@ -165,20 +215,56 @@
+     LIST_FOR_EACH_ENTRY( surface, &shown_surfaces, struct x11drv_vulkan_surface, shown_entry )
+     {
+         RECT inter;
+-        if (surface->shown_on != window) continue;
+-        if (!intersect_rect( &inter, &surface->shown_rect, rect )) continue;
+-        if (!gc && !(gc = XCreateGC( gdi_display, window, 0, NULL ))) break;
+-        XSetGraphicsExposures( gdi_display, gc, False );
+-        if (surface->shown_clip_count >= 0)
+-            XSetClipRectangles( gdi_display, gc, 0, 0, surface->shown_clip, surface->shown_clip_count, YXBanded );
+-        else
+-            XSetClipMask( gdi_display, gc, None );
+-        XCopyArea( gdi_display, surface->window, window, gc, 0, 0,
+-                   surface->shown_rect.right - surface->shown_rect.left,
+-                   surface->shown_rect.bottom - surface->shown_rect.top,
+-                   surface->shown_rect.left, surface->shown_rect.top );
++        if (surface->shown_on != window || !intersect_rect( &inter, &surface->shown_rect, rect )) continue;
++        max_depth = max( max_depth, surface->shown_depth );
++    }
++    for (depth = max_depth; depth >= 0; depth--)
++    {
++        LIST_FOR_EACH_ENTRY( surface, &shown_surfaces, struct x11drv_vulkan_surface, shown_entry )
++        {
++            XRectangle full;
++            Region clip;
++            RECT inter;
++            int i;
++
++#ifdef SG_MUTANT_VK_RESHOW_UNORDERED
++            if (surface->shown_on != window || depth != max_depth) continue;
++#else
++            if (surface->shown_on != window || surface->shown_depth != depth) continue;
++#endif
++            if (!intersect_rect( &inter, &surface->shown_rect, rect )) continue;
++            if (!(clip = XCreateRegion())) continue;
++            full.x = surface->shown_rect.left;
++            full.y = surface->shown_rect.top;
++            full.width = surface->shown_rect.right - surface->shown_rect.left;
++            full.height = surface->shown_rect.bottom - surface->shown_rect.top;
++            if (surface->shown_clip_count < 0) XUnionRectWithRegion( &full, clip, clip );
++            else for (i = 0; i < surface->shown_clip_count; i++)
++                XUnionRectWithRegion( &surface->shown_clip[i], clip, clip );
++#ifndef SG_MUTANT_VK_RESHOW_UNORDERED
++            if (covered) XSubtractRegion( clip, covered, clip );
++#endif
++            if (!XEmptyRegion( clip ))
++            {
++                if (!gc && !(gc = XCreateGC( gdi_display, window, 0, NULL )))
++                {
++                    XDestroyRegion( clip );
++                    goto done;
++                }
++                XSetGraphicsExposures( gdi_display, gc, False );
++                XSetRegion( gdi_display, gc, clip );
++                XCopyArea( gdi_display, surface->window, window, gc, 0, 0, full.width, full.height, full.x, full.y );
++                TRACE( "flush %s: frame of depth %d at %s shown again\n", wine_dbgstr_rect( rect ), depth,
++                       wine_dbgstr_rect( &surface->shown_rect ) );
++            }
++            if (!covered) covered = XCreateRegion();
++            if (covered) XUnionRegion( covered, clip, covered );
++            XDestroyRegion( clip );
++        }
+     }
++done:
+     pthread_mutex_unlock( &shown_mutex );
++    if (covered) XDestroyRegion( covered );
+     if (gc) XFreeGC( gdi_display, gc );
+ }
+ 
+@@ -524,7 +610,7 @@
+      * keeps it, can be shown again */
+     if (usexcomposite && rect_dst.right - rect_dst.left == surface->rect.right &&
+         rect_dst.bottom - rect_dst.top == surface->rect.bottom)
+-        surface_remember_shown( surface, window, &rect_dst, region );
++        surface_remember_shown( hwnd, surface, window, &rect_dst, region );
+     else
+         surface_forget_shown( surface );
+ 
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -3338,6 +3338,12 @@
+ 
+     sync_gl_drawable( hwnd, FALSE );
+ 
++    /* Stained Glass OS (wine-sg 1524): child windows' Vulkan frames kept to be
++     * shown again (vulkan.c) are not where they were */
++    if ((swp_flags & (SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)) != (SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER) ||
++        (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)))
++        vulkan_surfaces_window_changed( hwnd );
++
+     if (!(data = get_win_data( hwnd ))) return;
+ 
+     old_style = new_style & ~(WS_VISIBLE | WS_MINIMIZE | WS_MAXIMIZE);
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -753,6 +753,7 @@
+ extern Window create_client_window( HWND hwnd, const XVisualInfo *visual, Colormap colormap );
+ extern void detach_client_window( struct x11drv_win_data *data, Window client_window );
+ extern void vulkan_surfaces_reshow( Window window, const RECT *rect );
++extern void vulkan_surfaces_window_changed( HWND hwnd );
+ extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
+ extern void destroy_client_window( HWND hwnd, Window client_window );
+ extern void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha );

@@ -44,6 +44,11 @@ import -window root "$T/a.png"
 "$WINE" 'C:\\vkchild.exe' cover
 sleep 3
 import -window root "$T/b.png"
+"$WINE" 'C:\\vkchild.exe' nest > "$T/nest.out" 2>/dev/null &
+sleep 8
+"$WINE" 'C:\\vkchild.exe' cover
+sleep 3
+import -window root "$T/c.png"
 EOS
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s '-screen 0 800x600x24' "$T/session.sh"
@@ -57,6 +62,13 @@ echo "      shown: $A / after the cover went: $B / around: $O"
 [ "$B" = "$red $red $red" ] && pass "after a window covered it and went, the frame is shown again (not the top-level's white)" ||
     fail "after the cover: $B"
 [ "$O" = "$white $white" ] && pass "only the child's rectangle is drawn again" || fail "around the child: $O"
+# 1524: a window inside the child (at 170,170 on the screen, 60x40) presented
+# green before the child presented red; after an expose the inner frame is
+# put back over the outer one, not under it
+N="$(px c 200,190)"; NR="$(px c 290,250)"
+echo "      nested: inner $N, outer $NR"
+[ "$N" = 'srgb(0,255,0)' ] && pass "a window's frame stays over its parent's after an expose" || fail "nested inner frame: $N"
+[ "$NR" = "$red" ] && pass "the parent's frame is put back around it" || fail "nested outer frame: $NR"
 echo
 [ "$RC" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
