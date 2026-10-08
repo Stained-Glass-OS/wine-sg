@@ -1,0 +1,498 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] scrrun, wshom: text streams follow Line and Column, pipes and standard streams read, Exec's output arrives
+
+A program's output read through WshShell.Exec(...).StdOut -- how scripts
+capture a command's output -- was always empty: Exec started the program
+without letting it inherit the pipes, and a pipe stream could only be
+written (ReadLine, ReadAll, Read, AtEndOfStream and the rest were
+E_NOTIMPL). Scripting.FileSystemObject's text streams lacked Line, Column,
+AtEndOfLine, WriteBlankLines, Skip and SkipLine, and GetStandardStream was
+E_NOTIMPL. A failed read released the stream once too often.
+
+- WshShell.Exec: the program inherits its standard handles (the pipes).
+- Pipe streams (Exec's StdIn/StdOut/StdErr, DoOpenPipeStream) read as
+  file streams do; a pipe ends when its writer goes, and AtEndOfStream
+  waits for data or that end.
+- Line and Column follow what is read and written (1-based; a line feed
+  starts a new line).
+- AtEndOfLine (at a line's end or the stream's; on a stream opened for
+  writing, CTL_E_BADFILEMODE and False), WriteBlankLines, Skip, SkipLine.
+- GetStandardStream gives the process's standard input, output or error
+  as a stream of its own (Unicode or not).
+- Win32 errors scripts meet (sharing violations, a full disk, bad names,
+  drives not ready, directories not empty) map to their Visual Basic
+  errors; others are the Win32 error's HRESULT rather than E_FAIL.
+
+Wine's scrrun filesystem tests: six todo_wine pass and are removed; wshom
+tests: no change.
+
+Gate: test/textstreams-gate.sh (64- and 32-bit cscript with
+test/textstreams.vbs and input on its stdin). Mutants
+SG_MUTANT_PIPE_EOF_EARLY, SG_MUTANT_NO_POSITION (scrrun/filesystem.c).
+---
+--- a/dlls/scrrun/filesystem.c
++++ b/dlls/scrrun/filesystem.c
+@@ -126,6 +126,12 @@ struct textstream {
+     BOOL eof;
+     WCHAR *read_buf;
+     size_t read_buf_size;
++
++    /* Stained Glass OS (1648): a pipe or a standard stream: no size, the
++     * end when the writer goes; where reading or writing has got to */
++    BOOL pipe;
++    LONG line;
++    LONG column;
+ };
+ 
+ enum iotype {
+@@ -186,13 +192,31 @@ static inline HRESULT create_error(DWORD err)
+     case ERROR_ACCESS_DENIED: return CTL_E_PERMISSIONDENIED;
+     case ERROR_FILE_EXISTS: return CTL_E_FILEALREADYEXISTS;
+     case ERROR_ALREADY_EXISTS: return CTL_E_FILEALREADYEXISTS;
++    case ERROR_SHARING_VIOLATION:
++    case ERROR_LOCK_VIOLATION:
++    case ERROR_WRITE_PROTECT: return CTL_E_PERMISSIONDENIED;
++    case ERROR_DISK_FULL:
++    case ERROR_HANDLE_DISK_FULL: return CTL_E_DISKFULL;
++    case ERROR_INVALID_NAME:
++    case ERROR_BAD_PATHNAME:
++    case ERROR_FILENAME_EXCED_RANGE: return CTL_E_BADFILENAME;
++    case ERROR_NOT_READY: return CTL_E_DISKNOTREADY;
++    case ERROR_INVALID_DRIVE:
++    case ERROR_BAD_NETPATH:
++    case ERROR_BAD_NET_NAME: return CTL_E_DEVICEUNAVAILABLE;
++    case ERROR_DIR_NOT_EMPTY:
++    case ERROR_CURRENT_DIRECTORY: return CTL_E_PATHFILEACCESSERROR;
++    case ERROR_TOO_MANY_OPEN_FILES: return CTL_E_TOOMANYFILES;
++    case ERROR_HANDLE_EOF: return CTL_E_ENDOFFILE;
+     default:
+-        FIXME("Unsupported error code: %ld\n", err);
+-        return E_FAIL;
++        /* the others as they are */
++        return HRESULT_FROM_WIN32(err);
+     }
+ }
+ 
+ static HRESULT create_folder(const WCHAR*, IFolder**);
++struct textstream;
++static HRESULT read_more_data(struct textstream *stream);
+ static HRESULT create_file(BSTR, IFile**);
+ static HRESULT create_foldercoll_enum(struct foldercollection*, IUnknown**);
+ static HRESULT create_filecoll_enum(struct filecollection*, IUnknown**);
+@@ -393,15 +417,23 @@ static HRESULT WINAPI textstream_Invoke(ITextStream *iface, DISPID dispIdMember,
+ static HRESULT WINAPI textstream_get_Line(ITextStream *iface, LONG *line)
+ {
+     struct textstream *This = impl_from_ITextStream(iface);
+-    FIXME("(%p)->(%p): stub\n", This, line);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, line);
++
++    if (!line) return E_POINTER;
++    *line = This->line;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI textstream_get_Column(ITextStream *iface, LONG *column)
+ {
+     struct textstream *This = impl_from_ITextStream(iface);
+-    FIXME("(%p)->(%p): stub\n", This, column);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, column);
++
++    if (!column) return E_POINTER;
++    *column = This->column;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI textstream_get_AtEndOfStream(ITextStream *iface, VARIANT_BOOL *eos)
+@@ -418,6 +450,12 @@ static HRESULT WINAPI textstream_get_AtEndOfStream(ITextStream *iface, VARIANT_B
+         return CTL_E_BADFILEMODE;
+     }
+ 
++    /* a pipe: wait for something to read, or its end */
++    if (This->pipe && !This->read_buf_size && !This->eof)
++    {
++        HRESULT hr = read_more_data(This);
++        if (FAILED(hr)) return hr;
++    }
+     *eos = (This->eof && !This->read_buf_size) ? VARIANT_TRUE : VARIANT_FALSE;
+     return S_OK;
+ }
+@@ -425,8 +463,22 @@ static HRESULT WINAPI textstream_get_AtEndOfStream(ITextStream *iface, VARIANT_B
+ static HRESULT WINAPI textstream_get_AtEndOfLine(ITextStream *iface, VARIANT_BOOL *eol)
+ {
+     struct textstream *This = impl_from_ITextStream(iface);
+-    FIXME("(%p)->(%p): stub\n", This, eol);
+-    return E_NOTIMPL;
++    HRESULT hr;
++
++    TRACE("(%p)->(%p)\n", This, eol);
++
++    if (!eol) return E_POINTER;
++    if (textstream_check_iomode(This, IORead))
++    {
++        *eol = VARIANT_FALSE;
++        return CTL_E_BADFILEMODE;
++    }
++    while (!This->read_buf_size && !This->eof)
++        if (FAILED(hr = read_more_data(This))) return hr;
++    /* the end of a line, or of the stream */
++    *eol = (!This->read_buf_size || This->read_buf[0] == '\n' || This->read_buf[0] == '\r')
++           ? VARIANT_TRUE : VARIANT_FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT append_read_data(struct textstream *stream, const char *buf, size_t buf_size)
+@@ -476,6 +528,25 @@ static HRESULT append_read_data(struct textstream *stream, const char *buf, size
+     return S_OK;
+ }
+ 
++/* Line and Column follow what was read or written */
++static void track_position(struct textstream *stream, const WCHAR *text, size_t len)
++{
++    size_t i;
++
++#ifdef SG_MUTANT_NO_POSITION
++    return;
++#endif
++    for (i = 0; i < len; i++)
++    {
++        if (text[i] == '\n')
++        {
++            stream->line++;
++            stream->column = 1;
++        }
++        else stream->column++;
++    }
++}
++
+ static HRESULT read_more_data(struct textstream *stream)
+ {
+     char buf[256];
+@@ -485,11 +556,22 @@ static HRESULT read_more_data(struct textstream *stream)
+ 
+     if (!ReadFile(stream->file, buf, sizeof(buf), &read, NULL))
+     {
+-        ITextStream_Release(&stream->ITextStream_iface);
++        /* a pipe's writer is gone: its end */
++        if (stream->pipe && (GetLastError() == ERROR_BROKEN_PIPE || GetLastError() == ERROR_NO_DATA ||
++                             GetLastError() == ERROR_PIPE_NOT_CONNECTED))
++        {
++            stream->eof = TRUE;
++            return S_OK;
++        }
+         return create_error(GetLastError());
+     }
+ 
++    /* a pipe gives what there is: only nothing at all is its end */
++#ifndef SG_MUTANT_PIPE_EOF_EARLY
++    stream->eof = stream->pipe ? !read : read != sizeof(buf);
++#else
+     stream->eof = read != sizeof(buf);
++#endif
+     return append_read_data(stream, buf, read);
+ }
+ 
+@@ -500,6 +582,7 @@ static BOOL read_from_buffer(struct textstream *stream, size_t len, BSTR *ret, s
+     if (!(*ret = SysAllocStringLen(stream->read_buf, len))) return FALSE;
+ 
+     len += skip;
++    track_position(stream, stream->read_buf, len);
+     stream->read_buf_size -= len;
+     if (stream->read_buf_size)
+         memmove(stream->read_buf, stream->read_buf + len, stream->read_buf_size * sizeof(WCHAR));
+@@ -617,6 +700,7 @@ static HRESULT textstream_write(struct textstream *stream, BSTR text)
+     if (textstream_check_iomode(stream, IOWrite))
+         return CTL_E_BADFILEMODE;
+ 
++    track_position(stream, text, SysStringLen(text));
+     if (stream->unicode) {
+         ret = WriteFile(stream->file, text, SysStringByteLen(text), &written, NULL);
+         return (ret && written == SysStringByteLen(text)) ? S_OK : create_error(GetLastError());
+@@ -663,6 +747,8 @@ static HRESULT textstream_writecrlf(struct textstream *stream)
+         len = sizeof(crlfA);
+     }
+ 
++    stream->line++;
++    stream->column = 1;
+     ret = WriteFile(stream->file, ptr, len, &written, NULL);
+     return (ret && written == len) ? S_OK : create_error(GetLastError());
+ }
+@@ -682,23 +768,41 @@ static HRESULT WINAPI textstream_WriteLine(ITextStream *iface, BSTR text)
+ 
+ static HRESULT WINAPI textstream_WriteBlankLines(ITextStream *iface, LONG lines)
+ {
+-    FIXME("%p, %ld stub\n", iface, lines);
++    struct textstream *stream = impl_from_ITextStream(iface);
++    HRESULT hr = S_OK;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %ld.\n", iface, lines);
++
++    if (lines < 0) return CTL_E_ILLEGALFUNCTIONCALL;
++    if (textstream_check_iomode(stream, IOWrite)) return CTL_E_BADFILEMODE;
++    while (lines-- > 0 && SUCCEEDED(hr)) hr = textstream_writecrlf(stream);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI textstream_Skip(ITextStream *iface, LONG count)
+ {
+-    FIXME("%p, %ld stub\n", iface, count);
++    BSTR text = NULL;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %ld.\n", iface, count);
++
++    if (count < 0) return CTL_E_ILLEGALFUNCTIONCALL;
++    if (!count) return S_OK;
++    hr = ITextStream_Read(iface, count, &text);
++    SysFreeString(text);
++    return FAILED(hr) ? hr : S_OK;
+ }
+ 
+ static HRESULT WINAPI textstream_SkipLine(ITextStream *iface)
+ {
+-    struct textstream *This = impl_from_ITextStream(iface);
+-    FIXME("(%p): stub\n", This);
+-    return E_NOTIMPL;
++    BSTR text = NULL;
++    HRESULT hr;
++
++    TRACE("%p.\n", iface);
++
++    hr = ITextStream_ReadLine(iface, &text);
++    SysFreeString(text);
++    return FAILED(hr) ? hr : S_OK;
+ }
+ 
+ static HRESULT WINAPI textstream_Close(ITextStream *iface)
+@@ -740,91 +844,17 @@ static const ITextStreamVtbl textstreamvtbl =
+     textstream_Close
+ };
+ 
+-static HRESULT WINAPI pipestream_get_Line(ITextStream *iface, LONG *line)
+-{
+-    FIXME("%p, %p.\n", iface, line);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI pipestream_get_Column(ITextStream *iface, LONG *column)
+-{
+-    FIXME("%p, %p.\n", iface, column);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI pipestream_get_AtEndOfStream(ITextStream *iface, VARIANT_BOOL *eos)
+-{
+-    FIXME("%p, %p.\n", iface, eos);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI pipestream_get_AtEndOfLine(ITextStream *iface, VARIANT_BOOL *eol)
+-{
+-    FIXME("%p, %p.\n", iface, eol);
+ 
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI pipestream_Read(ITextStream *iface, LONG len, BSTR *text)
+-{
+-    FIXME("%p, %ld, %p.\n", iface, len, text);
+ 
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI pipestream_ReadLine(ITextStream *iface, BSTR *text)
+-{
+-    FIXME("%p, %p.\n", iface, text);
+-
+-    return E_NOTIMPL;
+-}
+ 
+-static HRESULT WINAPI pipestream_ReadAll(ITextStream *iface, BSTR *text)
+-{
+-    FIXME("%p, %p.\n", iface, text);
+ 
+-    return E_NOTIMPL;
+-}
+ 
+-static HRESULT WINAPI pipestream_Write(ITextStream *iface, BSTR text)
+-{
+-    struct textstream *stream = impl_from_ITextStream(iface);
+ 
+-    TRACE("%p, %s.\n", iface, debugstr_w(text));
+ 
+-    return textstream_write(stream, text);
+-}
+ 
+-static HRESULT WINAPI pipestream_WriteLine(ITextStream *iface, BSTR text)
+-{
+-    FIXME("%p, %s.\n", iface, debugstr_w(text));
+ 
+-    return E_NOTIMPL;
+-}
+ 
+-static HRESULT WINAPI pipestream_WriteBlankLines(ITextStream *iface, LONG lines)
+-{
+-    FIXME("%p, %ld.\n", iface, lines);
+ 
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI pipestream_Skip(ITextStream *iface, LONG count)
+-{
+-    FIXME("%p, %ld.\n", iface, count);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI pipestream_SkipLine(ITextStream *iface)
+-{
+-    FIXME("%p.\n", iface);
+-
+-    return E_NOTIMPL;
+-}
+ 
+ static const ITextStreamVtbl pipestreamvtbl =
+ {
+@@ -835,18 +865,18 @@ static const ITextStreamVtbl pipestreamvtbl =
+     textstream_GetTypeInfo,
+     textstream_GetIDsOfNames,
+     textstream_Invoke,
+-    pipestream_get_Line,
+-    pipestream_get_Column,
+-    pipestream_get_AtEndOfStream,
+-    pipestream_get_AtEndOfLine,
+-    pipestream_Read,
+-    pipestream_ReadLine,
+-    pipestream_ReadAll,
+-    pipestream_Write,
+-    pipestream_WriteLine,
+-    pipestream_WriteBlankLines,
+-    pipestream_Skip,
+-    pipestream_SkipLine,
++    textstream_get_Line,
++    textstream_get_Column,
++    textstream_get_AtEndOfStream,
++    textstream_get_AtEndOfLine,
++    textstream_Read,
++    textstream_ReadLine,
++    textstream_ReadAll,
++    textstream_Write,
++    textstream_WriteLine,
++    textstream_WriteBlankLines,
++    textstream_Skip,
++    textstream_SkipLine,
+     textstream_Close
+ };
+ 
+@@ -879,6 +909,7 @@ static HRESULT create_textstream(const WCHAR *filename, DWORD disposition, IOMod
+     stream->ITextStream_iface.lpVtbl = &textstreamvtbl;
+     stream->ref = 1;
+     stream->mode = mode;
++    stream->line = stream->column = 1;
+ 
+     stream->file = CreateFileW(filename, access, 0, NULL, disposition, FILE_ATTRIBUTE_NORMAL, NULL);
+     if (stream->file == INVALID_HANDLE_VALUE)
+@@ -973,6 +1004,8 @@ HRESULT WINAPI DoOpenPipeStream(HANDLE pipe, IOMode mode, ITextStream **ret)
+     stream->ref = 1;
+     stream->mode = mode;
+     stream->file = pipe;
++    stream->pipe = TRUE;
++    stream->line = stream->column = 1;
+ 
+     init_classinfo(&CLSID_TextStream, (IUnknown *)&stream->ITextStream_iface, &stream->classinfo);
+     *ret = &stream->ITextStream_iface;
+@@ -4077,9 +4110,27 @@ static HRESULT WINAPI filesys_GetStandardStream(IFileSystem3 *iface,
+                                             VARIANT_BOOL Unicode,
+                                             ITextStream **ppts)
+ {
+-    FIXME("%p %d %d %p\n", iface, StandardStreamType, Unicode, ppts);
++    static const DWORD std_handles[] = { STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE };
++    HANDLE handle, dup;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p %d %d %p\n", iface, StandardStreamType, Unicode, ppts);
++
++    if (!ppts) return E_POINTER;
++    *ppts = NULL;
++    if (StandardStreamType < StdIn || StandardStreamType > StdErr) return CTL_E_ILLEGALFUNCTIONCALL;
++    /* the process's standard input, output or error: a stream of its own on it */
++    handle = GetStdHandle(std_handles[StandardStreamType]);
++    if (!handle || handle == INVALID_HANDLE_VALUE) return CTL_E_BADFILENAMEORNUMBER;
++    if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS))
++        return create_error(GetLastError());
++    if (FAILED(hr = DoOpenPipeStream(dup, StandardStreamType == StdIn ? ForReading : ForWriting, ppts)))
++    {
++        CloseHandle(dup);
++        return hr;
++    }
++    impl_from_ITextStream(*ppts)->unicode = !!Unicode;
++    return S_OK;
+ }
+ 
+ static void get_versionstring(VS_FIXEDFILEINFO *info, WCHAR *ver)
+--- a/dlls/scrrun/tests/filesystem.c
++++ b/dlls/scrrun/tests/filesystem.c
+@@ -333,10 +333,8 @@ static void test_textstream(void)
+ 
+     b = 10;
+     hr = ITextStream_get_AtEndOfLine(stream, &b);
+-todo_wine {
+     ok(hr == CTL_E_BADFILEMODE, "Unexpected hr %#lx.\n", hr);
+     ok(b == VARIANT_FALSE || broken(b == 10), "got 0x%x\n", b);
+-}
+     hr = ITextStream_Read(stream, 1, &data);
+     ok(hr == CTL_E_BADFILEMODE, "Unexpected hr %#lx.\n", hr);
+ 
+@@ -358,10 +356,8 @@ todo_wine {
+ 
+     b = 10;
+     hr = ITextStream_get_AtEndOfLine(stream, &b);
+-todo_wine {
+     ok(hr == CTL_E_BADFILEMODE, "Unexpected hr %#lx.\n", hr);
+     ok(b == VARIANT_FALSE || broken(b == 10), "got 0x%x\n", b);
+-}
+     hr = ITextStream_Read(stream, 1, &data);
+     ok(hr == CTL_E_BADFILEMODE, "Unexpected hr %#lx.\n", hr);
+ 
+@@ -2669,7 +2665,6 @@ static void test_DoOpenPipeStream(void)
+         ok(written == sizeof(testdata), "Write to anonymous pipe wrote %ld bytes.\n", written);
+ 
+         hr = ITextStream_Read(stream_read, 4, &str);
+-        todo_wine
+         ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+         if (SUCCEEDED(hr))
+         {
+@@ -2710,11 +2705,9 @@ static void test_DoOpenPipeStream(void)
+         SysFreeString(str);
+ 
+         hr = ITextStream_Read(stream_write, 1, &str);
+-        todo_wine
+         ok(hr == CTL_E_BADFILEMODE, "Unexpected hr %#lx.\n", hr);
+ 
+         hr = ITextStream_Read(stream_read, 4, &str);
+-        todo_wine
+         ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+         if (SUCCEEDED(hr))
+         {
+--- a/dlls/wshom.ocx/shell.c
++++ b/dlls/wshom.ocx/shell.c
+@@ -439,7 +439,9 @@ static HRESULT WshExec_create(BSTR command, IWshExec **ret)
+ 
+     if (SUCCEEDED(hr))
+     {
+-        if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, &object->info))
++        /* the pipes' ends reach the program only if it inherits them
++         * (Stained Glass OS 1648: its output was lost, StdOut empty) */
++        if (!CreateProcessW(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &object->info))
+             hr = HRESULT_FROM_WIN32(GetLastError());
+     }
+ 
