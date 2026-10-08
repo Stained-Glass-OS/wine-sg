@@ -1,0 +1,263 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] advapi32, crypt32: protected memory is encrypted
+
+CryptProtectMemory, CryptUnprotectMemory, RtlEncryptMemory and
+RtlDecryptMemory (SystemFunction040/041) did nothing: a secret a program
+kept "protected" (.NET's SecureString and ProtectedMemory, credential
+dialogs) stayed in clear in its memory and in its dumps, and bad lengths
+were accepted.
+
+The memory is XORed with an AES-256 key stream (bcrypt, ECB on a block
+counter from the start of the buffer, so the same key decrypts it at any
+address). The key depends on the scope: SAME_PROCESS a random key of the
+process; SAME_LOGON a random key kept in a volatile key of the user's
+registry, which lives as long as the session; CROSS_PROCESS one derived
+from the machine GUID and the boot time, which any process can derive --
+as any process may decrypt such memory on Windows. Lengths must be whole
+blocks (16 bytes for CryptProtectMemory, 8 for RtlEncryptMemory), else
+ERROR_INVALID_PARAMETER / STATUS_INVALID_PARAMETER; unknown scopes are
+refused.
+
+Wine's crypt32 main and advapi32 crypt tests: no new failures.
+
+Gate: test/memprotect-gate.sh (a child process decrypts CROSS_PROCESS
+and SAME_LOGON memory, not SAME_PROCESS memory). Mutant
+SG_MUTANT_NO_MEMORY_ENCRYPTION (advapi32/crypt.c, crypt32/main.c).
+---
+--- a/dlls/advapi32/Makefile.in
++++ b/dlls/advapi32/Makefile.in
+@@ -3,7 +3,7 @@ MODULE    = advapi32.dll
+ UNIXLIB   = advapi32.so
+ IMPORTLIB = advapi32
+ IMPORTS   = kernelbase sechost msvcrt
+-DELAYIMPORTS = rpcrt4 user32
++DELAYIMPORTS = rpcrt4 user32 bcrypt
+ 
+ SOURCES = \
+ 	advapi.c \
+--- a/dlls/advapi32/crypt.c
++++ b/dlls/advapi32/crypt.c
+@@ -39,6 +39,7 @@
+ #include "wine/debug.h"
+ #include "wine/exception.h"
+ #include "winternl.h"
++#include "bcrypt.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(crypt);
+ 
+@@ -2454,6 +2455,129 @@ BOOLEAN WINAPI SystemFunction036( void *buffer, ULONG len )
+    in crypt32.dll.
+  */
+ 
++/* RtlEncryptMemory and RtlDecryptMemory (and so CryptProtectMemory) did
++ * nothing: a password a program kept "protected" (.NET's SecureString,
++ * ProtectedMemory, credential dialogs) stayed readable in its memory and
++ * dumps. The memory is XORed with an AES-256 key stream counted from the
++ * start of the buffer, so the same key decrypts it at any address. The key
++ * depends on the scope: the process's own random key; for the same logon
++ * a random key kept in a volatile key of the user's registry, which goes
++ * with the session; across processes one derived from the machine and the
++ * boot, which any process can derive, as any process may decrypt such
++ * memory on Windows. */
++#define RTL_ENCRYPT_MEMORY_SIZE         8
++#define RTL_ENCRYPT_OPTION_SAME_PROCESS 0
++#define RTL_ENCRYPT_OPTION_CROSS_PROCESS 1
++#define RTL_ENCRYPT_OPTION_SAME_LOGON   2
++
++static BCRYPT_KEY_HANDLE memory_keys[3];
++
++static BOOL get_logon_secret( BYTE secret[32] )
++{
++    DWORD disp, size, type, i;
++    HKEY key;
++    BOOL ret = FALSE;
++
++    if (RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\Wine\\MemoryProtection", 0, NULL, REG_OPTION_VOLATILE,
++                         KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, &disp ))
++        return FALSE;
++    if (disp == REG_CREATED_NEW_KEY)
++        ret = SystemFunction036( secret, 32 ) &&
++              !RegSetValueExW( key, L"Key", 0, REG_BINARY, secret, 32 );
++    else
++    {
++        /* another process may have just created it and not yet written it */
++        for (i = 0; i < 200 && !ret; i++)
++        {
++            size = 32;
++            if (!RegQueryValueExW( key, L"Key", NULL, &type, secret, &size ) && type == REG_BINARY && size == 32)
++                ret = TRUE;
++            else Sleep( 5 );
++        }
++    }
++    RegCloseKey( key );
++    return ret;
++}
++
++static BOOL get_cross_process_secret( BYTE secret[32] )
++{
++    struct
++    {
++        WCHAR machine_guid[40];
++        LARGE_INTEGER boot_time;
++        char scope[16];
++    } material;
++    SYSTEM_TIMEOFDAY_INFORMATION tod;
++    DWORD size = sizeof(material.machine_guid);
++    HKEY key;
++
++    memset( &material, 0, sizeof(material) );
++    if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Cryptography", 0,
++                        KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key ))
++    {
++        RegQueryValueExW( key, L"MachineGuid", NULL, NULL, (BYTE *)material.machine_guid, &size );
++        RegCloseKey( key );
++    }
++    if (!NtQuerySystemInformation( SystemTimeOfDayInformation, &tod, sizeof(tod), NULL ))
++        material.boot_time = tod.BootTime;
++    strcpy( material.scope, "cross-process" );
++    return !BCryptHash( BCRYPT_SHA256_ALG_HANDLE, NULL, 0, (BYTE *)&material, sizeof(material), secret, 32 );
++}
++
++static BCRYPT_KEY_HANDLE get_memory_key( ULONG scope )
++{
++    BCRYPT_KEY_HANDLE key, old;
++    BYTE secret[32];
++    BOOL ok;
++
++    if (memory_keys[scope]) return memory_keys[scope];
++    switch (scope)
++    {
++    case RTL_ENCRYPT_OPTION_SAME_PROCESS: ok = SystemFunction036( secret, sizeof(secret) ); break;
++    case RTL_ENCRYPT_OPTION_SAME_LOGON:   ok = get_logon_secret( secret ); break;
++    default:                              ok = get_cross_process_secret( secret ); break;
++    }
++    if (!ok || BCryptGenerateSymmetricKey( BCRYPT_AES_ECB_ALG_HANDLE, &key, NULL, 0, secret, sizeof(secret), 0 ))
++    {
++        RtlSecureZeroMemory( secret, sizeof(secret) );
++        return NULL;
++    }
++    RtlSecureZeroMemory( secret, sizeof(secret) );
++    if ((old = InterlockedCompareExchangePointer( &memory_keys[scope], key, NULL )))
++    {
++        BCryptDestroyKey( key );
++        return old;
++    }
++    return key;
++}
++
++static NTSTATUS crypt_memory( void *memory, ULONG length, ULONG flags )
++{
++    BCRYPT_KEY_HANDLE key;
++    BYTE counter[16], stream[16], *ptr = memory;
++    ULONG64 block;
++    ULONG i, n, done;
++    NTSTATUS status;
++
++    if (length % RTL_ENCRYPT_MEMORY_SIZE || flags > RTL_ENCRYPT_OPTION_SAME_LOGON) return STATUS_INVALID_PARAMETER;
++    if (!length) return STATUS_SUCCESS;
++    if (!(key = get_memory_key( flags ))) return STATUS_UNSUCCESSFUL;
++
++    for (block = 0; length; block++)
++    {
++        memset( counter, 0, sizeof(counter) );
++        memcpy( counter, &block, sizeof(block) );
++        if ((status = BCryptEncrypt( key, counter, sizeof(counter), NULL, NULL, 0, stream, sizeof(stream), &done, 0 )))
++            return status;
++        n = min( length, sizeof(stream) );
++        for (i = 0; i < n; i++) ptr[i] ^= stream[i];
++        ptr += n;
++        length -= n;
++    }
++    RtlSecureZeroMemory( stream, sizeof(stream) );
++    return STATUS_SUCCESS;
++}
++
+ /******************************************************************************
+  * SystemFunction040   (ADVAPI32.@)
+  *
+@@ -2478,8 +2602,13 @@ BOOLEAN WINAPI SystemFunction036( void *buffer, ULONG len )
+  */
+ NTSTATUS WINAPI SystemFunction040(PVOID memory, ULONG length, ULONG flags)
+ {
++#ifndef SG_MUTANT_NO_MEMORY_ENCRYPTION
++	TRACE("(%p, %lx, %lx)\n", memory, length, flags);
++	return crypt_memory( memory, length, flags );
++#else
+ 	FIXME("(%p, %lx, %lx): stub [RtlEncryptMemory]\n", memory, length, flags);
+ 	return STATUS_SUCCESS;
++#endif
+ }
+ 
+ /******************************************************************************
+@@ -2506,8 +2635,13 @@ NTSTATUS WINAPI SystemFunction040(PVOID memory, ULONG length, ULONG flags)
+  */
+ NTSTATUS WINAPI SystemFunction041(PVOID memory, ULONG length, ULONG flags)
+ {
++#ifndef SG_MUTANT_NO_MEMORY_ENCRYPTION
++	TRACE("(%p, %lx, %lx)\n", memory, length, flags);
++	return crypt_memory( memory, length, flags );
++#else
+ 	FIXME("(%p, %lx, %lx): stub [RtlDecryptMemory]\n", memory, length, flags);
+ 	return STATUS_SUCCESS;
++#endif
+ }
+ 
+ /******************************************************************************
+--- a/dlls/crypt32/main.c
++++ b/dlls/crypt32/main.c
+@@ -308,16 +308,55 @@ ASN1encoding_t WINAPI I_CryptGetAsn1Encoder(HCRYPTASN1MODULE x)
+     return NULL;
+ }
+ 
++/* RtlEncryptMemory and RtlDecryptMemory, in blocks of
++ * CRYPTPROTECTMEMORY_BLOCK_SIZE; the scopes have the same values */
++NTSTATUS WINAPI SystemFunction040(PVOID,ULONG,ULONG);
++NTSTATUS WINAPI SystemFunction041(PVOID,ULONG,ULONG);
++
+ BOOL WINAPI CryptProtectMemory(void *data, DWORD len, DWORD flags)
+ {
++#ifndef SG_MUTANT_NO_MEMORY_ENCRYPTION
++    NTSTATUS status;
++
++    TRACE("(%p %lu %08lx)\n", data, len, flags);
++    if (len % CRYPTPROTECTMEMORY_BLOCK_SIZE)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    if ((status = SystemFunction040(data, len, flags)))
++    {
++        SetLastError(RtlNtStatusToDosError(status));
++        return FALSE;
++    }
++    return TRUE;
++#else
+     static int fixme_once;
+     if (!fixme_once++) FIXME("(%p %lu %08lx): stub\n", data, len, flags);
+     return TRUE;
++#endif
+ }
+ 
+ BOOL WINAPI CryptUnprotectMemory(void *data, DWORD len, DWORD flags)
+ {
++#ifndef SG_MUTANT_NO_MEMORY_ENCRYPTION
++    NTSTATUS status;
++
++    TRACE("(%p %lu %08lx)\n", data, len, flags);
++    if (len % CRYPTPROTECTMEMORY_BLOCK_SIZE)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    if ((status = SystemFunction041(data, len, flags)))
++    {
++        SetLastError(RtlNtStatusToDosError(status));
++        return FALSE;
++    }
++    return TRUE;
++#else
+     static int fixme_once;
+     if (!fixme_once++) FIXME("(%p %lu %08lx): stub\n", data, len, flags);
+     return TRUE;
++#endif
+ }

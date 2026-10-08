@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-deskhover test-deskerase test-dpifollow test-hungwake test-savename test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg test-layeredblend test-linuxicon test-shellnew test-glassvk test-elevfolders test-displaycfg test-pss test-pyimports test-ownerrights test-ptracecap test-proxyblanket test-comlauncher test-cloakpaint test-gpupriority test-dbghelpinline test-regfsync test-sysversions test-drivewatch test-systemtemp test-desktopfront test-mcastif test-prtsc test-stiinf test-usbtree test-gpahook test-autoplay test-envreload test-iconhandler test-gdipfamily test-dirshare test-elevtray test-anotherwindow test-threadclass test-fetabs test-linuxbash test-embedmaxgrab test-toastactivate test-netfx3 test-smbshare test-smbview test-netuse test-mapcred test-wmiprinter test-cupsmodel test-devkeyread test-cupsrefresh test-pentouch test-drvpkg test-psdriver test-unidrvxl test-unidrvrast test-psplugin test-cpsui test-drvui test-netport test-printproc test-dwsubst test-ptcaps test-smoothshapes test-iconframes test-touch test-keybutton test-hiddenmax test-tlbbase test-comsvc test-privacysettings test-dwspacing test-msgboxicons test-credkeyring test-latepen test-wininet-listentimeout test-onlineid-ticket test-richtxsrv2 test-d2dsharedview test-rotransformerror
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-deskhover test-deskerase test-dpifollow test-hungwake test-savename test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg test-layeredblend test-linuxicon test-shellnew test-glassvk test-elevfolders test-displaycfg test-pss test-pyimports test-ownerrights test-ptracecap test-proxyblanket test-comlauncher test-cloakpaint test-gpupriority test-dbghelpinline test-regfsync test-sysversions test-drivewatch test-systemtemp test-desktopfront test-mcastif test-prtsc test-stiinf test-usbtree test-gpahook test-autoplay test-envreload test-iconhandler test-gdipfamily test-dirshare test-elevtray test-anotherwindow test-threadclass test-fetabs test-linuxbash test-embedmaxgrab test-toastactivate test-netfx3 test-smbshare test-smbview test-netuse test-mapcred test-wmiprinter test-cupsmodel test-devkeyread test-cupsrefresh test-pentouch test-drvpkg test-psdriver test-unidrvxl test-unidrvrast test-psplugin test-cpsui test-drvui test-netport test-printproc test-dwsubst test-ptcaps test-smoothshapes test-iconframes test-touch test-keybutton test-hiddenmax test-tlbbase test-comsvc test-privacysettings test-dwspacing test-msgboxicons test-credkeyring test-latepen test-wininet-listentimeout test-onlineid-ticket test-richtxsrv2 test-d2dsharedview test-rotransformerror test-cputime test-fileinfo test-procsettings test-memprotect test-userapis test-kbmisc test-cpusets test-werreg test-devfamily test-aclentries
 
 all: build
 
@@ -664,6 +664,46 @@ test-d2dsharedview:
 # a minute after opening a document.
 test-rotransformerror:
 	WINE=$(PREFIX)/bin/wine test/rotransformerror-gate.sh
+
+# Other processes' CPU times and cycle counts (1600).
+test-cputime:
+	WINE=$(PREFIX)/bin/wine test/cputime-gate.sh
+
+# The file information classes Windows has (1601).
+test-fileinfo:
+	WINE=$(PREFIX)/bin/wine test/fileinfo-gate.sh
+
+# Process and thread settings kept and read back (1602).
+test-procsettings:
+	WINE=$(PREFIX)/bin/wine test/procsettings-gate.sh
+
+# CryptProtectMemory / RtlEncryptMemory encrypt (1603).
+test-memprotect:
+	WINE=$(PREFIX)/bin/wine test/memprotect-gate.sh
+
+# Display affinity, user object security, power notifications (1604).
+test-userapis:
+	WINE=$(PREFIX)/bin/wine test/userapis-gate.sh
+
+# Precise interrupt time, file streams, fail-fast, drivers, page files (1605).
+test-kbmisc:
+	WINE=$(PREFIX)/bin/wine test/kbmisc-gate.sh
+
+# CPU sets, NUMA nodes, ideal processors, priority boost (1606).
+test-cpusets:
+	WINE=$(PREFIX)/bin/wine test/cpusets-gate.sh
+
+# Error report registrations (1607).
+test-werreg:
+	WINE=$(PREFIX)/bin/wine test/werreg-gate.sh
+
+# Device family version, ETW provider information, other threads' layout (1608).
+test-devfamily:
+	WINE=$(PREFIX)/bin/wine test/devfamily-gate.sh
+
+# SetEntriesInAclW builds the ACL as Windows does (1609).
+test-aclentries:
+	WINE=$(PREFIX)/bin/wine test/aclentries-gate.sh
 
 # A locale's sort looked up re-entrantly (0513): App-V's registry hooks.
 test-sortreenter:
