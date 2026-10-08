@@ -1,0 +1,375 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dbghelp: CodeView records, data segments, handle data, memory scan and filter in minidumps
+
+Crash reporters (Crashpad, .NET's dump writers, WER-style tools) ask
+MiniDumpWriteDump for these; they were FIXMEs that wrote nothing:
+
+- each PE module's CodeView record (the RSDS block naming the PDB, its
+  GUID and age) is copied from the module's debug directory into the dump,
+  so a debugger can find the symbols;
+- MiniDumpWithDataSegs adds every module's writable, non-code sections to
+  the memory list (modules whose callback keeps ModuleWriteDataSeg);
+- MiniDumpWithHandleData writes the handle stream: each handle's value,
+  type and object name, attributes, granted access and counts;
+- MiniDumpScanMemory sets ModuleReferencedByMemory for modules that a
+  value in a thread's stack points into, for the callback to decide;
+- MiniDumpFilterMemory keeps, in the stacks, only the values a stack trace
+  needs (addresses in modules or stacks); the rest are zeroed.
+
+The module's PE layout is read whatever the target's bitness.
+
+Wine's dbghelp minidump tests: no failures, as before (more of them run).
+
+Gate: test/minidumpx-gate.sh (64- and 32-bit). Mutants
+SG_MUTANT_NO_CV_RECORD, SG_MUTANT_NO_DATA_SEGS, SG_MUTANT_NO_HANDLE_DATA
+(dbghelp/minidump.c).
+---
+--- a/dlls/dbghelp/minidump.c
++++ b/dlls/dbghelp/minidump.c
+@@ -420,6 +420,142 @@ static  unsigned        dump_exception_info(struct dump_context* dc)
+     return sizeof(mdExcpt);
+ }
+ 
++/* Stained Glass OS: a module's PE layout, read from the process, whatever
++ * its bitness: its debug directory and its sections */
++struct pe_layout
++{
++    IMAGE_DATA_DIRECTORY debug_dir;
++    ULONG64              sections;  /* address of the section table */
++    unsigned             num_sections;
++};
++
++static BOOL read_pe_layout(struct dump_context* dc, ULONG64 base, struct pe_layout* pe)
++{
++    IMAGE_DOS_HEADER    dos;
++    IMAGE_FILE_HEADER   fh;
++    ULONG64             nt;
++    WORD                magic;
++    ULONG64             dirs;
++    DWORD               num_dirs;
++
++    memset(pe, 0, sizeof(*pe));
++    if (!read_process_memory(dc->process, base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE)
++        return FALSE;
++    nt = base + dos.e_lfanew;
++    if (!read_process_memory(dc->process, nt + sizeof(DWORD), &fh, sizeof(fh)) ||
++        !read_process_memory(dc->process, nt + sizeof(DWORD) + sizeof(fh), &magic, sizeof(magic)))
++        return FALSE;
++    if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
++    {
++        dirs = nt + sizeof(DWORD) + sizeof(fh) + FIELD_OFFSET(IMAGE_OPTIONAL_HEADER64, DataDirectory);
++        if (!read_process_memory(dc->process, nt + sizeof(DWORD) + sizeof(fh) +
++                                 FIELD_OFFSET(IMAGE_OPTIONAL_HEADER64, NumberOfRvaAndSizes), &num_dirs, sizeof(num_dirs)))
++            return FALSE;
++    }
++    else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
++    {
++        dirs = nt + sizeof(DWORD) + sizeof(fh) + FIELD_OFFSET(IMAGE_OPTIONAL_HEADER32, DataDirectory);
++        if (!read_process_memory(dc->process, nt + sizeof(DWORD) + sizeof(fh) +
++                                 FIELD_OFFSET(IMAGE_OPTIONAL_HEADER32, NumberOfRvaAndSizes), &num_dirs, sizeof(num_dirs)))
++            return FALSE;
++    }
++    else return FALSE;
++    if (num_dirs > IMAGE_DIRECTORY_ENTRY_DEBUG)
++        read_process_memory(dc->process, dirs + IMAGE_DIRECTORY_ENTRY_DEBUG * sizeof(IMAGE_DATA_DIRECTORY),
++                            &pe->debug_dir, sizeof(pe->debug_dir));
++    pe->sections = nt + sizeof(DWORD) + sizeof(fh) + fh.SizeOfOptionalHeader;
++    pe->num_sections = fh.NumberOfSections;
++    return TRUE;
++}
++
++/* the module's CodeView record (the PDB it was linked with), appended to
++ * the dump */
++static void dump_module_cv_record(struct dump_context* dc, ULONG64 base, MINIDUMP_LOCATION_DESCRIPTOR* loc)
++{
++    IMAGE_DEBUG_DIRECTORY   dbg;
++    struct pe_layout        pe;
++    unsigned                i;
++    char*                   data;
++
++    loc->DataSize = loc->Rva = 0;
++#ifndef SG_MUTANT_NO_CV_RECORD
++    if (!read_pe_layout(dc, base, &pe) || !pe.debug_dir.VirtualAddress) return;
++    for (i = 0; i < pe.debug_dir.Size / sizeof(dbg) && i < 32; i++)
++    {
++        if (!read_process_memory(dc->process, base + pe.debug_dir.VirtualAddress + i * sizeof(dbg), &dbg, sizeof(dbg)))
++            return;
++        if (dbg.Type != IMAGE_DEBUG_TYPE_CODEVIEW || !dbg.AddressOfRawData || !dbg.SizeOfData ||
++            dbg.SizeOfData > 0x10000)
++            continue;
++        if (!(data = HeapAlloc(GetProcessHeap(), 0, dbg.SizeOfData))) return;
++        if (read_process_memory(dc->process, base + dbg.AddressOfRawData, data, dbg.SizeOfData))
++        {
++            loc->Rva = dc->rva;
++            loc->DataSize = dbg.SizeOfData;
++            append(dc, data, dbg.SizeOfData);
++        }
++        HeapFree(GetProcessHeap(), 0, data);
++        return;
++    }
++#endif
++}
++
++/* the module's writable data sections, to the memory list */
++static void add_module_data_segments(struct dump_context* dc, ULONG64 base)
++{
++    IMAGE_SECTION_HEADER    sec;
++    struct pe_layout        pe;
++    unsigned                i;
++
++    if (!read_pe_layout(dc, base, &pe)) return;
++    for (i = 0; i < pe.num_sections && i < 96; i++)
++    {
++        if (!read_process_memory(dc->process, pe.sections + i * sizeof(sec), &sec, sizeof(sec))) return;
++        if (!(sec.Characteristics & IMAGE_SCN_MEM_WRITE) || (sec.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
++        if (!sec.Misc.VirtualSize) continue;
++        minidump_add_memory_block(dc, base + sec.VirtualAddress, sec.Misc.VirtualSize, 0);
++    }
++}
++
++/* whether a value in the threads' stacks points into the module */
++static BOOL module_referenced_by_stacks(struct dump_context* dc, ULONG64 base, ULONG size)
++{
++    unsigned    i, j, word = dbghelp_current_cpu->word_size;
++    ULONG64     value;
++    char        buf[4096];
++    ULONG       pos, len;
++
++    for (i = 0; i < dc->num_mem; i++)
++    {
++        if (!dc->mem[i].rva) continue;  /* stacks are the blocks the thread list points to */
++        for (pos = 0; pos < dc->mem[i].size; pos += len)
++        {
++            len = min(dc->mem[i].size - pos, sizeof(buf));
++            if (!read_process_memory(dc->process, dc->mem[i].base + pos, buf, len)) break;
++            for (j = 0; j + word <= len; j += word)
++            {
++                value = 0;
++                memcpy(&value, buf + j, word);
++                if (value >= base && value < base + size) return TRUE;
++            }
++        }
++    }
++    return FALSE;
++}
++
++/* whether a stack value is one a stack trace needs: an address in a module
++ * or in a thread's stack */
++static BOOL stack_value_needed(struct dump_context* dc, ULONG64 value)
++{
++    unsigned i;
++
++    for (i = 0; i < dc->num_modules; i++)
++        if (value >= dc->modules[i].base && value < dc->modules[i].base + dc->modules[i].size) return TRUE;
++    for (i = 0; i < dc->num_mem; i++)
++        if (dc->mem[i].rva && value >= dc->mem[i].base && value < dc->mem[i].base + dc->mem[i].size) return TRUE;
++    return FALSE;
++}
++
+ /******************************************************************
+  *		dump_modules
+  *
+@@ -469,6 +605,9 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
+             flags_out |= ModuleWriteTlsData;
+         if (dc->type & MiniDumpWithCodeSegs)
+             flags_out |= ModuleWriteCodeSegs;
++        if ((dc->type & MiniDumpScanMemory) && !dc->modules[i].is_elf &&
++            module_referenced_by_stacks(dc, dc->modules[i].base, dc->modules[i].size))
++            flags_out |= ModuleReferencedByMemory;
+         ms->Length = (lstrlenW(dc->modules[i].name) + 1) * sizeof(WCHAR);
+         if (sizeof(ULONG) + ms->Length > sizeof(tmp))
+             FIXME("Buffer overflow!!!\n");
+@@ -513,10 +652,17 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
+             append(dc, ms, sizeof(ULONG) + ms->Length + sizeof(WCHAR));
+             if (!dump_elf) fetch_module_versioninfo(ms->Buffer, &mdModule.VersionInfo);
+             else memset(&mdModule.VersionInfo, 0, sizeof(mdModule.VersionInfo));
+-            mdModule.CvRecord.DataSize = 0; /* FIXME */
+-            mdModule.CvRecord.Rva = 0; /* FIXME */
+-            mdModule.MiscRecord.DataSize = 0; /* FIXME */
+-            mdModule.MiscRecord.Rva = 0; /* FIXME */
++            if (!dump_elf && (flags_out & ModuleWriteCvRecord))
++                dump_module_cv_record(dc, dc->modules[i].base, &mdModule.CvRecord);
++            else
++                mdModule.CvRecord.DataSize = mdModule.CvRecord.Rva = 0;
++            /* the old MISC debug records are no longer linked into modules */
++            mdModule.MiscRecord.DataSize = 0;
++            mdModule.MiscRecord.Rva = 0;
++#ifndef SG_MUTANT_NO_DATA_SEGS
++            if (!dump_elf && (flags_out & ModuleWriteDataSeg) && !(dc->type & MiniDumpWithFullMemory))
++                add_module_data_segments(dc, dc->modules[i].base);
++#endif
+             mdModule.Reserved0 = 0; /* FIXME */
+             mdModule.Reserved1 = 0; /* FIXME */
+             writeat(dc,
+@@ -857,7 +1003,22 @@ static unsigned         dump_memory_info(struct dump_context* dc)
+         {
+             len = min(dc->mem[i].size - pos, sizeof(tmp));
+             if (read_process_memory(dc->process, dc->mem[i].base + pos, tmp, len))
++            {
++                /* filtered stacks keep only what a stack trace needs */
++                if ((dc->type & MiniDumpFilterMemory) && dc->mem[i].rva)
++                {
++                    unsigned j, word = dbghelp_current_cpu->word_size;
++                    ULONG64 value;
++
++                    for (j = 0; j + word <= len; j += word)
++                    {
++                        value = 0;
++                        memcpy(&value, tmp + j, word);
++                        if (!stack_value_needed(dc, value)) memset(tmp + j, 0, word);
++                    }
++                }
+                 WriteFile(dc->hFile, tmp, len, &written, NULL);
++            }
+         }
+         dc->rva += mdMem.Memory.DataSize;
+         writeat(dc, rva_base + i * sizeof(mdMem), &mdMem, sizeof(mdMem));
+@@ -870,6 +1031,106 @@ static unsigned         dump_memory_info(struct dump_context* dc)
+     return sz;
+ }
+ 
++/******************************************************************
++ *		dump_handle_data
++ *
++ * Stained Glass OS: the process's handles (MiniDumpWithHandleData): their
++ * values, types, names, attributes, access and counts.
++ */
++static unsigned dump_handle_data(struct dump_context* dc)
++{
++    SYSTEM_HANDLE_INFORMATION_EX*   info = NULL;
++    MINIDUMP_HANDLE_DATA_STREAM     hdr;
++    MINIDUMP_HANDLE_DESCRIPTOR      desc;
++    ULONG                           size = 0x10000, i, count = 0;
++    RVA                             rva_base;
++    NTSTATUS                        status;
++    char                            buf[1024];
++
++    for (;;)
++    {
++        if (!(info = HeapAlloc(GetProcessHeap(), 0, size))) return 0;
++        status = NtQuerySystemInformation(SystemExtendedHandleInformation, info, size, &size);
++        if (status != STATUS_INFO_LENGTH_MISMATCH) break;
++        HeapFree(GetProcessHeap(), 0, info);
++        size += 0x10000;
++    }
++    if (status)
++    {
++        HeapFree(GetProcessHeap(), 0, info);
++        info = NULL;
++    }
++    if (info)
++        for (i = 0; i < info->NumberOfHandles; i++)
++            if (info->Handles[i].UniqueProcessId == dc->pid) count++;
++
++    hdr.SizeOfHeader = sizeof(hdr);
++    hdr.SizeOfDescriptor = sizeof(desc);
++    hdr.NumberOfDescriptors = 0;
++    hdr.Reserved = 0;
++    rva_base = dc->rva;
++    dc->rva += sizeof(hdr) + count * sizeof(desc);
++
++    for (i = 0; info && i < info->NumberOfHandles && hdr.NumberOfDescriptors < count; i++)
++    {
++        SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX *h = info->Handles + i;
++        OBJECT_TYPE_INFORMATION *type = (OBJECT_TYPE_INFORMATION *)buf;
++        OBJECT_NAME_INFORMATION *name = (OBJECT_NAME_INFORMATION *)buf;
++        OBJECT_BASIC_INFORMATION basic;
++        MINIDUMP_STRING *ms;
++        HANDLE dup = NULL;
++        ULONG len;
++
++        if (h->UniqueProcessId != dc->pid) continue;
++        memset(&desc, 0, sizeof(desc));
++        desc.Handle = h->HandleValue;
++        desc.Attributes = h->HandleAttributes;
++        desc.GrantedAccess = h->GrantedAccess;
++        if (DuplicateHandle(dc->process->handle, (HANDLE)h->HandleValue, GetCurrentProcess(), &dup, 0, FALSE,
++                            DUPLICATE_SAME_ACCESS))
++        {
++            if (!NtQueryObject(dup, ObjectBasicInformation, &basic, sizeof(basic), NULL))
++            {
++                desc.HandleCount = basic.HandleCount ? basic.HandleCount - 1 : 0;  /* not counting ours */
++                desc.PointerCount = basic.PointerCount;
++            }
++            if (!NtQueryObject(dup, ObjectTypeInformation, buf, sizeof(buf) - sizeof(WCHAR), &len) &&
++                type->TypeName.Length)
++            {
++                ms = HeapAlloc(GetProcessHeap(), 0, sizeof(ULONG) + type->TypeName.Length + sizeof(WCHAR));
++                if (ms)
++                {
++                    ms->Length = type->TypeName.Length;
++                    memcpy(ms->Buffer, type->TypeName.Buffer, type->TypeName.Length);
++                    ms->Buffer[type->TypeName.Length / sizeof(WCHAR)] = 0;
++                    desc.TypeNameRva = dc->rva;
++                    append(dc, ms, sizeof(ULONG) + ms->Length + sizeof(WCHAR));
++                    HeapFree(GetProcessHeap(), 0, ms);
++                }
++            }
++            if (!NtQueryObject(dup, ObjectNameInformation, buf, sizeof(buf) - sizeof(WCHAR), &len) &&
++                name->Name.Length)
++            {
++                ms = HeapAlloc(GetProcessHeap(), 0, sizeof(ULONG) + name->Name.Length + sizeof(WCHAR));
++                if (ms)
++                {
++                    ms->Length = name->Name.Length;
++                    memcpy(ms->Buffer, name->Name.Buffer, name->Name.Length);
++                    ms->Buffer[name->Name.Length / sizeof(WCHAR)] = 0;
++                    desc.ObjectNameRva = dc->rva;
++                    append(dc, ms, sizeof(ULONG) + ms->Length + sizeof(WCHAR));
++                    HeapFree(GetProcessHeap(), 0, ms);
++                }
++            }
++            CloseHandle(dup);
++        }
++        writeat(dc, rva_base + sizeof(hdr) + hdr.NumberOfDescriptors++ * sizeof(desc), &desc, sizeof(desc));
++    }
++    writeat(dc, rva_base, &hdr, sizeof(hdr));
++    HeapFree(GetProcessHeap(), 0, info);
++    return sizeof(hdr) + hdr.NumberOfDescriptors * sizeof(desc);
++}
++
+ /******************************************************************
+  *		dump_memory64_info
+  *
+@@ -950,7 +1211,7 @@ static DWORD CALLBACK write_minidump(void *_args)
+     fetch_modules_info(dc);
+ 
+     /* 1) init */
+-    nStreams = 7 + (dc->except_param ? 1 : 0) +
++    nStreams = 7 + (dc->except_param ? 1 : 0) + ((dc->type & MiniDumpWithHandleData) ? 1 : 0) +
+         (dc->user_stream ? dc->user_stream->UserStreamCount : 0);
+ 
+     /* pad the directory size to a multiple of 4 for alignment purposes */
+@@ -1004,6 +1265,17 @@ static DWORD CALLBACK write_minidump(void *_args)
+             &mdDir, sizeof(mdDir));
+ 
+ 
++#ifndef SG_MUTANT_NO_HANDLE_DATA
++    if (dc->type & MiniDumpWithHandleData)
++    {
++        mdDir.StreamType = HandleDataStream;
++        mdDir.Location.Rva = dc->rva;
++        mdDir.Location.DataSize = dump_handle_data(dc);
++        writeat(dc, mdHead.StreamDirectoryRva + idx_stream++ * sizeof(mdDir),
++                &mdDir, sizeof(mdDir));
++    }
++#endif
++
+     if (!(dc->type & MiniDumpWithFullMemory))
+     {
+         mdDir.StreamType = MemoryListStream;
+@@ -1091,14 +1363,6 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
+         dc.process = process_find_by_handle(hProcess);
+     }
+ 
+-    if (DumpType & MiniDumpWithDataSegs)
+-        FIXME("NIY MiniDumpWithDataSegs\n");
+-    if (DumpType & MiniDumpWithHandleData)
+-        FIXME("NIY MiniDumpWithHandleData\n");
+-    if (DumpType & MiniDumpFilterMemory)
+-        FIXME("NIY MiniDumpFilterMemory\n");
+-    if (DumpType & MiniDumpScanMemory)
+-        FIXME("NIY MiniDumpScanMemory\n");
+ 
+     dc.hFile = hFile;
+     dc.pid = pid;
