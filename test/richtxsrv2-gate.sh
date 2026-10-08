@@ -15,6 +15,9 @@
 #  - TxDrawD2D draws the text into a Direct2D (WIC bitmap) target, inside the
 #    bounds only, and leaves a transparent background transparent.
 #
+#  - a host answering S_OK with no default formats, as Excel's cells do (1513;
+#    mutant SG_MUTANT_RICHED_HOST_FORMAT_UNCHECKED)
+#
 #   WINE=/opt/wine-sg/bin/wine test/richtxsrv2-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
 set -u
@@ -64,6 +67,7 @@ check qi_services2            "the text services answer ITextServices2"
 check qi_document2            "and ITextDocument2"
 check doc2_notification_mode  "ITextDocument2 keeps its notification mode"
 check doc2_typography         "and its typography options"
+check null_formats            "a host that gives no default formats (S_OK, NULL) is taken: no crash (1513)"
 check settext                 "TxSetText"
 check natural_size2           "TxGetNaturalSize2 gives the text's size"
 check ascent                  "and the first line's ascent"

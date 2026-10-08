@@ -75,9 +75,13 @@ static HRESULT WINAPI host_TxActivate(H, LONG *old) { return S_OK; }
 static HRESULT WINAPI host_TxDeactivate(H, LONG new) { return S_OK; }
 static HRESULT WINAPI host_TxGetClientRect(H, RECT *rect) { *rect = h->client; return S_OK; }
 static HRESULT WINAPI host_TxGetViewInset(H, RECT *rect) { SetRectEmpty(rect); return S_OK; }
+/* a host that answers S_OK and gives no default formats, as Excel's cells do
+ * (wine-sg 1513: Wine read the NULL and crashed as the editor was made) */
+static int null_formats;
 static HRESULT WINAPI host_TxGetCharFormat(H, const CHARFORMATW **fmt)
 {
     static CHARFORMAT2W cf;
+    if (null_formats) { *fmt = NULL; return S_OK; }
     memset(&cf, 0, sizeof(cf));
     cf.cbSize = sizeof(cf);
     cf.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR | CFM_BOLD | CFM_CHARSET;
@@ -92,6 +96,7 @@ static HRESULT WINAPI host_TxGetCharFormat(H, const CHARFORMATW **fmt)
 static HRESULT WINAPI host_TxGetParaFormat(H, const PARAFORMAT **fmt)
 {
     static PARAFORMAT2 pf;
+    if (null_formats) { *fmt = NULL; return S_OK; }
     memset(&pf, 0, sizeof(pf));
     pf.cbSize = sizeof(pf);
     pf.dwMask = PFM_ALIGNMENT;
@@ -267,6 +272,14 @@ int main(void)
             report("bounds_kept", !outside_drawn, "%u pixels drawn outside", outside_drawn);
             ID2D1RenderTarget_Release(rt);
         }
+    }
+    {
+        struct host host2 = { host_vtbl, 1, { 0, 0, 180, 30 } };
+        IUnknown *unk2 = NULL;
+        null_formats = 1;
+        hr = create(NULL, &host2, &unk2);
+        report("null_formats", SUCCEEDED(hr) && unk2, "%#lx", hr);
+        if (unk2) IUnknown_Release(unk2);
     }
     printf("done=1\n");
     return 0;
