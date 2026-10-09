@@ -10,7 +10,8 @@
 #
 #   WINE=/opt/wine-sg/bin/wine test/powerreq-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
-# Mutants: SG_MUTANT_NO_SCREENSAVER_INHIBIT (ntdll/unix/system.c).
+# Mutants: SG_MUTANT_NO_SCREENSAVER_INHIBIT, SG_MUTANT_CLOSE_KEEPS_REQUEST
+# (ntdll/unix/system.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"

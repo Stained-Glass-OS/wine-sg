@@ -95,6 +95,13 @@ int main(int argc, char **argv)
           "PowerCreateRequest(NULL): ERROR_INVALID_PARAMETER");
     CloseHandle(req);
 
+    /* closing a request's handle ends it, as on Windows */
+    req = PowerCreateRequest(&ctx);
+    PowerSetRequest(req, PowerRequestDisplayRequired);
+    check(value("held") == 1, "a request set again holds it");
+    CloseHandle(req);
+    check(value("held") == 0, "CloseHandle on the request releases it");
+
     /* execution state */
     old = SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
     check(old != 0 && value("held") == 1, "SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED) holds it");
