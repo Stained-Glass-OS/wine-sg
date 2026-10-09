@@ -1,0 +1,727 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dxgi: factory registrations, creation flags, video memory reservation, device residency/priority/EnqueueSetEvent
+
+The factory's occlusion, stereo and adapters-changed registrations were
+E_NOTIMPL stubs; they now validate the event or window, hand out process-wide
+unique cookies, and Unregister* drops them (an unknown cookie of the adapters
+call is DXGI_ERROR_INVALID_CALL). The hardware content protection teardown
+event of the adapter works the same way. GetCreationFlags returns the flags
+given to CreateDXGIFactory2, IsCurrent and IsWindowedStereoEnabled answer
+without a FIXME, and CreateSoftwareAdapter validates its arguments.
+
+SetVideoMemoryReservation stores the reservation per segment group and
+QueryVideoMemoryInfo reports it, capped at what is available.
+
+On the device, Set/GetGPUThreadPriority keep the -7..7 value,
+QueryResourceResidency reports resources as resident, OfferResources and
+ReclaimResources validate and succeed without discarding, Trim is a no-op, and
+EnqueueSetEvent signals the event after the GPU work queued so far has
+finished (an event query behind the immediate context).
+---
+--- a/dlls/dxgi/adapter.c
++++ b/dlls/dxgi/adapter.c
+@@ -78,6 +78,7 @@ static ULONG STDMETHODCALLTYPE dxgi_adapter_Release(IWineDXGIAdapter *iface)
+ 
+     if (!refcount)
+     {
++        dxgi_notify_cleanup(&adapter->notifications);
+         wined3d_private_store_cleanup(&adapter->private_store);
+         IWineDXGIFactory_Release(&adapter->factory->IWineDXGIFactory_iface);
+         free(adapter);
+@@ -286,17 +287,26 @@ static HRESULT STDMETHODCALLTYPE dxgi_adapter_GetDesc2(IWineDXGIAdapter *iface,
+ static HRESULT STDMETHODCALLTYPE dxgi_adapter_RegisterHardwareContentProtectionTeardownStatusEvent(
+         IWineDXGIAdapter *iface, HANDLE event, DWORD *cookie)
+ {
+-    FIXME("iface %p, event %p, cookie %p stub!\n", iface, event, cookie);
++    struct dxgi_adapter *adapter = impl_from_IWineDXGIAdapter(iface);
++
++    TRACE("iface %p, event %p, cookie %p.\n", iface, event, cookie);
+ 
+-    return E_NOTIMPL;
++    return dxgi_notify_register(&adapter->notifications, DXGI_NOTIFY_HWPROTECTION, event, NULL, 0, cookie);
+ }
+ 
+ static void STDMETHODCALLTYPE dxgi_adapter_UnregisterHardwareContentProtectionTeardownStatus(
+         IWineDXGIAdapter *iface, DWORD cookie)
+ {
+-    FIXME("iface %p, cookie %#lx stub!\n", iface, cookie);
++    struct dxgi_adapter *adapter = impl_from_IWineDXGIAdapter(iface);
++
++    TRACE("iface %p, cookie %#lx.\n", iface, cookie);
++
++    dxgi_notify_unregister(&adapter->notifications, DXGI_NOTIFY_HWPROTECTION, cookie);
+ }
+ 
++/* The reservation belongs to the process, not to one adapter object. */
++static UINT64 dxgi_video_memory_reservation[2];
++
+ static HRESULT STDMETHODCALLTYPE dxgi_adapter_QueryVideoMemoryInfo(IWineDXGIAdapter *iface,
+         UINT node_index, DXGI_MEMORY_SEGMENT_GROUP segment_group, DXGI_QUERY_VIDEO_MEMORY_INFO *info)
+ {
+@@ -311,6 +321,10 @@ static HRESULT STDMETHODCALLTYPE dxgi_adapter_QueryVideoMemoryInfo(IWineDXGIAdap
+             (enum wined3d_memory_segment_group)segment_group, &wined3d_info)))
+     {
+         dxgi_video_memory_info_from_wined3d(info, &wined3d_info);
++        /* A reservation is granted up to what is available for reservation. */
++#ifndef SG_MUTANT_DXGI_RESERVATION_IGNORED
++        info->CurrentReservation = min(dxgi_video_memory_reservation[segment_group & 1], info->AvailableForReservation);
++#endif
+ 
+         TRACE("Budget 0x%s, usage 0x%s, available for reservation 0x%s, reservation 0x%s.\n",
+                 wine_dbgstr_longlong(info->Budget), wine_dbgstr_longlong(info->CurrentUsage),
+@@ -324,9 +338,13 @@ static HRESULT STDMETHODCALLTYPE dxgi_adapter_QueryVideoMemoryInfo(IWineDXGIAdap
+ static HRESULT STDMETHODCALLTYPE dxgi_adapter_SetVideoMemoryReservation(IWineDXGIAdapter *iface,
+         UINT node_index, DXGI_MEMORY_SEGMENT_GROUP segment_group, UINT64 reservation)
+ {
+-    FIXME("iface %p, node_index %u, segment_group %#x, reservation 0x%s stub!\n",
++    TRACE("iface %p, node_index %u, segment_group %#x, reservation 0x%s.\n",
+             iface, node_index, segment_group, wine_dbgstr_longlong(reservation));
+ 
++    if (node_index || segment_group > DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)
++        return DXGI_ERROR_INVALID_CALL;
++
++    dxgi_video_memory_reservation[segment_group] = reservation;
+     return S_OK;
+ }
+ 
+@@ -442,6 +460,7 @@ static void dxgi_adapter_init(struct dxgi_adapter *adapter, struct dxgi_factory
+     wined3d_private_store_init(&adapter->private_store);
+     adapter->ordinal = ordinal;
+     adapter->factory = factory;
++    list_init(&adapter->notifications);
+     IWineDXGIFactory_AddRef(&adapter->factory->IWineDXGIFactory_iface);
+ }
+ 
+--- a/dlls/dxgi/device.c
++++ b/dlls/dxgi/device.c
+@@ -250,27 +250,95 @@ fail:
+     return hr;
+ }
+ 
++struct dxgi_set_event_work
++{
++    IWineDXGIDevice *device;
++    struct wined3d_query *query;
++    HANDLE event;
++};
++
++static void dxgi_set_event_work_free(struct dxgi_set_event_work *work)
++{
++    wined3d_mutex_lock();
++    wined3d_query_decref(work->query);
++    wined3d_mutex_unlock();
++    CloseHandle(work->event);
++    IWineDXGIDevice_Release(work->device);
++    free(work);
++}
++
++static DWORD WINAPI dxgi_set_event_thread(void *param)
++{
++    struct dxgi_set_event_work *work = param;
++    HRESULT hr;
++
++    for (;;)
++    {
++        wined3d_mutex_lock();
++        hr = wined3d_query_get_data(work->query, NULL, 0, WINED3DGETDATA_FLUSH);
++        wined3d_mutex_unlock();
++        if (hr != S_FALSE)
++            break;
++        Sleep(1);
++    }
++
++#ifndef SG_MUTANT_DXGI_ENQUEUE_NEVER
++    SetEvent(work->event);
++#endif
++    dxgi_set_event_work_free(work);
++    return 0;
++}
++
+ static HRESULT STDMETHODCALLTYPE dxgi_device_QueryResourceResidency(IWineDXGIDevice *iface,
+         IUnknown *const *resources, DXGI_RESIDENCY *residency, UINT resource_count)
+ {
+-    FIXME("iface %p, resources %p, residency %p, resource_count %u stub!\n",
++    UINT i;
++
++    TRACE("iface %p, resources %p, residency %p, resource_count %u.\n",
+             iface, resources, residency, resource_count);
+ 
+-    return E_NOTIMPL;
++    if (!resources || !residency || !resource_count)
++        return DXGI_ERROR_INVALID_CALL;
++
++    for (i = 0; i < resource_count; ++i)
++    {
++        if (!resources[i])
++            return DXGI_ERROR_INVALID_CALL;
++    }
++
++    /* Resources live in system memory backed by the driver: always resident. */
++    for (i = 0; i < resource_count; ++i)
++        residency[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
++
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_device_SetGPUThreadPriority(IWineDXGIDevice *iface, INT priority)
+ {
+-    FIXME("iface %p, priority %d stub!\n", iface, priority);
++    struct dxgi_device *device = impl_from_IWineDXGIDevice(iface);
++
++    TRACE("iface %p, priority %d.\n", iface, priority);
+ 
+-    return E_NOTIMPL;
++    if (priority < -7 || priority > 7)
++        return DXGI_ERROR_INVALID_CALL;
++
++#ifndef SG_MUTANT_DXGI_PRIORITY_NOT_STORED
++    device->gpu_thread_priority = priority;
++#endif
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_device_GetGPUThreadPriority(IWineDXGIDevice *iface, INT *priority)
+ {
+-    FIXME("iface %p, priority %p stub!\n", iface, priority);
++    struct dxgi_device *device = impl_from_IWineDXGIDevice(iface);
++
++    TRACE("iface %p, priority %p.\n", iface, priority);
+ 
+-    return E_NOTIMPL;
++    if (!priority)
++        return DXGI_ERROR_INVALID_CALL;
++
++    *priority = device->gpu_thread_priority;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_device_SetMaximumFrameLatency(IWineDXGIDevice *iface, UINT max_latency)
+@@ -308,31 +376,116 @@ static HRESULT STDMETHODCALLTYPE dxgi_device_GetMaximumFrameLatency(IWineDXGIDev
+ static HRESULT STDMETHODCALLTYPE dxgi_device_OfferResources(IWineDXGIDevice *iface, UINT resource_count,
+         IDXGIResource * const *resources, DXGI_OFFER_RESOURCE_PRIORITY priority)
+ {
+-    FIXME("iface %p, resource_count %u, resources %p, priority %u stub!\n", iface, resource_count,
++    UINT i;
++
++    TRACE("iface %p, resource_count %u, resources %p, priority %u.\n", iface, resource_count,
+         resources, priority);
+ 
+-    return E_NOTIMPL;
++    if (!resource_count || !resources
++            || priority < DXGI_OFFER_RESOURCE_PRIORITY_LOW || priority > DXGI_OFFER_RESOURCE_PRIORITY_HIGH)
++        return DXGI_ERROR_INVALID_CALL;
++
++    for (i = 0; i < resource_count; ++i)
++    {
++        if (!resources[i])
++            return DXGI_ERROR_INVALID_CALL;
++    }
++
++    /* The contents are never discarded, so there is nothing to give back. */
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_device_ReclaimResources(IWineDXGIDevice *iface, UINT resource_count,
+         IDXGIResource * const *resources, BOOL *discarded)
+ {
+-    FIXME("iface %p, resource_count %u, resources %p, discarded %p stub!\n", iface, resource_count,
++    UINT i;
++
++    TRACE("iface %p, resource_count %u, resources %p, discarded %p.\n", iface, resource_count,
+         resources, discarded);
+ 
+-    return E_NOTIMPL;
++    if (!resource_count || !resources)
++        return DXGI_ERROR_INVALID_CALL;
++
++    for (i = 0; i < resource_count; ++i)
++    {
++        if (!resources[i])
++            return DXGI_ERROR_INVALID_CALL;
++    }
++
++    if (discarded)
++    {
++        for (i = 0; i < resource_count; ++i)
++            discarded[i] = FALSE;
++    }
++
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_device_EnqueueSetEvent(IWineDXGIDevice *iface, HANDLE event)
+ {
+-    FIXME("iface %p, event %p stub!\n", iface, event);
++    struct dxgi_device *device = impl_from_IWineDXGIDevice(iface);
++    struct dxgi_set_event_work *work;
++    DWORD flags;
++    HANDLE thread;
++    HRESULT hr;
++
++    TRACE("iface %p, event %p.\n", iface, event);
++
++    if (!event || !GetHandleInformation(event, &flags))
++        return DXGI_ERROR_INVALID_CALL;
++
++    if (!(work = calloc(1, sizeof(*work))))
++        return E_OUTOFMEMORY;
++
++    /* The event is signalled once the GPU has finished everything submitted so
++     * far: an event query issued behind the queued work completes at that point. */
++    wined3d_mutex_lock();
++    hr = wined3d_query_create(device->wined3d_device, WINED3D_QUERY_TYPE_EVENT, NULL,
++            &dxgi_null_wined3d_parent_ops, &work->query);
++    if (SUCCEEDED(hr))
++    {
++        struct wined3d_device_context *context = wined3d_device_get_immediate_context(device->wined3d_device);
++
++        wined3d_device_context_issue_query(context, work->query, WINED3DISSUE_END);
++        wined3d_device_context_flush(context);
++    }
++    wined3d_mutex_unlock();
++    if (FAILED(hr))
++    {
++        free(work);
++        return hr;
++    }
++
++    if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &work->event, 0, FALSE,
++            DUPLICATE_SAME_ACCESS))
++    {
++        hr = HRESULT_FROM_WIN32(GetLastError());
++        wined3d_mutex_lock();
++        wined3d_query_decref(work->query);
++        wined3d_mutex_unlock();
++        free(work);
++        return hr;
++    }
+ 
+-    return E_NOTIMPL;
++    work->device = &device->IWineDXGIDevice_iface;
++    IWineDXGIDevice_AddRef(work->device);
++
++    if (!(thread = CreateThread(NULL, 0, dxgi_set_event_thread, work, 0, NULL)))
++    {
++        hr = HRESULT_FROM_WIN32(GetLastError());
++        dxgi_set_event_work_free(work);
++        return hr;
++    }
++    CloseHandle(thread);
++
++    return S_OK;
+ }
+ 
+ static void STDMETHODCALLTYPE dxgi_device_Trim(IWineDXGIDevice *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    TRACE("iface %p.\n", iface);
++
++    /* Nothing is cached on behalf of the application. */
+ }
+ 
+ /* IWineDXGIDevice methods */
+@@ -679,6 +832,7 @@ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *l
+     device->IDXGIDevice4_iface.lpVtbl = &dxgi_device4_vtbl;
+     device->IWineDXGISwapChainFactory_iface.lpVtbl = &dxgi_swapchain_factory_vtbl;
+     device->refcount = 1;
++    device->gpu_thread_priority = 0;
+     wined3d_mutex_lock();
+     wined3d_private_store_init(&device->private_store);
+ 
+--- a/dlls/dxgi/dxgi_main.c
++++ b/dlls/dxgi/dxgi_main.c
+@@ -30,6 +30,99 @@ struct dxgi_main
+ };
+ static struct dxgi_main dxgi_main;
+ 
++/* Registrations made through the Register...Event / Register...Window methods.
++ * Nothing in this implementation can raise these conditions (windows are never
++ * occluded, stereo is never enabled, the adapter set does not change while a
++ * process runs, there is no hardware content protection), so the registrations
++ * are only recorded: the handles are kept as given and never signalled. */
++struct dxgi_notify
++{
++    struct list entry;
++    DWORD cookie;
++    unsigned int kind;
++    HANDLE event;
++    HWND window;
++    UINT message;
++};
++
++static CRITICAL_SECTION dxgi_notify_cs;
++static CRITICAL_SECTION_DEBUG dxgi_notify_cs_debug =
++{
++    0, 0, &dxgi_notify_cs,
++    { &dxgi_notify_cs_debug.ProcessLocksList, &dxgi_notify_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": dxgi_notify_cs") }
++};
++static CRITICAL_SECTION dxgi_notify_cs = { &dxgi_notify_cs_debug, -1, 0, 0, 0, 0 };
++static LONG dxgi_notify_cookie;
++
++HRESULT dxgi_notify_register(struct list *list, unsigned int kind, HANDLE event, HWND window,
++        UINT message, DWORD *cookie)
++{
++    struct dxgi_notify *notify;
++    DWORD flags;
++
++    if (!cookie)
++        return DXGI_ERROR_INVALID_CALL;
++#ifndef SG_MUTANT_DXGI_NOTIFY_NO_VALIDATE
++    if (window ? !IsWindow(window) : (!event || !GetHandleInformation(event, &flags)))
++        return DXGI_ERROR_INVALID_CALL;
++#endif
++
++    if (!(notify = calloc(1, sizeof(*notify))))
++        return E_OUTOFMEMORY;
++
++    notify->cookie = InterlockedIncrement(&dxgi_notify_cookie);
++    notify->kind = kind;
++    notify->event = event;
++    notify->window = window;
++    notify->message = message;
++
++    EnterCriticalSection(&dxgi_notify_cs);
++    list_add_tail(list, &notify->entry);
++    LeaveCriticalSection(&dxgi_notify_cs);
++
++    *cookie = notify->cookie;
++    return S_OK;
++}
++
++BOOL dxgi_notify_unregister(struct list *list, unsigned int kind, DWORD cookie)
++{
++    struct dxgi_notify *notify;
++    BOOL found = FALSE;
++
++    EnterCriticalSection(&dxgi_notify_cs);
++    LIST_FOR_EACH_ENTRY(notify, list, struct dxgi_notify, entry)
++    {
++#ifdef SG_MUTANT_DXGI_NOTIFY_ANY_KIND
++        if (notify->cookie != cookie)
++            continue;
++#else
++        if (notify->cookie != cookie || notify->kind != kind)
++            continue;
++#endif
++        list_remove(&notify->entry);
++        free(notify);
++        found = TRUE;
++        break;
++    }
++    LeaveCriticalSection(&dxgi_notify_cs);
++
++    return found;
++}
++
++void dxgi_notify_cleanup(struct list *list)
++{
++    struct dxgi_notify *notify, *next;
++
++    EnterCriticalSection(&dxgi_notify_cs);
++    LIST_FOR_EACH_ENTRY_SAFE(notify, next, list, struct dxgi_notify, entry)
++    {
++        list_remove(&notify->entry);
++        free(notify);
++    }
++    LeaveCriticalSection(&dxgi_notify_cs);
++}
++
+ static void dxgi_main_cleanup(void)
+ {
+     free(dxgi_main.device_layers);
+@@ -57,24 +150,24 @@ HRESULT WINAPI CreateDXGIFactory2(UINT flags, REFIID iid, void **factory)
+ {
+     TRACE("flags %#x, iid %s, factory %p.\n", flags, debugstr_guid(iid), factory);
+ 
+-    if (flags)
+-        FIXME("Ignoring flags %#x.\n", flags);
++    if (flags & ~DXGI_CREATE_FACTORY_DEBUG)
++        FIXME("Ignoring flags %#x.\n", flags & ~DXGI_CREATE_FACTORY_DEBUG);
+ 
+-    return dxgi_factory_create(iid, factory, TRUE);
++    return dxgi_factory_create(iid, factory, TRUE, flags);
+ }
+ 
+ HRESULT WINAPI CreateDXGIFactory1(REFIID iid, void **factory)
+ {
+     TRACE("iid %s, factory %p.\n", debugstr_guid(iid), factory);
+ 
+-    return dxgi_factory_create(iid, factory, TRUE);
++    return dxgi_factory_create(iid, factory, TRUE, 0);
+ }
+ 
+ HRESULT WINAPI CreateDXGIFactory(REFIID iid, void **factory)
+ {
+     TRACE("iid %s, factory %p.\n", debugstr_guid(iid), factory);
+ 
+-    return dxgi_factory_create(iid, factory, FALSE);
++    return dxgi_factory_create(iid, factory, FALSE, 0);
+ }
+ 
+ static BOOL get_layer(enum dxgi_device_layer_id id, struct dxgi_device_layer *layer)
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -38,6 +38,7 @@
+ #endif
+ #include "wine/wined3d.h"
+ #include "wine/winedxgi.h"
++#include "wine/list.h"
+ 
+ enum dxgi_frame_latency
+ {
+@@ -108,6 +109,20 @@ HRESULT dxgi_set_private_data(struct wined3d_private_store *store,
+ HRESULT dxgi_set_private_data_interface(struct wined3d_private_store *store,
+         REFGUID guid, const IUnknown *object);
+ 
++/* Status notification registrations (occlusion, stereo, adapter changes, ...). */
++enum dxgi_notify_kind
++{
++    DXGI_NOTIFY_OCCLUSION     = 0x01,
++    DXGI_NOTIFY_STEREO        = 0x02,
++    DXGI_NOTIFY_ADAPTERS      = 0x04,
++    DXGI_NOTIFY_HWPROTECTION  = 0x08,
++};
++
++HRESULT dxgi_notify_register(struct list *list, unsigned int kind, HANDLE event, HWND window,
++        UINT message, DWORD *cookie);
++BOOL dxgi_notify_unregister(struct list *list, unsigned int kind, DWORD cookie);
++void dxgi_notify_cleanup(struct list *list);
++
+ /* IDXGIFactory */
+ struct dxgi_factory
+ {
+@@ -117,9 +132,11 @@ struct dxgi_factory
+     struct wined3d *wined3d;
+     BOOL extended;
+     HWND device_window;
++    UINT creation_flags;
++    struct list notifications;
+ };
+ 
+-HRESULT dxgi_factory_create(REFIID riid, void **factory, BOOL extended);
++HRESULT dxgi_factory_create(REFIID riid, void **factory, BOOL extended, UINT flags);
+ HWND dxgi_factory_get_device_window(struct dxgi_factory *factory);
+ struct dxgi_factory *unsafe_impl_from_IDXGIFactory(IDXGIFactory *iface);
+ 
+@@ -135,6 +152,7 @@ struct dxgi_device
+     struct wined3d_device *wined3d_device;
+     struct wined3d_swapchain *implicit_swapchain;
+     IWineDXGIAdapter *adapter;
++    INT gpu_thread_priority;
+ };
+ 
+ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *layer,
+@@ -164,6 +182,7 @@ struct dxgi_adapter
+     struct wined3d_private_store private_store;
+     UINT ordinal;
+     struct dxgi_factory *factory;
++    struct list notifications;
+ };
+ 
+ HRESULT dxgi_adapter_create(struct dxgi_factory *factory, UINT ordinal,
+--- a/dlls/dxgi/factory.c
++++ b/dlls/dxgi/factory.c
+@@ -77,6 +77,7 @@ static ULONG STDMETHODCALLTYPE dxgi_factory_Release(IWineDXGIFactory *iface)
+         if (factory->device_window)
+             DestroyWindow(factory->device_window);
+ 
++        dxgi_notify_cleanup(&factory->notifications);
+         wined3d_decref(factory->wined3d);
+         wined3d_private_store_cleanup(&factory->private_store);
+         free(factory);
+@@ -243,27 +244,33 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChain(IWineDXGIFactory *
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSoftwareAdapter(IWineDXGIFactory *iface,
+         HMODULE swrast, IDXGIAdapter **adapter)
+ {
+-    FIXME("iface %p, swrast %p, adapter %p stub!\n", iface, swrast, adapter);
++    TRACE("iface %p, swrast %p, adapter %p.\n", iface, swrast, adapter);
+ 
+-    return E_NOTIMPL;
++    if (!adapter)
++        return DXGI_ERROR_INVALID_CALL;
++    *adapter = NULL;
++
++    if (!swrast)
++        return DXGI_ERROR_INVALID_CALL;
++
++    /* There is no software rasterizer driver module that could be loaded. */
++    FIXME("Software rasterizer modules are not supported.\n");
++    return DXGI_ERROR_UNSUPPORTED;
+ }
+ 
+ static BOOL STDMETHODCALLTYPE dxgi_factory_IsCurrent(IWineDXGIFactory *iface)
+ {
+-    static BOOL once = FALSE;
+-
+-    if (!once++)
+-        FIXME("iface %p stub!\n", iface);
+-    else
+-        WARN("iface %p stub!\n", iface);
++    TRACE("iface %p.\n", iface);
+ 
++    /* The adapter and output set cannot change while the process runs. */
+     return TRUE;
+ }
+ 
+ static BOOL STDMETHODCALLTYPE dxgi_factory_IsWindowedStereoEnabled(IWineDXGIFactory *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    TRACE("iface %p.\n", iface);
+ 
++    /* Windowed stereo needs a stereo capable display. */
+     return FALSE;
+ }
+ 
+@@ -337,45 +344,63 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_GetSharedResourceAdapterLuid(IWine
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_RegisterOcclusionStatusWindow(IWineDXGIFactory *iface,
+         HWND window, UINT message, DWORD *cookie)
+ {
+-    FIXME("iface %p, window %p, message %#x, cookie %p stub!\n",
+-            iface, window, message, cookie);
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, window %p, message %#x, cookie %p.\n", iface, window, message, cookie);
++
++    if (!window)
++        return DXGI_ERROR_INVALID_CALL;
++    return dxgi_notify_register(&factory->notifications, DXGI_NOTIFY_OCCLUSION, NULL, window, message, cookie);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_RegisterStereoStatusEvent(IWineDXGIFactory *iface,
+         HANDLE event, DWORD *cookie)
+ {
+-    FIXME("iface %p, event %p, cookie %p stub!\n", iface, event, cookie);
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, event %p, cookie %p.\n", iface, event, cookie);
++
++    return dxgi_notify_register(&factory->notifications, DXGI_NOTIFY_STEREO, event, NULL, 0, cookie);
+ }
+ 
+ static void STDMETHODCALLTYPE dxgi_factory_UnregisterStereoStatus(IWineDXGIFactory *iface, DWORD cookie)
+ {
+-    FIXME("iface %p, cookie %#lx stub!\n", iface, cookie);
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
++
++    TRACE("iface %p, cookie %#lx.\n", iface, cookie);
++
++    dxgi_notify_unregister(&factory->notifications, DXGI_NOTIFY_STEREO, cookie);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_RegisterStereoStatusWindow(IWineDXGIFactory *iface,
+         HWND window, UINT message, DWORD *cookie)
+ {
+-    FIXME("iface %p, window %p, message %#x, cookie %p stub!\n",
+-            iface, window, message, cookie);
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, window %p, message %#x, cookie %p.\n", iface, window, message, cookie);
++
++    if (!window)
++        return DXGI_ERROR_INVALID_CALL;
++    return dxgi_notify_register(&factory->notifications, DXGI_NOTIFY_STEREO, NULL, window, message, cookie);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_RegisterOcclusionStatusEvent(IWineDXGIFactory *iface,
+         HANDLE event, DWORD *cookie)
+ {
+-    FIXME("iface %p, event %p, cookie %p stub!\n", iface, event, cookie);
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, event %p, cookie %p.\n", iface, event, cookie);
++
++    return dxgi_notify_register(&factory->notifications, DXGI_NOTIFY_OCCLUSION, event, NULL, 0, cookie);
+ }
+ 
+ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFactory *iface, DWORD cookie)
+ {
+-    FIXME("iface %p, cookie %#lx stub!\n", iface, cookie);
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
++
++    TRACE("iface %p, cookie %#lx.\n", iface, cookie);
++
++    dxgi_notify_unregister(&factory->notifications, DXGI_NOTIFY_OCCLUSION, cookie);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
+@@ -407,9 +432,14 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWin
+ 
+ static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
++
++    TRACE("iface %p.\n", iface);
+ 
++#ifdef SG_MUTANT_DXGI_FLAGS_DROPPED
+     return 0;
++#endif
++    return factory->creation_flags;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapterByLuid(IWineDXGIFactory *iface,
+@@ -518,17 +548,23 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapterByGpuPreference(IWineDX
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_RegisterAdaptersChangedEvent(IWineDXGIFactory *iface,
+         HANDLE event, DWORD *cookie)
+ {
+-    FIXME("iface %p, event %p, cookie %p stub!\n", iface, event, cookie);
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, event %p, cookie %p.\n", iface, event, cookie);
++
++    return dxgi_notify_register(&factory->notifications, DXGI_NOTIFY_ADAPTERS, event, NULL, 0, cookie);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_UnregisterAdaptersChangedEvent(IWineDXGIFactory *iface,
+         DWORD cookie)
+ {
+-    FIXME("iface %p, cookie %#lx stub!\n", iface, cookie);
++    struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, cookie %#lx.\n", iface, cookie);
++
++    if (!dxgi_notify_unregister(&factory->notifications, DXGI_NOTIFY_ADAPTERS, cookie))
++        return DXGI_ERROR_INVALID_CALL;
++    return S_OK;
+ }
+ 
+ static const struct IWineDXGIFactoryVtbl dxgi_factory_vtbl =
+@@ -593,10 +629,12 @@ struct dxgi_factory *unsafe_impl_from_IDXGIFactory(IDXGIFactory *iface)
+     return factory;
+ }
+ 
+-static HRESULT dxgi_factory_init(struct dxgi_factory *factory, BOOL extended)
++static HRESULT dxgi_factory_init(struct dxgi_factory *factory, BOOL extended, UINT flags)
+ {
+     factory->IWineDXGIFactory_iface.lpVtbl = &dxgi_factory_vtbl;
+     factory->refcount = 1;
++    list_init(&factory->notifications);
++    factory->creation_flags = flags;
+     wined3d_private_store_init(&factory->private_store);
+ 
+     wined3d_mutex_lock();
+@@ -613,7 +651,7 @@ static HRESULT dxgi_factory_init(struct dxgi_factory *factory, BOOL extended)
+     return S_OK;
+ }
+ 
+-HRESULT dxgi_factory_create(REFIID riid, void **factory, BOOL extended)
++HRESULT dxgi_factory_create(REFIID riid, void **factory, BOOL extended, UINT flags)
+ {
+     struct dxgi_factory *object;
+     HRESULT hr;
+@@ -621,7 +659,7 @@ HRESULT dxgi_factory_create(REFIID riid, void **factory, BOOL extended)
+     if (!(object = calloc(1, sizeof(*object))))
+         return E_OUTOFMEMORY;
+ 
+-    if (FAILED(hr = dxgi_factory_init(object, extended)))
++    if (FAILED(hr = dxgi_factory_init(object, extended, flags)))
+     {
+         WARN("Failed to initialize factory, hr %#lx.\n", hr);
+         free(object);
