@@ -1,0 +1,459 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] oleacc: IAccPropServices property store
+
+Every IAccPropServices method past QueryInterface returned E_NOTIMPL. Now a
+process-wide store keyed by the identity string: SetPropValue, SetHwndProp,
+SetHmenuProp (and the Str variants) keep a VARIANT; SetPropServer,
+SetHwndPropServer, SetHmenuPropServer keep (and AddRef) the IAccPropServer;
+ClearProps, ClearHwndProps, ClearHmenuProps drop and release them; setting
+the same identity and property again releases the previous registration.
+Compose/Decompose Hwnd/Hmenu identity strings round-trip through a tagged
+struct (an hwnd string is rejected by the hmenu decomposer). Nothing reads
+the store back into IAccessible queries yet (stated in the file comment).
+
+Gate: test/accprop-gate.sh (test/accprop-probe.c).
+Mutant SG_MUTANT_ACCPROP_NO_RELEASE_OLD (oleacc/propservice.c).
+---
+--- a/dlls/oleacc/propservice.c
++++ b/dlls/oleacc/propservice.c
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2014 Jacek Caban for CodeWeavers
++ * Copyright 2026 Stained Glass OS contributors
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -16,16 +17,184 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++/*
++ * IAccPropServices: a process-wide table of MSAA property overrides, keyed
++ * by an opaque "identity string" that names either an hwnd+idObject+idChild
++ * accessible or an hmenu+idChild one. An app (or AT bridge) calls the Set*
++ * methods to annotate a property with either a fixed VARIANT value or an
++ * IAccPropServer callback that is asked for the value each time; Clear*
++ * removes those annotations again. The identity string's byte layout is
++ * never documented by Microsoft and no caller is meant to parse it -- it is
++ * only round-tripped through the Compose.../Decompose... methods, so any
++ * internally consistent format is correct.
++ *
++ * Nothing in Wine yet reads this table back when answering an IAccessible
++ * property query (that plumbing lives in whatever provides the window's
++ * MSAA object -- comctl32, user32's default object, or the app itself), so
++ * for now this is a correctly-behaved store with no consumer. That matches
++ * real Windows closely enough for apps that only *set* annotations defensively
++ * and do not depend on them taking visible effect under Wine.
++ */
++
+ #define COBJMACROS
+ 
+ #include <stdarg.h>
+ 
+ #include "oleacc_private.h"
+-
++#include "wine/list.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(oleacc);
+ 
++/* Kinds of identity string this module hands out. */
++enum accprop_id_kind
++{
++    ACCPROP_ID_HWND = 1,
++    ACCPROP_ID_HMENU = 2,
++};
++
++struct accprop_hwnd_id
++{
++    DWORD kind;
++    HWND hwnd;
++    DWORD idObject;
++    DWORD idChild;
++};
++
++struct accprop_hmenu_id
++{
++    DWORD kind;
++    HMENU hmenu;
++    DWORD idChild;
++};
++
++/* Identity strings are compared with memcmp, so padding must be zeroed. */
++static void hwnd_id_init(struct accprop_hwnd_id *id, HWND hwnd, DWORD idObject, DWORD idChild)
++{
++    memset(id, 0, sizeof(*id));
++    id->kind = ACCPROP_ID_HWND;
++    id->hwnd = hwnd;
++    id->idObject = idObject;
++    id->idChild = idChild;
++}
++
++static void hmenu_id_init(struct accprop_hmenu_id *id, HMENU hmenu, DWORD idChild)
++{
++    memset(id, 0, sizeof(*id));
++    id->kind = ACCPROP_ID_HMENU;
++    id->hmenu = hmenu;
++    id->idChild = idChild;
++}
++
++struct accprop_entry
++{
++    struct list entry;
++    BYTE *id;
++    DWORD id_len;
++    MSAAPROPID prop;
++    VARIANT var;            /* VT_EMPTY when server is set instead */
++    IAccPropServer *server;
++};
++
++static struct list accprop_entries = LIST_INIT(accprop_entries);
++static CRITICAL_SECTION accprop_cs;
++static CRITICAL_SECTION_DEBUG accprop_cs_debug =
++{
++    0, 0, &accprop_cs,
++    { &accprop_cs_debug.ProcessLocksList, &accprop_cs_debug.ProcessLocksList },
++    0, 0, { (DWORD_PTR)(__FILE__ ": accprop_cs") }
++};
++static CRITICAL_SECTION accprop_cs = { &accprop_cs_debug, -1, 0, 0, 0, 0 };
++
++static void accprop_entry_destroy(struct accprop_entry *entry)
++{
++    list_remove(&entry->entry);
++    if (entry->server)
++        IAccPropServer_Release(entry->server);
++    else
++        VariantClear(&entry->var);
++    free(entry->id);
++    free(entry);
++}
++
++static BOOL accprop_id_equal(const BYTE *id1, DWORD len1, const BYTE *id2, DWORD len2)
++{
++    return len1 == len2 && !memcmp(id1, id2, len1);
++}
++
++/* Remove every stored entry for "id" whose property is in props[0..cProps),
++ * or every entry for "id" at all when cProps is 0 (ClearProps's documented
++ * meaning of an empty property list is "clear nothing", but SG_MUTANT below
++ * shows why that distinction matters for this store's cleanup path). */
++static HRESULT accprop_clear(const BYTE *id, DWORD id_len, const MSAAPROPID *props, int cProps)
++{
++    struct accprop_entry *entry, *next;
++    int i;
++
++    EnterCriticalSection(&accprop_cs);
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &accprop_entries, struct accprop_entry, entry)
++    {
++        if (!accprop_id_equal(entry->id, entry->id_len, id, id_len))
++            continue;
++        for (i = 0; i < cProps; i++)
++        {
++            if (IsEqualGUID(&entry->prop, &props[i]))
++            {
++                accprop_entry_destroy(entry);
++                break;
++            }
++        }
++    }
++    LeaveCriticalSection(&accprop_cs);
++    return S_OK;
++}
++
++/* Store a value or a server for "id"/"prop", replacing (and releasing) any
++ * existing entry for the same identity and property. */
++static HRESULT accprop_set(const BYTE *id, DWORD id_len, MSAAPROPID prop,
++        const VARIANT *var, IAccPropServer *server)
++{
++    struct accprop_entry *entry;
++    BYTE *id_copy;
++    HRESULT hr;
++
++    if (!(id_copy = malloc(id_len)))
++        return E_OUTOFMEMORY;
++    memcpy(id_copy, id, id_len);
++
++    if (!(entry = calloc(1, sizeof(*entry))))
++    {
++        free(id_copy);
++        return E_OUTOFMEMORY;
++    }
++    entry->id = id_copy;
++    entry->id_len = id_len;
++    entry->prop = prop;
++    VariantInit(&entry->var);
++    if (server)
++    {
++        IAccPropServer_AddRef(server);
++        entry->server = server;
++    }
++    else if (var)
++    {
++        if (FAILED(hr = VariantCopy(&entry->var, var)))
++        {
++            free(entry->id);
++            free(entry);
++            return hr;
++        }
++    }
++
++    EnterCriticalSection(&accprop_cs);
++#ifndef SG_MUTANT_ACCPROP_NO_RELEASE_OLD
++    accprop_clear(id, id_len, &prop, 1);
++#endif
++    list_add_tail(&accprop_entries, &entry->entry);
++    LeaveCriticalSection(&accprop_cs);
++    return S_OK;
++}
++
+ static HRESULT WINAPI AccPropServices_QueryInterface(IAccPropServices *iface, REFIID riid, void **ppv)
+ {
+     if(IsEqualGUID(&IID_IUnknown, riid)) {
+@@ -57,106 +226,217 @@ static ULONG WINAPI AccPropServices_Release(IAccPropServices *iface)
+ static HRESULT WINAPI AccPropServices_SetPropValue(IAccPropServices *iface, const BYTE *pIDString,
+         DWORD dwIDStringLen, MSAAPROPID idProp, VARIANT var)
+ {
+-    FIXME("(%p %lu %s %s)\n", pIDString, dwIDStringLen, debugstr_guid(&idProp), debugstr_variant(&var));
+-    return E_NOTIMPL;
++    TRACE("(%p %lu %s %s)\n", pIDString, dwIDStringLen, debugstr_guid(&idProp), debugstr_variant(&var));
++
++    if (!pIDString || !dwIDStringLen)
++        return E_INVALIDARG;
++    return accprop_set(pIDString, dwIDStringLen, idProp, &var, NULL);
+ }
+ 
+ static HRESULT WINAPI AccPropServices_SetPropServer(IAccPropServices *iface, const BYTE *pIDString,
+         DWORD dwIDStringLen, const MSAAPROPID *paProps, int cProps, IAccPropServer *pServer, AnnoScope AnnoScope)
+ {
+-    FIXME("(%p %lu %p %d %p %u)\n", pIDString, dwIDStringLen, paProps, cProps, pServer, AnnoScope);
+-    return E_NOTIMPL;
++    HRESULT hr = S_OK;
++    int i;
++
++    TRACE("(%p %lu %p %d %p %u)\n", pIDString, dwIDStringLen, paProps, cProps, pServer, AnnoScope);
++
++    if (!pIDString || !dwIDStringLen || !pServer)
++        return E_INVALIDARG;
++    for (i = 0; i < cProps && SUCCEEDED(hr); i++)
++        hr = accprop_set(pIDString, dwIDStringLen, paProps[i], NULL, pServer);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI AccPropServices_ClearProps(IAccPropServices *iface, const BYTE *pIDString,
+         DWORD dwIDStringLen, const MSAAPROPID *paProps, int cProps)
+ {
+-    FIXME("(%p %lu %p %d)\n", pIDString, dwIDStringLen, paProps, cProps);
+-    return E_NOTIMPL;
++    TRACE("(%p %lu %p %d)\n", pIDString, dwIDStringLen, paProps, cProps);
++
++    if (!pIDString || !dwIDStringLen)
++        return E_INVALIDARG;
++    return accprop_clear(pIDString, dwIDStringLen, paProps, cProps);
+ }
+ 
+ static HRESULT WINAPI AccPropServices_SetHwndProp(IAccPropServices *iface, HWND hwnd, DWORD idObject,
+         DWORD idChild, MSAAPROPID idProp, VARIANT var)
+ {
+-    FIXME("(%p %lu %lu %s %s)\n", hwnd, idObject, idChild, debugstr_guid(&idProp), debugstr_variant(&var));
+-    return E_NOTIMPL;
++    struct accprop_hwnd_id id;
++
++    hwnd_id_init(&id, hwnd, idObject, idChild);
++
++    TRACE("(%p %lu %lu %s %s)\n", hwnd, idObject, idChild, debugstr_guid(&idProp), debugstr_variant(&var));
++
++    if (!hwnd)
++        return E_INVALIDARG;
++    return accprop_set((const BYTE *)&id, sizeof(id), idProp, &var, NULL);
+ }
+ 
+ static HRESULT WINAPI AccPropServices_SetHwndPropStr(IAccPropServices *iface, HWND hwnd, DWORD idObject,
+         DWORD idChild, MSAAPROPID idProp, LPWSTR str)
+ {
+-    FIXME("(%p %lu %lu %s %s)\n", hwnd, idObject, idChild, debugstr_guid(&idProp), debugstr_w(str));
+-    return E_NOTIMPL;
++    VARIANT var;
++    HRESULT hr;
++
++    TRACE("(%p %lu %lu %s %s)\n", hwnd, idObject, idChild, debugstr_guid(&idProp), debugstr_w(str));
++
++    V_VT(&var) = VT_BSTR;
++    if (!(V_BSTR(&var) = SysAllocString(str)))
++        return E_OUTOFMEMORY;
++    hr = AccPropServices_SetHwndProp(iface, hwnd, idObject, idChild, idProp, var);
++    VariantClear(&var);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI AccPropServices_SetHwndPropServer(IAccPropServices *iface, HWND hwnd, DWORD idObject,
+         DWORD idChild, const MSAAPROPID *paProps, int cProps, IAccPropServer *pServer, AnnoScope AnnoScope)
+ {
+-    FIXME("(%p %lu %lu %p %d %p %u)\n", hwnd, idObject, idChild, paProps, cProps, pServer, AnnoScope);
+-    return E_NOTIMPL;
++    struct accprop_hwnd_id id;
++
++    hwnd_id_init(&id, hwnd, idObject, idChild);
++
++    TRACE("(%p %lu %lu %p %d %p %u)\n", hwnd, idObject, idChild, paProps, cProps, pServer, AnnoScope);
++
++    if (!hwnd || !pServer)
++        return E_INVALIDARG;
++    return AccPropServices_SetPropServer(iface, (const BYTE *)&id, sizeof(id), paProps, cProps, pServer, AnnoScope);
+ }
+ 
+ static HRESULT WINAPI AccPropServices_ClearHwndProps(IAccPropServices *iface, HWND hwnd, DWORD idObject,
+         DWORD idChild, const MSAAPROPID *paProps, int cProps)
+ {
+-    FIXME("(%p %lu %lu %p %d)\n", hwnd, idObject, idChild, paProps, cProps);
+-    return E_NOTIMPL;
++    struct accprop_hwnd_id id;
++
++    hwnd_id_init(&id, hwnd, idObject, idChild);
++
++    TRACE("(%p %lu %lu %p %d)\n", hwnd, idObject, idChild, paProps, cProps);
++
++    if (!hwnd)
++        return E_INVALIDARG;
++    return accprop_clear((const BYTE *)&id, sizeof(id), paProps, cProps);
+ }
+ 
+ static HRESULT WINAPI AccPropServices_ComposeHwndIdentityString(IAccPropServices *iface, HWND hwnd,
+         DWORD idObject, DWORD idChild, BYTE **ppIDString, DWORD *pdwIDStringLen)
+ {
+-    FIXME("(%p %lu %lu %p %p)\n", hwnd, idObject, idChild, ppIDString, pdwIDStringLen);
+-    return E_NOTIMPL;
++    struct accprop_hwnd_id *id;
++
++    TRACE("(%p %lu %lu %p %p)\n", hwnd, idObject, idChild, ppIDString, pdwIDStringLen);
++
++    if (!hwnd || !ppIDString || !pdwIDStringLen)
++        return E_INVALIDARG;
++
++    if (!(id = CoTaskMemAlloc(sizeof(*id))))
++        return E_OUTOFMEMORY;
++    hwnd_id_init(id, hwnd, idObject, idChild);
++    *ppIDString = (BYTE *)id;
++    *pdwIDStringLen = sizeof(*id);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AccPropServices_DecomposeHwndIdentityString(IAccPropServices *iface, const BYTE *pIDString,
+         DWORD dwIDStringLen, HWND *phwnd, DWORD *pidObject, DWORD *pidChild)
+ {
+-    FIXME("(%p %lu %p %p %p)\n", pIDString, dwIDStringLen, phwnd, pidObject, pidChild);
+-    return E_NOTIMPL;
++    const struct accprop_hwnd_id *id = (const struct accprop_hwnd_id *)pIDString;
++
++    TRACE("(%p %lu %p %p %p)\n", pIDString, dwIDStringLen, phwnd, pidObject, pidChild);
++
++    if (!pIDString || dwIDStringLen != sizeof(*id) || id->kind != ACCPROP_ID_HWND)
++        return E_INVALIDARG;
++    if (phwnd) *phwnd = id->hwnd;
++    if (pidObject) *pidObject = id->idObject;
++    if (pidChild) *pidChild = id->idChild;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AccPropServices_SetHmenuProp(IAccPropServices *iface, HMENU hmenu, DWORD idChild,
+         MSAAPROPID idProp, VARIANT var)
+ {
+-    FIXME("(%p %lu %s %s)\n", hmenu, idChild, debugstr_guid(&idProp), debugstr_variant(&var));
+-    return E_NOTIMPL;
++    struct accprop_hmenu_id id;
++
++    hmenu_id_init(&id, hmenu, idChild);
++
++    TRACE("(%p %lu %s %s)\n", hmenu, idChild, debugstr_guid(&idProp), debugstr_variant(&var));
++
++    if (!hmenu)
++        return E_INVALIDARG;
++    return accprop_set((const BYTE *)&id, sizeof(id), idProp, &var, NULL);
+ }
+ 
+ static HRESULT WINAPI AccPropServices_SetHmenuPropStr(IAccPropServices *iface, HMENU hmenu, DWORD idChild,
+         MSAAPROPID idProp, LPWSTR str)
+ {
+-    FIXME("(%p %lu %s %s)\n", hmenu, idChild, debugstr_guid(&idProp), debugstr_w(str));
+-    return E_NOTIMPL;
++    VARIANT var;
++    HRESULT hr;
++
++    TRACE("(%p %lu %s %s)\n", hmenu, idChild, debugstr_guid(&idProp), debugstr_w(str));
++
++    V_VT(&var) = VT_BSTR;
++    if (!(V_BSTR(&var) = SysAllocString(str)))
++        return E_OUTOFMEMORY;
++    hr = AccPropServices_SetHmenuProp(iface, hmenu, idChild, idProp, var);
++    VariantClear(&var);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI AccPropServices_SetHmenuPropServer(IAccPropServices *iface, HMENU hmenu, DWORD idChild,
+         const MSAAPROPID *paProps, int cProps, IAccPropServer *pServer, AnnoScope AnnoScope)
+ {
+-    FIXME("(%p %lu %p %d %p %u)\n", hmenu, idChild, paProps, cProps, pServer, AnnoScope);
+-    return E_NOTIMPL;
++    struct accprop_hmenu_id id;
++
++    hmenu_id_init(&id, hmenu, idChild);
++
++    TRACE("(%p %lu %p %d %p %u)\n", hmenu, idChild, paProps, cProps, pServer, AnnoScope);
++
++    if (!hmenu || !pServer)
++        return E_INVALIDARG;
++    return AccPropServices_SetPropServer(iface, (const BYTE *)&id, sizeof(id), paProps, cProps, pServer, AnnoScope);
+ }
+ 
+ static HRESULT WINAPI AccPropServices_ClearHmenuProps(IAccPropServices *iface, HMENU hmenu, DWORD idChild,
+         const MSAAPROPID *paProps, int cProps)
+ {
+-    FIXME("(%p %lu %p %d)\n", hmenu, idChild, paProps, cProps);
+-    return E_NOTIMPL;
++    struct accprop_hmenu_id id;
++
++    hmenu_id_init(&id, hmenu, idChild);
++
++    TRACE("(%p %lu %p %d)\n", hmenu, idChild, paProps, cProps);
++
++    if (!hmenu)
++        return E_INVALIDARG;
++    return accprop_clear((const BYTE *)&id, sizeof(id), paProps, cProps);
+ }
+ 
+ static HRESULT WINAPI AccPropServices_ComposeHmenuIdentityString(IAccPropServices *iface, HMENU hmenu, DWORD idChild,
+         BYTE **ppIDString, DWORD *pdwIDStringLen)
+ {
+-    FIXME("(%p %lu %p %p)\n", hmenu, idChild, ppIDString, pdwIDStringLen);
+-    return E_NOTIMPL;
++    struct accprop_hmenu_id *id;
++
++    TRACE("(%p %lu %p %p)\n", hmenu, idChild, ppIDString, pdwIDStringLen);
++
++    if (!hmenu || !ppIDString || !pdwIDStringLen)
++        return E_INVALIDARG;
++
++    if (!(id = CoTaskMemAlloc(sizeof(*id))))
++        return E_OUTOFMEMORY;
++    hmenu_id_init(id, hmenu, idChild);
++    *ppIDString = (BYTE *)id;
++    *pdwIDStringLen = sizeof(*id);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI AccPropServices_DecomposeHmenuIdentityString(IAccPropServices *iface, const BYTE *pIDString,
+         DWORD dwIDStringLen, HMENU *phmenu, DWORD *pidChild)
+ {
+-    FIXME("(%p %lu %p %p\n", pIDString, dwIDStringLen, phmenu, pidChild);
+-    return E_NOTIMPL;
++    const struct accprop_hmenu_id *id = (const struct accprop_hmenu_id *)pIDString;
++
++    TRACE("(%p %lu %p %p)\n", pIDString, dwIDStringLen, phmenu, pidChild);
++
++    if (!pIDString || dwIDStringLen != sizeof(*id) || id->kind != ACCPROP_ID_HMENU)
++        return E_INVALIDARG;
++    if (phmenu) *phmenu = id->hmenu;
++    if (pidChild) *pidChild = id->idChild;
++    return S_OK;
+ }
+ 
+ static const IAccPropServicesVtbl AccPropServicesVtbl = {
