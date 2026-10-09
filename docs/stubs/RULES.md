@@ -64,6 +64,20 @@ behaves. An Opus "integrator" merges your branch into main; you never push to ma
   update it). CI runs a full build on the PR. Check `gh pr checks` later; if red,
   fix before the next batch.
 
+## Review lessons (read before every batch)
+- State another process can read: many Windows APIs are called from a DIFFERENT
+  process than the one that set the state (e.g. ShutdownBlockReasonQuery from the
+  logoff UI, window properties, shared handles). Never hand out raw pointers via
+  window properties or shared memory; keep such state server-side or in a
+  cross-process store, and make the gate test it from a second process.
+- Lifetime: anything you allocate per window/object must be freed when that
+  window/object goes away (WM_NCDESTROY / final Release), and the gate should
+  show it does.
+- Check every allocation (NetApiBufferAllocate, HeapAlloc...) and return the
+  error Windows returns on failure.
+- Build your touched DLLs from the clean series-applied tree before pushing, not
+  just compare sources (CI is the backstop, not the check).
+
 ## Licensing and safety
 - Our code, written from documentation and observed behaviour. Never copy or
   disassemble Microsoft binaries or code. Never call our product "Windows ...".
