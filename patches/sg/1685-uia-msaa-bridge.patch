@@ -1,0 +1,1126 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] uiautomationcore: the UI Automation to MSAA bridge
+
+UiaReturnRawElementProvider answered only UiaRootObjectId; for OBJID_CLIENT
+it returned nothing (a FIXME), so a program with a UI Automation provider
+was invisible to MSAA clients (screen readers and oleacc's users). As
+documented for the bridge, OBJID_CLIENT now gets an IAccessible made from
+the provider (dlls/uiautomationcore/uia_bridge.c):
+
+- get_accName (Name), get_accHelp (HelpText), get_accKeyboardShortcut
+  (AccessKey, else AcceleratorKey), get_accDescription (FullDescription,
+  else ItemStatus), get_accValue (the Value or RangeValue pattern) and
+  put_accValue (IValueProvider::SetValue);
+- get_accRole from the control type; get_accState from IsEnabled,
+  IsKeyboardFocusable, HasKeyboardFocus, IsOffscreen, IsPassword and the
+  Toggle, SelectionItem, ExpandCollapse and Value patterns;
+- children, accNavigate (first/last child, next/previous) and
+  get_accParent from fragment navigation (the root's parent is its
+  window's OBJID_WINDOW object); accLocation from BoundingRectangle;
+  accHitTest from the fragment root's ElementProviderFromPoint;
+  get_accFocus from HasKeyboardFocus and the root's GetFocus;
+  get_accSelection from the Selection pattern (one object, or an
+  IEnumVARIANT of several);
+- get_accDefaultAction and accDoDefaultAction: Invoke, Toggle,
+  ExpandCollapse or SelectionItem; accSelect: SetFocus and the selection
+  item's Select/AddToSelection/RemoveFromSelection;
+- IServiceProvider gives back the provider (IID_IRawElementProviderSimple),
+  which UIA_PFIA_UNWRAP_BRIDGE (1683) uses; IOleWindow gives the window.
+
+The provider map call (all arguments zero) has nothing to free: the
+bridge's objects hold their providers.
+
+Gate: test/uiabridge-gate.sh (64- and 32-bit, a client in another process,
+test/uiabridge-probe.c). Mutants SG_MUTANT_NO_BRIDGE, SG_MUTANT_NO_BRIDGE_ACTION
+(uia_bridge.c).
+---
+--- a/dlls/uiautomationcore/Makefile.in
++++ b/dlls/uiautomationcore/Makefile.in
+@@ -8,6 +8,7 @@ SOURCES = \
+ 	uia_classes.idl \
+ 	uia_classes_client.idl \
+ 	uia_classes_core.idl \
++	uia_bridge.c \
+ 	uia_client.c \
+ 	uia_com_client.c \
+ 	uia_event.c \
+new file mode 100644
+--- /dev/null
++++ b/dlls/uiautomationcore/uia_bridge.c
+@@ -0,0 +1,1038 @@
++/*
++ * The UI Automation to MSAA bridge (Stained Glass OS 1685)
++ *
++ * A window that answers WM_GETOBJECT with UiaReturnRawElementProvider for
++ * any object id gets, for OBJID_CLIENT, an IAccessible made from its UI
++ * Automation provider, so MSAA clients (screen readers, oleacc's own
++ * users) see it: names, roles, states, values, locations, children, focus,
++ * selection, hit testing and default actions come from the provider's
++ * properties and patterns, as documented for the bridge.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "uia_private.h"
++#include "ocidl.h"
++#include "servprov.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(uiautomation);
++
++struct uia_bridge
++{
++    IAccessible IAccessible_iface;
++    IServiceProvider IServiceProvider_iface;
++    IOleWindow IOleWindow_iface;
++    LONG ref;
++
++    IRawElementProviderSimple *elprov;
++    IRawElementProviderFragment *frag;
++    HWND hwnd;
++    BOOL is_root;
++};
++
++static HRESULT create_uia_bridge(IRawElementProviderSimple *elprov, HWND hwnd, BOOL is_root, IAccessible **out);
++
++static inline struct uia_bridge *impl_from_IAccessible(IAccessible *iface)
++{
++    return CONTAINING_RECORD(iface, struct uia_bridge, IAccessible_iface);
++}
++
++static HRESULT bridge_get_prop(struct uia_bridge *bridge, PROPERTYID id, VARIANT *v)
++{
++    VariantInit(v);
++    return IRawElementProviderSimple_GetPropertyValue(bridge->elprov, id, v);
++}
++
++static BOOL bridge_get_bool(struct uia_bridge *bridge, PROPERTYID id, BOOL def)
++{
++    VARIANT v;
++    BOOL ret = def;
++
++    if (SUCCEEDED(bridge_get_prop(bridge, id, &v)) && V_VT(&v) == VT_BOOL)
++        ret = V_BOOL(&v) == VARIANT_TRUE;
++    VariantClear(&v);
++    return ret;
++}
++
++static HRESULT bridge_get_bstr(struct uia_bridge *bridge, PROPERTYID id, BSTR *out)
++{
++    VARIANT v;
++
++    *out = NULL;
++    if (SUCCEEDED(bridge_get_prop(bridge, id, &v)) && V_VT(&v) == VT_BSTR && V_BSTR(&v) && *V_BSTR(&v))
++    {
++        *out = V_BSTR(&v);
++        return S_OK;
++    }
++    VariantClear(&v);
++    return S_FALSE;
++}
++
++static HRESULT bridge_get_pattern(struct uia_bridge *bridge, PATTERNID id, REFIID riid, void **out)
++{
++    IUnknown *unk = NULL;
++    HRESULT hr;
++
++    *out = NULL;
++    hr = IRawElementProviderSimple_GetPatternProvider(bridge->elprov, id, &unk);
++    if (FAILED(hr) || !unk)
++        return E_NOINTERFACE;
++    hr = IUnknown_QueryInterface(unk, riid, out);
++    IUnknown_Release(unk);
++    return hr;
++}
++
++static BOOL bridge_check_self(VARIANT cid)
++{
++    return V_VT(&cid) == VT_I4 && V_I4(&cid) == CHILDID_SELF;
++}
++
++static HRESULT bridge_wrap_fragment(struct uia_bridge *bridge, IRawElementProviderFragment *frag, IDispatch **out)
++{
++    IRawElementProviderSimple *elprov;
++    IAccessible *acc;
++    HRESULT hr;
++
++    *out = NULL;
++    hr = IRawElementProviderFragment_QueryInterface(frag, &IID_IRawElementProviderSimple, (void **)&elprov);
++    if (FAILED(hr))
++        return hr;
++    hr = create_uia_bridge(elprov, bridge->hwnd, FALSE, &acc);
++    IRawElementProviderSimple_Release(elprov);
++    if (SUCCEEDED(hr))
++        *out = (IDispatch *)acc;
++    return hr;
++}
++
++static HRESULT bridge_wrap_unknown(struct uia_bridge *bridge, IUnknown *unk, IDispatch **out)
++{
++    IRawElementProviderSimple *elprov;
++    IAccessible *acc;
++    HRESULT hr;
++
++    *out = NULL;
++    hr = IUnknown_QueryInterface(unk, &IID_IRawElementProviderSimple, (void **)&elprov);
++    if (FAILED(hr))
++        return hr;
++    hr = create_uia_bridge(elprov, bridge->hwnd, FALSE, &acc);
++    IRawElementProviderSimple_Release(elprov);
++    if (SUCCEEDED(hr))
++        *out = (IDispatch *)acc;
++    return hr;
++}
++
++/* the index-th child (1-based), or the number of children */
++static HRESULT bridge_child(struct uia_bridge *bridge, LONG index, LONG *count, IRawElementProviderFragment **out)
++{
++    IRawElementProviderFragment *cur = NULL, *next;
++    LONG n = 0;
++    HRESULT hr;
++
++    if (out) *out = NULL;
++    if (count) *count = 0;
++    if (!bridge->frag)
++        return S_OK;
++    hr = IRawElementProviderFragment_Navigate(bridge->frag, NavigateDirection_FirstChild, &cur);
++    while (SUCCEEDED(hr) && cur)
++    {
++        n++;
++        if (out && n == index)
++        {
++            *out = cur;
++            return S_OK;
++        }
++        next = NULL;
++        hr = IRawElementProviderFragment_Navigate(cur, NavigateDirection_NextSibling, &next);
++        IRawElementProviderFragment_Release(cur);
++        cur = next;
++        if (n > 100000) break;
++    }
++    if (count) *count = n;
++    return out ? E_INVALIDARG : S_OK;
++}
++
++static HRESULT WINAPI bridge_QueryInterface(IAccessible *iface, REFIID riid, void **obj)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++
++    TRACE("%p, %s, %p\n", iface, debugstr_guid(riid), obj);
++
++    if (IsEqualIID(riid, &IID_IAccessible) || IsEqualIID(riid, &IID_IDispatch) || IsEqualIID(riid, &IID_IUnknown))
++        *obj = iface;
++    else if (IsEqualIID(riid, &IID_IServiceProvider))
++        *obj = &bridge->IServiceProvider_iface;
++    else if (IsEqualIID(riid, &IID_IOleWindow))
++        *obj = &bridge->IOleWindow_iface;
++    else
++    {
++        *obj = NULL;
++        return E_NOINTERFACE;
++    }
++    IAccessible_AddRef(iface);
++    return S_OK;
++}
++
++static ULONG WINAPI bridge_AddRef(IAccessible *iface)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    return InterlockedIncrement(&bridge->ref);
++}
++
++static ULONG WINAPI bridge_Release(IAccessible *iface)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    ULONG ref = InterlockedDecrement(&bridge->ref);
++
++    if (!ref)
++    {
++        if (bridge->frag) IRawElementProviderFragment_Release(bridge->frag);
++        IRawElementProviderSimple_Release(bridge->elprov);
++        free(bridge);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI bridge_GetTypeInfoCount(IAccessible *iface, UINT *count)
++{
++    *count = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI bridge_GetTypeInfo(IAccessible *iface, UINT index, LCID lcid, ITypeInfo **out)
++{
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI bridge_GetIDsOfNames(IAccessible *iface, REFIID riid, LPOLESTR *names, UINT count,
++        LCID lcid, DISPID *ids)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI bridge_Invoke(IAccessible *iface, DISPID id, REFIID riid, LCID lcid, WORD flags,
++        DISPPARAMS *params, VARIANT *result, EXCEPINFO *excep, UINT *arg_err)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI bridge_get_accParent(IAccessible *iface, IDispatch **out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    IRawElementProviderFragment *parent = NULL;
++    HRESULT hr;
++
++    TRACE("%p, %p\n", iface, out);
++
++    *out = NULL;
++    if (!bridge->is_root && bridge->frag &&
++        SUCCEEDED(IRawElementProviderFragment_Navigate(bridge->frag, NavigateDirection_Parent, &parent)) && parent)
++    {
++        hr = bridge_wrap_fragment(bridge, parent, out);
++        IRawElementProviderFragment_Release(parent);
++        return hr;
++    }
++    /* the root's parent is its window */
++    if (bridge->hwnd)
++        return AccessibleObjectFromWindow(bridge->hwnd, OBJID_WINDOW, &IID_IDispatch, (void **)out);
++    return S_FALSE;
++}
++
++static HRESULT WINAPI bridge_get_accChildCount(IAccessible *iface, LONG *count)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++
++    TRACE("%p, %p\n", iface, count);
++
++    return bridge_child(bridge, 0, count, NULL);
++}
++
++static HRESULT WINAPI bridge_get_accChild(IAccessible *iface, VARIANT cid, IDispatch **out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    IRawElementProviderFragment *child;
++    HRESULT hr;
++
++    TRACE("%p, %s, %p\n", iface, debugstr_variant(&cid), out);
++
++    *out = NULL;
++    if (V_VT(&cid) != VT_I4 || V_I4(&cid) <= 0)
++        return E_INVALIDARG;
++    if (FAILED(hr = bridge_child(bridge, V_I4(&cid), NULL, &child)))
++        return hr;
++    hr = bridge_wrap_fragment(bridge, child, out);
++    IRawElementProviderFragment_Release(child);
++    return hr;
++}
++
++static HRESULT WINAPI bridge_get_accName(IAccessible *iface, VARIANT cid, BSTR *out)
++{
++    TRACE("%p, %s, %p\n", iface, debugstr_variant(&cid), out);
++
++    *out = NULL;
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    return bridge_get_bstr(impl_from_IAccessible(iface), UIA_NamePropertyId, out);
++}
++
++static HRESULT WINAPI bridge_get_accValue(IAccessible *iface, VARIANT cid, BSTR *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    IRangeValueProvider *range;
++    IValueProvider *value;
++    HRESULT hr;
++
++    TRACE("%p, %s, %p\n", iface, debugstr_variant(&cid), out);
++
++    *out = NULL;
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_ValuePatternId, &IID_IValueProvider, (void **)&value)))
++    {
++        hr = IValueProvider_get_Value(value, out);
++        IValueProvider_Release(value);
++        return FAILED(hr) ? hr : (*out ? S_OK : S_FALSE);
++    }
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_RangeValuePatternId, &IID_IRangeValueProvider, (void **)&range)))
++    {
++        double val = 0;
++        WCHAR buf[64];
++
++        hr = IRangeValueProvider_get_Value(range, &val);
++        IRangeValueProvider_Release(range);
++        if (FAILED(hr)) return hr;
++        swprintf(buf, ARRAY_SIZE(buf), L"%g", val);
++        *out = SysAllocString(buf);
++        return S_OK;
++    }
++    return S_FALSE;
++}
++
++static HRESULT WINAPI bridge_get_accDescription(IAccessible *iface, VARIANT cid, BSTR *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++
++    TRACE("%p, %s, %p\n", iface, debugstr_variant(&cid), out);
++
++    *out = NULL;
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    if (bridge_get_bstr(bridge, UIA_FullDescriptionPropertyId, out) == S_OK) return S_OK;
++    return bridge_get_bstr(bridge, UIA_ItemStatusPropertyId, out);
++}
++
++static const struct { CONTROLTYPEID type; LONG role; } control_type_roles[] =
++{
++    { UIA_ButtonControlTypeId,       ROLE_SYSTEM_PUSHBUTTON },
++    { UIA_CalendarControlTypeId,     ROLE_SYSTEM_CLIENT },
++    { UIA_CheckBoxControlTypeId,     ROLE_SYSTEM_CHECKBUTTON },
++    { UIA_ComboBoxControlTypeId,     ROLE_SYSTEM_COMBOBOX },
++    { UIA_EditControlTypeId,         ROLE_SYSTEM_TEXT },
++    { UIA_HyperlinkControlTypeId,    ROLE_SYSTEM_LINK },
++    { UIA_ImageControlTypeId,        ROLE_SYSTEM_GRAPHIC },
++    { UIA_ListItemControlTypeId,     ROLE_SYSTEM_LISTITEM },
++    { UIA_ListControlTypeId,         ROLE_SYSTEM_LIST },
++    { UIA_MenuControlTypeId,         ROLE_SYSTEM_MENUPOPUP },
++    { UIA_MenuBarControlTypeId,      ROLE_SYSTEM_MENUBAR },
++    { UIA_MenuItemControlTypeId,     ROLE_SYSTEM_MENUITEM },
++    { UIA_ProgressBarControlTypeId,  ROLE_SYSTEM_PROGRESSBAR },
++    { UIA_RadioButtonControlTypeId,  ROLE_SYSTEM_RADIOBUTTON },
++    { UIA_ScrollBarControlTypeId,    ROLE_SYSTEM_SCROLLBAR },
++    { UIA_SliderControlTypeId,       ROLE_SYSTEM_SLIDER },
++    { UIA_SpinnerControlTypeId,      ROLE_SYSTEM_SPINBUTTON },
++    { UIA_StatusBarControlTypeId,    ROLE_SYSTEM_STATUSBAR },
++    { UIA_TabControlTypeId,          ROLE_SYSTEM_PAGETABLIST },
++    { UIA_TabItemControlTypeId,      ROLE_SYSTEM_PAGETAB },
++    { UIA_TextControlTypeId,         ROLE_SYSTEM_STATICTEXT },
++    { UIA_ToolBarControlTypeId,      ROLE_SYSTEM_TOOLBAR },
++    { UIA_ToolTipControlTypeId,      ROLE_SYSTEM_TOOLTIP },
++    { UIA_TreeControlTypeId,         ROLE_SYSTEM_OUTLINE },
++    { UIA_TreeItemControlTypeId,     ROLE_SYSTEM_OUTLINEITEM },
++    { UIA_CustomControlTypeId,       ROLE_SYSTEM_CLIENT },
++    { UIA_GroupControlTypeId,        ROLE_SYSTEM_GROUPING },
++    { UIA_ThumbControlTypeId,        ROLE_SYSTEM_INDICATOR },
++    { UIA_DataGridControlTypeId,     ROLE_SYSTEM_TABLE },
++    { UIA_DataItemControlTypeId,     ROLE_SYSTEM_LISTITEM },
++    { UIA_DocumentControlTypeId,     ROLE_SYSTEM_DOCUMENT },
++    { UIA_SplitButtonControlTypeId,  ROLE_SYSTEM_SPLITBUTTON },
++    { UIA_WindowControlTypeId,       ROLE_SYSTEM_WINDOW },
++    { UIA_PaneControlTypeId,         ROLE_SYSTEM_PANE },
++    { UIA_HeaderControlTypeId,       ROLE_SYSTEM_LIST },
++    { UIA_HeaderItemControlTypeId,   ROLE_SYSTEM_COLUMNHEADER },
++    { UIA_TableControlTypeId,        ROLE_SYSTEM_TABLE },
++    { UIA_TitleBarControlTypeId,     ROLE_SYSTEM_TITLEBAR },
++    { UIA_SeparatorControlTypeId,    ROLE_SYSTEM_SEPARATOR },
++    { UIA_SemanticZoomControlTypeId, ROLE_SYSTEM_LIST },
++    { UIA_AppBarControlTypeId,       ROLE_SYSTEM_TOOLBAR },
++};
++
++static HRESULT WINAPI bridge_get_accRole(IAccessible *iface, VARIANT cid, VARIANT *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    LONG role = ROLE_SYSTEM_CLIENT;
++    unsigned int i;
++    VARIANT v;
++
++    TRACE("%p, %s, %p\n", iface, debugstr_variant(&cid), out);
++
++    VariantInit(out);
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    if (SUCCEEDED(bridge_get_prop(bridge, UIA_ControlTypePropertyId, &v)) && V_VT(&v) == VT_I4)
++    {
++        for (i = 0; i < ARRAY_SIZE(control_type_roles); i++)
++            if (control_type_roles[i].type == V_I4(&v)) role = control_type_roles[i].role;
++    }
++    VariantClear(&v);
++    V_VT(out) = VT_I4;
++    V_I4(out) = role;
++    return S_OK;
++}
++
++static HRESULT WINAPI bridge_get_accState(IAccessible *iface, VARIANT cid, VARIANT *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    ISelectionItemProvider *sel_item;
++    IExpandCollapseProvider *expand;
++    IToggleProvider *toggle;
++    IValueProvider *value;
++    LONG state = 0;
++
++    TRACE("%p, %s, %p\n", iface, debugstr_variant(&cid), out);
++
++    VariantInit(out);
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    if (!bridge_get_bool(bridge, UIA_IsEnabledPropertyId, TRUE)) state |= STATE_SYSTEM_UNAVAILABLE;
++    if (bridge_get_bool(bridge, UIA_IsKeyboardFocusablePropertyId, FALSE)) state |= STATE_SYSTEM_FOCUSABLE;
++    if (bridge_get_bool(bridge, UIA_HasKeyboardFocusPropertyId, FALSE)) state |= STATE_SYSTEM_FOCUSED;
++    if (bridge_get_bool(bridge, UIA_IsOffscreenPropertyId, FALSE)) state |= STATE_SYSTEM_OFFSCREEN;
++    if (bridge_get_bool(bridge, UIA_IsPasswordPropertyId, FALSE)) state |= STATE_SYSTEM_PROTECTED;
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_TogglePatternId, &IID_IToggleProvider, (void **)&toggle)))
++    {
++        enum ToggleState ts = ToggleState_Off;
++        IToggleProvider_get_ToggleState(toggle, &ts);
++        if (ts == ToggleState_On) state |= STATE_SYSTEM_CHECKED;
++        else if (ts == ToggleState_Indeterminate) state |= STATE_SYSTEM_MIXED;
++        IToggleProvider_Release(toggle);
++    }
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_SelectionItemPatternId, &IID_ISelectionItemProvider, (void **)&sel_item)))
++    {
++        BOOL selected = FALSE;
++        state |= STATE_SYSTEM_SELECTABLE;
++        ISelectionItemProvider_get_IsSelected(sel_item, &selected);
++        if (selected) state |= STATE_SYSTEM_SELECTED;
++        ISelectionItemProvider_Release(sel_item);
++    }
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_ExpandCollapsePatternId, &IID_IExpandCollapseProvider, (void **)&expand)))
++    {
++        enum ExpandCollapseState es = ExpandCollapseState_LeafNode;
++        IExpandCollapseProvider_get_ExpandCollapseState(expand, &es);
++        if (es == ExpandCollapseState_Expanded || es == ExpandCollapseState_PartiallyExpanded) state |= STATE_SYSTEM_EXPANDED;
++        else if (es == ExpandCollapseState_Collapsed) state |= STATE_SYSTEM_COLLAPSED;
++        IExpandCollapseProvider_Release(expand);
++    }
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_ValuePatternId, &IID_IValueProvider, (void **)&value)))
++    {
++        BOOL ro = FALSE;
++        IValueProvider_get_IsReadOnly(value, &ro);
++        if (ro) state |= STATE_SYSTEM_READONLY;
++        IValueProvider_Release(value);
++    }
++    V_VT(out) = VT_I4;
++    V_I4(out) = state;
++    return S_OK;
++}
++
++static HRESULT WINAPI bridge_get_accHelp(IAccessible *iface, VARIANT cid, BSTR *out)
++{
++    TRACE("%p, %s, %p\n", iface, debugstr_variant(&cid), out);
++
++    *out = NULL;
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    return bridge_get_bstr(impl_from_IAccessible(iface), UIA_HelpTextPropertyId, out);
++}
++
++static HRESULT WINAPI bridge_get_accHelpTopic(IAccessible *iface, BSTR *file, VARIANT cid, LONG *topic)
++{
++    *file = NULL;
++    *topic = 0;
++    return S_FALSE;
++}
++
++static HRESULT WINAPI bridge_get_accKeyboardShortcut(IAccessible *iface, VARIANT cid, BSTR *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++
++    TRACE("%p, %s, %p\n", iface, debugstr_variant(&cid), out);
++
++    *out = NULL;
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    if (bridge_get_bstr(bridge, UIA_AccessKeyPropertyId, out) == S_OK) return S_OK;
++    return bridge_get_bstr(bridge, UIA_AcceleratorKeyPropertyId, out);
++}
++
++/* an element of ours as a VARIANT: CHILDID_SELF when it is this one */
++static HRESULT bridge_variant_from_fragment(struct uia_bridge *bridge, IRawElementProviderFragment *frag, VARIANT *out)
++{
++    IRawElementProviderSimple *elprov;
++    IDispatch *disp;
++    HRESULT hr;
++
++    VariantInit(out);
++    if (SUCCEEDED(IRawElementProviderFragment_QueryInterface(frag, &IID_IRawElementProviderSimple, (void **)&elprov)))
++    {
++        BOOL self = elprov == bridge->elprov;
++        IRawElementProviderSimple_Release(elprov);
++        if (self)
++        {
++            V_VT(out) = VT_I4;
++            V_I4(out) = CHILDID_SELF;
++            return S_OK;
++        }
++    }
++    if (FAILED(hr = bridge_wrap_fragment(bridge, frag, &disp)))
++        return hr;
++    V_VT(out) = VT_DISPATCH;
++    V_DISPATCH(out) = disp;
++    return S_OK;
++}
++
++static HRESULT bridge_get_root(struct uia_bridge *bridge, IRawElementProviderFragmentRoot **root)
++{
++    *root = NULL;
++    if (!bridge->frag) return E_NOINTERFACE;
++    if (SUCCEEDED(IRawElementProviderSimple_QueryInterface(bridge->elprov, &IID_IRawElementProviderFragmentRoot,
++            (void **)root)))
++        return S_OK;
++    return IRawElementProviderFragment_get_FragmentRoot(bridge->frag, root);
++}
++
++static HRESULT WINAPI bridge_get_accFocus(IAccessible *iface, VARIANT *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    IRawElementProviderFragmentRoot *root;
++    IRawElementProviderFragment *focus = NULL;
++    HRESULT hr;
++
++    TRACE("%p, %p\n", iface, out);
++
++    VariantInit(out);
++    if (bridge_get_bool(bridge, UIA_HasKeyboardFocusPropertyId, FALSE))
++    {
++        V_VT(out) = VT_I4;
++        V_I4(out) = CHILDID_SELF;
++        return S_OK;
++    }
++    if (FAILED(bridge_get_root(bridge, &root)) || !root)
++        return S_FALSE;
++    hr = IRawElementProviderFragmentRoot_GetFocus(root, &focus);
++    IRawElementProviderFragmentRoot_Release(root);
++    if (FAILED(hr) || !focus)
++        return S_FALSE;
++    hr = bridge_variant_from_fragment(bridge, focus, out);
++    IRawElementProviderFragment_Release(focus);
++    return hr;
++}
++
++/* IEnumVARIANT over a selection */
++struct bridge_enum
++{
++    IEnumVARIANT IEnumVARIANT_iface;
++    LONG ref;
++    VARIANT *items;
++    ULONG count, pos;
++};
++
++static inline struct bridge_enum *impl_from_IEnumVARIANT(IEnumVARIANT *iface)
++{
++    return CONTAINING_RECORD(iface, struct bridge_enum, IEnumVARIANT_iface);
++}
++
++static HRESULT WINAPI bridge_enum_QueryInterface(IEnumVARIANT *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IEnumVARIANT) || IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IEnumVARIANT_AddRef(iface);
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI bridge_enum_AddRef(IEnumVARIANT *iface)
++{
++    return InterlockedIncrement(&impl_from_IEnumVARIANT(iface)->ref);
++}
++
++static ULONG WINAPI bridge_enum_Release(IEnumVARIANT *iface)
++{
++    struct bridge_enum *e = impl_from_IEnumVARIANT(iface);
++    ULONG ref = InterlockedDecrement(&e->ref), i;
++
++    if (!ref)
++    {
++        for (i = 0; i < e->count; i++) VariantClear(&e->items[i]);
++        free(e->items);
++        free(e);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI bridge_enum_Next(IEnumVARIANT *iface, ULONG count, VARIANT *out, ULONG *fetched)
++{
++    struct bridge_enum *e = impl_from_IEnumVARIANT(iface);
++    ULONG i;
++
++    for (i = 0; i < count && e->pos < e->count; i++, e->pos++)
++    {
++        VariantInit(&out[i]);
++        VariantCopy(&out[i], &e->items[e->pos]);
++    }
++    if (fetched) *fetched = i;
++    return i == count ? S_OK : S_FALSE;
++}
++
++static HRESULT WINAPI bridge_enum_Skip(IEnumVARIANT *iface, ULONG count)
++{
++    struct bridge_enum *e = impl_from_IEnumVARIANT(iface);
++
++    if (e->pos + count > e->count)
++    {
++        e->pos = e->count;
++        return S_FALSE;
++    }
++    e->pos += count;
++    return S_OK;
++}
++
++static HRESULT WINAPI bridge_enum_Reset(IEnumVARIANT *iface)
++{
++    impl_from_IEnumVARIANT(iface)->pos = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI bridge_enum_Clone(IEnumVARIANT *iface, IEnumVARIANT **out)
++{
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++static const IEnumVARIANTVtbl bridge_enum_vtbl = {
++    bridge_enum_QueryInterface, bridge_enum_AddRef, bridge_enum_Release,
++    bridge_enum_Next, bridge_enum_Skip, bridge_enum_Reset, bridge_enum_Clone,
++};
++
++static HRESULT WINAPI bridge_get_accSelection(IAccessible *iface, VARIANT *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    ISelectionProvider *sel;
++    struct bridge_enum *e;
++    SAFEARRAY *sa = NULL;
++    LONG lbound, elems, i;
++    IDispatch *disp;
++    HRESULT hr;
++
++    TRACE("%p, %p\n", iface, out);
++
++    VariantInit(out);
++    if (FAILED(bridge_get_pattern(bridge, UIA_SelectionPatternId, &IID_ISelectionProvider, (void **)&sel)))
++        return S_FALSE;
++    hr = ISelectionProvider_GetSelection(sel, &sa);
++    ISelectionProvider_Release(sel);
++    if (FAILED(hr) || !sa)
++        return S_FALSE;
++    if (FAILED(get_safearray_bounds(sa, &lbound, &elems)) || !elems)
++    {
++        SafeArrayDestroy(sa);
++        return S_FALSE;
++    }
++    if (!(e = calloc(1, sizeof(*e))) || !(e->items = calloc(elems, sizeof(VARIANT))))
++    {
++        free(e);
++        SafeArrayDestroy(sa);
++        return E_OUTOFMEMORY;
++    }
++    e->IEnumVARIANT_iface.lpVtbl = &bridge_enum_vtbl;
++    e->ref = 1;
++    for (i = 0; i < elems; i++)
++    {
++        LONG idx = lbound + i;
++        IUnknown *unk = NULL;
++
++        SafeArrayGetElement(sa, &idx, &unk);
++        if (unk && SUCCEEDED(bridge_wrap_unknown(bridge, unk, &disp)))
++        {
++            V_VT(&e->items[e->count]) = VT_DISPATCH;
++            V_DISPATCH(&e->items[e->count]) = disp;
++            e->count++;
++        }
++        if (unk) IUnknown_Release(unk);
++    }
++    SafeArrayDestroy(sa);
++    if (e->count == 1)
++    {
++        /* one selected object: itself */
++        *out = e->items[0];
++        e->count = 0;
++        IEnumVARIANT_Release(&e->IEnumVARIANT_iface);
++        return S_OK;
++    }
++    if (!e->count)
++    {
++        IEnumVARIANT_Release(&e->IEnumVARIANT_iface);
++        return S_FALSE;
++    }
++    V_VT(out) = VT_UNKNOWN;
++    V_UNKNOWN(out) = (IUnknown *)&e->IEnumVARIANT_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI bridge_get_accDefaultAction(IAccessible *iface, VARIANT cid, BSTR *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    IUnknown *unk;
++
++    TRACE("%p, %s, %p\n", iface, debugstr_variant(&cid), out);
++
++    *out = NULL;
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_InvokePatternId, &IID_IInvokeProvider, (void **)&unk)))
++        *out = SysAllocString(L"Press");
++    else if (SUCCEEDED(bridge_get_pattern(bridge, UIA_TogglePatternId, &IID_IToggleProvider, (void **)&unk)))
++        *out = SysAllocString(L"Toggle");
++    else if (SUCCEEDED(bridge_get_pattern(bridge, UIA_ExpandCollapsePatternId, &IID_IExpandCollapseProvider, (void **)&unk)))
++    {
++        enum ExpandCollapseState es = ExpandCollapseState_Collapsed;
++        IExpandCollapseProvider_get_ExpandCollapseState((IExpandCollapseProvider *)unk, &es);
++        *out = SysAllocString(es == ExpandCollapseState_Expanded ? L"Collapse" : L"Expand");
++    }
++    else if (SUCCEEDED(bridge_get_pattern(bridge, UIA_SelectionItemPatternId, &IID_ISelectionItemProvider, (void **)&unk)))
++        *out = SysAllocString(L"Select");
++    else
++        return S_FALSE;
++    IUnknown_Release(unk);
++    return S_OK;
++}
++
++static HRESULT WINAPI bridge_accSelect(IAccessible *iface, LONG flags, VARIANT cid)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    ISelectionItemProvider *sel_item = NULL;
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %#lx, %s\n", iface, flags, debugstr_variant(&cid));
++
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    if ((flags & SELFLAG_TAKEFOCUS) && bridge->frag)
++        hr = IRawElementProviderFragment_SetFocus(bridge->frag);
++    if (FAILED(hr)) return hr;
++    if (!(flags & (SELFLAG_TAKESELECTION | SELFLAG_ADDSELECTION | SELFLAG_REMOVESELECTION)))
++        return S_OK;
++    if (FAILED(bridge_get_pattern(bridge, UIA_SelectionItemPatternId, &IID_ISelectionItemProvider, (void **)&sel_item)))
++        return DISP_E_MEMBERNOTFOUND;
++    if (flags & SELFLAG_TAKESELECTION) hr = ISelectionItemProvider_Select(sel_item);
++    else if (flags & SELFLAG_ADDSELECTION) hr = ISelectionItemProvider_AddToSelection(sel_item);
++    else hr = ISelectionItemProvider_RemoveFromSelection(sel_item);
++    ISelectionItemProvider_Release(sel_item);
++    return hr;
++}
++
++static HRESULT WINAPI bridge_accLocation(IAccessible *iface, LONG *left, LONG *top, LONG *width, LONG *height,
++        VARIANT cid)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    struct UiaRect rect = { 0 };
++    HRESULT hr;
++
++    TRACE("%p, %p, %p, %p, %p, %s\n", iface, left, top, width, height, debugstr_variant(&cid));
++
++    *left = *top = *width = *height = 0;
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    if (bridge->frag)
++    {
++        if (FAILED(hr = IRawElementProviderFragment_get_BoundingRectangle(bridge->frag, &rect)))
++            return hr;
++    }
++    if ((!rect.width || !rect.height) && bridge->is_root && bridge->hwnd)
++    {
++        RECT rc;
++        POINT pt = { 0, 0 };
++
++        GetClientRect(bridge->hwnd, &rc);
++        ClientToScreen(bridge->hwnd, &pt);
++        rect.left = pt.x;
++        rect.top = pt.y;
++        rect.width = rc.right;
++        rect.height = rc.bottom;
++    }
++    *left = rect.left;
++    *top = rect.top;
++    *width = rect.width;
++    *height = rect.height;
++    return S_OK;
++}
++
++static HRESULT WINAPI bridge_accNavigate(IAccessible *iface, LONG dir, VARIANT start, VARIANT *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    IRawElementProviderFragment *frag = NULL;
++    enum NavigateDirection uia_dir;
++    HRESULT hr;
++
++    TRACE("%p, %ld, %s, %p\n", iface, dir, debugstr_variant(&start), out);
++
++    VariantInit(out);
++    if (!bridge_check_self(start)) return E_INVALIDARG;
++    switch (dir)
++    {
++    case NAVDIR_FIRSTCHILD: uia_dir = NavigateDirection_FirstChild; break;
++    case NAVDIR_LASTCHILD:  uia_dir = NavigateDirection_LastChild; break;
++    case NAVDIR_NEXT:       uia_dir = NavigateDirection_NextSibling; break;
++    case NAVDIR_PREVIOUS:   uia_dir = NavigateDirection_PreviousSibling; break;
++    default:
++        /* spatial directions: not kept by the provider */
++        return S_FALSE;
++    }
++    if (!bridge->frag || (bridge->is_root && (dir == NAVDIR_NEXT || dir == NAVDIR_PREVIOUS)))
++        return S_FALSE;
++    hr = IRawElementProviderFragment_Navigate(bridge->frag, uia_dir, &frag);
++    if (FAILED(hr) || !frag)
++        return S_FALSE;
++    V_VT(out) = VT_DISPATCH;
++    hr = bridge_wrap_fragment(bridge, frag, &V_DISPATCH(out));
++    if (FAILED(hr)) V_VT(out) = VT_EMPTY;
++    IRawElementProviderFragment_Release(frag);
++    return hr;
++}
++
++static HRESULT WINAPI bridge_accHitTest(IAccessible *iface, LONG x, LONG y, VARIANT *out)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    IRawElementProviderFragmentRoot *root;
++    IRawElementProviderFragment *frag = NULL;
++    LONG left, top, width, height;
++    VARIANT self;
++    HRESULT hr;
++
++    TRACE("%p, %ld, %ld, %p\n", iface, x, y, out);
++
++    VariantInit(out);
++    V_VT(&self) = VT_I4;
++    V_I4(&self) = CHILDID_SELF;
++    if (FAILED(bridge_accLocation(iface, &left, &top, &width, &height, self)) ||
++        x < left || y < top || x >= left + width || y >= top + height)
++        return S_FALSE;
++    if (SUCCEEDED(bridge_get_root(bridge, &root)) && root)
++    {
++        hr = IRawElementProviderFragmentRoot_ElementProviderFromPoint(root, x, y, &frag);
++        IRawElementProviderFragmentRoot_Release(root);
++        if (SUCCEEDED(hr) && frag)
++        {
++            hr = bridge_variant_from_fragment(bridge, frag, out);
++            IRawElementProviderFragment_Release(frag);
++            return hr;
++        }
++    }
++    V_VT(out) = VT_I4;
++    V_I4(out) = CHILDID_SELF;
++    return S_OK;
++}
++
++static HRESULT WINAPI bridge_accDoDefaultAction(IAccessible *iface, VARIANT cid)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    ISelectionItemProvider *sel_item;
++    IExpandCollapseProvider *expand;
++    IInvokeProvider *invoke;
++    IToggleProvider *toggle;
++    HRESULT hr;
++
++    TRACE("%p, %s\n", iface, debugstr_variant(&cid));
++
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++#ifdef SG_MUTANT_NO_BRIDGE_ACTION
++    return S_OK;
++#endif
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_InvokePatternId, &IID_IInvokeProvider, (void **)&invoke)))
++    {
++        hr = IInvokeProvider_Invoke(invoke);
++        IInvokeProvider_Release(invoke);
++        return hr;
++    }
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_TogglePatternId, &IID_IToggleProvider, (void **)&toggle)))
++    {
++        hr = IToggleProvider_Toggle(toggle);
++        IToggleProvider_Release(toggle);
++        return hr;
++    }
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_ExpandCollapsePatternId, &IID_IExpandCollapseProvider, (void **)&expand)))
++    {
++        enum ExpandCollapseState es = ExpandCollapseState_Collapsed;
++        IExpandCollapseProvider_get_ExpandCollapseState(expand, &es);
++        hr = es == ExpandCollapseState_Expanded ? IExpandCollapseProvider_Collapse(expand)
++                                                : IExpandCollapseProvider_Expand(expand);
++        IExpandCollapseProvider_Release(expand);
++        return hr;
++    }
++    if (SUCCEEDED(bridge_get_pattern(bridge, UIA_SelectionItemPatternId, &IID_ISelectionItemProvider, (void **)&sel_item)))
++    {
++        hr = ISelectionItemProvider_Select(sel_item);
++        ISelectionItemProvider_Release(sel_item);
++        return hr;
++    }
++    return DISP_E_MEMBERNOTFOUND;
++}
++
++static HRESULT WINAPI bridge_put_accName(IAccessible *iface, VARIANT cid, BSTR name)
++{
++    /* obsolete in MSAA, as on Windows */
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI bridge_put_accValue(IAccessible *iface, VARIANT cid, BSTR value)
++{
++    struct uia_bridge *bridge = impl_from_IAccessible(iface);
++    IValueProvider *prov;
++    HRESULT hr;
++
++    TRACE("%p, %s, %s\n", iface, debugstr_variant(&cid), debugstr_w(value));
++
++    if (!bridge_check_self(cid)) return E_INVALIDARG;
++    if (FAILED(bridge_get_pattern(bridge, UIA_ValuePatternId, &IID_IValueProvider, (void **)&prov)))
++        return DISP_E_MEMBERNOTFOUND;
++    hr = IValueProvider_SetValue(prov, value);
++    IValueProvider_Release(prov);
++    return hr;
++}
++
++static const IAccessibleVtbl bridge_vtbl = {
++    bridge_QueryInterface, bridge_AddRef, bridge_Release,
++    bridge_GetTypeInfoCount, bridge_GetTypeInfo, bridge_GetIDsOfNames, bridge_Invoke,
++    bridge_get_accParent, bridge_get_accChildCount, bridge_get_accChild, bridge_get_accName,
++    bridge_get_accValue, bridge_get_accDescription, bridge_get_accRole, bridge_get_accState,
++    bridge_get_accHelp, bridge_get_accHelpTopic, bridge_get_accKeyboardShortcut, bridge_get_accFocus,
++    bridge_get_accSelection, bridge_get_accDefaultAction, bridge_accSelect, bridge_accLocation,
++    bridge_accNavigate, bridge_accHitTest, bridge_accDoDefaultAction, bridge_put_accName, bridge_put_accValue,
++};
++
++/* IServiceProvider: the provider behind the bridge, for UIA_PFIA_UNWRAP_BRIDGE */
++static inline struct uia_bridge *impl_from_IServiceProvider(IServiceProvider *iface)
++{
++    return CONTAINING_RECORD(iface, struct uia_bridge, IServiceProvider_iface);
++}
++
++static HRESULT WINAPI bridge_sp_QueryInterface(IServiceProvider *iface, REFIID riid, void **obj)
++{
++    return IAccessible_QueryInterface(&impl_from_IServiceProvider(iface)->IAccessible_iface, riid, obj);
++}
++
++static ULONG WINAPI bridge_sp_AddRef(IServiceProvider *iface)
++{
++    return IAccessible_AddRef(&impl_from_IServiceProvider(iface)->IAccessible_iface);
++}
++
++static ULONG WINAPI bridge_sp_Release(IServiceProvider *iface)
++{
++    return IAccessible_Release(&impl_from_IServiceProvider(iface)->IAccessible_iface);
++}
++
++static HRESULT WINAPI bridge_sp_QueryService(IServiceProvider *iface, REFGUID sid, REFIID riid, void **obj)
++{
++    struct uia_bridge *bridge = impl_from_IServiceProvider(iface);
++
++    TRACE("%p, %s, %s, %p\n", iface, debugstr_guid(sid), debugstr_guid(riid), obj);
++
++    *obj = NULL;
++    if (IsEqualIID(sid, &IID_IRawElementProviderSimple))
++        return IRawElementProviderSimple_QueryInterface(bridge->elprov, riid, obj);
++    return E_NOINTERFACE;
++}
++
++static const IServiceProviderVtbl bridge_sp_vtbl = {
++    bridge_sp_QueryInterface, bridge_sp_AddRef, bridge_sp_Release, bridge_sp_QueryService,
++};
++
++static inline struct uia_bridge *impl_from_IOleWindow(IOleWindow *iface)
++{
++    return CONTAINING_RECORD(iface, struct uia_bridge, IOleWindow_iface);
++}
++
++static HRESULT WINAPI bridge_ow_QueryInterface(IOleWindow *iface, REFIID riid, void **obj)
++{
++    return IAccessible_QueryInterface(&impl_from_IOleWindow(iface)->IAccessible_iface, riid, obj);
++}
++
++static ULONG WINAPI bridge_ow_AddRef(IOleWindow *iface)
++{
++    return IAccessible_AddRef(&impl_from_IOleWindow(iface)->IAccessible_iface);
++}
++
++static ULONG WINAPI bridge_ow_Release(IOleWindow *iface)
++{
++    return IAccessible_Release(&impl_from_IOleWindow(iface)->IAccessible_iface);
++}
++
++static HRESULT WINAPI bridge_ow_GetWindow(IOleWindow *iface, HWND *hwnd)
++{
++    struct uia_bridge *bridge = impl_from_IOleWindow(iface);
++
++    *hwnd = bridge->hwnd;
++    return bridge->hwnd ? S_OK : E_FAIL;
++}
++
++static HRESULT WINAPI bridge_ow_ContextSensitiveHelp(IOleWindow *iface, BOOL mode)
++{
++    return E_NOTIMPL;
++}
++
++static const IOleWindowVtbl bridge_ow_vtbl = {
++    bridge_ow_QueryInterface, bridge_ow_AddRef, bridge_ow_Release, bridge_ow_GetWindow, bridge_ow_ContextSensitiveHelp,
++};
++
++static HRESULT create_uia_bridge(IRawElementProviderSimple *elprov, HWND hwnd, BOOL is_root, IAccessible **out)
++{
++    struct uia_bridge *bridge;
++
++    *out = NULL;
++    if (!(bridge = calloc(1, sizeof(*bridge))))
++        return E_OUTOFMEMORY;
++    bridge->IAccessible_iface.lpVtbl = &bridge_vtbl;
++    bridge->IServiceProvider_iface.lpVtbl = &bridge_sp_vtbl;
++    bridge->IOleWindow_iface.lpVtbl = &bridge_ow_vtbl;
++    bridge->ref = 1;
++    bridge->elprov = elprov;
++    IRawElementProviderSimple_AddRef(elprov);
++    if (FAILED(IRawElementProviderSimple_QueryInterface(elprov, &IID_IRawElementProviderFragment, (void **)&bridge->frag)))
++        bridge->frag = NULL;
++    bridge->hwnd = hwnd;
++    bridge->is_root = is_root;
++    *out = &bridge->IAccessible_iface;
++    return S_OK;
++}
++
++/* UiaReturnRawElementProvider for OBJID_CLIENT */
++LRESULT uia_bridge_lresult(HWND hwnd, WPARAM wparam, IRawElementProviderSimple *elprov)
++{
++    IAccessible *acc;
++    LRESULT lr;
++
++#ifdef SG_MUTANT_NO_BRIDGE
++    return 0;
++#endif
++    if (FAILED(create_uia_bridge(elprov, hwnd, TRUE, &acc)))
++        return 0;
++    lr = LresultFromObject(&IID_IAccessible, wparam, (IUnknown *)acc);
++    IAccessible_Release(acc);
++    return lr;
++}
+--- a/dlls/uiautomationcore/uia_private.h
++++ b/dlls/uiautomationcore/uia_private.h
+@@ -281,6 +281,9 @@ HRESULT uia_event_invoke(HUIANODE node, HUIANODE nav_start_node, struct uia_even
+ HRESULT uia_event_check_node_within_event_scope(struct uia_event *event, HUIANODE node, SAFEARRAY *rt_id,
+         HUIANODE *clientside_nav_node_out);
+ 
++/* uia_bridge.c */
++LRESULT uia_bridge_lresult(HWND hwnd, WPARAM wparam, IRawElementProviderSimple *elprov);
++
+ /* uia_ids.c */
+ const struct uia_prop_info *uia_prop_info_from_id(PROPERTYID prop_id);
+ const struct uia_event_info *uia_event_info_from_id(EVENTID event_id);
+--- a/dlls/uiautomationcore/uia_provider.c
++++ b/dlls/uiautomationcore/uia_provider.c
+@@ -2566,15 +2566,19 @@ LRESULT WINAPI UiaReturnRawElementProvider(HWND hwnd, WPARAM wparam,
+ 
+     TRACE("(%p, %Ix, %#Ix, %p)\n", hwnd, wparam, lparam, elprov);
+ 
++    /* the provider map of the bridge: none is kept, the bridge's objects
++     * hold their providers themselves */
+     if (!wparam && !lparam && !elprov)
+-    {
+-        FIXME("UIA-to-MSAA bridge not implemented, no provider map to free.\n");
+         return 0;
+-    }
++
++    /* Stained Glass OS 1685: MSAA clients get the provider through the
++     * UI Automation to MSAA bridge */
++    if ((LONG)lparam == OBJID_CLIENT && elprov)
++        return uia_bridge_lresult(hwnd, wparam, elprov);
+ 
+     if (lparam != UiaRootObjectId)
+     {
+-        FIXME("Unsupported object id %Id, ignoring.\n", lparam);
++        WARN("Unsupported object id %Id, ignoring.\n", lparam);
+         return 0;
+     }
+ 
