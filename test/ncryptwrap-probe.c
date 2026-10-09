@@ -107,6 +107,46 @@ int main(void)
         NCryptFreeObject(restored);
     }
 
+    /* what the AES key is wrapped with: RSA-OAEP, SHA-1, no label (2411); and an envelope
+     * written by the first version (SHA-256, one-byte dummy label) still imports */
+    {
+        BYTE kb[4096], secret[64], rewrapped[512], *w3;
+        DWORD kblen, nsec = 0, nre = 0;
+        BCRYPT_ALG_HANDLE ralg;
+        BCRYPT_KEY_HANDLE rkey;
+        BCRYPT_OAEP_PADDING_INFO sha1 = { BCRYPT_SHA1_ALGORITHM, NULL, 0 };
+        BCRYPT_OAEP_PADDING_INFO sha256 = { BCRYPT_SHA256_ALGORITHM, (BYTE *)"", 0 };
+        BCRYPT_OAEP_PADDING_INFO sha512 = { BCRYPT_SHA512_ALGORITHM, NULL, 0 };
+        NTSTATUS st;
+        NCRYPT_KEY_HANDLE legacy = 0;
+
+        check(!NCryptExportKey(kek, 0, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, kb, sizeof(kb), &kblen, 0), "the wrapping key, in the clear");
+        check(!BCryptOpenAlgorithmProvider(&ralg, BCRYPT_RSA_ALGORITHM, NULL, 0) &&
+              !BCryptImportKeyPair(ralg, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, &rkey, kb, kblen, 0), "as a BCrypt key");
+        st = BCryptDecrypt(rkey, wrapped + 28, 256, &sha1, NULL, 0, secret, sizeof(secret), &nsec, BCRYPT_PAD_OAEP);
+        check(!st && nsec == 32, "the wrapped AES key opens as OAEP SHA-1 without a label");
+        st = BCryptDecrypt(rkey, wrapped + 28, 256, &sha256, NULL, 0, secret + 32, 32, &nre, BCRYPT_PAD_OAEP);
+        check(st != 0, "and not as SHA-256");
+        w3 = malloc(wlen);
+        memcpy(w3, wrapped, wlen);
+        st = BCryptEncrypt(rkey, secret, 32, &sha256, NULL, 0, rewrapped, sizeof(rewrapped), &nre, BCRYPT_PAD_OAEP);
+        check(!st && nre == 256, "an old-style (SHA-256, dummy label) wrapping of the same key");
+        memcpy(w3 + 28, rewrapped, 256);
+        ret = NCryptImportKey(prov, kek, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, &legacy, w3, wlen, 0);
+        check(!ret && legacy, "an envelope written the old way still imports");
+        if (legacy) NCryptFreeObject(legacy);
+        st = BCryptEncrypt(rkey, secret, 32, &sha512, NULL, 0, rewrapped, sizeof(rewrapped), &nre, BCRYPT_PAD_OAEP);
+        memcpy(w3 + 28, rewrapped, 256);
+        legacy = 0;
+        ret = NCryptImportKey(prov, kek, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, &legacy, w3, wlen, 0);
+        check(!st && ret != 0 && !legacy, "a wrapping with another hash does not import");
+        free(w3);
+        RtlSecureZeroMemory(secret, sizeof(secret));
+        RtlSecureZeroMemory(kb, sizeof(kb));
+        BCryptDestroyKey(rkey);
+        BCryptCloseAlgorithmProvider(ralg, 0);
+    }
+
     /* things that must not import */
     restored = 0;
     ret = NCryptImportKey(prov, other_kek, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, &restored, wrapped, wlen, 0);

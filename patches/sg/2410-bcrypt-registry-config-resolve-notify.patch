@@ -1,0 +1,1607 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] bcrypt: keep the CNG configuration in the registry; BCryptResolveProviders and config-change notification
+
+The context / function / provider store from 2402 lived in process memory,
+so nothing a program configured outlived it or reached another process.
+It is now read from and written to the keys Windows uses,
+HKLM\SYSTEM\CurrentControlSet\Control\Cryptography\Configuration\{Local,Domain}
+and ...\Cryptography\Providers: every call loads the keys into the model,
+and a call that changes something writes the touched table or the provider
+list back (STATUS_ACCESS_DENIED when the key cannot be written). A store that
+was never written gets the built-in Default and SSL contexts and the
+Microsoft Primitive Provider written out. Names that cannot be registry key
+names (a backslash) are rejected. The failure NTSTATUS values are the
+documented ones, now said in the file header.
+
+BCryptResolveProviders walks the context's function and provider lists (the
+Default context when none is named; Local before Domain), keeps registered
+providers that register the function in the image kind the mode asks for,
+and returns each with the function's properties and the image names and
+flags in one block. CRYPT_ALL_FUNCTIONS and CRYPT_ALL_PROVIDERS are
+supported, plus the include/bcrypt.h structures.
+
+BCryptRegisterConfigChangeNotify / BCryptUnregisterConfigChangeNotify keep
+a list of events that a worker thread signals, from a registry change
+notification on the Configuration and Providers keys, so changes made by
+other processes are seen too.
+---
+--- a/dlls/bcrypt/bcrypt.spec
++++ b/dlls/bcrypt/bcrypt.spec
+@@ -40,17 +40,17 @@
+ @ stdcall BCryptQueryContextFunctionConfiguration(long wstr long wstr ptr ptr)
+ @ stdcall BCryptQueryContextFunctionProperty(long wstr long wstr wstr ptr ptr)
+ @ stdcall BCryptQueryProviderRegistration(wstr long long ptr ptr)
+-@ stub BCryptRegisterConfigChangeNotify
++@ stdcall BCryptRegisterConfigChangeNotify(ptr)
+ @ stdcall BCryptRegisterProvider(wstr long ptr)
+ @ stdcall BCryptRemoveContextFunction(long wstr long wstr)
+ @ stdcall BCryptRemoveContextFunctionProvider(long wstr long wstr wstr)
+-@ stub BCryptResolveProviders
++@ stdcall BCryptResolveProviders(wstr long wstr wstr long long ptr ptr)
+ @ stdcall BCryptSecretAgreement(ptr ptr ptr long)
+ @ stub BCryptSetAuditingInterface
+ @ stdcall BCryptSetContextFunctionProperty(long wstr long wstr wstr long ptr)
+ @ stdcall BCryptSetProperty(ptr wstr ptr long long)
+ @ stdcall BCryptSignHash(ptr ptr ptr long ptr long ptr long)
+-@ stub BCryptUnregisterConfigChangeNotify
++@ stdcall BCryptUnregisterConfigChangeNotify(ptr)
+ @ stdcall BCryptUnregisterProvider(wstr)
+ @ stdcall BCryptVerifySignature(ptr ptr ptr long ptr long long)
+ @ stub GetAsymmetricEncryptionInterface
+--- a/dlls/bcrypt/config.c
++++ b/dlls/bcrypt/config.c
+@@ -2,12 +2,36 @@
+  * CNG configuration store: contexts, context functions, providers
+  *
+  * Windows keeps this in the registry under
+- * HKLM\SYSTEM\CurrentControlSet\Control\Cryptography\Configuration (and the
+- * Providers key).  This implementation keeps the same model in memory for the
+- * lifetime of the process: a table (local or domain) holds named contexts, a
+- * context holds an ordered list of functions per interface, a function holds
+- * an ordered list of providers plus named properties, and registered
+- * providers are described by a CRYPT_PROVIDER_REG.
++ * HKLM\SYSTEM\CurrentControlSet\Control\Cryptography\Configuration (the
++ * Local and Domain tables) and ...\Cryptography\Providers.  The same keys
++ * hold it here, so every process (and every restart) sees one store.  Each
++ * API call loads the keys into an in-memory model, works on that, and a
++ * call that changes something writes the touched part back: a table (local
++ * or domain) holds named contexts, a context holds an ordered list of
++ * functions per interface, a function holds an ordered list of providers
++ * plus named properties, and registered providers are described by a
++ * CRYPT_PROVIDER_REG.
++ *
++ * Layout under Configuration\<Local|Domain>:
++ *   <context>                   Flags, Reserved (DWORD)
++ *     <interface, 8 hex>        Functions (REG_MULTI_SZ, priority order)
++ *       <function>              Providers (REG_MULTI_SZ, priority order),
++ *                               Flags, Reserved
++ *         Properties            one REG_BINARY value per property
++ * and under Providers:
++ *   <provider>                  Alias (REG_MULTI_SZ)
++ *     UM, KM                    Image (REG_SZ)
++ *       <interface, 8 hex>      Functions (REG_MULTI_SZ), Flags
++ * The key names and the value names are what Windows is known to use for the
++ * parts we are confident of (the Configuration and Providers roots, the
++ * Local/Domain split, Functions, Providers, Image, UM/KM, 8-hex interface
++ * keys); the rest of the naming is our own and only has to be read back by
++ * this implementation.
++ *
++ * The NTSTATUS values returned for the failure cases (STATUS_NOT_FOUND,
++ * STATUS_OBJECT_NAME_COLLISION, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER,
++ * STATUS_ACCESS_DENIED for a store that cannot be written) come from the
++ * CNG documentation, not from observation of Windows.
+  *
+  * Every buffer handed back to the caller is a single allocation with the
+  * pointers inside it pointing into the same block, so BCryptFreeBuffer (free)
+@@ -22,6 +46,7 @@
+ #define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winreg.h"
+ #include "winternl.h"
+ #include "bcrypt.h"
+ 
+@@ -76,7 +101,6 @@ struct provider
+ };
+ 
+ static SRWLOCK config_lock = SRWLOCK_INIT;
+-static BOOL    seeded;
+ static struct list contexts[2] = { LIST_INIT( contexts[0] ), LIST_INIT( contexts[1] ) };
+ static struct list providers = LIST_INIT( providers );
+ 
+@@ -174,6 +198,12 @@ static BOOL valid_name( const WCHAR *name )
+     return name && name[0];
+ }
+ 
++/* names that become registry key names */
++static BOOL valid_key_name( const WCHAR *name )
++{
++    return valid_name( name ) && wcslen( name ) <= 255 && !wcschr( name, '\\' );
++}
++
+ /* ---- provider registration blobs ---- */
+ 
+ struct reg_copy
+@@ -371,6 +401,34 @@ static void free_function( struct function *f )
+     free( f );
+ }
+ 
++static void free_context( struct context *ctx )
++{
++    while (!list_empty( &ctx->functions ))
++        free_function( LIST_ENTRY( list_head( &ctx->functions ), struct function, entry ) );
++    list_remove( &ctx->entry );
++    free( ctx->name );
++    free( ctx );
++}
++
++static void free_provider( struct provider *p )
++{
++    list_remove( &p->entry );
++    free( p->reg );
++    free( p->name );
++    free( p );
++}
++
++static void clear_model(void)
++{
++    ULONG i;
++
++    for (i = 0; i < 2; i++)
++        while (!list_empty( &contexts[i] ))
++            free_context( LIST_ENTRY( list_head( &contexts[i] ), struct context, entry ) );
++    while (!list_empty( &providers ))
++        free_provider( LIST_ENTRY( list_head( &providers ), struct provider, entry ) );
++}
++
+ static struct context *add_context( ULONG table, const WCHAR *name, const CRYPT_CONTEXT_CONFIG *cfg )
+ {
+     struct context *ctx;
+@@ -452,7 +510,7 @@ static struct function *add_function( struct context *ctx, ULONG iface, const WC
+ 
+ /* Default context and the built-in provider are derived from the algorithms
+  * this bcrypt implements, so the two never disagree with BCryptEnumAlgorithms. */
+-static void seed_config(void)
++static void seed_model(void)
+ {
+     BCRYPT_ALGORITHM_IDENTIFIER *algs;
+     CRYPT_INTERFACE_REG ifaces[LAST_INTERFACE + 1], *iface_list[LAST_INTERFACE];
+@@ -462,9 +520,6 @@ static void seed_config(void)
+     PWSTR *names[LAST_INTERFACE + 1] = { 0 };
+     ULONG count, i, j, n, iface;
+ 
+-    if (seeded) return;
+-    seeded = TRUE;
+-
+     ctx = add_context( CRYPT_LOCAL, L"Default", NULL );
+     add_context( CRYPT_LOCAL, L"SSL", NULL );
+     if (BCryptEnumAlgorithms( 0, &count, &algs, 0 )) return;
+@@ -507,6 +562,510 @@ static void seed_config(void)
+     BCryptFreeBuffer( algs );
+ }
+ 
++/* ---- registry store ---- */
++
++#define CRYPTO_KEY    L"System\\CurrentControlSet\\Control\\Cryptography"
++#define CONFIG_KEY    CRYPTO_KEY L"\\Configuration"
++#define PROVIDERS_KEY CRYPTO_KEY L"\\Providers"
++
++#define DIRTY_LOCAL     0x01
++#define DIRTY_DOMAIN    0x02
++#define DIRTY_PROVIDERS 0x04
++
++static const WCHAR *table_key_name( ULONG table )
++{
++    return table == CRYPT_LOCAL ? L"Local" : L"Domain";
++}
++
++/* everything allocated while reading one registry subtree, freed at once */
++struct arena
++{
++    void  **ptr;
++    SIZE_T  count, cap;
++};
++
++static void *arena_alloc( struct arena *a, SIZE_T size )
++{
++    void *mem;
++
++    if (a->count == a->cap)
++    {
++        SIZE_T cap = a->cap ? a->cap * 2 : 16;
++        void **p = realloc( a->ptr, cap * sizeof(*p) );
++        if (!p) return NULL;
++        a->ptr = p;
++        a->cap = cap;
++    }
++    if (!(mem = calloc( 1, size ? size : 1 ))) return NULL;
++    a->ptr[a->count++] = mem;
++    return mem;
++}
++
++static void arena_free( struct arena *a )
++{
++    while (a->count) free( a->ptr[--a->count] );
++    free( a->ptr );
++    memset( a, 0, sizeof(*a) );
++}
++
++static void iface_key_name( ULONG iface, WCHAR *buf )
++{
++    ULONG i, d;
++
++    for (i = 0; i < 8; i++)
++    {
++        d = (iface >> (28 - 4 * i)) & 0xf;
++        buf[i] = d < 10 ? '0' + d : 'A' + d - 10;
++    }
++    buf[8] = 0;
++}
++
++static BOOL parse_iface_key( const WCHAR *name, ULONG *iface )
++{
++    ULONG i, val = 0;
++
++    for (i = 0; i < 8; i++)
++    {
++        WCHAR c = name[i];
++        if (c >= '0' && c <= '9') val = (val << 4) | (c - '0');
++        else if (c >= 'A' && c <= 'F') val = (val << 4) | (c - 'A' + 10);
++        else if (c >= 'a' && c <= 'f') val = (val << 4) | (c - 'a' + 10);
++        else return FALSE;
++    }
++    if (name[8]) return FALSE;
++    *iface = val;
++    return TRUE;
++}
++
++/* a REG_MULTI_SZ (or a single REG_SZ) as an array of strings */
++static WCHAR **read_multi( struct arena *a, HKEY key, const WCHAR *name, ULONG *count )
++{
++    DWORD type, size = 0, n = 0;
++    WCHAR *buf, *p, **list;
++
++    *count = 0;
++    if (RegQueryValueExW( key, name, NULL, &type, NULL, &size ) || (type != REG_MULTI_SZ && type != REG_SZ))
++        return NULL;
++    if (!(buf = arena_alloc( a, size + 2 * sizeof(WCHAR) ))) return NULL;
++    if (RegQueryValueExW( key, name, NULL, &type, (BYTE *)buf, &size )) return NULL;
++    for (p = buf; *p; p += wcslen( p ) + 1) n++;
++    if (!(list = arena_alloc( a, (n + 1) * sizeof(*list) ))) return NULL;
++    for (p = buf, n = 0; *p; p += wcslen( p ) + 1) list[n++] = p;
++    *count = n;
++    return list;
++}
++
++static ULONG read_dword( HKEY key, const WCHAR *name )
++{
++    DWORD type, size = sizeof(DWORD), val = 0;
++
++    if (RegQueryValueExW( key, name, NULL, &type, (BYTE *)&val, &size ) || type != REG_DWORD) return 0;
++    return val;
++}
++
++static void load_function( HKEY ifkey, struct context *ctx, ULONG iface, const WCHAR *fname )
++{
++    struct arena a = { 0 };
++    struct function *f;
++    HKEY fk, pk;
++    WCHAR **list;
++    ULONG count, i;
++
++    if (!(f = add_function( ctx, iface, fname, CRYPT_PRIORITY_BOTTOM ))) return;
++    if (RegOpenKeyExW( ifkey, fname, 0, KEY_READ, &fk )) return;
++
++    list = read_multi( &a, fk, L"Providers", &count );
++    for (i = 0; i < count; i++) add_name( &f->providers, list[i], CRYPT_PRIORITY_BOTTOM );
++    f->flags = read_dword( fk, L"Flags" );
++    f->reserved = read_dword( fk, L"Reserved" );
++    arena_free( &a );
++
++    if (!RegOpenKeyExW( fk, L"Properties", 0, KEY_READ, &pk ))
++    {
++        for (i = 0;; i++)
++        {
++            WCHAR pname[256];
++            DWORD nlen = ARRAY_SIZE(pname), type, size = 0;
++            struct property *p;
++            LONG ret = RegEnumValueW( pk, i, pname, &nlen, NULL, &type, NULL, &size );
++
++            if (ret == ERROR_NO_MORE_ITEMS) break;
++            if (ret) continue;
++            if (!(p = malloc( sizeof(*p) ))) break;
++            if (!(p->name = dup_str( pname )) || !(p->data = malloc( size ? size : 1 )))
++            {
++                free( p->name );
++                free( p );
++                break;
++            }
++            nlen = size;
++            if (size && RegQueryValueExW( pk, pname, NULL, &type, p->data, &nlen )) size = 0;
++            p->size = size;
++            list_add_tail( &f->properties, &p->entry );
++        }
++        RegCloseKey( pk );
++    }
++    RegCloseKey( fk );
++}
++
++static void load_context( ULONG table, const WCHAR *name, HKEY ck )
++{
++    struct context *ctx;
++    ULONG i;
++
++    if (!(ctx = add_context( table, name, NULL ))) return;
++    ctx->flags = read_dword( ck, L"Flags" );
++    ctx->reserved = read_dword( ck, L"Reserved" );
++
++    for (i = 0;; i++)
++    {
++        WCHAR kname[256];
++        DWORD len = ARRAY_SIZE(kname);
++        struct arena a = { 0 };
++        WCHAR **list;
++        ULONG iface, count, j;
++        HKEY ik;
++        LONG ret = RegEnumKeyExW( ck, i, kname, &len, NULL, NULL, NULL, NULL );
++
++        if (ret == ERROR_NO_MORE_ITEMS) break;
++        if (ret || !parse_iface_key( kname, &iface )) continue;
++        if (RegOpenKeyExW( ck, kname, 0, KEY_READ, &ik )) continue;
++        list = read_multi( &a, ik, L"Functions", &count );
++        for (j = 0; j < count; j++)
++            if (!find_function( ctx, iface, list[j] )) load_function( ik, ctx, iface, list[j] );
++        arena_free( &a );
++        RegCloseKey( ik );
++    }
++}
++
++/* returns FALSE when the table key does not exist at all (a store that was never written) */
++static BOOL load_table( ULONG table )
++{
++    HKEY base, tk;
++    ULONG i;
++
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, CONFIG_KEY, 0, KEY_READ, &base )) return FALSE;
++    if (RegOpenKeyExW( base, table_key_name( table ), 0, KEY_READ, &tk ))
++    {
++        RegCloseKey( base );
++        return FALSE;
++    }
++    for (i = 0;; i++)
++    {
++        WCHAR name[256];
++        DWORD len = ARRAY_SIZE(name);
++        HKEY ck;
++        LONG ret = RegEnumKeyExW( tk, i, name, &len, NULL, NULL, NULL, NULL );
++
++        if (ret == ERROR_NO_MORE_ITEMS) break;
++        if (ret) continue;
++        if (RegOpenKeyExW( tk, name, 0, KEY_READ, &ck )) continue;
++        load_context( table, name, ck );
++        RegCloseKey( ck );
++    }
++    RegCloseKey( tk );
++    RegCloseKey( base );
++    return TRUE;
++}
++
++static CRYPT_IMAGE_REG *load_image( struct arena *a, HKEY pk, const WCHAR *which )
++{
++    CRYPT_IMAGE_REG *image;
++    HKEY ik;
++    WCHAR **str;
++    DWORD nsub = 0, i;
++    ULONG count, n = 0;
++
++    if (RegOpenKeyExW( pk, which, 0, KEY_READ, &ik )) return NULL;
++    if (!(image = arena_alloc( a, sizeof(*image) ))) goto done;
++    str = read_multi( a, ik, L"Image", &count );
++    image->pszImage = count ? str[0] : (WCHAR *)L"";
++    RegQueryInfoKeyW( ik, NULL, NULL, NULL, &nsub, NULL, NULL, NULL, NULL, NULL, NULL, NULL );
++    if (!(image->rgpInterfaces = arena_alloc( a, (nsub + 1) * sizeof(*image->rgpInterfaces) ))) goto done;
++
++    for (i = 0; i < nsub; i++)
++    {
++        WCHAR kname[256];
++        DWORD len = ARRAY_SIZE(kname);
++        CRYPT_INTERFACE_REG *reg;
++        ULONG iface;
++        HKEY fk;
++
++        if (RegEnumKeyExW( ik, i, kname, &len, NULL, NULL, NULL, NULL ) || !parse_iface_key( kname, &iface )) continue;
++        if (RegOpenKeyExW( ik, kname, 0, KEY_READ, &fk )) continue;
++        if ((reg = arena_alloc( a, sizeof(*reg) )))
++        {
++            reg->dwInterface = iface;
++            reg->dwFlags = read_dword( fk, L"Flags" );
++            reg->rgpszFunctions = read_multi( a, fk, L"Functions", &reg->cFunctions );
++            image->rgpInterfaces[n++] = reg;
++        }
++        RegCloseKey( fk );
++    }
++    image->cInterfaces = n;
++done:
++    RegCloseKey( ik );
++    return image;
++}
++
++static void load_providers(void)
++{
++    HKEY base;
++    ULONG i;
++
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, PROVIDERS_KEY, 0, KEY_READ, &base )) return;
++    for (i = 0;; i++)
++    {
++        WCHAR name[256];
++        DWORD len = ARRAY_SIZE(name);
++        struct arena a = { 0 };
++        CRYPT_PROVIDER_REG reg = { 0 };
++        HKEY pk;
++        LONG ret = RegEnumKeyExW( base, i, name, &len, NULL, NULL, NULL, NULL );
++
++        if (ret == ERROR_NO_MORE_ITEMS) break;
++        if (ret || RegOpenKeyExW( base, name, 0, KEY_READ, &pk )) continue;
++        reg.rgpszAliases = read_multi( &a, pk, L"Alias", &reg.cAliases );
++        reg.pUM = load_image( &a, pk, L"UM" );
++        reg.pKM = load_image( &a, pk, L"KM" );
++        register_provider( name, CRYPT_OVERWRITE, &reg );
++        arena_free( &a );
++        RegCloseKey( pk );
++    }
++    RegCloseKey( base );
++}
++
++static LONG create_key( HKEY parent, const WCHAR *name, HKEY *key )
++{
++    return RegCreateKeyExW( parent, name, 0, NULL, 0, KEY_ALL_ACCESS, NULL, key, NULL );
++}
++
++static LONG set_multi( HKEY key, const WCHAR *name, const WCHAR *const *strs, ULONG count )
++{
++    SIZE_T len = 2, i;
++    WCHAR *buf, *p;
++    LONG ret;
++
++    for (i = 0; i < count; i++) len += wcslen( strs[i] ) + 1;
++    if (!(buf = malloc( len * sizeof(WCHAR) ))) return ERROR_NOT_ENOUGH_MEMORY;
++    for (i = 0, p = buf; i < count; i++)
++    {
++        wcscpy( p, strs[i] );
++        p += wcslen( p ) + 1;
++    }
++    p[0] = p[1] = 0;
++    ret = RegSetValueExW( key, name, 0, REG_MULTI_SZ, (const BYTE *)buf, (p - buf + 1) * sizeof(WCHAR) );
++    free( buf );
++    return ret;
++}
++
++static LONG set_multi_list( HKEY key, const WCHAR *name, struct list *list )
++{
++    const WCHAR **strs;
++    struct name_entry *n;
++    ULONG count = 0;
++    LONG ret;
++
++    LIST_FOR_EACH_ENTRY( n, list, struct name_entry, entry ) count++;
++    if (!(strs = malloc( (count + 1) * sizeof(*strs) ))) return ERROR_NOT_ENOUGH_MEMORY;
++    count = 0;
++    LIST_FOR_EACH_ENTRY( n, list, struct name_entry, entry ) strs[count++] = n->name;
++    ret = set_multi( key, name, strs, count );
++    free( strs );
++    return ret;
++}
++
++static LONG set_dword( HKEY key, const WCHAR *name, DWORD val )
++{
++    return RegSetValueExW( key, name, 0, REG_DWORD, (const BYTE *)&val, sizeof(val) );
++}
++
++static LONG save_function( HKEY ik, const struct function *f )
++{
++    struct property *p;
++    HKEY fk, pk;
++    LONG ret;
++
++    if ((ret = create_key( ik, f->name, &fk ))) return ret;
++    if (!(ret = set_multi_list( fk, L"Providers", (struct list *)&f->providers )) &&
++        !(ret = set_dword( fk, L"Flags", f->flags )))
++        ret = set_dword( fk, L"Reserved", f->reserved );
++    if (!ret && !list_empty( &f->properties ))
++    {
++        if (!(ret = create_key( fk, L"Properties", &pk )))
++        {
++            LIST_FOR_EACH_ENTRY( p, &f->properties, struct property, entry )
++                if ((ret = RegSetValueExW( pk, p->name, 0, REG_BINARY, p->data, p->size ))) break;
++            RegCloseKey( pk );
++        }
++    }
++    RegCloseKey( fk );
++    return ret;
++}
++
++static LONG save_context( HKEY tk, const struct context *ctx )
++{
++    const struct function *f, *g;
++    ULONG done[16], ndone = 0, i;
++    HKEY ck, ik;
++    LONG ret;
++
++    if ((ret = create_key( tk, ctx->name, &ck ))) return ret;
++    if ((ret = set_dword( ck, L"Flags", ctx->flags )) || (ret = set_dword( ck, L"Reserved", ctx->reserved )))
++        goto done;
++
++    LIST_FOR_EACH_ENTRY( f, &ctx->functions, struct function, entry )
++    {
++        WCHAR kname[9];
++        const WCHAR **names;
++        ULONG count = 0;
++
++        for (i = 0; i < ndone; i++) if (done[i] == f->iface) break;
++        if (i < ndone) continue;
++        if (ndone < ARRAY_SIZE(done)) done[ndone++] = f->iface;
++
++        LIST_FOR_EACH_ENTRY( g, &ctx->functions, struct function, entry ) if (g->iface == f->iface) count++;
++        if (!(names = malloc( count * sizeof(*names) ))) { ret = ERROR_NOT_ENOUGH_MEMORY; goto done; }
++        count = 0;
++        LIST_FOR_EACH_ENTRY( g, &ctx->functions, struct function, entry )
++            if (g->iface == f->iface) names[count++] = g->name;
++
++        iface_key_name( f->iface, kname );
++        if (!(ret = create_key( ck, kname, &ik )))
++        {
++#ifdef SG_MUTANT_BCCFG_SAVEORD
++            for (i = 0; i < count / 2; i++) { const WCHAR *tmp = names[i]; names[i] = names[count - 1 - i]; names[count - 1 - i] = tmp; }
++#endif
++            ret = set_multi( ik, L"Functions", names, count );
++            LIST_FOR_EACH_ENTRY( g, &ctx->functions, struct function, entry )
++                if (!ret && g->iface == f->iface) ret = save_function( ik, g );
++            RegCloseKey( ik );
++        }
++        free( names );
++        if (ret) goto done;
++    }
++done:
++    RegCloseKey( ck );
++    return ret;
++}
++
++static LONG save_table( ULONG table )
++{
++    const struct context *ctx;
++    HKEY base, tk;
++    LONG ret;
++
++    if ((ret = create_key( HKEY_LOCAL_MACHINE, CONFIG_KEY, &base ))) return ret;
++    ret = RegDeleteTreeW( base, table_key_name( table ) );
++    if (ret == ERROR_FILE_NOT_FOUND) ret = 0;
++    if (!ret && !(ret = create_key( base, table_key_name( table ), &tk )))
++    {
++        LIST_FOR_EACH_ENTRY( ctx, &contexts[table - 1], struct context, entry )
++            if ((ret = save_context( tk, ctx ))) break;
++        RegCloseKey( tk );
++    }
++    RegCloseKey( base );
++    return ret;
++}
++
++static LONG save_image( HKEY pk, const WCHAR *which, const CRYPT_IMAGE_REG *image )
++{
++    HKEY uk, ik;
++    ULONG i;
++    LONG ret;
++
++    if ((ret = create_key( pk, which, &uk ))) return ret;
++    if ((ret = RegSetValueExW( uk, L"Image", 0, REG_SZ, (const BYTE *)image->pszImage,
++                               (wcslen( image->pszImage ) + 1) * sizeof(WCHAR) ))) goto done;
++    for (i = 0; i < image->cInterfaces; i++)
++    {
++        const CRYPT_INTERFACE_REG *in = image->rgpInterfaces[i];
++        WCHAR kname[9];
++
++        iface_key_name( in->dwInterface, kname );
++        if ((ret = create_key( uk, kname, &ik ))) break;
++        if (!(ret = set_multi( ik, L"Functions", (const WCHAR *const *)in->rgpszFunctions, in->cFunctions )))
++            ret = set_dword( ik, L"Flags", in->dwFlags );
++        RegCloseKey( ik );
++        if (ret) break;
++    }
++done:
++    RegCloseKey( uk );
++    return ret;
++}
++
++static LONG save_providers(void)
++{
++    const struct provider *p;
++    HKEY base, pk;
++    LONG ret;
++
++    if ((ret = create_key( HKEY_LOCAL_MACHINE, PROVIDERS_KEY, &base ))) return ret;
++    for (;;)  /* everything stored here was loaded into the model, so rewrite it all */
++    {
++        WCHAR name[256];
++        DWORD len = ARRAY_SIZE(name);
++
++        if (RegEnumKeyExW( base, 0, name, &len, NULL, NULL, NULL, NULL )) break;
++        if ((ret = RegDeleteTreeW( base, name ))) goto done;
++    }
++    LIST_FOR_EACH_ENTRY( p, &providers, struct provider, entry )
++    {
++        if ((ret = create_key( base, p->name, &pk ))) break;
++        ret = set_multi( pk, L"Alias", (const WCHAR *const *)p->reg->rgpszAliases, p->reg->cAliases );
++        if (!ret && p->reg->pUM) ret = save_image( pk, L"UM", p->reg->pUM );
++        if (!ret && p->reg->pKM) ret = save_image( pk, L"KM", p->reg->pKM );
++        RegCloseKey( pk );
++        if (ret) break;
++    }
++done:
++    RegCloseKey( base );
++    return ret;
++}
++
++static LONG save_model( unsigned int dirty )
++{
++    LONG ret = 0;
++
++    /* the Local table last: its existence says the whole store was written */
++    if ((dirty & DIRTY_PROVIDERS) && (ret = save_providers())) return ret;
++    if ((dirty & DIRTY_DOMAIN) && (ret = save_table( CRYPT_DOMAIN ))) return ret;
++    if (dirty & DIRTY_LOCAL) ret = save_table( CRYPT_LOCAL );
++    return ret;
++}
++
++/* called with config_lock held: the model is whatever the registry says now */
++static void config_begin(void)
++{
++    BOOL have_local;
++
++    clear_model();
++    have_local = load_table( CRYPT_LOCAL );
++    load_table( CRYPT_DOMAIN );
++    load_providers();
++    if (have_local) return;  /* the Local key is written last, see save_model() */
++
++    /* a store that was never written: the built-in defaults, written out when
++     * we are allowed to (otherwise they are re-derived on every call) */
++    seed_model();
++    save_model( DIRTY_LOCAL | DIRTY_DOMAIN | DIRTY_PROVIDERS );
++}
++
++/* releases config_lock; a change that succeeded is written back first */
++static NTSTATUS config_end( NTSTATUS status, unsigned int dirty )
++{
++#ifdef SG_MUTANT_BCCFG_NOPERSIST
++    dirty = 0;
++#endif
++    if (!status && dirty)
++    {
++        LONG ret = save_model( dirty );
++        if (ret) status = ret == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED : STATUS_UNSUCCESSFUL;
++    }
++    ReleaseSRWLockExclusive( &config_lock );
++    return status;
++}
++
+ /* ---- string-list results ---- */
+ 
+ struct strlist
+@@ -575,14 +1134,13 @@ NTSTATUS WINAPI BCryptCreateContext( ULONG table, const WCHAR *ctx_name, CRYPT_C
+ 
+     TRACE( "%#lx, %s, %p\n", table, debugstr_w(ctx_name), cfg );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name )) return STATUS_INVALID_PARAMETER;
++    if (!valid_table( table ) || !valid_key_name( ctx_name )) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (find_context( table, ctx_name )) status = STATUS_OBJECT_NAME_COLLISION;
+     else if (!add_context( table, ctx_name, cfg )) status = STATUS_NO_MEMORY;
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, (1u << (table - 1)) );
+ }
+ 
+ NTSTATUS WINAPI BCryptDeleteContext( ULONG table, const WCHAR *ctx_name )
+@@ -592,21 +1150,16 @@ NTSTATUS WINAPI BCryptDeleteContext( ULONG table, const WCHAR *ctx_name )
+ 
+     TRACE( "%#lx, %s\n", table, debugstr_w(ctx_name) );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name )) return STATUS_INVALID_PARAMETER;
++    if (!valid_table( table ) || !valid_key_name( ctx_name )) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name ))) status = STATUS_NOT_FOUND;
+     else
+     {
+-        while (!list_empty( &ctx->functions ))
+-            free_function( LIST_ENTRY( list_head( &ctx->functions ), struct function, entry ) );
+-        list_remove( &ctx->entry );
+-        free( ctx->name );
+-        free( ctx );
++        free_context( ctx );
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, (1u << (table - 1)) );
+ }
+ 
+ NTSTATUS WINAPI BCryptConfigureContext( ULONG table, const WCHAR *ctx_name, CRYPT_CONTEXT_CONFIG *cfg )
+@@ -616,18 +1169,17 @@ NTSTATUS WINAPI BCryptConfigureContext( ULONG table, const WCHAR *ctx_name, CRYP
+ 
+     TRACE( "%#lx, %s, %p\n", table, debugstr_w(ctx_name), cfg );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !cfg) return STATUS_INVALID_PARAMETER;
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !cfg) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name ))) status = STATUS_NOT_FOUND;
+     else
+     {
+         ctx->flags = cfg->dwFlags;
+         ctx->reserved = cfg->dwReserved;
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, (1u << (table - 1)) );
+ }
+ 
+ static void fill_context_config( struct blob *b, const void *arg )
+@@ -650,14 +1202,13 @@ NTSTATUS WINAPI BCryptQueryContextConfiguration( ULONG table, const WCHAR *ctx_n
+ 
+     TRACE( "%#lx, %s, %p, %p\n", table, debugstr_w(ctx_name), size, buffer );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !size || !buffer) return STATUS_INVALID_PARAMETER;
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !size || !buffer) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name ))) status = STATUS_NOT_FOUND;
+     else status = deliver( fill_context_config, ctx, size, (void **)buffer );
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, 0 );
+ }
+ 
+ NTSTATUS WINAPI BCryptEnumContexts( ULONG table, ULONG *size, CRYPT_CONTEXTS **buffer )
+@@ -671,7 +1222,7 @@ NTSTATUS WINAPI BCryptEnumContexts( ULONG table, ULONG *size, CRYPT_CONTEXTS **b
+     if (!valid_table( table ) || !size || !buffer) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     LIST_FOR_EACH_ENTRY( ctx, &contexts[table - 1], struct context, entry ) l.count++;
+     if (!(l.names = malloc( (l.count + 1) * sizeof(*l.names) ))) status = STATUS_NO_MEMORY;
+     else
+@@ -681,8 +1232,7 @@ NTSTATUS WINAPI BCryptEnumContexts( ULONG table, ULONG *size, CRYPT_CONTEXTS **b
+         status = deliver( fill_strlist, &l, size, (void **)buffer );
+         free( l.names );
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, 0 );
+ }
+ 
+ NTSTATUS WINAPI BCryptAddContextFunction( ULONG table, const WCHAR *ctx_name, ULONG iface, const WCHAR *func,
+@@ -693,16 +1243,15 @@ NTSTATUS WINAPI BCryptAddContextFunction( ULONG table, const WCHAR *ctx_name, UL
+ 
+     TRACE( "%#lx, %s, %#lx, %s, %lu\n", table, debugstr_w(ctx_name), iface, debugstr_w(func), pos );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !valid_name( func ))
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !valid_key_name( func ))
+         return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name ))) status = STATUS_NOT_FOUND;
+     else if (find_function( ctx, iface, func )) status = STATUS_OBJECT_NAME_COLLISION;
+     else if (!add_function( ctx, iface, func, pos )) status = STATUS_NO_MEMORY;
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, (1u << (table - 1)) );
+ }
+ 
+ NTSTATUS WINAPI BCryptRemoveContextFunction( ULONG table, const WCHAR *ctx_name, ULONG iface, const WCHAR *func )
+@@ -713,15 +1262,14 @@ NTSTATUS WINAPI BCryptRemoveContextFunction( ULONG table, const WCHAR *ctx_name,
+ 
+     TRACE( "%#lx, %s, %#lx, %s\n", table, debugstr_w(ctx_name), iface, debugstr_w(func) );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !valid_name( func ))
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !valid_key_name( func ))
+         return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name )) || !(f = find_function( ctx, iface, func ))) status = STATUS_NOT_FOUND;
+     else free_function( f );
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, (1u << (table - 1)) );
+ }
+ 
+ NTSTATUS WINAPI BCryptEnumContextFunctions( ULONG table, const WCHAR *ctx_name, ULONG iface, ULONG *size,
+@@ -734,11 +1282,11 @@ NTSTATUS WINAPI BCryptEnumContextFunctions( ULONG table, const WCHAR *ctx_name,
+ 
+     TRACE( "%#lx, %s, %#lx, %p, %p\n", table, debugstr_w(ctx_name), iface, size, buffer );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !size || !buffer)
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !size || !buffer)
+         return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name ))) status = STATUS_NOT_FOUND;
+     else
+     {
+@@ -753,8 +1301,7 @@ NTSTATUS WINAPI BCryptEnumContextFunctions( ULONG table, const WCHAR *ctx_name,
+             free( l.names );
+         }
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, 0 );
+ }
+ 
+ static void fill_function_config( struct blob *b, const void *arg )
+@@ -778,19 +1325,18 @@ NTSTATUS WINAPI BCryptConfigureContextFunction( ULONG table, const WCHAR *ctx_na
+ 
+     TRACE( "%#lx, %s, %#lx, %s, %p\n", table, debugstr_w(ctx_name), iface, debugstr_w(func), cfg );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !valid_name( func ) || !cfg)
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !valid_key_name( func ) || !cfg)
+         return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name )) || !(f = find_function( ctx, iface, func ))) status = STATUS_NOT_FOUND;
+     else
+     {
+         f->flags = cfg->dwFlags;
+         f->reserved = cfg->dwReserved;
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, (1u << (table - 1)) );
+ }
+ 
+ NTSTATUS WINAPI BCryptQueryContextFunctionConfiguration( ULONG table, const WCHAR *ctx_name, ULONG iface,
+@@ -803,15 +1349,14 @@ NTSTATUS WINAPI BCryptQueryContextFunctionConfiguration( ULONG table, const WCHA
+ 
+     TRACE( "%#lx, %s, %#lx, %s, %p, %p\n", table, debugstr_w(ctx_name), iface, debugstr_w(func), size, buffer );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !valid_name( func ) ||
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !valid_key_name( func ) ||
+         !size || !buffer) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name )) || !(f = find_function( ctx, iface, func ))) status = STATUS_NOT_FOUND;
+     else status = deliver( fill_function_config, f, size, (void **)buffer );
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, 0 );
+ }
+ 
+ NTSTATUS WINAPI BCryptAddContextFunctionProvider( ULONG table, const WCHAR *ctx_name, ULONG iface, const WCHAR *func,
+@@ -825,11 +1370,11 @@ NTSTATUS WINAPI BCryptAddContextFunctionProvider( ULONG table, const WCHAR *ctx_
+     TRACE( "%#lx, %s, %#lx, %s, %s, %lu\n", table, debugstr_w(ctx_name), iface, debugstr_w(func),
+            debugstr_w(provider), pos );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !valid_name( func ) ||
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !valid_key_name( func ) ||
+         !valid_name( provider )) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name )) || !(f = find_function( ctx, iface, func ))) status = STATUS_NOT_FOUND;
+     else
+     {
+@@ -837,8 +1382,7 @@ NTSTATUS WINAPI BCryptAddContextFunctionProvider( ULONG table, const WCHAR *ctx_
+             if (name_eq( n->name, provider )) status = STATUS_OBJECT_NAME_COLLISION;
+         if (!status && !add_name( &f->providers, provider, pos )) status = STATUS_NO_MEMORY;
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, (1u << (table - 1)) );
+ }
+ 
+ NTSTATUS WINAPI BCryptRemoveContextFunctionProvider( ULONG table, const WCHAR *ctx_name, ULONG iface,
+@@ -851,11 +1395,11 @@ NTSTATUS WINAPI BCryptRemoveContextFunctionProvider( ULONG table, const WCHAR *c
+ 
+     TRACE( "%#lx, %s, %#lx, %s, %s\n", table, debugstr_w(ctx_name), iface, debugstr_w(func), debugstr_w(provider) );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !valid_name( func ) ||
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !valid_key_name( func ) ||
+         !valid_name( provider )) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if ((ctx = find_context( table, ctx_name )) && (f = find_function( ctx, iface, func )))
+     {
+         LIST_FOR_EACH_ENTRY( n, &f->providers, struct name_entry, entry )
+@@ -868,8 +1412,7 @@ NTSTATUS WINAPI BCryptRemoveContextFunctionProvider( ULONG table, const WCHAR *c
+             break;
+         }
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, (1u << (table - 1)) );
+ }
+ 
+ NTSTATUS WINAPI BCryptEnumContextFunctionProviders( ULONG table, const WCHAR *ctx_name, ULONG iface,
+@@ -882,15 +1425,14 @@ NTSTATUS WINAPI BCryptEnumContextFunctionProviders( ULONG table, const WCHAR *ct
+ 
+     TRACE( "%#lx, %s, %#lx, %s, %p, %p\n", table, debugstr_w(ctx_name), iface, debugstr_w(func), size, buffer );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !valid_name( func ) ||
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !valid_key_name( func ) ||
+         !size || !buffer) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name )) || !(f = find_function( ctx, iface, func ))) status = STATUS_NOT_FOUND;
+     else status = deliver_names( &f->providers, size, (void **)buffer );
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, 0 );
+ }
+ 
+ NTSTATUS WINAPI BCryptSetContextFunctionProperty( ULONG table, const WCHAR *ctx_name, ULONG iface, const WCHAR *func,
+@@ -905,11 +1447,11 @@ NTSTATUS WINAPI BCryptSetContextFunctionProperty( ULONG table, const WCHAR *ctx_
+     TRACE( "%#lx, %s, %#lx, %s, %s, %lu, %p\n", table, debugstr_w(ctx_name), iface, debugstr_w(func),
+            debugstr_w(prop_name), size, value );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !valid_name( func ) ||
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !valid_key_name( func ) ||
+         !valid_name( prop_name ) || (size && !value)) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(ctx = find_context( table, ctx_name )) || !(f = find_function( ctx, iface, func ))) status = STATUS_NOT_FOUND;
+     else if (!(data = malloc( size ? size : 1 ))) status = STATUS_NO_MEMORY;
+     else
+@@ -935,8 +1477,7 @@ NTSTATUS WINAPI BCryptSetContextFunctionProperty( ULONG table, const WCHAR *ctx_
+         list_add_tail( &f->properties, &p->entry );
+     }
+ done:
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, (1u << (table - 1)) );
+ }
+ 
+ static void fill_property( struct blob *b, const void *arg )
+@@ -959,11 +1500,11 @@ NTSTATUS WINAPI BCryptQueryContextFunctionProperty( ULONG table, const WCHAR *ct
+     TRACE( "%#lx, %s, %#lx, %s, %s, %p, %p\n", table, debugstr_w(ctx_name), iface, debugstr_w(func),
+            debugstr_w(prop_name), size, value );
+ 
+-    if (!valid_table( table ) || !valid_name( ctx_name ) || !valid_interface( iface ) || !valid_name( func ) ||
++    if (!valid_table( table ) || !valid_key_name( ctx_name ) || !valid_interface( iface ) || !valid_key_name( func ) ||
+         !valid_name( prop_name ) || !size || !value) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if ((ctx = find_context( table, ctx_name )) && (f = find_function( ctx, iface, func )))
+     {
+         LIST_FOR_EACH_ENTRY( p, &f->properties, struct property, entry )
+@@ -990,8 +1531,7 @@ NTSTATUS WINAPI BCryptQueryContextFunctionProperty( ULONG table, const WCHAR *ct
+             break;
+         }
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, 0 );
+ }
+ 
+ /* ---- providers ---- */
+@@ -1002,14 +1542,13 @@ NTSTATUS WINAPI BCryptRegisterProvider( const WCHAR *name, ULONG flags, CRYPT_PR
+ 
+     TRACE( "%s, %#lx, %p\n", debugstr_w(name), flags, reg );
+ 
+-    if (!valid_name( name ) || !reg || (flags & ~CRYPT_OVERWRITE) || !valid_provider_reg( reg ))
++    if (!valid_key_name( name ) || !reg || (flags & ~CRYPT_OVERWRITE) || !valid_provider_reg( reg ))
+         return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     status = register_provider( name, flags, reg );
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, DIRTY_PROVIDERS );
+ }
+ 
+ NTSTATUS WINAPI BCryptUnregisterProvider( const WCHAR *name )
+@@ -1019,20 +1558,16 @@ NTSTATUS WINAPI BCryptUnregisterProvider( const WCHAR *name )
+ 
+     TRACE( "%s\n", debugstr_w(name) );
+ 
+-    if (!valid_name( name )) return STATUS_INVALID_PARAMETER;
++    if (!valid_key_name( name )) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(p = find_provider( name ))) status = STATUS_NOT_FOUND;
+     else
+     {
+-        list_remove( &p->entry );
+-        free( p->reg );
+-        free( p->name );
+-        free( p );
++        free_provider( p );
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, DIRTY_PROVIDERS );
+ }
+ 
+ NTSTATUS WINAPI BCryptQueryProviderRegistration( const WCHAR *name, ULONG mode, ULONG iface, ULONG *size,
+@@ -1044,11 +1579,11 @@ NTSTATUS WINAPI BCryptQueryProviderRegistration( const WCHAR *name, ULONG mode,
+ 
+     TRACE( "%s, %#lx, %#lx, %p, %p\n", debugstr_w(name), mode, iface, size, buffer );
+ 
+-    if (!valid_name( name ) || !size || !buffer || mode < CRYPT_UM || mode > CRYPT_ANY ||
++    if (!valid_key_name( name ) || !size || !buffer || mode < CRYPT_UM || mode > CRYPT_ANY ||
+         (iface && !valid_interface( iface ))) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     if (!(p = find_provider( name ))) status = STATUS_NOT_FOUND;
+     else if ((mode == CRYPT_UM && !p->reg->pUM) || (mode == CRYPT_KM && !p->reg->pKM) ||
+              (mode == CRYPT_MM && (!p->reg->pUM || !p->reg->pKM)))
+@@ -1064,8 +1599,7 @@ NTSTATUS WINAPI BCryptQueryProviderRegistration( const WCHAR *name, ULONG mode,
+ #endif
+         status = deliver( fill_provider_reg, &rc, size, (void **)buffer );
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, 0 );
+ }
+ 
+ NTSTATUS WINAPI BCryptEnumRegisteredProviders( ULONG *size, CRYPT_PROVIDERS **buffer )
+@@ -1079,7 +1613,7 @@ NTSTATUS WINAPI BCryptEnumRegisteredProviders( ULONG *size, CRYPT_PROVIDERS **bu
+     if (!size || !buffer) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     LIST_FOR_EACH_ENTRY( p, &providers, struct provider, entry ) l.count++;
+     if (!(l.names = malloc( (l.count + 1) * sizeof(*l.names) ))) status = STATUS_NO_MEMORY;
+     else
+@@ -1089,8 +1623,7 @@ NTSTATUS WINAPI BCryptEnumRegisteredProviders( ULONG *size, CRYPT_PROVIDERS **bu
+         status = deliver( fill_strlist, &l, size, (void **)buffer );
+         free( l.names );
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
+-    return status;
++    return config_end( status, 0 );
+ }
+ 
+ static BOOL image_has_function( const CRYPT_IMAGE_REG *image, const WCHAR *alg )
+@@ -1116,7 +1649,7 @@ NTSTATUS WINAPI BCryptEnumProviders( const WCHAR *alg, ULONG *count, BCRYPT_PROV
+     if (!valid_name( alg ) || !count || !list) return STATUS_INVALID_PARAMETER;
+ 
+     AcquireSRWLockExclusive( &config_lock );
+-    seed_config();
++    config_begin();
+     LIST_FOR_EACH_ENTRY( p, &providers, struct provider, entry ) l.count++;
+     if (!(l.names = malloc( (l.count + 1) * sizeof(*l.names) ))) status = STATUS_NO_MEMORY;
+     else
+@@ -1133,6 +1666,436 @@ NTSTATUS WINAPI BCryptEnumProviders( const WCHAR *alg, ULONG *count, BCRYPT_PROV
+         }
+         free( l.names );
+     }
+-    ReleaseSRWLockExclusive( &config_lock );
++    return config_end( status, 0 );
++}
++
++/* ---- provider resolution ---- */
++
++struct resolve_item
++{
++    ULONG                     iface;
++    const WCHAR              *func;
++    const WCHAR              *provider;
++    const struct function    *f;      /* the context function, if it is configured */
++    const CRYPT_PROVIDER_REG *reg;
++};
++
++struct resolve_list
++{
++    ULONG                mode;
++    ULONG                count, cap;
++    struct resolve_item *items;
++};
++
++/* does the image register this function for this interface */
++static const CRYPT_INTERFACE_REG *image_interface( const CRYPT_IMAGE_REG *image, ULONG iface, const WCHAR *func )
++{
++    ULONG i, j;
++
++    if (!image) return NULL;
++    for (i = 0; i < image->cInterfaces; i++)
++    {
++        const CRYPT_INTERFACE_REG *in = image->rgpInterfaces[i];
++        if (in->dwInterface != iface) continue;
++        for (j = 0; j < in->cFunctions; j++)
++            if (name_eq( in->rgpszFunctions[j], func )) return in;
++    }
++    return NULL;
++}
++
++static BOOL resolve_wants_um( ULONG mode ) { return mode != CRYPT_KM; }
++static BOOL resolve_wants_km( ULONG mode ) { return mode != CRYPT_UM; }
++
++static BOOL provider_usable( const CRYPT_PROVIDER_REG *reg, ULONG iface, const WCHAR *func, ULONG mode )
++{
++    BOOL um = image_interface( reg->pUM, iface, func ) != NULL;
++    BOOL km = image_interface( reg->pKM, iface, func ) != NULL;
++
++#ifdef SG_MUTANT_BCRES_MODE
++    return um || km;
++#endif
++    switch (mode)
++    {
++    case CRYPT_UM: return um;
++    case CRYPT_KM: return km;
++    case CRYPT_MM: return um && km;
++    default:       return um || km;
++    }
++}
++
++static BOOL resolve_add( struct resolve_list *l, ULONG iface, const struct function *f, const WCHAR *func,
++                         const WCHAR *provider, const WCHAR *only )
++{
++    const struct provider *p;
++
++    if (only && !name_eq( only, provider )) return TRUE;
++    if (!(p = find_provider( provider ))) return TRUE;
++    if (!provider_usable( p->reg, iface, func, l->mode )) return TRUE;
++    if (l->count == l->cap)
++    {
++        ULONG cap = l->cap ? l->cap * 2 : 8;
++        struct resolve_item *items = realloc( l->items, cap * sizeof(*items) );
++        if (!items) return FALSE;
++        l->items = items;
++        l->cap = cap;
++    }
++    l->items[l->count].iface = iface;
++    l->items[l->count].func = func;
++    l->items[l->count].provider = p->name;
++    l->items[l->count].f = f;
++    l->items[l->count].reg = p->reg;
++    l->count++;
++    return TRUE;
++}
++
++static void fill_resolved( struct blob *b, const void *arg )
++{
++    const struct resolve_list *l = arg;
++    CRYPT_PROVIDER_REFS *refs;
++    CRYPT_PROVIDER_REF **list;
++    ULONG i;
++
++    refs = blob_alloc( b, sizeof(*refs) );
++    list = blob_alloc( b, l->count * sizeof(*list) );
++    if (refs)
++    {
++        refs->cProviders = l->count;
++        refs->rgpProviders = list;
++    }
++    for (i = 0; i < l->count; i++)
++    {
++        const struct resolve_item *it = &l->items[i];
++        const struct property *prop;
++        CRYPT_PROVIDER_REF *ref;
++        CRYPT_PROPERTY_REF **props;
++        ULONG nprops = 0, j = 0;
++
++        if (it->f) LIST_FOR_EACH_ENTRY( prop, &it->f->properties, struct property, entry ) nprops++;
++#ifdef SG_MUTANT_BCRES_PROPS
++        nprops = 0;
++#endif
++        ref = blob_alloc( b, sizeof(*ref) );
++        props = blob_alloc( b, nprops * sizeof(*props) );
++        if (ref)
++        {
++            ref->dwInterface = it->iface;
++            ref->cProperties = nprops;
++            ref->rgpProperties = props;
++            ref->pUM = ref->pKM = NULL;
++            list[i] = ref;
++        }
++        {
++            WCHAR *s = blob_str( b, it->func );
++            if (ref) ref->pszFunction = s;
++            s = blob_str( b, it->provider );
++            if (ref) ref->pszProvider = s;
++        }
++        if (nprops) LIST_FOR_EACH_ENTRY( prop, &it->f->properties, struct property, entry )
++        {
++            CRYPT_PROPERTY_REF *pr = blob_alloc( b, sizeof(*pr) );
++            WCHAR *name = blob_str( b, prop->name );
++            BYTE *data = blob_alloc( b, prop->size ? prop->size : 1 );
++
++            if (data && prop->size) memcpy( data, prop->data, prop->size );
++            if (pr)
++            {
++                pr->pszProperty = name;
++                pr->cbValue = prop->size;
++                pr->pbValue = data;
++                props[j] = pr;
++            }
++            j++;
++        }
++        for (j = 0; j < 2; j++)
++        {
++            const CRYPT_IMAGE_REG *src = j ? it->reg->pKM : it->reg->pUM;
++            const CRYPT_INTERFACE_REG *in;
++            CRYPT_IMAGE_REF *image;
++
++            if (!(j ? resolve_wants_km( l->mode ) : resolve_wants_um( l->mode ))) continue;
++            if (!(in = image_interface( src, it->iface, it->func ))) continue;
++            image = blob_alloc( b, sizeof(*image) );
++            {
++                WCHAR *s = blob_str( b, src->pszImage );
++                if (image)
++                {
++                    image->pszImage = s;
++                    image->dwFlags = in->dwFlags;
++                    if (ref) { if (j) ref->pKM = image; else ref->pUM = image; }
++                }
++            }
++        }
++    }
++}
++
++/* Modes and flags as documented: the context defaults to "Default"; a NULL
++ * function (or CRYPT_ALL_FUNCTIONS) walks every function configured for the
++ * interface (0 = every interface); CRYPT_ALL_PROVIDERS lists every registered
++ * provider that offers the function instead of the context's own list; a
++ * provider name narrows the result to that provider.  A provider is only
++ * returned when it is registered and registers the function in the image
++ * kind the mode asks for.  Which table wins when a name is in both is not
++ * documented, the local one is searched first. */
++NTSTATUS WINAPI BCryptResolveProviders( const WCHAR *ctx_name, ULONG iface, const WCHAR *func,
++                                        const WCHAR *provider, ULONG mode, ULONG flags, ULONG *size,
++                                        CRYPT_PROVIDER_REFS **buffer )
++{
++    struct resolve_list l = { mode, 0, 0, NULL };
++    struct context *ctx = NULL;
++    const struct function *f;
++    const struct provider *p;
++    NTSTATUS status = STATUS_SUCCESS;
++    BOOL all_funcs = !func || (flags & CRYPT_ALL_FUNCTIONS);
++    ULONG t;
++
++    TRACE( "%s, %#lx, %s, %s, %#lx, %#lx, %p, %p\n", debugstr_w(ctx_name), iface, debugstr_w(func),
++           debugstr_w(provider), mode, flags, size, buffer );
++
++    if (!size || !buffer || mode < CRYPT_UM || mode > CRYPT_ANY ||
++        (flags & ~(CRYPT_ALL_FUNCTIONS | CRYPT_ALL_PROVIDERS)) || (iface && !valid_interface( iface )) ||
++        (ctx_name && !valid_key_name( ctx_name )) || (func && !valid_name( func )) ||
++        (provider && !valid_name( provider )))
++        return STATUS_INVALID_PARAMETER;
++    if (!ctx_name) ctx_name = L"Default";
++#ifdef SG_MUTANT_BCRES_ALLPROV
++    flags &= ~CRYPT_ALL_PROVIDERS;
++#endif
++
++    AcquireSRWLockExclusive( &config_lock );
++    config_begin();
++    for (t = CRYPT_LOCAL; t <= CRYPT_DOMAIN && !ctx; t++) ctx = find_context( t, ctx_name );
++    if (!ctx) status = STATUS_NOT_FOUND;
++    else
++    {
++        struct resolve_item *targets = NULL;
++        ULONG ntargets = 0, i;
++
++        /* the (interface, function) pairs to resolve, then their providers */
++        LIST_FOR_EACH_ENTRY( f, &ctx->functions, struct function, entry )
++        {
++            if (iface && f->iface != iface) continue;
++            if (!all_funcs && !name_eq( f->name, func )) continue;
++            ntargets++;
++        }
++        if (!(targets = calloc( ntargets + 1, sizeof(*targets) ))) status = STATUS_NO_MEMORY;
++        else
++        {
++            ntargets = 0;
++            LIST_FOR_EACH_ENTRY( f, &ctx->functions, struct function, entry )
++            {
++                if (iface && f->iface != iface) continue;
++                if (!all_funcs && !name_eq( f->name, func )) continue;
++                targets[ntargets].iface = f->iface;
++                targets[ntargets++].f = f;
++            }
++            if (!ntargets && !all_funcs && iface && (flags & CRYPT_ALL_PROVIDERS))
++            {
++                /* not configured in the context, but every provider that has it counts */
++                targets[0].iface = iface;
++                ntargets = 1;
++            }
++            for (i = 0; i < ntargets && status == STATUS_SUCCESS; i++)
++            {
++                const WCHAR *name = targets[i].f ? targets[i].f->name : func;
++
++                if (flags & CRYPT_ALL_PROVIDERS)
++                {
++                    LIST_FOR_EACH_ENTRY( p, &providers, struct provider, entry )
++                        if (!resolve_add( &l, targets[i].iface, targets[i].f, name, p->name, provider ))
++                            status = STATUS_NO_MEMORY;
++                }
++                else if (targets[i].f)
++                {
++                    struct name_entry *n;
++                    LIST_FOR_EACH_ENTRY( n, &targets[i].f->providers, struct name_entry, entry )
++                        if (!resolve_add( &l, targets[i].iface, targets[i].f, name, n->name, provider ))
++                            status = STATUS_NO_MEMORY;
++                }
++            }
++            free( targets );
++        }
++        if (!status && !l.count) status = STATUS_NOT_FOUND;
++        if (!status) status = deliver( fill_resolved, &l, size, (void **)buffer );
++        free( l.items );
++    }
++    return config_end( status, 0 );
++}
++
++/* ---- configuration change notification ---- */
++
++struct notify_entry
++{
++    struct list entry;
++    HANDLE      event;
++};
++
++static SRWLOCK     notify_lock = SRWLOCK_INIT;
++static struct list notify_list = LIST_INIT( notify_list );
++static HANDLE      notify_thread, notify_stop;
++static HMODULE     notify_module;  /* keeps this dll mapped while the thread runs */
++
++static DWORD WINAPI notify_proc( void *arg )
++{
++    HANDLE ready = arg, events[3];
++    HKEY keys[2] = { NULL, NULL };
++    BOOL armed[2] = { FALSE, FALSE };
++    const WCHAR *names[2] = { CONFIG_KEY, PROVIDERS_KEY };
++    ULONG i, n;
++
++    events[0] = notify_stop;
++    for (i = 0, n = 0; i < 2; i++)
++    {
++        HKEY key;
++        /* the keys are created when we may; reading them is enough to be told */
++        if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, names[i], 0, NULL, 0, KEY_NOTIFY, NULL, &key, NULL ) &&
++            RegOpenKeyExW( HKEY_LOCAL_MACHINE, names[i], 0, KEY_NOTIFY, &key )) continue;
++        if (!(events[1 + n] = CreateEventW( NULL, FALSE, FALSE, NULL )))
++        {
++            RegCloseKey( key );
++            continue;
++        }
++        keys[n++] = key;
++    }
++
++    for (;;)
++    {
++        DWORD ret;
++        struct notify_entry *e;
++
++        for (i = 0; i < n; i++)
++        {
++            if (armed[i]) continue;
++            if (!RegNotifyChangeKeyValue( keys[i], TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |
++                                          REG_NOTIFY_CHANGE_LAST_SET, events[1 + i], TRUE )) armed[i] = TRUE;
++        }
++        if (ready)
++        {
++            SetEvent( ready );
++            ready = NULL;
++        }
++        ret = WaitForMultipleObjects( 1 + n, events, FALSE, INFINITE );
++        if (ret == WAIT_OBJECT_0 || ret >= WAIT_OBJECT_0 + 1 + n) break;
++        armed[ret - WAIT_OBJECT_0 - 1] = FALSE;
++
++#ifndef SG_MUTANT_BCNOT_NOSIGNAL
++        AcquireSRWLockShared( &notify_lock );
++        LIST_FOR_EACH_ENTRY( e, &notify_list, struct notify_entry, entry ) SetEvent( e->event );
++        ReleaseSRWLockShared( &notify_lock );
++#endif
++    }
++
++    for (i = 0; i < n; i++)
++    {
++        RegCloseKey( keys[i] );
++        CloseHandle( events[1 + i] );
++    }
++    if (ready) SetEvent( ready );
++    return 0;
++}
++
++static void stop_notify_thread( HANDLE thread, HANDLE stop, HMODULE module )
++{
++    SetEvent( stop );
++    WaitForSingleObject( thread, INFINITE );
++    CloseHandle( thread );
++    CloseHandle( stop );
++    FreeLibrary( module );
++}
++
++/* Which way round the argument goes is not documented for user mode (the
++ * kernel header takes an event object).  A handle to an event the caller
++ * already has is signalled on every change; if *event holds no usable handle
++ * a manual-reset event is created and returned there, which the caller owns
++ * and closes after unregistering it. */
++NTSTATUS WINAPI BCryptRegisterConfigChangeNotify( HANDLE *event )
++{
++    struct notify_entry *e;
++    HANDLE ready = NULL, h, stop = NULL, thread = NULL;
++    DWORD flags;
++    BOOL created = FALSE;
++
++    TRACE( "%p\n", event );
++
++    if (!event) return STATUS_INVALID_PARAMETER;
++    h = *event;
++    if (!h || h == INVALID_HANDLE_VALUE || !GetHandleInformation( h, &flags ))
++    {
++        if (!(h = CreateEventW( NULL, TRUE, FALSE, NULL ))) return STATUS_NO_MEMORY;
++        created = TRUE;
++    }
++    if (!(e = malloc( sizeof(*e) )))
++    {
++        if (created) CloseHandle( h );
++        return STATUS_NO_MEMORY;
++    }
++    e->event = h;
++
++    AcquireSRWLockExclusive( &notify_lock );
++    if (!notify_thread)
++    {
++        HMODULE module = NULL;
++
++        ready = CreateEventW( NULL, FALSE, FALSE, NULL );
++        stop = CreateEventW( NULL, TRUE, FALSE, NULL );
++        GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (const WCHAR *)notify_proc, &module );
++        notify_stop = stop;
++        if (ready && stop && module) thread = CreateThread( NULL, 0, notify_proc, ready, 0, NULL );
++        if (!thread)
++        {
++            ReleaseSRWLockExclusive( &notify_lock );
++            notify_stop = NULL;
++            if (ready) CloseHandle( ready );
++            if (stop) CloseHandle( stop );
++            if (module) FreeLibrary( module );
++            free( e );
++            if (created) CloseHandle( h );
++            return STATUS_NO_MEMORY;
++        }
++        notify_thread = thread;
++        notify_module = module;
++        /* wait until the first change is guaranteed to be seen; the thread
++         * takes notify_lock only after it has said it is ready */
++        WaitForSingleObject( ready, INFINITE );
++        CloseHandle( ready );
++    }
++    list_add_tail( &notify_list, &e->entry );
++    ReleaseSRWLockExclusive( &notify_lock );
++    *event = h;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS WINAPI BCryptUnregisterConfigChangeNotify( HANDLE event )
++{
++    struct notify_entry *e;
++    HANDLE thread = NULL, stop = NULL;
++    HMODULE module = NULL;
++    NTSTATUS status = STATUS_NOT_FOUND;
++
++    TRACE( "%p\n", event );
++
++    if (!event) return STATUS_INVALID_PARAMETER;
++
++    AcquireSRWLockExclusive( &notify_lock );
++    LIST_FOR_EACH_ENTRY( e, &notify_list, struct notify_entry, entry )
++    {
++#ifdef SG_MUTANT_BCNOT_NOUNREG
++        break;
++#endif
++        if (e->event != event) continue;
++        list_remove( &e->entry );
++        free( e );
++        status = STATUS_SUCCESS;
++        break;
++    }
++    if (list_empty( &notify_list ) && notify_thread)
++    {
++        thread = notify_thread;
++        stop = notify_stop;
++        module = notify_module;
++        notify_thread = notify_stop = NULL;
++        notify_module = NULL;
++    }
++    ReleaseSRWLockExclusive( &notify_lock );
++    if (thread) stop_notify_thread( thread, stop, module );
+     return status;
+ }
+--- a/include/bcrypt.h
++++ b/include/bcrypt.h
+@@ -406,6 +406,36 @@ typedef struct _CRYPT_PROVIDER_REG
+     PCRYPT_IMAGE_REG pKM;
+ } CRYPT_PROVIDER_REG, *PCRYPT_PROVIDER_REG;
+ 
++typedef struct _CRYPT_PROPERTY_REF
++{
++    PWSTR pszProperty;
++    ULONG cbValue;
++    PUCHAR pbValue;
++} CRYPT_PROPERTY_REF, *PCRYPT_PROPERTY_REF;
++
++typedef struct _CRYPT_IMAGE_REF
++{
++    PWSTR pszImage;
++    ULONG dwFlags;
++} CRYPT_IMAGE_REF, *PCRYPT_IMAGE_REF;
++
++typedef struct _CRYPT_PROVIDER_REF
++{
++    ULONG dwInterface;
++    PWSTR pszFunction;
++    PWSTR pszProvider;
++    ULONG cProperties;
++    PCRYPT_PROPERTY_REF *rgpProperties;
++    PCRYPT_IMAGE_REF pUM;
++    PCRYPT_IMAGE_REF pKM;
++} CRYPT_PROVIDER_REF, *PCRYPT_PROVIDER_REF;
++
++typedef struct _CRYPT_PROVIDER_REFS
++{
++    ULONG cProviders;
++    PCRYPT_PROVIDER_REF *rgpProviders;
++} CRYPT_PROVIDER_REFS, *PCRYPT_PROVIDER_REFS;
++
+ typedef struct _BCRYPT_KEY_DATA_BLOB_HEADER
+ {
+     ULONG dwMagic;
+@@ -528,6 +558,9 @@ typedef PVOID BCRYPT_SECRET_HANDLE;
+ 
+ #define CRYPT_OVERWRITE 0x00000001
+ 
++#define CRYPT_ALL_FUNCTIONS 0x00000001
++#define CRYPT_ALL_PROVIDERS 0x00000002
++
+ typedef struct _CRYPT_CONTEXT_FUNCTIONS
+ {
+     ULONG cFunctions;
+@@ -583,9 +616,12 @@ NTSTATUS WINAPI BCryptQueryContextConfiguration(ULONG, LPCWSTR, ULONG *, PCRYPT_
+ NTSTATUS WINAPI BCryptQueryContextFunctionConfiguration(ULONG, LPCWSTR, ULONG, LPCWSTR, ULONG *, PCRYPT_CONTEXT_FUNCTION_CONFIG *);
+ NTSTATUS WINAPI BCryptQueryContextFunctionProperty(ULONG, LPCWSTR, ULONG, LPCWSTR, LPCWSTR, ULONG *, PUCHAR *);
+ NTSTATUS WINAPI BCryptQueryProviderRegistration(LPCWSTR, ULONG, ULONG, ULONG *, PCRYPT_PROVIDER_REG *);
++NTSTATUS WINAPI BCryptRegisterConfigChangeNotify(HANDLE *);
+ NTSTATUS WINAPI BCryptRegisterProvider(LPCWSTR, ULONG, PCRYPT_PROVIDER_REG);
+ NTSTATUS WINAPI BCryptRemoveContextFunctionProvider(ULONG, LPCWSTR, ULONG, LPCWSTR, LPCWSTR);
++NTSTATUS WINAPI BCryptResolveProviders(LPCWSTR, ULONG, LPCWSTR, LPCWSTR, ULONG, ULONG, ULONG *, PCRYPT_PROVIDER_REFS *);
+ NTSTATUS WINAPI BCryptSetContextFunctionProperty(ULONG, LPCWSTR, ULONG, LPCWSTR, LPCWSTR, ULONG, PUCHAR);
++NTSTATUS WINAPI BCryptUnregisterConfigChangeNotify(HANDLE);
+ NTSTATUS WINAPI BCryptUnregisterProvider(LPCWSTR);
+ NTSTATUS WINAPI BCryptCloseAlgorithmProvider(BCRYPT_ALG_HANDLE, ULONG);
+ NTSTATUS WINAPI BCryptCreateHash(BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE *, PUCHAR, ULONG, PUCHAR, ULONG, ULONG);

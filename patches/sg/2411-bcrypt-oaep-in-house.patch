@@ -1,0 +1,382 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] bcrypt: RSA-OAEP done in bcrypt itself; ncrypt key transport uses SHA-1 again
+
+GnuTLS' OAEP route refused SHA-1 and a NULL label, so BCryptEncrypt/Decrypt
+with BCRYPT_PAD_OAEP failed on both, and the conformance test for OAEP was
+todo_wine. The padding is now built and taken apart in bcrypt (RFC 8017
+7.1: label hash, 0x01 separator, seed, MGF1 with the named hash) over the
+raw RSA operation, so every hash Windows offers works and the label may be
+NULL. Decryption checks without early exits and fails alike for any damage.
+A message too long for the key is STATUS_INVALID_PARAMETER, a short output
+buffer STATUS_BUFFER_TOO_SMALL with the size.
+
+The NCryptExportKey/NCryptImportKey key transport (2401) wraps its AES key
+with OAEP SHA-1 and no label again; envelopes written with the earlier
+SHA-256 and dummy label still import. The OAEP todo_wine block in the bcrypt
+conformance test is gone.
+---
+--- a/dlls/bcrypt/gnutls.c
++++ b/dlls/bcrypt/gnutls.c
+@@ -179,6 +179,9 @@ MAKE_FUNCPTR(gnutls_global_deinit);
+ MAKE_FUNCPTR(gnutls_global_init);
+ MAKE_FUNCPTR(gnutls_global_set_log_function);
+ MAKE_FUNCPTR(gnutls_global_set_log_level);
++MAKE_FUNCPTR(gnutls_hash_fast);
++MAKE_FUNCPTR(gnutls_hash_get_len);
++MAKE_FUNCPTR(gnutls_rnd);
+ MAKE_FUNCPTR(gnutls_perror);
+ MAKE_FUNCPTR(gnutls_privkey_decrypt_data);
+ MAKE_FUNCPTR(gnutls_privkey_deinit);
+@@ -408,6 +411,9 @@ static NTSTATUS gnutls_process_attach( void *args )
+     LOAD_FUNCPTR(gnutls_global_init)
+     LOAD_FUNCPTR(gnutls_global_set_log_function)
+     LOAD_FUNCPTR(gnutls_global_set_log_level)
++    LOAD_FUNCPTR(gnutls_hash_fast)
++    LOAD_FUNCPTR(gnutls_hash_get_len)
++    LOAD_FUNCPTR(gnutls_rnd)
+     LOAD_FUNCPTR(gnutls_perror)
+     LOAD_FUNCPTR(gnutls_privkey_deinit);
+     LOAD_FUNCPTR(gnutls_privkey_import_dsa_raw);
+@@ -2634,27 +2640,6 @@ static NTSTATUS key_asymmetric_duplicate( void *args )
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS privkey_set_rsa_oaep_params( gnutls_privkey_t key, gnutls_digest_algorithm_t dig, gnutls_datum_t *label )
+-{
+-    gnutls_x509_spki_t spki;
+-    int ret;
+-
+-    if (((ret = pgnutls_x509_spki_init( &spki ) < 0)))
+-    {
+-        pgnutls_perror( ret );
+-        return STATUS_INTERNAL_ERROR;
+-    }
+-    pgnutls_x509_spki_set_rsa_oaep_params( spki, dig, label );
+-    ret = pgnutls_privkey_set_spki( key, spki, 0 );
+-    pgnutls_x509_spki_deinit( spki );
+-    if (ret < 0)
+-    {
+-        pgnutls_perror( ret );
+-        return STATUS_INTERNAL_ERROR;
+-    }
+-    return STATUS_SUCCESS;
+-}
+-
+ /* Stained Glass OS 1681: raw RSA (BCRYPT_PAD_NONE): the block raised to the
+  * key's exponent modulo its modulus. GnuTLS has no call for it; GMP, which
+  * GnuTLS's own arithmetic stands on, does the arithmetic. */
+@@ -2760,6 +2745,157 @@ static NTSTATUS key_rsa_raw( struct key *key, BOOL private, const UCHAR *input,
+     return status;
+ }
+ 
++
++#ifdef SG_MUTANT_OAEP_NOLABEL
++#define OAEP_LABEL_LEN( pad ) 0
++#else
++#define OAEP_LABEL_LEN( pad ) ((pad)->cbLabel)
++#endif
++
++/* RSAES-OAEP (RFC 8017 7.1), done here over the raw RSA operation so that every hash
++ * Windows offers works, SHA-1 included, and so that the label may be NULL (empty), which
++ * the GnuTLS SPKI route can do neither of. */
++static NTSTATUS oaep_hash( gnutls_digest_algorithm_t dig, const UCHAR *data, ULONG len, UCHAR *out )
++{
++    static const UCHAR none[1];
++
++    if (!pgnutls_hash_fast) return STATUS_NOT_SUPPORTED;
++#ifdef SG_MUTANT_OAEP_SHA1
++    dig = GNUTLS_DIG_SHA1;  /* the hash named is ignored */
++#endif
++    if (pgnutls_hash_fast( dig, len ? data : none, len, out )) return STATUS_NOT_SUPPORTED;
++    return STATUS_SUCCESS;
++}
++
++/* mask generation function MGF1: xor the mask for seed into out */
++static NTSTATUS oaep_mgf1_xor( gnutls_digest_algorithm_t dig, ULONG hlen, const UCHAR *seed, ULONG seed_len,
++                               UCHAR *out, ULONG out_len )
++{
++    UCHAR *buf, digest[64];
++    ULONG counter, i, n;
++    NTSTATUS status = STATUS_SUCCESS;
++
++    if (!(buf = malloc( seed_len + 4 ))) return STATUS_NO_MEMORY;
++    memcpy( buf, seed, seed_len );
++    for (counter = 0, i = 0; i < out_len && !status; counter++)
++    {
++        buf[seed_len] = counter >> 24; buf[seed_len + 1] = counter >> 16;
++        buf[seed_len + 2] = counter >> 8; buf[seed_len + 3] = counter;
++#ifdef SG_MUTANT_OAEP_MGF
++        if (counter) buf[seed_len + 3]++;  /* counter skips: not MGF1 */
++#endif
++        if ((status = oaep_hash( dig, buf, seed_len + 4, digest ))) break;
++        for (n = 0; n < hlen && i < out_len; n++, i++) out[i] ^= digest[n];
++    }
++    free( buf );
++    return status;
++}
++
++static NTSTATUS oaep_params( const BCRYPT_OAEP_PADDING_INFO *pad, gnutls_digest_algorithm_t *dig, ULONG *hlen )
++{
++    if (!pad || !pad->pszAlgId)
++    {
++        WARN( "padding info not found\n" );
++        return STATUS_INVALID_PARAMETER;
++    }
++    if (pad->cbLabel && !pad->pbLabel) return STATUS_INVALID_PARAMETER;
++    if ((*dig = get_digest_from_id( pad->pszAlgId )) == GNUTLS_DIG_UNKNOWN || !pgnutls_hash_get_len)
++    {
++        FIXME( "hash algorithm %s not recognized\n", debugstr_w(pad->pszAlgId) );
++        return STATUS_NOT_SUPPORTED;
++    }
++    *hlen = pgnutls_hash_get_len( *dig );
++    if (!*hlen || *hlen > 64) return STATUS_NOT_SUPPORTED;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS key_oaep_encrypt( struct key *key, const BCRYPT_OAEP_PADDING_INFO *pad, const UCHAR *input,
++                                  ULONG input_len, UCHAR *output, ULONG output_len, ULONG *ret_len )
++{
++    gnutls_digest_algorithm_t dig;
++    ULONG hlen, k, db_len;
++    UCHAR *em = NULL, *seed, *db;
++    NTSTATUS status;
++
++    if ((status = oaep_params( pad, &dig, &hlen ))) return status;
++    if ((status = key_rsa_raw( key, FALSE, NULL, 0, NULL, 0, &k ))) return status;
++    *ret_len = k;
++#ifdef SG_MUTANT_OAEP_LENCHK
++    if (k < 2 * hlen + 2) return STATUS_INVALID_PARAMETER;
++#else
++    if (k < 2 * hlen + 2 || input_len > k - 2 * hlen - 2) return STATUS_INVALID_PARAMETER;
++#endif
++    if (!output) return STATUS_SUCCESS;
++    if (output_len < k) return STATUS_BUFFER_TOO_SMALL;
++    if (!pgnutls_rnd) return STATUS_NOT_SUPPORTED;
++
++    if (!(em = calloc( 1, k ))) return STATUS_NO_MEMORY;
++    seed = em + 1;
++    db = em + 1 + hlen;
++    db_len = k - hlen - 1;
++    if ((status = oaep_hash( dig, pad->pbLabel, OAEP_LABEL_LEN( pad ), db ))) goto done;
++    db[db_len - input_len - 1] = 1;
++    memcpy( db + db_len - input_len, input, input_len );
++    if (pgnutls_rnd( GNUTLS_RND_RANDOM, seed, hlen )) { status = STATUS_INTERNAL_ERROR; goto done; }
++#ifdef SG_MUTANT_OAEP_FIXEDSEED
++    memset( seed, 0x5a, hlen );
++#endif
++    if ((status = oaep_mgf1_xor( dig, hlen, seed, hlen, db, db_len ))) goto done;
++    if ((status = oaep_mgf1_xor( dig, hlen, db, db_len, seed, hlen ))) goto done;
++    status = key_rsa_raw( key, FALSE, em, k, output, output_len, ret_len );
++done:
++    free( em );
++    return status;
++}
++
++static NTSTATUS key_oaep_decrypt( struct key *key, const BCRYPT_OAEP_PADDING_INFO *pad, const UCHAR *input,
++                                  ULONG input_len, UCHAR *output, ULONG output_len, ULONG *ret_len )
++{
++    gnutls_digest_algorithm_t dig;
++    ULONG hlen, k, db_len, i, msg_start = 0, bad;
++    UCHAR *em = NULL, *seed, *db, lhash[64], found = 0;
++    NTSTATUS status;
++
++    if ((status = oaep_params( pad, &dig, &hlen ))) return status;
++    if ((status = key_rsa_raw( key, TRUE, NULL, 0, NULL, 0, &k ))) return status;
++    if (input_len != k || k < 2 * hlen + 2) return STATUS_INVALID_PARAMETER;
++    if (!(em = malloc( k ))) return STATUS_NO_MEMORY;
++    if ((status = key_rsa_raw( key, TRUE, input, input_len, em, k, &k ))) goto done;
++
++    seed = em + 1;
++    db = em + 1 + hlen;
++    db_len = k - hlen - 1;
++    if ((status = oaep_mgf1_xor( dig, hlen, db, db_len, seed, hlen ))) goto done;
++    if ((status = oaep_mgf1_xor( dig, hlen, seed, hlen, db, db_len ))) goto done;
++    if ((status = oaep_hash( dig, pad->pbLabel, OAEP_LABEL_LEN( pad ), lhash ))) goto done;
++
++    /* no early exits on the secret bytes: remember the first 0x01 after the zero padding */
++    bad = em[0];
++    for (i = 0; i < hlen; i++) bad |= db[i] ^ lhash[i];
++    for (i = hlen; i < db_len; i++)
++    {
++        UCHAR is1 = (db[i] == 1) && !found;
++        UCHAR nz = db[i] != 0;
++        if (!found && nz && !is1) bad |= 1;
++        if (is1) { msg_start = i + 1; found = 1; }
++    }
++    if (!found) bad |= 1;
++#ifdef SG_MUTANT_OAEP_NOCHECK
++    bad = 0; if (!found) msg_start = hlen;
++#endif
++    if (bad)
++    {
++        status = STATUS_UNSUCCESSFUL;
++        goto done;
++    }
++    *ret_len = db_len - msg_start;
++    if (output && output_len < *ret_len) status = STATUS_BUFFER_TOO_SMALL;
++    else if (output) memcpy( output, db + msg_start, *ret_len );
++done:
++    if (em) { memset( em, 0, k ); free( em ); }
++    return status;
++}
++
+ static NTSTATUS key_asymmetric_decrypt( void *args )
+ {
+     const struct key_asymmetric_decrypt_params *params = args;
+@@ -2772,26 +2908,8 @@ static NTSTATUS key_asymmetric_decrypt( void *args )
+                             params->output_len, params->ret_len );
+ 
+     if (params->key->alg_id == ALG_ID_RSA && params->flags & BCRYPT_PAD_OAEP)
+-    {
+-        BCRYPT_OAEP_PADDING_INFO *pad = params->padding;
+-        gnutls_digest_algorithm_t dig;
+-        gnutls_datum_t label;
+-
+-        if (!pad || !pad->pszAlgId)
+-        {
+-            WARN( "padding info not found\n" );
+-            return STATUS_INVALID_PARAMETER;
+-        }
+-        if ((dig = get_digest_from_id( pad->pszAlgId )) == GNUTLS_DIG_UNKNOWN)
+-        {
+-            FIXME( "hash algorithm %s not recognized\n", debugstr_w(pad->pszAlgId) );
+-            return STATUS_NOT_SUPPORTED;
+-        }
+-
+-        label.data = pad->pbLabel;
+-        label.size = pad->cbLabel;
+-        if ((status = privkey_set_rsa_oaep_params( key_data(params->key)->a.privkey, dig, &label ))) return status;
+-    }
++        return key_oaep_decrypt( params->key, params->padding, params->input, params->input_len, params->output,
++                                 params->output_len, params->ret_len );
+ 
+     e.data = params->input;
+     e.size = params->input_len;
+@@ -2809,27 +2927,6 @@ static NTSTATUS key_asymmetric_decrypt( void *args )
+     return status;
+ }
+ 
+-static NTSTATUS pubkey_set_rsa_oaep_params( gnutls_pubkey_t key, gnutls_digest_algorithm_t dig, gnutls_datum_t *label )
+-{
+-    gnutls_x509_spki_t spki;
+-    int ret;
+-
+-    if (((ret = pgnutls_x509_spki_init( &spki ) < 0)))
+-    {
+-        pgnutls_perror( ret );
+-        return STATUS_INTERNAL_ERROR;
+-    }
+-    pgnutls_x509_spki_set_rsa_oaep_params( spki, dig, label );
+-    ret = pgnutls_pubkey_set_spki( key, spki, 0 );
+-    pgnutls_x509_spki_deinit( spki );
+-    if (ret < 0)
+-    {
+-        pgnutls_perror( ret );
+-        return STATUS_INTERNAL_ERROR;
+-    }
+-    return STATUS_SUCCESS;
+-}
+-
+ static NTSTATUS key_asymmetric_encrypt( void *args )
+ {
+     const struct key_asymmetric_encrypt_params *params = args;
+@@ -2844,26 +2941,8 @@ static NTSTATUS key_asymmetric_encrypt( void *args )
+                             params->output_len, params->ret_len );
+ 
+     if (params->key->alg_id == ALG_ID_RSA && params->flags & BCRYPT_PAD_OAEP)
+-    {
+-        BCRYPT_OAEP_PADDING_INFO *pad = params->padding;
+-        gnutls_digest_algorithm_t dig;
+-        gnutls_datum_t label;
+-
+-        if (!pad || !pad->pszAlgId || !pad->pbLabel)
+-        {
+-            WARN( "padding info not found\n" );
+-            return STATUS_INVALID_PARAMETER;
+-        }
+-        if ((dig = get_digest_from_id( pad->pszAlgId )) == GNUTLS_DIG_UNKNOWN)
+-        {
+-            FIXME( "hash algorithm %s not recognized\n", debugstr_w(pad->pszAlgId) );
+-            return STATUS_NOT_SUPPORTED;
+-        }
+-
+-        label.data = pad->pbLabel;
+-        label.size = pad->cbLabel;
+-        if ((status = pubkey_set_rsa_oaep_params( key_data(params->key)->a.pubkey, dig, &label ))) return status;
+-    }
++        return key_oaep_encrypt( params->key, params->padding, params->input, params->input_len, params->output,
++                                 params->output_len, params->ret_len );
+ 
+     d.data = params->input;
+     d.size = params->input_len;
+--- a/dlls/bcrypt/tests/bcrypt.c
++++ b/dlls/bcrypt/tests/bcrypt.c
+@@ -2572,7 +2572,6 @@ static void test_rsa_encrypt(void)
+     ret = BCryptFinalizeKeyPair(key, 0);
+     ok(ret == STATUS_SUCCESS, "got %#lx\n", ret);
+ 
+-    todo_wine {
+     encrypted_size = 0;
+     ret = BCryptEncrypt(key, input, sizeof(input), &oaep_pad, NULL, 0, NULL, 0, &encrypted_size, BCRYPT_PAD_OAEP);
+     ok(ret == STATUS_SUCCESS, "got %lx\n", ret);
+@@ -2602,7 +2601,6 @@ static void test_rsa_encrypt(void)
+     ok(ret == STATUS_SUCCESS, "got %lx\n", ret);
+     ok(decrypted_size == sizeof(input), "got %lu\n", decrypted_size);
+     ok(!memcmp(decrypted, input, sizeof(input)), "unexpected output\n");
+-    }
+ 
+     free(encrypted_a);
+     free(encrypted_b);
+--- a/dlls/ncrypt/main.c
++++ b/dlls/ncrypt/main.c
+@@ -1366,7 +1366,7 @@ static SECURITY_STATUS crypt_data(NCRYPT_KEY_HANDLE key, BYTE *input, DWORD insi
+  * provider's own import always reads what its own export wrote:
+  *
+  *   DWORD magic; BYTE iv[16]; DWORD wrapped_key_len; DWORD payload_len;
+- *   then wrapped_key_len bytes: a fresh AES-256 key, RSA-OAEP (SHA-256) encrypted
++ *   then wrapped_key_len bytes: a fresh AES-256 key, RSA-OAEP (SHA-1, no label, as CNG's default) encrypted
+  *   under the wrapping key; then payload_len bytes: the plain export,
+  *   AES-256-CBC encrypted under that AES key with iv (PKCS7 padded).
+  *
+@@ -1389,8 +1389,10 @@ static SECURITY_STATUS wrap_key_for_transport(NCRYPT_KEY_HANDLE encrypt_key, con
+                                                BYTE *output, DWORD output_len, DWORD *ret_len)
+ {
+     struct object *kek = get_typed_object(encrypt_key, KEY);
+-    BYTE empty_label[1] = { 0 };
+-    BCRYPT_OAEP_PADDING_INFO oaep = { BCRYPT_SHA256_ALGORITHM, empty_label, 0 };
++    BCRYPT_OAEP_PADDING_INFO oaep = { BCRYPT_SHA1_ALGORITHM, NULL, 0 };
++#ifdef SG_MUTANT_WRAP_SHA256
++    oaep.pszAlgId = BCRYPT_SHA256_ALGORITHM; oaep.pbLabel = (BYTE *)"";
++#endif
+     BCRYPT_ALG_HANDLE aes_alg = NULL;
+     BCRYPT_KEY_HANDLE aes_key = NULL;
+     BYTE aes_secret[32], iv[16], iv_copy[16];
+@@ -1488,8 +1490,7 @@ static SECURITY_STATUS unwrap_key_for_transport(NCRYPT_KEY_HANDLE decrypt_key, c
+ {
+     struct object *kek = get_typed_object(decrypt_key, KEY);
+     const struct sg_wrapped_key_header *hdr = (const struct sg_wrapped_key_header *)blob;
+-    BYTE empty_label[1] = { 0 };
+-    BCRYPT_OAEP_PADDING_INFO oaep = { BCRYPT_SHA256_ALGORITHM, empty_label, 0 };
++    BCRYPT_OAEP_PADDING_INFO oaep = { BCRYPT_SHA1_ALGORITHM, NULL, 0 };
+     BCRYPT_ALG_HANDLE aes_alg = NULL;
+     BCRYPT_KEY_HANDLE aes_key = NULL;
+     BYTE aes_secret[32], iv_copy[16];
+@@ -1515,7 +1516,18 @@ static SECURITY_STATUS unwrap_key_for_transport(NCRYPT_KEY_HANDLE decrypt_key, c
+ 
+     if ((ret = crypt_data(decrypt_key, (BYTE *)wrapped_key, hdr->wrapped_key_len, &oaep, aes_secret,
+                           sizeof(aes_secret), &secret_len, BCRYPT_PAD_OAEP, FALSE)))
++    {
++        /* envelopes written before 2411 used SHA-256 with a dummy label */
++        BCRYPT_OAEP_PADDING_INFO old_oaep = { BCRYPT_SHA256_ALGORITHM, (BYTE *)"", 0 };
++
++#ifdef SG_MUTANT_WRAP_NOLEGACY
+         return ret;
++#endif
++        secret_len = sizeof(aes_secret);
++        if (crypt_data(decrypt_key, (BYTE *)wrapped_key, hdr->wrapped_key_len, &old_oaep, aes_secret,
++                       sizeof(aes_secret), &secret_len, BCRYPT_PAD_OAEP, FALSE))
++            return ret;
++    }
+     if (secret_len != sizeof(aes_secret))
+     {
+         RtlSecureZeroMemory(aes_secret, sizeof(aes_secret));
