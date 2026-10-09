@@ -151,6 +151,15 @@ int main(int argc, char **argv)
     }
     ok = present_color(child, 1.0f, 0.0f, 0.0f);
     printf("presented=%d\n", ok); fflush(stdout);
+    if (argc > 1 && !strcmp(argv[1], "restack"))
+    {
+        /* the top-level is restacked (what showing an owned dialog does to
+         * its owner): its child's frame is still where it was */
+        Sleep(1000);
+        SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(top, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        printf("restacked\n"); fflush(stdout);
+    }
     while (GetMessageW(&msg, NULL, 0, 0)) DispatchMessageW(&msg);
     return 0;
 }

@@ -49,6 +49,11 @@ sleep 8
 "$WINE" 'C:\\vkchild.exe' cover
 sleep 3
 import -window root "$T/c.png"
+"$WINE" 'C:\\vkchild.exe' restack > "$T/restack.out" 2>/dev/null &
+sleep 9
+"$WINE" 'C:\\vkchild.exe' cover
+sleep 3
+import -window root "$T/d.png"
 EOS
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s '-screen 0 800x600x24' "$T/session.sh"
@@ -69,6 +74,11 @@ N="$(px c 200,190)"; NR="$(px c 290,250)"
 echo "      nested: inner $N, outer $NR"
 [ "$N" = 'srgb(0,255,0)' ] && pass "a window's frame stays over its parent's after an expose" || fail "nested inner frame: $N"
 [ "$NR" = "$red" ] && pass "the parent's frame is put back around it" || fail "nested outer frame: $NR"
+# 1533: the top-level was restacked (as when it owns a dialog that opens)
+# after its child presented; after an expose the frame is shown again
+R="$(px d 250,225) $(px d 151,151)"
+echo "      after a restack and a cover: $R ($(tr '\n' ' ' < "$T/restack.out" 2>/dev/null))"
+[ "$R" = "$red $red" ] && pass "a restacked top-level's child frame is shown again after an expose" || fail "after a restack: $R"
 echo
 [ "$RC" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
