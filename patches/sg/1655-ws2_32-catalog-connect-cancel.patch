@@ -1,0 +1,2084 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ws2_32: the Winsock catalog, WSAConnectByName timeouts, WSAConnectByList, cancellable GetAddrInfoEx
+
+The rest of the Winsock catalog API were stubs that claimed success and
+did nothing (WSCInstallNameSpace, WSCEnableNSProvider, WSASetService,
+WSCSetApplicationCategory, ...) or failed (service classes,
+WSAProviderConfigChange); WSAConnectByName ignored its timeout and tried
+only the first address; WSAConnectByList was missing; GetAddrInfoEx
+ignored its timeout and GetAddrInfoExCancel never cancelled (.NET's
+cancellable DNS lookups use it).
+
+- WSAConnectByName tries each address the name resolves to, through
+  ConnectEx, until one connects; the timeout covers them all and ends a
+  connect in progress (WSAETIMEDOUT), whatever the socket's blocking
+  mode. An IPv6 socket that is not IPv6-only reaches IPv4 hosts through
+  mapped addresses. WSAConnectByList (new) does the same over a list.
+- GetAddrInfoExW's asynchronous lookups can be cancelled with
+  GetAddrInfoExCancel and end at their timeout: the overlapped completes
+  with WSA_E_CANCELLED or WSAETIMEDOUT, the completion routine or event is
+  told once, and the caller's result is not written afterwards.
+- The catalog lives under HKLM\System\CurrentControlSet\Services\
+  WinSock2\Parameters, and changing it takes an administrator:
+  - name space providers: WSCInstallNameSpace, WSCUnInstallNameSpace (not
+    the built-in ones), WSCEnableNSProvider, WSCWriteNameSpaceOrder (now
+    exported); WSAEnumNameSpaceProviders lists them in order, with their
+    state;
+  - service classes: WSAInstallServiceClass (A/W; WSAEALREADY twice),
+    WSARemoveServiceClass, WSAGetServiceClassInfo (the entries for a
+    provider's name space), WSAGetServiceClassNameByClassId;
+  - WSCSetApplicationCategory / WSCGetApplicationCategory;
+  - WSCInstallProvider / WSCDeinstallProvider record a transport provider
+    (WSCGetProviderPath gives its path); sockets are not layered through
+    it, and a FIXME says so; WSCWriteProviderOrder checks and keeps the
+    order;
+  - WSAProviderConfigChange gives a handle, then waits, or completes an
+    overlapped (event or completion routine), when the catalog changes.
+- WSASetService fails as Windows does where no name space takes
+  registrations, instead of claiming success.
+- WSANSCLASSINFOW's name is a wide string (it was declared LPSTR).
+
+Wine's ws2_32 tests: protocol 7806 tests, no failures (4 more todo_wine
+removed, WSCGetApplicationCategory); sock 2672348 tests, the same 2
+failures as before (select on a full pipe).
+
+Gate: test/wscatalog-gate.sh (64- and 32-bit, test/wscatalog-probe.c).
+Mutants SG_MUTANT_NO_CANCEL (ws2_32/protocol.c),
+SG_MUTANT_CONNECT_NO_TIMEOUT (ws2_32/socket.c), SG_MUTANT_NO_CONFIG_NOTIFY
+(ws2_32/nsp.c).
+---
+--- a/dlls/ws2_32/nsp.c
++++ b/dlls/ws2_32/nsp.c
+@@ -957,13 +957,206 @@ int WINAPI WSALookupServiceEnd( HANDLE handle )
+     return 0;
+ }
+ 
++/* The Winsock catalog (Stained Glass OS 1655): name space providers
++ * installed beside the built-in ones, their order and enabled state, service
++ * classes, application categories and installed transport providers, kept
++ * under HKLM\System\CurrentControlSet\Services\WinSock2\Parameters. Changing
++ * it takes an administrator, as on Windows. Installed transport providers
++ * (layered service providers) are recorded but not loaded: sockets here do
++ * not go through layers. */
++
++static const WCHAR catalog_path[] = L"System\\CurrentControlSet\\Services\\WinSock2\\Parameters";
++
++static int reg_error( LSTATUS status )
++{
++    switch (status)
++    {
++    case ERROR_SUCCESS: return 0;
++    case ERROR_ACCESS_DENIED: return WSAEACCES;
++    case ERROR_FILE_NOT_FOUND: return WSAEINVAL;
++    case ERROR_NOT_ENOUGH_MEMORY: case ERROR_OUTOFMEMORY: return WSA_NOT_ENOUGH_MEMORY;
++    default: return WSANO_RECOVERY;
++    }
++}
++
++static LSTATUS open_catalog( const WCHAR *sub, REGSAM access, BOOL create, HKEY *key )
++{
++    WCHAR path[256];
++
++    swprintf( path, ARRAY_SIZE(path), sub ? L"%s\\%s" : L"%s", catalog_path, sub );
++    if (create) return RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0, access, NULL, key, NULL );
++    return RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, access, key );
++}
++
++static void guid_to_name( const GUID *guid, WCHAR *buf )
++{
++    swprintf( buf, 39, L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", guid->Data1, guid->Data2,
++              guid->Data3, guid->Data4[0], guid->Data4[1], guid->Data4[2], guid->Data4[3], guid->Data4[4],
++              guid->Data4[5], guid->Data4[6], guid->Data4[7] );
++}
++
++static BOOL parse_guid( const WCHAR *str, GUID *guid )
++{
++    unsigned int d[11], i;
++
++    if (wcslen( str ) != 38 ||
++        swscanf( str, L"{%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x}", &d[0], &d[1], &d[2], &d[3], &d[4],
++                 &d[5], &d[6], &d[7], &d[8], &d[9], &d[10] ) != 11)
++        return FALSE;
++    guid->Data1 = d[0];
++    guid->Data2 = d[1];
++    guid->Data3 = d[2];
++    for (i = 0; i < 8; i++) guid->Data4[i] = d[3 + i];
++    return TRUE;
++}
++
++static LSTATUS open_catalog_entry( const WCHAR *list, const GUID *guid, REGSAM access, BOOL create, HKEY *key )
++{
++    WCHAR sub[80];
++
++    swprintf( sub, ARRAY_SIZE(sub), L"%s\\", list );
++    guid_to_name( guid, sub + wcslen( sub ) );
++    return open_catalog( sub, access, create, key );
++}
++
++static WCHAR *reg_get_string( HKEY key, const WCHAR *name )
++{
++    DWORD size = 0, type;
++    WCHAR *ret;
++
++    if (RegQueryValueExW( key, name, NULL, &type, NULL, &size ) || type != REG_SZ) return NULL;
++    if (!(ret = calloc( 1, size + sizeof(WCHAR) ))) return NULL;
++    if (RegQueryValueExW( key, name, NULL, NULL, (BYTE *)ret, &size ))
++    {
++        free( ret );
++        return NULL;
++    }
++    return ret;
++}
++
++static DWORD reg_get_dword( HKEY key, const WCHAR *name, DWORD def )
++{
++    DWORD size = sizeof(DWORD), value;
++    if (RegQueryValueExW( key, name, NULL, NULL, (BYTE *)&value, &size ) || size != sizeof(DWORD)) return def;
++    return value;
++}
++
++struct ns_provider
++{
++    GUID id;
++    DWORD name_space;
++    BOOL active;
++    DWORD version;
++    WCHAR *identifier;
++    WCHAR *path;
++    BOOL builtin;
++};
++
++static void free_ns_providers( struct ns_provider *list, unsigned int count )
++{
++    while (count--)
++    {
++        free( list[count].identifier );
++        free( list[count].path );
++    }
++    free( list );
++}
++
++/* the built-in providers, then the installed ones, in the written order */
++static unsigned int get_ns_providers( struct ns_provider **ret )
++{
++    struct ns_provider *list;
++    unsigned int count = 0, i, j;
++    WCHAR name[64];
++    DWORD index, size;
++    GUID *order;
++    HKEY key, sub;
++
++    if (!(list = calloc( ARRAY_SIZE(providers), sizeof(*list) ))) return 0;
++    for (i = 0; i < ARRAY_SIZE(providers); i++, count++)
++    {
++        list[i].id = *providers[i].id;
++        list[i].name_space = providers[i].name_space;
++        list[i].active = TRUE;
++        list[i].version = 1;
++        list[i].identifier = strdupW( providers[i].identifier );
++        list[i].path = strdupW( L"%SystemRoot%\\system32\\mswsock.dll" );
++        list[i].builtin = TRUE;
++    }
++
++    if (!open_catalog( L"NameSpaces", KEY_READ, FALSE, &key ))
++    {
++        for (index = 0; size = ARRAY_SIZE(name), !RegEnumKeyExW( key, index, name, &size, NULL, NULL, NULL, NULL ); index++)
++        {
++            struct ns_provider *grown;
++            GUID id;
++
++            if (!parse_guid( name, &id )) continue;
++            if (RegOpenKeyExW( key, name, 0, KEY_READ, &sub )) continue;
++            for (i = 0; i < count; i++) if (IsEqualGUID( &list[i].id, &id )) break;
++            if (i < count)  /* a built-in provider's state */
++            {
++                list[i].active = reg_get_dword( sub, L"Enabled", TRUE ) != 0;
++                RegCloseKey( sub );
++                continue;
++            }
++            if (!(grown = realloc( list, (count + 1) * sizeof(*list) )))
++            {
++                RegCloseKey( sub );
++                break;
++            }
++            list = grown;
++            memset( &list[count], 0, sizeof(*list) );
++            list[count].id = id;
++            list[count].name_space = reg_get_dword( sub, L"NameSpace", 0 );
++            list[count].version = reg_get_dword( sub, L"Version", 0 );
++            list[count].active = reg_get_dword( sub, L"Enabled", TRUE ) != 0;
++            list[count].identifier = reg_get_string( sub, L"Identifier" );
++            list[count].path = reg_get_string( sub, L"Path" );
++            if (!list[count].identifier) list[count].identifier = strdupW( L"" );
++            count++;
++            RegCloseKey( sub );
++        }
++
++        /* WSCWriteNameSpaceOrder */
++        size = 0;
++        if (!RegQueryValueExW( key, L"Order", NULL, NULL, NULL, &size ) && size && (order = malloc( size )))
++        {
++            unsigned int n = size / sizeof(GUID), pos = 0;
++            if (!RegQueryValueExW( key, L"Order", NULL, NULL, (BYTE *)order, &size ))
++            {
++                for (j = 0; j < n; j++)
++                {
++                    for (i = pos; i < count; i++)
++                    {
++                        if (!IsEqualGUID( &list[i].id, &order[j] )) continue;
++                        if (i != pos)
++                        {
++                            struct ns_provider tmp = list[i];
++                            memmove( &list[pos + 1], &list[pos], (i - pos) * sizeof(*list) );
++                            list[pos] = tmp;
++                        }
++                        pos++;
++                        break;
++                    }
++                }
++            }
++            free( order );
++        }
++        RegCloseKey( key );
++    }
++    *ret = list;
++    return count;
++}
++
+ /***********************************************************************
+  *      WSAEnumNameSpaceProvidersW   (ws2_32.@)
+  */
+ int WINAPI WSAEnumNameSpaceProvidersW( DWORD *len, WSANAMESPACE_INFOW *buffer )
+ {
+-    size_t size = ARRAY_SIZE(providers) * sizeof(*buffer);
+-    unsigned int i;
++    struct ns_provider *list;
++    unsigned int count, i;
++    size_t size;
+     WCHAR *str;
+ 
+     TRACE( "(%p %p)\n", len, buffer );
+@@ -973,25 +1166,32 @@ int WINAPI WSAEnumNameSpaceProvidersW( DWORD *len, WSANAMESPACE_INFOW *buffer )
+         SetLastError( WSAEFAULT );
+         return SOCKET_ERROR;
+     }
+-    for (i = 0; i < ARRAY_SIZE(providers); i++) size += (wcslen( providers[i].identifier ) + 1) * sizeof(WCHAR);
++    count = get_ns_providers( &list );
++#ifdef SG_MUTANT_NO_INSTALLED_NS
++    count = min( count, ARRAY_SIZE(providers) );
++#endif
++    size = count * sizeof(*buffer);
++    for (i = 0; i < count; i++) size += (wcslen( list[i].identifier ) + 1) * sizeof(WCHAR);
+     if (!buffer || *len < size)
+     {
++        free_ns_providers( list, count );
+         *len = size;
+         SetLastError( WSAEFAULT );
+         return SOCKET_ERROR;
+     }
+-    str = (WCHAR *)(buffer + ARRAY_SIZE(providers));
+-    for (i = 0; i < ARRAY_SIZE(providers); i++)
++    str = (WCHAR *)(buffer + count);
++    for (i = 0; i < count; i++)
+     {
+-        buffer[i].NSProviderId = *providers[i].id;
+-        buffer[i].dwNameSpace = providers[i].name_space;
+-        buffer[i].fActive = TRUE;
+-        buffer[i].dwVersion = 1;
++        buffer[i].NSProviderId = list[i].id;
++        buffer[i].dwNameSpace = list[i].name_space;
++        buffer[i].fActive = list[i].active;
++        buffer[i].dwVersion = list[i].version;
+         buffer[i].lpszIdentifier = str;
+-        wcscpy( str, providers[i].identifier );
++        wcscpy( str, list[i].identifier );
+         str += wcslen( str ) + 1;
+     }
+-    return ARRAY_SIZE(providers);
++    free_ns_providers( list, count );
++    return count;
+ }
+ 
+ /***********************************************************************
+@@ -999,8 +1199,9 @@ int WINAPI WSAEnumNameSpaceProvidersW( DWORD *len, WSANAMESPACE_INFOW *buffer )
+  */
+ int WINAPI WSAEnumNameSpaceProvidersA( DWORD *len, WSANAMESPACE_INFOA *buffer )
+ {
+-    size_t size = ARRAY_SIZE(providers) * sizeof(*buffer);
+-    unsigned int i;
++    struct ns_provider *list;
++    unsigned int count, i;
++    size_t size;
+     char *str;
+ 
+     TRACE( "(%p %p)\n", len, buffer );
+@@ -1010,26 +1211,903 @@ int WINAPI WSAEnumNameSpaceProvidersA( DWORD *len, WSANAMESPACE_INFOA *buffer )
+         SetLastError( WSAEFAULT );
+         return SOCKET_ERROR;
+     }
+-    for (i = 0; i < ARRAY_SIZE(providers); i++)
+-        size += WideCharToMultiByte( CP_ACP, 0, providers[i].identifier, -1, NULL, 0, NULL, NULL );
++    count = get_ns_providers( &list );
++    size = count * sizeof(*buffer);
++    for (i = 0; i < count; i++)
++        size += WideCharToMultiByte( CP_ACP, 0, list[i].identifier, -1, NULL, 0, NULL, NULL );
+     if (!buffer || *len < size)
+     {
++        free_ns_providers( list, count );
+         *len = size;
+         SetLastError( WSAEFAULT );
+         return SOCKET_ERROR;
+     }
+-    str = (char *)(buffer + ARRAY_SIZE(providers));
+-    for (i = 0; i < ARRAY_SIZE(providers); i++)
++    str = (char *)(buffer + count);
++    for (i = 0; i < count; i++)
+     {
+-        buffer[i].NSProviderId = *providers[i].id;
+-        buffer[i].dwNameSpace = providers[i].name_space;
+-        buffer[i].fActive = TRUE;
+-        buffer[i].dwVersion = 1;
++        buffer[i].NSProviderId = list[i].id;
++        buffer[i].dwNameSpace = list[i].name_space;
++        buffer[i].fActive = list[i].active;
++        buffer[i].dwVersion = list[i].version;
+         buffer[i].lpszIdentifier = str;
+-        str += WideCharToMultiByte( CP_ACP, 0, providers[i].identifier, -1, str,
++        str += WideCharToMultiByte( CP_ACP, 0, list[i].identifier, -1, str,
+                                     size - (str - (char *)buffer), NULL, NULL );
+     }
+-    return ARRAY_SIZE(providers);
++    free_ns_providers( list, count );
++    return count;
++}
++
++static BOOL is_builtin_ns( const GUID *id )
++{
++    unsigned int i;
++    for (i = 0; i < ARRAY_SIZE(providers); i++) if (IsEqualGUID( providers[i].id, id )) return TRUE;
++    return FALSE;
++}
++
++/***********************************************************************
++ *      WSCInstallNameSpace   (ws2_32.@)
++ */
++int WINAPI WSCInstallNameSpace( WCHAR *identifier, WCHAR *path, DWORD name_space, DWORD version, GUID *provider )
++{
++    LSTATUS status;
++    DWORD disp, one = 1;
++    HKEY key;
++    WCHAR sub[80];
++
++    TRACE( "(%s %s %#lx %#lx %s)\n", debugstr_w(identifier), debugstr_w(path), name_space, version,
++           debugstr_guid(provider) );
++
++    if (!identifier || !path || !provider || is_builtin_ns( provider ))
++    {
++        SetLastError( WSAEINVAL );
++        return SOCKET_ERROR;
++    }
++    wcscpy( sub, L"NameSpaces\\" );
++    guid_to_name( provider, sub + wcslen( sub ) );
++    {
++        WCHAR full[256];
++        swprintf( full, ARRAY_SIZE(full), L"%s\\%s", catalog_path, sub );
++        status = RegCreateKeyExW( HKEY_LOCAL_MACHINE, full, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, &disp );
++    }
++    if (status)
++    {
++        SetLastError( reg_error( status ) );
++        return SOCKET_ERROR;
++    }
++    if (disp == REG_OPENED_EXISTING_KEY)
++    {
++        RegCloseKey( key );
++        SetLastError( WSAEINVAL );   /* already installed */
++        return SOCKET_ERROR;
++    }
++    RegSetValueExW( key, L"Identifier", 0, REG_SZ, (BYTE *)identifier, (wcslen( identifier ) + 1) * sizeof(WCHAR) );
++    RegSetValueExW( key, L"Path", 0, REG_SZ, (BYTE *)path, (wcslen( path ) + 1) * sizeof(WCHAR) );
++    RegSetValueExW( key, L"NameSpace", 0, REG_DWORD, (BYTE *)&name_space, sizeof(DWORD) );
++    RegSetValueExW( key, L"Version", 0, REG_DWORD, (BYTE *)&version, sizeof(DWORD) );
++    RegSetValueExW( key, L"Enabled", 0, REG_DWORD, (BYTE *)&one, sizeof(DWORD) );
++    RegCloseKey( key );
++    return 0;
++}
++
++/***********************************************************************
++ *      WSCUnInstallNameSpace   (ws2_32.@)
++ */
++int WINAPI WSCUnInstallNameSpace( GUID *provider )
++{
++    LSTATUS status;
++    WCHAR name[40];
++    HKEY key;
++
++    TRACE( "(%s)\n", debugstr_guid(provider) );
++
++    if (!provider || is_builtin_ns( provider ))
++    {
++        SetLastError( WSAEINVAL );
++        return SOCKET_ERROR;
++    }
++    if ((status = open_catalog( L"NameSpaces", KEY_ALL_ACCESS, FALSE, &key )))
++    {
++        SetLastError( reg_error( status ) );
++        return SOCKET_ERROR;
++    }
++    guid_to_name( provider, name );
++    status = RegDeleteTreeW( key, name );
++    RegCloseKey( key );
++    if (status)
++    {
++        SetLastError( reg_error( status ) );
++        return SOCKET_ERROR;
++    }
++    return 0;
++}
++
++/***********************************************************************
++ *      WSCEnableNSProvider   (ws2_32.@)
++ */
++int WINAPI WSCEnableNSProvider( GUID *provider, BOOL enable )
++{
++    struct ns_provider *list;
++    unsigned int count, i;
++    LSTATUS status;
++    DWORD value = !!enable;
++    HKEY key;
++
++    TRACE( "(%s %d)\n", debugstr_guid(provider), enable );
++
++    if (!provider)
++    {
++        SetLastError( WSAEINVAL );
++        return SOCKET_ERROR;
++    }
++    count = get_ns_providers( &list );
++    for (i = 0; i < count; i++) if (IsEqualGUID( &list[i].id, provider )) break;
++    free_ns_providers( list, count );
++    if (i == count)
++    {
++        SetLastError( WSAEINVAL );
++        return SOCKET_ERROR;
++    }
++    if ((status = open_catalog_entry( L"NameSpaces", provider, KEY_SET_VALUE, TRUE, &key )))
++    {
++        SetLastError( reg_error( status ) );
++        return SOCKET_ERROR;
++    }
++    status = RegSetValueExW( key, L"Enabled", 0, REG_DWORD, (BYTE *)&value, sizeof(value) );
++    RegCloseKey( key );
++    if (status)
++    {
++        SetLastError( reg_error( status ) );
++        return SOCKET_ERROR;
++    }
++    return 0;
++}
++
++/***********************************************************************
++ *      WSCWriteNameSpaceOrder   (ws2_32.@)
++ */
++int WINAPI WSCWriteNameSpaceOrder( GUID *ids, DWORD count )
++{
++    struct ns_provider *list;
++    unsigned int n, i, j;
++    LSTATUS status;
++    HKEY key;
++
++    TRACE( "(%p %lu)\n", ids, count );
++
++    if (!ids) return WSAEINVAL;
++    n = get_ns_providers( &list );
++    /* every provider, each once */
++    for (i = 0; i < count && count == n; i++)
++    {
++        for (j = 0; j < n; j++) if (IsEqualGUID( &list[j].id, &ids[i] )) break;
++        if (j == n) break;
++        for (j = 0; j < i; j++) if (IsEqualGUID( &ids[j], &ids[i] )) break;
++        if (j < i) break;
++    }
++    free_ns_providers( list, n );
++    if (count != n || i < count) return WSAEINVAL;
++
++    if ((status = open_catalog( L"NameSpaces", KEY_SET_VALUE, TRUE, &key ))) return reg_error( status );
++    status = RegSetValueExW( key, L"Order", 0, REG_BINARY, (BYTE *)ids, count * sizeof(GUID) );
++    RegCloseKey( key );
++    return reg_error( status );
++}
++
++/***********************************************************************
++ *      WSCWriteProviderOrder   (ws2_32.@)
++ */
++int WINAPI WSCWriteProviderOrder( DWORD *entries, DWORD count )
++{
++    WSAPROTOCOL_INFOW *info;
++    DWORD size = 0;
++    LSTATUS status;
++    int n, i, j;
++    HKEY key;
++
++    TRACE( "(%p %lu)\n", entries, count );
++
++    if (!entries) return WSAEINVAL;
++    WSAEnumProtocolsW( NULL, NULL, &size );
++    if (!size || !(info = malloc( size ))) return WSA_NOT_ENOUGH_MEMORY;
++    n = WSAEnumProtocolsW( NULL, info, &size );
++    /* every catalog entry, each once */
++    for (i = 0; i < count && count == n; i++)
++    {
++        for (j = 0; j < n; j++) if (info[j].dwCatalogEntryId == entries[i]) break;
++        if (j == n) break;
++        for (j = 0; j < i; j++) if (entries[j] == entries[i]) break;
++        if (j < i) break;
++    }
++    free( info );
++    if (count != n || i < count) return WSAEINVAL;
++
++    if ((status = open_catalog( NULL, KEY_SET_VALUE, TRUE, &key ))) return reg_error( status );
++    status = RegSetValueExW( key, L"ProviderOrder", 0, REG_BINARY, (BYTE *)entries, count * sizeof(DWORD) );
++    RegCloseKey( key );
++    return reg_error( status );
++}
++
++/***********************************************************************
++ *      WSCInstallProvider   (ws2_32.@)
++ */
++int WINAPI WSCInstallProvider( GUID *provider, const WCHAR *path, WSAPROTOCOL_INFOW *protocol_info,
++                               DWORD count, int *err )
++{
++    LSTATUS status;
++    DWORD disp;
++    WCHAR full[256], name[40];
++    HKEY key;
++
++    TRACE( "(%s, %s, %p, %lu, %p)\n", debugstr_guid(provider), debugstr_w(path), protocol_info, count, err );
++
++    if (!err) return SOCKET_ERROR;
++    if (!provider || !path || !protocol_info || !count)
++    {
++        *err = WSAEINVAL;
++        return SOCKET_ERROR;
++    }
++    guid_to_name( provider, name );
++    swprintf( full, ARRAY_SIZE(full), L"%s\\Providers\\%s", catalog_path, name );
++    if ((status = RegCreateKeyExW( HKEY_LOCAL_MACHINE, full, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, &disp )))
++    {
++        *err = reg_error( status );
++        return SOCKET_ERROR;
++    }
++    if (disp == REG_OPENED_EXISTING_KEY)
++    {
++        RegCloseKey( key );
++        *err = WSAEINVAL;
++        return SOCKET_ERROR;
++    }
++    RegSetValueExW( key, L"Path", 0, REG_SZ, (BYTE *)path, (wcslen( path ) + 1) * sizeof(WCHAR) );
++    RegSetValueExW( key, L"Protocols", 0, REG_BINARY, (BYTE *)protocol_info, count * sizeof(*protocol_info) );
++    RegCloseKey( key );
++    FIXME( "provider %s recorded; sockets are not layered through %s\n", debugstr_guid(provider), debugstr_w(path) );
++    *err = 0;
++    return 0;
++}
++
++/***********************************************************************
++ *      WSCDeinstallProvider   (ws2_32.@)
++ */
++int WINAPI WSCDeinstallProvider( GUID *provider, int *err )
++{
++    LSTATUS status;
++    WCHAR name[40];
++    HKEY key;
++
++    TRACE( "(%s, %p)\n", debugstr_guid(provider), err );
++
++    if (!err) return SOCKET_ERROR;
++    if (!provider)
++    {
++        *err = WSAEFAULT;
++        return SOCKET_ERROR;
++    }
++    if ((status = open_catalog( L"Providers", KEY_ALL_ACCESS, FALSE, &key )))
++    {
++        *err = status == ERROR_FILE_NOT_FOUND ? WSAEINVAL : reg_error( status );
++        return SOCKET_ERROR;
++    }
++    guid_to_name( provider, name );
++    status = RegDeleteTreeW( key, name );
++    RegCloseKey( key );
++    if (status)
++    {
++        *err = reg_error( status );
++        return SOCKET_ERROR;
++    }
++    *err = 0;
++    return 0;
++}
++
++/* an installed transport provider's path */
++static WCHAR *installed_provider_path( const GUID *provider )
++{
++    WCHAR *ret = NULL;
++    HKEY key;
++
++    if (!open_catalog_entry( L"Providers", provider, KEY_READ, FALSE, &key ))
++    {
++        ret = reg_get_string( key, L"Path" );
++        RegCloseKey( key );
++    }
++    return ret;
++}
++
++/* service classes: "Name", and "Infos": a count, then per entry the name
++ * space, value type, value size and name length, the name and the value */
++static BYTE *serialize_class_infos( const WSASERVICECLASSINFOW *info, DWORD *size )
++{
++    DWORD i, total = sizeof(DWORD), *p;
++    BYTE *ret, *q;
++
++    for (i = 0; i < info->dwCount; i++)
++        total += 4 * sizeof(DWORD) + (wcslen( info->lpClassInfos[i].lpszName ) + 1) * sizeof(WCHAR) +
++                 info->lpClassInfos[i].dwValueSize;
++    if (!(ret = malloc( total ))) return NULL;
++    *(DWORD *)ret = info->dwCount;
++    q = ret + sizeof(DWORD);
++    for (i = 0; i < info->dwCount; i++)
++    {
++        const WSANSCLASSINFOW *c = &info->lpClassInfos[i];
++        DWORD name_size = (wcslen( c->lpszName ) + 1) * sizeof(WCHAR);
++        p = (DWORD *)q;
++        p[0] = c->dwNameSpace;
++        p[1] = c->dwValueType;
++        p[2] = c->dwValueSize;
++        p[3] = name_size;
++        q += 4 * sizeof(DWORD);
++        memcpy( q, c->lpszName, name_size );
++        q += name_size;
++        if (c->dwValueSize) memcpy( q, c->lpValue, c->dwValueSize );
++        q += c->dwValueSize;
++    }
++    *size = total;
++    return ret;
++}
++
++/***********************************************************************
++ *      WSAInstallServiceClassW   (ws2_32.@)
++ */
++int WINAPI WSAInstallServiceClassW( WSASERVICECLASSINFOW *info )
++{
++    LSTATUS status;
++    DWORD disp, size, i;
++    WCHAR full[256], name[40];
++    BYTE *infos;
++    HKEY key;
++
++    TRACE( "(%p)\n", info );
++
++    if (!info || !info->lpServiceClassId || !info->lpszServiceClassName || (info->dwCount && !info->lpClassInfos))
++    {
++        SetLastError( WSAEINVAL );
++        return SOCKET_ERROR;
++    }
++    for (i = 0; i < info->dwCount; i++)
++        if (!info->lpClassInfos[i].lpszName || (info->lpClassInfos[i].dwValueSize && !info->lpClassInfos[i].lpValue))
++        {
++            SetLastError( WSAEINVAL );
++            return SOCKET_ERROR;
++        }
++    if (!(infos = serialize_class_infos( info, &size )))
++    {
++        SetLastError( WSA_NOT_ENOUGH_MEMORY );
++        return SOCKET_ERROR;
++    }
++    guid_to_name( info->lpServiceClassId, name );
++    swprintf( full, ARRAY_SIZE(full), L"%s\\ServiceClasses\\%s", catalog_path, name );
++    if ((status = RegCreateKeyExW( HKEY_LOCAL_MACHINE, full, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, &disp )))
++    {
++        free( infos );
++        SetLastError( reg_error( status ) );
++        return SOCKET_ERROR;
++    }
++    if (disp == REG_OPENED_EXISTING_KEY)
++    {
++        free( infos );
++        RegCloseKey( key );
++        SetLastError( WSAEALREADY );
++        return SOCKET_ERROR;
++    }
++    RegSetValueExW( key, L"Name", 0, REG_SZ, (BYTE *)info->lpszServiceClassName,
++                    (wcslen( info->lpszServiceClassName ) + 1) * sizeof(WCHAR) );
++    RegSetValueExW( key, L"Infos", 0, REG_BINARY, infos, size );
++    RegCloseKey( key );
++    free( infos );
++    return 0;
++}
++
++/***********************************************************************
++ *      WSAInstallServiceClassA   (ws2_32.@)
++ */
++int WINAPI WSAInstallServiceClassA( WSASERVICECLASSINFOA *info )
++{
++    WSASERVICECLASSINFOW infoW;
++    WSANSCLASSINFOW *classes = NULL;
++    BOOL ok = TRUE;
++    DWORD i;
++    int ret;
++
++    TRACE( "(%p)\n", info );
++
++    if (!info || !info->lpServiceClassId || !info->lpszServiceClassName || (info->dwCount && !info->lpClassInfos))
++    {
++        SetLastError( WSAEINVAL );
++        return SOCKET_ERROR;
++    }
++    infoW.lpServiceClassId = info->lpServiceClassId;
++    infoW.lpszServiceClassName = strdupAtoW( info->lpszServiceClassName );
++    infoW.dwCount = info->dwCount;
++    if (info->dwCount && !(classes = calloc( info->dwCount, sizeof(*classes) ))) ok = FALSE;
++    for (i = 0; ok && i < info->dwCount; i++)
++    {
++        classes[i].lpszName = strdupAtoW( info->lpClassInfos[i].lpszName );
++        classes[i].dwNameSpace = info->lpClassInfos[i].dwNameSpace;
++        classes[i].dwValueType = info->lpClassInfos[i].dwValueType;
++        classes[i].dwValueSize = info->lpClassInfos[i].dwValueSize;
++        classes[i].lpValue = info->lpClassInfos[i].lpValue;
++        if (info->lpClassInfos[i].lpszName && !classes[i].lpszName) ok = FALSE;
++    }
++    infoW.lpClassInfos = classes;
++    if (ok && infoW.lpszServiceClassName) ret = WSAInstallServiceClassW( &infoW );
++    else
++    {
++        SetLastError( WSA_NOT_ENOUGH_MEMORY );
++        ret = SOCKET_ERROR;
++    }
++    for (i = 0; classes && i < info->dwCount; i++) free( classes[i].lpszName );
++    free( classes );
++    free( infoW.lpszServiceClassName );
++    return ret;
++}
++
++/***********************************************************************
++ *      WSARemoveServiceClass   (ws2_32.@)
++ */
++int WINAPI WSARemoveServiceClass( GUID *class_id )
++{
++    LSTATUS status;
++    WCHAR name[40];
++    HKEY key;
++
++    TRACE( "(%s)\n", debugstr_guid(class_id) );
++
++    if (!class_id)
++    {
++        SetLastError( WSAEINVAL );
++        return SOCKET_ERROR;
++    }
++    if ((status = open_catalog( L"ServiceClasses", KEY_ALL_ACCESS, FALSE, &key )))
++    {
++        SetLastError( status == ERROR_FILE_NOT_FOUND ? WSATYPE_NOT_FOUND : reg_error( status ) );
++        return SOCKET_ERROR;
++    }
++    guid_to_name( class_id, name );
++    status = RegDeleteTreeW( key, name );
++    RegCloseKey( key );
++    if (status)
++    {
++        SetLastError( status == ERROR_FILE_NOT_FOUND ? WSATYPE_NOT_FOUND : reg_error( status ) );
++        return SOCKET_ERROR;
++    }
++    return 0;
++}
++
++/* the class's name and serialized infos */
++static int read_service_class( const GUID *class_id, WCHAR **name, BYTE **infos, DWORD *size )
++{
++    HKEY key;
++
++    *infos = NULL;
++    if (!class_id) return WSAEINVAL;
++    if (open_catalog_entry( L"ServiceClasses", class_id, KEY_READ, FALSE, &key )) return WSATYPE_NOT_FOUND;
++    *name = reg_get_string( key, L"Name" );
++    *size = 0;
++    if (!RegQueryValueExW( key, L"Infos", NULL, NULL, NULL, size ) && *size >= sizeof(DWORD) &&
++        (*infos = malloc( *size )))
++        RegQueryValueExW( key, L"Infos", NULL, NULL, *infos, size );
++    RegCloseKey( key );
++    if (!*name || !*infos)
++    {
++        free( *name );
++        free( *infos );
++        return WSATYPE_NOT_FOUND;
++    }
++    return 0;
++}
++
++static int get_class_info( GUID *provider, GUID *service, DWORD *len, BYTE *out, BOOL ansi )
++{
++    struct ns_provider *list;
++    unsigned int count, i;
++    DWORD name_space = 0, size, n, kept = 0;
++    WCHAR *name;
++    BYTE *infos, *q;
++    size_t need, off;
++    int err;
++
++    if (!len || !provider || !service) return WSAEFAULT;
++    count = get_ns_providers( &list );
++    for (i = 0; i < count; i++) if (IsEqualGUID( &list[i].id, provider )) name_space = list[i].name_space;
++    free_ns_providers( list, count );
++    if (!name_space) return WSAEINVAL;
++    if ((err = read_service_class( service, &name, &infos, &size ))) return err;
++
++    /* the entries for this provider's name space */
++    n = *(DWORD *)infos;
++    need = sizeof(WSASERVICECLASSINFOW) + sizeof(GUID) + string_size( name, ansi );
++    for (i = 0, q = infos + sizeof(DWORD); i < n; i++)
++    {
++        DWORD *p = (DWORD *)q;
++        if (p[0] == name_space || p[0] == NS_ALL)
++        {
++            kept++;
++            need += sizeof(WSANSCLASSINFOW) + string_size( (WCHAR *)(q + 4 * sizeof(DWORD)), ansi ) + p[2] + sizeof(void *);
++        }
++        q += 4 * sizeof(DWORD) + p[3] + p[2];
++    }
++    if (!out || *len < need)
++    {
++        *len = need;
++        free( name );
++        free( infos );
++        return WSAEFAULT;
++    }
++
++    {
++        WSASERVICECLASSINFOW *ci = (WSASERVICECLASSINFOW *)out;
++        WSANSCLASSINFOW *classes;
++
++        off = sizeof(*ci);
++        ci->lpServiceClassId = (GUID *)(out + off);
++        *ci->lpServiceClassId = *service;
++        off += sizeof(GUID);
++        off = ALIGN_PTR( off );
++        classes = (WSANSCLASSINFOW *)(out + off);
++        ci->lpClassInfos = classes;
++        ci->dwCount = kept;
++        off += kept * sizeof(*classes);
++        ci->lpszServiceClassName = put_string( out, &off, name, ansi );
++        for (i = 0, kept = 0, q = infos + sizeof(DWORD); i < n; i++)
++        {
++            DWORD *p = (DWORD *)q;
++            if (p[0] == name_space || p[0] == NS_ALL)
++            {
++                classes[kept].dwNameSpace = p[0];
++                classes[kept].dwValueType = p[1];
++                classes[kept].dwValueSize = p[2];
++                classes[kept].lpszName = put_string( out, &off, (WCHAR *)(q + 4 * sizeof(DWORD)), ansi );
++                off = ALIGN_PTR( off );
++                classes[kept].lpValue = p[2] ? out + off : NULL;
++                memcpy( out + off, q + 4 * sizeof(DWORD) + p[3], p[2] );
++                off += p[2];
++                kept++;
++            }
++            q += 4 * sizeof(DWORD) + p[3] + p[2];
++        }
++    }
++    free( name );
++    free( infos );
++    return 0;
++}
++
++/***********************************************************************
++ *      WSAGetServiceClassInfoW   (ws2_32.@)
++ */
++int WINAPI WSAGetServiceClassInfoW( GUID *provider, GUID *service, DWORD *len, WSASERVICECLASSINFOW *info )
++{
++    int err;
++
++    TRACE( "(%s %s %p %p)\n", debugstr_guid(provider), debugstr_guid(service), len, info );
++
++    if ((err = get_class_info( provider, service, len, (BYTE *)info, FALSE )))
++    {
++        SetLastError( err );
++        return SOCKET_ERROR;
++    }
++    return 0;
++}
++
++/***********************************************************************
++ *      WSAGetServiceClassInfoA   (ws2_32.@)
++ */
++int WINAPI WSAGetServiceClassInfoA( GUID *provider, GUID *service, DWORD *len, WSASERVICECLASSINFOA *info )
++{
++    int err;
++
++    C_ASSERT( sizeof(WSASERVICECLASSINFOA) == sizeof(WSASERVICECLASSINFOW) );
++
++    TRACE( "(%s %s %p %p)\n", debugstr_guid(provider), debugstr_guid(service), len, info );
++
++    if ((err = get_class_info( provider, service, len, (BYTE *)info, TRUE )))
++    {
++        SetLastError( err );
++        return SOCKET_ERROR;
++    }
++    return 0;
++}
++
++/***********************************************************************
++ *      WSAGetServiceClassNameByClassIdW   (ws2_32.@)
++ */
++int WINAPI WSAGetServiceClassNameByClassIdW( GUID *class_id, WCHAR *service, DWORD *len )
++{
++    WCHAR *name;
++    BYTE *infos;
++    DWORD size, need;
++    int err;
++
++    TRACE( "(%s %p %p)\n", debugstr_guid(class_id), service, len );
++
++    if (!len)
++    {
++        SetLastError( WSAEFAULT );
++        return SOCKET_ERROR;
++    }
++    if ((err = read_service_class( class_id, &name, &infos, &size )))
++    {
++        SetLastError( err );
++        return SOCKET_ERROR;
++    }
++    free( infos );
++    need = wcslen( name ) + 1;
++    if (!service || *len < need)
++    {
++        *len = need;
++        free( name );
++        SetLastError( WSAEFAULT );
++        return SOCKET_ERROR;
++    }
++    wcscpy( service, name );
++    *len = need;
++    free( name );
++    return 0;
++}
++
++/***********************************************************************
++ *      WSAGetServiceClassNameByClassIdA   (ws2_32.@)
++ */
++int WINAPI WSAGetServiceClassNameByClassIdA( GUID *class_id, char *service, DWORD *len )
++{
++    WCHAR *name;
++    BYTE *infos;
++    DWORD size, need;
++    int err;
++
++    TRACE( "(%s %p %p)\n", debugstr_guid(class_id), service, len );
++
++    if (!len)
++    {
++        SetLastError( WSAEFAULT );
++        return SOCKET_ERROR;
++    }
++    if ((err = read_service_class( class_id, &name, &infos, &size )))
++    {
++        SetLastError( err );
++        return SOCKET_ERROR;
++    }
++    free( infos );
++    need = WideCharToMultiByte( CP_ACP, 0, name, -1, NULL, 0, NULL, NULL );
++    if (!service || *len < need)
++    {
++        *len = need;
++        free( name );
++        SetLastError( WSAEFAULT );
++        return SOCKET_ERROR;
++    }
++    WideCharToMultiByte( CP_ACP, 0, name, -1, service, *len, NULL, NULL );
++    *len = need;
++    free( name );
++    return 0;
++}
++
++/***********************************************************************
++ *      WSASetServiceW   (ws2_32.@)
++ */
++int WINAPI WSASetServiceW( WSAQUERYSETW *query, WSAESETSERVICEOP operation, DWORD flags )
++{
++    TRACE( "(%p %#x %#lx)\n", query, operation, flags );
++
++    if (!query || query->dwSize < sizeof(*query) || !query->lpServiceClassId || operation > RNRSERVICE_DELETE)
++    {
++        SetLastError( WSAEINVAL );
++        return SOCKET_ERROR;
++    }
++    /* the name spaces here (DNS, the network list) do not take registrations:
++     * those go to a directory (NS_NTDS) or SAP, which this machine has not */
++    SetLastError( operation == RNRSERVICE_REGISTER ? WSAEINVAL : WSASERVICE_NOT_FOUND );
++    return SOCKET_ERROR;
++}
++
++/***********************************************************************
++ *      WSASetServiceA   (ws2_32.@)
++ */
++int WINAPI WSASetServiceA( WSAQUERYSETA *query, WSAESETSERVICEOP operation, DWORD flags )
++{
++    TRACE( "(%p %#x %#lx)\n", query, operation, flags );
++
++    if (!query || query->dwSize < sizeof(*query) || !query->lpServiceClassId || operation > RNRSERVICE_DELETE)
++    {
++        SetLastError( WSAEINVAL );
++        return SOCKET_ERROR;
++    }
++    SetLastError( operation == RNRSERVICE_REGISTER ? WSAEINVAL : WSASERVICE_NOT_FOUND );
++    return SOCKET_ERROR;
++}
++
++/* application categories: "AppCategories\<path|extra>", backslashes as
++ * slashes, with the category */
++static BOOL app_category_key( const WCHAR *path, DWORD path_len, const WCHAR *extra, DWORD extra_len,
++                              WCHAR *buf, DWORD size )
++{
++    DWORD i, n = 0;
++
++    if (path_len + extra_len + 32 > size) return FALSE;
++    n = swprintf( buf, size, L"AppCategories\\" );
++    for (i = 0; i < path_len && path[i]; i++) buf[n++] = path[i] == '\\' ? '/' : towlower( path[i] );
++    buf[n++] = '|';
++    for (i = 0; extra && i < extra_len && extra[i]; i++) buf[n++] = extra[i] == '\\' ? '/' : extra[i];
++    buf[n] = 0;
++    return TRUE;
++}
++
++/***********************************************************************
++ *      WSCGetApplicationCategory   (ws2_32.@)
++ */
++int WINAPI WSCGetApplicationCategory( const WCHAR *path, DWORD path_len, const WCHAR *extra,
++                                      DWORD extra_len, DWORD *category, int *errcode )
++{
++    WCHAR sub[MAX_PATH * 2 + 64];
++    HKEY key;
++
++    TRACE( "(%s %lu %s %lu %p %p)\n", debugstr_w(path), path_len, debugstr_w(extra), extra_len, category, errcode );
++
++    if (!errcode) return SOCKET_ERROR;
++    if (!path || !path_len || !category || (extra_len && !extra) ||
++        !app_category_key( path, path_len, extra, extra_len, sub, ARRAY_SIZE(sub) ))
++    {
++        *errcode = WSAEINVAL;
++        return SOCKET_ERROR;
++    }
++    if (open_catalog( sub, KEY_READ, FALSE, &key ))
++    {
++        *errcode = WSANO_RECOVERY;   /* no category set for this application */
++        return SOCKET_ERROR;
++    }
++    *category = reg_get_dword( key, L"Category", 0 );
++    RegCloseKey( key );
++    return 0;
++}
++
++/***********************************************************************
++ *      WSCSetApplicationCategory   (ws2_32.@)
++ */
++int WINAPI WSCSetApplicationCategory( const WCHAR *path, DWORD path_len, const WCHAR *extra, DWORD extra_len,
++                                      DWORD category, DWORD *prev_category, int *err )
++{
++    WCHAR sub[MAX_PATH * 2 + 64];
++    LSTATUS status;
++    HKEY key;
++
++    TRACE( "(%s %lu %s %lu %#lx %p %p)\n", debugstr_w(path), path_len, debugstr_w(extra), extra_len,
++           category, prev_category, err );
++
++    if (!err) return SOCKET_ERROR;
++    if (!path || !path_len || (extra_len && !extra) ||
++        !app_category_key( path, path_len, extra, extra_len, sub, ARRAY_SIZE(sub) ))
++    {
++        *err = WSAEINVAL;
++        return SOCKET_ERROR;
++    }
++    if ((status = open_catalog( sub, KEY_ALL_ACCESS, TRUE, &key )))
++    {
++        *err = reg_error( status );
++        return SOCKET_ERROR;
++    }
++    if (prev_category) *prev_category = reg_get_dword( key, L"Category", 0 );
++    status = RegSetValueExW( key, L"Category", 0, REG_DWORD, (BYTE *)&category, sizeof(category) );
++    RegCloseKey( key );
++    if (status)
++    {
++        *err = reg_error( status );
++        return SOCKET_ERROR;
++    }
++    *err = 0;
++    return 0;
++}
++
++struct config_change
++{
++    HKEY key;
++    HANDLE event, wait, thread;
++    OVERLAPPED *overlapped;
++    LPWSAOVERLAPPED_COMPLETION_ROUTINE completion;
++};
++
++static void WINAPI config_change_apc( ULONG_PTR arg )
++{
++    struct config_change *change = (struct config_change *)arg;
++    change->completion( 0, 0, change->overlapped, 0 );
++    CloseHandle( change->thread );
++    free( change );
++}
++
++static void CALLBACK config_changed( void *context, BOOLEAN timeout )
++{
++    struct config_change *change = context;
++
++    UnregisterWaitEx( change->wait, NULL );
++    CloseHandle( change->event );
++    change->overlapped->Internal = 0;
++    change->overlapped->InternalHigh = 0;
++    if (change->completion)
++    {
++        if (QueueUserAPC( config_change_apc, change->thread, (ULONG_PTR)change )) return;
++        CloseHandle( change->thread );
++    }
++    else if (change->overlapped->hEvent) SetEvent( change->overlapped->hEvent );
++    free( change );
++}
++
++/***********************************************************************
++ *      WSAProviderConfigChange   (ws2_32.@)
++ */
++int WINAPI WSAProviderConfigChange( HANDLE *handle, OVERLAPPED *overlapped,
++                                    LPWSAOVERLAPPED_COMPLETION_ROUTINE completion )
++{
++    static const DWORD filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET;
++    struct config_change *change;
++    LSTATUS status;
++    HKEY key;
++
++    TRACE( "(%p %p %p)\n", handle, overlapped, completion );
++
++    if (!handle)
++    {
++        SetLastError( WSAEFAULT );
++        return SOCKET_ERROR;
++    }
++    if (!*handle)
++    {
++        /* the first call gives the handle to wait with; it closes with CloseHandle */
++        if ((status = open_catalog( NULL, KEY_NOTIFY, FALSE, &key )) &&
++            (status = open_catalog( NULL, KEY_NOTIFY, TRUE, &key )))
++        {
++            SetLastError( reg_error( status ) );
++            return SOCKET_ERROR;
++        }
++        *handle = key;
++        return 0;
++    }
++
++    if (!overlapped)
++    {
++        if ((status = RegNotifyChangeKeyValue( *handle, TRUE, filter, NULL, FALSE )))
++        {
++            SetLastError( WSA_INVALID_HANDLE );
++            return SOCKET_ERROR;
++        }
++        return 0;
++    }
++
++    if (!(change = calloc( 1, sizeof(*change) )) || !(change->event = CreateEventW( NULL, FALSE, FALSE, NULL )))
++    {
++        free( change );
++        SetLastError( WSA_NOT_ENOUGH_MEMORY );
++        return SOCKET_ERROR;
++    }
++    change->key = *handle;
++    change->overlapped = overlapped;
++    change->completion = completion;
++    if (completion && !DuplicateHandle( GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
++                                        &change->thread, 0, FALSE, DUPLICATE_SAME_ACCESS ))
++        goto fail;
++#ifdef SG_MUTANT_NO_CONFIG_NOTIFY
++    ResetEvent( change->event );
++    if (FALSE)
++#else
++    if (RegNotifyChangeKeyValue( *handle, TRUE, filter, change->event, TRUE ))
++#endif
++    {
++        SetLastError( WSA_INVALID_HANDLE );
++        goto fail_set;
++    }
++    overlapped->Internal = STATUS_PENDING;
++    if (!RegisterWaitForSingleObject( &change->wait, change->event, config_changed, change, INFINITE,
++                                      WT_EXECUTEONLYONCE ))
++        goto fail;
++    SetLastError( WSA_IO_PENDING );
++    return SOCKET_ERROR;
++
++fail:
++    SetLastError( WSA_NOT_ENOUGH_MEMORY );
++fail_set:
++    if (change->thread) CloseHandle( change->thread );
++    CloseHandle( change->event );
++    free( change );
++    return SOCKET_ERROR;
+ }
+ 
+ /* is this the id of one of the transport providers WSAEnumProtocols lists? */
+@@ -1054,6 +2132,7 @@ static BOOL is_transport_provider( const GUID *id )
+ int WINAPI WSCGetProviderPath( GUID *provider, WCHAR *path, int *len, int *errcode )
+ {
+     static const WCHAR provider_path[] = L"%SystemRoot%\\system32\\mswsock.dll";
++    WCHAR *installed;
+ 
+     TRACE( "(%s %p %p %p)\n", debugstr_guid(provider), path, len, errcode );
+ 
+@@ -1068,7 +2147,23 @@ int WINAPI WSCGetProviderPath( GUID *provider, WCHAR *path, int *len, int *errco
+         *errcode = WSAEINVAL;
+         return SOCKET_ERROR;
+     }
+-    /* the base transport providers, and the name space providers, live in mswsock */
++    /* the base transport providers, and the name space providers, live in
++     * mswsock; installed ones where they were installed from */
++    if ((installed = installed_provider_path( provider )))
++    {
++        int need = wcslen( installed ) + 1;
++        if (!path || *len < need)
++        {
++            *len = need;
++            *errcode = WSAEFAULT;
++            free( installed );
++            return SOCKET_ERROR;
++        }
++        wcscpy( path, installed );
++        *len = need - 1;
++        free( installed );
++        return 0;
++    }
+     if (!is_transport_provider( provider ) && !IsEqualGUID( provider, &dns_provider_id ) &&
+         !IsEqualGUID( provider, &nla_provider_id ))
+     {
+--- a/dlls/ws2_32/protocol.c
++++ b/dlls/ws2_32/protocol.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "ws2_32_private.h"
++#include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+@@ -341,37 +342,111 @@ struct getaddrinfo_args
+     char *nodename;
+     char *servname;
+     struct addrinfo *hints;
++
++    /* Stained Glass OS 1655: GetAddrInfoExCancel and the timeout. Once a
++     * request is finished -- answered, cancelled or timed out -- the
++     * caller's overlapped and result are not touched again. */
++    struct list entry;
++    BOOL finished;
++    PTP_TIMER timer;
++};
++
++static struct list pending_lookups = LIST_INIT( pending_lookups );
++static CRITICAL_SECTION pending_lookups_cs;
++static CRITICAL_SECTION_DEBUG pending_lookups_cs_debug =
++{
++    0, 0, &pending_lookups_cs,
++    { &pending_lookups_cs_debug.ProcessLocksList, &pending_lookups_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": pending_lookups_cs") }
+ };
++static CRITICAL_SECTION pending_lookups_cs = { &pending_lookups_cs_debug, -1, 0, 0, 0, 0 };
++
++/* tell the caller, once; pending_lookups_cs held */
++static void finish_lookup( struct getaddrinfo_args *args, int status, LPLOOKUPSERVICE_COMPLETION_ROUTINE *routine,
++                           OVERLAPPED **overlapped )
++{
++    args->finished = TRUE;
++    args->overlapped->Internal = status;
++    *routine = args->completion_routine;
++    *overlapped = args->overlapped;
++}
++
++static void notify_lookup( LPLOOKUPSERVICE_COMPLETION_ROUTINE routine, OVERLAPPED *overlapped, int status )
++{
++    HANDLE event = overlapped->hEvent;
++    if (routine) routine( status, 0, overlapped );
++    if (event) SetEvent( event );
++}
++
++static int stop_lookup( struct getaddrinfo_args *args, int status )
++{
++    LPLOOKUPSERVICE_COMPLETION_ROUTINE routine;
++    OVERLAPPED *overlapped;
++    struct getaddrinfo_args *iter;
++    BOOL found = FALSE;
++
++    EnterCriticalSection( &pending_lookups_cs );
++    LIST_FOR_EACH_ENTRY( iter, &pending_lookups, struct getaddrinfo_args, entry )
++        if (iter == args) found = TRUE;
++    if (!found || args->finished)
++    {
++        LeaveCriticalSection( &pending_lookups_cs );
++        return WSA_INVALID_HANDLE;
++    }
++    finish_lookup( args, status, &routine, &overlapped );
++    LeaveCriticalSection( &pending_lookups_cs );
++    notify_lookup( routine, overlapped, status );
++    return 0;
++}
++
++static void CALLBACK getaddrinfo_timeout( TP_CALLBACK_INSTANCE *instance, void *context, TP_TIMER *timer )
++{
++    TRACE( "lookup %p timed out\n", context );
++    stop_lookup( context, WSAETIMEDOUT );
++}
+ 
+ static void WINAPI getaddrinfo_callback(TP_CALLBACK_INSTANCE *instance, void *context)
+ {
+     struct getaddrinfo_args *args = context;
+-    OVERLAPPED *overlapped = args->overlapped;
+-    HANDLE event = overlapped->hEvent;
+-    LPLOOKUPSERVICE_COMPLETION_ROUTINE completion_routine = args->completion_routine;
+-    struct addrinfo *res;
++    LPLOOKUPSERVICE_COMPLETION_ROUTINE routine = NULL;
++    OVERLAPPED *overlapped = NULL;
++    struct addrinfo *res = NULL;
++    BOOL finished;
+     int ret;
+ 
+     ret = getaddrinfo( args->nodename, args->servname, args->hints, &res );
+-    if (res)
++
++    EnterCriticalSection( &pending_lookups_cs );
++    list_remove( &args->entry );
++    if (!(finished = args->finished))
+     {
+-        *args->result = addrinfo_list_AtoW(res);
+-        overlapped->Pointer = args->result;
+-        freeaddrinfo(res);
++        if (res)
++        {
++            *args->result = addrinfo_list_AtoW(res);
++            args->overlapped->Pointer = args->result;
++        }
++        finish_lookup( args, ret, &routine, &overlapped );
+     }
++    LeaveCriticalSection( &pending_lookups_cs );
++    if (res) freeaddrinfo(res);
+ 
++    if (args->timer)
++    {
++        SetThreadpoolTimer( args->timer, NULL, 0, 0 );
++        WaitForThreadpoolTimerCallbacks( args->timer, TRUE );
++        CloseThreadpoolTimer( args->timer );
++    }
+     free( args->nodename );
+     free( args->servname );
+     free( args );
+ 
+-    overlapped->Internal = ret;
+-    if (completion_routine) completion_routine( ret, 0, overlapped );
+-    if (event) SetEvent( event );
++    if (!finished) notify_lookup( routine, overlapped, ret );
+ }
+ 
+ static int getaddrinfoW( const WCHAR *nodename, const WCHAR *servname,
+                             const struct addrinfo *hints, ADDRINFOEXW **res, OVERLAPPED *overlapped,
+-                            LPLOOKUPSERVICE_COMPLETION_ROUTINE completion_routine )
++                            LPLOOKUPSERVICE_COMPLETION_ROUTINE completion_routine,
++                            const struct timeval *timeout, HANDLE *handle )
+ {
+     int ret = EAI_MEMORY, len, i;
+     char *nodenameA = NULL, *servnameA = NULL;
+@@ -433,7 +508,7 @@ static int getaddrinfoW( const WCHAR *nodename, const WCHAR *servname,
+             goto end;
+         }
+ 
+-        if (!(args = malloc( sizeof(*args) + sizeof(*args->hints) ))) goto end;
++        if (!(args = calloc( 1, sizeof(*args) + sizeof(*args->hints) ))) goto end;
+         args->overlapped = overlapped;
+         args->completion_routine = completion_routine;
+         args->result = res;
+@@ -450,12 +525,34 @@ static int getaddrinfoW( const WCHAR *nodename, const WCHAR *servname,
+         else args->hints = NULL;
+ 
+         overlapped->Internal = WSAEINPROGRESS;
++        if (timeout && !(args->timer = CreateThreadpoolTimer( getaddrinfo_timeout, args, NULL )))
++        {
++            free( args );
++            ret = GetLastError();
++            goto end;
++        }
++        EnterCriticalSection( &pending_lookups_cs );
++        list_add_tail( &pending_lookups, &args->entry );
++        if (handle) *handle = args;
+         if (!TrySubmitThreadpoolCallback( getaddrinfo_callback, args, NULL ))
+         {
++            list_remove( &args->entry );
++            LeaveCriticalSection( &pending_lookups_cs );
++            if (args->timer) CloseThreadpoolTimer( args->timer );
+             free( args );
+             ret = GetLastError();
+             goto end;
+         }
++        if (args->timer)
++        {
++            LARGE_INTEGER due;
++            FILETIME ft;
++            due.QuadPart = -((LONGLONG)timeout->tv_sec * 10000000 + (LONGLONG)timeout->tv_usec * 10);
++            ft.dwLowDateTime = due.u.LowPart;
++            ft.dwHighDateTime = due.u.HighPart;
++            SetThreadpoolTimer( args->timer, &ft, 0, 0 );
++        }
++        LeaveCriticalSection( &pending_lookups_cs );
+ 
+         if (local_nodenameW != nodename)
+             free( local_nodenameW );
+@@ -496,15 +593,13 @@ int WINAPI GetAddrInfoExW( const WCHAR *name, const WCHAR *servname, DWORD names
+         FIXME( "Unsupported namespace %lu\n", namespace );
+     if (namespace_id)
+         FIXME( "Unsupported namespace_id %s\n", debugstr_guid(namespace_id) );
+-    if (timeout)
+-        FIXME( "Unsupported timeout\n" );
+-    if (handle)
+-        FIXME( "Unsupported cancel handle\n" );
++    if (timeout && !overlapped)
++        WARN( "a timeout is only kept for asynchronous lookups\n" );
+ 
+-    ret = getaddrinfoW( name, servname, (struct addrinfo *)hints, result, overlapped, completion_routine );
+-    if (ret) return ret;
+-    if (handle) *handle = (HANDLE)0xdeadbeef;
+-    return 0;
++    if (handle) *handle = NULL;
++    ret = getaddrinfoW( name, servname, (struct addrinfo *)hints, result, overlapped, completion_routine,
++                        overlapped ? timeout : NULL, overlapped ? handle : NULL );
++    return ret;
+ }
+ 
+ 
+@@ -527,8 +622,14 @@ int WINAPI GetAddrInfoExOverlappedResult( OVERLAPPED *overlapped )
+  */
+ int WINAPI GetAddrInfoExCancel( HANDLE *handle )
+ {
+-    FIXME( "(%p)\n", handle );
++    TRACE( "(%p)\n", handle );
++
++    /* Stained Glass OS 1655: the lookup completes now with WSA_E_CANCELLED */
++    if (!handle || !*handle) return WSA_INVALID_HANDLE;
++#ifdef SG_MUTANT_NO_CANCEL
+     return WSA_INVALID_HANDLE;
++#endif
++    return stop_lookup( *handle, WSA_E_CANCELLED );
+ }
+ 
+ 
+@@ -546,7 +647,7 @@ int WINAPI GetAddrInfoW(const WCHAR *nodename, const WCHAR *servname, const ADDR
+ 
+     *res = NULL;
+     if (hints) hintsA = addrinfo_WtoA( hints );
+-    ret = getaddrinfoW( nodename, servname, hintsA, &resex, NULL, NULL );
++    ret = getaddrinfoW( nodename, servname, hintsA, &resex, NULL, NULL, NULL, NULL );
+     freeaddrinfo( hintsA );
+     if (ret) return ret;
+ 
+@@ -1982,214 +2083,6 @@ int WINAPI WSANtohs( SOCKET s, u_short netshort, u_short *hostshort )
+ }
+ 
+ 
+-/***********************************************************************
+- *      WSAInstallServiceClassA   (ws2_32.@)
+- */
+-int WINAPI WSAInstallServiceClassA( WSASERVICECLASSINFOA *info )
+-{
+-    FIXME( "Request to install service %s\n", debugstr_a(info->lpszServiceClassName) );
+-    SetLastError( WSAEACCES );
+-    return -1;
+-}
+-
+-
+-/***********************************************************************
+- *      WSAInstallServiceClassW   (ws2_32.@)
+- */
+-int WINAPI WSAInstallServiceClassW( WSASERVICECLASSINFOW *info )
+-{
+-    FIXME( "Request to install service %s\n", debugstr_w(info->lpszServiceClassName) );
+-    SetLastError( WSAEACCES );
+-    return -1;
+-}
+-
+-
+-/***********************************************************************
+- *      WSARemoveServiceClass   (ws2_32.@)
+- */
+-int WINAPI WSARemoveServiceClass( GUID *info )
+-{
+-    FIXME( "Request to remove service %s\n", debugstr_guid(info) );
+-    SetLastError( WSATYPE_NOT_FOUND );
+-    return -1;
+-}
+-
+-
+-/***********************************************************************
+- *      WSAGetServiceClassInfoA   (ws2_32.@)
+- */
+-int WINAPI WSAGetServiceClassInfoA( GUID *provider, GUID *service, DWORD *len,
+-                                    WSASERVICECLASSINFOA *info )
+-{
+-    FIXME( "(%s %s %p %p) Stub!\n", debugstr_guid(provider), debugstr_guid(service), len, info );
+-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
+-    return -1;
+-}
+-
+-
+-/***********************************************************************
+- *      WSAGetServiceClassInfoW   (ws2_32.@)
+- */
+-int WINAPI WSAGetServiceClassInfoW( GUID *provider, GUID *service, DWORD *len,
+-                                    WSASERVICECLASSINFOW *info )
+-{
+-    FIXME( "(%s %s %p %p) Stub!\n", debugstr_guid(provider), debugstr_guid(service), len, info );
+-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
+-    return -1;
+-}
+-
+-
+-/***********************************************************************
+- *      WSAGetServiceClassNameByClassIdA   (ws2_32.@)
+- */
+-int WINAPI WSAGetServiceClassNameByClassIdA( GUID *class, char *service, DWORD *len )
+-{
+-    FIXME( "(%s %p %p) Stub!\n", debugstr_guid(class), service, len );
+-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
+-    return -1;
+-}
+-
+-
+-/***********************************************************************
+- *      WSAGetServiceClassNameByClassIdW   (ws2_32.@)
+- */
+-int WINAPI WSAGetServiceClassNameByClassIdW( GUID *class, WCHAR *service, DWORD *len )
+-{
+-    FIXME( "(%s %p %p) Stub!\n", debugstr_guid(class), service, len );
+-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
+-    return -1;
+-}
+-
+-
+-/***********************************************************************
+- *      WSASetServiceA   (ws2_32.@)
+- */
+-int WINAPI WSASetServiceA( WSAQUERYSETA *query, WSAESETSERVICEOP operation, DWORD flags )
+-{
+-    FIXME( "(%p %#x %#lx) Stub!\n", query, operation, flags );
+-    return 0;
+-}
+-
+-
+-/***********************************************************************
+- *      WSASetServiceW   (ws2_32.@)
+- */
+-int WINAPI WSASetServiceW( WSAQUERYSETW *query, WSAESETSERVICEOP operation, DWORD flags )
+-{
+-    FIXME( "(%p %#x %#lx) Stub!\n", query, operation, flags );
+-    return 0;
+-}
+-
+-
+-/***********************************************************************
+- *      WSAProviderConfigChange   (ws2_32.@)
+- */
+-int WINAPI WSAProviderConfigChange( HANDLE *handle, OVERLAPPED *overlapped,
+-                                    LPWSAOVERLAPPED_COMPLETION_ROUTINE completion )
+-{
+-    FIXME( "(%p %p %p) Stub!\n", handle, overlapped, completion );
+-    return -1;
+-}
+-
+-
+-/***********************************************************************
+- *      WSCEnableNSProvider   (ws2_32.@)
+- */
+-int WINAPI WSCEnableNSProvider( GUID *provider, BOOL enable )
+-{
+-    FIXME( "(%s %d) Stub!\n", debugstr_guid(provider), enable );
+-    return 0;
+-}
+-
+-
+-/***********************************************************************
+- *      WSCGetApplicationCategory   (ws2_32.@)
+- */
+-int WINAPI WSCGetApplicationCategory( const WCHAR *path, DWORD path_len, const WCHAR *extra,
+-		                      DWORD extra_len, DWORD *category, int *errcode )
+-{
+-    FIXME( "(%s %lu %s %lu %p %p) Stub!\n",
+-           debugstr_w(path), path_len, debugstr_w(extra), extra_len, category, errcode );
+-
+-    if (!path)
+-    {
+-        *errcode = WSAEINVAL;
+-        return -1;
+-    }
+-
+-    *errcode = WSANO_RECOVERY;
+-    return -1;
+-}
+-
+-
+-/***********************************************************************
+- *      WSCInstallNameSpace   (ws2_32.@)
+- */
+-int WINAPI WSCInstallNameSpace( WCHAR *identifier, WCHAR *path, DWORD namespace,
+-                                DWORD version, GUID *provider )
+-{
+-    FIXME( "(%s %s %#lx %#lx %s) Stub!\n", debugstr_w(identifier), debugstr_w(path),
+-           namespace, version, debugstr_guid(provider) );
+-    return 0;
+-}
+-
+-
+-/***********************************************************************
+- *      WSCUnInstallNameSpace   (ws2_32.@)
+- */
+-int WINAPI WSCUnInstallNameSpace( GUID *provider )
+-{
+-    FIXME( "(%s) Stub!\n", debugstr_guid(provider) );
+-    return NO_ERROR;
+-}
+-
+-
+-/***********************************************************************
+- *      WSCWriteProviderOrder   (ws2_32.@)
+- */
+-int WINAPI WSCWriteProviderOrder( DWORD *entry, DWORD number )
+-{
+-    FIXME( "(%p %#lx) Stub!\n", entry, number );
+-    return 0;
+-}
+-
+-
+-/***********************************************************************
+- *      WSCInstallProvider   (ws2_32.@)
+- */
+-int WINAPI WSCInstallProvider( GUID *provider, const WCHAR *path,
+-                               WSAPROTOCOL_INFOW *protocol_info, DWORD count, int *err )
+-{
+-    FIXME( "(%s, %s, %p, %lu, %p): stub !\n", debugstr_guid(provider),
+-           debugstr_w(path), protocol_info, count, err );
+-    *err = 0;
+-    return 0;
+-}
+-
+-
+-/***********************************************************************
+- *      WSCDeinstallProvider   (ws2_32.@)
+- */
+-int WINAPI WSCDeinstallProvider( GUID *provider, int *err )
+-{
+-    FIXME( "(%s, %p): stub !\n", debugstr_guid(provider), err );
+-    *err = 0;
+-    return 0;
+-}
+-
+-
+-/***********************************************************************
+- *      WSCSetApplicationCategory   (ws2_32.@)
+- */
+-int WINAPI WSCSetApplicationCategory( const WCHAR *path, DWORD len, const WCHAR *extra, DWORD extralen,
+-                                      DWORD lspcat, DWORD *prev_lspcat, int *err )
+-{
+-    FIXME( "(%s %lu %s %lu %#lx %p) Stub!\n", debugstr_w(path), len, debugstr_w(extra),
+-           extralen, lspcat, prev_lspcat );
+-    return 0;
+-}
+-
+-
+ /***********************************************************************
+  *      WSCEnumProtocols   (ws2_32.@)
+  */
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -1308,6 +1308,128 @@ static BOOL WINAPI WS2_ConnectEx( SOCKET s, const struct sockaddr *name, int nam
+ }
+ 
+ 
++/* Stained Glass OS 1655: connect to the first of the addresses that answers,
++ * within the timeout, through ConnectEx, so a timeout can stop a connect in
++ * progress whatever the socket's blocking mode. */
++static BOOL connect_to_any( SOCKET s, int family, const SOCKET_ADDRESS *addrs, unsigned int count,
++                            const struct timeval *timeout, unsigned int *connected )
++{
++    GUID connectex_guid = WSAID_CONNECTEX;
++    LPFN_CONNECTEX connectex;
++    ULONGLONG deadline = 0;
++    SOCKADDR_STORAGE local;
++    int len, err = WSAEADDRNOTAVAIL;
++    OVERLAPPED ov;
++    DWORD size;
++    unsigned int i;
++
++    if (WSAIoctl( s, SIO_GET_EXTENSION_FUNCTION_POINTER, &connectex_guid, sizeof(connectex_guid),
++                  &connectex, sizeof(connectex), &size, NULL, NULL ))
++        return FALSE;
++    if (timeout) deadline = GetTickCount64() + (ULONGLONG)timeout->tv_sec * 1000 + timeout->tv_usec / 1000;
++
++    /* ConnectEx takes a bound socket */
++    len = sizeof(local);
++    if (getsockname( s, (struct sockaddr *)&local, &len ))
++    {
++        memset( &local, 0, sizeof(local) );
++        local.ss_family = family;
++        if (bind( s, (struct sockaddr *)&local, family == AF_INET6 ? sizeof(SOCKADDR_IN6) : sizeof(SOCKADDR_IN) ))
++            return FALSE;
++    }
++
++    memset( &ov, 0, sizeof(ov) );
++    if (!(ov.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL ))) return FALSE;
++    for (i = 0; i < count; i++)
++    {
++        DWORD wait = INFINITE, bytes, flags;
++
++        if (!addrs[i].lpSockaddr || addrs[i].lpSockaddr->sa_family != family) continue;
++        ResetEvent( ov.hEvent );
++        if (connectex( s, addrs[i].lpSockaddr, addrs[i].iSockaddrLength, NULL, 0, NULL, &ov )) break;
++        if ((err = WSAGetLastError()) != ERROR_IO_PENDING) continue;
++        if (timeout)
++        {
++            ULONGLONG now = GetTickCount64();
++            wait = now >= deadline ? 0 : deadline - now;
++        }
++#ifdef SG_MUTANT_CONNECT_NO_TIMEOUT
++        wait = INFINITE;
++#endif
++        if (WaitForSingleObject( ov.hEvent, wait ) == WAIT_TIMEOUT)
++        {
++            CancelIoEx( (HANDLE)s, &ov );
++            WSAGetOverlappedResult( s, &ov, &bytes, TRUE, &flags );
++            err = WSAETIMEDOUT;
++            i = count;
++            break;
++        }
++        if (WSAGetOverlappedResult( s, &ov, &bytes, FALSE, &flags )) break;
++        err = WSAGetLastError();
++    }
++    CloseHandle( ov.hEvent );
++    if (i >= count)
++    {
++        SetLastError( err );
++        return FALSE;
++    }
++    setsockopt( s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0 );
++    *connected = i;
++    return TRUE;
++}
++
++/* the addresses connected from and to, as WSAConnectByName/List give them */
++static BOOL connected_addresses( SOCKET s, const SOCKET_ADDRESS *remote, DWORD *local_addr_len,
++                                 struct sockaddr *local_addr, DWORD *remote_addr_len, struct sockaddr *remote_addr )
++{
++    int len;
++
++    if (remote_addr_len && remote_addr)
++    {
++        if (*remote_addr_len < remote->iSockaddrLength)
++        {
++            SetLastError( WSAEFAULT );
++            return FALSE;
++        }
++        memcpy( remote_addr, remote->lpSockaddr, remote->iSockaddrLength );
++        *remote_addr_len = remote->iSockaddrLength;
++    }
++    if (local_addr_len && local_addr)
++    {
++        if (*local_addr_len < remote->iSockaddrLength)
++        {
++            SetLastError( WSAEFAULT );
++            return FALSE;
++        }
++        len = remote->iSockaddrLength;
++        if (getsockname( s, local_addr, &len )) return FALSE;
++        if (local_addr->sa_family == AF_INET6) ((SOCKADDR_IN6 *)local_addr)->sin6_port = 0;
++        else ((SOCKADDR_IN *)local_addr)->sin_port = 0;
++        *local_addr_len = len;
++    }
++    return TRUE;
++}
++
++static BOOL get_stream_family( SOCKET s, int *family )
++{
++    WSAPROTOCOL_INFOA proto_info;
++    int proto_len = sizeof(proto_info);
++
++    if (getsockopt( s, SOL_SOCKET, SO_PROTOCOL_INFOA, (char *)&proto_info, &proto_len )) return FALSE;
++    if (proto_info.iSocketType != SOCK_STREAM)
++    {
++        SetLastError( WSAEFAULT );
++        return FALSE;
++    }
++    if (proto_info.iAddressFamily != AF_INET && proto_info.iAddressFamily != AF_INET6)
++    {
++        SetLastError( WSAENOTSOCK );
++        return FALSE;
++    }
++    *family = proto_info.iAddressFamily;
++    return TRUE;
++}
++
+ /***********************************************************************
+  *          WSAConnectByNameA      (WS2_32.@)
+  */
+@@ -1316,10 +1438,12 @@ BOOL WINAPI WSAConnectByNameA(SOCKET s, const char *node_name, const char *servi
+                               DWORD *remote_addr_len, struct sockaddr *remote_addr,
+                               const struct timeval *timeout, WSAOVERLAPPED *reserved)
+ {
+-    WSAPROTOCOL_INFOA proto_info;
+-    WSAPOLLFD pollout;
+-    struct addrinfo *service, hints;
+-    int ret, proto_len, sockaddr_size, sockname_size, sock_err, int_len;
++    struct addrinfo *service, *ai, hints;
++    SOCKADDR_IN6 *mapped = NULL;
++    SOCKET_ADDRESS *addrs;
++    unsigned int count = 0, n, i;
++    int family, v6only = 1, len = sizeof(v6only);
++    BOOL ret;
+ 
+     TRACE("socket %#Ix, node_name %s, service_name %s, local_addr_len %p, local_addr %p, \
+           remote_addr_len %p, remote_addr %p, timeout %p, reserved %p\n",
+@@ -1338,108 +1462,84 @@ BOOL WINAPI WSAConnectByNameA(SOCKET s, const char *node_name, const char *servi
+         return FALSE;
+     }
+ 
+-    if (timeout)
+-        FIXME("WSAConnectByName timeout stub\n");
++    if (!get_stream_family( s, &family )) return FALSE;
+ 
+-    proto_len = sizeof(WSAPROTOCOL_INFOA);
+-    ret = getsockopt(s, SOL_SOCKET, SO_PROTOCOL_INFOA, (char *)&proto_info, &proto_len);
+-    if (ret)
+-        return FALSE;
++    /* an IPv6 socket that is not IPv6-only reaches IPv4 hosts too, through
++     * IPv4-mapped addresses */
++    if (family == AF_INET6) getsockopt( s, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&v6only, &len );
+ 
+     memset(&hints, 0, sizeof(struct addrinfo));
+-    hints.ai_socktype = proto_info.iSocketType;
+-    hints.ai_family = proto_info.iAddressFamily;
+-    hints.ai_protocol = proto_info.iProtocol;
+-    ret = getaddrinfo(node_name, service_name, &hints, &service);
+-    if (ret)
+-        return FALSE;
+-
+-    if (proto_info.iSocketType != SOCK_STREAM)
+-    {
+-        freeaddrinfo(service);
+-        SetLastError(WSAEFAULT);
+-        return FALSE;
+-    }
+-
+-    switch (proto_info.iAddressFamily)
+-    {
+-    case AF_INET:
+-        sockaddr_size = sizeof(SOCKADDR_IN);
+-        break;
+-    case AF_INET6:
+-        sockaddr_size = sizeof(SOCKADDR_IN6);
+-        break;
+-    default:
+-        freeaddrinfo(service);
+-        SetLastError(WSAENOTSOCK);
+-        return FALSE;
+-    }
+-
+-    ret = connect(s, service->ai_addr, sockaddr_size);
+-    if (ret)
+-    {
+-        freeaddrinfo(service);
++    hints.ai_socktype = SOCK_STREAM;
++    hints.ai_family = (family == AF_INET6 && !v6only) ? AF_UNSPEC : family;
++    hints.ai_protocol = IPPROTO_TCP;
++    if (getaddrinfo(node_name, service_name, &hints, &service))
+         return FALSE;
+-    }
+ 
+-    pollout.fd = s;
+-    pollout.events = POLLWRNORM;
+-    ret = WSAPoll(&pollout, 1, -1);
+-    if (ret == SOCKET_ERROR)
++    for (ai = service; ai; ai = ai->ai_next) count++;
++    if (!(addrs = calloc( count ? count : 1, sizeof(*addrs) )) ||
++        !(mapped = calloc( count ? count : 1, sizeof(*mapped) )))
+     {
+-        freeaddrinfo(service);
+-        return FALSE;
+-    }
+-    if (pollout.revents & (POLLERR | POLLHUP | POLLNVAL))
+-    {
+-        freeaddrinfo(service);
+-        int_len = sizeof(int);
+-        ret = getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&sock_err, &int_len);
+-        if (ret == SOCKET_ERROR)
+-            return FALSE;
+-        SetLastError(sock_err);
++        free( addrs );
++        freeaddrinfo( service );
++        SetLastError( WSAENOBUFS );
+         return FALSE;
+     }
+-
+-    if (remote_addr_len && remote_addr)
++    for (ai = service, n = 0; ai; ai = ai->ai_next, n++)
+     {
+-        if (*remote_addr_len >= sockaddr_size)
++        if (family == AF_INET6 && ai->ai_family == AF_INET)
+         {
+-            memcpy(remote_addr, service->ai_addr, sockaddr_size);
+-            *remote_addr_len = sockaddr_size;
++            const SOCKADDR_IN *sin = (const SOCKADDR_IN *)ai->ai_addr;
++            mapped[n].sin6_family = AF_INET6;
++            mapped[n].sin6_port = sin->sin_port;
++            mapped[n].sin6_addr.s6_addr[10] = mapped[n].sin6_addr.s6_addr[11] = 0xff;
++            memcpy( &mapped[n].sin6_addr.s6_addr[12], &sin->sin_addr, 4 );
++            addrs[n].lpSockaddr = (struct sockaddr *)&mapped[n];
++            addrs[n].iSockaddrLength = sizeof(mapped[n]);
+         }
+         else
+         {
+-            freeaddrinfo(service);
+-            SetLastError(WSAEFAULT);
+-            return FALSE;
++            addrs[n].lpSockaddr = ai->ai_addr;
++            addrs[n].iSockaddrLength = ai->ai_addrlen;
+         }
+     }
+ 
+-    freeaddrinfo(service);
++    ret = connect_to_any( s, family, addrs, count, timeout, &i );
++    if (ret) ret = connected_addresses( s, &addrs[i], local_addr_len, local_addr, remote_addr_len, remote_addr );
+ 
+-    if (local_addr_len && local_addr)
++    free( mapped );
++    free( addrs );
++    freeaddrinfo( service );
++    return ret;
++}
++
++
++/***********************************************************************
++ *          WSAConnectByList      (WS2_32.@)
++ */
++BOOL WINAPI WSAConnectByList( SOCKET s, SOCKET_ADDRESS_LIST *list, DWORD *local_addr_len,
++                              struct sockaddr *local_addr, DWORD *remote_addr_len,
++                              struct sockaddr *remote_addr, const struct timeval *timeout,
++                              WSAOVERLAPPED *reserved )
++{
++    unsigned int i;
++    int family;
++
++    TRACE( "socket %#Ix, list %p, timeout %p\n", s, list, timeout );
++
++    /* Stained Glass OS 1655: the addresses are tried in turn */
++    if (!list || reserved)
+     {
+-        if (*local_addr_len >= sockaddr_size)
+-        {
+-            sockname_size = sockaddr_size;
+-            ret = getsockname(s, local_addr, &sockname_size);
+-            if (ret)
+-                return FALSE;
+-            if (proto_info.iAddressFamily == AF_INET6)
+-                ((SOCKADDR_IN6 *)local_addr)->sin6_port = 0;
+-            else
+-                ((SOCKADDR_IN *)local_addr)->sin_port = 0;
+-            *local_addr_len = sockaddr_size;
+-        }
+-        else
+-        {
+-            SetLastError(WSAEFAULT);
+-            return FALSE;
+-        }
++        SetLastError( WSAEINVAL );
++        return FALSE;
+     }
+-
+-    return TRUE;
++    if (!list->iAddressCount)
++    {
++        SetLastError( WSAEINVAL );
++        return FALSE;
++    }
++    if (!get_stream_family( s, &family )) return FALSE;
++    if (!connect_to_any( s, family, list->Address, list->iAddressCount, timeout, &i )) return FALSE;
++    return connected_addresses( s, &list->Address[i], local_addr_len, local_addr, remote_addr_len, remote_addr );
+ }
+ 
+ 
+--- a/dlls/ws2_32/tests/protocol.c
++++ b/dlls/ws2_32/tests/protocol.c
+@@ -2871,22 +2871,22 @@ static void test_WSCGetApplicationCategory(void)
+     errcode = 0xdeadbeef;
+     ret = pWSCGetApplicationCategory(L"", 0, NULL, 0, NULL, &errcode);
+     ok(ret == SOCKET_ERROR, "got %d, expected SOCKET_ERROR\n", ret);
+-    todo_wine ok(errcode == WSAEINVAL, "got %d, expected WSAEINVAL\n", errcode);
++    ok(errcode == WSAEINVAL, "got %d, expected WSAEINVAL\n", errcode);
+ 
+     errcode = 0xdeadbeef;
+     ret = pWSCGetApplicationCategory(L"", 0, L"", 0, NULL, &errcode);
+     ok(ret == SOCKET_ERROR, "got %d, expected SOCKET_ERROR\n", ret);
+-    todo_wine ok(errcode == WSAEINVAL, "got %d, expected WSAEINVAL\n", errcode);
++    ok(errcode == WSAEINVAL, "got %d, expected WSAEINVAL\n", errcode);
+ 
+     errcode = 0xdeadbeef;
+     ret = pWSCGetApplicationCategory(L"", 0, NULL, 0, &category, &errcode);
+     ok(ret == SOCKET_ERROR, "got %d, expected SOCKET_ERROR\n", ret);
+-    todo_wine ok(errcode == WSAEINVAL, "got %d, expected WSAEINVAL\n", errcode);
++    ok(errcode == WSAEINVAL, "got %d, expected WSAEINVAL\n", errcode);
+ 
+     errcode = 0xdeadbeef;
+     ret = pWSCGetApplicationCategory(L"", 0, L"", 0, &category, &errcode);
+     ok(ret == SOCKET_ERROR, "got %d, expected SOCKET_ERROR\n", ret);
+-    todo_wine ok(errcode == WSAEINVAL, "got %d, expected WSAEINVAL\n", errcode);
++    ok(errcode == WSAEINVAL, "got %d, expected WSAEINVAL\n", errcode);
+ }
+ 
+ static void test_WSCGetProviderInfo(void)
+--- a/dlls/ws2_32/ws2_32.spec
++++ b/dlls/ws2_32/ws2_32.spec
+@@ -70,6 +70,7 @@
+ @ stdcall WSAConnect(long ptr long ptr ptr ptr ptr)
+ @ stdcall WSAConnectByNameA(long str str ptr ptr ptr ptr ptr ptr)
+ @ stdcall WSAConnectByNameW(long str str ptr ptr ptr ptr ptr ptr)
++@ stdcall WSAConnectByList(long ptr ptr ptr ptr ptr ptr ptr)
+ @ stdcall WSACreateEvent ()
+ @ stdcall WSADuplicateSocketA(long long ptr)
+ @ stdcall WSADuplicateSocketW(long long ptr)
+@@ -129,7 +130,7 @@
+ @ stdcall WSCSetApplicationCategory(wstr long wstr long long ptr ptr)
+ @ stdcall WSCUnInstallNameSpace(ptr)
+ @ stub    WSCUpdateProvider
+-@ stub    WSCWriteNameSpaceOrder
++@ stdcall WSCWriteNameSpaceOrder(ptr long)
+ @ stdcall WSCWriteProviderOrder(ptr long)
+ @ stdcall freeaddrinfo(ptr)
+ @ stdcall getaddrinfo(str str ptr ptr)
+--- a/include/winsock2.h
++++ b/include/winsock2.h
+@@ -743,7 +743,7 @@ typedef struct _WSANSClassInfoA
+ 
+ typedef struct _WSANSClassInfoW
+ {
+-    LPSTR lpszName;
++    LPWSTR lpszName;
+     DWORD dwNameSpace;
+     DWORD dwValueType;
+     DWORD dwValueSize;
+@@ -1130,6 +1130,7 @@ WINSOCK_API_LINKAGE int WINAPI WSACancelBlockingCall(void);
+ WINSOCK_API_LINKAGE int WINAPI WSACleanup(void);
+ WINSOCK_API_LINKAGE BOOL WINAPI WSACloseEvent(WSAEVENT);
+ WINSOCK_API_LINKAGE int WINAPI WSAConnect(SOCKET,const struct WS(sockaddr)*,int,LPWSABUF,LPWSABUF,LPQOS,LPQOS);
++WINSOCK_API_LINKAGE BOOL WINAPI WSAConnectByList(SOCKET,LPSOCKET_ADDRESS_LIST,DWORD *,struct WS(sockaddr) *,DWORD *,struct WS(sockaddr) *,const struct WS(timeval) *,WSAOVERLAPPED *);
+ WINSOCK_API_LINKAGE BOOL WINAPI WSAConnectByNameA(SOCKET,const char *,const char *,DWORD *,struct WS(sockaddr) *,DWORD *,struct WS(sockaddr) *,const struct WS(timeval) *,WSAOVERLAPPED *);
+ WINSOCK_API_LINKAGE BOOL WINAPI WSAConnectByNameW(SOCKET,const WCHAR *,const WCHAR *,DWORD *,struct WS(sockaddr) *,DWORD *,struct WS(sockaddr) *,const struct WS(timeval) *,WSAOVERLAPPED *);
+ #define WSAConnectByName           WINELIB_NAME_AW(WSAConnectByName)
