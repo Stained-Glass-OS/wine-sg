@@ -1,0 +1,305 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ws2_32, server, ntdll: setsockopt(SO_ERROR) and TransmitPackets
+
+- setsockopt(SO_ERROR) was a stub that dropped the value; it is kept with
+  the socket now (a new IOCTL_AFD_WINE_SET_SO_ERROR) and getsockopt(SO_ERROR)
+  gives it back, as on Windows, until it is set to 0 (then the socket's own
+  pending error is reported again). A value shorter than an int:
+  WSAEFAULT. Wine's sock test's todo passes.
+- TransmitPackets is given by SIO_GET_EXTENSION_FUNCTION_POINTER
+  (WSAID_TRANSMITPACKETS was commented out, so callers got WSAEINVAL): it
+  sends its elements in order, memory buffers and file ranges (from an
+  offset, -1 for the file's own position, a length of 0 for the rest of
+  the file), in pieces of nSendSize, waits on a non-blocking socket, and
+  with TF_DISCONNECT or TF_REUSE_SOCKET disconnects after them. An
+  overlapped call completes with the bytes sent: IOCTL_AFD_WINE_COMPLETE_ASYNC
+  takes the transfer count beside the status now.
+- An unknown extension GUID is a warning, not a FIXME.
+
+Gate: test/sockmisc-gate.sh (64- and 32-bit, test/sockmisc-probe.c). Mutants
+SG_MUTANT_SO_ERROR_IGNORED (server/sock.c), SG_MUTANT_NO_TRANSMIT
+(ws2_32/socket.c).
+---
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -1869,7 +1869,10 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+ 
+         case IOCTL_AFD_WINE_COMPLETE_ASYNC:
+         {
+-            if (in_size != sizeof(NTSTATUS))
++            ULONG info = 0;
++
++            /* the status, and (Stained Glass OS 1688) the bytes moved */
++            if (in_size != sizeof(NTSTATUS) && in_size != sizeof(NTSTATUS) + sizeof(ULONG))
+                 return STATUS_BUFFER_TOO_SMALL;
+ 
+             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options )))
+@@ -1877,7 +1880,8 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+             if (needs_close) close( fd );
+ 
+             status = *(NTSTATUS *)in_buffer;
+-            file_complete_async( handle, options, event, apc, apc_user, io, status, 0 );
++            if (in_size > sizeof(NTSTATUS)) info = ((ULONG *)in_buffer)[1];
++            file_complete_async( handle, options, event, apc, apc_user, io, status, info );
+             return status;
+         }
+ 
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -1576,6 +1576,146 @@ BOOL WINAPI WSAConnectByNameW(SOCKET s, const WCHAR *node_name, const WCHAR *ser
+ }
+ 
+ 
++static BOOL WINAPI WS2_DisconnectEx( SOCKET s, OVERLAPPED *overlapped, DWORD flags, DWORD reserved );
++
++/* Stained Glass OS 1688: TransmitPackets. The elements (memory buffers and
++ * file ranges) are sent in order, in pieces of nSendSize; TF_DISCONNECT
++ * and TF_REUSE_SOCKET disconnect after them, as TransmitFile does. The
++ * sending is done here and an overlapped call completes with the bytes
++ * sent (and its completion port told). */
++static int transmit_send_all( SOCKET s, const char *buf, DWORD len, DWORD piece )
++{
++    while (len)
++    {
++        int chunk = piece && piece < len ? piece : len, ret;
++
++        ret = send( s, buf, chunk, 0 );
++        if (ret == SOCKET_ERROR)
++        {
++            fd_set set;
++
++            if (WSAGetLastError() != WSAEWOULDBLOCK) return WSAGetLastError();
++            FD_ZERO( &set );
++            FD_SET( s, &set );
++            if (select( 0, NULL, &set, NULL, NULL ) == SOCKET_ERROR) return WSAGetLastError();
++            continue;
++        }
++        buf += ret;
++        len -= ret;
++    }
++    return 0;
++}
++
++static BOOL WINAPI WS2_TransmitPackets( SOCKET s, TRANSMIT_PACKETS_ELEMENT *elements, DWORD count, DWORD send_size,
++                                        OVERLAPPED *overlapped, DWORD flags )
++{
++    struct { NTSTATUS status; ULONG info; } done;
++    DWORD i, sent = 0;
++    char *buffer = NULL;
++    int err = 0;
++
++    TRACE( "socket %#Ix, elements %p, count %lu, send_size %lu, overlapped %p, flags %#lx\n",
++           s, elements, count, send_size, overlapped, flags );
++
++    if (count && !elements)
++    {
++        SetLastError( WSAEINVAL );
++        return FALSE;
++    }
++    if (send_size == ~0u) send_size = 0;
++
++    for (i = 0; i < count && !err; i++)
++    {
++        TRANSMIT_PACKETS_ELEMENT *el = &elements[i];
++
++        if (el->dwElFlags & TP_ELEMENT_MEMORY)
++        {
++            if (el->cLength && !el->pBuffer)
++            {
++                err = WSAEINVAL;
++                break;
++            }
++#ifndef SG_MUTANT_NO_TRANSMIT
++            err = transmit_send_all( s, el->pBuffer, el->cLength, send_size );
++#endif
++            if (!err) sent += el->cLength;
++        }
++        else if (el->dwElFlags & TP_ELEMENT_FILE)
++        {
++            LARGE_INTEGER offset = el->nFileOffset, size;
++            ULONGLONG left;
++            DWORD got;
++
++            if (!buffer && !(buffer = malloc( 65536 )))
++            {
++                err = WSAENOBUFS;
++                break;
++            }
++            if (offset.QuadPart == -1)
++            {
++                LARGE_INTEGER zero = {{0}};
++                SetFilePointerEx( el->hFile, zero, &offset, FILE_CURRENT );
++            }
++            if (el->cLength) left = el->cLength;
++            else
++            {
++                if (!GetFileSizeEx( el->hFile, &size ))
++                {
++                    err = WSAEINVAL;
++                    break;
++                }
++                left = size.QuadPart > offset.QuadPart ? size.QuadPart - offset.QuadPart : 0;
++            }
++            while (left && !err)
++            {
++                OVERLAPPED ov = {0};
++
++                ov.Offset = offset.LowPart;
++                ov.OffsetHigh = offset.HighPart;
++                if (!ReadFile( el->hFile, buffer, left < 65536 ? left : 65536, &got, &ov ) &&
++                    !(GetLastError() == ERROR_IO_PENDING && GetOverlappedResult( el->hFile, &ov, &got, TRUE )))
++                {
++                    err = GetLastError() == ERROR_HANDLE_EOF ? 0 : WSAEINVAL;
++                    break;
++                }
++                if (!got) break;
++                err = transmit_send_all( s, buffer, got, send_size );
++                if (err) break;
++                sent += got;
++                left -= got;
++                offset.QuadPart += got;
++            }
++        }
++        else if (!(el->dwElFlags & TP_ELEMENT_EOP))
++            err = WSAEINVAL;
++    }
++    free( buffer );
++
++    if (!err && (flags & (TF_DISCONNECT | TF_REUSE_SOCKET)))
++    {
++        if (!WS2_DisconnectEx( s, NULL, flags & TF_REUSE_SOCKET, 0 )) err = WSAGetLastError();
++    }
++
++    if (overlapped)
++    {
++        IO_STATUS_BLOCK *piosb = (IO_STATUS_BLOCK *)overlapped;
++        void *cvalue = ((ULONG_PTR)overlapped->hEvent & 1) ? NULL : overlapped;
++        NTSTATUS status;
++
++        overlapped->Internal = STATUS_PENDING;
++        overlapped->InternalHigh = 0;
++        done.status = err ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
++        if (err == WSAECONNRESET) done.status = STATUS_CONNECTION_RESET;
++        done.info = sent;
++        status = NtDeviceIoControlFile( (HANDLE)s, overlapped->hEvent, NULL, cvalue, piosb,
++                                        IOCTL_AFD_WINE_COMPLETE_ASYNC, &done, sizeof(done), NULL, 0 );
++        if (status == STATUS_PENDING) status = STATUS_SUCCESS;
++        if (!err && status) err = NtStatusToWSAError( status );
++    }
++    SetLastError( err );
++    return !err;
++}
++
+ static BOOL WINAPI WS2_DisconnectEx( SOCKET s, OVERLAPPED *overlapped, DWORD flags, DWORD reserved )
+ {
+     IO_STATUS_BLOCK iosb, *piosb = &iosb;
+@@ -2614,7 +2754,7 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID
+             EXTENSION_FUNCTION(WSAID_ACCEPTEX, WS2_AcceptEx)
+             EXTENSION_FUNCTION(WSAID_GETACCEPTEXSOCKADDRS, WS2_GetAcceptExSockaddrs)
+             EXTENSION_FUNCTION(WSAID_TRANSMITFILE, WS2_TransmitFile)
+-            /* EXTENSION_FUNCTION(WSAID_TRANSMITPACKETS, WS2_TransmitPackets) */
++            EXTENSION_FUNCTION(WSAID_TRANSMITPACKETS, WS2_TransmitPackets)
+             EXTENSION_FUNCTION(WSAID_WSARECVMSG, WS2_WSARecvMsg)
+             EXTENSION_FUNCTION(WSAID_WSASENDMSG, WSASendMsg)
+         };
+@@ -2639,7 +2779,7 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID
+             }
+         }
+ 
+-        FIXME("SIO_GET_EXTENSION_FUNCTION_POINTER %s: stub\n", debugstr_guid(in_buff));
++        WARN("SIO_GET_EXTENSION_FUNCTION_POINTER %s: no such function\n", debugstr_guid(in_buff));
+         SetLastError( WSAEINVAL );
+         return -1;
+     }
+@@ -3303,9 +3443,20 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+         }
+ 
+         case SO_ERROR:
+-            FIXME( "SO_ERROR, stub.\n" );
++        {
++            /* Stained Glass OS 1688: kept, getsockopt(SO_ERROR) gives it back */
++            int value;
++
++            if (optlen < sizeof(value) || !optval)
++            {
++                SetLastError( WSAEFAULT );
++                return SOCKET_ERROR;
++            }
++            memcpy( &value, optval, sizeof(value) );
++            if (server_setsockopt( s, IOCTL_AFD_WINE_SET_SO_ERROR, (char *)&value, sizeof(value) )) return SOCKET_ERROR;
+             SetLastError( ERROR_SUCCESS );
+             return 0;
++        }
+ 
+         case SO_KEEPALIVE:
+             if (optlen <= 0 || !optval)
+--- a/dlls/ws2_32/tests/sock.c
++++ b/dlls/ws2_32/tests/sock.c
+@@ -1527,7 +1527,6 @@ static void test_set_getsockopt(void)
+     ok( !err && !WSAGetLastError(),
+         "got %d with %d (expected 0 with 0)\n",
+         err, WSAGetLastError());
+-    todo_wine
+     ok (i == 1234, "got %d (expected 1234)\n", i);
+ 
+     /* Test invalid optlen */
+--- a/include/wine/afd.h
++++ b/include/wine/afd.h
+@@ -291,6 +291,7 @@ C_ASSERT( sizeof(struct afd_get_events_params) == 56 );
+ #define IOCTL_AFD_WINE_SET_TCP_KEEPCNT                  WINE_AFD_IOC(302)
+ #define IOCTL_AFD_WINE_GET_TCP_KEEPINTVL                WINE_AFD_IOC(303)
+ #define IOCTL_AFD_WINE_SET_TCP_KEEPINTVL                WINE_AFD_IOC(304)
++#define IOCTL_AFD_WINE_SET_SO_ERROR                     WINE_AFD_IOC(305)
+ 
+ struct afd_iovec
+ {
+--- a/server/sock.c
++++ b/server/sock.c
+@@ -244,6 +244,7 @@ struct sock
+     unsigned int        message;     /* message to send */
+     obj_handle_t        wparam;      /* message wparam (socket handle) */
+     int                 errors[AFD_POLL_BIT_COUNT]; /* event errors */
++    int                 so_error;    /* Stained Glass OS: SO_ERROR as setsockopt set it (a WSA code) */
+     timeout_t           connect_time;/* time the socket was connected */
+     struct sock        *deferred;    /* socket that waits for a deferred accept */
+     struct async_queue  read_q;      /* queue for asynchronous reads */
+@@ -1768,6 +1769,7 @@ static struct sock *create_socket(void)
+     sock->exclusiveaddruse = 0;
+     sock->rcvbuf = 0;
+     sock->sndbuf = 0;
++    sock->so_error = 0;
+     sock->rcvtimeo = 0;
+     sock->sndtimeo = 0;
+     sock->icmp_fixup_data_len = 0;
+@@ -3160,6 +3162,13 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+             return;
+         }
+ 
++        /* Stained Glass OS 1688: what setsockopt(SO_ERROR) set, as on Windows */
++        if (sock->so_error)
++        {
++            set_reply_data( &sock->so_error, sizeof(sock->so_error) );
++            return;
++        }
++
+         error = sock_error( sock, NULL );
+         if (!error)
+         {
+@@ -3178,6 +3187,17 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+         return;
+     }
+ 
++    case IOCTL_AFD_WINE_SET_SO_ERROR:
++        if (get_req_data_size() < sizeof(int))
++        {
++            set_error( STATUS_BUFFER_TOO_SMALL );
++            return;
++        }
++#ifndef SG_MUTANT_SO_ERROR_IGNORED
++        sock->so_error = *(int *)get_req_data();
++#endif
++        return;
++
+     case IOCTL_AFD_WINE_GET_SO_RCVBUF:
+     {
+         int rcvbuf = sock->rcvbuf;
