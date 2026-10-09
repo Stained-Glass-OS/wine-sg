@@ -1,0 +1,575 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] cfgmgr32, sechost, user32: configuration manager notifications, service device events
+
+- CM_Register_Notification returned CR_CALL_NOT_IMPLEMENTED and
+  CM_Unregister_Notification was not exported (Firefox and other programs
+  watch for devices with them). Over the device notifications sechost has
+  from Wine's plug and play service:
+  - an interface class, or all of them: DEVICEINTERFACEARRIVAL and
+    DEVICEINTERFACEREMOVAL with the class and the interface's path;
+  - a handle: the query-remove, remove and custom events (a custom event's
+    GUID, name offset and data);
+  - a device instance, or all of them: DEVICEINSTANCEENUMERATED and
+    DEVICEINSTANCESTARTED when the first interface of the device arrives,
+    DEVICEINSTANCEREMOVED when its interfaces have gone or it is no longer
+    present (Wine's PnP manager reports interfaces, not device nodes).
+  The filter is checked (size, flags, type, an instance or a handle). After
+  CM_Unregister_Notification returns no callback runs, unless it was called
+  from the callback itself, which does not hang.
+- sechost: the first registration in a process waited for nothing, so an
+  interface that arrived right after it was lost; it now returns once the
+  process listens to the plug and play service.
+- RegisterDeviceNotification with DEVICE_NOTIFY_SERVICE_HANDLE registered a
+  callback that only printed a FIXME: the service's HandlerEx now gets
+  SERVICE_CONTROL_DEVICEEVENT with the event and its data. A
+  DBT_DEVTYP_HANDLE filter (a FIXME, though it worked) is checked for a
+  handle.
+
+Gate: test/cmnotify-gate.sh (64- and 32-bit, test/cmnotify-probe.c, with a
+plug and play client widl makes from test/cmnotify-plugplay.idl).
+Mutants SG_MUTANT_NO_CM_NOTIFY (cfgmgr32/main.c),
+SG_MUTANT_NO_SERVICE_DEVEVENT, SG_MUTANT_NO_LISTEN_WAIT
+(sechost/service.c).
+---
+--- a/dlls/cfgmgr32/Makefile.in
++++ b/dlls/cfgmgr32/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = cfgmgr32.dll
+ IMPORTLIB = cfgmgr32
+-IMPORTS   = setupapi
++IMPORTS   = setupapi sechost
+ 
+ SOURCES = \
+ 	main.c
+--- a/dlls/cfgmgr32/cfgmgr32.spec
++++ b/dlls/cfgmgr32/cfgmgr32.spec
+@@ -192,3 +192,4 @@
+ @ stdcall CM_Unregister_Device_InterfaceW(wstr long) setupapi.CM_Unregister_Device_InterfaceW
+ @ stdcall CM_Unregister_Device_Interface_ExA(str long ptr) setupapi.CM_Unregister_Device_Interface_ExA
+ @ stdcall CM_Unregister_Device_Interface_ExW(wstr long ptr) setupapi.CM_Unregister_Device_Interface_ExW
++@ stdcall CM_Unregister_Notification(ptr)
+--- a/dlls/cfgmgr32/main.c
++++ b/dlls/cfgmgr32/main.c
+@@ -16,9 +16,19 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
+-#include "wine/debug.h"
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "windef.h"
++#include "winbase.h"
+ #include "winreg.h"
++#include "winuser.h"
++#include "dbt.h"
+ #include "cfgmgr32.h"
++#include "devpropdef.h"
++#include "wine/debug.h"
++#include "wine/list.h"
++#include "wine/plugplay.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(setupapi);
+ 
+@@ -58,13 +68,355 @@ DWORD WINAPI CM_MapCrToWin32Err( CONFIGRET code, DWORD default_error )
+     return default_error;
+ }
+ 
++/* Stained Glass OS: configuration manager notifications, over the device
++ * notifications sechost has from Wine's plug and play service. Device
++ * instance notifications come from the device's interfaces: a device is
++ * enumerated and started when the first interface of it arrives, removed
++ * when its interfaces have gone or it is no longer present. */
++static const DEVPROPKEY instance_id_key =
++    { { 0x78c34fc8, 0x104a, 0x4aca, { 0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57 } }, 256 };
++
++struct cm_instance
++{
++    struct list entry;
++    unsigned int interfaces;
++    WCHAR id[1];
++};
++
++struct cm_notify
++{
++    struct list entry;
++    HDEVNOTIFY devnotify;
++    CM_NOTIFY_FILTER filter;
++    PCM_NOTIFY_CALLBACK callback;
++    void *context;
++    unsigned int busy;     /* callbacks running */
++    DWORD busy_thread;
++    BOOL dead;
++    BOOL free_in_callback; /* unregistered from its own callback */
++    struct list instances; /* struct cm_instance */
++};
++
++static CRITICAL_SECTION cm_cs;
++static CRITICAL_SECTION_DEBUG cm_cs_debug =
++{
++    0, 0, &cm_cs,
++    { &cm_cs_debug.ProcessLocksList, &cm_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": cm_cs") }
++};
++static CRITICAL_SECTION cm_cs = { &cm_cs_debug, -1, 0, 0, 0, 0 };
++static CONDITION_VARIABLE cm_cv = CONDITION_VARIABLE_INIT;
++static struct list cm_notifies = LIST_INIT( cm_notifies );
++
++static void free_notify( struct cm_notify *notify )
++{
++    struct cm_instance *instance, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( instance, next, &notify->instances, struct cm_instance, entry )
++    {
++        list_remove( &instance->entry );
++        free( instance );
++    }
++    free( notify );
++}
++
++static DWORD call_back( struct cm_notify *notify, CM_NOTIFY_ACTION action, CM_NOTIFY_EVENT_DATA *data, DWORD size )
++{
++    TRACE( "%p action %u\n", notify, action );
++    return notify->callback( (HCMNOTIFICATION)notify, notify->context, action, data, size );
++}
++
++static DWORD instance_event( struct cm_notify *notify, CM_NOTIFY_ACTION action, const WCHAR *id )
++{
++    DWORD size = offsetof( CM_NOTIFY_EVENT_DATA, u.DeviceInstance.InstanceId[wcslen( id ) + 1] );
++    CM_NOTIFY_EVENT_DATA *data;
++    DWORD ret;
++
++    if (!(data = calloc( 1, size ))) return 0;
++    data->FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINSTANCE;
++    lstrcpyW( data->u.DeviceInstance.InstanceId, id );
++    ret = call_back( notify, action, data, size );
++    free( data );
++    return ret;
++}
++
++/* the device instance an interface's path belongs to */
++static BOOL iface_instance( const WCHAR *path, WCHAR *id, ULONG len )
++{
++    DEVPROPTYPE type;
++    ULONG size = len * sizeof(WCHAR);
++    const WCHAR *start, *end;
++    WCHAR *ptr;
++
++    if (!CM_Get_Device_Interface_PropertyW( path, &instance_id_key, &type, (BYTE *)id, &size, 0 )
++            && type == DEVPROP_TYPE_STRING)
++        return TRUE;
++    /* gone already: \\?\ROOT#DEVICE#0000#{class}\refstr */
++    if (wcslen( path ) < 4) return FALSE;
++    start = path + 4;
++    if (!(end = wcsstr( start, L"#{" ))) return FALSE;
++    while (wcsstr( end + 1, L"#{" )) end = wcsstr( end + 1, L"#{" );
++    if (end - start >= len) return FALSE;
++    memcpy( id, start, (end - start) * sizeof(WCHAR) );
++    id[end - start] = 0;
++    for (ptr = id; *ptr; ptr++) if (*ptr == '#') *ptr = '\\';
++    wcsupr( id );
++    return TRUE;
++}
++
++static void instance_iface_event( struct cm_notify *notify, DWORD code, const WCHAR *path )
++{
++    struct cm_instance *instance = NULL, *iter;
++    WCHAR id[MAX_DEVICE_ID_LEN];
++    DEVINST devnode;
++
++    if (!iface_instance( path, id, ARRAY_SIZE(id) )) return;
++    if (!(notify->filter.Flags & CM_NOTIFY_FILTER_FLAG_ALL_DEVICE_INSTANCES)
++            && wcsicmp( id, notify->filter.u.DeviceInstance.InstanceId ))
++        return;
++
++    LIST_FOR_EACH_ENTRY( iter, &notify->instances, struct cm_instance, entry )
++        if (!wcsicmp( iter->id, id )) { instance = iter; break; }
++
++    if (code == DBT_DEVICEARRIVAL)
++    {
++        if (instance)
++        {
++            instance->interfaces++;
++            return;
++        }
++        if (!(instance = malloc( offsetof( struct cm_instance, id[wcslen( id ) + 1] ) ))) return;
++        lstrcpyW( instance->id, id );
++        instance->interfaces = 1;
++        list_add_tail( &notify->instances, &instance->entry );
++        instance_event( notify, CM_NOTIFY_ACTION_DEVICEINSTANCEENUMERATED, id );
++        instance_event( notify, CM_NOTIFY_ACTION_DEVICEINSTANCESTARTED, id );
++    }
++    else if (code == DBT_DEVICEREMOVECOMPLETE)
++    {
++        if (instance && --instance->interfaces) return;
++        if (!instance && !CM_Locate_DevNodeW( &devnode, id, CM_LOCATE_DEVNODE_NORMAL )) return;
++        if (instance)
++        {
++            list_remove( &instance->entry );
++            free( instance );
++        }
++        instance_event( notify, CM_NOTIFY_ACTION_DEVICEINSTANCEREMOVED, id );
++    }
++}
++
++static DWORD deliver( struct cm_notify *notify, DWORD code, DEV_BROADCAST_HDR *header )
++{
++    CM_NOTIFY_EVENT_DATA *data;
++    DWORD size, ret = 0;
++
++    switch (notify->filter.FilterType)
++    {
++    case CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE:
++    {
++        DEV_BROADCAST_DEVICEINTERFACE_W *iface = (DEV_BROADCAST_DEVICEINTERFACE_W *)header;
++        CM_NOTIFY_ACTION action;
++
++        if (header->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE) return 0;
++        if (code == DBT_DEVICEARRIVAL) action = CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL;
++        else if (code == DBT_DEVICEREMOVECOMPLETE) action = CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL;
++        else return 0;
++        size = offsetof( CM_NOTIFY_EVENT_DATA, u.DeviceInterface.SymbolicLink[wcslen( iface->dbcc_name ) + 1] );
++        if (!(data = calloc( 1, size ))) return 0;
++        data->FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE;
++        data->u.DeviceInterface.ClassGuid = iface->dbcc_classguid;
++        lstrcpyW( data->u.DeviceInterface.SymbolicLink, iface->dbcc_name );
++        ret = call_back( notify, action, data, size );
++        free( data );
++        break;
++    }
++    case CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE:
++    {
++        DEV_BROADCAST_HANDLE *handle = (DEV_BROADCAST_HANDLE *)header;
++        CM_NOTIFY_ACTION action;
++        DWORD data_size = 0;
++
++        if (header->dbch_devicetype != DBT_DEVTYP_HANDLE) return 0;
++        switch (code)
++        {
++        case DBT_DEVICEQUERYREMOVE: action = CM_NOTIFY_ACTION_DEVICEQUERYREMOVE; break;
++        case DBT_DEVICEQUERYREMOVEFAILED: action = CM_NOTIFY_ACTION_DEVICEQUERYREMOVEFAILED; break;
++        case DBT_DEVICEREMOVEPENDING: action = CM_NOTIFY_ACTION_DEVICEREMOVEPENDING; break;
++        case DBT_DEVICEREMOVECOMPLETE: action = CM_NOTIFY_ACTION_DEVICEREMOVECOMPLETE; break;
++        case DBT_CUSTOMEVENT: action = CM_NOTIFY_ACTION_DEVICECUSTOMEVENT; break;
++        default: return 0;
++        }
++        if (action == CM_NOTIFY_ACTION_DEVICECUSTOMEVENT && header->dbch_size > offsetof( DEV_BROADCAST_HANDLE, dbch_data ))
++            data_size = header->dbch_size - offsetof( DEV_BROADCAST_HANDLE, dbch_data );
++        size = max( sizeof(*data), offsetof( CM_NOTIFY_EVENT_DATA, u.DeviceHandle.Data[data_size] ) );
++        if (!(data = calloc( 1, size ))) return 0;
++        data->FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE;
++        if (action == CM_NOTIFY_ACTION_DEVICECUSTOMEVENT)
++        {
++            data->u.DeviceHandle.EventGuid = handle->dbch_eventguid;
++            data->u.DeviceHandle.NameOffset = handle->dbch_nameoffset;
++            data->u.DeviceHandle.DataSize = data_size;
++            memcpy( data->u.DeviceHandle.Data, handle->dbch_data, data_size );
++        }
++        else data->u.DeviceHandle.NameOffset = -1;
++        ret = call_back( notify, action, data, size );
++        free( data );
++        break;
++    }
++    case CM_NOTIFY_FILTER_TYPE_DEVICEINSTANCE:
++        if (header->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE) return 0;
++        instance_iface_event( notify, code, ((DEV_BROADCAST_DEVICEINTERFACE_W *)header)->dbcc_name );
++        break;
++    default:
++        break;
++    }
++    return ret;
++}
++
++static DWORD CALLBACK cm_notify_callback( HANDLE handle, DWORD code, DEV_BROADCAST_HDR *header )
++{
++    struct cm_notify *notify = handle, *iter;
++    BOOL found = FALSE;
++    DWORD ret;
++
++    EnterCriticalSection( &cm_cs );
++    LIST_FOR_EACH_ENTRY( iter, &cm_notifies, struct cm_notify, entry )
++        if (iter == notify) { found = TRUE; break; }
++    if (!found)
++    {
++        LeaveCriticalSection( &cm_cs );
++        return 0;
++    }
++    notify->busy++;
++    notify->busy_thread = GetCurrentThreadId();
++    LeaveCriticalSection( &cm_cs );
++
++    ret = deliver( notify, code, header );
++
++    EnterCriticalSection( &cm_cs );
++    if (!--notify->busy)
++    {
++        notify->busy_thread = 0;
++        if (notify->free_in_callback) free_notify( notify );
++        else WakeAllConditionVariable( &cm_cv );
++    }
++    LeaveCriticalSection( &cm_cs );
++    return ret;
++}
++
+ /***********************************************************************
+  *           CM_Register_Notification (cfgmgr32.@)
+  */
+ CONFIGRET WINAPI CM_Register_Notification( CM_NOTIFY_FILTER *filter, void *context,
+                                            PCM_NOTIFY_CALLBACK callback, HCMNOTIFICATION *notify_context )
+ {
+-    FIXME("%p %p %p %p stub!\n", filter, context, callback, notify_context);
++    union
++    {
++        DEV_BROADCAST_HDR header;
++        DEV_BROADCAST_DEVICEINTERFACE_W iface;
++        DEV_BROADCAST_HANDLE handle;
++    } dbt;
++    struct cm_notify *notify;
++
++    TRACE( "%p %p %p %p\n", filter, context, callback, notify_context );
++
++    if (!filter || !callback || !notify_context) return CR_INVALID_POINTER;
++    if (filter->cbSize != sizeof(*filter)) return CR_INVALID_DATA;
++    if (filter->Flags & ~CM_NOTIFY_FILTER_VALID_FLAGS) return CR_INVALID_FLAG;
++    if (filter->Reserved) return CR_INVALID_DATA;
++
++    memset( &dbt, 0, sizeof(dbt) );
++    switch (filter->FilterType)
++    {
++    case CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE:
++        if (filter->Flags & CM_NOTIFY_FILTER_FLAG_ALL_DEVICE_INSTANCES) return CR_INVALID_FLAG;
++        dbt.iface.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
++        dbt.iface.dbcc_classguid = filter->u.DeviceInterface.ClassGuid;
++        /* sechost matches every class when the filter stops before it */
++        dbt.iface.dbcc_size = (filter->Flags & CM_NOTIFY_FILTER_FLAG_ALL_INTERFACE_CLASSES)
++                ? offsetof( DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_classguid )
++                : offsetof( DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name );
++        break;
++    case CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE:
++        if (filter->Flags) return CR_INVALID_FLAG;
++        if (!filter->u.DeviceHandle.hTarget || filter->u.DeviceHandle.hTarget == INVALID_HANDLE_VALUE)
++            return CR_INVALID_DATA;
++        dbt.handle.dbch_size = sizeof(dbt.handle);
++        dbt.handle.dbch_devicetype = DBT_DEVTYP_HANDLE;
++        dbt.handle.dbch_handle = filter->u.DeviceHandle.hTarget;
++        break;
++    case CM_NOTIFY_FILTER_TYPE_DEVICEINSTANCE:
++        if (filter->Flags & CM_NOTIFY_FILTER_FLAG_ALL_INTERFACE_CLASSES) return CR_INVALID_FLAG;
++        if (!(filter->Flags & CM_NOTIFY_FILTER_FLAG_ALL_DEVICE_INSTANCES) && !filter->u.DeviceInstance.InstanceId[0])
++            return CR_INVALID_DATA;
++        dbt.iface.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
++        dbt.iface.dbcc_size = offsetof( DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_classguid );
++        break;
++    default:
++        return CR_INVALID_DATA;
++    }
++
++    if (!(notify = calloc( 1, sizeof(*notify) ))) return CR_OUT_OF_MEMORY;
++    notify->filter = *filter;
++    notify->callback = callback;
++    notify->context = context;
++    list_init( &notify->instances );
++
++    EnterCriticalSection( &cm_cs );
++    list_add_tail( &cm_notifies, &notify->entry );
++    LeaveCriticalSection( &cm_cs );
++
++#ifdef SG_MUTANT_NO_CM_NOTIFY
++    notify->devnotify = (HDEVNOTIFY)1;
++#else
++    if (!(notify->devnotify = I_ScRegisterDeviceNotification( notify, &dbt.header, cm_notify_callback )))
++    {
++        EnterCriticalSection( &cm_cs );
++        list_remove( &notify->entry );
++        LeaveCriticalSection( &cm_cs );
++        free( notify );
++        return GetLastError() == ERROR_NOT_ENOUGH_MEMORY && filter->FilterType == CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE
++                ? CR_INVALID_DATA : CR_FAILURE;
++    }
++#endif
++    *notify_context = (HCMNOTIFICATION)notify;
++    return CR_SUCCESS;
++}
++
++/***********************************************************************
++ *           CM_Unregister_Notification (cfgmgr32.@)
++ */
++CONFIGRET WINAPI CM_Unregister_Notification( HCMNOTIFICATION handle )
++{
++    struct cm_notify *notify = (struct cm_notify *)handle, *iter;
++    BOOL found = FALSE;
++
++    TRACE( "%p\n", handle );
++
++    if (!handle || handle == INVALID_HANDLE_VALUE) return CR_INVALID_POINTER;
++
++    EnterCriticalSection( &cm_cs );
++    LIST_FOR_EACH_ENTRY( iter, &cm_notifies, struct cm_notify, entry )
++        if (iter == notify) { found = TRUE; break; }
++    if (!found)
++    {
++        LeaveCriticalSection( &cm_cs );
++        return CR_INVALID_DATA;
++    }
++    list_remove( &notify->entry );
++    notify->dead = TRUE;
++    LeaveCriticalSection( &cm_cs );
++
++#ifndef SG_MUTANT_NO_CM_NOTIFY
++    I_ScUnregisterDeviceNotification( notify->devnotify );
++#endif
+ 
+-    return CR_CALL_NOT_IMPLEMENTED;
++    /* no callback after this returns, except from within one */
++    EnterCriticalSection( &cm_cs );
++    while (notify->busy && notify->busy_thread != GetCurrentThreadId())
++        SleepConditionVariableCS( &cm_cv, &cm_cs, INFINITE );
++    if (!notify->busy) free_notify( notify );
++    else notify->free_in_callback = TRUE;
++    LeaveCriticalSection( &cm_cs );
++    return CR_SUCCESS;
+ }
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -2344,6 +2344,39 @@ static BOOL notification_filter_matches( DEV_BROADCAST_HDR *filter, const WCHAR
+     return TRUE;
+ }
+ 
++/* Stained Glass OS: a service registered for device events with its status
++ * handle (RegisterDeviceNotification, DEVICE_NOTIFY_SERVICE_HANDLE, which
++ * registers with no callback) gets them as SERVICE_CONTROL_DEVICEEVENT in
++ * its HandlerEx. */
++static DWORD service_device_event( HANDLE handle, DWORD code, DEV_BROADCAST_HDR *header )
++{
++    LPHANDLER_FUNCTION_EX handler = NULL;
++    void *context = NULL;
++    unsigned int i;
++
++    EnterCriticalSection( &service_cs );
++    for (i = 0; i < nb_services; i++)
++    {
++        if (services[i]->handle != (SC_HANDLE)handle) continue;
++        handler = services[i]->handler;
++        context = services[i]->context;
++        break;
++    }
++    LeaveCriticalSection( &service_cs );
++
++#ifdef SG_MUTANT_NO_SERVICE_DEVEVENT
++    handler = NULL;
++#endif
++    /* only HandlerEx gets device events */
++    if (!handler || handler == ctrl_handler_thunk)
++    {
++        TRACE( "no handler for %p\n", handle );
++        return 0;
++    }
++    TRACE( "service %p event %#lx\n", handle, code );
++    return handler( SERVICE_CONTROL_DEVICEEVENT, code, header, context );
++}
++
+ static DWORD WINAPI device_notify_proc( void *arg )
+ {
+     WCHAR endpoint[] = L"\\pipe\\wine_plugplay";
+@@ -2363,6 +2396,7 @@ static DWORD WINAPI device_notify_proc( void *arg )
+     if ((err = RpcStringBindingComposeW( NULL, protseq, NULL, endpoint, NULL, &binding_str )))
+     {
+         ERR("RpcStringBindingCompose() failed, error %#lx\n", err);
++        if (arg) { SetEvent( arg ); CloseHandle( arg ); }
+         return err;
+     }
+     err = RpcBindingFromStringBindingW( binding_str, &plugplay_binding_handle );
+@@ -2370,6 +2404,7 @@ static DWORD WINAPI device_notify_proc( void *arg )
+     if (err)
+     {
+         ERR("RpcBindingFromStringBinding() failed, error %#lx\n", err);
++        if (arg) { SetEvent( arg ); CloseHandle( arg ); }
+         return err;
+     }
+ 
+@@ -2383,6 +2418,11 @@ static DWORD WINAPI device_notify_proc( void *arg )
+     }
+     __ENDTRY
+ 
++    if (arg)
++    {
++        SetEvent( arg ); /* listening (or not, but done trying) */
++        CloseHandle( arg );
++    }
+     if (!handle)
+     {
+         ERR("failed to open RPC handle, error %lu\n", err);
+@@ -2422,7 +2462,8 @@ static DWORD WINAPI device_notify_proc( void *arg )
+ 
+         LIST_FOR_EACH_ENTRY_SAFE( event, next, &events, struct device_notify, entry )
+         {
+-            event->callback( event->handle, code, event->header );
++            if (event->callback) event->callback( event->handle, code, event->header );
++            else service_device_event( event->handle, code, event->header );
+             list_remove( &event->entry );
+             free( event );
+         }
+@@ -2485,7 +2526,20 @@ HDEVNOTIFY WINAPI I_ScRegisterDeviceNotification( HANDLE handle, DEV_BROADCAST_H
+     list_add_tail( &device_notify_list, &notify->entry );
+ 
+     if (!device_notify_thread)
+-        device_notify_thread = CreateThread( NULL, 0, device_notify_proc, NULL, 0, NULL );
++    {
++        /* Stained Glass OS: events from the moment this returns, as on
++         * Windows: wait for the thread to be listening (an interface that
++         * arrived right after the first registration was lost) */
++        HANDLE listening = CreateEventW( NULL, TRUE, FALSE, NULL ); /* the thread's, it closes it */
++
++        device_notify_thread = CreateThread( NULL, 0, device_notify_proc, listening, 0, NULL );
++        LeaveCriticalSection( &service_cs );
++#ifndef SG_MUTANT_NO_LISTEN_WAIT
++        if (listening && device_notify_thread) WaitForSingleObject( listening, 5000 );
++#endif
++        if (listening && !device_notify_thread) CloseHandle( listening );
++        return notify;
++    }
+ 
+     LeaveCriticalSection( &service_cs );
+ 
+--- a/dlls/user32/input.c
++++ b/dlls/user32/input.c
+@@ -553,12 +553,6 @@ static DWORD CALLBACK devnotify_window_callbackA(HANDLE handle, DWORD flags, DEV
+     return 0;
+ }
+ 
+-static DWORD CALLBACK devnotify_service_callback(HANDLE handle, DWORD flags, DEV_BROADCAST_HDR *header)
+-{
+-    FIXME("Support for service handles is not yet implemented!\n");
+-    return 0;
+-}
+-
+ /***********************************************************************
+  *		RegisterDeviceNotificationA (USER32.@)
+  *
+@@ -591,8 +585,9 @@ HDEVNOTIFY WINAPI RegisterDeviceNotificationW( HANDLE handle, void *filter, DWOR
+         return NULL;
+     }
+ 
++    /* sechost gives a service its events through its HandlerEx */
+     if (flags & DEVICE_NOTIFY_SERVICE_HANDLE)
+-        callback = devnotify_service_callback;
++        callback = NULL;
+     else if (IsWindowUnicode( handle ))
+         callback = devnotify_window_callbackW;
+     else
+@@ -616,7 +611,14 @@ HDEVNOTIFY WINAPI RegisterDeviceNotificationW( HANDLE handle, void *filter, DWOR
+     }
+     if (header->dbch_devicetype == DBT_DEVTYP_HANDLE)
+     {
+-        FIXME( "DBT_DEVTYP_HANDLE not implemented\n" );
++        DEV_BROADCAST_HANDLE *filter = (DEV_BROADCAST_HANDLE *)header;
++
++        if (header->dbch_size < offsetof( DEV_BROADCAST_HANDLE, dbch_eventguid ) || !filter->dbch_handle
++                || filter->dbch_handle == INVALID_HANDLE_VALUE)
++        {
++            SetLastError( ERROR_INVALID_DATA );
++            return NULL;
++        }
+         return I_ScRegisterDeviceNotification( handle, header, callback );
+     }
+ 
