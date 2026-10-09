@@ -1,0 +1,2357 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] shell32, explorer: jump lists
+
+ICustomDestinationList, IApplicationDestinations and
+IApplicationDocumentLists were E_NOTIMPL stubs, and there was no
+EnumerableObjectCollection at all -- the object programs build their
+jump list categories and tasks in, so their CoCreateInstance failed.
+SHAddToRecentDocs knew only paths and ID lists, and clearing it left the
+Recent folder's shortcuts.
+
+- EnumerableObjectCollection (IObjectCollection, IObjectArray).
+- ICustomDestinationList: SetAppID, BeginList (the slots the taskbar
+  shows, and what the user removed), AppendCategory (documents as shell
+  items and links; a removed one is E_ACCESSDENIED), AppendKnownCategory
+  (Recent, Frequent), AddUserTasks (links, with separators), CommitList,
+  AbortList, DeleteList, GetRemovedDestinations; calls out of order are
+  E_UNEXPECTED. A committed list is kept per AppUserModelID (the explicit
+  one, else the program's path) under the Recent folder, in a format of
+  our own.
+- SHAddToRecentDocs takes SHARD_APPIDINFO, SHARD_APPIDINFOIDLIST,
+  SHARD_LINK, SHARD_APPIDINFOLINK and SHARD_SHELLITEM, and puts the
+  document on its program's list too (with its use count), unless
+  NoRecentDocsHistory is set. Clearing it deletes the Recent shortcuts and
+  the programs' document lists.
+- IApplicationDocumentLists.GetList gives a program's documents most
+  recent or most used first; IApplicationDestinations removes one or all.
+- The taskbar shows a program's jump list at the top of its button's
+  menu (and a pinned program's): the categories, Recent/Frequent where
+  the program asked for them -- or its recent documents when it has no
+  list of its own -- and its tasks; choosing a task runs it, a document
+  opens in the program.
+
+Wine's shell32 shelllink, shlfolder and shellole tests: as before.
+
+Gate: test/jumplist-gate.sh (Xvfb, test/jumplist-probe.c).
+Mutants SG_MUTANT_COMMIT_NOTHING (shell32/jumplist.c),
+SG_MUTANT_NO_APP_RECENT (shell32/shellord.c), SG_MUTANT_NO_JUMP_MENU
+(explorer/systray.c).
+---
+--- a/dlls/shell32/Makefile.in
++++ b/dlls/shell32/Makefile.in
+@@ -102,4 +102,5 @@ SOURCES = \
+ 	shpolicy.c \
+ 	systray.c \
+ 	vdesktopmgr.c \
+-	zipfolder.c
++	zipfolder.c \
++	jumplist.c
+new file mode 100644
+--- /dev/null
++++ b/dlls/shell32/jumplist.c
+@@ -0,0 +1,1522 @@
++/*
++ * Jump lists: custom destination lists, application destinations and
++ * document lists, and the enumerable object collection
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Stained Glass OS 1664. A program's jump list -- the categories of
++ * destinations and the tasks it commits with ICustomDestinationList, and
++ * the documents it opened (SHAddToRecentDocs) -- is kept per AppUserModelID
++ * (the program's explicit one, else its file's path) in files of our own
++ * format under the user's Recent folder:
++ *   CustomDestinations\<hash>.sg-customdest   the committed list
++ *   CustomDestinations\<hash>.sg-removed      what the user took off it
++ *   AutomaticDestinations\<hash>.sg-autodest  the documents, with their use
++ * The taskbar shows them on a program's button (SGJumpList* below). */
++
++#include <stdarg.h>
++
++#define COBJMACROS
++#include "windef.h"
++#include "winbase.h"
++#include "winreg.h"
++#include "shlobj.h"
++#include "shlwapi.h"
++#include "shobjidl.h"
++#include "objectarray.h"
++#include "propkey.h"
++#include "propvarutil.h"
++#include "wine/debug.h"
++
++#include "pidl.h"
++#include "shell32_main.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(shell);
++
++#define JUMPLIST_MAGIC  0x4c4a4753  /* "SGJL" */
++#define AUTODEST_MAGIC  0x44414753  /* "SGAD" */
++#define REMOVED_MAGIC   0x4d524753  /* "SGRM" */
++#define FORMAT_VERSION  1
++#define MAX_RECENT      60
++
++enum category_kind { CAT_CUSTOM = 0, CAT_KNOWN = 1, CAT_TASKS = 2 };
++enum item_type { ITEM_LINK = 1, ITEM_SHELLITEM = 2 };
++
++/* ---- the enumerable object collection ------------------------------------ */
++
++struct object_collection
++{
++    IObjectCollection IObjectCollection_iface;
++    LONG ref;
++    IUnknown **objects;
++    UINT count, size;
++};
++
++static inline struct object_collection *impl_from_IObjectCollection( IObjectCollection *iface )
++{
++    return CONTAINING_RECORD( iface, struct object_collection, IObjectCollection_iface );
++}
++
++static HRESULT WINAPI collection_QueryInterface( IObjectCollection *iface, REFIID riid, void **obj )
++{
++    struct object_collection *This = impl_from_IObjectCollection( iface );
++
++    TRACE( "(%p, %s, %p)\n", This, debugstr_guid( riid ), obj );
++
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IObjectArray ) ||
++        IsEqualIID( riid, &IID_IObjectCollection ))
++    {
++        *obj = &This->IObjectCollection_iface;
++        IObjectCollection_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI collection_AddRef( IObjectCollection *iface )
++{
++    struct object_collection *This = impl_from_IObjectCollection( iface );
++    return InterlockedIncrement( &This->ref );
++}
++
++static ULONG WINAPI collection_Release( IObjectCollection *iface )
++{
++    struct object_collection *This = impl_from_IObjectCollection( iface );
++    ULONG ref = InterlockedDecrement( &This->ref ), i;
++
++    if (!ref)
++    {
++        for (i = 0; i < This->count; i++) IUnknown_Release( This->objects[i] );
++        free( This->objects );
++        free( This );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI collection_GetCount( IObjectCollection *iface, UINT *count )
++{
++    struct object_collection *This = impl_from_IObjectCollection( iface );
++
++    if (!count) return E_POINTER;
++    *count = This->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI collection_GetAt( IObjectCollection *iface, UINT index, REFIID riid, void **obj )
++{
++    struct object_collection *This = impl_from_IObjectCollection( iface );
++
++    TRACE( "(%p, %u, %s, %p)\n", This, index, debugstr_guid( riid ), obj );
++
++    if (!obj) return E_POINTER;
++    *obj = NULL;
++    if (index >= This->count) return E_INVALIDARG;
++    return IUnknown_QueryInterface( This->objects[index], riid, obj );
++}
++
++static HRESULT WINAPI collection_AddObject( IObjectCollection *iface, IUnknown *object )
++{
++    struct object_collection *This = impl_from_IObjectCollection( iface );
++
++    TRACE( "(%p, %p)\n", This, object );
++
++    if (!object) return E_INVALIDARG;
++    if (This->count == This->size)
++    {
++        UINT size = This->size ? This->size * 2 : 8;
++        IUnknown **objects = realloc( This->objects, size * sizeof(*objects) );
++        if (!objects) return E_OUTOFMEMORY;
++        This->objects = objects;
++        This->size = size;
++    }
++    IUnknown_AddRef( object );
++    This->objects[This->count++] = object;
++    return S_OK;
++}
++
++static HRESULT WINAPI collection_AddFromArray( IObjectCollection *iface, IObjectArray *array )
++{
++    UINT count, i;
++    IUnknown *object;
++    HRESULT hr;
++
++    TRACE( "(%p, %p)\n", iface, array );
++
++    if (!array) return E_INVALIDARG;
++    if (FAILED(hr = IObjectArray_GetCount( array, &count ))) return hr;
++    for (i = 0; i < count; i++)
++    {
++        if (FAILED(hr = IObjectArray_GetAt( array, i, &IID_IUnknown, (void **)&object ))) return hr;
++        hr = collection_AddObject( iface, object );
++        IUnknown_Release( object );
++        if (FAILED(hr)) return hr;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI collection_RemoveObjectAt( IObjectCollection *iface, UINT index )
++{
++    struct object_collection *This = impl_from_IObjectCollection( iface );
++
++    TRACE( "(%p, %u)\n", This, index );
++
++    if (index >= This->count) return E_INVALIDARG;
++    IUnknown_Release( This->objects[index] );
++    memmove( This->objects + index, This->objects + index + 1, (This->count - index - 1) * sizeof(IUnknown *) );
++    This->count--;
++    return S_OK;
++}
++
++static HRESULT WINAPI collection_Clear( IObjectCollection *iface )
++{
++    struct object_collection *This = impl_from_IObjectCollection( iface );
++
++    TRACE( "(%p)\n", This );
++
++    while (This->count)
++    {
++        IUnknown *object = This->objects[--This->count];
++        IUnknown_Release( object );
++    }
++    return S_OK;
++}
++
++static const IObjectCollectionVtbl collection_vtbl =
++{
++    collection_QueryInterface,
++    collection_AddRef,
++    collection_Release,
++    collection_GetCount,
++    collection_GetAt,
++    collection_AddObject,
++    collection_AddFromArray,
++    collection_RemoveObjectAt,
++    collection_Clear,
++};
++
++static HRESULT create_collection( IObjectCollection **out )
++{
++    struct object_collection *This;
++
++    *out = NULL;
++    if (!(This = calloc( 1, sizeof(*This) ))) return E_OUTOFMEMORY;
++    This->IObjectCollection_iface.lpVtbl = &collection_vtbl;
++    This->ref = 1;
++    *out = &This->IObjectCollection_iface;
++    return S_OK;
++}
++
++HRESULT WINAPI EnumerableObjectCollection_Constructor( IUnknown *outer, REFIID riid, void **obj )
++{
++    IObjectCollection *collection;
++    HRESULT hr;
++
++    TRACE( "(%p, %s, %p)\n", outer, debugstr_guid( riid ), obj );
++
++    *obj = NULL;
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (FAILED(hr = create_collection( &collection ))) return hr;
++    hr = IObjectCollection_QueryInterface( collection, riid, obj );
++    IObjectCollection_Release( collection );
++    return hr;
++}
++
++/* ---- where a program's lists are ------------------------------------------ */
++
++/* the program's AppUserModelID: its explicit one, else its file's path */
++static void current_app_id( WCHAR *id, DWORD size )
++{
++    static HRESULT (WINAPI *get_explicit_id)( WCHAR ** );
++    WCHAR *explicit_id = NULL;
++
++    if (!get_explicit_id)
++    {
++        HMODULE shcore = LoadLibraryW( L"shcore.dll" );
++        if (shcore) get_explicit_id = (void *)GetProcAddress( shcore, "GetCurrentProcessExplicitAppUserModelID" );
++    }
++    if (get_explicit_id && SUCCEEDED(get_explicit_id( &explicit_id )) && explicit_id)
++    {
++        lstrcpynW( id, explicit_id, size );
++        CoTaskMemFree( explicit_id );
++        return;
++    }
++    if (!GetModuleFileNameW( NULL, id, size )) id[0] = 0;
++}
++
++static BOOL list_path( const WCHAR *appid, const WCHAR *dir, const WCHAR *ext, WCHAR *path )
++{
++    ULONGLONG hash = 0xcbf29ce484222325ull;
++    WCHAR base[MAX_PATH];
++    const WCHAR *p;
++
++    if (!appid || !appid[0]) return FALSE;
++    /* FNV-1a over the ID, case-insensitively */
++    for (p = appid; *p; p++)
++    {
++        WCHAR c = towlower( *p );
++        hash = (hash ^ (c & 0xff)) * 0x100000001b3ull;
++        hash = (hash ^ (c >> 8)) * 0x100000001b3ull;
++    }
++    if (FAILED(SHGetFolderPathW( NULL, CSIDL_RECENT | CSIDL_FLAG_CREATE, NULL, SHGFP_TYPE_CURRENT, base ))) return FALSE;
++    swprintf( path, MAX_PATH, L"%s\\%s", base, dir );
++    CreateDirectoryW( path, NULL );
++    swprintf( path, MAX_PATH, L"%s\\%s\\%08lx%08lx.%s", base, dir, (DWORD)(hash >> 32), (DWORD)hash, ext );
++    return TRUE;
++}
++
++static BOOL custom_path( const WCHAR *appid, WCHAR *path )
++{
++    return list_path( appid, L"CustomDestinations", L"sg-customdest", path );
++}
++
++static BOOL removed_path( const WCHAR *appid, WCHAR *path )
++{
++    return list_path( appid, L"CustomDestinations", L"sg-removed", path );
++}
++
++static BOOL auto_path( const WCHAR *appid, WCHAR *path )
++{
++    return list_path( appid, L"AutomaticDestinations", L"sg-autodest", path );
++}
++
++/* ---- reading and writing ---------------------------------------------------- */
++
++static HRESULT write_dword( IStream *stream, DWORD value )
++{
++    return IStream_Write( stream, &value, sizeof(value), NULL );
++}
++
++static HRESULT read_dword( IStream *stream, DWORD *value )
++{
++    ULONG read;
++    HRESULT hr = IStream_Read( stream, value, sizeof(*value), &read );
++    if (SUCCEEDED(hr) && read != sizeof(*value)) hr = E_FAIL;
++    return hr;
++}
++
++static HRESULT write_string( IStream *stream, const WCHAR *str )
++{
++    DWORD len = str ? wcslen( str ) : 0;
++    HRESULT hr;
++
++    if (FAILED(hr = write_dword( stream, len ))) return hr;
++    return len ? IStream_Write( stream, str, len * sizeof(WCHAR), NULL ) : S_OK;
++}
++
++static HRESULT read_string( IStream *stream, WCHAR **str )
++{
++    DWORD len;
++    ULONG read;
++    HRESULT hr;
++
++    *str = NULL;
++    if (FAILED(hr = read_dword( stream, &len ))) return hr;
++    if (len > 32768) return E_FAIL;
++    if (!(*str = malloc( (len + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++    hr = len ? IStream_Read( stream, *str, len * sizeof(WCHAR), &read ) : S_OK;
++    if (SUCCEEDED(hr) && len && read != len * sizeof(WCHAR)) hr = E_FAIL;
++    if (FAILED(hr))
++    {
++        free( *str );
++        *str = NULL;
++        return hr;
++    }
++    (*str)[len] = 0;
++    return S_OK;
++}
++
++/* a link (IShellLinkW, with its properties) or a shell item */
++static HRESULT write_item( IStream *stream, IUnknown *object )
++{
++    IPersistStream *persist;
++    IShellLinkW *link;
++    ITEMIDLIST *pidl;
++    HRESULT hr;
++
++    if (SUCCEEDED(IUnknown_QueryInterface( object, &IID_IShellLinkW, (void **)&link )))
++    {
++        hr = IShellLinkW_QueryInterface( link, &IID_IPersistStream, (void **)&persist );
++        IShellLinkW_Release( link );
++        if (FAILED(hr)) return hr;
++        if (SUCCEEDED(hr = write_dword( stream, ITEM_LINK ))) hr = OleSaveToStream( persist, stream );
++        IPersistStream_Release( persist );
++        return hr;
++    }
++    if (FAILED(hr = SHGetIDListFromObject( object, &pidl ))) return hr;
++    if (SUCCEEDED(hr = write_dword( stream, ITEM_SHELLITEM ))) hr = ILSaveToStream( stream, pidl );
++    ILFree( pidl );
++    return hr;
++}
++
++static HRESULT read_item( IStream *stream, IUnknown **object )
++{
++    ITEMIDLIST *pidl;
++    DWORD type;
++    HRESULT hr;
++
++    *object = NULL;
++    if (FAILED(hr = read_dword( stream, &type ))) return hr;
++    if (type == ITEM_LINK) return OleLoadFromStream( stream, &IID_IUnknown, (void **)object );
++    if (type != ITEM_SHELLITEM) return E_FAIL;
++    if (FAILED(hr = ILLoadFromStream( stream, &pidl ))) return hr;
++    hr = SHCreateItemFromIDList( pidl, &IID_IUnknown, (void **)object );
++    ILFree( pidl );
++    return hr;
++}
++
++/* what tells two destinations apart: a link's target and arguments, an
++ * item's parsing name */
++static BOOL item_key( IUnknown *object, WCHAR *key, DWORD size )
++{
++    IShellLinkW *link;
++    IShellItem *item;
++    WCHAR *name;
++    DWORD len;
++
++    key[0] = 0;
++    if (SUCCEEDED(IUnknown_QueryInterface( object, &IID_IShellLinkW, (void **)&link )))
++    {
++        IShellLinkW_GetPath( link, key, size, NULL, SLGP_RAWPATH );
++        len = wcslen( key );
++        if (len + 2 < size)
++        {
++            key[len++] = '|';
++            IShellLinkW_GetArguments( link, key + len, size - len );
++        }
++        IShellLinkW_Release( link );
++        return TRUE;
++    }
++    if (SUCCEEDED(IUnknown_QueryInterface( object, &IID_IShellItem, (void **)&item )))
++    {
++        if (SUCCEEDED(IShellItem_GetDisplayName( item, SIGDN_DESKTOPABSOLUTEPARSING, &name )))
++        {
++            lstrcpynW( key, name, size );
++            CoTaskMemFree( name );
++        }
++        IShellItem_Release( item );
++        return key[0] != 0;
++    }
++    return FALSE;
++}
++
++/* the removed destinations of a program */
++static HRESULT load_removed( const WCHAR *appid, IObjectCollection **out )
++{
++    WCHAR path[MAX_PATH];
++    IStream *stream;
++    IUnknown *object;
++    DWORD magic, version, count, i;
++    HRESULT hr;
++
++    if (FAILED(hr = create_collection( out ))) return hr;
++    if (!removed_path( appid, path ) ||
++        FAILED(SHCreateStreamOnFileEx( path, STGM_READ | STGM_SHARE_DENY_WRITE, 0, FALSE, NULL, &stream )))
++        return S_OK;
++    if (SUCCEEDED(read_dword( stream, &magic )) && magic == REMOVED_MAGIC &&
++        SUCCEEDED(read_dword( stream, &version )) && version == FORMAT_VERSION &&
++        SUCCEEDED(read_dword( stream, &count )))
++    {
++        for (i = 0; i < count && SUCCEEDED(read_item( stream, &object )); i++)
++        {
++            IObjectCollection_AddObject( *out, object );
++            IUnknown_Release( object );
++        }
++    }
++    IStream_Release( stream );
++    return S_OK;
++}
++
++static BOOL is_removed( IObjectArray *removed, IUnknown *object )
++{
++    WCHAR key[MAX_PATH * 2], other[MAX_PATH * 2];
++    IUnknown *entry;
++    UINT count = 0, i;
++    BOOL found = FALSE;
++
++    if (!removed || !item_key( object, key, ARRAY_SIZE(key) )) return FALSE;
++    IObjectArray_GetCount( removed, &count );
++    for (i = 0; i < count && !found; i++)
++    {
++        if (FAILED(IObjectArray_GetAt( removed, i, &IID_IUnknown, (void **)&entry ))) continue;
++        found = item_key( entry, other, ARRAY_SIZE(other) ) && !wcsicmp( key, other );
++        IUnknown_Release( entry );
++    }
++    return found;
++}
++
++/* the documents a program opened (SHAddToRecentDocs) */
++struct auto_entry
++{
++    WCHAR *path;
++    DWORD uses;
++    FILETIME last;
++};
++
++struct auto_list
++{
++    struct auto_entry *entries;
++    DWORD count;
++};
++
++static void free_auto( struct auto_list *list )
++{
++    DWORD i;
++    for (i = 0; i < list->count; i++) free( list->entries[i].path );
++    free( list->entries );
++    list->entries = NULL;
++    list->count = 0;
++}
++
++static void load_auto( const WCHAR *appid, struct auto_list *list )
++{
++    WCHAR path[MAX_PATH];
++    IStream *stream;
++    DWORD magic, version, count, i;
++
++    list->entries = NULL;
++    list->count = 0;
++    if (!auto_path( appid, path ) ||
++        FAILED(SHCreateStreamOnFileEx( path, STGM_READ | STGM_SHARE_DENY_WRITE, 0, FALSE, NULL, &stream )))
++        return;
++    if (SUCCEEDED(read_dword( stream, &magic )) && magic == AUTODEST_MAGIC &&
++        SUCCEEDED(read_dword( stream, &version )) && version == FORMAT_VERSION &&
++        SUCCEEDED(read_dword( stream, &count )) && count <= 4096 &&
++        (list->entries = calloc( count, sizeof(*list->entries) )))
++    {
++        for (i = 0; i < count; i++)
++        {
++            struct auto_entry *e = &list->entries[i];
++            if (FAILED(read_string( stream, &e->path )) || FAILED(read_dword( stream, &e->uses )) ||
++                FAILED(read_dword( stream, &e->last.dwLowDateTime )) ||
++                FAILED(read_dword( stream, &e->last.dwHighDateTime )))
++            {
++                free( e->path );
++                break;
++            }
++            list->count++;
++        }
++    }
++    IStream_Release( stream );
++}
++
++static void save_auto( const WCHAR *appid, const struct auto_list *list )
++{
++    WCHAR path[MAX_PATH];
++    IStream *stream;
++    DWORD i;
++
++    if (!auto_path( appid, path )) return;
++    if (!list->count)
++    {
++        DeleteFileW( path );
++        return;
++    }
++    if (FAILED(SHCreateStreamOnFileEx( path, STGM_WRITE | STGM_CREATE | STGM_SHARE_EXCLUSIVE, 0, TRUE, NULL,
++                                       &stream )))
++        return;
++    write_dword( stream, AUTODEST_MAGIC );
++    write_dword( stream, FORMAT_VERSION );
++    write_dword( stream, list->count );
++    for (i = 0; i < list->count; i++)
++    {
++        write_string( stream, list->entries[i].path );
++        write_dword( stream, list->entries[i].uses );
++        write_dword( stream, list->entries[i].last.dwLowDateTime );
++        write_dword( stream, list->entries[i].last.dwHighDateTime );
++    }
++    IStream_Release( stream );
++}
++
++/* SHAddToRecentDocs: the document goes on the program's own list too */
++void jumplist_add_recent( const WCHAR *appid, const WCHAR *doc )
++{
++    WCHAR id[MAX_PATH];
++    struct auto_list list;
++    DWORD i, oldest = 0;
++    FILETIME now;
++
++    if (!doc || !doc[0]) return;
++    if (!appid || !appid[0])
++    {
++        current_app_id( id, ARRAY_SIZE(id) );
++        appid = id;
++    }
++    GetSystemTimeAsFileTime( &now );
++    load_auto( appid, &list );
++    for (i = 0; i < list.count; i++)
++        if (!wcsicmp( list.entries[i].path, doc )) break;
++    if (i == list.count)
++    {
++        struct auto_entry *entries;
++
++        if (list.count >= MAX_RECENT)
++        {
++            /* the least recently used goes */
++            for (i = 1; i < list.count; i++)
++                if (CompareFileTime( &list.entries[i].last, &list.entries[oldest].last ) < 0) oldest = i;
++            free( list.entries[oldest].path );
++            list.entries[oldest] = list.entries[--list.count];
++        }
++        if (!(entries = realloc( list.entries, (list.count + 1) * sizeof(*entries) )))
++        {
++            free_auto( &list );
++            return;
++        }
++        list.entries = entries;
++        i = list.count++;
++        entries[i].path = wcsdup( doc );
++        entries[i].uses = 0;
++    }
++    list.entries[i].uses++;
++    list.entries[i].last = now;
++    save_auto( appid, &list );
++    free_auto( &list );
++}
++
++static int __cdecl cmp_recent( const void *a, const void *b )
++{
++    const struct auto_entry *x = a, *y = b;
++    return CompareFileTime( &y->last, &x->last );
++}
++
++static int __cdecl cmp_frequent( const void *a, const void *b )
++{
++    const struct auto_entry *x = a, *y = b;
++    if (x->uses != y->uses) return x->uses > y->uses ? -1 : 1;
++    return CompareFileTime( &y->last, &x->last );
++}
++
++/* the program's documents, most recent or most used first, that still exist */
++static HRESULT auto_items( const WCHAR *appid, BOOL frequent, UINT max, IObjectCollection **out )
++{
++    struct auto_list list;
++    IShellItem *item;
++    UINT added = 0;
++    DWORD i;
++    HRESULT hr;
++
++    if (FAILED(hr = create_collection( out ))) return hr;
++    load_auto( appid, &list );
++    if (list.count) qsort( list.entries, list.count, sizeof(*list.entries), frequent ? cmp_frequent : cmp_recent );
++    for (i = 0; i < list.count && (!max || added < max); i++)
++    {
++        if (GetFileAttributesW( list.entries[i].path ) == INVALID_FILE_ATTRIBUTES) continue;
++        if (FAILED(SHCreateItemFromParsingName( list.entries[i].path, NULL, &IID_IShellItem, (void **)&item )))
++            continue;
++        IObjectCollection_AddObject( *out, (IUnknown *)item );
++        IShellItem_Release( item );
++        added++;
++    }
++    free_auto( &list );
++    return S_OK;
++}
++
++/* ---- ICustomDestinationList ------------------------------------------------- */
++
++struct category
++{
++    enum category_kind kind;
++    DWORD known;
++    WCHAR *name;
++    IObjectCollection *items;
++};
++
++struct destination_list
++{
++    ICustomDestinationList ICustomDestinationList_iface;
++    LONG ref;
++    WCHAR appid[MAX_PATH];
++    BOOL explicit_id;
++    BOOL building;
++    IObjectCollection *removed;
++    struct category *categories;
++    UINT count;
++};
++
++static inline struct destination_list *impl_from_ICustomDestinationList( ICustomDestinationList *iface )
++{
++    return CONTAINING_RECORD( iface, struct destination_list, ICustomDestinationList_iface );
++}
++
++static void clear_categories( struct destination_list *This )
++{
++    UINT i;
++
++    for (i = 0; i < This->count; i++)
++    {
++        free( This->categories[i].name );
++        if (This->categories[i].items) IObjectCollection_Release( This->categories[i].items );
++    }
++    free( This->categories );
++    This->categories = NULL;
++    This->count = 0;
++    if (This->removed) IObjectCollection_Release( This->removed );
++    This->removed = NULL;
++    This->building = FALSE;
++}
++
++static const WCHAR *list_app_id( struct destination_list *This )
++{
++    if (!This->explicit_id) current_app_id( This->appid, ARRAY_SIZE(This->appid) );
++    return This->appid;
++}
++
++static HRESULT WINAPI CustomDestinationList_QueryInterface( ICustomDestinationList *iface, REFIID riid, void **obj )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++
++    TRACE( "(%p, %s, %p)\n", This, debugstr_guid( riid ), obj );
++
++    if (IsEqualIID( &IID_ICustomDestinationList, riid ) || IsEqualIID( &IID_IUnknown, riid ))
++    {
++        *obj = &This->ICustomDestinationList_iface;
++        ICustomDestinationList_AddRef( iface );
++        return S_OK;
++    }
++    WARN( "Unsupported interface %s.\n", debugstr_guid( riid ) );
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI CustomDestinationList_AddRef( ICustomDestinationList *iface )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++    return InterlockedIncrement( &This->ref );
++}
++
++static ULONG WINAPI CustomDestinationList_Release( ICustomDestinationList *iface )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++
++    if (!ref)
++    {
++        clear_categories( This );
++        free( This );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI CustomDestinationList_SetAppID( ICustomDestinationList *iface, const WCHAR *appid )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++
++    TRACE( "(%p, %s)\n", This, debugstr_w( appid ));
++
++    if (!appid || !appid[0] || wcslen( appid ) >= 128) return E_INVALIDARG;
++    if (This->building) return E_UNEXPECTED;
++    lstrcpyW( This->appid, appid );
++    This->explicit_id = TRUE;
++    return S_OK;
++}
++
++/* the most items the taskbar shows in a list */
++static UINT max_slots(void)
++{
++    DWORD value = 10, size = sizeof(value);
++
++    RegGetValueW( HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
++                  L"JumpListItems_Maximum", RRF_RT_REG_DWORD, NULL, &value, &size );
++    return value ? value : 10;
++}
++
++static HRESULT WINAPI CustomDestinationList_BeginList( ICustomDestinationList *iface, UINT *min_slots, REFIID riid,
++                                                       void **obj )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++    HRESULT hr;
++
++    TRACE( "(%p, %p, %s, %p)\n", This, min_slots, debugstr_guid( riid ), obj );
++
++    if (!min_slots || !obj) return E_POINTER;
++    *obj = NULL;
++    clear_categories( This );
++    if (FAILED(hr = load_removed( list_app_id( This ), &This->removed ))) return hr;
++    if (FAILED(hr = IObjectCollection_QueryInterface( This->removed, riid, obj )))
++    {
++        clear_categories( This );
++        return hr;
++    }
++    *min_slots = max_slots();
++    This->building = TRUE;
++    return S_OK;
++}
++
++static HRESULT add_category( struct destination_list *This, enum category_kind kind, DWORD known,
++                             const WCHAR *name, IObjectArray *items )
++{
++    struct category *categories, *cat;
++    HRESULT hr;
++
++    if (!(categories = realloc( This->categories, (This->count + 1) * sizeof(*categories) )))
++        return E_OUTOFMEMORY;
++    This->categories = categories;
++    cat = &categories[This->count];
++    memset( cat, 0, sizeof(*cat) );
++    cat->kind = kind;
++    cat->known = known;
++    if (name && !(cat->name = wcsdup( name ))) return E_OUTOFMEMORY;
++    if (items)
++    {
++        if (FAILED(hr = create_collection( &cat->items )) ||
++            FAILED(hr = IObjectCollection_AddFromArray( cat->items, items )))
++        {
++            if (cat->items) IObjectCollection_Release( cat->items );
++            free( cat->name );
++            return hr;
++        }
++    }
++    This->count++;
++    return S_OK;
++}
++
++/* destinations are links and shell items; tasks are links */
++static HRESULT check_items( IObjectArray *array, BOOL links_only, IObjectArray *removed )
++{
++    UINT count, i;
++    IUnknown *object, *probe;
++    HRESULT hr;
++
++    if (!array) return E_INVALIDARG;
++    if (FAILED(hr = IObjectArray_GetCount( array, &count ))) return hr;
++    for (i = 0; i < count; i++)
++    {
++        if (FAILED(hr = IObjectArray_GetAt( array, i, &IID_IUnknown, (void **)&object ))) return hr;
++        if (SUCCEEDED(IUnknown_QueryInterface( object, &IID_IShellLinkW, (void **)&probe )) ||
++            (!links_only && SUCCEEDED(IUnknown_QueryInterface( object, &IID_IShellItem, (void **)&probe ))))
++        {
++            IUnknown_Release( probe );
++            hr = S_OK;
++        }
++        else hr = E_INVALIDARG;
++        /* what the user removed stays off the list */
++        if (SUCCEEDED(hr) && is_removed( removed, object )) hr = E_ACCESSDENIED;
++        IUnknown_Release( object );
++        if (FAILED(hr)) return hr;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI CustomDestinationList_AppendCategory( ICustomDestinationList *iface, const WCHAR *category,
++                                                            IObjectArray *array )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++    HRESULT hr;
++
++    TRACE( "(%p, %s, %p)\n", This, debugstr_w( category ), array );
++
++    if (!This->building) return E_UNEXPECTED;
++    if (!category || !category[0]) return E_INVALIDARG;
++    if (FAILED(hr = check_items( array, FALSE, (IObjectArray *)This->removed ))) return hr;
++    return add_category( This, CAT_CUSTOM, 0, category, array );
++}
++
++static HRESULT WINAPI CustomDestinationList_AppendKnownCategory( ICustomDestinationList *iface,
++                                                                 KNOWNDESTCATEGORY category )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++    UINT i;
++
++    TRACE( "(%p, %d)\n", This, category );
++
++    if (!This->building) return E_UNEXPECTED;
++    if (category != KDC_FREQUENT && category != KDC_RECENT) return E_INVALIDARG;
++    for (i = 0; i < This->count; i++)
++        if (This->categories[i].kind == CAT_KNOWN && This->categories[i].known == category) return S_OK;
++    return add_category( This, CAT_KNOWN, category, NULL, NULL );
++}
++
++static HRESULT WINAPI CustomDestinationList_AddUserTasks( ICustomDestinationList *iface, IObjectArray *tasks )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++    HRESULT hr;
++    UINT i;
++
++    TRACE( "(%p, %p)\n", This, tasks );
++
++    if (!This->building) return E_UNEXPECTED;
++    if (FAILED(hr = check_items( tasks, TRUE, NULL ))) return hr;
++    /* tasks added again are added to the tasks */
++    for (i = 0; i < This->count; i++)
++        if (This->categories[i].kind == CAT_TASKS) return IObjectCollection_AddFromArray( This->categories[i].items, tasks );
++    return add_category( This, CAT_TASKS, 0, NULL, tasks );
++}
++
++static HRESULT WINAPI CustomDestinationList_CommitList( ICustomDestinationList *iface )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++    WCHAR path[MAX_PATH], temp[MAX_PATH];
++    IStream *stream;
++    IUnknown *object;
++    UINT i, j, count;
++    HRESULT hr;
++
++    TRACE( "(%p)\n", This );
++
++    if (!This->building) return E_UNEXPECTED;
++    if (!custom_path( list_app_id( This ), path )) return E_FAIL;
++    swprintf( temp, ARRAY_SIZE(temp), L"%s.new", path );
++    if (FAILED(hr = SHCreateStreamOnFileEx( temp, STGM_WRITE | STGM_CREATE | STGM_SHARE_EXCLUSIVE, 0, TRUE,
++                                            NULL, &stream )))
++        return hr;
++    write_dword( stream, JUMPLIST_MAGIC );
++    write_dword( stream, FORMAT_VERSION );
++    write_string( stream, This->appid );
++    write_dword( stream, This->count );
++    for (i = 0; i < This->count && SUCCEEDED(hr); i++)
++    {
++        struct category *cat = &This->categories[i];
++
++        count = 0;
++        if (cat->items) IObjectCollection_GetCount( cat->items, &count );
++        write_dword( stream, cat->kind );
++        write_dword( stream, cat->known );
++        write_string( stream, cat->name );
++        hr = write_dword( stream, count );
++        for (j = 0; j < count && SUCCEEDED(hr); j++)
++        {
++            if (FAILED(hr = IObjectCollection_GetAt( cat->items, j, &IID_IUnknown, (void **)&object ))) break;
++            hr = write_item( stream, object );
++            IUnknown_Release( object );
++        }
++    }
++    IStream_Release( stream );
++#ifdef SG_MUTANT_COMMIT_NOTHING
++    hr = E_FAIL;
++#endif
++    if (SUCCEEDED(hr) && !MoveFileExW( temp, path, MOVEFILE_REPLACE_EXISTING ))
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++    if (FAILED(hr))
++    {
++        DeleteFileW( temp );
++        return hr;
++    }
++    clear_categories( This );
++    return S_OK;
++}
++
++static HRESULT WINAPI CustomDestinationList_GetRemovedDestinations( ICustomDestinationList *iface, REFIID riid,
++                                                                    void **obj )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++    IObjectCollection *removed;
++    HRESULT hr;
++
++    TRACE( "(%p, %s, %p)\n", This, debugstr_guid( riid ), obj );
++
++    if (!obj) return E_POINTER;
++    *obj = NULL;
++    if (FAILED(hr = load_removed( list_app_id( This ), &removed ))) return hr;
++    hr = IObjectCollection_QueryInterface( removed, riid, obj );
++    IObjectCollection_Release( removed );
++    return hr;
++}
++
++static HRESULT WINAPI CustomDestinationList_DeleteList( ICustomDestinationList *iface, const WCHAR *appid )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++    WCHAR path[MAX_PATH];
++
++    TRACE( "(%p, %s)\n", This, debugstr_w( appid ) );
++
++    if (!appid) appid = list_app_id( This );
++    if (!custom_path( appid, path )) return E_INVALIDARG;
++    DeleteFileW( path );
++    return S_OK;
++}
++
++static HRESULT WINAPI CustomDestinationList_AbortList( ICustomDestinationList *iface )
++{
++    struct destination_list *This = impl_from_ICustomDestinationList( iface );
++
++    TRACE( "(%p)\n", This );
++
++    if (!This->building) return E_UNEXPECTED;
++    clear_categories( This );
++    return S_OK;
++}
++
++static const ICustomDestinationListVtbl CustomDestinationListVtbl =
++{
++    CustomDestinationList_QueryInterface,
++    CustomDestinationList_AddRef,
++    CustomDestinationList_Release,
++    CustomDestinationList_SetAppID,
++    CustomDestinationList_BeginList,
++    CustomDestinationList_AppendCategory,
++    CustomDestinationList_AppendKnownCategory,
++    CustomDestinationList_AddUserTasks,
++    CustomDestinationList_CommitList,
++    CustomDestinationList_GetRemovedDestinations,
++    CustomDestinationList_DeleteList,
++    CustomDestinationList_AbortList
++};
++
++HRESULT WINAPI CustomDestinationList_Constructor( IUnknown *outer, REFIID riid, void **obj )
++{
++    struct destination_list *list;
++    HRESULT hr;
++
++    TRACE( "%p %s %p\n", outer, debugstr_guid( riid ), obj );
++
++    *obj = NULL;
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (!(list = calloc( 1, sizeof(*list) ))) return E_OUTOFMEMORY;
++    list->ICustomDestinationList_iface.lpVtbl = &CustomDestinationListVtbl;
++    list->ref = 1;
++    hr = ICustomDestinationList_QueryInterface( &list->ICustomDestinationList_iface, riid, obj );
++    ICustomDestinationList_Release( &list->ICustomDestinationList_iface );
++    return hr;
++}
++
++/* ---- IApplicationDestinations ------------------------------------------------ */
++
++struct app_destinations
++{
++    IApplicationDestinations IApplicationDestinations_iface;
++    LONG ref;
++    WCHAR appid[MAX_PATH];
++    BOOL explicit_id;
++};
++
++static inline struct app_destinations *impl_from_IApplicationDestinations( IApplicationDestinations *iface )
++{
++    return CONTAINING_RECORD( iface, struct app_destinations, IApplicationDestinations_iface );
++}
++
++static HRESULT WINAPI ApplicationDestinations_QueryInterface( IApplicationDestinations *iface, REFIID riid,
++                                                              void **ppv )
++{
++    struct app_destinations *This = impl_from_IApplicationDestinations( iface );
++
++    TRACE( "(%p, %s, %p)\n", This, debugstr_guid( riid ), ppv );
++
++    if (!ppv) return E_POINTER;
++    if (IsEqualGUID( &IID_IUnknown, riid ) || IsEqualGUID( &IID_IApplicationDestinations, riid ))
++    {
++        *ppv = &This->IApplicationDestinations_iface;
++        IApplicationDestinations_AddRef( iface );
++        return S_OK;
++    }
++    *ppv = NULL;
++    FIXME( "(%p)->(%s, %p) interface not supported.\n", This, debugstr_guid( riid ), ppv );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI ApplicationDestinations_AddRef( IApplicationDestinations *iface )
++{
++    struct app_destinations *This = impl_from_IApplicationDestinations( iface );
++    return InterlockedIncrement( &This->ref );
++}
++
++static ULONG WINAPI ApplicationDestinations_Release( IApplicationDestinations *iface )
++{
++    struct app_destinations *This = impl_from_IApplicationDestinations( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++    if (!ref) free( This );
++    return ref;
++}
++
++static HRESULT WINAPI ApplicationDestinations_SetAppID( IApplicationDestinations *iface, const WCHAR *appid )
++{
++    struct app_destinations *This = impl_from_IApplicationDestinations( iface );
++
++    TRACE( "(%p, %s)\n", This, debugstr_w( appid ) );
++
++    if (!appid || !appid[0] || wcslen( appid ) >= 128) return E_INVALIDARG;
++    lstrcpyW( This->appid, appid );
++    This->explicit_id = TRUE;
++    return S_OK;
++}
++
++static const WCHAR *destinations_app_id( struct app_destinations *This )
++{
++    if (!This->explicit_id) current_app_id( This->appid, ARRAY_SIZE(This->appid) );
++    return This->appid;
++}
++
++/* takes a document off the program's Recent and Frequent lists */
++static HRESULT WINAPI ApplicationDestinations_RemoveDestination( IApplicationDestinations *iface, IUnknown *punk )
++{
++    struct app_destinations *This = impl_from_IApplicationDestinations( iface );
++    WCHAR key[MAX_PATH * 2], *bar;
++    struct auto_list list;
++    BOOL removed = FALSE;
++    DWORD i;
++
++    TRACE( "(%p, %p)\n", This, punk );
++
++    if (!punk) return E_INVALIDARG;
++    if (!item_key( punk, key, ARRAY_SIZE(key) )) return E_INVALIDARG;
++    /* a link stands for its target */
++    if ((bar = wcschr( key, '|' ))) *bar = 0;
++    load_auto( destinations_app_id( This ), &list );
++    for (i = 0; i < list.count; )
++    {
++        if (wcsicmp( list.entries[i].path, key )) { i++; continue; }
++        free( list.entries[i].path );
++        list.entries[i] = list.entries[--list.count];
++        removed = TRUE;
++    }
++    if (removed) save_auto( This->appid, &list );
++    free_auto( &list );
++    return removed ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT WINAPI ApplicationDestinations_RemoveAllDestinations( IApplicationDestinations *iface )
++{
++    struct app_destinations *This = impl_from_IApplicationDestinations( iface );
++    WCHAR path[MAX_PATH];
++
++    TRACE( "(%p)\n", This );
++
++    if (auto_path( destinations_app_id( This ), path )) DeleteFileW( path );
++    return S_OK;
++}
++
++static const IApplicationDestinationsVtbl ApplicationDestinationsVtbl =
++{
++    ApplicationDestinations_QueryInterface,
++    ApplicationDestinations_AddRef,
++    ApplicationDestinations_Release,
++    ApplicationDestinations_SetAppID,
++    ApplicationDestinations_RemoveDestination,
++    ApplicationDestinations_RemoveAllDestinations
++};
++
++HRESULT WINAPI ApplicationDestinations_Constructor( IUnknown *outer, REFIID riid, LPVOID *ppv )
++{
++    struct app_destinations *This;
++    HRESULT hr;
++
++    TRACE( "(%p, %s, %p)\n", outer, debugstr_guid( riid ), ppv );
++
++    *ppv = NULL;
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (!(This = calloc( 1, sizeof(*This) ))) return E_OUTOFMEMORY;
++    This->IApplicationDestinations_iface.lpVtbl = &ApplicationDestinationsVtbl;
++    This->ref = 1;
++    hr = IApplicationDestinations_QueryInterface( &This->IApplicationDestinations_iface, riid, ppv );
++    IApplicationDestinations_Release( &This->IApplicationDestinations_iface );
++    return hr;
++}
++
++/* ---- IApplicationDocumentLists ----------------------------------------------- */
++
++struct app_documents
++{
++    IApplicationDocumentLists IApplicationDocumentLists_iface;
++    LONG ref;
++    WCHAR appid[MAX_PATH];
++    BOOL explicit_id;
++};
++
++static inline struct app_documents *impl_from_IApplicationDocumentLists( IApplicationDocumentLists *iface )
++{
++    return CONTAINING_RECORD( iface, struct app_documents, IApplicationDocumentLists_iface );
++}
++
++static HRESULT WINAPI ApplicationDocumentLists_QueryInterface( IApplicationDocumentLists *iface, REFIID riid,
++                                                               void **ppv )
++{
++    struct app_documents *This = impl_from_IApplicationDocumentLists( iface );
++
++    TRACE( "(%p, %s, %p)\n", This, debugstr_guid( riid ), ppv );
++
++    if (!ppv) return E_POINTER;
++    if (IsEqualGUID( &IID_IUnknown, riid ) || IsEqualGUID( &IID_IApplicationDocumentLists, riid ))
++    {
++        *ppv = &This->IApplicationDocumentLists_iface;
++        IApplicationDocumentLists_AddRef( iface );
++        return S_OK;
++    }
++    *ppv = NULL;
++    FIXME( "(%p)->(%s, %p) interface not supported.\n", This, debugstr_guid( riid ), ppv );
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI ApplicationDocumentLists_AddRef( IApplicationDocumentLists *iface )
++{
++    struct app_documents *This = impl_from_IApplicationDocumentLists( iface );
++    return InterlockedIncrement( &This->ref );
++}
++
++static ULONG WINAPI ApplicationDocumentLists_Release( IApplicationDocumentLists *iface )
++{
++    struct app_documents *This = impl_from_IApplicationDocumentLists( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++    if (!ref) free( This );
++    return ref;
++}
++
++static HRESULT WINAPI ApplicationDocumentLists_SetAppID( IApplicationDocumentLists *iface, const WCHAR *appid )
++{
++    struct app_documents *This = impl_from_IApplicationDocumentLists( iface );
++
++    TRACE( "(%p, %s)\n", This, debugstr_w( appid ) );
++
++    if (!appid || !appid[0] || wcslen( appid ) >= 128) return E_INVALIDARG;
++    lstrcpyW( This->appid, appid );
++    This->explicit_id = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI ApplicationDocumentLists_GetList( IApplicationDocumentLists *iface, APPDOCLISTTYPE list_type,
++                                                        UINT item_count, REFIID riid, void **obj )
++{
++    struct app_documents *This = impl_from_IApplicationDocumentLists( iface );
++    IObjectCollection *items;
++    HRESULT hr;
++
++    TRACE( "(%p, %u, %u, %s, %p)\n", This, list_type, item_count, debugstr_guid( riid ), obj );
++
++    if (!obj) return E_POINTER;
++    *obj = NULL;
++    if (list_type != ADLT_RECENT && list_type != ADLT_FREQUENT) return E_INVALIDARG;
++    if (!This->explicit_id) current_app_id( This->appid, ARRAY_SIZE(This->appid) );
++    if (FAILED(hr = auto_items( This->appid, list_type == ADLT_FREQUENT, item_count, &items ))) return hr;
++    hr = IObjectCollection_QueryInterface( items, riid, obj );
++    IObjectCollection_Release( items );
++    return hr;
++}
++
++static const IApplicationDocumentListsVtbl ApplicationDocumentListsVtbl =
++{
++    ApplicationDocumentLists_QueryInterface,
++    ApplicationDocumentLists_AddRef,
++    ApplicationDocumentLists_Release,
++    ApplicationDocumentLists_SetAppID,
++    ApplicationDocumentLists_GetList
++};
++
++HRESULT WINAPI ApplicationDocumentLists_Constructor( IUnknown *outer, REFIID riid, LPVOID *ppv )
++{
++    struct app_documents *This;
++    HRESULT hr;
++
++    TRACE( "(%p, %s, %p)\n", outer, debugstr_guid( riid ), ppv );
++
++    *ppv = NULL;
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (!(This = calloc( 1, sizeof(*This) ))) return E_OUTOFMEMORY;
++    This->IApplicationDocumentLists_iface.lpVtbl = &ApplicationDocumentListsVtbl;
++    This->ref = 1;
++    hr = IApplicationDocumentLists_QueryInterface( &This->IApplicationDocumentLists_iface, riid, ppv );
++    IApplicationDocumentLists_Release( &This->IApplicationDocumentLists_iface );
++    return hr;
++}
++
++/* ---- the taskbar's view ---------------------------------------------------------- */
++
++/* A program's jump list as its taskbar button shows it: its categories (a
++ * heading, then its destinations), its tasks, and -- for a program that has
++ * not said otherwise -- the documents it opened recently. Private to
++ * explorer (GetProcAddress). */
++struct jump_entry
++{
++    int kind;           /* 0 a heading, 1 a destination or task, 2 a separator */
++    WCHAR *title;
++    IUnknown *object;   /* entries */
++};
++
++struct jump_view
++{
++    WCHAR exe[MAX_PATH];
++    struct jump_entry *entries;
++    UINT count;
++};
++
++static void view_add( struct jump_view *view, int kind, const WCHAR *title, IUnknown *object )
++{
++    struct jump_entry *entries = realloc( view->entries, (view->count + 1) * sizeof(*entries) );
++
++    if (!entries) return;
++    view->entries = entries;
++    entries[view->count].kind = kind;
++    entries[view->count].title = wcsdup( title ? title : L"" );
++    entries[view->count].object = object;
++    if (object) IUnknown_AddRef( object );
++    view->count++;
++}
++
++/* a link's Title property, else its description, else its target's name;
++ * an item's display name. Indirect strings (@file,-id) are loaded. */
++static void object_title( IUnknown *object, WCHAR *title, DWORD size, BOOL *separator )
++{
++    IPropertyStore *store;
++    IShellLinkW *link;
++    IShellItem *item;
++    PROPVARIANT value;
++    WCHAR *name, raw[MAX_PATH];
++
++    title[0] = 0;
++    *separator = FALSE;
++    if (SUCCEEDED(IUnknown_QueryInterface( object, &IID_IPropertyStore, (void **)&store )))
++    {
++        PropVariantInit( &value );
++        if (SUCCEEDED(IPropertyStore_GetValue( store, &PKEY_AppUserModel_IsDestListSeparator, &value )) &&
++            value.vt == VT_BOOL && value.boolVal)
++            *separator = TRUE;
++        PropVariantClear( &value );
++        if (SUCCEEDED(IPropertyStore_GetValue( store, &PKEY_Title, &value )) && value.vt == VT_LPWSTR && value.pwszVal)
++            lstrcpynW( title, value.pwszVal, size );
++        PropVariantClear( &value );
++        IPropertyStore_Release( store );
++    }
++    if (!title[0] && SUCCEEDED(IUnknown_QueryInterface( object, &IID_IShellLinkW, (void **)&link )))
++    {
++        IShellLinkW_GetDescription( link, title, size );
++        if (!title[0] && SUCCEEDED(IShellLinkW_GetPath( link, raw, ARRAY_SIZE(raw), NULL, 0 )) && raw[0])
++        {
++            lstrcpynW( title, PathFindFileNameW( raw ), size );
++            PathRemoveExtensionW( title );
++        }
++        IShellLinkW_Release( link );
++    }
++    if (!title[0] && SUCCEEDED(IUnknown_QueryInterface( object, &IID_IShellItem, (void **)&item )))
++    {
++        if (SUCCEEDED(IShellItem_GetDisplayName( item, SIGDN_NORMALDISPLAY, &name )))
++        {
++            lstrcpynW( title, name, size );
++            CoTaskMemFree( name );
++        }
++        IShellItem_Release( item );
++    }
++    if (title[0] == '@')
++    {
++        lstrcpynW( raw, title, ARRAY_SIZE(raw) );
++        SHLoadIndirectString( raw, title, size, NULL );
++    }
++}
++
++static void view_add_items( struct jump_view *view, IObjectArray *items, UINT max )
++{
++    WCHAR title[MAX_PATH];
++    IUnknown *object;
++    UINT count = 0, i, shown = 0;
++    BOOL separator;
++
++    IObjectArray_GetCount( items, &count );
++    for (i = 0; i < count && (!max || shown < max); i++)
++    {
++        if (FAILED(IObjectArray_GetAt( items, i, &IID_IUnknown, (void **)&object ))) continue;
++        object_title( object, title, ARRAY_SIZE(title), &separator );
++        if (separator) view_add( view, 2, NULL, NULL );
++        else
++        {
++            view_add( view, 1, title, object );
++            shown++;
++        }
++        IUnknown_Release( object );
++    }
++}
++
++static void view_add_auto( struct jump_view *view, const WCHAR *appid, BOOL frequent, UINT max )
++{
++    IObjectCollection *items;
++    UINT count = 0;
++
++    if (FAILED(auto_items( appid, frequent, max, &items ))) return;
++    IObjectCollection_GetCount( items, &count );
++    if (count)
++    {
++        view_add( view, 0, frequent ? L"Frequent" : L"Recent", NULL );
++        view_add_items( view, (IObjectArray *)items, max );
++    }
++    IObjectCollection_Release( items );
++}
++
++void WINAPI SGJumpListFree( struct jump_view *view )
++{
++    UINT i;
++
++    if (!view) return;
++    for (i = 0; i < view->count; i++)
++    {
++        free( view->entries[i].title );
++        if (view->entries[i].object) IUnknown_Release( view->entries[i].object );
++    }
++    free( view->entries );
++    free( view );
++}
++
++HRESULT WINAPI SGJumpListLoad( const WCHAR *appid, const WCHAR *exe, struct jump_view **out )
++{
++    struct jump_view *view;
++    WCHAR path[MAX_PATH], *name, *saved_id = NULL;
++    IObjectCollection *items, *tasks = NULL;
++    IUnknown *object;
++    IStream *stream;
++    DWORD magic, version, ncat, kind, known, count, i, j;
++    BOOL custom = FALSE;
++    UINT max = max_slots();
++
++    TRACE( "(%s, %s, %p)\n", debugstr_w( appid ), debugstr_w( exe ), out );
++
++    *out = NULL;
++    if (!appid || !appid[0]) appid = exe;
++    if (!appid || !appid[0]) return E_INVALIDARG;
++    if (!(view = calloc( 1, sizeof(*view) ))) return E_OUTOFMEMORY;
++    if (exe) lstrcpynW( view->exe, exe, ARRAY_SIZE(view->exe) );
++
++    if (custom_path( appid, path ) &&
++        SUCCEEDED(SHCreateStreamOnFileEx( path, STGM_READ | STGM_SHARE_DENY_WRITE, 0, FALSE, NULL, &stream )))
++    {
++        if (SUCCEEDED(read_dword( stream, &magic )) && magic == JUMPLIST_MAGIC &&
++            SUCCEEDED(read_dword( stream, &version )) && version == FORMAT_VERSION &&
++            SUCCEEDED(read_string( stream, &saved_id )) && SUCCEEDED(read_dword( stream, &ncat )))
++        {
++            custom = TRUE;
++            for (i = 0; i < ncat; i++)
++            {
++                name = NULL;
++                if (FAILED(read_dword( stream, &kind )) || FAILED(read_dword( stream, &known )) ||
++                    FAILED(read_string( stream, &name )) || FAILED(read_dword( stream, &count )))
++                {
++                    free( name );
++                    break;
++                }
++                if (FAILED(create_collection( &items )))
++                {
++                    free( name );
++                    break;
++                }
++                for (j = 0; j < count && SUCCEEDED(read_item( stream, &object )); j++)
++                {
++                    IObjectCollection_AddObject( items, object );
++                    IUnknown_Release( object );
++                }
++                if (kind == CAT_KNOWN) view_add_auto( view, appid, known == KDC_FREQUENT, max );
++                else if (kind == CAT_TASKS)
++                {
++                    if (tasks) IObjectCollection_Release( tasks );
++                    tasks = items;
++                    IObjectCollection_AddRef( tasks );
++                }
++                else if (j)
++                {
++                    WCHAR heading[MAX_PATH];
++
++                    lstrcpynW( heading, name ? name : L"", ARRAY_SIZE(heading) );
++                    if (heading[0] == '@') SHLoadIndirectString( name, heading, ARRAY_SIZE(heading), NULL );
++                    view_add( view, 0, heading, NULL );
++                    view_add_items( view, (IObjectArray *)items, max );
++                }
++                IObjectCollection_Release( items );
++                free( name );
++                if (j < count) break;
++            }
++        }
++        free( saved_id );
++        IStream_Release( stream );
++    }
++    /* a program without a list of its own has its recent documents */
++    if (!custom) view_add_auto( view, appid, FALSE, max );
++    if (tasks)
++    {
++        UINT ntasks = 0;
++
++        IObjectCollection_GetCount( tasks, &ntasks );
++        if (ntasks)
++        {
++            view_add( view, 0, L"Tasks", NULL );
++            view_add_items( view, (IObjectArray *)tasks, 0 );
++        }
++        IObjectCollection_Release( tasks );
++    }
++    *out = view;
++    return S_OK;
++}
++
++UINT WINAPI SGJumpListCount( struct jump_view *view )
++{
++    return view ? view->count : 0;
++}
++
++/* kind: 0 a heading, 1 an entry, 2 a separator */
++BOOL WINAPI SGJumpListEntry( struct jump_view *view, UINT index, int *kind, WCHAR *title, UINT size )
++{
++    if (!view || index >= view->count) return FALSE;
++    *kind = view->entries[index].kind;
++    lstrcpynW( title, view->entries[index].title, size );
++    return TRUE;
++}
++
++/* a task or destination link runs as the link says; a document opens in the
++ * program the list belongs to */
++HRESULT WINAPI SGJumpListInvoke( struct jump_view *view, UINT index, HWND hwnd )
++{
++    SHELLEXECUTEINFOW info = { sizeof(info) };
++    WCHAR file[MAX_PATH], args[2048], dir[MAX_PATH], *doc = NULL, *quoted = NULL;
++    ITEMIDLIST *pidl = NULL;
++    IShellLinkW *link;
++    IShellItem *item;
++    int show = SW_SHOWNORMAL;
++    HRESULT hr = S_OK;
++
++    if (!view || index >= view->count || !view->entries[index].object) return E_INVALIDARG;
++    info.hwnd = hwnd;
++    info.nShow = SW_SHOWNORMAL;
++    if (SUCCEEDED(IUnknown_QueryInterface( view->entries[index].object, &IID_IShellLinkW, (void **)&link )))
++    {
++        file[0] = args[0] = dir[0] = 0;
++        IShellLinkW_GetPath( link, file, ARRAY_SIZE(file), NULL, 0 );
++        IShellLinkW_GetArguments( link, args, ARRAY_SIZE(args) );
++        IShellLinkW_GetWorkingDirectory( link, dir, ARRAY_SIZE(dir) );
++        IShellLinkW_GetShowCmd( link, &show );
++        if (!file[0]) IShellLinkW_GetIDList( link, &pidl );
++        IShellLinkW_Release( link );
++        info.nShow = show;
++        if (file[0]) info.lpFile = file;
++        else if (pidl)
++        {
++            info.fMask = SEE_MASK_IDLIST;
++            info.lpIDList = pidl;
++        }
++        else return E_FAIL;
++        info.lpParameters = args[0] ? args : NULL;
++        info.lpDirectory = dir[0] ? dir : NULL;
++    }
++    else if (SUCCEEDED(IUnknown_QueryInterface( view->entries[index].object, &IID_IShellItem, (void **)&item )))
++    {
++        hr = IShellItem_GetDisplayName( item, SIGDN_FILESYSPATH, &doc );
++        if (FAILED(hr)) hr = SHGetIDListFromObject( (IUnknown *)item, &pidl );
++        IShellItem_Release( item );
++        if (FAILED(hr)) return hr;
++        if (doc && view->exe[0] && (quoted = malloc( (wcslen( doc ) + 3) * sizeof(WCHAR) )))
++        {
++            swprintf( quoted, wcslen( doc ) + 3, L"\"%s\"", doc );
++            info.lpFile = view->exe;
++            info.lpParameters = quoted;
++        }
++        else if (doc) info.lpFile = doc;
++        else
++        {
++            info.fMask = SEE_MASK_IDLIST;
++            info.lpIDList = pidl;
++        }
++    }
++    else return E_INVALIDARG;
++    info.fMask |= SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
++    if (!ShellExecuteExW( &info )) hr = HRESULT_FROM_WIN32( GetLastError() );
++    ILFree( pidl );
++    CoTaskMemFree( doc );
++    free( quoted );
++    return hr;
++}
+--- a/dlls/shell32/shell32.spec
++++ b/dlls/shell32/shell32.spec
+@@ -496,3 +496,10 @@
+ @ stdcall -private StrStrIW(wstr wstr) shlwapi.StrStrIW
+ @ stdcall -private StrStrW(wstr wstr) shlwapi.StrStrW
+ @ stdcall WOWShellExecute(long str str str str long ptr)
++
++# Stained Glass OS 1664: the taskbar's view of jump lists (explorer)
++@ stdcall -private SGJumpListLoad(wstr wstr ptr)
++@ stdcall -private SGJumpListCount(ptr)
++@ stdcall -private SGJumpListEntry(ptr long ptr ptr long)
++@ stdcall -private SGJumpListInvoke(ptr long long)
++@ stdcall -private SGJumpListFree(ptr)
+--- a/dlls/shell32/shell32_classes.idl
++++ b/dlls/shell32/shell32_classes.idl
+@@ -167,6 +167,12 @@ coclass KnownFolderManager { interface IKnownFolderManager; }
+     uuid(77f10cf0-3db5-4966-b520-b7c54fd35ed6)
+ ] coclass DestinationList { interface ICustomDestinationList; }
+ 
++[
++    helpstring("Enumerable Object Collection"),
++    threading(apartment),
++    uuid(2d3468c1-36a7-43b6-ac24-d3f02fd9607a)
++] coclass EnumerableObjectCollection { interface IObjectCollection; }
++
+ [
+     helpstring("Shell Image Data Factory"),
+     threading(apartment),
+--- a/dlls/shell32/shell32_main.h
++++ b/dlls/shell32/shell32_main.h
+@@ -144,6 +144,8 @@ LPEXTRACTICONA	IExtractIconA_Constructor(LPCITEMIDLIST);
+ LPEXTRACTICONW	IExtractIconW_Constructor(LPCITEMIDLIST);
+ 
+ HRESULT WINAPI CustomDestinationList_Constructor(IUnknown *outer, REFIID riid, void **obj);
++HRESULT WINAPI EnumerableObjectCollection_Constructor(IUnknown *outer, REFIID riid, void **obj);
++void jumplist_add_recent(const WCHAR *appid, const WCHAR *doc);
+ 
+ /* initialisation for FORMATETC */
+ #define InitFormatEtc(fe, cf, med) \
+--- a/dlls/shell32/shellitem.c
++++ b/dlls/shell32/shellitem.c
+@@ -40,11 +40,6 @@ struct shell_item {
+     IShellItemImageFactory  IShellItemImageFactory_iface;
+ };
+ 
+-typedef struct _CustomDestinationList {
+-    ICustomDestinationList ICustomDestinationList_iface;
+-    LONG ref;
+-} CustomDestinationList;
+-
+ static struct shell_item *impl_from_IShellItem2(IShellItem2 *iface)
+ {
+     return CONTAINING_RECORD(iface, struct shell_item, IShellItem2_iface);
+@@ -60,11 +55,6 @@ static struct shell_item *impl_from_IShellItemImageFactory(IShellItemImageFactor
+     return CONTAINING_RECORD(iface, struct shell_item, IShellItemImageFactory_iface);
+ }
+ 
+-static inline CustomDestinationList *impl_from_ICustomDestinationList( ICustomDestinationList *iface )
+-{
+-    return CONTAINING_RECORD(iface, CustomDestinationList, ICustomDestinationList_iface);
+-}
+-
+ static HRESULT WINAPI ShellItem_QueryInterface(IShellItem2 *iface, REFIID riid,
+     void **ppv)
+ {
+@@ -1483,167 +1473,6 @@ HRESULT WINAPI SHGetPropertyStoreFromParsingName(const WCHAR *path, IBindCtx *pb
+     return hr;
+ }
+ 
+-static HRESULT WINAPI CustomDestinationList_QueryInterface(ICustomDestinationList *iface, REFIID riid, void **obj)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    TRACE("(%p, %s, %p)\n", This, debugstr_guid(riid), obj);
+-
+-    if (IsEqualIID(&IID_ICustomDestinationList, riid) || IsEqualIID(&IID_IUnknown, riid))
+-    {
+-        *obj = &This->ICustomDestinationList_iface;
+-    }
+-    else {
+-        WARN("Unsupported interface %s.\n", shdebugstr_guid(riid));
+-        *obj = NULL;
+-        return E_NOINTERFACE;
+-    }
+-
+-    IUnknown_AddRef((IUnknown*)*obj);
+-    return S_OK;
+-}
+-
+-static ULONG WINAPI CustomDestinationList_AddRef(ICustomDestinationList *iface)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
+-
+-    TRACE("(%p), new refcount=%li\n", This, ref);
+-
+-    return ref;
+-}
+-
+-static ULONG WINAPI CustomDestinationList_Release(ICustomDestinationList *iface)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
+-
+-    TRACE("(%p), new refcount=%li\n", This, ref);
+-
+-    if (ref == 0)
+-        free(This);
+-
+-    return ref;
+-}
+-
+-static HRESULT WINAPI CustomDestinationList_SetAppID(ICustomDestinationList *iface, const WCHAR *appid)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    FIXME("%p (%s): stub\n", This, debugstr_w(appid));
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI CustomDestinationList_BeginList(ICustomDestinationList *iface, UINT *min_slots, REFIID riid, void **obj)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    FIXME("%p (%p %s %p): stub\n", This, min_slots, debugstr_guid(riid), obj);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI CustomDestinationList_AppendCategory(ICustomDestinationList *iface, const WCHAR *category, IObjectArray *array)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    FIXME("%p (%s %p): stub\n", This, debugstr_w(category), array);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI CustomDestinationList_AppendKnownCategory(ICustomDestinationList *iface, KNOWNDESTCATEGORY category)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    FIXME("%p (%d): stub\n", This, category);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI CustomDestinationList_AddUserTasks(ICustomDestinationList *iface, IObjectArray *tasks)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    FIXME("%p (%p): stub\n", This, tasks);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI CustomDestinationList_CommitList(ICustomDestinationList *iface)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    FIXME("%p: stub\n", This);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI CustomDestinationList_GetRemovedDestinations(ICustomDestinationList *iface, REFIID riid, void **obj)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    FIXME("%p (%s %p): stub\n", This, debugstr_guid(riid), obj);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI CustomDestinationList_DeleteList(ICustomDestinationList *iface, const WCHAR *appid)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    FIXME("%p (%s): stub\n", This, debugstr_w(appid));
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI CustomDestinationList_AbortList(ICustomDestinationList *iface)
+-{
+-    CustomDestinationList *This = impl_from_ICustomDestinationList(iface);
+-
+-    FIXME("%p: stub\n", This);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static const ICustomDestinationListVtbl CustomDestinationListVtbl =
+-{
+-    CustomDestinationList_QueryInterface,
+-    CustomDestinationList_AddRef,
+-    CustomDestinationList_Release,
+-    CustomDestinationList_SetAppID,
+-    CustomDestinationList_BeginList,
+-    CustomDestinationList_AppendCategory,
+-    CustomDestinationList_AppendKnownCategory,
+-    CustomDestinationList_AddUserTasks,
+-    CustomDestinationList_CommitList,
+-    CustomDestinationList_GetRemovedDestinations,
+-    CustomDestinationList_DeleteList,
+-    CustomDestinationList_AbortList
+-};
+-
+-HRESULT WINAPI CustomDestinationList_Constructor(IUnknown *outer, REFIID riid, void **obj)
+-{
+-    CustomDestinationList *list;
+-    HRESULT hr;
+-
+-    TRACE("%p %s %p\n", outer, debugstr_guid(riid), obj);
+-
+-    if (outer)
+-        return CLASS_E_NOAGGREGATION;
+-
+-    if(!(list = malloc(sizeof(*list))))
+-        return E_OUTOFMEMORY;
+-
+-    list->ICustomDestinationList_iface.lpVtbl = &CustomDestinationListVtbl;
+-    list->ref = 1;
+-
+-    hr = ICustomDestinationList_QueryInterface(&list->ICustomDestinationList_iface, riid, obj);
+-    ICustomDestinationList_Release(&list->ICustomDestinationList_iface);
+-    return hr;
+-}
+-
+ HRESULT WINAPI SHSetTemporaryPropertyForItem(IShellItem *psi, REFPROPERTYKEY propkey, REFPROPVARIANT propvar)
+ {
+     FIXME("%p %p %p: stub\n", psi, propkey, propvar);
+--- a/dlls/shell32/shellole.c
++++ b/dlls/shell32/shellole.c
+@@ -85,6 +85,7 @@ static const struct {
+ 	{&CLSID_KnownFolderManager, KnownFolderManager_Constructor},
+ 	{&CLSID_Shell,          IShellDispatch_Constructor},
+ 	{&CLSID_DestinationList, CustomDestinationList_Constructor},
++	{&CLSID_EnumerableObjectCollection, EnumerableObjectCollection_Constructor},
+ 	{&CLSID_ShellImageDataFactory, ShellImageDataFactory_Constructor},
+ 	{&CLSID_FileOperation, IFileOperation_Constructor},
+ 	{&CLSID_ActiveDesktop, ActiveDesktop_Constructor},
+--- a/dlls/shell32/shellord.c
++++ b/dlls/shell32/shellord.c
+@@ -726,6 +726,34 @@ static BOOL SHADD_unicode_link(UINT flags, LPCVOID pv)
+     return SUCCEEDED(hr);
+ }
+ 
++/* Stained Glass OS 1664: clearing the list deletes the shortcuts in the
++ * Recent folder and the programs' document lists (their jump lists) */
++static void SHADD_clear_recent(const char *link_dir)
++{
++    static const char *patterns[] = { "*.lnk", "AutomaticDestinations\\*.sg-autodest" };
++    char path[MAX_PATH];
++    WIN32_FIND_DATAA data;
++    HANDLE find;
++    unsigned int i;
++
++    if (!link_dir[0]) return;
++    for (i = 0; i < ARRAY_SIZE(patterns); i++)
++    {
++        snprintf(path, sizeof(path), "%s\\%s", link_dir, patterns[i]);
++        if ((find = FindFirstFileA(path, &data)) == INVALID_HANDLE_VALUE) continue;
++        do
++        {
++            char *slash;
++            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
++            snprintf(path, sizeof(path), "%s\\%s", link_dir, patterns[i]);
++            if ((slash = strrchr(path, '\\'))) slash[1] = 0;
++            if (strlen(path) + strlen(data.cFileName) < sizeof(path)) strcat(path, data.cFileName);
++            DeleteFileA(path);
++        } while (FindNextFileA(find, &data));
++        FindClose(find);
++    }
++}
++
+ /*************************************************************************
+  * SHAddToRecentDocs				[SHELL32.@]
+  *
+@@ -741,7 +769,7 @@ static BOOL SHADD_unicode_link(UINT flags, LPCVOID pv)
+  * FIXME
+  *  convert to unicode
+  */
+-void WINAPI SHAddToRecentDocs (UINT uFlags,LPCVOID pv)
++static void SHADD_add_document(UINT uFlags,LPCVOID pv)
+ {
+ /* If list is a string list lpfnCompare has the following prototype
+  * int CALLBACK MRUCompareString(LPCSTR s1, LPCSTR s2)
+@@ -839,7 +867,7 @@ void WINAPI SHAddToRecentDocs (UINT uFlags,LPCVOID pv)
+ 	 *    DeleteFileA(old_lnk_name);
+ 	 * }
+ 	 */
+-	FIXME("should delete all files in %s\\\n", link_dir);
++	SHADD_clear_recent(link_dir);
+ 
+ 	/* clear MRU list
+ 	 */
+@@ -1082,6 +1110,80 @@ void WINAPI SHAddToRecentDocs (UINT uFlags,LPCVOID pv)
+     return;
+ }
+ 
++/*************************************************************************
++ * SHAddToRecentDocs				[SHELL32.@]
++ *
++ * Stained Glass OS 1664: also SHARD_APPIDINFO, SHARD_APPIDINFOIDLIST,
++ * SHARD_LINK, SHARD_APPIDINFOLINK and SHARD_SHELLITEM, and the document goes
++ * on its program's own list (the jump list's Recent and Frequent) -- the
++ * AppUserModelID given, else the calling program's.
++ */
++void WINAPI SHAddToRecentDocs (UINT uFlags,LPCVOID pv)
++{
++    const WCHAR *appid = NULL;
++    IShellItem *item = NULL;
++    IShellLinkW *link = NULL;
++    ITEMIDLIST *pidl = NULL;
++    WCHAR path[MAX_PATH];
++
++    TRACE("%04x %p\n", uFlags, pv);
++
++    if (!pv)
++    {
++        SHADD_add_document(uFlags, NULL);
++        return;
++    }
++    path[0] = 0;
++    switch (uFlags)
++    {
++    case SHARD_PIDL:
++        SHGetPathFromIDListW(pv, path);
++        break;
++    case SHARD_PATHA:
++        MultiByteToWideChar(CP_ACP, 0, pv, -1, path, MAX_PATH);
++        break;
++    case SHARD_PATHW:
++        lstrcpynW(path, pv, MAX_PATH);
++        break;
++    case SHARD_APPIDINFO:
++        item = ((const SHARDAPPIDINFO *)pv)->psi;
++        appid = ((const SHARDAPPIDINFO *)pv)->pszAppID;
++        break;
++    case SHARD_APPIDINFOIDLIST:
++        SHGetPathFromIDListW(((const SHARDAPPIDINFOIDLIST *)pv)->pidl, path);
++        appid = ((const SHARDAPPIDINFOIDLIST *)pv)->pszAppID;
++        break;
++    case SHARD_LINK:
++        link = (IShellLinkW *)pv;
++        break;
++    case SHARD_APPIDINFOLINK:
++        link = ((const SHARDAPPIDINFOLINK *)pv)->psl;
++        appid = ((const SHARDAPPIDINFOLINK *)pv)->pszAppID;
++        break;
++    case SHARD_SHELLITEM:
++        item = (IShellItem *)pv;
++        break;
++    default:
++        FIXME("Unsupported flags: %u\n", uFlags);
++        return;
++    }
++    if (item && SUCCEEDED(SHGetIDListFromObject((IUnknown *)item, &pidl)))
++        SHGetPathFromIDListW(pidl, path);
++    if (link)
++    {
++        if (FAILED(IShellLinkW_GetPath(link, path, MAX_PATH, NULL, SLGP_RAWPATH)) || !path[0])
++        {
++            if (SUCCEEDED(IShellLinkW_GetIDList(link, &pidl))) SHGetPathFromIDListW(pidl, path);
++        }
++    }
++    ILFree(pidl);
++    if (!path[0]) return;
++    SHADD_add_document(SHARD_PATHW, path);
++#ifndef SG_MUTANT_NO_APP_RECENT
++    if (!SHRestricted(REST_NORECENTDOCSHISTORY)) jumplist_add_recent(appid, path);
++#endif
++}
++
+ /*************************************************************************
+  *  SHWinHelp					[SHELL32.127]
+  *
+--- a/dlls/shell32/shellpath.c
++++ b/dlls/shell32/shellpath.c
+@@ -845,236 +845,7 @@ typedef enum _CSIDL_Type {
+ #define CSIDL_SAVED_GAMES      0x0062
+ #define CSIDL_SEARCHES         0x0063
+ 
+-typedef struct
+-{
+-    IApplicationDestinations IApplicationDestinations_iface;
+-    LONG ref;
+-} IApplicationDestinationsImpl;
+-
+-static inline IApplicationDestinationsImpl *impl_from_IApplicationDestinations( IApplicationDestinations *iface )
+-{
+-    return CONTAINING_RECORD(iface, IApplicationDestinationsImpl, IApplicationDestinations_iface);
+-}
+-
+-static HRESULT WINAPI ApplicationDestinations_QueryInterface(IApplicationDestinations *iface, REFIID riid,
+-                                                             LPVOID *ppv)
+-{
+-    IApplicationDestinationsImpl *This = impl_from_IApplicationDestinations(iface);
+-
+-    TRACE("(%p, %s, %p)\n", This, debugstr_guid(riid), ppv);
+-
+-    if (ppv == NULL)
+-        return E_POINTER;
+-
+-    if (IsEqualGUID(&IID_IUnknown, riid) || IsEqualGUID(&IID_IApplicationDestinations, riid))
+-    {
+-        *ppv = &This->IApplicationDestinations_iface;
+-        IUnknown_AddRef((IUnknown*)*ppv);
+-
+-        TRACE("Returning IApplicationDestinations: %p\n", *ppv);
+-        return S_OK;
+-    }
+-
+-    *ppv = NULL;
+-    FIXME("(%p)->(%s, %p) interface not supported.\n", This, debugstr_guid(riid), ppv);
+-
+-    return E_NOINTERFACE;
+-}
+-
+-static ULONG WINAPI ApplicationDestinations_AddRef(IApplicationDestinations *iface)
+-{
+-    IApplicationDestinationsImpl *This = impl_from_IApplicationDestinations(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
+-
+-    TRACE("(%p), new refcount=%li\n", This, ref);
+-
+-    return ref;
+-}
+-
+-static ULONG WINAPI ApplicationDestinations_Release(IApplicationDestinations *iface)
+-{
+-    IApplicationDestinationsImpl *This = impl_from_IApplicationDestinations(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
+-
+-    TRACE("(%p), new refcount=%li\n", This, ref);
+-
+-    if (ref == 0)
+-        free(This);
+-
+-    return ref;
+-}
+-
+-static HRESULT WINAPI ApplicationDestinations_SetAppID(IApplicationDestinations *iface, const WCHAR *appid)
+-{
+-    IApplicationDestinationsImpl *This = impl_from_IApplicationDestinations(iface);
+-
+-    FIXME("(%p, %s) stub!\n", This, debugstr_w(appid));
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI ApplicationDestinations_RemoveDestination(IApplicationDestinations *iface, IUnknown *punk)
+-{
+-    IApplicationDestinationsImpl *This = impl_from_IApplicationDestinations(iface);
+-
+-    FIXME("(%p, %p) stub!\n", This, punk);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI ApplicationDestinations_RemoveAllDestinations(IApplicationDestinations *iface)
+-{
+-    IApplicationDestinationsImpl *This = impl_from_IApplicationDestinations(iface);
+-
+-    FIXME("(%p) stub!\n", This);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static const IApplicationDestinationsVtbl ApplicationDestinationsVtbl =
+-{
+-    ApplicationDestinations_QueryInterface,
+-    ApplicationDestinations_AddRef,
+-    ApplicationDestinations_Release,
+-    ApplicationDestinations_SetAppID,
+-    ApplicationDestinations_RemoveDestination,
+-    ApplicationDestinations_RemoveAllDestinations
+-};
+-
+-HRESULT WINAPI ApplicationDestinations_Constructor(IUnknown *outer, REFIID riid, LPVOID *ppv)
+-{
+-    IApplicationDestinationsImpl *This;
+-    HRESULT hr;
+-
+-    TRACE("(%p, %s, %p)\n", outer, debugstr_guid(riid), ppv);
+-
+-    if (outer)
+-        return CLASS_E_NOAGGREGATION;
+-
+-    if (!(This = SHAlloc(sizeof(*This))))
+-        return E_OUTOFMEMORY;
+-
+-    This->IApplicationDestinations_iface.lpVtbl = &ApplicationDestinationsVtbl;
+-    This->ref = 0;
+-
+-    hr = IUnknown_QueryInterface(&This->IApplicationDestinations_iface, riid, ppv);
+-    if (FAILED(hr))
+-        SHFree(This);
+-
+-    return hr;
+-}
+-
+-typedef struct
+-{
+-    IApplicationDocumentLists IApplicationDocumentLists_iface;
+-    LONG ref;
+-} IApplicationDocumentListsImpl;
+-
+-static inline IApplicationDocumentListsImpl *impl_from_IApplicationDocumentLists( IApplicationDocumentLists *iface )
+-{
+-    return CONTAINING_RECORD(iface, IApplicationDocumentListsImpl, IApplicationDocumentLists_iface);
+-}
+-
+-static HRESULT WINAPI ApplicationDocumentLists_QueryInterface(IApplicationDocumentLists *iface,
+-                                                              REFIID riid, LPVOID *ppv)
+-{
+-    IApplicationDocumentListsImpl *This = impl_from_IApplicationDocumentLists(iface);
+-
+-    TRACE("(%p, %s, %p)\n", This, debugstr_guid(riid), ppv);
+-
+-    if (ppv == NULL)
+-        return E_POINTER;
+-
+-    if (IsEqualGUID(&IID_IUnknown, riid) || IsEqualGUID(&IID_IApplicationDocumentLists, riid))
+-    {
+-        *ppv = &This->IApplicationDocumentLists_iface;
+-        IUnknown_AddRef((IUnknown*)*ppv);
+-
+-        TRACE("Returning IApplicationDocumentLists: %p\n", *ppv);
+-        return S_OK;
+-    }
+-
+-    *ppv = NULL;
+-    FIXME("(%p)->(%s, %p) interface not supported.\n", This, debugstr_guid(riid), ppv);
+-
+-    return E_NOINTERFACE;
+-}
+-
+-static ULONG WINAPI ApplicationDocumentLists_AddRef(IApplicationDocumentLists *iface)
+-{
+-    IApplicationDocumentListsImpl *This = impl_from_IApplicationDocumentLists(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
+-
+-    TRACE("(%p), new refcount=%li\n", This, ref);
+-
+-    return ref;
+-}
+-
+-static ULONG WINAPI ApplicationDocumentLists_Release(IApplicationDocumentLists *iface)
+-{
+-    IApplicationDocumentListsImpl *This = impl_from_IApplicationDocumentLists(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
+-
+-    TRACE("(%p), new refcount=%li\n", This, ref);
+-
+-    if (ref == 0)
+-        free(This);
+-
+-    return ref;
+-}
+-
+-static HRESULT WINAPI ApplicationDocumentLists_SetAppID(IApplicationDocumentLists *iface,
+-                                                        const WCHAR *appid)
+-{
+-    IApplicationDocumentListsImpl *This = impl_from_IApplicationDocumentLists(iface);
+-
+-    FIXME("(%p, %s) stub!\n", This, debugstr_w(appid));
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI ApplicationDocumentLists_GetList(IApplicationDocumentLists *iface,
+-                                                       APPDOCLISTTYPE list_type, UINT item_count,
+-                                                       REFIID riid, void **obj)
+-{
+-    IApplicationDocumentListsImpl *This = impl_from_IApplicationDocumentLists(iface);
+-
+-    FIXME("(%p, %u, %u, %s, %p): stub\n", This, list_type, item_count, debugstr_guid(riid), obj);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static const IApplicationDocumentListsVtbl ApplicationDocumentListsVtbl =
+-{
+-    ApplicationDocumentLists_QueryInterface,
+-    ApplicationDocumentLists_AddRef,
+-    ApplicationDocumentLists_Release,
+-    ApplicationDocumentLists_SetAppID,
+-    ApplicationDocumentLists_GetList
+-};
+-
+-HRESULT WINAPI ApplicationDocumentLists_Constructor(IUnknown *outer, REFIID riid, LPVOID *ppv)
+-{
+-    IApplicationDocumentListsImpl *This;
+-    HRESULT hr;
+-
+-    TRACE("(%p, %s, %p)\n", outer, debugstr_guid(riid), ppv);
+-
+-    if (outer)
+-        return CLASS_E_NOAGGREGATION;
+-
+-    if (!(This = SHAlloc(sizeof(*This))))
+-        return E_OUTOFMEMORY;
+-
+-    This->IApplicationDocumentLists_iface.lpVtbl = &ApplicationDocumentListsVtbl;
+-    This->ref = 0;
+-
+-    hr = IUnknown_QueryInterface(&This->IApplicationDocumentLists_iface, riid, ppv);
+-    if (FAILED(hr))
+-        SHFree(This);
+-
+-    return hr;
+-}
++/* ApplicationDestinations and ApplicationDocumentLists: jumplist.c */
+ 
+ typedef struct
+ {
+--- a/include/shlobj.h
++++ b/include/shlobj.h
+@@ -868,6 +868,33 @@ DECLARE_INTERFACE_(IActiveDesktop, IUnknown)
+ #define SHARD_PATHA     __MSABI_LONG(0x00000002)
+ #define SHARD_PATHW     __MSABI_LONG(0x00000003)
+ #define SHARD_PATH WINELIB_NAME_AW(SHARD_PATH)
++#define SHARD_APPIDINFO         __MSABI_LONG(0x00000004)
++#define SHARD_APPIDINFOIDLIST   __MSABI_LONG(0x00000005)
++#define SHARD_LINK              __MSABI_LONG(0x00000006)
++#define SHARD_APPIDINFOLINK     __MSABI_LONG(0x00000007)
++#define SHARD_SHELLITEM         __MSABI_LONG(0x00000008)
++
++#ifdef __IShellItem_FWD_DEFINED__
++typedef struct SHARDAPPIDINFO
++{
++    IShellItem *psi;
++    PCWSTR pszAppID;
++} SHARDAPPIDINFO;
++#endif
++
++typedef struct SHARDAPPIDINFOIDLIST
++{
++    PCIDLIST_ABSOLUTE pidl;
++    PCWSTR pszAppID;
++} SHARDAPPIDINFOIDLIST;
++
++#ifdef __IShellLinkW_FWD_DEFINED__
++typedef struct SHARDAPPIDINFOLINK
++{
++    IShellLinkW *psl;
++    PCWSTR pszAppID;
++} SHARDAPPIDINFOLINK;
++#endif
+ 
+ WINSHELLAPI void WINAPI SHAddToRecentDocs(UINT,LPCVOID);
+ 
+--- a/programs/explorer/systray.c
++++ b/programs/explorer/systray.c
+@@ -4768,6 +4768,79 @@ static void sg_button_middle_click( HWND button )
+  * Close window; Shift+right-click keeps the window's own system menu. */
+ enum { SG_BTN_LAUNCH = 1, SG_BTN_REPORT, SG_BTN_CLOSE, SG_BTN_PIN, SG_BTN_UNPIN };
+ 
++/* Stained Glass OS 1664: a program's jump list on its button -- the
++ * categories and tasks it committed (ICustomDestinationList), else the
++ * documents it opened -- read through shell32's private SGJumpList* */
++#define SG_BTN_JUMP 0x1000
++
++struct sg_jump_api
++{
++    HRESULT (WINAPI *load)( const WCHAR *, const WCHAR *, void ** );
++    UINT (WINAPI *count)( void * );
++    BOOL (WINAPI *entry)( void *, UINT, int *, WCHAR *, UINT );
++    HRESULT (WINAPI *invoke)( void *, UINT, HWND );
++    void (WINAPI *release)( void * );
++};
++
++static const struct sg_jump_api *sg_jump_api(void)
++{
++    static struct sg_jump_api api;
++    static BOOL tried;
++    HMODULE shell32;
++
++    if (!tried)
++    {
++        tried = TRUE;
++        if ((shell32 = LoadLibraryW( L"shell32.dll" )))
++        {
++            api.load = (void *)GetProcAddress( shell32, "SGJumpListLoad" );
++            api.count = (void *)GetProcAddress( shell32, "SGJumpListCount" );
++            api.entry = (void *)GetProcAddress( shell32, "SGJumpListEntry" );
++            api.invoke = (void *)GetProcAddress( shell32, "SGJumpListInvoke" );
++            api.release = (void *)GetProcAddress( shell32, "SGJumpListFree" );
++        }
++    }
++    return api.load && api.count && api.entry && api.invoke && api.release ? &api : NULL;
++}
++
++/* the list's entries go first in the menu; returns the list (or NULL) */
++static void *sg_jump_menu( HMENU menu, const WCHAR *appid, const WCHAR *exe )
++{
++    const struct sg_jump_api *api = sg_jump_api();
++    WCHAR title[MAX_PATH];
++    void *view = NULL;
++    UINT count, i;
++    int kind;
++
++#ifdef SG_MUTANT_NO_JUMP_MENU
++    return NULL;
++#endif
++    if (!api || FAILED(api->load( appid, exe, &view )) || !view) return NULL;
++    if (!(count = api->count( view )))
++    {
++        api->release( view );
++        return NULL;
++    }
++    for (i = 0; i < count && i < 0x800; i++)
++    {
++        if (!api->entry( view, i, &kind, title, ARRAY_SIZE(title) )) continue;
++        if (kind == 2) AppendMenuW( menu, MF_SEPARATOR, 0, NULL );
++        else if (kind == 0) AppendMenuW( menu, MF_STRING | MF_DISABLED, 0, title );
++        else AppendMenuW( menu, MF_STRING, SG_BTN_JUMP + i, title[0] ? title : L"(untitled)" );
++    }
++    AppendMenuW( menu, MF_SEPARATOR, 0, NULL );
++    return view;
++}
++
++static void sg_jump_done( void *view, int cmd )
++{
++    const struct sg_jump_api *api = sg_jump_api();
++
++    if (!view || !api) return;
++    if (cmd >= SG_BTN_JUMP && cmd < SG_BTN_JUMP + 0x800) api->invoke( view, cmd - SG_BTN_JUMP, NULL );
++    api->release( view );
++}
++
+ /* the name a program gives itself (its FileDescription), else its file's */
+ static void sg_exe_display_name( const WCHAR *exe, WCHAR *name, int size )
+ {
+@@ -4806,12 +4879,14 @@ static BOOL sg_button_menu( struct taskbar_button *win, HWND button, LPARAM lpar
+     BOOL group = win->combined && leader->group_count > 1;
+     POINT pt = { (short)LOWORD(lparam), (short)HIWORD(lparam) };
+     WCHAR name[MAX_PATH], args[32];
++    void *jump;
+     HMENU menu;
+     int cmd;
+ 
+     if (GetKeyState( VK_SHIFT ) < 0) return FALSE;
+     if (lparam == -1) { RECT rc; GetWindowRect( button, &rc ); pt.x = rc.left; pt.y = rc.top; }
+     menu = CreatePopupMenu();
++    jump = sg_jump_menu( menu, leader->appid[0] ? leader->appid : win->appid, win->exe );
+     if (win->exe[0])
+     {
+         sg_exe_display_name( win->exe, name, ARRAY_SIZE(name) );
+@@ -4831,6 +4906,7 @@ static BOOL sg_button_menu( struct taskbar_button *win, HWND button, LPARAM lpar
+                           (sg_bar.edge == ABE_TOP ? TPM_TOPALIGN : TPM_BOTTOMALIGN),
+                           pt.x, pt.y, 0, tray_window, NULL );
+     DestroyMenu( menu );
++    sg_jump_done( jump, cmd );
+ 
+     switch (cmd)
+     {
+@@ -4867,12 +4943,14 @@ static BOOL sg_button_menu( struct taskbar_button *win, HWND button, LPARAM lpar
+ static void sg_pin_menu( int i, HWND button, LPARAM lparam )
+ {
+     POINT pt = { (short)LOWORD(lparam), (short)HIWORD(lparam) };
++    void *jump;
+     HMENU menu;
+     int cmd;
+ 
+     if (i >= sg_npins) return;
+     if (lparam == -1) { RECT rc; GetWindowRect( button, &rc ); pt.x = rc.left; pt.y = rc.top; }
+     menu = CreatePopupMenu();
++    jump = sg_jump_menu( menu, NULL, sg_pins[i].target );
+     AppendMenuW( menu, MF_STRING, SG_BTN_LAUNCH, sg_pins[i].name );
+     AppendMenuW( menu, MF_STRING, SG_BTN_UNPIN, L"Unpin from tas&kbar" );
+     SetForegroundWindow( tray_window );
+@@ -4880,6 +4958,7 @@ static void sg_pin_menu( int i, HWND button, LPARAM lparam )
+                           (sg_bar.edge == ABE_TOP ? TPM_TOPALIGN : TPM_BOTTOMALIGN),
+                           pt.x, pt.y, 0, tray_window, NULL );
+     DestroyMenu( menu );
++    sg_jump_done( jump, cmd );
+     if (cmd == SG_BTN_LAUNCH) ShellExecuteW( NULL, NULL, sg_pins[i].lnk, NULL, NULL, SW_SHOWNORMAL );
+     else if (cmd == SG_BTN_UNPIN)
+     {
