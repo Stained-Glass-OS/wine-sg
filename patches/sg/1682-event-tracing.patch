@@ -1980,3 +1980,1251 @@ new file mode 100644
 +}
 +
 +#endif /* __WINE_SG_ETW_H */
+--- a/dlls/sechost/trace.c
++++ b/dlls/sechost/trace.c
+@@ -20,24 +20,466 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++/* Stained Glass OS 1682: trace sessions and their consumers, as documented.
++ * StartTrace makes a session -- with a log file, a real-time ring, or both
++ * -- that EnableTraceEx2 enables providers in; ControlTrace queries, flushes,
++ * updates and stops it; QueryAllTraces lists them. OpenTrace opens a log
++ * file or a real-time session, and ProcessTrace hands its events to the
++ * consumer's callbacks until the file ends, the session stops or CloseTrace
++ * is called. The sessions are shared with every process's providers
++ * (ntdll/etw.c, include/wine/sg_etw.h). */
++
+ #include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winnls.h"
++#include "winternl.h"
+ #include "wmistr.h"
+ #define _WMI_SOURCE_
++#include "initguid.h"
+ #include "evntrace.h"
++#include "evntprov.h"
++#include "evntcons.h"
++#include "wine/sg_etw.h"
+ 
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(eventlog);
+ 
++static struct sg_etw_shared *shared;
++static HANDLE shared_mutex;
++
++static void named_object( WCHAR *buffer, const WCHAR *path, ULONG suffix, BOOL with_suffix )
++{
++    const WCHAR *name = path + wcslen( L"\\BaseNamedObjects\\" );
++    if (with_suffix)
++        swprintf( buffer, 128, L"\\Sessions\\%u\\BaseNamedObjects\\%s%u", NtCurrentTeb()->Peb->SessionId, name, suffix );
++    else
++        swprintf( buffer, 128, L"\\Sessions\\%u\\BaseNamedObjects\\%s", NtCurrentTeb()->Peb->SessionId, name );
++}
++
++static BOOL map_shared(void)
++{
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING str;
++    WCHAR buffer[128];
++    HANDLE section;
++    void *ptr;
++
++    if (shared) return TRUE;
++    named_object( buffer, SG_ETW_MUTEX_NAME, 0, FALSE );
++    RtlInitUnicodeString( &str, buffer );
++    InitializeObjectAttributes( &attr, &str, OBJ_OPENIF, 0, NULL );
++    if (!shared_mutex && NtCreateMutant( &shared_mutex, MUTANT_ALL_ACCESS, &attr, FALSE ) < 0) return FALSE;
++    named_object( buffer, SG_ETW_SECTION_NAME, 0, FALSE );
++    if (!(ptr = sg_etw_map( buffer, L"SgEtwControl.dat", sizeof(struct sg_etw_shared), &section ))) return FALSE;
++    shared = ptr;
++    return TRUE;
++}
++
++static void lock_shared(void)
++{
++    WaitForSingleObject( shared_mutex, INFINITE );
++    sg_etw_check_boot( shared );
++}
++
++static void unlock_shared(void)
++{
++    ReleaseMutex( shared_mutex );
++}
++
++/* every process with providers looks again; with the section locked */
++static void notify_providers(void)
++{
++    WCHAR buffer[128];
++    UNICODE_STRING str;
++    OBJECT_ATTRIBUTES attr;
++    HANDLE event;
++    unsigned int i = 0;
++
++    shared->generation++;
++    while (i < shared->process_count && i < SG_ETW_MAX_PROCESSES)
++    {
++        named_object( buffer, SG_ETW_NOTIFY_PREFIX, shared->processes[i], TRUE );
++        RtlInitUnicodeString( &str, buffer );
++        InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
++        if (!NtOpenEvent( &event, EVENT_MODIFY_STATE, &attr ))
++        {
++            NtSetEvent( event, NULL );
++            CloseHandle( event );
++            i++;
++        }
++        else  /* that process has gone */
++            shared->processes[i] = shared->processes[--shared->process_count];
++    }
++}
++
++static struct sg_etw_session *find_session( TRACEHANDLE handle, const WCHAR *name )
++{
++    unsigned int i;
++
++    for (i = 0; i < SG_ETW_MAX_SESSIONS; i++)
++    {
++        struct sg_etw_session *session = &shared->sessions[i];
++        if (!session->in_use) continue;
++        if (name && name[0] && !wcsicmp( session->name, name )) return session;
++        if ((!name || !name[0]) && handle && session->logger_id == handle) return session;
++    }
++    return NULL;
++}
++
++/* ---- sessions ---- */
++
++static void fill_properties( const struct sg_etw_session *session, EVENT_TRACE_PROPERTIES *props )
++{
++    props->Wnode.HistoricalContext = session->logger_id;
++    props->Wnode.Guid = session->guid;
++    props->BufferSize = session->buffer_size;
++    props->MinimumBuffers = session->min_buffers;
++    props->MaximumBuffers = session->max_buffers;
++    props->MaximumFileSize = session->max_file_size;
++    props->LogFileMode = session->mode;
++    props->FlushTimer = session->flush_timer;
++    props->EnableFlags = session->enable_flags;
++    props->AgeLimit = session->age_limit;
++    props->NumberOfBuffers = session->min_buffers;
++    props->FreeBuffers = session->min_buffers;
++    props->EventsLost = session->events_lost;
++    props->BuffersWritten = session->buffers_written;
++    props->LogBuffersLost = 0;
++    props->RealTimeBuffersLost = 0;
++    props->LoggerThreadId = 0;
++    /* the names, where the caller has room for them */
++    if (props->LoggerNameOffset >= sizeof(*props) &&
++        props->LoggerNameOffset + (wcslen( session->name ) + 1) * sizeof(WCHAR) <= props->Wnode.BufferSize)
++        wcscpy( (WCHAR *)((BYTE *)props + props->LoggerNameOffset), session->name );
++    if (props->LogFileNameOffset >= sizeof(*props) &&
++        props->LogFileNameOffset + (wcslen( session->logfile ) + 1) * sizeof(WCHAR) <= props->Wnode.BufferSize)
++        wcscpy( (WCHAR *)((BYTE *)props + props->LogFileNameOffset), session->logfile );
++}
++
++static ULONG create_ring( ULONG logger_id, HANDLE *section_ret, HANDLE *event_ret )
++{
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING str;
++    WCHAR buffer[128], leaf[64];
++    struct sg_etw_ring *ring;
++
++    named_object( buffer, SG_ETW_RING_PREFIX, logger_id, TRUE );
++    swprintf( leaf, ARRAY_SIZE(leaf), L"SgEtwRing%u.dat", logger_id );
++    if (!(ring = sg_etw_map( buffer, leaf, offsetof(struct sg_etw_ring, data[SG_ETW_RING_SIZE]), section_ret )))
++        return ERROR_NO_SYSTEM_RESOURCES;
++    ring->head = ring->tail = ring->lost = 0;
++    ring->size = SG_ETW_RING_SIZE;
++    NtUnmapViewOfSection( GetCurrentProcess(), ring );
++    named_object( buffer, SG_ETW_RING_EVENT_PREFIX, logger_id, TRUE );
++    RtlInitUnicodeString( &str, buffer );
++    InitializeObjectAttributes( &attr, &str, OBJ_OPENIF, 0, NULL );
++    if (NtCreateEvent( event_ret, EVENT_ALL_ACCESS, &attr, SynchronizationEvent, FALSE ))
++    {
++        CloseHandle( *section_ret );
++        return ERROR_NO_SYSTEM_RESOURCES;
++    }
++    return ERROR_SUCCESS;
++}
++
++/* the ring's objects live while some process holds them: the session's
++ * starter keeps them for the session's life */
++static struct { ULONG logger_id; HANDLE section, event; } rings[SG_ETW_MAX_SESSIONS];
++
++static void keep_ring( ULONG logger_id, HANDLE section, HANDLE event )
++{
++    unsigned int i;
++    for (i = 0; i < ARRAY_SIZE(rings); i++)
++        if (!rings[i].logger_id)
++        {
++            rings[i].logger_id = logger_id;
++            rings[i].section = section;
++            rings[i].event = event;
++            return;
++        }
++    CloseHandle( section );
++    CloseHandle( event );
++}
++
++static void drop_ring( ULONG logger_id )
++{
++    unsigned int i;
++    for (i = 0; i < ARRAY_SIZE(rings); i++)
++        if (rings[i].logger_id == logger_id)
++        {
++            /* wake a consumer, which sees the session gone */
++            SetEvent( rings[i].event );
++            CloseHandle( rings[i].section );
++            CloseHandle( rings[i].event );
++            rings[i].logger_id = 0;
++        }
++}
++
++static ULONG start_trace( TRACEHANDLE *handle, const WCHAR *name, const WCHAR *logfile,
++                          EVENT_TRACE_PROPERTIES *props )
++{
++    struct sg_etw_file_header header;
++    struct sg_etw_session *session = NULL;
++    HANDLE ring_section = 0, ring_event = 0, file;
++    WCHAR full[MAX_PATH];
++    unsigned int i;
++    ULONG ret;
++    DWORD written;
++
++    if (!map_shared()) return ERROR_NO_SYSTEM_RESOURCES;
++    if (logfile && logfile[0])
++    {
++        if (!GetFullPathNameW( logfile, MAX_PATH, full, NULL )) return ERROR_BAD_PATHNAME;
++        logfile = full;
++    }
++
++    lock_shared();
++    if (find_session( 0, name ))
++    {
++        unlock_shared();
++        return ERROR_ALREADY_EXISTS;
++    }
++    for (i = 0; i < SG_ETW_MAX_SESSIONS; i++)
++        if (!shared->sessions[i].in_use)
++        {
++            session = &shared->sessions[i];
++            break;
++        }
++    if (!session)
++    {
++        unlock_shared();
++        return ERROR_NO_SYSTEM_RESOURCES;
++    }
++    memset( session, 0, sizeof(*session) );
++    if (!shared->next_logger_id) shared->next_logger_id = 2;  /* 0 and 1 are never loggers */
++    session->logger_id = shared->next_logger_id++;
++    session->mode = props->LogFileMode;
++    session->buffer_size = props->BufferSize ? props->BufferSize : 64;
++    session->min_buffers = props->MinimumBuffers ? props->MinimumBuffers : 4;
++    session->max_buffers = max( props->MaximumBuffers, session->min_buffers );
++    session->max_file_size = props->MaximumFileSize;
++    session->flush_timer = props->FlushTimer;
++    session->enable_flags = props->EnableFlags;
++    session->age_limit = props->AgeLimit;
++    session->guid = props->Wnode.Guid;
++    GetSystemTimeAsFileTime( (FILETIME *)&session->start_time );
++    lstrcpynW( session->name, name, SG_ETW_NAME_LEN );
++    if (logfile) lstrcpynW( session->logfile, logfile, MAX_PATH );
++
++    if (session->logfile[0])
++    {
++        /* the log file starts with its header */
++        file = CreateFileW( session->logfile, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                            NULL, (session->mode & EVENT_TRACE_FILE_MODE_APPEND) ? OPEN_ALWAYS : CREATE_ALWAYS,
++                            FILE_ATTRIBUTE_NORMAL, NULL );
++        if (file == INVALID_HANDLE_VALUE)
++        {
++            ret = GetLastError() == ERROR_PATH_NOT_FOUND ? ERROR_BAD_PATHNAME : GetLastError();
++            session->in_use = 0;
++            unlock_shared();
++            return ret;
++        }
++        if (!GetFileSize( file, NULL ))
++        {
++            memset( &header, 0, sizeof(header) );
++            memcpy( header.magic, SG_ETW_FILE_MAGIC, sizeof(header.magic) );
++            header.version = 1;
++            header.mode = session->mode;
++            header.start_time = session->start_time;
++            header.pointer_size = sizeof(void *);
++            header.buffer_size = session->buffer_size;
++            lstrcpynW( header.logger_name, session->name, SG_ETW_NAME_LEN );
++            WriteFile( file, &header, sizeof(header), &written, NULL );
++        }
++        CloseHandle( file );
++    }
++    if ((session->mode & EVENT_TRACE_REAL_TIME_MODE) &&
++        (ret = create_ring( session->logger_id, &ring_section, &ring_event )))
++    {
++        unlock_shared();
++        return ret;
++    }
++    session->in_use = 1;
++    *handle = session->logger_id;
++    fill_properties( session, props );
++    notify_providers();
++    unlock_shared();
++    if (ring_section) keep_ring( *handle, ring_section, ring_event );
++    TRACE( "session %s: logger %s, mode %#lx, file %s\n", debugstr_w(name), wine_dbgstr_longlong(*handle),
++           props->LogFileMode, debugstr_w(logfile) );
++    return ERROR_SUCCESS;
++}
++
++/* the checks StartTrace makes of its properties (Wine's tests show them) */
++static ULONG check_start_properties( const void *name, BOOL ansi, EVENT_TRACE_PROPERTIES *props )
++{
++    SIZE_T name_size;
++
++    if (!props || !name) return ERROR_INVALID_PARAMETER;
++    if (props->Wnode.BufferSize < sizeof(*props)) return ERROR_BAD_LENGTH;
++    name_size = ansi ? strlen( name ) + 1 : (wcslen( name ) + 1) * sizeof(WCHAR);
++    if (props->LoggerNameOffset && props->LoggerNameOffset < sizeof(*props)) return ERROR_INVALID_PARAMETER;
++    if (props->LogFileNameOffset && props->LogFileNameOffset < sizeof(*props)) return ERROR_INVALID_PARAMETER;
++    if (props->LoggerNameOffset && props->LoggerNameOffset + name_size > props->Wnode.BufferSize)
++        return ERROR_BAD_LENGTH;
++    if (name_size > SG_ETW_NAME_LEN * (ansi ? 1 : sizeof(WCHAR))) return ERROR_BAD_LENGTH;
++    if ((props->LogFileMode & EVENT_TRACE_FILE_MODE_SEQUENTIAL) && (props->LogFileMode & EVENT_TRACE_FILE_MODE_CIRCULAR))
++        return ERROR_INVALID_PARAMETER;
++    if (IsEqualGUID( &props->Wnode.Guid, &SystemTraceControlGuid ) &&
++        (ansi ? strcmp( name, KERNEL_LOGGER_NAMEA ) : wcscmp( name, KERNEL_LOGGER_NAMEW )))
++        return ERROR_INVALID_PARAMETER;
++    if (!props->LogFileNameOffset &&
++        !(props->LogFileMode & (EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_BUFFERING_MODE)))
++        return ERROR_BAD_PATHNAME;
++    return ERROR_SUCCESS;
++}
++
+ /******************************************************************************
+- *     ControlTraceA   (sechost.@)
++ *     StartTraceW   (sechost.@)
+  */
+-ULONG WINAPI ControlTraceA( TRACEHANDLE handle, const char *session,
+-                            EVENT_TRACE_PROPERTIES *properties, ULONG control )
++ULONG WINAPI StartTraceW( TRACEHANDLE *handle, const WCHAR *session, EVENT_TRACE_PROPERTIES *properties )
++{
++    const WCHAR *logfile = NULL;
++    ULONG ret;
++
++    TRACE("(%p, %s, %p)\n", handle, debugstr_w(session), properties);
++
++    if (!handle) return ERROR_INVALID_PARAMETER;
++    if ((ret = check_start_properties( session, FALSE, properties ))) return ret;
++    if (properties->LogFileNameOffset) logfile = (const WCHAR *)((BYTE *)properties + properties->LogFileNameOffset);
++#ifdef SG_MUTANT_NO_SESSIONS
++    *handle = 0xcafe4242;
++    return ERROR_SUCCESS;
++#endif
++    return start_trace( handle, session, logfile, properties );
++}
++
++static WCHAR *strdupAW( const char *str )
++{
++    WCHAR *ret;
++    int len;
++
++    if (!str) return NULL;
++    len = MultiByteToWideChar( CP_ACP, 0, str, -1, NULL, 0 );
++    if ((ret = malloc( len * sizeof(WCHAR) ))) MultiByteToWideChar( CP_ACP, 0, str, -1, ret, len );
++    return ret;
++}
++
++/* the properties with the A names converted, so the session's W names fit
++ * where the caller's ANSI ones were */
++static void write_names_a( EVENT_TRACE_PROPERTIES *props, const struct sg_etw_session *session )
++{
++    if (props->LoggerNameOffset >= sizeof(*props))
++        WideCharToMultiByte( CP_ACP, 0, session->name, -1, (char *)props + props->LoggerNameOffset,
++                             props->Wnode.BufferSize - props->LoggerNameOffset, NULL, NULL );
++    if (props->LogFileNameOffset >= sizeof(*props) && props->LogFileNameOffset < props->Wnode.BufferSize)
++        WideCharToMultiByte( CP_ACP, 0, session->logfile, -1, (char *)props + props->LogFileNameOffset,
++                             props->Wnode.BufferSize - props->LogFileNameOffset, NULL, NULL );
++}
++
++/******************************************************************************
++ *     StartTraceA   (sechost.@)
++ */
++ULONG WINAPI StartTraceA( TRACEHANDLE *handle, const char *session, EVENT_TRACE_PROPERTIES *properties )
++{
++    EVENT_TRACE_PROPERTIES copy;
++    WCHAR *name, *logfile = NULL;
++    struct sg_etw_session *s;
++    ULONG ret;
++
++    TRACE("(%p, %s, %p)\n", handle, debugstr_a(session), properties);
++
++    if (!handle) return ERROR_INVALID_PARAMETER;
++    if ((ret = check_start_properties( session, TRUE, properties ))) return ret;
++    name = strdupAW( session );
++    if (properties->LogFileNameOffset) logfile = strdupAW( (const char *)properties + properties->LogFileNameOffset );
++    /* the W names go nowhere near the caller's buffer */
++    copy = *properties;
++    copy.LoggerNameOffset = copy.LogFileNameOffset = 0;
++    copy.Wnode.BufferSize = sizeof(copy);
++#ifdef SG_MUTANT_NO_SESSIONS
++    *handle = 0xcafe4242;
++    ret = ERROR_SUCCESS;
++#else
++    ret = start_trace( handle, name, logfile, &copy );
++#endif
++    if (!ret)
++    {
++        ULONG lnoff = properties->LoggerNameOffset, lfoff = properties->LogFileNameOffset, size = properties->Wnode.BufferSize;
++        *properties = copy;
++        properties->LoggerNameOffset = lnoff;
++        properties->LogFileNameOffset = lfoff;
++        properties->Wnode.BufferSize = size;
++        lock_shared();
++        if ((s = find_session( *handle, NULL ))) write_names_a( properties, s );
++        unlock_shared();
++    }
++    free( name );
++    free( logfile );
++    return ret;
++}
++
++static ULONG control_trace( TRACEHANDLE handle, const WCHAR *name, EVENT_TRACE_PROPERTIES *props, ULONG control,
++                            BOOL ansi )
+ {
+-    FIXME("(%s, %s, %p, %ld) stub\n", wine_dbgstr_longlong(handle), debugstr_a(session), properties, control);
++    struct sg_etw_session *session;
++    ULONG logger_id;
++
++    if (!props) return ERROR_INVALID_PARAMETER;
++    if (props->Wnode.BufferSize < sizeof(*props)) return ERROR_BAD_LENGTH;
++    if (control > EVENT_TRACE_CONTROL_FLUSH) return ERROR_INVALID_PARAMETER;
++    if (!map_shared()) return ERROR_WMI_INSTANCE_NOT_FOUND;
++    lock_shared();
++    if (!(session = find_session( handle, name )) && name && name[0] && handle)
++        session = find_session( handle, NULL );
++    if (!session)
++    {
++        unlock_shared();
++        return ERROR_WMI_INSTANCE_NOT_FOUND;
++    }
++    switch (control)
++    {
++    case EVENT_TRACE_CONTROL_UPDATE:
++        /* what can change while it runs */
++        if (props->FlushTimer) session->flush_timer = props->FlushTimer;
++        if (props->MaximumBuffers) session->max_buffers = max( props->MaximumBuffers, session->min_buffers );
++        session->enable_flags = props->EnableFlags;
++        if ((props->LogFileMode & EVENT_TRACE_REAL_TIME_MODE) != (session->mode & EVENT_TRACE_REAL_TIME_MODE))
++        {
++            unlock_shared();
++            return ERROR_INVALID_PARAMETER;
++        }
++        break;
++    case EVENT_TRACE_CONTROL_FLUSH:
++        session->buffers_written++;
++        break;
++    }
++    if (ansi)
++    {
++        ULONG lnoff = props->LoggerNameOffset, lfoff = props->LogFileNameOffset;
++        props->LoggerNameOffset = props->LogFileNameOffset = 0;
++        fill_properties( session, props );
++        props->LoggerNameOffset = lnoff;
++        props->LogFileNameOffset = lfoff;
++        write_names_a( props, session );
++    }
++    else fill_properties( session, props );
++    logger_id = session->logger_id;
++    if (control == EVENT_TRACE_CONTROL_STOP)
++    {
++        TRACE( "stopping %s\n", debugstr_w(session->name) );
++        session->in_use = 0;
++        session->provider_count = 0;
++        notify_providers();
++    }
++    unlock_shared();
++    if (control == EVENT_TRACE_CONTROL_STOP) drop_ring( logger_id );
+     return ERROR_SUCCESS;
+ }
+ 
+@@ -47,33 +489,73 @@
+ ULONG WINAPI ControlTraceW( TRACEHANDLE handle, const WCHAR *session,
+                             EVENT_TRACE_PROPERTIES *properties, ULONG control )
+ {
+-    FIXME("(%s, %s, %p, %ld) stub\n", wine_dbgstr_longlong(handle), debugstr_w(session), properties, control);
+-    return ERROR_SUCCESS;
++    TRACE("(%s, %s, %p, %ld)\n", wine_dbgstr_longlong(handle), debugstr_w(session), properties, control);
++    return control_trace( handle, session, properties, control, FALSE );
+ }
+ 
+ /******************************************************************************
+- *     EnableTraceEx2   (sechost.@)
++ *     ControlTraceA   (sechost.@)
+  */
+-ULONG WINAPI EnableTraceEx2( TRACEHANDLE handle, const GUID *provider, ULONG control, UCHAR level,
+-                             ULONGLONG match_any, ULONGLONG match_all, ULONG timeout,
+-                             ENABLE_TRACE_PARAMETERS *params )
++ULONG WINAPI ControlTraceA( TRACEHANDLE handle, const char *session,
++                            EVENT_TRACE_PROPERTIES *properties, ULONG control )
+ {
+-    FIXME("(%s, %s, %lu, %u, %s, %s, %lu, %p): stub\n", wine_dbgstr_longlong(handle),
+-          debugstr_guid(provider), control, level, wine_dbgstr_longlong(match_any),
+-          wine_dbgstr_longlong(match_all), timeout, params);
++    WCHAR *name = strdupAW( session );
++    ULONG ret;
+ 
+-    return ERROR_SUCCESS;
++    TRACE("(%s, %s, %p, %ld)\n", wine_dbgstr_longlong(handle), debugstr_a(session), properties, control);
++    ret = control_trace( handle, name, properties, control, TRUE );
++    free( name );
++    return ret;
+ }
+ 
+ /******************************************************************************
+- *     QueryAllTracesA   (sechost.@)
++ *     StopTraceW   (sechost.@)
+  */
+-ULONG WINAPI QueryAllTracesA( EVENT_TRACE_PROPERTIES **properties, ULONG count, ULONG *ret_count )
++ULONG WINAPI StopTraceW( TRACEHANDLE handle, const WCHAR *session, EVENT_TRACE_PROPERTIES *properties )
+ {
+-    FIXME("(%p, %ld, %p) stub\n", properties, count, ret_count);
++    TRACE("(%s, %s, %p)\n", wine_dbgstr_longlong(handle), debugstr_w(session), properties);
++    return ControlTraceW( handle, session, properties, EVENT_TRACE_CONTROL_STOP );
++}
+ 
+-    if (ret_count) *ret_count = 0;
+-    return ERROR_SUCCESS;
++static ULONG query_all( EVENT_TRACE_PROPERTIES **properties, ULONG count, ULONG *ret_count, BOOL ansi )
++{
++    unsigned int i, n = 0;
++    ULONG ret = ERROR_SUCCESS;
++
++    if (!properties || !ret_count || !count || count > SG_ETW_MAX_SESSIONS) return ERROR_INVALID_PARAMETER;
++    *ret_count = 0;
++    if (!map_shared()) return ERROR_SUCCESS;
++    lock_shared();
++    for (i = 0; i < SG_ETW_MAX_SESSIONS; i++)
++    {
++        const struct sg_etw_session *session = &shared->sessions[i];
++        if (!session->in_use) continue;
++        if (n >= count)
++        {
++            ret = ERROR_MORE_DATA;
++            n++;
++            continue;
++        }
++        if (!properties[n] || properties[n]->Wnode.BufferSize < sizeof(EVENT_TRACE_PROPERTIES))
++        {
++            ret = ERROR_INVALID_PARAMETER;
++            break;
++        }
++        if (ansi)
++        {
++            ULONG lnoff = properties[n]->LoggerNameOffset, lfoff = properties[n]->LogFileNameOffset;
++            properties[n]->LoggerNameOffset = properties[n]->LogFileNameOffset = 0;
++            fill_properties( session, properties[n] );
++            properties[n]->LoggerNameOffset = lnoff;
++            properties[n]->LogFileNameOffset = lfoff;
++            write_names_a( properties[n], session );
++        }
++        else fill_properties( session, properties[n] );
++        n++;
++    }
++    unlock_shared();
++    *ret_count = n;
++    return ret;
+ }
+ 
+ /******************************************************************************
+@@ -81,39 +563,251 @@
+  */
+ ULONG WINAPI QueryAllTracesW( EVENT_TRACE_PROPERTIES **properties, ULONG count, ULONG *ret_count )
+ {
+-    FIXME("(%p, %ld, %p) stub\n", properties, count, ret_count);
+-
+-    if (ret_count) *ret_count = 0;
+-    return ERROR_SUCCESS;
++    TRACE("(%p, %ld, %p)\n", properties, count, ret_count);
++    return query_all( properties, count, ret_count, FALSE );
+ }
+ 
+ /******************************************************************************
+- *     StartTraceA   (sechost.@)
++ *     QueryAllTracesA   (sechost.@)
+  */
+-ULONG WINAPI StartTraceA( TRACEHANDLE *handle, const char *session, EVENT_TRACE_PROPERTIES *properties )
++ULONG WINAPI QueryAllTracesA( EVENT_TRACE_PROPERTIES **properties, ULONG count, ULONG *ret_count )
+ {
+-    FIXME("(%p, %s, %p) stub\n", handle, debugstr_a(session), properties);
+-    if (handle) *handle = 0xcafe4242;
+-    return ERROR_SUCCESS;
++    TRACE("(%p, %ld, %p)\n", properties, count, ret_count);
++    return query_all( properties, count, ret_count, TRUE );
+ }
+ 
+ /******************************************************************************
+- *     StartTraceW   (sechost.@)
++ *     EnableTraceEx2   (sechost.@)
+  */
+-ULONG WINAPI StartTraceW( TRACEHANDLE *handle, const WCHAR *session, EVENT_TRACE_PROPERTIES *properties )
++ULONG WINAPI EnableTraceEx2( TRACEHANDLE handle, const GUID *provider, ULONG control, UCHAR level,
++                             ULONGLONG match_any, ULONGLONG match_all, ULONG timeout,
++                             ENABLE_TRACE_PARAMETERS *params )
+ {
+-    FIXME("(%p, %s, %p) stub\n", handle, debugstr_w(session), properties);
+-    if (handle) *handle = 0xcafe4242;
++    struct sg_etw_session *session;
++    struct sg_etw_provider *entry = NULL;
++    unsigned int i;
++
++    TRACE("(%s, %s, %lu, %u, %s, %s, %lu, %p)\n", wine_dbgstr_longlong(handle),
++          debugstr_guid(provider), control, level, wine_dbgstr_longlong(match_any),
++          wine_dbgstr_longlong(match_all), timeout, params);
++
++    if (!provider || control > EVENT_CONTROL_CODE_CAPTURE_STATE) return ERROR_INVALID_PARAMETER;
++    if (!handle || !map_shared()) return ERROR_INVALID_HANDLE;
++    lock_shared();
++    if (!(session = find_session( handle, NULL )))
++    {
++        unlock_shared();
++        return ERROR_INVALID_HANDLE;
++    }
++    for (i = 0; i < session->provider_count; i++)
++        if (IsEqualGUID( &session->providers[i].guid, provider )) entry = &session->providers[i];
++
++    switch (control)
++    {
++    case EVENT_CONTROL_CODE_ENABLE_PROVIDER:
++        if (!entry)
++        {
++            if (session->provider_count >= SG_ETW_MAX_PROVIDERS)
++            {
++                unlock_shared();
++                return ERROR_NO_SYSTEM_RESOURCES;
++            }
++            entry = &session->providers[session->provider_count++];
++            memset( entry, 0, sizeof(*entry) );
++            entry->guid = *provider;
++        }
++        entry->level = level;
++        entry->any = match_any;
++        entry->all = match_all;
++        entry->enable_property = params ? params->EnableProperty : 0;
++        break;
++    case EVENT_CONTROL_CODE_DISABLE_PROVIDER:
++        if (entry) *entry = session->providers[--session->provider_count];
++        break;
++    case EVENT_CONTROL_CODE_CAPTURE_STATE:
++        if (!entry)
++        {
++            unlock_shared();
++            return ERROR_INVALID_PARAMETER;
++        }
++        entry->capture++;
++        break;
++    }
++    notify_providers();
++    unlock_shared();
++    return ERROR_SUCCESS;
++}
++
++/* EnableTrace and EnableTraceEx (advapi32) */
++ULONG WINAPI SgEnableTraceClassic( ULONG enable, ULONG flags, ULONG level, const GUID *provider, TRACEHANDLE handle )
++{
++    struct sg_etw_session *session;
++    unsigned int i;
++    ULONG ret;
++
++    ret = EnableTraceEx2( handle, provider, enable ? EVENT_CONTROL_CODE_ENABLE_PROVIDER :
++                          EVENT_CONTROL_CODE_DISABLE_PROVIDER, level, flags, 0, 0, NULL );
++    if (ret || !enable) return ret;
++    /* a classic provider's flags are its keywords; marked classic */
++    lock_shared();
++    if ((session = find_session( handle, NULL )))
++        for (i = 0; i < session->provider_count; i++)
++            if (IsEqualGUID( &session->providers[i].guid, provider )) session->providers[i].classic = 1;
++    unlock_shared();
+     return ERROR_SUCCESS;
+ }
+ 
+ /******************************************************************************
+- *     StopTraceW   (sechost.@)
++ *     TraceSetInformation   (sechost.@)
+  */
+-ULONG WINAPI StopTraceW( TRACEHANDLE handle, const WCHAR *session, EVENT_TRACE_PROPERTIES *properties )
++ULONG WINAPI TraceSetInformation( TRACEHANDLE handle, TRACE_INFO_CLASS class, void *info, ULONG len )
+ {
+-    FIXME("(%s, %s, %p) stub\n", wine_dbgstr_longlong(handle), debugstr_w(session), properties);
+-    return ERROR_SUCCESS;
++    FIXME("%s %d %p %ld: stub\n", wine_dbgstr_longlong(handle), class, info, len);
++    return ERROR_CALL_NOT_IMPLEMENTED;
++}
++
++/* ---- consumers ---- */
++
++struct consumer
++{
++    EVENT_TRACE_LOGFILEW logfile;    /* the caller's, copied: what the callbacks get */
++    EVENT_TRACE_LOGFILEA *logfile_a; /* the caller's A one, for OpenTraceA */
++    WCHAR   name[MAX_PATH];
++    BOOL    real_time;
++    ULONG   logger_id;
++    HANDLE  file;
++    struct sg_etw_file_header header;
++    LONG    processing;
++    LONG    closing;
++    HANDLE  ring_event;
++};
++
++static struct consumer *consumers[64];
++static CRITICAL_SECTION consumers_cs;
++static CRITICAL_SECTION_DEBUG consumers_cs_debug =
++{
++    0, 0, &consumers_cs,
++    { &consumers_cs_debug.ProcessLocksList, &consumers_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": consumers_cs") }
++};
++static CRITICAL_SECTION consumers_cs = { &consumers_cs_debug, -1, 0, 0, 0, 0 };
++
++/* handles: an index with a tag, never 0 or INVALID_PROCESSTRACE_HANDLE */
++#define CONSUMER_TAG 0x5347000000000000ull
++
++static struct consumer *get_consumer( TRACEHANDLE handle )
++{
++    ULONG index = (ULONG)(handle & 0xffff);
++    if ((handle & ~0xffffull) != CONSUMER_TAG || index >= ARRAY_SIZE(consumers)) return NULL;
++    return consumers[index];
++}
++
++static TRACEHANDLE open_trace( EVENT_TRACE_LOGFILEW *logfile, EVENT_TRACE_LOGFILEA *logfile_a )
++{
++    struct consumer *consumer;
++    unsigned int index;
++    DWORD read;
++
++    if (!logfile)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return INVALID_PROCESSTRACE_HANDLE;
++    }
++    if (!(consumer = calloc( 1, sizeof(*consumer) )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return INVALID_PROCESSTRACE_HANDLE;
++    }
++    consumer->logfile = *logfile;
++    consumer->logfile_a = logfile_a;
++    consumer->file = INVALID_HANDLE_VALUE;
++
++    if (logfile->ProcessTraceMode & PROCESS_TRACE_MODE_REAL_TIME)
++    {
++        struct sg_etw_session *session;
++
++        if (!logfile->LoggerName || !map_shared())
++        {
++            free( consumer );
++            SetLastError( ERROR_WMI_INSTANCE_NOT_FOUND );
++            return INVALID_PROCESSTRACE_HANDLE;
++        }
++        lock_shared();
++        session = find_session( 0, logfile->LoggerName );
++        if (session && (session->mode & EVENT_TRACE_REAL_TIME_MODE))
++        {
++            consumer->logger_id = session->logger_id;
++            session->rt_consumers++;
++            lstrcpynW( consumer->name, session->name, MAX_PATH );
++            logfile->LogfileHeader.LogFileMode = session->mode;
++            logfile->LogfileHeader.StartTime.QuadPart = session->start_time;
++        }
++        unlock_shared();
++        if (!consumer->logger_id)
++        {
++            free( consumer );
++            SetLastError( ERROR_WMI_INSTANCE_NOT_FOUND );
++            return INVALID_PROCESSTRACE_HANDLE;
++        }
++        consumer->real_time = TRUE;
++    }
++    else
++    {
++        if (!logfile->LogFileName)
++        {
++            free( consumer );
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return INVALID_PROCESSTRACE_HANDLE;
++        }
++        lstrcpynW( consumer->name, logfile->LogFileName, MAX_PATH );
++        consumer->file = CreateFileW( consumer->name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                                      NULL, OPEN_EXISTING, 0, NULL );
++        if (consumer->file == INVALID_HANDLE_VALUE)
++        {
++            DWORD err = GetLastError();
++            free( consumer );
++            SetLastError( err );
++            return INVALID_PROCESSTRACE_HANDLE;
++        }
++        if (!ReadFile( consumer->file, &consumer->header, sizeof(consumer->header), &read, NULL ) ||
++            read != sizeof(consumer->header) || memcmp( consumer->header.magic, SG_ETW_FILE_MAGIC, 8 ))
++        {
++            /* not a log file of ours (a Windows .etl is not read here) */
++            CloseHandle( consumer->file );
++            free( consumer );
++            SetLastError( ERROR_BAD_FORMAT );
++            return INVALID_PROCESSTRACE_HANDLE;
++        }
++        logfile->LogfileHeader.LogFileMode = consumer->header.mode;
++        logfile->LogfileHeader.StartTime.QuadPart = consumer->header.start_time;
++        logfile->LogfileHeader.PointerSize = consumer->header.pointer_size;
++        logfile->LogfileHeader.BufferSize = consumer->header.buffer_size * 1024;
++    }
++    {
++        SYSTEM_INFO si;
++        GetSystemInfo( &si );
++        logfile->LogfileHeader.NumberOfProcessors = si.dwNumberOfProcessors;
++        logfile->LogfileHeader.Version = 0x0a000000;
++        logfile->LogfileHeader.TimerResolution = 156001;
++        QueryPerformanceFrequency( &logfile->LogfileHeader.PerfFreq );
++        GetTimeZoneInformation( &logfile->LogfileHeader.TimeZone );
++    }
++    consumer->logfile.LogfileHeader = logfile->LogfileHeader;
++
++    EnterCriticalSection( &consumers_cs );
++    for (index = 0; index < ARRAY_SIZE(consumers); index++)
++        if (!consumers[index]) break;
++    if (index == ARRAY_SIZE(consumers))
++    {
++        LeaveCriticalSection( &consumers_cs );
++        if (consumer->file != INVALID_HANDLE_VALUE) CloseHandle( consumer->file );
++        free( consumer );
++        SetLastError( ERROR_NO_SYSTEM_RESOURCES );
++        return INVALID_PROCESSTRACE_HANDLE;
++    }
++    consumers[index] = consumer;
++    LeaveCriticalSection( &consumers_cs );
++    return CONSUMER_TAG | index;
+ }
+ 
+ /******************************************************************************
+@@ -121,36 +815,401 @@
+  */
+ TRACEHANDLE WINAPI OpenTraceW( EVENT_TRACE_LOGFILEW *logfile )
+ {
+-    static int once;
+-
+-    if (!once++) FIXME("%p: stub\n", logfile);
++    TRACE("%p\n", logfile);
++#ifdef SG_MUTANT_NO_CONSUMER
+     SetLastError(ERROR_ACCESS_DENIED);
+     return INVALID_PROCESSTRACE_HANDLE;
++#endif
++    return open_trace( logfile, NULL );
+ }
+ 
+ /******************************************************************************
+- *     ProcessTrace   (sechost.@)
++ *     OpenTraceA   (sechost.@)
+  */
+-ULONG WINAPI ProcessTrace( TRACEHANDLE *handles, ULONG count, FILETIME *start_time, FILETIME *end_time )
++TRACEHANDLE WINAPI OpenTraceA( EVENT_TRACE_LOGFILEA *logfile )
+ {
+-    FIXME("%p %lu %p %p: stub\n", handles, count, start_time, end_time);
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    EVENT_TRACE_LOGFILEW w;
++    WCHAR *file, *logger;
++    TRACEHANDLE ret;
++
++    TRACE("%p\n", logfile);
++    if (!logfile)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return INVALID_PROCESSTRACE_HANDLE;
++    }
++    memcpy( &w, logfile, sizeof(w) );  /* the same layout but for the names */
++    w.LogFileName = file = strdupAW( logfile->LogFileName );
++    w.LoggerName = logger = strdupAW( logfile->LoggerName );
++    ret = open_trace( &w, logfile );
++    logfile->LogfileHeader = w.LogfileHeader;
++    if (ret == INVALID_PROCESSTRACE_HANDLE) return ret;
++    /* the copy keeps its own names */
++    EnterCriticalSection( &consumers_cs );
++    {
++        struct consumer *consumer = get_consumer( ret );
++        if (consumer)
++        {
++            consumer->logfile.LogFileName = file ? consumer->name : NULL;
++            consumer->logfile.LoggerName = logger ? consumer->name : NULL;
++        }
++    }
++    LeaveCriticalSection( &consumers_cs );
++    free( file );
++    free( logger );
++    return ret;
++}
++
++/* one event to the consumer's callback */
++static void deliver( struct consumer *consumer, struct sg_etw_record *record )
++{
++    EVENT_TRACE_LOGFILEW *logfile = &consumer->logfile;
++    EVENT_HEADER_EXTENDED_DATA_ITEM ext;
++    EVENT_RECORD event;
++
++#ifdef SG_MUTANT_NO_DELIVERY
++    return;
++#endif
++    if (logfile->ProcessTraceMode & PROCESS_TRACE_MODE_EVENT_RECORD)
++    {
++        if (!logfile->EventRecordCallback) return;
++        memset( &event, 0, sizeof(event) );
++        event.EventHeader = record->header;
++        event.BufferContext.LoggerId = (USHORT)consumer->logger_id;
++        event.UserDataLength = (USHORT)min( record->user_data_length, 0xffff );
++        event.UserData = event.UserDataLength ? (void *)(record + 1) : NULL;
++        event.UserContext = logfile->Context;
++        if (record->has_related)
++        {
++            ext.Reserved1 = 0;
++            ext.ExtType = EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID;
++            ext.Linkage = 0;
++            ext.DataSize = sizeof(GUID);
++            ext.DataPtr = (ULONG_PTR)&record->related_activity;
++            event.ExtendedData = &ext;
++            event.ExtendedDataCount = 1;
++            event.EventHeader.Flags |= EVENT_HEADER_FLAG_EXTENDED_INFO;
++        }
++        logfile->EventRecordCallback( &event );
++    }
++    else if (logfile->EventCallback)
++    {
++        /* the classic view of it */
++        EVENT_TRACE *trace = &logfile->CurrentEvent;
++
++        memset( trace, 0, sizeof(*trace) );
++        trace->Header.Size = sizeof(EVENT_TRACE_HEADER) + record->user_data_length;
++        trace->Header.Class.Type = record->header.EventDescriptor.Opcode;
++        trace->Header.Class.Level = record->header.EventDescriptor.Level;
++        trace->Header.Class.Version = record->header.EventDescriptor.Version;
++        trace->Header.ThreadId = record->header.ThreadId;
++        trace->Header.ProcessId = record->header.ProcessId;
++        trace->Header.TimeStamp = record->header.TimeStamp;
++        trace->Header.Guid = record->header.ProviderId;
++        trace->MofData = record->user_data_length ? (void *)(record + 1) : NULL;
++        trace->MofLength = record->user_data_length;
++        if (consumer->logfile_a) consumer->logfile_a->CurrentEvent = *trace;
++        logfile->EventCallback( trace );
++    }
++    logfile->CurrentTime = record->header.TimeStamp.QuadPart;
++}
++
++/* the log file's own first event: EventTraceGuid with the header */
++static void deliver_header( struct consumer *consumer )
++{
++    struct { struct sg_etw_record record; TRACE_LOGFILE_HEADER header; } ev;
++
++    memset( &ev, 0, sizeof(ev) );
++    ev.record.size = sizeof(ev);
++    ev.record.kind = SG_ETW_RECORD_HEADER;
++    ev.record.header.Size = sizeof(EVENT_HEADER);
++    ev.record.header.Flags = EVENT_HEADER_FLAG_CLASSIC_HEADER |
++                             (sizeof(void *) == 8 ? EVENT_HEADER_FLAG_64_BIT_HEADER : EVENT_HEADER_FLAG_32_BIT_HEADER);
++    ev.record.header.TimeStamp.QuadPart = consumer->header.start_time;
++    ev.record.header.ProviderId = EventTraceGuid;
++    ev.record.header.ProcessId = GetCurrentProcessId();
++    ev.record.user_data_length = sizeof(TRACE_LOGFILE_HEADER);
++    ev.header = consumer->logfile.LogfileHeader;
++    deliver( consumer, &ev.record );
++}
++
++static BOOL buffer_callback( struct consumer *consumer )
++{
++    BOOL ret;
++    consumer->logfile.BuffersRead++;
++    if (consumer->logfile_a)
++    {
++        if (!consumer->logfile_a->BufferCallback) return TRUE;
++        consumer->logfile_a->BuffersRead = consumer->logfile.BuffersRead;
++        ret = consumer->logfile_a->BufferCallback( consumer->logfile_a );
++    }
++    else
++    {
++        if (!consumer->logfile.BufferCallback) return TRUE;
++        ret = consumer->logfile.BufferCallback( &consumer->logfile );
++    }
++    return ret;
++}
++
++static BOOL in_window( const struct sg_etw_record *record, const FILETIME *start, const FILETIME *end )
++{
++    LONGLONG t = record->header.TimeStamp.QuadPart;
++    if (start && t < ((LARGE_INTEGER *)start)->QuadPart) return FALSE;
++    if (end && t > ((LARGE_INTEGER *)end)->QuadPart) return FALSE;
++    return TRUE;
++}
++
++static ULONG process_file( struct consumer *consumer, const FILETIME *start, const FILETIME *end )
++{
++    struct sg_etw_record header, *record;
++    DWORD read;
++    ULONG count = 0;
++
++    deliver_header( consumer );
++    for (;;)
++    {
++        if (consumer->closing) return ERROR_CANCELLED;
++        if (!ReadFile( consumer->file, &header, sizeof(header), &read, NULL ) || read != sizeof(header)) break;
++        if (header.size < sizeof(header) || header.size > 16 * 1024 * 1024) return ERROR_BAD_FORMAT;
++        if (!(record = malloc( header.size ))) return ERROR_NOT_ENOUGH_MEMORY;
++        *record = header;
++        if (!ReadFile( consumer->file, record + 1, header.size - sizeof(header), &read, NULL ) ||
++            read != header.size - sizeof(header))
++        {
++            free( record );
++            break;
++        }
++        if (record->kind == SG_ETW_RECORD_EVENT && in_window( record, start, end )) deliver( consumer, record );
++        free( record );
++        if (!(++count % 64) && !buffer_callback( consumer )) return ERROR_SUCCESS;
++    }
++    buffer_callback( consumer );
++    return ERROR_SUCCESS;
++}
++
++/* drain a real-time ring; FALSE when the session has gone */
++static BOOL process_ring( struct consumer *consumer, ULONG *status )
++{
++    WCHAR buffer[128];
++    struct sg_etw_ring *ring = NULL;
++    struct sg_etw_record *record;
++    HANDLE section;
++    BOOL alive, any = FALSE;
++
++    lock_shared();
++    alive = find_session( consumer->logger_id, NULL ) != NULL;
++    unlock_shared();
++
++    {
++        WCHAR leaf[64];
++        named_object( buffer, SG_ETW_RING_PREFIX, consumer->logger_id, TRUE );
++        swprintf( leaf, ARRAY_SIZE(leaf), L"SgEtwRing%u.dat", consumer->logger_id );
++        if (!(ring = sg_etw_map( buffer, leaf, offsetof(struct sg_etw_ring, data[SG_ETW_RING_SIZE]), &section )))
++            return FALSE;
++        if (ring->size != SG_ETW_RING_SIZE)
++        {
++            NtUnmapViewOfSection( GetCurrentProcess(), ring );
++            CloseHandle( section );
++            return alive;
++        }
++    }
++    for (;;)
++    {
++        ULONG size, pos, first;
++
++        lock_shared();
++        if (ring->head == ring->tail)
++        {
++            unlock_shared();
++            break;
++        }
++        pos = ring->tail % ring->size;
++        first = min( sizeof(ULONG), ring->size - pos );
++        memcpy( &size, ring->data + pos, first );
++        memcpy( (BYTE *)&size + first, ring->data, sizeof(ULONG) - first );
++        if (size < sizeof(*record) || size > ring->head - ring->tail || !(record = malloc( size )))
++        {
++            ring->tail = ring->head;  /* damaged: dropped */
++            unlock_shared();
++            break;
++        }
++        first = min( size, ring->size - pos );
++        memcpy( record, ring->data + pos, first );
++        memcpy( (BYTE *)record + first, ring->data, size - first );
++        ring->tail += size;
++        consumer->logfile.EventsLost = ring->lost;
++        unlock_shared();
++        deliver( consumer, record );
++        free( record );
++        any = TRUE;
++        if (consumer->closing) break;
++    }
++    NtUnmapViewOfSection( GetCurrentProcess(), ring );
++    CloseHandle( section );
++    if (any && !buffer_callback( consumer ))
++    {
++        *status = ERROR_SUCCESS;
++        return FALSE;
++    }
++    return alive;
+ }
+ 
+ /******************************************************************************
+- *     CloseTrace   (sechost.@)
++ *     ProcessTrace   (sechost.@)
+  */
+-ULONG WINAPI CloseTrace( TRACEHANDLE handle )
++ULONG WINAPI ProcessTrace( TRACEHANDLE *handles, ULONG count, FILETIME *start_time, FILETIME *end_time )
++{
++    struct consumer *list[64];
++    HANDLE events[64];
++    ULONG i, n_rt = 0, ret = ERROR_SUCCESS;
++
++    TRACE("%p %lu %p %p\n", handles, count, start_time, end_time);
++
++    if (!handles || !count || count > ARRAY_SIZE(list)) return ERROR_INVALID_PARAMETER;
++    EnterCriticalSection( &consumers_cs );
++    for (i = 0; i < count; i++)
++    {
++        if (!(list[i] = get_consumer( handles[i] )))
++        {
++            LeaveCriticalSection( &consumers_cs );
++            return ERROR_INVALID_HANDLE;
++        }
++        if (list[i]->real_time && i && !list[0]->real_time)
++        {
++            /* real-time sessions and files are not processed together */
++            LeaveCriticalSection( &consumers_cs );
++            return ERROR_INVALID_PARAMETER;
++        }
++    }
++    for (i = 0; i < count; i++) InterlockedIncrement( &list[i]->processing );
++    LeaveCriticalSection( &consumers_cs );
++
++    for (i = 0; i < count && !ret; i++)
++    {
++        if (list[i]->real_time)
++        {
++            WCHAR buffer[128];
++            UNICODE_STRING str;
++            OBJECT_ATTRIBUTES attr;
++
++            named_object( buffer, SG_ETW_RING_EVENT_PREFIX, list[i]->logger_id, TRUE );
++            RtlInitUnicodeString( &str, buffer );
++            InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
++            if (NtOpenEvent( &events[n_rt], SYNCHRONIZE | EVENT_MODIFY_STATE, &attr )) events[n_rt] = 0;
++            list[i]->ring_event = events[n_rt];
++            n_rt++;
++        }
++        else ret = process_file( list[i], start_time, end_time );
++    }
++
++    if (n_rt && !ret)
++    {
++        /* until every session has stopped, or the consumer closes */
++        BOOL alive = TRUE;
++        while (alive)
++        {
++            alive = FALSE;
++            for (i = 0; i < count; i++)
++            {
++                if (list[i]->closing)
++                {
++                    ret = ERROR_CANCELLED;
++                    continue;
++                }
++                if (process_ring( list[i], &ret )) alive = TRUE;
++            }
++            if (ret == ERROR_CANCELLED) break;
++            if (alive)
++            {
++                HANDLE wait[64];
++                ULONG w = 0;
++                for (i = 0; i < n_rt; i++) if (events[i]) wait[w++] = events[i];
++                if (w) WaitForMultipleObjects( w, wait, FALSE, 200 );
++                else Sleep( 200 );
++            }
++        }
++        for (i = 0; i < n_rt; i++) if (events[i]) CloseHandle( events[i] );
++    }
++
++    for (i = 0; i < count; i++) InterlockedDecrement( &list[i]->processing );
++    /* consumers closed while they were processed go now */
++    EnterCriticalSection( &consumers_cs );
++    for (i = 0; i < count; i++)
++        if (list[i]->closing && !list[i]->processing && get_consumer( handles[i] ) == list[i])
++        {
++            consumers[handles[i] & 0xffff] = NULL;
++            if (list[i]->file != INVALID_HANDLE_VALUE) CloseHandle( list[i]->file );
++            free( list[i] );
++        }
++    LeaveCriticalSection( &consumers_cs );
++    return ret;
++}
++
++/* EnumerateTraceGuids (advapi32): the providers the sessions enable */
++ULONG WINAPI SgEnumerateTraceGuids( TRACE_GUID_PROPERTIES **properties, ULONG count, ULONG *ret_count )
+ {
+-    FIXME("%s: stub\n", wine_dbgstr_longlong(handle));
+-    return ERROR_INVALID_HANDLE;
++    unsigned int s, p;
++    ULONG n = 0, ret = ERROR_SUCCESS;
++
++    if (!properties || !count || !ret_count) return ERROR_INVALID_PARAMETER;
++    *ret_count = 0;
++    if (!map_shared()) return ERROR_SUCCESS;
++    lock_shared();
++    for (s = 0; s < SG_ETW_MAX_SESSIONS; s++)
++    {
++        const struct sg_etw_session *session = &shared->sessions[s];
++        if (!session->in_use) continue;
++        for (p = 0; p < session->provider_count; p++, n++)
++        {
++            if (n >= count) { ret = ERROR_MORE_DATA; continue; }
++            if (!properties[n]) { ret = ERROR_INVALID_PARAMETER; break; }
++            properties[n]->Guid = session->providers[p].guid;
++            properties[n]->GuidType = 0;
++            properties[n]->LoggerId = session->logger_id;
++            properties[n]->EnableLevel = session->providers[p].level;
++            properties[n]->EnableFlags = (ULONG)session->providers[p].any;
++            properties[n]->IsEnable = TRUE;
++        }
++    }
++    unlock_shared();
++    *ret_count = n;
++    return ret;
+ }
+ 
+ /******************************************************************************
+- *     TraceSetInformation   (sechost.@)
++ *     CloseTrace   (sechost.@)
+  */
+-ULONG WINAPI TraceSetInformation( TRACEHANDLE handle, TRACE_INFO_CLASS class, void *info, ULONG len )
++ULONG WINAPI CloseTrace( TRACEHANDLE handle )
+ {
+-    FIXME("%s %d %p %ld: stub\n", wine_dbgstr_longlong(handle), class, info, len);
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    struct consumer *consumer;
++    ULONG index = (ULONG)(handle & 0xffff);
++
++    TRACE("%s\n", wine_dbgstr_longlong(handle));
++
++    EnterCriticalSection( &consumers_cs );
++    if (!(consumer = get_consumer( handle )))
++    {
++        LeaveCriticalSection( &consumers_cs );
++        return ERROR_INVALID_HANDLE;
++    }
++    if (consumer->processing)
++    {
++        /* ProcessTrace stops, and the handle goes once it has (documented) */
++        consumer->closing = TRUE;
++        if (consumer->ring_event) SetEvent( consumer->ring_event );
++        LeaveCriticalSection( &consumers_cs );
++        return ERROR_CTX_CLOSE_PENDING;
++    }
++    consumers[index] = NULL;
++    LeaveCriticalSection( &consumers_cs );
++    if (consumer->real_time && map_shared())
++    {
++        struct sg_etw_session *session;
++        lock_shared();
++        if ((session = find_session( consumer->logger_id, NULL )) && session->rt_consumers) session->rt_consumers--;
++        unlock_shared();
++    }
++    if (consumer->file != INVALID_HANDLE_VALUE) CloseHandle( consumer->file );
++    free( consumer );
++    return ERROR_SUCCESS;
+ }
