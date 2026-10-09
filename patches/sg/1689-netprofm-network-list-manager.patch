@@ -1,0 +1,1835 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] netprofm: network names, profiles, connectivity, costs, events and IDispatch
+
+The Network List Manager answered much with E_NOTIMPL or a FIXME and fixed
+values, and never told anyone of a change. As documented now:
+
+- Networks: a name and description (the profile's, else the DNS suffix or
+  the adapter's name), SetName and SetDescription, the category from the
+  profile (public, or domain-authenticated on the machine's own domain)
+  and SetCategory (public or private; E_INVALIDARG else), the times
+  created and connected, and the domain type. Profiles are kept where
+  Windows keeps them, HKLM\Software\Microsoft\Windows NT\CurrentVersion\
+  NetworkList\Profiles\{id}, so a new manager reads them back.
+- Connectivity per network, connection and machine, IPv4 and IPv6 apart:
+  an address is the local network, a default route the internet (it was
+  IPv4 only, from any gateway).
+- Costs: from DefaultMediaCost by medium (Ethernet, WiFi, 4G, Default:
+  1 unrestricted, 2 fixed), for a connection, for the machine, and for a
+  destination (the connection that reaches it); SetDestinationAddresses
+  is accepted.
+- Events: the manager follows the host's interface, address and route
+  changes (NotifyIpInterfaceChange and kin) and tells its sinks:
+  INetworkListManagerEvents::ConnectivityChanged,
+  INetworkEvents::NetworkConnectivityChanged,
+  INetworkConnectionEvents::NetworkConnectionConnectivityChanged and
+  INetworkCostManagerEvents::CostChanged. Sinks are reached through the
+  global interface table, in their own apartments. EnumConnections and
+  EnumConnectionPoints are implemented; an unknown event interface is
+  CONNECT_E_NOCONNECTION.
+- IDispatch: a type library (netprofm_tlb.idl, NETWORKLIST) and
+  GetTypeInfoCount, GetTypeInfo, GetIDsOfNames and Invoke on the manager,
+  networks, connections and their enumerators, so scripts call them by
+  name; _NewEnum gives an IEnumVARIANT. netlistmgr.idl gives
+  INetworkListManager's methods their DISPIDs, and IsConnected and
+  IsConnectedToInternet are properties (get_IsConnected, as in the SDK).
+
+Wine's netprofm test's 4 todos pass.
+
+Gate: test/netlist-gate.sh (in a user and network namespace with a dummy
+interface; the gate adds a default route; test/netlist-probe.c). Mutants
+SG_MUTANT_NO_DISPATCH, SG_MUTANT_NO_EVENTS, SG_MUTANT_NO_MEDIA_COST
+(netprofm/list.c).
+---
+--- a/dlls/netprofm/Makefile.in
++++ b/dlls/netprofm/Makefile.in
+@@ -1,9 +1,10 @@
+ MODULE    = netprofm.dll
+-IMPORTS   = iphlpapi
++IMPORTS   = iphlpapi ole32 oleaut32 advapi32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
+ 	list.c \
+ 	main.c \
+-	netprofm.idl
++	netprofm.idl \
++	netprofm_tlb.idl
+--- a/dlls/netprofm/list.c
++++ b/dlls/netprofm/list.c
+@@ -32,6 +32,9 @@
+ #include "ocidl.h"
+ #include "netlistmgr.h"
+ #include "olectl.h"
++#include "oleauto.h"
++#include "lmcons.h"
++#include "winreg.h"
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
+@@ -48,6 +51,14 @@ struct network
+     INetworkListManager *mgr;
+     VARIANT_BOOL         connected_to_internet;
+     VARIANT_BOOL         connected;
++    /* Stained Glass OS 1689 */
++    NLM_CONNECTIVITY     connectivity;
++    NLM_NETWORK_CATEGORY category;
++    NLM_DOMAIN_TYPE      domain_type;
++    WCHAR                name[256];
++    WCHAR                description[256];
++    FILETIME             created;
++    FILETIME             connected_time;
+ };
+ 
+ struct connection
+@@ -60,6 +71,10 @@ struct connection
+     INetwork              *network;
+     VARIANT_BOOL           connected_to_internet;
+     VARIANT_BOOL           connected;
++    /* Stained Glass OS 1689 */
++    NLM_CONNECTIVITY       connectivity;
++    NLM_DOMAIN_TYPE        domain_type;
++    DWORD                  cost;
+ };
+ 
+ struct connection_point
+@@ -83,6 +98,11 @@ struct list_manager
+     struct connection_point cost_mgr_cp;
+     struct connection_point conn_mgr_cp;
+     struct connection_point events_cp;
++    /* Stained Glass OS 1689: told of the host's network changes */
++    CRITICAL_SECTION    cs;
++    HANDLE              notify_if, notify_addr, notify_route;
++    NLM_CONNECTIVITY    connectivity;
++    DWORD               cost;
+ };
+ 
+ struct sink_entry
+@@ -90,8 +110,76 @@ struct sink_entry
+     struct list entry;
+     DWORD cookie;
+     IUnknown *unk;
++    DWORD git_cookie;   /* the sink in the global interface table, for the event thread */
+ };
+ 
++static HRESULT set_profile_value( const GUID *id, const WCHAR *name, DWORD type, const void *data, DWORD size );
++static HRESULT set_profile_string( const GUID *id, const WCHAR *name, const WCHAR *value );
++
++/* Stained Glass OS 1689: the dual interfaces' IDispatch, from the type library */
++static ITypeLib *netprofm_typelib;
++
++static HRESULT get_typeinfo( REFIID riid, ITypeInfo **info )
++{
++    HRESULT hr;
++
++    *info = NULL;
++    if (!netprofm_typelib)
++    {
++        WCHAR path[MAX_PATH];
++        HMODULE module;
++        ITypeLib *lib;
++
++        GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                            (const WCHAR *)get_typeinfo, &module );
++        GetModuleFileNameW( module, path, ARRAY_SIZE(path) );
++        if (FAILED(hr = LoadTypeLibEx( path, REGKIND_NONE, &lib ))) return hr;
++        if (InterlockedCompareExchangePointer( (void **)&netprofm_typelib, lib, NULL )) ITypeLib_Release( lib );
++    }
++    return ITypeLib_GetTypeInfoOfGuid( netprofm_typelib, riid, info );
++}
++
++static HRESULT disp_get_type_info_count( UINT *count )
++{
++    if (!count) return E_INVALIDARG;
++    *count = 1;
++    return S_OK;
++}
++
++static HRESULT disp_get_type_info( REFIID riid, UINT index, ITypeInfo **info )
++{
++    if (!info) return E_INVALIDARG;
++    *info = NULL;
++    if (index) return DISP_E_BADINDEX;
++    return get_typeinfo( riid, info );
++}
++
++static HRESULT disp_get_ids_of_names( REFIID riid, LPOLESTR *names, UINT count, DISPID *ids )
++{
++    ITypeInfo *info;
++    HRESULT hr;
++
++    if (FAILED(hr = get_typeinfo( riid, &info ))) return hr;
++    hr = ITypeInfo_GetIDsOfNames( info, names, count, ids );
++    ITypeInfo_Release( info );
++    return hr;
++}
++
++static HRESULT disp_invoke( REFIID riid, void *obj, DISPID member, WORD flags, DISPPARAMS *params,
++                            VARIANT *result, EXCEPINFO *excep_info, UINT *arg_err )
++{
++    ITypeInfo *info;
++    HRESULT hr;
++
++#ifdef SG_MUTANT_NO_DISPATCH
++    return E_NOTIMPL;
++#endif
++    if (FAILED(hr = get_typeinfo( riid, &info ))) return hr;
++    hr = ITypeInfo_Invoke( info, obj, member, flags, params, result, excep_info, arg_err );
++    ITypeInfo_Release( info );
++    return hr;
++}
++
+ static inline struct list_manager *impl_from_IConnectionPointContainer(IConnectionPointContainer *iface)
+ {
+     return CONTAINING_RECORD(iface, struct list_manager, IConnectionPointContainer_iface);
+@@ -124,7 +212,7 @@ static HRESULT WINAPI connection_point_QueryInterface(
+     }
+     else
+     {
+-        FIXME( "interface %s not implemented\n", debugstr_guid(riid) );
++        WARN( "interface %s not implemented\n", debugstr_guid(riid) );
+         *obj = NULL;
+         return E_NOINTERFACE;
+     }
+@@ -175,6 +263,30 @@ static HRESULT WINAPI connection_point_GetConnectionPointContainer(
+     return S_OK;
+ }
+ 
++static CRITICAL_SECTION sinks_cs;
++static CRITICAL_SECTION_DEBUG sinks_cs_debug =
++{
++    0, 0, &sinks_cs,
++    { &sinks_cs_debug.ProcessLocksList, &sinks_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": sinks_cs") }
++};
++static CRITICAL_SECTION sinks_cs = { &sinks_cs_debug, -1, 0, 0, 0, 0 };
++
++DEFINE_GUID( CLSID_netprofm_StdGIT, 0x00000323, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46 );
++
++static IGlobalInterfaceTable *get_git(void)
++{
++    static IGlobalInterfaceTable *git;
++    IGlobalInterfaceTable *table;
++
++    if (!git && SUCCEEDED(CoCreateInstance( &CLSID_netprofm_StdGIT, NULL, CLSCTX_INPROC_SERVER,
++                                            &IID_IGlobalInterfaceTable, (void **)&table )))
++    {
++        if (InterlockedCompareExchangePointer( (void **)&git, table, NULL )) IGlobalInterfaceTable_Release( table );
++    }
++    return git;
++}
++
+ static HRESULT WINAPI connection_point_Advise(
+     IConnectionPoint *iface,
+     IUnknown *sink,
+@@ -185,7 +297,7 @@ static HRESULT WINAPI connection_point_Advise(
+     IUnknown *unk;
+     HRESULT hr;
+ 
+-    FIXME( "%p, %p, %p - semi-stub\n", cp, sink, cookie );
++    TRACE( "%p, %p, %p\n", cp, sink, cookie );
+ 
+     if (!sink || !cookie)
+         return E_POINTER;
+@@ -205,14 +317,22 @@ static HRESULT WINAPI connection_point_Advise(
+     }
+ 
+     sink_entry->unk = unk;
++    /* Stained Glass OS 1689: events come from the network change thread,
++     * so the sink is reached through the global interface table, in its
++     * own apartment */
++    sink_entry->git_cookie = 0;
++    if (get_git()) IGlobalInterfaceTable_RegisterInterfaceInGlobal( get_git(), unk, &cp->iid, &sink_entry->git_cookie );
++    EnterCriticalSection( &sinks_cs );
+     *cookie = sink_entry->cookie = ++cp->cookie;
+     list_add_tail( &cp->sinks, &sink_entry->entry );
++    LeaveCriticalSection( &sinks_cs );
+     return S_OK;
+ }
+ 
+ static void sink_entry_release( struct sink_entry *entry )
+ {
+     list_remove( &entry->entry );
++    if (entry->git_cookie && get_git()) IGlobalInterfaceTable_RevokeInterfaceFromGlobal( get_git(), entry->git_cookie );
+     IUnknown_Release( entry->unk );
+     free( entry );
+ }
+@@ -226,25 +346,173 @@ static HRESULT WINAPI connection_point_Unadvise(
+ 
+     TRACE( "%p, %ld\n", cp, cookie );
+ 
++    EnterCriticalSection( &sinks_cs );
+     LIST_FOR_EACH_ENTRY( iter, &cp->sinks, struct sink_entry, entry )
+     {
+         if (iter->cookie != cookie) continue;
+         sink_entry_release( iter );
++        LeaveCriticalSection( &sinks_cs );
+         return S_OK;
+     }
++    LeaveCriticalSection( &sinks_cs );
+ 
+     WARN( "invalid cookie\n" );
+     return CONNECT_E_NOCONNECTION;
+ }
+ 
++/* IEnumConnections over a connection point's sinks, as they were */
++struct connections_list
++{
++    IEnumConnections IEnumConnections_iface;
++    LONG refs;
++    CONNECTDATA *data;
++    ULONG count, pos;
++};
++
++static inline struct connections_list *impl_from_IEnumConnections( IEnumConnections *iface )
++{
++    return CONTAINING_RECORD( iface, struct connections_list, IEnumConnections_iface );
++}
++
++static HRESULT WINAPI enum_connections_QueryInterface( IEnumConnections *iface, REFIID riid, void **obj )
++{
++    if (IsEqualGUID( riid, &IID_IEnumConnections ) || IsEqualGUID( riid, &IID_IUnknown ))
++    {
++        *obj = iface;
++        IEnumConnections_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI enum_connections_AddRef( IEnumConnections *iface )
++{
++    return InterlockedIncrement( &impl_from_IEnumConnections( iface )->refs );
++}
++
++static ULONG WINAPI enum_connections_Release( IEnumConnections *iface )
++{
++    struct connections_list *list = impl_from_IEnumConnections( iface );
++    ULONG refs = InterlockedDecrement( &list->refs ), i;
++
++    if (!refs)
++    {
++        for (i = 0; i < list->count; i++) IUnknown_Release( list->data[i].pUnk );
++        free( list->data );
++        free( list );
++    }
++    return refs;
++}
++
++static HRESULT WINAPI enum_connections_Next( IEnumConnections *iface, ULONG count, CONNECTDATA *data, ULONG *fetched )
++{
++    struct connections_list *list = impl_from_IEnumConnections( iface );
++    ULONG i;
++
++    if (!data) return E_POINTER;
++    for (i = 0; i < count && list->pos < list->count; i++, list->pos++)
++    {
++        data[i] = list->data[list->pos];
++        IUnknown_AddRef( data[i].pUnk );
++    }
++    if (fetched) *fetched = i;
++    return i == count ? S_OK : S_FALSE;
++}
++
++static HRESULT WINAPI enum_connections_Skip( IEnumConnections *iface, ULONG count )
++{
++    struct connections_list *list = impl_from_IEnumConnections( iface );
++
++    if (list->pos + count > list->count)
++    {
++        list->pos = list->count;
++        return S_FALSE;
++    }
++    list->pos += count;
++    return S_OK;
++}
++
++static HRESULT WINAPI enum_connections_Reset( IEnumConnections *iface )
++{
++    impl_from_IEnumConnections( iface )->pos = 0;
++    return S_OK;
++}
++
++static HRESULT create_enum_connections( const CONNECTDATA *data, ULONG count, ULONG pos, IEnumConnections **ret );
++
++static HRESULT WINAPI enum_connections_Clone( IEnumConnections *iface, IEnumConnections **ret )
++{
++    struct connections_list *list = impl_from_IEnumConnections( iface );
++    return create_enum_connections( list->data, list->count, list->pos, ret );
++}
++
++static const IEnumConnectionsVtbl enum_connections_vtbl =
++{
++    enum_connections_QueryInterface,
++    enum_connections_AddRef,
++    enum_connections_Release,
++    enum_connections_Next,
++    enum_connections_Skip,
++    enum_connections_Reset,
++    enum_connections_Clone
++};
++
++static HRESULT create_enum_connections( const CONNECTDATA *data, ULONG count, ULONG pos, IEnumConnections **ret )
++{
++    struct connections_list *list;
++    ULONG i;
++
++    if (!(list = calloc( 1, sizeof(*list) ))) return E_OUTOFMEMORY;
++    if (count && !(list->data = malloc( count * sizeof(*data) )))
++    {
++        free( list );
++        return E_OUTOFMEMORY;
++    }
++    list->IEnumConnections_iface.lpVtbl = &enum_connections_vtbl;
++    list->refs = 1;
++    list->count = count;
++    list->pos = pos;
++    for (i = 0; i < count; i++)
++    {
++        list->data[i] = data[i];
++        IUnknown_AddRef( data[i].pUnk );
++    }
++    *ret = &list->IEnumConnections_iface;
++    return S_OK;
++}
++
+ static HRESULT WINAPI connection_point_EnumConnections(
+     IConnectionPoint *iface,
+     IEnumConnections **connections )
+ {
+     struct connection_point *cp = impl_from_IConnectionPoint( iface );
+-    FIXME( "%p, %p - stub\n", cp, connections );
++    struct sink_entry *iter;
++    CONNECTDATA *data;
++    ULONG count = 0;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE( "%p, %p\n", cp, connections );
++
++    if (!connections) return E_POINTER;
++    EnterCriticalSection( &sinks_cs );
++    count = list_count( &cp->sinks );
++    if (!(data = malloc( max( count, 1 ) * sizeof(*data) )))
++    {
++        LeaveCriticalSection( &sinks_cs );
++        return E_OUTOFMEMORY;
++    }
++    count = 0;
++    LIST_FOR_EACH_ENTRY( iter, &cp->sinks, struct sink_entry, entry )
++    {
++        data[count].pUnk = iter->unk;
++        data[count].dwCookie = iter->cookie;
++        count++;
++    }
++    hr = create_enum_connections( data, count, 0, connections );
++    LeaveCriticalSection( &sinks_cs );
++    free( data );
++    return hr;
+ }
+ 
+ static const IConnectionPointVtbl connection_point_vtbl =
+@@ -336,8 +604,8 @@ static HRESULT WINAPI network_GetTypeInfoCount(
+     INetwork *iface,
+     UINT *count )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %p\n", iface, count );
++    return disp_get_type_info_count( count );
+ }
+ 
+ static HRESULT WINAPI network_GetTypeInfo(
+@@ -346,8 +614,8 @@ static HRESULT WINAPI network_GetTypeInfo(
+     LCID lcid,
+     ITypeInfo **info )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %u, %#lx, %p\n", iface, index, lcid, info );
++    return disp_get_type_info( &IID_INetwork, index, info );
+ }
+ 
+ static HRESULT WINAPI network_GetIDsOfNames(
+@@ -358,8 +626,8 @@ static HRESULT WINAPI network_GetIDsOfNames(
+     LCID lcid,
+     DISPID *dispid )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %s, %p, %u, %#lx, %p\n", iface, debugstr_guid(riid), names, count, lcid, dispid );
++    return disp_get_ids_of_names( &IID_INetwork, names, count, dispid );
+ }
+ 
+ static HRESULT WINAPI network_Invoke(
+@@ -373,40 +641,67 @@ static HRESULT WINAPI network_Invoke(
+     EXCEPINFO *excep_info,
+     UINT *arg_err )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %ld, %s, %#lx, %#x, %p, %p, %p, %p\n", iface, member, debugstr_guid(riid), lcid, flags,
++           params, result, excep_info, arg_err );
++    return disp_invoke( &IID_INetwork, iface, member, flags, params, result, excep_info, arg_err );
+ }
+ 
+ static HRESULT WINAPI network_GetName(
+     INetwork *iface,
+     BSTR *pszNetworkName )
+ {
+-    FIXME( "%p, %p\n", iface, pszNetworkName );
+-    return E_NOTIMPL;
++    struct network *network = impl_from_INetwork( iface );
++
++    TRACE( "%p, %p\n", iface, pszNetworkName );
++
++    if (!pszNetworkName) return E_POINTER;
++    if (!(*pszNetworkName = SysAllocString( network->name ))) return E_OUTOFMEMORY;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI network_SetName(
+     INetwork *iface,
+     BSTR szNetworkNewName )
+ {
+-    FIXME( "%p, %s\n", iface, debugstr_w(szNetworkNewName) );
+-    return E_NOTIMPL;
++    struct network *network = impl_from_INetwork( iface );
++    HRESULT hr;
++
++    TRACE( "%p, %s\n", iface, debugstr_w(szNetworkNewName) );
++
++    if (!szNetworkNewName) return E_POINTER;
++    if (!*szNetworkNewName || wcslen( szNetworkNewName ) >= ARRAY_SIZE(network->name)) return E_INVALIDARG;
++    if (FAILED(hr = set_profile_string( &network->id, L"ProfileName", szNetworkNewName ))) return hr;
++    wcscpy( network->name, szNetworkNewName );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI network_GetDescription(
+     INetwork *iface,
+     BSTR *pszDescription )
+ {
+-    FIXME( "%p, %p\n", iface, pszDescription );
+-    return E_NOTIMPL;
++    struct network *network = impl_from_INetwork( iface );
++
++    TRACE( "%p, %p\n", iface, pszDescription );
++
++    if (!pszDescription) return E_POINTER;
++    if (!(*pszDescription = SysAllocString( network->description ))) return E_OUTOFMEMORY;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI network_SetDescription(
+     INetwork *iface,
+     BSTR szDescription )
+ {
+-    FIXME( "%p, %s\n", iface, debugstr_w(szDescription) );
+-    return E_NOTIMPL;
++    struct network *network = impl_from_INetwork( iface );
++    HRESULT hr;
++
++    TRACE( "%p, %s\n", iface, debugstr_w(szDescription) );
++
++    if (!szDescription) return E_POINTER;
++    if (wcslen( szDescription ) >= ARRAY_SIZE(network->description)) return E_INVALIDARG;
++    if (FAILED(hr = set_profile_string( &network->id, L"Description", szDescription ))) return hr;
++    wcscpy( network->description, szDescription );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI network_GetNetworkId(
+@@ -425,9 +720,12 @@ static HRESULT WINAPI network_GetDomainType(
+     INetwork *iface,
+     NLM_DOMAIN_TYPE *pDomainType )
+ {
+-    FIXME( "%p, %p\n", iface, pDomainType );
++    struct network *network = impl_from_INetwork( iface );
+ 
+-    *pDomainType = NLM_DOMAIN_TYPE_NON_DOMAIN_NETWORK;
++    TRACE( "%p, %p\n", iface, pDomainType );
++
++    if (!pDomainType) return E_POINTER;
++    *pDomainType = network->domain_type;
+     return S_OK;
+ }
+ 
+@@ -458,9 +756,18 @@ static HRESULT WINAPI network_GetTimeCreatedAndConnected(
+     DWORD *pdwLowDateTimeConnected,
+     DWORD *pdwHighDateTimeConnected )
+ {
+-    FIXME( "%p, %p, %p, %p, %p\n", iface, pdwLowDateTimeCreated, pdwHighDateTimeCreated,
++    struct network *network = impl_from_INetwork( iface );
++
++    TRACE( "%p, %p, %p, %p, %p\n", iface, pdwLowDateTimeCreated, pdwHighDateTimeCreated,
+         pdwLowDateTimeConnected, pdwHighDateTimeConnected );
+-    return E_NOTIMPL;
++
++    if (!pdwLowDateTimeCreated || !pdwHighDateTimeCreated || !pdwLowDateTimeConnected || !pdwHighDateTimeConnected)
++        return E_POINTER;
++    *pdwLowDateTimeCreated = network->created.dwLowDateTime;
++    *pdwHighDateTimeCreated = network->created.dwHighDateTime;
++    *pdwLowDateTimeConnected = network->connected_time.dwLowDateTime;
++    *pdwHighDateTimeConnected = network->connected_time.dwHighDateTime;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI network_get_IsConnectedToInternet(
+@@ -493,15 +800,10 @@ static HRESULT WINAPI network_GetConnectivity(
+ {
+     struct network *network = impl_from_INetwork( iface );
+ 
+-    FIXME( "%p, %p\n", iface, pConnectivity );
+-
+-    *pConnectivity = NLM_CONNECTIVITY_DISCONNECTED;
+-
+-    if (network->connected_to_internet)
+-        *pConnectivity |= NLM_CONNECTIVITY_IPV4_INTERNET;
+-    else if (network->connected)
+-        *pConnectivity |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
++    TRACE( "%p, %p\n", iface, pConnectivity );
+ 
++    if (!pConnectivity) return E_POINTER;
++    *pConnectivity = network->connectivity;
+     return S_OK;
+ }
+ 
+@@ -509,9 +811,12 @@ static HRESULT WINAPI network_GetCategory(
+     INetwork *iface,
+     NLM_NETWORK_CATEGORY *pCategory )
+ {
+-    FIXME( "%p, %p\n", iface, pCategory );
++    struct network *network = impl_from_INetwork( iface );
++
++    TRACE( "%p, %p\n", iface, pCategory );
+ 
+-    *pCategory = NLM_NETWORK_CATEGORY_PUBLIC;
++    if (!pCategory) return E_POINTER;
++    *pCategory = network->category;
+     return S_OK;
+ }
+ 
+@@ -519,8 +824,18 @@ static HRESULT WINAPI network_SetCategory(
+     INetwork *iface,
+     NLM_NETWORK_CATEGORY NewCategory )
+ {
+-    FIXME( "%p, %u\n", iface, NewCategory );
+-    return E_NOTIMPL;
++    struct network *network = impl_from_INetwork( iface );
++    DWORD value = NewCategory;
++    HRESULT hr;
++
++    TRACE( "%p, %u\n", iface, NewCategory );
++
++    /* a domain network is so by its domain, not by choice */
++    if (NewCategory != NLM_NETWORK_CATEGORY_PUBLIC && NewCategory != NLM_NETWORK_CATEGORY_PRIVATE)
++        return E_INVALIDARG;
++    if (FAILED(hr = set_profile_value( &network->id, L"Category", REG_DWORD, &value, sizeof(value) ))) return hr;
++    network->category = NewCategory;
++    return S_OK;
+ }
+ 
+ static const struct INetworkVtbl network_vtbl =
+@@ -547,6 +862,123 @@ static const struct INetworkVtbl network_vtbl =
+     network_SetCategory
+ };
+ 
++/* Stained Glass OS 1689: a network's profile, as Windows keeps it */
++static void profile_key_name( const GUID *id, WCHAR *buf, size_t size )
++{
++    swprintf( buf, size, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles\\"
++              L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", id->Data1, id->Data2, id->Data3,
++              id->Data4[0], id->Data4[1], id->Data4[2], id->Data4[3], id->Data4[4], id->Data4[5],
++              id->Data4[6], id->Data4[7] );
++}
++
++static HRESULT set_profile_value( const GUID *id, const WCHAR *name, DWORD type, const void *data, DWORD size )
++{
++    WCHAR path[256];
++    LSTATUS ret;
++    HKEY key;
++
++    profile_key_name( id, path, ARRAY_SIZE(path) );
++    if ((ret = RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL )))
++        return HRESULT_FROM_WIN32( ret );
++    ret = RegSetValueExW( key, name, 0, type, data, size );
++    RegCloseKey( key );
++    return HRESULT_FROM_WIN32( ret );
++}
++
++static HRESULT set_profile_string( const GUID *id, const WCHAR *name, const WCHAR *value )
++{
++    return set_profile_value( id, name, REG_SZ, value, (wcslen( value ) + 1) * sizeof(WCHAR) );
++}
++
++static void read_profile( struct network *network )
++{
++    WCHAR path[256];
++    DWORD size, value;
++    SYSTEMTIME st;
++    HKEY key;
++
++    profile_key_name( &network->id, path, ARRAY_SIZE(path) );
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE, &key )) return;
++    size = sizeof(network->name);
++    RegQueryValueExW( key, L"ProfileName", NULL, NULL, (BYTE *)network->name, &size );
++    size = sizeof(network->description);
++    RegQueryValueExW( key, L"Description", NULL, NULL, (BYTE *)network->description, &size );
++    size = sizeof(value);
++    if (!RegQueryValueExW( key, L"Category", NULL, NULL, (BYTE *)&value, &size ) && value <= 2)
++        network->category = value;
++    size = sizeof(st);
++    if (!RegQueryValueExW( key, L"DateCreated", NULL, NULL, (BYTE *)&st, &size ) && size == sizeof(st))
++        SystemTimeToFileTime( &st, &network->created );
++    RegCloseKey( key );
++}
++
++/* the cost Windows gives a medium: HKLM\...\NetworkList\DefaultMediaCost
++ * (1 unrestricted, 2 fixed, i.e. metered) */
++static DWORD media_cost( DWORD if_type )
++{
++    const WCHAR *name = L"Default";
++    DWORD value = 0, size = sizeof(value);
++
++    if (if_type == IF_TYPE_ETHERNET_CSMACD) name = L"Ethernet";
++    else if (if_type == IF_TYPE_IEEE80211) name = L"WiFi";
++    else if (if_type == IF_TYPE_WWANPP || if_type == IF_TYPE_WWANPP2) name = L"4G";
++#ifndef SG_MUTANT_NO_MEDIA_COST
++    if (RegGetValueW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\DefaultMediaCost",
++                      name, RRF_RT_REG_DWORD, NULL, &value, &size ) || !value)
++#endif
++        value = 1;
++    return value == 2 ? NLM_CONNECTION_COST_FIXED : NLM_CONNECTION_COST_UNRESTRICTED;
++}
++
++static BOOL ipv6_is_global( const SOCKADDR_IN6 *addr )
++{
++    const BYTE *b = addr->sin6_addr.u.Byte;
++
++    if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return FALSE;   /* link-local */
++    if (IN6_IS_ADDR_LOOPBACK( &addr->sin6_addr )) return FALSE;
++    return TRUE;
++}
++
++/* an adapter's connectivity: addresses for the local network, a gateway
++ * (a default route) for the internet, IPv4 and IPv6 apart */
++static NLM_CONNECTIVITY adapter_connectivity( const IP_ADAPTER_ADDRESSES *aa )
++{
++    IP_ADAPTER_UNICAST_ADDRESS *ua;
++    IP_ADAPTER_GATEWAY_ADDRESS *gw;
++    NLM_CONNECTIVITY ret = NLM_CONNECTIVITY_DISCONNECTED;
++    BOOL v4 = FALSE, v6 = FALSE;
++
++    if (aa->OperStatus != IfOperStatusUp || aa->IfType == IF_TYPE_SOFTWARE_LOOPBACK) return ret;
++    for (ua = aa->FirstUnicastAddress; ua; ua = ua->Next)
++    {
++        if (ua->Address.lpSockaddr->sa_family == AF_INET) v4 = TRUE;
++        else if (ua->Address.lpSockaddr->sa_family == AF_INET6 &&
++                 ipv6_is_global( (SOCKADDR_IN6 *)ua->Address.lpSockaddr )) v6 = TRUE;
++    }
++    if (v4) ret |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
++    if (v6) ret |= NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
++    for (gw = aa->FirstGatewayAddress; gw; gw = gw->Next)
++    {
++        if (gw->Address.lpSockaddr->sa_family == AF_INET && v4)
++            ret = (ret & ~NLM_CONNECTIVITY_IPV4_LOCALNETWORK) | NLM_CONNECTIVITY_IPV4_INTERNET;
++        else if (gw->Address.lpSockaddr->sa_family == AF_INET6 && v6)
++            ret = (ret & ~NLM_CONNECTIVITY_IPV6_LOCALNETWORK) | NLM_CONNECTIVITY_IPV6_INTERNET;
++    }
++    return ret;
++}
++
++static NLM_DOMAIN_TYPE adapter_domain_type( const IP_ADAPTER_ADDRESSES *aa )
++{
++    WCHAR domain[256];
++    DWORD size = ARRAY_SIZE(domain);
++
++    /* a network of the machine's own domain */
++    if (GetComputerNameExW( ComputerNameDnsDomain, domain, &size ) && domain[0] &&
++        aa->DnsSuffix && !wcsicmp( aa->DnsSuffix, domain ))
++        return NLM_DOMAIN_TYPE_DOMAIN_AUTHENTICATED;
++    return NLM_DOMAIN_TYPE_NON_DOMAIN_NETWORK;
++}
++
+ static struct network *create_network( const GUID *id )
+ {
+     struct network *ret;
+@@ -586,14 +1018,34 @@ static ULONG WINAPI cost_manager_Release(
+     return INetworkListManager_Release( &mgr->INetworkListManager_iface );
+ }
+ 
++static BOOL map_address_6to4( const SOCKADDR_IN6 *addr6, SOCKADDR_IN *addr4 );
++
+ static HRESULT WINAPI cost_manager_GetCost(
+     INetworkCostManager *iface, DWORD *pCost, NLM_SOCKADDR *pDestIPAddr)
+ {
+-    FIXME( "%p, %p, %p\n", iface, pCost, pDestIPAddr );
++    struct list_manager *mgr = impl_from_INetworkCostManager( iface );
++    SOCKADDR *dst = (SOCKADDR *)pDestIPAddr;
++    SOCKADDR_IN addr4, *dst4 = NULL;
++    struct connection *connection;
++    NET_LUID luid;
++    DWORD index;
++    GUID id;
+ 
+-    if (!pCost) return E_POINTER;
++    TRACE( "%p, %p, %p\n", iface, pCost, pDestIPAddr );
+ 
+-    *pCost = NLM_CONNECTION_COST_UNRESTRICTED;
++    if (!pCost) return E_POINTER;
++    EnterCriticalSection( &mgr->cs );
++    *pCost = mgr->cost;
++    /* to a destination: the cost of the connection that reaches it */
++    if (dst && dst->sa_family == AF_INET) dst4 = (SOCKADDR_IN *)dst;
++    else if (dst && map_address_6to4( (const SOCKADDR_IN6 *)dst, &addr4 )) dst4 = &addr4;
++    if (dst4 && !GetBestInterface( dst4->sin_addr.S_un.S_addr, &index ) &&
++        !ConvertInterfaceIndexToLuid( index, &luid ) && !ConvertInterfaceLuidToGuid( &luid, &id ))
++    {
++        LIST_FOR_EACH_ENTRY( connection, &mgr->connections, struct connection, entry )
++            if (IsEqualGUID( &connection->id, &id )) *pCost = connection->cost;
++    }
++    LeaveCriticalSection( &mgr->cs );
+     return S_OK;
+ }
+ 
+@@ -625,7 +1077,7 @@ static HRESULT WINAPI cost_manager_GetDataPlanStatus(
+     SOCKADDR *dst = (SOCKADDR *)pDestIPAddr;
+     SOCKADDR_IN addr4, *dst4;
+ 
+-    FIXME( "%p, %p, %p\n", iface, pDataPlanStatus, pDestIPAddr );
++    TRACE( "%p, %p, %p\n", iface, pDataPlanStatus, pDestIPAddr );
+ 
+     if (!pDataPlanStatus) return E_POINTER;
+ 
+@@ -644,7 +1096,7 @@ static HRESULT WINAPI cost_manager_GetDataPlanStatus(
+     }
+     else
+     {
+-        FIXME( "interface guid not found\n" );
++        /* no destination: the machine's own status */
+         memset( &pDataPlanStatus->InterfaceGuid, 0, sizeof(pDataPlanStatus->InterfaceGuid) );
+     }
+ 
+@@ -664,8 +1116,12 @@ static HRESULT WINAPI cost_manager_SetDestinationAddresses(
+     INetworkCostManager *iface, UINT32 length, NLM_SOCKADDR *pDestIPAddrList,
+     VARIANT_BOOL bAppend)
+ {
+-    FIXME( "%p, %u, %p, %x\n", iface, length, pDestIPAddrList, bAppend );
+-    return E_NOTIMPL;
++    TRACE( "%p, %u, %p, %x\n", iface, length, pDestIPAddrList, bAppend );
++
++    /* the addresses only narrow which cost changes are told: every change is */
++    if (length && !pDestIPAddrList) return E_POINTER;
++    if (length > 500) return E_INVALIDARG;
++    return S_OK;
+ }
+ 
+ static const INetworkCostManagerVtbl cost_manager_vtbl =
+@@ -678,6 +1134,123 @@ static const INetworkCostManagerVtbl cost_manager_vtbl =
+     cost_manager_SetDestinationAddresses
+ };
+ 
++/* Stained Glass OS 1689: _NewEnum, an IEnumVARIANT of IDispatch objects
++ * over a copy of an IEnumNetworks or IEnumNetworkConnections */
++struct var_enum
++{
++    IEnumVARIANT IEnumVARIANT_iface;
++    LONG refs;
++    IUnknown *inner;
++    BOOL networks;
++};
++
++static inline struct var_enum *impl_from_IEnumVARIANT( IEnumVARIANT *iface )
++{
++    return CONTAINING_RECORD( iface, struct var_enum, IEnumVARIANT_iface );
++}
++
++static HRESULT WINAPI var_enum_QueryInterface( IEnumVARIANT *iface, REFIID riid, void **obj )
++{
++    if (IsEqualGUID( riid, &IID_IEnumVARIANT ) || IsEqualGUID( riid, &IID_IUnknown ))
++    {
++        *obj = iface;
++        IEnumVARIANT_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI var_enum_AddRef( IEnumVARIANT *iface )
++{
++    return InterlockedIncrement( &impl_from_IEnumVARIANT( iface )->refs );
++}
++
++static ULONG WINAPI var_enum_Release( IEnumVARIANT *iface )
++{
++    struct var_enum *e = impl_from_IEnumVARIANT( iface );
++    ULONG refs = InterlockedDecrement( &e->refs );
++
++    if (!refs)
++    {
++        IUnknown_Release( e->inner );
++        free( e );
++    }
++    return refs;
++}
++
++static HRESULT WINAPI var_enum_Next( IEnumVARIANT *iface, ULONG count, VARIANT *var, ULONG *fetched )
++{
++    struct var_enum *e = impl_from_IEnumVARIANT( iface );
++    ULONG i;
++
++    if (!var) return E_POINTER;
++    for (i = 0; i < count; i++)
++    {
++        IDispatch *disp = NULL;
++        ULONG got = 0;
++        HRESULT hr = e->networks ? IEnumNetworks_Next( (IEnumNetworks *)e->inner, 1, (INetwork **)&disp, &got )
++                                 : IEnumNetworkConnections_Next( (IEnumNetworkConnections *)e->inner, 1,
++                                                                 (INetworkConnection **)&disp, &got );
++        if (hr != S_OK || !got) break;
++        V_VT(&var[i]) = VT_DISPATCH;
++        V_DISPATCH(&var[i]) = disp;
++    }
++    if (fetched) *fetched = i;
++    return i == count ? S_OK : S_FALSE;
++}
++
++static HRESULT WINAPI var_enum_Skip( IEnumVARIANT *iface, ULONG count )
++{
++    struct var_enum *e = impl_from_IEnumVARIANT( iface );
++    return e->networks ? IEnumNetworks_Skip( (IEnumNetworks *)e->inner, count )
++                       : IEnumNetworkConnections_Skip( (IEnumNetworkConnections *)e->inner, count );
++}
++
++static HRESULT WINAPI var_enum_Reset( IEnumVARIANT *iface )
++{
++    struct var_enum *e = impl_from_IEnumVARIANT( iface );
++    return e->networks ? IEnumNetworks_Reset( (IEnumNetworks *)e->inner )
++                       : IEnumNetworkConnections_Reset( (IEnumNetworkConnections *)e->inner );
++}
++
++static HRESULT create_var_enum( IUnknown *inner, BOOL networks, IEnumVARIANT **ret );
++
++static HRESULT WINAPI var_enum_Clone( IEnumVARIANT *iface, IEnumVARIANT **ret )
++{
++    struct var_enum *e = impl_from_IEnumVARIANT( iface );
++    IUnknown *copy;
++    HRESULT hr;
++
++    hr = e->networks ? IEnumNetworks_Clone( (IEnumNetworks *)e->inner, (IEnumNetworks **)&copy )
++                     : IEnumNetworkConnections_Clone( (IEnumNetworkConnections *)e->inner,
++                                                      (IEnumNetworkConnections **)&copy );
++    if (FAILED(hr)) return hr;
++    hr = create_var_enum( copy, e->networks, ret );
++    IUnknown_Release( copy );
++    return hr;
++}
++
++static const IEnumVARIANTVtbl var_enum_vtbl =
++{
++    var_enum_QueryInterface, var_enum_AddRef, var_enum_Release,
++    var_enum_Next, var_enum_Skip, var_enum_Reset, var_enum_Clone
++};
++
++static HRESULT create_var_enum( IUnknown *inner, BOOL networks, IEnumVARIANT **ret )
++{
++    struct var_enum *e;
++
++    if (!(e = calloc( 1, sizeof(*e) ))) return E_OUTOFMEMORY;
++    e->IEnumVARIANT_iface.lpVtbl = &var_enum_vtbl;
++    e->refs = 1;
++    e->inner = inner;
++    IUnknown_AddRef( inner );
++    e->networks = networks;
++    *ret = &e->IEnumVARIANT_iface;
++    return S_OK;
++}
++
+ struct networks_enum
+ {
+     IEnumNetworks        IEnumNetworks_iface;
+@@ -745,8 +1318,8 @@ static HRESULT WINAPI networks_enum_GetTypeInfoCount(
+     IEnumNetworks *iface,
+     UINT *count )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %p\n", iface, count );
++    return disp_get_type_info_count( count );
+ }
+ 
+ static HRESULT WINAPI networks_enum_GetTypeInfo(
+@@ -755,8 +1328,8 @@ static HRESULT WINAPI networks_enum_GetTypeInfo(
+     LCID lcid,
+     ITypeInfo **info )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %u, %#lx, %p\n", iface, index, lcid, info );
++    return disp_get_type_info( &IID_IEnumNetworks, index, info );
+ }
+ 
+ static HRESULT WINAPI networks_enum_GetIDsOfNames(
+@@ -767,8 +1340,8 @@ static HRESULT WINAPI networks_enum_GetIDsOfNames(
+     LCID lcid,
+     DISPID *dispid )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %s, %p, %u, %#lx, %p\n", iface, debugstr_guid(riid), names, count, lcid, dispid );
++    return disp_get_ids_of_names( &IID_IEnumNetworks, names, count, dispid );
+ }
+ 
+ static HRESULT WINAPI networks_enum_Invoke(
+@@ -782,15 +1355,25 @@ static HRESULT WINAPI networks_enum_Invoke(
+     EXCEPINFO *excep_info,
+     UINT *arg_err )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %ld, %s, %#lx, %#x, %p, %p, %p, %p\n", iface, member, debugstr_guid(riid), lcid, flags,
++           params, result, excep_info, arg_err );
++    return disp_invoke( &IID_IEnumNetworks, iface, member, flags, params, result, excep_info, arg_err );
+ }
+ 
+ static HRESULT WINAPI networks_enum_get__NewEnum(
+     IEnumNetworks *iface, IEnumVARIANT **ppEnumVar )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    IEnumNetworks *copy;
++    HRESULT hr;
++
++    TRACE( "%p, %p\n", iface, ppEnumVar );
++
++    if (!ppEnumVar) return E_POINTER;
++    if (FAILED(hr = IEnumNetworks_Clone( iface, &copy ))) return hr;
++    IEnumNetworks_Reset( copy );
++    hr = create_var_enum( (IUnknown *)copy, TRUE, ppEnumVar );
++    IEnumNetworks_Release( copy );
++    return hr;
+ }
+ 
+ static BOOL match_enum_network_flags( NLM_ENUM_NETWORK flags, struct network *network )
+@@ -980,8 +1563,8 @@ static HRESULT WINAPI connections_enum_GetTypeInfoCount(
+     IEnumNetworkConnections *iface,
+     UINT *count )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %p\n", iface, count );
++    return disp_get_type_info_count( count );
+ }
+ 
+ static HRESULT WINAPI connections_enum_GetTypeInfo(
+@@ -990,8 +1573,8 @@ static HRESULT WINAPI connections_enum_GetTypeInfo(
+     LCID lcid,
+     ITypeInfo **info )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %u, %#lx, %p\n", iface, index, lcid, info );
++    return disp_get_type_info( &IID_IEnumNetworkConnections, index, info );
+ }
+ 
+ static HRESULT WINAPI connections_enum_GetIDsOfNames(
+@@ -1002,8 +1585,8 @@ static HRESULT WINAPI connections_enum_GetIDsOfNames(
+     LCID lcid,
+     DISPID *dispid )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %s, %p, %u, %#lx, %p\n", iface, debugstr_guid(riid), names, count, lcid, dispid );
++    return disp_get_ids_of_names( &IID_IEnumNetworkConnections, names, count, dispid );
+ }
+ 
+ static HRESULT WINAPI connections_enum_Invoke(
+@@ -1017,15 +1600,25 @@ static HRESULT WINAPI connections_enum_Invoke(
+     EXCEPINFO *excep_info,
+     UINT *arg_err )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %ld, %s, %#lx, %#x, %p, %p, %p, %p\n", iface, member, debugstr_guid(riid), lcid, flags,
++           params, result, excep_info, arg_err );
++    return disp_invoke( &IID_IEnumNetworkConnections, iface, member, flags, params, result, excep_info, arg_err );
+ }
+ 
+ static HRESULT WINAPI connections_enum_get__NewEnum(
+     IEnumNetworkConnections *iface, IEnumVARIANT **ppEnumVar )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    IEnumNetworkConnections *copy;
++    HRESULT hr;
++
++    TRACE( "%p, %p\n", iface, ppEnumVar );
++
++    if (!ppEnumVar) return E_POINTER;
++    if (FAILED(hr = IEnumNetworkConnections_Clone( iface, &copy ))) return hr;
++    IEnumNetworkConnections_Reset( copy );
++    hr = create_var_enum( (IUnknown *)copy, FALSE, ppEnumVar );
++    IEnumNetworkConnections_Release( copy );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI connections_enum_Next(
+@@ -1146,6 +1739,10 @@ static ULONG WINAPI list_manager_Release(
+ 
+         TRACE( "destroying %p\n", mgr );
+ 
++        if (mgr->notify_if) CancelMibChangeNotify2( mgr->notify_if );
++        if (mgr->notify_addr) CancelMibChangeNotify2( mgr->notify_addr );
++        if (mgr->notify_route) CancelMibChangeNotify2( mgr->notify_route );
++
+         connection_point_release( &mgr->events_cp );
+         connection_point_release( &mgr->conn_mgr_cp );
+         connection_point_release( &mgr->cost_mgr_cp );
+@@ -1158,6 +1755,8 @@ static ULONG WINAPI list_manager_Release(
+         {
+             INetwork_Release( &network->INetwork_iface );
+         }
++        mgr->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &mgr->cs );
+         free( mgr );
+     }
+     return refs;
+@@ -1188,7 +1787,7 @@ static HRESULT WINAPI list_manager_QueryInterface(
+     }
+     else
+     {
+-        FIXME( "interface %s not implemented\n", debugstr_guid(riid) );
++        WARN( "interface %s not implemented\n", debugstr_guid(riid) );
+         *obj = NULL;
+         return E_NOINTERFACE;
+     }
+@@ -1200,8 +1799,8 @@ static HRESULT WINAPI list_manager_GetTypeInfoCount(
+     INetworkListManager *iface,
+     UINT *count )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %p\n", iface, count );
++    return disp_get_type_info_count( count );
+ }
+ 
+ static HRESULT WINAPI list_manager_GetTypeInfo(
+@@ -1210,8 +1809,8 @@ static HRESULT WINAPI list_manager_GetTypeInfo(
+     LCID lcid,
+     ITypeInfo **info )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %u, %#lx, %p\n", iface, index, lcid, info );
++    return disp_get_type_info( &IID_INetworkListManager, index, info );
+ }
+ 
+ static HRESULT WINAPI list_manager_GetIDsOfNames(
+@@ -1222,8 +1821,8 @@ static HRESULT WINAPI list_manager_GetIDsOfNames(
+     LCID lcid,
+     DISPID *dispid )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %s, %p, %u, %#lx, %p\n", iface, debugstr_guid(riid), names, count, lcid, dispid );
++    return disp_get_ids_of_names( &IID_INetworkListManager, names, count, dispid );
+ }
+ 
+ static HRESULT WINAPI list_manager_Invoke(
+@@ -1237,8 +1836,9 @@ static HRESULT WINAPI list_manager_Invoke(
+     EXCEPINFO *excep_info,
+     UINT *arg_err )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %ld, %s, %#lx, %#x, %p, %p, %p, %p\n", iface, member, debugstr_guid(riid), lcid, flags,
++           params, result, excep_info, arg_err );
++    return disp_invoke( &IID_INetworkListManager, iface, member, flags, params, result, excep_info, arg_err );
+ }
+ 
+ static HRESULT WINAPI list_manager_GetNetworks(
+@@ -1359,20 +1959,13 @@ static HRESULT WINAPI list_manager_GetConnectivity(
+     NLM_CONNECTIVITY *pConnectivity )
+ {
+     struct list_manager *mgr = impl_from_INetworkListManager( iface );
+-    struct network *network;
+-
+-    FIXME( "%p, %p\n", iface, pConnectivity );
+-
+-    *pConnectivity = NLM_CONNECTIVITY_DISCONNECTED;
+ 
+-    LIST_FOR_EACH_ENTRY( network, &mgr->networks, struct network, entry )
+-    {
+-        if (network->connected_to_internet)
+-            *pConnectivity |= NLM_CONNECTIVITY_IPV4_INTERNET;
+-        else if (network->connected)
+-            *pConnectivity |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
+-    }
++    TRACE( "%p, %p\n", iface, pConnectivity );
+ 
++    if (!pConnectivity) return E_POINTER;
++    EnterCriticalSection( &mgr->cs );
++    *pConnectivity = mgr->connectivity;
++    LeaveCriticalSection( &mgr->cs );
+     return S_OK;
+ }
+ 
+@@ -1413,12 +2006,133 @@ static ULONG WINAPI ConnectionPointContainer_Release(IConnectionPointContainer *
+     return INetworkListManager_Release(&This->INetworkListManager_iface);
+ }
+ 
++/* Stained Glass OS 1689: the four connection points, enumerated */
++struct cp_enum
++{
++    IEnumConnectionPoints IEnumConnectionPoints_iface;
++    LONG refs;
++    struct list_manager *mgr;
++    ULONG pos;
++};
++
++static inline struct cp_enum *impl_from_IEnumConnectionPoints( IEnumConnectionPoints *iface )
++{
++    return CONTAINING_RECORD( iface, struct cp_enum, IEnumConnectionPoints_iface );
++}
++
++static IConnectionPoint *cp_at( struct list_manager *mgr, ULONG index )
++{
++    switch (index)
++    {
++    case 0: return &mgr->list_mgr_cp.IConnectionPoint_iface;
++    case 1: return &mgr->cost_mgr_cp.IConnectionPoint_iface;
++    case 2: return &mgr->conn_mgr_cp.IConnectionPoint_iface;
++    case 3: return &mgr->events_cp.IConnectionPoint_iface;
++    }
++    return NULL;
++}
++
++static HRESULT WINAPI cp_enum_QueryInterface( IEnumConnectionPoints *iface, REFIID riid, void **obj )
++{
++    if (IsEqualGUID( riid, &IID_IEnumConnectionPoints ) || IsEqualGUID( riid, &IID_IUnknown ))
++    {
++        *obj = iface;
++        IEnumConnectionPoints_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI cp_enum_AddRef( IEnumConnectionPoints *iface )
++{
++    return InterlockedIncrement( &impl_from_IEnumConnectionPoints( iface )->refs );
++}
++
++static ULONG WINAPI cp_enum_Release( IEnumConnectionPoints *iface )
++{
++    struct cp_enum *e = impl_from_IEnumConnectionPoints( iface );
++    ULONG refs = InterlockedDecrement( &e->refs );
++
++    if (!refs)
++    {
++        INetworkListManager_Release( &e->mgr->INetworkListManager_iface );
++        free( e );
++    }
++    return refs;
++}
++
++static HRESULT WINAPI cp_enum_Next( IEnumConnectionPoints *iface, ULONG count, IConnectionPoint **cps, ULONG *fetched )
++{
++    struct cp_enum *e = impl_from_IEnumConnectionPoints( iface );
++    ULONG i;
++
++    if (!cps) return E_POINTER;
++    for (i = 0; i < count && e->pos < 4; i++, e->pos++)
++    {
++        cps[i] = cp_at( e->mgr, e->pos );
++        IConnectionPoint_AddRef( cps[i] );
++    }
++    if (fetched) *fetched = i;
++    return i == count ? S_OK : S_FALSE;
++}
++
++static HRESULT WINAPI cp_enum_Skip( IEnumConnectionPoints *iface, ULONG count )
++{
++    struct cp_enum *e = impl_from_IEnumConnectionPoints( iface );
++
++    if (e->pos + count > 4)
++    {
++        e->pos = 4;
++        return S_FALSE;
++    }
++    e->pos += count;
++    return S_OK;
++}
++
++static HRESULT WINAPI cp_enum_Reset( IEnumConnectionPoints *iface )
++{
++    impl_from_IEnumConnectionPoints( iface )->pos = 0;
++    return S_OK;
++}
++
++static HRESULT create_cp_enum( struct list_manager *mgr, ULONG pos, IEnumConnectionPoints **ret );
++
++static HRESULT WINAPI cp_enum_Clone( IEnumConnectionPoints *iface, IEnumConnectionPoints **ret )
++{
++    struct cp_enum *e = impl_from_IEnumConnectionPoints( iface );
++    return create_cp_enum( e->mgr, e->pos, ret );
++}
++
++static const IEnumConnectionPointsVtbl cp_enum_vtbl =
++{
++    cp_enum_QueryInterface, cp_enum_AddRef, cp_enum_Release,
++    cp_enum_Next, cp_enum_Skip, cp_enum_Reset, cp_enum_Clone
++};
++
++static HRESULT create_cp_enum( struct list_manager *mgr, ULONG pos, IEnumConnectionPoints **ret )
++{
++    struct cp_enum *e;
++
++    if (!(e = calloc( 1, sizeof(*e) ))) return E_OUTOFMEMORY;
++    e->IEnumConnectionPoints_iface.lpVtbl = &cp_enum_vtbl;
++    e->refs = 1;
++    e->mgr = mgr;
++    INetworkListManager_AddRef( &mgr->INetworkListManager_iface );
++    e->pos = pos;
++    *ret = &e->IEnumConnectionPoints_iface;
++    return S_OK;
++}
++
+ static HRESULT WINAPI ConnectionPointContainer_EnumConnectionPoints(IConnectionPointContainer *iface,
+         IEnumConnectionPoints **ppEnum)
+ {
+     struct list_manager *This = impl_from_IConnectionPointContainer( iface );
+-    FIXME("(%p)->(%p): stub\n", This, ppEnum);
+-    return E_NOTIMPL;
++
++    TRACE( "%p, %p\n", This, ppEnum );
++
++    if (!ppEnum) return E_POINTER;
++    return create_cp_enum( This, 0, ppEnum );
+ }
+ 
+ static HRESULT WINAPI ConnectionPointContainer_FindConnectionPoint(IConnectionPointContainer *iface,
+@@ -1442,9 +2156,9 @@ static HRESULT WINAPI ConnectionPointContainer_FindConnectionPoint(IConnectionPo
+         ret = &This->events_cp;
+     else
+     {
+-        FIXME( "interface %s not implemented\n", debugstr_guid(riid) );
++        WARN( "no connection point for %s\n", debugstr_guid(riid) );
+         *cp = NULL;
+-        return E_NOINTERFACE;
++        return CONNECT_E_NOCONNECTION;
+     }
+ 
+     IConnectionPoint_AddRef( *cp = &ret->IConnectionPoint_iface );
+@@ -1523,8 +2237,8 @@ static HRESULT WINAPI connection_GetTypeInfoCount(
+     INetworkConnection *iface,
+     UINT *count )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %p\n", iface, count );
++    return disp_get_type_info_count( count );
+ }
+ 
+ static HRESULT WINAPI connection_GetTypeInfo(
+@@ -1533,8 +2247,8 @@ static HRESULT WINAPI connection_GetTypeInfo(
+     LCID lcid,
+     ITypeInfo **info )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %u, %#lx, %p\n", iface, index, lcid, info );
++    return disp_get_type_info( &IID_INetworkConnection, index, info );
+ }
+ 
+ static HRESULT WINAPI connection_GetIDsOfNames(
+@@ -1545,8 +2259,8 @@ static HRESULT WINAPI connection_GetIDsOfNames(
+     LCID lcid,
+     DISPID *dispid )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %s, %p, %u, %#lx, %p\n", iface, debugstr_guid(riid), names, count, lcid, dispid );
++    return disp_get_ids_of_names( &IID_INetworkConnection, names, count, dispid );
+ }
+ 
+ static HRESULT WINAPI connection_Invoke(
+@@ -1560,8 +2274,9 @@ static HRESULT WINAPI connection_Invoke(
+     EXCEPINFO *excep_info,
+     UINT *arg_err )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    TRACE( "%p, %ld, %s, %#lx, %#x, %p, %p, %p, %p\n", iface, member, debugstr_guid(riid), lcid, flags,
++           params, result, excep_info, arg_err );
++    return disp_invoke( &IID_INetworkConnection, iface, member, flags, params, result, excep_info, arg_err );
+ }
+ 
+ static HRESULT WINAPI connection_GetNetwork(
+@@ -1607,15 +2322,10 @@ static HRESULT WINAPI connection_GetConnectivity(
+ {
+     struct connection *connection = impl_from_INetworkConnection( iface );
+ 
+-    FIXME( "%p, %p\n", iface, pConnectivity );
+-
+-    *pConnectivity = NLM_CONNECTIVITY_DISCONNECTED;
+-
+-    if (connection->connected_to_internet)
+-        *pConnectivity |= NLM_CONNECTIVITY_IPV4_INTERNET;
+-    else if (connection->connected)
+-        *pConnectivity |= NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
++    TRACE( "%p, %p\n", iface, pConnectivity );
+ 
++    if (!pConnectivity) return E_POINTER;
++    *pConnectivity = connection->connectivity;
+     return S_OK;
+ }
+ 
+@@ -1637,8 +2347,10 @@ static HRESULT WINAPI connection_GetAdapterId(
+ {
+     struct connection *connection = impl_from_INetworkConnection( iface );
+ 
+-    FIXME( "%p, %p\n", iface, pgdAdapterId );
++    TRACE( "%p, %p\n", iface, pgdAdapterId );
+ 
++    /* a connection here is its adapter's */
++    if (!pgdAdapterId) return E_POINTER;
+     *pgdAdapterId = connection->id;
+     return S_OK;
+ }
+@@ -1647,9 +2359,12 @@ static HRESULT WINAPI connection_GetDomainType(
+     INetworkConnection *iface,
+     NLM_DOMAIN_TYPE *pDomainType )
+ {
+-    FIXME( "%p, %p\n", iface, pDomainType );
++    struct connection *connection = impl_from_INetworkConnection( iface );
++
++    TRACE( "%p, %p\n", iface, pDomainType );
+ 
+-    *pDomainType = NLM_DOMAIN_TYPE_NON_DOMAIN_NETWORK;
++    if (!pDomainType) return E_POINTER;
++    *pDomainType = connection->domain_type;
+     return S_OK;
+ }
+ 
+@@ -1703,11 +2418,12 @@ static ULONG WINAPI connection_cost_Release(
+ static HRESULT WINAPI connection_cost_GetCost(
+     INetworkConnectionCost *iface, DWORD *pCost )
+ {
+-    FIXME( "%p, %p\n", iface, pCost );
++    struct connection *conn = impl_from_INetworkConnectionCost( iface );
+ 
+-    if (!pCost) return E_POINTER;
++    TRACE( "%p, %p\n", iface, pCost );
+ 
+-    *pCost = NLM_CONNECTION_COST_UNRESTRICTED;
++    if (!pCost) return E_POINTER;
++    *pCost = conn->cost;
+     return S_OK;
+ }
+ 
+@@ -1716,7 +2432,7 @@ static HRESULT WINAPI connection_cost_GetDataPlanStatus(
+ {
+     struct connection *conn = impl_from_INetworkConnectionCost( iface );
+ 
+-    FIXME( "%p, %p\n", iface, pDataPlanStatus );
++    TRACE( "%p, %p\n", iface, pDataPlanStatus );
+ 
+     if (!pDataPlanStatus) return E_POINTER;
+ 
+@@ -1779,9 +2495,35 @@ static IP_ADAPTER_ADDRESSES *get_network_adapters(void)
+     return NULL;
+ }
+ 
++static void apply_adapter( struct network *network, struct connection *connection, const IP_ADAPTER_ADDRESSES *aa )
++{
++    NLM_CONNECTIVITY conn = adapter_connectivity( aa );
++
++    network->connectivity = connection->connectivity = conn;
++    network->connected = connection->connected = conn ? VARIANT_TRUE : VARIANT_FALSE;
++    network->connected_to_internet = connection->connected_to_internet =
++        (conn & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) ? VARIANT_TRUE : VARIANT_FALSE;
++    network->domain_type = connection->domain_type = adapter_domain_type( aa );
++    connection->cost = media_cost( aa->IfType );
++}
++
++static void update_totals( struct list_manager *mgr )
++{
++    struct connection *connection;
++
++    mgr->connectivity = NLM_CONNECTIVITY_DISCONNECTED;
++    mgr->cost = NLM_CONNECTION_COST_UNRESTRICTED;
++    LIST_FOR_EACH_ENTRY( connection, &mgr->connections, struct connection, entry )
++    {
++        mgr->connectivity |= connection->connectivity;
++        if (connection->connected_to_internet) mgr->cost = connection->cost;
++    }
++}
++
+ static void init_networks( struct list_manager *mgr )
+ {
+     IP_ADAPTER_ADDRESSES *buf, *aa;
++    FILETIME now;
+     GUID id;
+ 
+     list_init( &mgr->networks );
+@@ -1789,6 +2531,7 @@ static void init_networks( struct list_manager *mgr )
+ 
+     if (!(buf = get_network_adapters())) return;
+ 
++    GetSystemTimeAsFileTime( &now );
+     memset( &id, 0, sizeof(id) );
+     for (aa = buf; aa; aa = aa->Next)
+     {
+@@ -1807,16 +2550,15 @@ static void init_networks( struct list_manager *mgr )
+             goto done;
+         }
+ 
+-        if (aa->FirstUnicastAddress)
+-        {
+-            network->connected = VARIANT_TRUE;
+-            connection->connected = VARIANT_TRUE;
+-        }
+-        if (aa->FirstGatewayAddress)
+-        {
+-            network->connected_to_internet = VARIANT_TRUE;
+-            connection->connected_to_internet = VARIANT_TRUE;
+-        }
++        apply_adapter( network, connection, aa );
++        /* named as Windows names an unnamed network: by its DNS suffix, else its adapter */
++        lstrcpynW( network->name, aa->DnsSuffix && aa->DnsSuffix[0] ? aa->DnsSuffix :
++                   aa->FriendlyName ? aa->FriendlyName : L"Network", ARRAY_SIZE(network->name) );
++        lstrcpynW( network->description, network->name, ARRAY_SIZE(network->description) );
++        network->category = network->domain_type == NLM_DOMAIN_TYPE_DOMAIN_AUTHENTICATED ?
++                            NLM_NETWORK_CATEGORY_DOMAIN_AUTHENTICATED : NLM_NETWORK_CATEGORY_PUBLIC;
++        network->created = network->connected_time = now;
++        read_profile( network );
+ 
+         network->mgr = &mgr->INetworkListManager_iface;
+         INetworkListManager_AddRef( network->mgr );
+@@ -1829,6 +2571,148 @@ static void init_networks( struct list_manager *mgr )
+ 
+ done:
+     free( buf );
++    update_totals( mgr );
++}
++
++/* Stained Glass OS 1689: the host's network changes, told to the sinks */
++struct sink_call
++{
++    IUnknown *sink;
++};
++
++static ULONG get_sinks( struct connection_point *cp, IUnknown ***sinks )
++{
++    struct sink_entry *iter;
++    ULONG count = 0;
++
++    *sinks = NULL;
++    EnterCriticalSection( &sinks_cs );
++    if (!list_empty( &cp->sinks ) && (*sinks = calloc( list_count( &cp->sinks ), sizeof(IUnknown *) )))
++    {
++        LIST_FOR_EACH_ENTRY( iter, &cp->sinks, struct sink_entry, entry )
++        {
++            IUnknown *unk = NULL;
++            if (iter->git_cookie && get_git() &&
++                SUCCEEDED(IGlobalInterfaceTable_GetInterfaceFromGlobal( get_git(), iter->git_cookie, &cp->iid,
++                                                                        (void **)&unk )))
++                (*sinks)[count++] = unk;
++        }
++    }
++    LeaveCriticalSection( &sinks_cs );
++    return count;
++}
++
++static void refresh_networks( struct list_manager *mgr )
++{
++    IP_ADAPTER_ADDRESSES *buf, *aa;
++    struct connection *connection;
++    NLM_CONNECTIVITY old_total, changed[64];
++    GUID changed_ids[64];
++    IUnknown **sinks;
++    DWORD old_cost;
++    ULONG i, n, nchanged = 0;
++    HRESULT init;
++
++    if (!(buf = get_network_adapters())) return;
++    init = CoInitializeEx( NULL, COINIT_MULTITHREADED );
++
++    EnterCriticalSection( &mgr->cs );
++    old_total = mgr->connectivity;
++    old_cost = mgr->cost;
++    LIST_FOR_EACH_ENTRY( connection, &mgr->connections, struct connection, entry )
++    {
++        struct network *network = CONTAINING_RECORD( connection->network, struct network, INetwork_iface );
++        NLM_CONNECTIVITY before = connection->connectivity;
++        BOOL found = FALSE;
++
++        for (aa = buf; aa; aa = aa->Next)
++        {
++            NET_LUID luid;
++            GUID id;
++
++            ConvertInterfaceIndexToLuid( aa->IfIndex, &luid );
++            ConvertInterfaceLuidToGuid( &luid, &id );
++            if (!IsEqualGUID( &id, &connection->id )) continue;
++            apply_adapter( network, connection, aa );
++            found = TRUE;
++            break;
++        }
++        if (!found)
++        {
++            network->connectivity = connection->connectivity = NLM_CONNECTIVITY_DISCONNECTED;
++            network->connected = connection->connected = VARIANT_FALSE;
++            network->connected_to_internet = connection->connected_to_internet = VARIANT_FALSE;
++        }
++        if (before != connection->connectivity && nchanged < ARRAY_SIZE(changed))
++        {
++            if (!before) GetSystemTimeAsFileTime( &network->connected_time );
++            changed_ids[nchanged] = connection->id;
++            changed[nchanged++] = connection->connectivity;
++        }
++    }
++    update_totals( mgr );
++    LeaveCriticalSection( &mgr->cs );
++    free( buf );
++
++#ifdef SG_MUTANT_NO_EVENTS
++    nchanged = 0;
++    old_total = mgr->connectivity;
++    old_cost = mgr->cost;
++#endif
++    for (i = 0; i < nchanged; i++)
++    {
++        n = get_sinks( &mgr->events_cp, &sinks );
++        while (n--)
++        {
++            INetworkEvents_NetworkConnectivityChanged( (INetworkEvents *)sinks[n], changed_ids[i], changed[i] );
++            IUnknown_Release( sinks[n] );
++        }
++        free( sinks );
++        n = get_sinks( &mgr->conn_mgr_cp, &sinks );
++        while (n--)
++        {
++            INetworkConnectionEvents_NetworkConnectionConnectivityChanged( (INetworkConnectionEvents *)sinks[n],
++                                                                           changed_ids[i], changed[i] );
++            IUnknown_Release( sinks[n] );
++        }
++        free( sinks );
++    }
++    if (old_total != mgr->connectivity)
++    {
++        n = get_sinks( &mgr->list_mgr_cp, &sinks );
++        while (n--)
++        {
++            INetworkListManagerEvents_ConnectivityChanged( (INetworkListManagerEvents *)sinks[n], mgr->connectivity );
++            IUnknown_Release( sinks[n] );
++        }
++        free( sinks );
++    }
++    if (old_cost != mgr->cost)
++    {
++        n = get_sinks( &mgr->cost_mgr_cp, &sinks );
++        while (n--)
++        {
++            INetworkCostManagerEvents_CostChanged( (INetworkCostManagerEvents *)sinks[n], mgr->cost, NULL );
++            IUnknown_Release( sinks[n] );
++        }
++        free( sinks );
++    }
++    if (SUCCEEDED(init)) CoUninitialize();
++}
++
++static void WINAPI interface_changed( void *ctx, MIB_IPINTERFACE_ROW *row, MIB_NOTIFICATION_TYPE type )
++{
++    if (type != MibInitialNotification) refresh_networks( ctx );
++}
++
++static void WINAPI address_changed( void *ctx, MIB_UNICASTIPADDRESS_ROW *row, MIB_NOTIFICATION_TYPE type )
++{
++    if (type != MibInitialNotification) refresh_networks( ctx );
++}
++
++static void WINAPI route_changed( void *ctx, MIB_IPFORWARD_ROW2 *row, MIB_NOTIFICATION_TYPE type )
++{
++    if (type != MibInitialNotification) refresh_networks( ctx );
+ }
+ 
+ HRESULT list_manager_create( void **obj )
+@@ -1841,6 +2725,8 @@ HRESULT list_manager_create( void **obj )
+     mgr->INetworkListManager_iface.lpVtbl = &list_manager_vtbl;
+     mgr->INetworkCostManager_iface.lpVtbl = &cost_manager_vtbl;
+     mgr->IConnectionPointContainer_iface.lpVtbl = &cpc_vtbl;
++    InitializeCriticalSectionEx( &mgr->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    mgr->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": list_manager.cs");
+     init_networks( mgr );
+     mgr->refs = 1;
+ 
+@@ -1853,6 +2739,10 @@ HRESULT list_manager_create( void **obj )
+     connection_point_init( &mgr->events_cp, &IID_INetworkEvents,
+                            &mgr->IConnectionPointContainer_iface );
+ 
++    NotifyIpInterfaceChange( AF_UNSPEC, interface_changed, mgr, FALSE, &mgr->notify_if );
++    NotifyUnicastIpAddressChange( AF_UNSPEC, address_changed, mgr, FALSE, &mgr->notify_addr );
++    NotifyRouteChange2( AF_UNSPEC, route_changed, mgr, FALSE, &mgr->notify_route );
++
+     *obj = &mgr->INetworkListManager_iface;
+     TRACE( "returning iface %p\n", *obj );
+     return S_OK;
+--- a/dlls/netprofm/main.c
++++ b/dlls/netprofm/main.c
+@@ -48,7 +48,7 @@ static HRESULT WINAPI netprofm_cf_QueryInterface( IClassFactory *iface, REFIID r
+         *ppobj = iface;
+         return S_OK;
+     }
+-    FIXME( "interface %s not implemented\n", debugstr_guid(riid) );
++    WARN( "interface %s not implemented\n", debugstr_guid(riid) );
+     return E_NOINTERFACE;
+ }
+ 
+@@ -85,7 +85,7 @@ static HRESULT WINAPI netprofm_cf_CreateInstance( IClassFactory *iface, LPUNKNOW
+ 
+ static HRESULT WINAPI netprofm_cf_LockServer( IClassFactory *iface, BOOL dolock )
+ {
+-    FIXME( "%p, %d\n", iface, dolock );
++    TRACE( "%p, %d\n", iface, dolock );
+     return S_OK;
+ }
+ 
+new file mode 100644
+--- /dev/null
++++ b/dlls/netprofm/netprofm_tlb.idl
+@@ -0,0 +1,44 @@
++/*
++ * The Network List Manager's type library (Stained Glass OS 1689), so its
++ * dual interfaces answer IDispatch: scripts call them by name.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep regtypelib
++
++#include "netlistmgr.idl"
++
++[
++    uuid(dcb00d01-570f-4a9b-8d69-199fdba5723b),
++    version(1.0),
++    helpstring("Network List Manager 1.0 Type Library")
++]
++library NETWORKLIST
++{
++    importlib("stdole2.tlb");
++
++    interface INetworkListManager;
++    interface INetwork;
++    interface INetworkConnection;
++    interface IEnumNetworks;
++    interface IEnumNetworkConnections;
++    interface INetworkListManagerEvents;
++    interface INetworkEvents;
++    interface INetworkConnectionEvents;
++    interface INetworkCostManager;
++    interface INetworkCostManagerEvents;
++    interface INetworkConnectionCost;
++}
+--- a/dlls/netprofm/tests/list.c
++++ b/dlls/netprofm/tests/list.c
+@@ -44,15 +44,15 @@ static void test_INetwork( INetwork *network, INetworkConnection *conn )
+ 
+     str = NULL;
+     hr = INetwork_GetName( network, &str );
+-    todo_wine ok( hr == S_OK, "got %08lx\n", hr );
+-    todo_wine ok( str != NULL, "str not set\n" );
++    ok( hr == S_OK, "got %08lx\n", hr );
++    ok( str != NULL, "str not set\n" );
+     if (str) trace( "name %s\n", wine_dbgstr_w(str) );
+     SysFreeString( str );
+ 
+     str = NULL;
+     hr = INetwork_GetDescription( network, &str );
+-    todo_wine ok( hr == S_OK, "got %08lx\n", hr );
+-    todo_wine ok( str != NULL, "str not set\n" );
++    ok( hr == S_OK, "got %08lx\n", hr );
++    ok( str != NULL, "str not set\n" );
+     if (str) trace( "description %s\n", wine_dbgstr_w(str) );
+     SysFreeString( str );
+ 
+@@ -288,12 +288,12 @@ static void test_INetworkListManager( void )
+     trace( "GetConnectivity: %08x\n", connectivity );
+ 
+     connected = 0xdead;
+-    hr = INetworkListManager_IsConnected( mgr, &connected );
++    hr = INetworkListManager_get_IsConnected( mgr, &connected );
+     ok( hr == S_OK, "got %08lx\n", hr );
+     ok( connected == VARIANT_TRUE || connected == VARIANT_FALSE, "expected boolean value\n" );
+ 
+     connected = 0xdead;
+-    hr = INetworkListManager_IsConnectedToInternet( mgr, &connected );
++    hr = INetworkListManager_get_IsConnectedToInternet( mgr, &connected );
+     ok( hr == S_OK, "got %08lx\n", hr );
+     ok( connected == VARIANT_TRUE || connected == VARIANT_FALSE, "expected boolean value\n" );
+ 
+--- a/include/netioapi.h
++++ b/include/netioapi.h
+@@ -284,6 +284,7 @@ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetIpNetTable2(ADDRESS_FAMILY,MIB_IPNET_TABLE2
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetUnicastIpAddressEntry(MIB_UNICASTIPADDRESS_ROW*);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI GetUnicastIpAddressTable(ADDRESS_FAMILY,MIB_UNICASTIPADDRESS_TABLE**);
+ IPHLPAPI_DLL_LINKAGE VOID WINAPI InitializeIpInterfaceEntry(MIB_IPINTERFACE_ROW*);
++IPHLPAPI_DLL_LINKAGE DWORD WINAPI CancelMibChangeNotify2(HANDLE);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI NotifyIpInterfaceChange(ADDRESS_FAMILY,PIPINTERFACE_CHANGE_CALLBACK,PVOID,BOOLEAN,HANDLE*);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI NotifyRouteChange2(ADDRESS_FAMILY,PIPFORWARD_CHANGE_CALLBACK,PVOID,BOOLEAN,HANDLE*);
+ IPHLPAPI_DLL_LINKAGE DWORD WINAPI NotifyStableUnicastIpAddressTable(ADDRESS_FAMILY,PMIB_UNICASTIPADDRESS_TABLE*,PSTABLE_UNICAST_IPADDRESS_TABLE_CALLBACK,PVOID,HANDLE*);
+--- a/include/netlistmgr.idl
++++ b/include/netlistmgr.idl
+@@ -232,27 +232,34 @@ interface IEnumNetworkConnections : IDispatch
+ ]
+ interface INetworkListManager : IDispatch
+ {
++    [id(1)]
+     HRESULT GetNetworks(
+         [in] NLM_ENUM_NETWORK Flags,
+         [out, retval] IEnumNetworks **ppEnumNetwork);
+ 
++    [id(2)]
+     HRESULT GetNetwork(
+         [in] GUID gdNetworkId,
+         [out, retval] INetwork **ppNetwork);
+ 
++    [id(3)]
+     HRESULT GetNetworkConnections(
+         [out, retval] IEnumNetworkConnections **ppEnum);
+ 
++    [id(4)]
+     HRESULT GetNetworkConnection(
+         [in] GUID gdNetworkConnectionId,
+         [out, retval] INetworkConnection **ppNetworkConnection);
+ 
++    [propget, id(5)]
+     HRESULT IsConnectedToInternet(
+         [out, retval] VARIANT_BOOL *pbIsConnected);
+ 
++    [propget, id(6)]
+     HRESULT IsConnected(
+         [out, retval] VARIANT_BOOL *pbIsConnected);
+ 
++    [id(7)]
+     HRESULT GetConnectivity(
+         [out, retval] NLM_CONNECTIVITY *pConnectivity);
+ }
