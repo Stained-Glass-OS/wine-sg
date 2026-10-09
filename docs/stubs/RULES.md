@@ -42,6 +42,29 @@ behaves. An Opus "integrator" merges your branch into main; you never push to ma
 - No VMs. Do not run release/release.sh. Never send email.
 - Memory: if `free -g` shows under 4 GB available, wait before building.
 
+## Build slots (MANDATORY since 2026-10-09: the host ran out of memory)
+- Run EVERY build (make, configure, full or partial) through
+  /var/tmp/stubs-common/buildslot.sh, e.g.
+  `/var/tmp/stubs-common/buildslot.sh make -j3 dlls/foo`. It allows at most 3
+  builds at once across all agents and waits for 5 GB of free memory.
+  Never run make directly, never above -j3 (integrator full builds: -j6).
+- Run Wine tests/gates one at a time per agent (no parallel test runs).
+- Gates must be light: probes run one at a time (at most 2 at once), each with
+  a timeout, small data (a few MB at most), and the gate's trap kills its
+  wineserver (`wineserver -k`) and anything it started, on every exit path. A
+  gate that ran ~40 probes of 64 MB at once took the host to 0 GB free
+  (2026-10-09). Never leave Xvfb, dbus-daemon, udevadm or wine processes behind.
+
+## Ground truth first (from drafter 2, 2026-10-09)
+- Before drafting a batch, look for todo_wine blocks in Wine's conformance tests
+  (dlls/*/tests/*.c) for your functions: they record Windows behaviour that
+  Wine's tests have verified on real Windows. Run that test first, implement
+  until the todo_wine checks pass, then remove those todo_wine marks in the same
+  patch. Prefer this over guessing from documentation, and don't "fix" what the
+  tests show Windows really does (e.g. an E_NOTIMPL that is correct).
+- When Windows requires a privilege for a call, enforce it
+  (ERROR_PRIVILEGE_NOT_HELD), don't leave it open.
+
 ## Your branch
 - A worktree of wine-sg on your own branch: `git -C /home/david/Stained-Glass-OS/wine-sg
   worktree add /var/tmp/drafter-N/wsg -b stubs-N origin/main` (first time), then push
