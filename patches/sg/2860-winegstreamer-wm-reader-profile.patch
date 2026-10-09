@@ -1,0 +1,1911 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winegstreamer: wm_reader profile and stream configuration (IWMProfile, IWMStreamConfig, IWMMediaProps, output props names, INSSBuffer::GetLength, mutual exclusion / bandwidth sharing / stream prioritization objects)
+
+Stubs of the sync reader's WMV objects, as the Windows Media Format SDK
+documents them:
+
+- String properties follow the SDK buffer protocol: a NULL buffer returns
+  the length needed (characters, NUL included), a short buffer returns it
+  with ASF_E_BUFFERTOOSMALL, a NULL length is E_INVALIDARG. Used by
+  IWMStreamConfig::Get/SetStreamName and Get/SetConnectionName,
+  IWMProfile::Get/SetName and Get/SetDescription,
+  IWMOutputMediaProps::GetStreamGroupName / GetConnectionName (an output of
+  a file reader has no group or connection: empty strings).
+- INSSBuffer::GetLength returns the current length.
+- IWMStreamConfig: stream number 1..63 (E_INVALIDARG otherwise), bitrate,
+  buffer window (-1 when unset), media type through IWMMediaProps
+  (GetType, SetMediaType, E_INVALIDARG for NULL or another major type).
+  A config is a copy: edits reach the profile with ReconfigStream.
+- IWMProfile of a reader: GetVersion, GetProfileID (GUID_NULL), storage
+  format (V1 default, MP3), RemoveStream / RemoveStreamByNumber
+  (NS_E_NO_STREAM when absent), AddStream (NS_E_INVALID_STREAM when the
+  number is taken), ReconfigStream, CreateNewStream (lowest free number),
+  GetExpectedPacketCount (bitrates over the duration in 3200-byte packets).
+  Only the profile view changes; the streams the reader delivers do not.
+- IWMMutualExclusion, IWMBandwidthSharing and IWMStreamPrioritization
+  objects with their profile Get/Add/Remove/CreateNew calls.
+  Removing a stream from the profile removes it from those lists.
+
+---
+diff --git a/dlls/winegstreamer/wm_reader.c b/dlls/winegstreamer/wm_reader.c
+index ce79aa0..549ee81 100644
+--- a/dlls/winegstreamer/wm_reader.c
++++ b/dlls/winegstreamer/wm_reader.c
+@@ -19,12 +19,34 @@
+ #include "gst_private.h"
+ #include "initguid.h"
+ #include "wmsdk.h"
++#include <math.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wmvcore);
+ 
++/* The profile view of a stream: the editable properties of an IWMStreamConfig.
++ * A reader's streams come from the file; the profile can additionally have
++ * streams removed, added and edited, which never affects what the reader
++ * delivers. */
++struct stream_attrs
++{
++    WCHAR *name, *connection;
++    DWORD bitrate, window;
++    bool window_set;
++    bool removed;
++    AM_MEDIA_TYPE *mt;  /* overrides the media type of the file's stream */
++};
++
++struct extra_stream
++{
++    WORD number;
++    GUID type;
++    struct stream_attrs attrs;
++};
++
+ struct wm_stream
+ {
+     struct wm_reader *reader;
++    struct stream_attrs attrs;
+     wg_parser_stream_t wg_stream;
+     struct wg_format format;
+     WMT_STREAM_SELECTION selection;
+@@ -66,8 +88,141 @@ struct wm_reader
+ 
+     struct wm_stream *streams;
+     WORD stream_count;
++
++    /* profile state */
++    struct extra_stream *extras;
++    unsigned int extra_count;
++    WCHAR *profile_name, *profile_description;
++    bool storage_mp3;
++    IWMMutualExclusion **mutexes;
++    unsigned int mutex_count;
++    IWMBandwidthSharing **sharings;
++    unsigned int sharing_count;
++    IWMStreamPrioritization *priorities;
+ };
+ 
++#define MAX_PROFILE_STREAM 63
++
++/* The Windows Media Format SDK string getters: a NULL buffer returns the
++ * length needed, in characters including the terminator; a short buffer
++ * returns that length with ASF_E_BUFFERTOOSMALL. */
++static HRESULT get_string_property(const WCHAR *str, WCHAR *out, DWORD *len)
++{
++    DWORD length = str ? wcslen(str) : 0;
++    DWORD size = length + 1;
++
++    if (!len)
++        return E_INVALIDARG;
++
++#ifdef SG_MUTANT_STRLEN
++    size--;
++#endif
++    if (!out)
++    {
++        *len = size;
++        return S_OK;
++    }
++    if (*len < size)
++    {
++        *len = size;
++        return ASF_E_BUFFERTOOSMALL;
++    }
++    if (length)
++        memcpy(out, str, length * sizeof(WCHAR));
++    out[length] = 0;
++    *len = size;
++    return S_OK;
++}
++
++static HRESULT get_string_property_word(const WCHAR *str, WCHAR *out, WORD *len)
++{
++    DWORD size;
++    HRESULT hr;
++
++    if (!len)
++        return E_INVALIDARG;
++    size = *len;
++    hr = get_string_property(str, out, &size);
++    if (hr == S_OK || hr == ASF_E_BUFFERTOOSMALL)
++        *len = min(size, 0xffff);
++    return hr;
++}
++
++static HRESULT set_string_property(WCHAR **dst, const WCHAR *src, size_t max)
++{
++    WCHAR *copy;
++
++    if (!src || wcslen(src) + 1 > max)
++        return E_INVALIDARG;
++    if (!(copy = wcsdup(src)))
++        return E_OUTOFMEMORY;
++    free(*dst);
++    *dst = copy;
++    return S_OK;
++}
++
++static void stream_attrs_clear(struct stream_attrs *attrs)
++{
++    free(attrs->name);
++    free(attrs->connection);
++    if (attrs->mt)
++    {
++        FreeMediaType(attrs->mt);
++        free(attrs->mt);
++    }
++    memset(attrs, 0, sizeof(*attrs));
++}
++
++static HRESULT stream_attrs_copy(struct stream_attrs *dst, const struct stream_attrs *src)
++{
++    struct stream_attrs tmp = *src;
++
++    tmp.name = tmp.connection = NULL;
++    tmp.mt = NULL;
++    tmp.removed = false;
++
++    if ((src->name && !(tmp.name = wcsdup(src->name)))
++            || (src->connection && !(tmp.connection = wcsdup(src->connection))))
++        goto fail;
++    if (src->mt)
++    {
++        if (!(tmp.mt = calloc(1, sizeof(*tmp.mt))))
++            goto fail;
++        if (FAILED(CopyMediaType(tmp.mt, src->mt)))
++        {
++            free(tmp.mt);
++            tmp.mt = NULL;
++            goto fail;
++        }
++    }
++
++    stream_attrs_clear(dst);
++    *dst = tmp;
++    return S_OK;
++
++fail:
++    stream_attrs_clear(&tmp);
++    return E_OUTOFMEMORY;
++}
++
++/* Copy a media type out through the buffer-size protocol shared by
++ * IWMMediaProps::GetMediaType and IWMOutputMediaProps::GetMediaType. */
++static HRESULT copy_wm_media_type(const AM_MEDIA_TYPE *src, WM_MEDIA_TYPE *mt, DWORD *size)
++{
++    const DWORD req_size = *size;
++
++    *size = sizeof(*mt) + src->cbFormat;
++    if (!mt)
++        return S_OK;
++    if (req_size < *size)
++        return ASF_E_BUFFERTOOSMALL;
++
++    memcpy(mt, src, sizeof(*mt));
++    memcpy(mt + 1, src->pbFormat, src->cbFormat);
++    mt->pbFormat = (BYTE *)(mt + 1);
++    return S_OK;
++}
++
+ static struct wm_stream *get_stream_by_output_number(struct wm_reader *reader, DWORD output)
+ {
+     if (output < reader->stream_count)
+@@ -180,14 +335,17 @@ static HRESULT WINAPI output_props_SetMediaType(IWMOutputMediaProps *iface, WM_M
+ 
+ static HRESULT WINAPI output_props_GetStreamGroupName(IWMOutputMediaProps *iface, WCHAR *name, WORD *len)
+ {
+-    FIXME("iface %p, name %p, len %p, stub!\n", iface, name, len);
+-    return E_NOTIMPL;
++    TRACE("iface %p, name %p, len %p.\n", iface, name, len);
++
++    /* An output of a file reader belongs to no named group. */
++    return get_string_property_word(NULL, name, len);
+ }
+ 
+ static HRESULT WINAPI output_props_GetConnectionName(IWMOutputMediaProps *iface, WCHAR *name, WORD *len)
+ {
+-    FIXME("iface %p, name %p, len %p, stub!\n", iface, name, len);
+-    return E_NOTIMPL;
++    TRACE("iface %p, name %p, len %p.\n", iface, name, len);
++
++    return get_string_property_word(NULL, name, len);
+ }
+ 
+ static const struct IWMOutputMediaPropsVtbl output_props_vtbl =
+@@ -287,8 +445,19 @@ static ULONG WINAPI buffer_Release(INSSBuffer *iface)
+ 
+ static HRESULT WINAPI buffer_GetLength(INSSBuffer *iface, DWORD *size)
+ {
+-    FIXME("iface %p, size %p, stub!\n", iface, size);
+-    return E_NOTIMPL;
++    struct buffer *buffer = impl_from_INSSBuffer(iface);
++
++    TRACE("iface %p, size %p.\n", iface, size);
++
++    if (!size)
++        return E_INVALIDARG;
++
++#ifdef SG_MUTANT_BUFLEN
++    *size = buffer->capacity;
++#else
++    *size = buffer->size;
++#endif
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI buffer_SetLength(INSSBuffer *iface, DWORD size)
+@@ -353,7 +522,11 @@ struct stream_config
+     IWMMediaProps IWMMediaProps_iface;
+     LONG refcount;
+ 
+-    const struct wm_stream *stream;
++    struct wm_reader *reader;
++    const struct wm_stream *stream;  /* NULL for a stream made by CreateNewStream */
++    WORD number;
++    GUID type;
++    struct stream_attrs attrs;
+ };
+ 
+ static struct stream_config *impl_from_IWMStreamConfig(IWMStreamConfig *iface)
+@@ -401,7 +574,8 @@ static ULONG WINAPI stream_config_Release(IWMStreamConfig *iface)
+ 
+     if (!refcount)
+     {
+-        IWMProfile3_Release(&config->stream->reader->IWMProfile3_iface);
++        stream_attrs_clear(&config->attrs);
++        IWMProfile3_Release(&config->reader->IWMProfile3_iface);
+         free(config);
+     }
+ 
+@@ -411,11 +585,17 @@ static ULONG WINAPI stream_config_Release(IWMStreamConfig *iface)
+ static HRESULT WINAPI stream_config_GetStreamType(IWMStreamConfig *iface, GUID *type)
+ {
+     struct stream_config *config = impl_from_IWMStreamConfig(iface);
+-    struct wm_reader *reader = config->stream->reader;
++    struct wm_reader *reader = config->reader;
+     AM_MEDIA_TYPE mt;
+ 
+     TRACE("config %p, type %p.\n", config, type);
+ 
++    if (!config->stream)
++    {
++        *type = config->type;
++        return S_OK;
++    }
++
+     EnterCriticalSection(&reader->cs);
+ 
+     if (!amt_from_wg_format(&mt, &config->stream->format, true))
+@@ -438,62 +618,107 @@ static HRESULT WINAPI stream_config_GetStreamNumber(IWMStreamConfig *iface, WORD
+ 
+     TRACE("config %p, number %p.\n", config, number);
+ 
+-    *number = config->stream->index + 1;
++    *number = config->number;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI stream_config_SetStreamNumber(IWMStreamConfig *iface, WORD number)
+ {
+-    FIXME("iface %p, number %u, stub!\n", iface, number);
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMStreamConfig(iface);
++
++    TRACE("iface %p, number %u.\n", iface, number);
++
++#ifdef SG_MUTANT_NUMRANGE
++    if (!number)
++#else
++    if (!number || number > MAX_PROFILE_STREAM)
++#endif
++        return E_INVALIDARG;
++
++    config->number = number;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI stream_config_GetStreamName(IWMStreamConfig *iface, WCHAR *name, WORD *len)
+ {
+-    FIXME("iface %p, name %p, len %p, stub!\n", iface, name, len);
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMStreamConfig(iface);
++
++    TRACE("iface %p, name %p, len %p.\n", iface, name, len);
++
++    return get_string_property_word(config->attrs.name, name, len);
+ }
+ 
+ static HRESULT WINAPI stream_config_SetStreamName(IWMStreamConfig *iface, const WCHAR *name)
+ {
+-    FIXME("iface %p, name %s, stub!\n", iface, debugstr_w(name));
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMStreamConfig(iface);
++
++    TRACE("iface %p, name %s.\n", iface, debugstr_w(name));
++
++    return set_string_property(&config->attrs.name, name, 0xffff);
+ }
+ 
+ static HRESULT WINAPI stream_config_GetConnectionName(IWMStreamConfig *iface, WCHAR *name, WORD *len)
+ {
+-    FIXME("iface %p, name %p, len %p, stub!\n", iface, name, len);
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMStreamConfig(iface);
++
++    TRACE("iface %p, name %p, len %p.\n", iface, name, len);
++
++    return get_string_property_word(config->attrs.connection, name, len);
+ }
+ 
+ static HRESULT WINAPI stream_config_SetConnectionName(IWMStreamConfig *iface, const WCHAR *name)
+ {
+-    FIXME("iface %p, name %s, stub!\n", iface, debugstr_w(name));
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMStreamConfig(iface);
++
++    TRACE("iface %p, name %s.\n", iface, debugstr_w(name));
++
++    return set_string_property(&config->attrs.connection, name, 0xffff);
+ }
+ 
+ static HRESULT WINAPI stream_config_GetBitrate(IWMStreamConfig *iface, DWORD *bitrate)
+ {
+-    FIXME("iface %p, bitrate %p, stub!\n", iface, bitrate);
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMStreamConfig(iface);
++
++    TRACE("iface %p, bitrate %p.\n", iface, bitrate);
++
++    if (!bitrate)
++        return E_INVALIDARG;
++    *bitrate = config->attrs.bitrate;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI stream_config_SetBitrate(IWMStreamConfig *iface, DWORD bitrate)
+ {
+-    FIXME("iface %p, bitrate %lu, stub!\n", iface, bitrate);
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMStreamConfig(iface);
++
++    TRACE("iface %p, bitrate %lu.\n", iface, bitrate);
++
++    config->attrs.bitrate = bitrate;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI stream_config_GetBufferWindow(IWMStreamConfig *iface, DWORD *window)
+ {
+-    FIXME("iface %p, window %p, stub!\n", iface, window);
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMStreamConfig(iface);
++
++    TRACE("iface %p, window %p.\n", iface, window);
++
++    if (!window)
++        return E_INVALIDARG;
++    /* -1 means that the stream has no buffer window of its own. */
++    *window = config->attrs.window_set ? config->attrs.window : ~0u;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI stream_config_SetBufferWindow(IWMStreamConfig *iface, DWORD window)
+ {
+-    FIXME("iface %p, window %lu, stub!\n", iface, window);
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMStreamConfig(iface);
++
++    TRACE("iface %p, window %lu.\n", iface, window);
++
++    config->attrs.window = window;
++    config->attrs.window_set = true;
++    return S_OK;
+ }
+ 
+ static const IWMStreamConfigVtbl stream_config_vtbl =
+@@ -539,45 +764,77 @@ static ULONG WINAPI stream_props_Release(IWMMediaProps *iface)
+ 
+ static HRESULT WINAPI stream_props_GetType(IWMMediaProps *iface, GUID *major_type)
+ {
+-    FIXME("iface %p, major_type %p, stub!\n", iface, major_type);
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMMediaProps(iface);
++
++    TRACE("iface %p, major_type %p.\n", iface, major_type);
++
++    if (!major_type)
++        return E_INVALIDARG;
++    return IWMStreamConfig_GetStreamType(&config->IWMStreamConfig_iface, major_type);
+ }
+ 
+ static HRESULT WINAPI stream_props_GetMediaType(IWMMediaProps *iface, WM_MEDIA_TYPE *mt, DWORD *size)
+ {
+     struct stream_config *config = impl_from_IWMMediaProps(iface);
+-    const struct wg_format *format;
++    const AM_MEDIA_TYPE *src;
+     struct wg_format codec_format;
+-    const DWORD req_size = *size;
++    const struct wg_format *format;
+     AM_MEDIA_TYPE stream_mt;
++    HRESULT hr;
+ 
+     TRACE("iface %p, mt %p, size %p.\n", iface, mt, size);
+ 
++    if (config->attrs.mt)
++    {
++        src = config->attrs.mt;
++        strmbase_dump_media_type(src);
++        return copy_wm_media_type(src, mt, size);
++    }
++
+     wg_parser_stream_get_codec_format(config->stream->wg_stream, &codec_format);
+     format = (codec_format.major_type != WG_MAJOR_TYPE_UNKNOWN) ? &codec_format : &config->stream->format;
+     if (!amt_from_wg_format(&stream_mt, format, true))
+         return E_OUTOFMEMORY;
+ 
+-    *size = sizeof(stream_mt) + stream_mt.cbFormat;
+-    if (mt && req_size >= *size)
+-    {
++    if (mt && *size >= sizeof(*mt) + stream_mt.cbFormat)
+         strmbase_dump_media_type(&stream_mt);
+-
+-        memcpy(mt, &stream_mt, sizeof(*mt));
+-        memcpy(mt + 1, stream_mt.pbFormat, stream_mt.cbFormat);
+-        mt->pbFormat = (BYTE *)(mt + 1);
+-    }
++    hr = copy_wm_media_type(&stream_mt, mt, size);
+     FreeMediaType(&stream_mt);
+-
+-    if (mt && req_size < *size)
+-        return ASF_E_BUFFERTOOSMALL;
+-    return S_OK;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI stream_props_SetMediaType(IWMMediaProps *iface, WM_MEDIA_TYPE *mt)
+ {
+-    FIXME("iface %p, mt %p, stub!\n", iface, mt);
+-    return E_NOTIMPL;
++    struct stream_config *config = impl_from_IWMMediaProps(iface);
++    AM_MEDIA_TYPE *copy;
++    GUID type;
++    HRESULT hr;
++
++    TRACE("iface %p, mt %p.\n", iface, mt);
++
++    if (!mt || (mt->cbFormat && !mt->pbFormat))
++        return E_INVALIDARG;
++
++    if (FAILED(hr = IWMStreamConfig_GetStreamType(&config->IWMStreamConfig_iface, &type)))
++        return hr;
++    if (!IsEqualGUID(&type, &mt->majortype))
++        return E_INVALIDARG;
++
++    if (!(copy = calloc(1, sizeof(*copy))))
++        return E_OUTOFMEMORY;
++    if (FAILED(hr = CopyMediaType(copy, (const AM_MEDIA_TYPE *)mt)))
++    {
++        free(copy);
++        return hr;
++    }
++
++    if (config->attrs.mt)
++    {
++        FreeMediaType(config->attrs.mt);
++        free(config->attrs.mt);
++    }
++    config->attrs.mt = copy;
++    return S_OK;
+ }
+ 
+ static const IWMMediaPropsVtbl stream_props_vtbl =
+@@ -675,261 +932,1243 @@ static DWORD CALLBACK read_thread(void *arg)
+     return 0;
+ }
+ 
+-static struct wm_reader *impl_from_IWMProfile3(IWMProfile3 *iface)
++/* Lists of stream numbers: the shared part of mutual exclusions and
++ * bandwidth sharing objects. */
++struct stream_list
+ {
+-    return CONTAINING_RECORD(iface, struct wm_reader, IWMProfile3_iface);
++    WORD *numbers;
++    WORD count;
++};
++
++static HRESULT stream_list_get(const struct stream_list *list, WORD *array, WORD *count)
++{
++    if (!count)
++        return E_INVALIDARG;
++    if (!array)
++    {
++        *count = list->count;
++        return S_OK;
++    }
++    if (*count < list->count)
++    {
++        *count = list->count;
++        return ASF_E_BUFFERTOOSMALL;
++    }
++    if (list->count)
++        memcpy(array, list->numbers, list->count * sizeof(*array));
++    *count = list->count;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI profile_QueryInterface(IWMProfile3 *iface, REFIID iid, void **out)
++static HRESULT stream_list_add(struct stream_list *list, WORD number)
+ {
+-    struct wm_reader *reader = impl_from_IWMProfile3(iface);
+-    return IUnknown_QueryInterface(reader->outer, iid, out);
++    WORD *numbers;
++    unsigned int i;
++
++    if (!number || number > MAX_PROFILE_STREAM)
++        return E_INVALIDARG;
++#ifndef SG_MUTANT_LISTDUP
++    for (i = 0; i < list->count; ++i)
++    {
++        if (list->numbers[i] == number)
++            return NS_E_INVALID_STREAM;
++    }
++#endif
++    if (!(numbers = realloc(list->numbers, (list->count + 1) * sizeof(*numbers))))
++        return E_OUTOFMEMORY;
++    list->numbers = numbers;
++    list->numbers[list->count++] = number;
++    return S_OK;
+ }
+ 
+-static ULONG WINAPI profile_AddRef(IWMProfile3 *iface)
++static HRESULT stream_list_remove(struct stream_list *list, WORD number)
+ {
+-    struct wm_reader *reader = impl_from_IWMProfile3(iface);
+-    return IUnknown_AddRef(reader->outer);
++    unsigned int i;
++
++    for (i = 0; i < list->count; ++i)
++    {
++        if (list->numbers[i] != number)
++            continue;
++        memmove(&list->numbers[i], &list->numbers[i + 1], (list->count - i - 1) * sizeof(*list->numbers));
++        --list->count;
++        return S_OK;
++    }
++    return NS_E_INVALID_STREAM;
+ }
+ 
+-static ULONG WINAPI profile_Release(IWMProfile3 *iface)
++/* WMMUTEX_Unknown and WMBandwidthSharing_Exclusive: the types of a freshly
++ * created object. The types are otherwise opaque and stored as given. */
++static const GUID mutex_type_unknown = {0xd6e22a03, 0x35da, 0x11d1, {0x90, 0x34, 0x00, 0xa0, 0xc9, 0x03, 0x49, 0xbe}};
++static const GUID sharing_type_exclusive = {0xaf6060aa, 0x5197, 0x11d2, {0xb6, 0xaf, 0x00, 0xc0, 0x4f, 0xd9, 0x08, 0xe9}};
++
++struct mutual_exclusion
+ {
+-    struct wm_reader *reader = impl_from_IWMProfile3(iface);
+-    return IUnknown_Release(reader->outer);
++    IWMMutualExclusion IWMMutualExclusion_iface;
++    LONG refcount;
++    GUID type;
++    struct stream_list list;
++};
++
++static struct mutual_exclusion *impl_from_IWMMutualExclusion(IWMMutualExclusion *iface)
++{
++    return CONTAINING_RECORD(iface, struct mutual_exclusion, IWMMutualExclusion_iface);
+ }
+ 
+-static HRESULT WINAPI profile_GetVersion(IWMProfile3 *iface, WMT_VERSION *version)
++static HRESULT WINAPI mutex_QueryInterface(IWMMutualExclusion *iface, REFIID iid, void **out)
+ {
+-    FIXME("iface %p, version %p, stub!\n", iface, version);
+-    return E_NOTIMPL;
++    struct mutual_exclusion *mutex = impl_from_IWMMutualExclusion(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IWMStreamList)
++            || IsEqualGUID(iid, &IID_IWMMutualExclusion))
++        *out = &mutex->IWMMutualExclusion_iface;
++    else
++    {
++        *out = NULL;
++        WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        return E_NOINTERFACE;
++    }
++
++    IUnknown_AddRef((IUnknown *)*out);
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI profile_GetName(IWMProfile3 *iface, WCHAR *name, DWORD *length)
++static ULONG WINAPI mutex_AddRef(IWMMutualExclusion *iface)
+ {
+-    FIXME("iface %p, name %p, length %p, stub!\n", iface, name, length);
+-    return E_NOTIMPL;
++    struct mutual_exclusion *mutex = impl_from_IWMMutualExclusion(iface);
++    return InterlockedIncrement(&mutex->refcount);
+ }
+ 
+-static HRESULT WINAPI profile_SetName(IWMProfile3 *iface, const WCHAR *name)
++static ULONG WINAPI mutex_Release(IWMMutualExclusion *iface)
+ {
+-    FIXME("iface %p, name %s, stub!\n", iface, debugstr_w(name));
+-    return E_NOTIMPL;
++    struct mutual_exclusion *mutex = impl_from_IWMMutualExclusion(iface);
++    ULONG refcount = InterlockedDecrement(&mutex->refcount);
++
++    if (!refcount)
++    {
++        free(mutex->list.numbers);
++        free(mutex);
++    }
++    return refcount;
+ }
+ 
+-static HRESULT WINAPI profile_GetDescription(IWMProfile3 *iface, WCHAR *description, DWORD *length)
++static HRESULT WINAPI mutex_GetStreams(IWMMutualExclusion *iface, WORD *numbers, WORD *count)
+ {
+-    FIXME("iface %p, description %p, length %p, stub!\n", iface, description, length);
+-    return E_NOTIMPL;
++    struct mutual_exclusion *mutex = impl_from_IWMMutualExclusion(iface);
++
++    TRACE("iface %p, numbers %p, count %p.\n", iface, numbers, count);
++
++    return stream_list_get(&mutex->list, numbers, count);
++}
++
++static HRESULT WINAPI mutex_AddStream(IWMMutualExclusion *iface, WORD number)
++{
++    struct mutual_exclusion *mutex = impl_from_IWMMutualExclusion(iface);
++
++    TRACE("iface %p, number %u.\n", iface, number);
++
++    return stream_list_add(&mutex->list, number);
++}
++
++static HRESULT WINAPI mutex_RemoveStream(IWMMutualExclusion *iface, WORD number)
++{
++    struct mutual_exclusion *mutex = impl_from_IWMMutualExclusion(iface);
++
++    TRACE("iface %p, number %u.\n", iface, number);
++
++    return stream_list_remove(&mutex->list, number);
++}
++
++static HRESULT WINAPI mutex_GetType(IWMMutualExclusion *iface, GUID *type)
++{
++    struct mutual_exclusion *mutex = impl_from_IWMMutualExclusion(iface);
++
++    TRACE("iface %p, type %p.\n", iface, type);
++
++    if (!type)
++        return E_INVALIDARG;
++    *type = mutex->type;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI profile_SetDescription(IWMProfile3 *iface, const WCHAR *description)
+-{
+-    FIXME("iface %p, description %s, stub!\n", iface, debugstr_w(description));
+-    return E_NOTIMPL;
++static HRESULT WINAPI mutex_SetType(IWMMutualExclusion *iface, REFGUID type)
++{
++    struct mutual_exclusion *mutex = impl_from_IWMMutualExclusion(iface);
++
++    TRACE("iface %p, type %s.\n", iface, debugstr_guid(type));
++
++    if (!type)
++        return E_INVALIDARG;
++    mutex->type = *type;
++    return S_OK;
++}
++
++static const IWMMutualExclusionVtbl mutex_vtbl =
++{
++    mutex_QueryInterface,
++    mutex_AddRef,
++    mutex_Release,
++    mutex_GetStreams,
++    mutex_AddStream,
++    mutex_RemoveStream,
++    mutex_GetType,
++    mutex_SetType,
++};
++
++struct bandwidth_sharing
++{
++    IWMBandwidthSharing IWMBandwidthSharing_iface;
++    LONG refcount;
++    GUID type;
++    DWORD bitrate, buffer;
++    struct stream_list list;
++};
++
++static struct bandwidth_sharing *impl_from_IWMBandwidthSharing(IWMBandwidthSharing *iface)
++{
++    return CONTAINING_RECORD(iface, struct bandwidth_sharing, IWMBandwidthSharing_iface);
++}
++
++static HRESULT WINAPI sharing_QueryInterface(IWMBandwidthSharing *iface, REFIID iid, void **out)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IWMStreamList)
++            || IsEqualGUID(iid, &IID_IWMBandwidthSharing))
++        *out = &sharing->IWMBandwidthSharing_iface;
++    else
++    {
++        *out = NULL;
++        WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        return E_NOINTERFACE;
++    }
++
++    IUnknown_AddRef((IUnknown *)*out);
++    return S_OK;
++}
++
++static ULONG WINAPI sharing_AddRef(IWMBandwidthSharing *iface)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++    return InterlockedIncrement(&sharing->refcount);
++}
++
++static ULONG WINAPI sharing_Release(IWMBandwidthSharing *iface)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++    ULONG refcount = InterlockedDecrement(&sharing->refcount);
++
++    if (!refcount)
++    {
++        free(sharing->list.numbers);
++        free(sharing);
++    }
++    return refcount;
++}
++
++static HRESULT WINAPI sharing_GetStreams(IWMBandwidthSharing *iface, WORD *numbers, WORD *count)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++
++    TRACE("iface %p, numbers %p, count %p.\n", iface, numbers, count);
++
++    return stream_list_get(&sharing->list, numbers, count);
++}
++
++static HRESULT WINAPI sharing_AddStream(IWMBandwidthSharing *iface, WORD number)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++
++    TRACE("iface %p, number %u.\n", iface, number);
++
++    return stream_list_add(&sharing->list, number);
++}
++
++static HRESULT WINAPI sharing_RemoveStream(IWMBandwidthSharing *iface, WORD number)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++
++    TRACE("iface %p, number %u.\n", iface, number);
++
++    return stream_list_remove(&sharing->list, number);
++}
++
++static HRESULT WINAPI sharing_GetType(IWMBandwidthSharing *iface, GUID *type)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++
++    TRACE("iface %p, type %p.\n", iface, type);
++
++    if (!type)
++        return E_INVALIDARG;
++    *type = sharing->type;
++    return S_OK;
++}
++
++static HRESULT WINAPI sharing_SetType(IWMBandwidthSharing *iface, REFGUID type)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++
++    TRACE("iface %p, type %s.\n", iface, debugstr_guid(type));
++
++    if (!type)
++        return E_INVALIDARG;
++    sharing->type = *type;
++    return S_OK;
++}
++
++static HRESULT WINAPI sharing_GetBandwidth(IWMBandwidthSharing *iface, DWORD *bitrate, DWORD *buffer)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++
++    TRACE("iface %p, bitrate %p, buffer %p.\n", iface, bitrate, buffer);
++
++    if (!bitrate || !buffer)
++        return E_INVALIDARG;
++    *bitrate = sharing->bitrate;
++    *buffer = sharing->buffer;
++    return S_OK;
++}
++
++static HRESULT WINAPI sharing_SetBandwidth(IWMBandwidthSharing *iface, DWORD bitrate, DWORD buffer)
++{
++    struct bandwidth_sharing *sharing = impl_from_IWMBandwidthSharing(iface);
++
++    TRACE("iface %p, bitrate %lu, buffer %lu.\n", iface, bitrate, buffer);
++
++    sharing->bitrate = bitrate;
++    sharing->buffer = buffer;
++    return S_OK;
++}
++
++static const IWMBandwidthSharingVtbl sharing_vtbl =
++{
++    sharing_QueryInterface,
++    sharing_AddRef,
++    sharing_Release,
++    sharing_GetStreams,
++    sharing_AddStream,
++    sharing_RemoveStream,
++    sharing_GetType,
++    sharing_SetType,
++    sharing_GetBandwidth,
++    sharing_SetBandwidth,
++};
++
++struct stream_priorities
++{
++    IWMStreamPrioritization IWMStreamPrioritization_iface;
++    LONG refcount;
++    WM_STREAM_PRIORITY_RECORD *records;
++    WORD count;
++};
++
++static struct stream_priorities *impl_from_IWMStreamPrioritization(IWMStreamPrioritization *iface)
++{
++    return CONTAINING_RECORD(iface, struct stream_priorities, IWMStreamPrioritization_iface);
++}
++
++static HRESULT WINAPI priorities_QueryInterface(IWMStreamPrioritization *iface, REFIID iid, void **out)
++{
++    struct stream_priorities *priorities = impl_from_IWMStreamPrioritization(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IWMStreamPrioritization))
++        *out = &priorities->IWMStreamPrioritization_iface;
++    else
++    {
++        *out = NULL;
++        WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        return E_NOINTERFACE;
++    }
++
++    IUnknown_AddRef((IUnknown *)*out);
++    return S_OK;
++}
++
++static ULONG WINAPI priorities_AddRef(IWMStreamPrioritization *iface)
++{
++    struct stream_priorities *priorities = impl_from_IWMStreamPrioritization(iface);
++    return InterlockedIncrement(&priorities->refcount);
++}
++
++static ULONG WINAPI priorities_Release(IWMStreamPrioritization *iface)
++{
++    struct stream_priorities *priorities = impl_from_IWMStreamPrioritization(iface);
++    ULONG refcount = InterlockedDecrement(&priorities->refcount);
++
++    if (!refcount)
++    {
++        free(priorities->records);
++        free(priorities);
++    }
++    return refcount;
++}
++
++static HRESULT WINAPI priorities_GetPriorityRecords(IWMStreamPrioritization *iface,
++        WM_STREAM_PRIORITY_RECORD *array, WORD *count)
++{
++    struct stream_priorities *priorities = impl_from_IWMStreamPrioritization(iface);
++
++    TRACE("iface %p, array %p, count %p.\n", iface, array, count);
++
++    if (!count)
++        return E_INVALIDARG;
++    if (!array)
++    {
++        *count = priorities->count;
++        return S_OK;
++    }
++    if (*count < priorities->count)
++    {
++        *count = priorities->count;
++        return ASF_E_BUFFERTOOSMALL;
++    }
++    if (priorities->count)
++        memcpy(array, priorities->records, priorities->count * sizeof(*array));
++    *count = priorities->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI priorities_SetPriorityRecords(IWMStreamPrioritization *iface,
++        WM_STREAM_PRIORITY_RECORD *array, WORD count)
++{
++    struct stream_priorities *priorities = impl_from_IWMStreamPrioritization(iface);
++    WM_STREAM_PRIORITY_RECORD *records = NULL;
++    unsigned int i, j;
++
++    TRACE("iface %p, array %p, count %u.\n", iface, array, count);
++
++    if (count && !array)
++        return E_INVALIDARG;
++    for (i = 0; i < count; ++i)
++    {
++        if (!array[i].wStreamNumber || array[i].wStreamNumber > MAX_PROFILE_STREAM)
++            return E_INVALIDARG;
++        for (j = 0; j < i; ++j)
++        {
++            if (array[j].wStreamNumber == array[i].wStreamNumber)
++                return E_INVALIDARG;
++        }
++    }
++
++    if (count)
++    {
++        if (!(records = malloc(count * sizeof(*records))))
++            return E_OUTOFMEMORY;
++        memcpy(records, array, count * sizeof(*records));
++    }
++    free(priorities->records);
++#ifdef SG_MUTANT_PRIOSTALE
++    if (priorities->count)
++    {
++        free(records);
++        return S_OK;
++    }
++#endif
++    priorities->records = records;
++    priorities->count = count;
++    return S_OK;
++}
++
++static const IWMStreamPrioritizationVtbl priorities_vtbl =
++{
++    priorities_QueryInterface,
++    priorities_AddRef,
++    priorities_Release,
++    priorities_GetPriorityRecords,
++    priorities_SetPriorityRecords,
++};
++
++/* The profile of a reader: the streams of the file, minus those removed,
++ * plus those added. Called with reader->cs held. */
++static struct stream_attrs *profile_entry(struct wm_reader *reader, DWORD index,
++        WORD *number, struct wm_stream **stream, struct extra_stream **extra)
++{
++    unsigned int i;
++
++    for (i = 0; i < reader->stream_count; ++i)
++    {
++        struct wm_stream *s = &reader->streams[i];
++
++        if (s->attrs.removed)
++            continue;
++        if (!index--)
++        {
++            *number = i + 1;
++            *stream = s;
++            *extra = NULL;
++            return &s->attrs;
++        }
++    }
++    for (i = 0; i < reader->extra_count; ++i)
++    {
++        struct extra_stream *e = &reader->extras[i];
++
++        if (!index--)
++        {
++            *number = e->number;
++            *stream = NULL;
++            *extra = e;
++            return &e->attrs;
++        }
++    }
++    return NULL;
++}
++
++static struct stream_attrs *profile_find(struct wm_reader *reader, WORD number,
++        struct wm_stream **stream, struct extra_stream **extra)
++{
++    struct stream_attrs *attrs;
++    WORD n;
++    DWORD i;
++
++    for (i = 0; (attrs = profile_entry(reader, i, &n, stream, extra)); ++i)
++    {
++        if (n == number)
++            return attrs;
++    }
++    return NULL;
++}
++
++static void profile_clear(struct wm_reader *reader)
++{
++    unsigned int i;
++
++    for (i = 0; i < reader->extra_count; ++i)
++        stream_attrs_clear(&reader->extras[i].attrs);
++    free(reader->extras);
++    free(reader->profile_name);
++    free(reader->profile_description);
++    for (i = 0; i < reader->mutex_count; ++i)
++        IWMMutualExclusion_Release(reader->mutexes[i]);
++    free(reader->mutexes);
++    for (i = 0; i < reader->sharing_count; ++i)
++        IWMBandwidthSharing_Release(reader->sharings[i]);
++    free(reader->sharings);
++    if (reader->priorities)
++        IWMStreamPrioritization_Release(reader->priorities);
++}
++
++static struct stream_config *unsafe_impl_from_IWMStreamConfig(IWMStreamConfig *iface)
++{
++    if (!iface || iface->lpVtbl != &stream_config_vtbl)
++        return NULL;
++    return impl_from_IWMStreamConfig(iface);
++}
++
++static HRESULT stream_config_create(struct wm_reader *reader, const struct wm_stream *stream,
++        WORD number, const GUID *type, const struct stream_attrs *attrs, struct stream_config **out)
++{
++    struct stream_config *object;
++    HRESULT hr;
++
++    if (!(object = calloc(1, sizeof(*object))))
++        return E_OUTOFMEMORY;
++
++    object->IWMStreamConfig_iface.lpVtbl = &stream_config_vtbl;
++    object->IWMMediaProps_iface.lpVtbl = &stream_props_vtbl;
++    object->refcount = 1;
++    object->reader = reader;
++    object->stream = stream;
++    object->number = number;
++    object->type = *type;
++    if (FAILED(hr = stream_attrs_copy(&object->attrs, attrs)))
++    {
++        free(object);
++        return hr;
++    }
++    IWMProfile3_AddRef(&reader->IWMProfile3_iface);
++
++    TRACE("Created stream config %p.\n", object);
++    *out = object;
++    return S_OK;
++}
++
++static void profile_forget_stream(struct wm_reader *reader, WORD number)
++{
++    unsigned int i;
++
++    for (i = 0; i < reader->mutex_count; ++i)
++        IWMMutualExclusion_RemoveStream(reader->mutexes[i], number);
++    for (i = 0; i < reader->sharing_count; ++i)
++        IWMBandwidthSharing_RemoveStream(reader->sharings[i], number);
++}
++
++static HRESULT profile_remove_stream(struct wm_reader *reader, WORD number)
++{
++    struct extra_stream *extra;
++    struct wm_stream *stream;
++    struct stream_attrs *attrs;
++
++    EnterCriticalSection(&reader->cs);
++
++    if (!(attrs = profile_find(reader, number, &stream, &extra)))
++    {
++        LeaveCriticalSection(&reader->cs);
++        return NS_E_NO_STREAM;
++    }
++
++#ifndef SG_MUTANT_REMOVE
++    if (stream)
++    {
++        stream_attrs_clear(attrs);
++        attrs->removed = true;
++    }
++    else
++    {
++        stream_attrs_clear(attrs);
++        memmove(extra, extra + 1, (&reader->extras[reader->extra_count] - (extra + 1)) * sizeof(*extra));
++        --reader->extra_count;
++    }
++    profile_forget_stream(reader, number);
++#endif
++
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
++}
++
++
++static struct wm_reader *impl_from_IWMProfile3(IWMProfile3 *iface)
++{
++    return CONTAINING_RECORD(iface, struct wm_reader, IWMProfile3_iface);
++}
++
++static HRESULT WINAPI profile_QueryInterface(IWMProfile3 *iface, REFIID iid, void **out)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    return IUnknown_QueryInterface(reader->outer, iid, out);
++}
++
++static ULONG WINAPI profile_AddRef(IWMProfile3 *iface)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    return IUnknown_AddRef(reader->outer);
++}
++
++static ULONG WINAPI profile_Release(IWMProfile3 *iface)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    return IUnknown_Release(reader->outer);
++}
++
++static HRESULT WINAPI profile_GetVersion(IWMProfile3 *iface, WMT_VERSION *version)
++{
++    TRACE("iface %p, version %p.\n", iface, version);
++
++    if (!version)
++        return E_INVALIDARG;
++    *version = WMT_VER_9_0;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_GetName(IWMProfile3 *iface, WCHAR *name, DWORD *length)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, name %p, length %p.\n", iface, name, length);
++
++    EnterCriticalSection(&reader->cs);
++    hr = get_string_property(reader->profile_name, name, length);
++    LeaveCriticalSection(&reader->cs);
++    return hr;
++}
++
++static HRESULT WINAPI profile_SetName(IWMProfile3 *iface, const WCHAR *name)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, name %s.\n", iface, debugstr_w(name));
++
++    EnterCriticalSection(&reader->cs);
++    hr = set_string_property(&reader->profile_name, name, ~0u);
++    LeaveCriticalSection(&reader->cs);
++    return hr;
++}
++
++static HRESULT WINAPI profile_GetDescription(IWMProfile3 *iface, WCHAR *description, DWORD *length)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, description %p, length %p.\n", iface, description, length);
++
++    EnterCriticalSection(&reader->cs);
++    hr = get_string_property(reader->profile_description, description, length);
++    LeaveCriticalSection(&reader->cs);
++    return hr;
++}
++
++static HRESULT WINAPI profile_SetDescription(IWMProfile3 *iface, const WCHAR *description)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, description %s.\n", iface, debugstr_w(description));
++
++    EnterCriticalSection(&reader->cs);
++    hr = set_string_property(&reader->profile_description, description, ~0u);
++    LeaveCriticalSection(&reader->cs);
++    return hr;
++}
++
++static HRESULT WINAPI profile_GetStreamCount(IWMProfile3 *iface, DWORD *count)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    struct wm_stream *stream;
++    struct extra_stream *extra;
++    WORD number;
++    DWORD n = 0;
++
++    TRACE("reader %p, count %p.\n", reader, count);
++
++    if (!count)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&reader->cs);
++    while (profile_entry(reader, n, &number, &stream, &extra))
++        ++n;
++    *count = n;
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_GetStream(IWMProfile3 *iface, DWORD index, IWMStreamConfig **config)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    struct stream_config *object;
++    struct extra_stream *extra;
++    struct wm_stream *stream;
++    struct stream_attrs *attrs;
++    WORD number;
++    HRESULT hr;
++
++    TRACE("reader %p, index %lu, config %p.\n", reader, index, config);
++
++    EnterCriticalSection(&reader->cs);
++
++    if (!(attrs = profile_entry(reader, index, &number, &stream, &extra)))
++    {
++        LeaveCriticalSection(&reader->cs);
++        WARN("Index %lu exceeds stream count; returning E_INVALIDARG.\n", index);
++        return E_INVALIDARG;
++    }
++
++    hr = stream_config_create(reader, stream, number, extra ? &extra->type : &GUID_NULL, attrs, &object);
++    LeaveCriticalSection(&reader->cs);
++    if (FAILED(hr))
++        return hr;
++
++    *config = &object->IWMStreamConfig_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_GetStreamByNumber(IWMProfile3 *iface, WORD stream_number, IWMStreamConfig **config)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    struct stream_config *object;
++    struct extra_stream *extra;
++    struct wm_stream *stream;
++    struct stream_attrs *attrs;
++    HRESULT hr;
++
++    TRACE("iface %p, stream_number %u, config %p.\n", iface, stream_number, config);
++
++    if (!stream_number)
++        return NS_E_NO_STREAM;
++
++    EnterCriticalSection(&reader->cs);
++
++    if (!(attrs = profile_find(reader, stream_number, &stream, &extra)))
++    {
++        LeaveCriticalSection(&reader->cs);
++        return NS_E_NO_STREAM;
++    }
++
++    hr = stream_config_create(reader, stream, stream_number, extra ? &extra->type : &GUID_NULL, attrs, &object);
++    LeaveCriticalSection(&reader->cs);
++    if (FAILED(hr))
++        return hr;
++
++    *config = &object->IWMStreamConfig_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_RemoveStream(IWMProfile3 *iface, IWMStreamConfig *config)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    struct stream_config *object = unsafe_impl_from_IWMStreamConfig(config);
++
++    TRACE("iface %p, config %p.\n", iface, config);
++
++    if (!object)
++        return E_INVALIDARG;
++    return profile_remove_stream(reader, object->number);
++}
++
++static HRESULT WINAPI profile_RemoveStreamByNumber(IWMProfile3 *iface, WORD stream_number)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++
++    TRACE("iface %p, stream_number %u.\n", iface, stream_number);
++
++    return profile_remove_stream(reader, stream_number);
++}
++
++static HRESULT WINAPI profile_AddStream(IWMProfile3 *iface, IWMStreamConfig *config)
++{
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    struct stream_config *object = unsafe_impl_from_IWMStreamConfig(config);
++    struct extra_stream *extras, *extra;
++    struct wm_stream *stream;
++    GUID type;
++    HRESULT hr;
++
++    TRACE("iface %p, config %p.\n", iface, config);
++
++    if (!object || !object->number || object->number > MAX_PROFILE_STREAM)
++        return E_INVALIDARG;
++    if (FAILED(hr = IWMStreamConfig_GetStreamType(config, &type)))
++        return hr;
++
++    EnterCriticalSection(&reader->cs);
++
++#ifndef SG_MUTANT_ADDDUP
++    if (profile_find(reader, object->number, &stream, &extra))
++    {
++        LeaveCriticalSection(&reader->cs);
++        return NS_E_INVALID_STREAM;
++    }
++#endif
++
++    if (!(extras = realloc(reader->extras, (reader->extra_count + 1) * sizeof(*extras))))
++    {
++        LeaveCriticalSection(&reader->cs);
++        return E_OUTOFMEMORY;
++    }
++    reader->extras = extras;
++    extra = &extras[reader->extra_count];
++    memset(extra, 0, sizeof(*extra));
++    if (FAILED(hr = stream_attrs_copy(&extra->attrs, &object->attrs)))
++    {
++        LeaveCriticalSection(&reader->cs);
++        return hr;
++    }
++    extra->number = object->number;
++    extra->type = type;
++    ++reader->extra_count;
++
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI profile_GetStreamCount(IWMProfile3 *iface, DWORD *count)
++static HRESULT WINAPI profile_ReconfigStream(IWMProfile3 *iface, IWMStreamConfig *config)
+ {
+     struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    struct stream_config *object = unsafe_impl_from_IWMStreamConfig(config);
++    struct extra_stream *extra;
++    struct wm_stream *stream;
++    struct stream_attrs *attrs;
++    HRESULT hr = S_OK;
+ 
+-    TRACE("reader %p, count %p.\n", reader, count);
++    TRACE("iface %p, config %p.\n", iface, config);
+ 
+-    if (!count)
++    if (!object)
+         return E_INVALIDARG;
+ 
+     EnterCriticalSection(&reader->cs);
+-    *count = reader->stream_count;
++    if (!(attrs = profile_find(reader, object->number, &stream, &extra)))
++        hr = NS_E_NO_STREAM;
++#ifndef SG_MUTANT_NORECONFIG
++    else
++        hr = stream_attrs_copy(attrs, &object->attrs);
++#endif
+     LeaveCriticalSection(&reader->cs);
+-    return S_OK;
++    return hr;
+ }
+ 
+-static HRESULT WINAPI profile_GetStream(IWMProfile3 *iface, DWORD index, IWMStreamConfig **config)
++static HRESULT WINAPI profile_CreateNewStream(IWMProfile3 *iface, REFGUID type, IWMStreamConfig **config)
+ {
+     struct wm_reader *reader = impl_from_IWMProfile3(iface);
+     struct stream_config *object;
++    struct stream_attrs attrs = {0};
++    struct extra_stream *extra;
++    struct wm_stream *stream;
++    HRESULT hr;
++    WORD number;
+ 
+-    TRACE("reader %p, index %lu, config %p.\n", reader, index, config);
++    TRACE("iface %p, type %s, config %p.\n", iface, debugstr_guid(type), config);
++
++    if (!type || !config || IsEqualGUID(type, &GUID_NULL))
++        return E_INVALIDARG;
+ 
+     EnterCriticalSection(&reader->cs);
+ 
+-    if (index >= reader->stream_count)
++    /* The new stream gets the lowest number not in use. */
++    for (number = 1; number <= MAX_PROFILE_STREAM; ++number)
++    {
++        if (!profile_find(reader, number, &stream, &extra))
++            break;
++    }
++    if (number > MAX_PROFILE_STREAM)
+     {
+         LeaveCriticalSection(&reader->cs);
+-        WARN("Index %lu exceeds stream count %u; returning E_INVALIDARG.\n", index, reader->stream_count);
+-        return E_INVALIDARG;
++        return E_FAIL;
+     }
+ 
+-    if (!(object = calloc(1, sizeof(*object))))
++    if (!(attrs.mt = calloc(1, sizeof(*attrs.mt))))
+     {
+         LeaveCriticalSection(&reader->cs);
+         return E_OUTOFMEMORY;
+     }
++    attrs.mt->majortype = *type;
+ 
+-    object->IWMStreamConfig_iface.lpVtbl = &stream_config_vtbl;
+-    object->IWMMediaProps_iface.lpVtbl = &stream_props_vtbl;
+-    object->refcount = 1;
+-    object->stream = &reader->streams[index];
+-    IWMProfile3_AddRef(&reader->IWMProfile3_iface);
+-
++    hr = stream_config_create(reader, NULL, number, type, &attrs, &object);
++    free(attrs.mt);
+     LeaveCriticalSection(&reader->cs);
++    if (FAILED(hr))
++        return hr;
+ 
+-    TRACE("Created stream config %p.\n", object);
+     *config = &object->IWMStreamConfig_iface;
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI profile_GetStreamByNumber(IWMProfile3 *iface, WORD stream_number, IWMStreamConfig **config)
++static HRESULT WINAPI profile_GetMutualExclusionCount(IWMProfile3 *iface, DWORD *count)
+ {
+-    HRESULT hr;
+-
+-    TRACE("iface %p, stream_number %u, config %p.\n", iface, stream_number, config);
+-
+-    if (!stream_number)
+-        return NS_E_NO_STREAM;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
+ 
+-    hr = profile_GetStream(iface, stream_number - 1, config);
+-    if (hr == E_INVALIDARG)
+-        hr = NS_E_NO_STREAM;
++    TRACE("iface %p, count %p.\n", iface, count);
+ 
+-    return hr;
++    if (!count)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    *count = reader->mutex_count;
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI profile_RemoveStream(IWMProfile3 *iface, IWMStreamConfig *config)
++static HRESULT WINAPI profile_GetMutualExclusion(IWMProfile3 *iface, DWORD index, IWMMutualExclusion **excl)
+ {
+-    FIXME("iface %p, config %p, stub!\n", iface, config);
+-    return E_NOTIMPL;
+-}
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    HRESULT hr = S_OK;
+ 
+-static HRESULT WINAPI profile_RemoveStreamByNumber(IWMProfile3 *iface, WORD stream_number)
+-{
+-    FIXME("iface %p, stream_number %u, stub!\n", iface, stream_number);
+-    return E_NOTIMPL;
+-}
++    TRACE("iface %p, index %lu, excl %p.\n", iface, index, excl);
+ 
+-static HRESULT WINAPI profile_AddStream(IWMProfile3 *iface, IWMStreamConfig *config)
+-{
+-    FIXME("iface %p, config %p, stub!\n", iface, config);
+-    return E_NOTIMPL;
++    if (!excl)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    if (index >= reader->mutex_count)
++        hr = E_INVALIDARG;
++    else
++    {
++        *excl = reader->mutexes[index];
++        IWMMutualExclusion_AddRef(*excl);
++    }
++    LeaveCriticalSection(&reader->cs);
++    return hr;
+ }
+ 
+-static HRESULT WINAPI profile_ReconfigStream(IWMProfile3 *iface, IWMStreamConfig *config)
++static HRESULT WINAPI profile_RemoveMutualExclusion(IWMProfile3 *iface, IWMMutualExclusion *excl)
+ {
+-    FIXME("iface %p, config %p, stub!\n", iface, config);
+-    return E_NOTIMPL;
+-}
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    unsigned int i;
+ 
+-static HRESULT WINAPI profile_CreateNewStream(IWMProfile3 *iface, REFGUID type, IWMStreamConfig **config)
+-{
+-    FIXME("iface %p, type %s, config %p, stub!\n", iface, debugstr_guid(type), config);
+-    return E_NOTIMPL;
+-}
++    TRACE("iface %p, excl %p.\n", iface, excl);
+ 
+-static HRESULT WINAPI profile_GetMutualExclusionCount(IWMProfile3 *iface, DWORD *count)
+-{
+-    FIXME("iface %p, count %p, stub!\n", iface, count);
+-    return E_NOTIMPL;
++    if (!excl)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    for (i = 0; i < reader->mutex_count; ++i)
++    {
++        if (reader->mutexes[i] != excl)
++            continue;
++        memmove(&reader->mutexes[i], &reader->mutexes[i + 1],
++                (reader->mutex_count - i - 1) * sizeof(*reader->mutexes));
++        --reader->mutex_count;
++        LeaveCriticalSection(&reader->cs);
++        IWMMutualExclusion_Release(excl);
++        return S_OK;
++    }
++    LeaveCriticalSection(&reader->cs);
++    return E_INVALIDARG;
+ }
+ 
+-static HRESULT WINAPI profile_GetMutualExclusion(IWMProfile3 *iface, DWORD index, IWMMutualExclusion **excl)
++static HRESULT WINAPI profile_AddMutualExclusion(IWMProfile3 *iface, IWMMutualExclusion *excl)
+ {
+-    FIXME("iface %p, index %lu, excl %p, stub!\n", iface, index, excl);
+-    return E_NOTIMPL;
+-}
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    IWMMutualExclusion **mutexes;
+ 
+-static HRESULT WINAPI profile_RemoveMutualExclusion(IWMProfile3 *iface, IWMMutualExclusion *excl)
+-{
+-    FIXME("iface %p, excl %p, stub!\n", iface, excl);
+-    return E_NOTIMPL;
+-}
++    TRACE("iface %p, excl %p.\n", iface, excl);
+ 
+-static HRESULT WINAPI profile_AddMutualExclusion(IWMProfile3 *iface, IWMMutualExclusion *excl)
+-{
+-    FIXME("iface %p, excl %p, stub!\n", iface, excl);
+-    return E_NOTIMPL;
++    if (!excl)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    if (!(mutexes = realloc(reader->mutexes, (reader->mutex_count + 1) * sizeof(*mutexes))))
++    {
++        LeaveCriticalSection(&reader->cs);
++        return E_OUTOFMEMORY;
++    }
++    reader->mutexes = mutexes;
++    IWMMutualExclusion_AddRef(excl);
++    reader->mutexes[reader->mutex_count++] = excl;
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_CreateNewMutualExclusion(IWMProfile3 *iface, IWMMutualExclusion **excl)
+ {
+-    FIXME("iface %p, excl %p, stub!\n", iface, excl);
+-    return E_NOTIMPL;
++    struct mutual_exclusion *object;
++
++    TRACE("iface %p, excl %p.\n", iface, excl);
++
++    if (!excl)
++        return E_INVALIDARG;
++    if (!(object = calloc(1, sizeof(*object))))
++        return E_OUTOFMEMORY;
++    object->IWMMutualExclusion_iface.lpVtbl = &mutex_vtbl;
++    object->refcount = 1;
++    object->type = mutex_type_unknown;
++    *excl = &object->IWMMutualExclusion_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_GetProfileID(IWMProfile3 *iface, GUID *id)
+ {
+-    FIXME("iface %p, id %p, stub!\n", iface, id);
+-    return E_NOTIMPL;
++    TRACE("iface %p, id %p.\n", iface, id);
++
++    if (!id)
++        return E_INVALIDARG;
++    /* A profile read from a file is not one of the system profiles. */
++    *id = GUID_NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_GetStorageFormat(IWMProfile3 *iface, WMT_STORAGE_FORMAT *format)
+ {
+-    FIXME("iface %p, format %p, stub!\n", iface, format);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++
++    TRACE("iface %p, format %p.\n", iface, format);
++
++    if (!format)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    *format = reader->storage_mp3 ? WMT_Storage_Format_MP3 : WMT_Storage_Format_V1;
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_SetStorageFormat(IWMProfile3 *iface, WMT_STORAGE_FORMAT format)
+ {
+-    FIXME("iface %p, format %#x, stub!\n", iface, format);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++
++    TRACE("iface %p, format %#x.\n", iface, format);
++
++    if (format != WMT_Storage_Format_MP3 && format != WMT_Storage_Format_V1)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    reader->storage_mp3 = format == WMT_Storage_Format_MP3;
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_GetBandwidthSharingCount(IWMProfile3 *iface, DWORD *count)
+ {
+-    FIXME("iface %p, count %p, stub!\n", iface, count);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++
++    TRACE("iface %p, count %p.\n", iface, count);
++
++    if (!count)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    *count = reader->sharing_count;
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_GetBandwidthSharing(IWMProfile3 *iface, DWORD index, IWMBandwidthSharing **sharing)
+ {
+-    FIXME("iface %p, index %lu, sharing %p, stub!\n", iface, index, sharing);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, index %lu, sharing %p.\n", iface, index, sharing);
++
++    if (!sharing)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    if (index >= reader->sharing_count)
++        hr = E_INVALIDARG;
++    else
++    {
++        *sharing = reader->sharings[index];
++        IWMBandwidthSharing_AddRef(*sharing);
++    }
++    LeaveCriticalSection(&reader->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI profile_RemoveBandwidthSharing( IWMProfile3 *iface, IWMBandwidthSharing *sharing)
+ {
+-    FIXME("iface %p, sharing %p, stub!\n", iface, sharing);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    unsigned int i;
++
++    TRACE("iface %p, sharing %p.\n", iface, sharing);
++
++    if (!sharing)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    for (i = 0; i < reader->sharing_count; ++i)
++    {
++        if (reader->sharings[i] != sharing)
++            continue;
++        memmove(&reader->sharings[i], &reader->sharings[i + 1],
++                (reader->sharing_count - i - 1) * sizeof(*reader->sharings));
++        --reader->sharing_count;
++        LeaveCriticalSection(&reader->cs);
++        IWMBandwidthSharing_Release(sharing);
++        return S_OK;
++    }
++    LeaveCriticalSection(&reader->cs);
++    return E_INVALIDARG;
+ }
+ 
+ static HRESULT WINAPI profile_AddBandwidthSharing(IWMProfile3 *iface, IWMBandwidthSharing *sharing)
+ {
+-    FIXME("iface %p, sharing %p, stub!\n", iface, sharing);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    IWMBandwidthSharing **sharings;
++
++    TRACE("iface %p, sharing %p.\n", iface, sharing);
++
++    if (!sharing)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    if (!(sharings = realloc(reader->sharings, (reader->sharing_count + 1) * sizeof(*sharings))))
++    {
++        LeaveCriticalSection(&reader->cs);
++        return E_OUTOFMEMORY;
++    }
++    reader->sharings = sharings;
++    IWMBandwidthSharing_AddRef(sharing);
++    reader->sharings[reader->sharing_count++] = sharing;
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_CreateNewBandwidthSharing( IWMProfile3 *iface, IWMBandwidthSharing **sharing)
+ {
+-    FIXME("iface %p, sharing %p, stub!\n", iface, sharing);
+-    return E_NOTIMPL;
++    struct bandwidth_sharing *object;
++
++    TRACE("iface %p, sharing %p.\n", iface, sharing);
++
++    if (!sharing)
++        return E_INVALIDARG;
++    if (!(object = calloc(1, sizeof(*object))))
++        return E_OUTOFMEMORY;
++    object->IWMBandwidthSharing_iface.lpVtbl = &sharing_vtbl;
++    object->refcount = 1;
++    object->type = sharing_type_exclusive;
++    *sharing = &object->IWMBandwidthSharing_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_GetStreamPrioritization(IWMProfile3 *iface, IWMStreamPrioritization **stream)
+ {
+-    FIXME("iface %p, stream %p, stub!\n", iface, stream);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, stream %p.\n", iface, stream);
++
++    if (!stream)
++        return E_INVALIDARG;
++    EnterCriticalSection(&reader->cs);
++    if ((*stream = reader->priorities))
++        IWMStreamPrioritization_AddRef(*stream);
++    else
++        hr = S_FALSE;
++    LeaveCriticalSection(&reader->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI profile_SetStreamPrioritization(IWMProfile3 *iface, IWMStreamPrioritization *stream)
+ {
+-    FIXME("iface %p, stream %p, stub!\n", iface, stream);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    IWMStreamPrioritization *old;
++
++    TRACE("iface %p, stream %p.\n", iface, stream);
++
++    if (!stream)
++        return E_INVALIDARG;
++    IWMStreamPrioritization_AddRef(stream);
++    EnterCriticalSection(&reader->cs);
++    old = reader->priorities;
++    reader->priorities = stream;
++    LeaveCriticalSection(&reader->cs);
++    if (old)
++        IWMStreamPrioritization_Release(old);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_RemoveStreamPrioritization(IWMProfile3 *iface)
+ {
+-    FIXME("iface %p, stub!\n", iface);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    IWMStreamPrioritization *old;
++
++    TRACE("iface %p.\n", iface);
++
++    EnterCriticalSection(&reader->cs);
++    old = reader->priorities;
++    reader->priorities = NULL;
++    LeaveCriticalSection(&reader->cs);
++    if (old)
++        IWMStreamPrioritization_Release(old);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_CreateNewStreamPrioritization(IWMProfile3 *iface, IWMStreamPrioritization **stream)
+ {
+-    FIXME("iface %p, stream %p, stub!\n", iface, stream);
+-    return E_NOTIMPL;
++    struct stream_priorities *object;
++
++    TRACE("iface %p, stream %p.\n", iface, stream);
++
++    if (!stream)
++        return E_INVALIDARG;
++    if (!(object = calloc(1, sizeof(*object))))
++        return E_OUTOFMEMORY;
++    object->IWMStreamPrioritization_iface.lpVtbl = &priorities_vtbl;
++    object->refcount = 1;
++    *stream = &object->IWMStreamPrioritization_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI profile_GetExpectedPacketCount(IWMProfile3 *iface, QWORD duration, QWORD *count)
+ {
+-    FIXME("iface %p, duration %s, count %p, stub!\n", iface, debugstr_time(duration), count);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMProfile3(iface);
++    struct extra_stream *extra;
++    struct wm_stream *stream;
++    struct stream_attrs *attrs;
++    double bytes = 0;
++    WORD number;
++    DWORD i;
++
++    TRACE("iface %p, duration %s, count %p.\n", iface, debugstr_time(duration), count);
++
++    if (!count)
++        return E_INVALIDARG;
++
++    /* The bytes the streams' bitrates produce over the duration, in packets
++     * of the 3200 bytes that are the usual packet size of a file. */
++    EnterCriticalSection(&reader->cs);
++    for (i = 0; (attrs = profile_entry(reader, i, &number, &stream, &extra)); ++i)
++        bytes += attrs->bitrate / 8.0 * (duration / 10000000.0);
++    LeaveCriticalSection(&reader->cs);
++
++    *count = (QWORD)ceil(bytes / 3200.0);
++    return S_OK;
+ }
+ 
+ static const IWMProfile3Vtbl profile_vtbl =
+@@ -1856,6 +3095,7 @@ static ULONG WINAPI unknown_inner_Release(IUnknown *iface)
+         reader->shutdown_cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&reader->shutdown_cs);
+ 
++        profile_clear(reader);
+         free(reader);
+     }
+ 
+@@ -1895,6 +3135,7 @@ static ULONG WINAPI reader_Release(IWMSyncReader2 *iface)
+ static HRESULT WINAPI reader_Close(IWMSyncReader2 *iface)
+ {
+     struct wm_reader *reader = impl_from_IWMSyncReader2(iface);
++    unsigned int i;
+ 
+     TRACE("reader %p.\n", reader);
+ 
+@@ -1916,6 +3157,8 @@ static HRESULT WINAPI reader_Close(IWMSyncReader2 *iface)
+     reader->read_thread = NULL;
+ 
+     destroy_stream(reader);
++    for (i = 0; i < reader->stream_count; ++i)
++        stream_attrs_clear(&reader->streams[i].attrs);
+     wg_parser_destroy(reader->wg_parser);
+     reader->wg_parser = 0;
+ 

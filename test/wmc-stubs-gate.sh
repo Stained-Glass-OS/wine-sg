@@ -1,0 +1,44 @@
+#!/bin/sh
+. "$(dirname "$0")/scratch-home.sh"
+# windows.media.mediacontrol (patches/sg/2820), on Xvfb: test/wmc-stubs-probe.c
+# asks the SystemMediaTransportControls factory, a control made for a window,
+# its display updater, the music properties and the Genres list (the
+# IVector<HSTRING> it hands out, its view and iterator) for their IInspectable
+# contract, their defaults, their round-trips, the event registrations, and
+# ClearAll. These were FIXME stubs returning E_NOTIMPL.
+#
+#   WINE=/opt/wine-sg/bin/wine test/wmc-stubs-gate.sh
+#   WINESERVER=... when it is not beside $WINE (a build tree)
+# Mutants (windows.media.mediacontrol, -DSG_MUTANT_x): MC_IIDS (GetIids drops an
+# interface), MC_TRUST (PartialTrust), MC_ALBUM_ARTIST (AlbumArtist writes
+# Artist), MC_EVENT_REMOVE (a removed handler stays), MC_CLEARALL (ClearAll does
+# nothing), MC_CHANGED_STATE (iterators ignore changes to the list).
+set -u
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+WINE="${WINE:-/opt/wine-sg/bin/wine}"
+WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
+[ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
+MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
+command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW not installed"; exit 77; }
+command -v xvfb-run >/dev/null || { echo "SKIP: needs xvfb-run"; exit 77; }
+[ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
+T=$(mktemp -d /var/tmp/sg-wmcstubs.XXXXXX)
+export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
+cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
+trap cleanup EXIT INT TERM
+TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/wmc-stubs-probe.exe" "$HERE/wmc-stubs-probe.c" -lole32 -lruntimeobject -luuid \
+    || { echo "FAIL  probe did not build"; exit 1; }
+mkdir -p "$WINEPREFIX"
+timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
+"$WINESERVER" -w
+cp "$T/wmc-stubs-probe.exe" "$WINEPREFIX/drive_c/"
+cat > "$T/run.sh" <<EOS
+#!/bin/sh
+cd "$WINEPREFIX/drive_c"
+timeout -s KILL 180 "$WINE" wmc-stubs-probe.exe 2>/dev/null </dev/null | tr -d '\r' > "$T/probe.out"
+EOS
+chmod +x "$T/run.sh"
+timeout -s KILL 300 xvfb-run -a -s '-screen 0 1024x768x24' "$T/run.sh"
+cat "$T/probe.out"
+grep -qx 'RESULT: PASS' "$T/probe.out" && exit 0
+exit 1
