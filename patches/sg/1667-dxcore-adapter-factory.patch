@@ -1,0 +1,905 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dxcore: adapter factory, lists and adapters over DXGI
+
+DXCoreCreateAdapterFactory was a stub that returned E_NOINTERFACE, so
+everything built on DXCore -- DirectML, ONNX Runtime and Windows ML
+device selection, PyTorch's DirectML backend, programs choosing a GPU for
+compute -- found no adapter.
+
+- The factory is one object per process. CreateAdapterList gives the
+  adapters with every attribute asked for: Direct3D 11 graphics (all of
+  DXGI's adapters), Direct3D 12 graphics and core compute (where d3d12
+  can make a device for the adapter, asked once); no attributes is
+  E_INVALIDARG. GetAdapterByLuid; event registration for list-stale,
+  adapter-removed and budget events (kept; adapters do not come and go
+  while a process runs here).
+- Adapter lists: GetAdapter, GetAdapterCount, IsStale (the adapters DXGI
+  has now against the list's), Sort by Hardware, MinimumPower and
+  HighPerformance (stable, first deciding preference wins),
+  IsAdapterPreferenceSupported, GetFactory.
+- An adapter is the same object however it is found. Its properties:
+  instance LUID, driver version (the user-mode driver's), description,
+  hardware ID and its parts, kernel driver model (from D3DKMT, else
+  WDDM 2.6), preemption granularity (DMA buffer), dedicated adapter and
+  system memory, shared memory, ACG compatible, hardware, integrated,
+  detachable; sizes, too-small buffers (E_INVALIDARG) and unknown
+  properties (DXGI_ERROR_INVALID_CALL) as documented. QueryState: the
+  memory budget of a node's local or non-local segments
+  (IDXGIAdapter3::QueryVideoMemoryInfo) and driver updates (none); no
+  state can be set.
+
+Gate: test/dxcore-gate.sh (Xvfb, test/dxcore-probe.c).
+Mutants SG_MUTANT_NO_D3D12_ATTRIBUTE, SG_MUTANT_NEW_ADAPTER
+(dxcore/main.c).
+---
+--- a/dlls/dxcore/Makefile.in
++++ b/dlls/dxcore/Makefile.in
+@@ -1,4 +1,5 @@
+ MODULE = dxcore.dll
++IMPORTS = dxgi gdi32 uuid
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+--- a/dlls/dxcore/main.c
++++ b/dlls/dxcore/main.c
+@@ -1,5 +1,7 @@
+ /*
+- * Copyright (C) 2023 Mohamad Al-Jaf
++ * DXCore: graphics and compute adapter enumeration
++ *
++ * Copyright 2026 Stained Glass OS
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -16,13 +18,849 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++/* Stained Glass OS 1667. The adapters are DXGI's: each one's description,
++ * driver version, memory and memory budget come from its IDXGIAdapter;
++ * Direct3D 12 support is asked of d3d12 (D3D12CreateDevice without a
++ * device) once per adapter. The factory is one object per process, as the
++ * documentation says, and an adapter is the same object however it is
++ * found. */
++
++#define COBJMACROS
++#include <stdarg.h>
++#include <stdbool.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "initguid.h"
++#include "dxgi1_6.h"
++#include "d3dcommon.h"
+ #include "dxcore.h"
++#include "ddk/d3dkmthk.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dxcore);
+ 
+-HRESULT WINAPI DXCoreCreateAdapterFactory( REFIID riid, void **ppv )
++#define MAX_ADAPTERS 16
++
++struct adapter
++{
++    IDXCoreAdapter IDXCoreAdapter_iface;
++    LONG ref;
++    struct factory *factory;
++    LUID luid;
++    DXGI_ADAPTER_DESC1 desc;
++    LARGE_INTEGER umd_version;
++    BOOL has_umd_version;
++    int d3d12;              /* -1 not asked yet, 0 no, 1 yes */
++    BOOL removed;
++};
++
++struct adapter_list
++{
++    IDXCoreAdapterList IDXCoreAdapterList_iface;
++    LONG ref;
++    struct factory *factory;
++    struct adapter *adapters[MAX_ADAPTERS];
++    UINT count;
++    LUID luids[MAX_ADAPTERS];   /* what there was when made (IsStale) */
++    UINT nluids;
++};
++
++struct registration
++{
++    uint32_t cookie;
++    IUnknown *object;
++    DXCoreNotificationType type;
++    PFN_DXCORE_NOTIFICATION_CALLBACK callback;
++    void *context;
++};
++
++struct factory
++{
++    IDXCoreAdapterFactory IDXCoreAdapterFactory_iface;
++    LONG ref;
++    CRITICAL_SECTION cs;
++    struct adapter *adapters[MAX_ADAPTERS];   /* every adapter seen, kept */
++    UINT count;
++    struct registration *registrations;
++    UINT nregistrations;
++    uint32_t next_cookie;
++};
++
++static struct factory *the_factory;
++static CRITICAL_SECTION factory_cs;
++static CRITICAL_SECTION_DEBUG factory_cs_debug =
++{
++    0, 0, &factory_cs,
++    { &factory_cs_debug.ProcessLocksList, &factory_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": factory_cs") }
++};
++static CRITICAL_SECTION factory_cs = { &factory_cs_debug, -1, 0, 0, 0, 0 };
++
++static inline struct adapter *impl_from_IDXCoreAdapter( IDXCoreAdapter *iface )
++{
++    return CONTAINING_RECORD( iface, struct adapter, IDXCoreAdapter_iface );
++}
++
++static inline struct adapter_list *impl_from_IDXCoreAdapterList( IDXCoreAdapterList *iface )
++{
++    return CONTAINING_RECORD( iface, struct adapter_list, IDXCoreAdapterList_iface );
++}
++
++static inline struct factory *impl_from_IDXCoreAdapterFactory( IDXCoreAdapterFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct factory, IDXCoreAdapterFactory_iface );
++}
++
++static BOOL luid_equal( const LUID *a, const LUID *b )
++{
++    return a->LowPart == b->LowPart && a->HighPart == b->HighPart;
++}
++
++/* the adapter of DXGI's with the LUID, or NULL */
++static IDXGIAdapter1 *dxgi_adapter( const LUID *luid )
+ {
+-    FIXME( "riid %s, ppv %p stub!\n", debugstr_guid(riid), ppv );
++    IDXGIFactory1 *factory;
++    IDXGIAdapter1 *adapter = NULL, *found = NULL;
++    DXGI_ADAPTER_DESC1 desc;
++    UINT i;
++
++    if (FAILED(CreateDXGIFactory1( &IID_IDXGIFactory1, (void **)&factory ))) return NULL;
++    for (i = 0; !found && IDXGIFactory1_EnumAdapters1( factory, i, &adapter ) == S_OK; i++)
++    {
++        if (SUCCEEDED(IDXGIAdapter1_GetDesc1( adapter, &desc )) && luid_equal( &desc.AdapterLuid, luid ))
++            found = adapter;
++        else IDXGIAdapter1_Release( adapter );
++    }
++    IDXGIFactory1_Release( factory );
++    return found;
++}
++
++/* the LUIDs DXGI has now */
++static UINT current_luids( LUID *luids, UINT max )
++{
++    IDXGIFactory1 *factory;
++    IDXGIAdapter1 *adapter;
++    DXGI_ADAPTER_DESC1 desc;
++    UINT i, n = 0;
++
++    if (FAILED(CreateDXGIFactory1( &IID_IDXGIFactory1, (void **)&factory ))) return 0;
++    for (i = 0; n < max && IDXGIFactory1_EnumAdapters1( factory, i, &adapter ) == S_OK; i++)
++    {
++        if (SUCCEEDED(IDXGIAdapter1_GetDesc1( adapter, &desc ))) luids[n++] = desc.AdapterLuid;
++        IDXGIAdapter1_Release( adapter );
++    }
++    IDXGIFactory1_Release( factory );
++    return n;
++}
++
++static BOOL adapter_is_integrated( const struct adapter *adapter )
++{
++    /* the iGPUs: Intel's, and the ones whose memory is the system's */
++    return adapter->desc.VendorId == 0x8086 ||
++           (adapter->desc.DedicatedVideoMemory < 128 * 1024 * 1024 && adapter->desc.SharedSystemMemory);
++}
++
++static BOOL adapter_is_hardware( const struct adapter *adapter )
++{
++    return !(adapter->desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
++}
++
++static BOOL adapter_supports_d3d12( struct adapter *adapter )
++{
++    static HRESULT (WINAPI *create_device)( IUnknown *, D3D_FEATURE_LEVEL, REFIID, void ** );
++    IDXGIAdapter1 *dxgi;
++
++    if (adapter->d3d12 >= 0) return adapter->d3d12;
++    adapter->d3d12 = 0;
++    if (!create_device)
++    {
++        HMODULE d3d12 = LoadLibraryW( L"d3d12.dll" );
++        if (d3d12) create_device = (void *)GetProcAddress( d3d12, "D3D12CreateDevice" );
++    }
++    if (create_device && (dxgi = dxgi_adapter( &adapter->luid )))
++    {
++        /* no device: only whether one could be made */
++        adapter->d3d12 = SUCCEEDED(create_device( (IUnknown *)dxgi, D3D_FEATURE_LEVEL_11_0, &IID_IUnknown, NULL ));
++        IDXGIAdapter1_Release( dxgi );
++    }
++    return adapter->d3d12;
++}
++
++static BOOL adapter_has_attribute( struct adapter *adapter, const GUID *attribute )
++{
++    if (IsEqualGUID( attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS )) return TRUE;
++    if (IsEqualGUID( attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS ) ||
++        IsEqualGUID( attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE ))
++    {
++#ifdef SG_MUTANT_NO_D3D12_ATTRIBUTE
++        return FALSE;
++#endif
++        return adapter_supports_d3d12( adapter );
++    }
++    return FALSE;
++}
++
++/* ---- IDXCoreAdapter ---------------------------------------------------------- */
++
++static HRESULT WINAPI adapter_QueryInterface( IDXCoreAdapter *iface, REFIID riid, void **out )
++{
++    TRACE( "iface %p, riid %s, out %p.\n", iface, debugstr_guid( riid ), out );
++
++    if (!out) return E_POINTER;
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IDXCoreAdapter ))
++    {
++        *out = iface;
++        iface->lpVtbl->AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
+     return E_NOINTERFACE;
+ }
++
++static ULONG WINAPI adapter_AddRef( IDXCoreAdapter *iface )
++{
++    struct adapter *adapter = impl_from_IDXCoreAdapter( iface );
++    return InterlockedIncrement( &adapter->ref );
++}
++
++/* the factory keeps its adapters: their own count only says who uses them */
++static ULONG WINAPI adapter_Release( IDXCoreAdapter *iface )
++{
++    struct adapter *adapter = impl_from_IDXCoreAdapter( iface );
++    return InterlockedDecrement( &adapter->ref );
++}
++
++static BOOL WINAPI adapter_IsValid( IDXCoreAdapter *iface )
++{
++    struct adapter *adapter = impl_from_IDXCoreAdapter( iface );
++    IDXGIAdapter1 *dxgi;
++
++    TRACE( "iface %p.\n", iface );
++
++    if (adapter->removed) return FALSE;
++    if (!(dxgi = dxgi_adapter( &adapter->luid )))
++    {
++        adapter->removed = TRUE;
++        return FALSE;
++    }
++    IDXGIAdapter1_Release( dxgi );
++    return TRUE;
++}
++
++static BOOL WINAPI adapter_IsAttributeSupported( IDXCoreAdapter *iface, REFGUID attribute )
++{
++    struct adapter *adapter = impl_from_IDXCoreAdapter( iface );
++
++    TRACE( "iface %p, attribute %s.\n", iface, debugstr_guid( attribute ) );
++    return attribute && adapter_has_attribute( adapter, attribute );
++}
++
++static size_t property_size( struct adapter *adapter, DXCoreAdapterProperty property )
++{
++    switch (property)
++    {
++    case InstanceLuid: return sizeof(LUID);
++    case DriverVersion: return adapter->has_umd_version ? sizeof(uint64_t) : 0;
++    case DriverDescription: return WideCharToMultiByte( CP_ACP, 0, adapter->desc.Description, -1, NULL, 0, NULL, NULL );
++    case HardwareID: return sizeof(DXCoreHardwareID);
++    case KmdModelVersion: return sizeof(uint32_t);
++    case ComputePreemptionGranularity: return sizeof(uint16_t);
++    case GraphicsPreemptionGranularity: return sizeof(uint16_t);
++    case DedicatedAdapterMemory:
++    case DedicatedSystemMemory:
++    case SharedSystemMemory: return sizeof(uint64_t);
++    case AcgCompatible:
++    case IsHardware:
++    case IsIntegrated:
++    case IsDetachable: return sizeof(bool);
++    case HardwareIDParts: return sizeof(DXCoreHardwareIDParts);
++    default: return 0;
++    }
++}
++
++static BOOL WINAPI adapter_IsPropertySupported( IDXCoreAdapter *iface, DXCoreAdapterProperty property )
++{
++    struct adapter *adapter = impl_from_IDXCoreAdapter( iface );
++
++    TRACE( "iface %p, property %u.\n", iface, property );
++    return property_size( adapter, property ) != 0;
++}
++
++static uint32_t kmd_version( struct adapter *adapter )
++{
++    D3DKMT_OPENADAPTERFROMLUID open = {0};
++    D3DKMT_QUERYADAPTERINFO query = {0};
++    D3DKMT_CLOSEADAPTER close = {0};
++    uint32_t version = 2600;   /* WDDM 2.6 */
++
++    open.AdapterLuid = adapter->luid;
++    if (!D3DKMTOpenAdapterFromLuid( &open ))
++    {
++        query.hAdapter = open.hAdapter;
++        query.Type = KMTQAITYPE_DRIVERVERSION;
++        query.pPrivateDriverData = &version;
++        query.PrivateDriverDataSize = sizeof(version);
++        if (D3DKMTQueryAdapterInfo( &query )) version = 2600;
++        close.hAdapter = open.hAdapter;
++        D3DKMTCloseAdapter( &close );
++    }
++    return version;
++}
++
++static HRESULT WINAPI adapter_GetProperty( IDXCoreAdapter *iface, DXCoreAdapterProperty property, size_t size,
++                                           void *buffer )
++{
++    struct adapter *adapter = impl_from_IDXCoreAdapter( iface );
++    size_t need = property_size( adapter, property );
++
++    TRACE( "iface %p, property %u, size %Iu, buffer %p.\n", iface, property, size, buffer );
++
++    if (!need) return DXGI_ERROR_INVALID_CALL;
++    if (!buffer) return E_POINTER;
++    if (size < need) return E_INVALIDARG;
++    switch (property)
++    {
++    case InstanceLuid:
++        *(LUID *)buffer = adapter->luid;
++        break;
++    case DriverVersion:
++        *(uint64_t *)buffer = adapter->umd_version.QuadPart;
++        break;
++    case DriverDescription:
++        WideCharToMultiByte( CP_ACP, 0, adapter->desc.Description, -1, buffer, need, NULL, NULL );
++        break;
++    case HardwareID:
++    {
++        DXCoreHardwareID *id = buffer;
++        id->vendorID = adapter->desc.VendorId;
++        id->deviceID = adapter->desc.DeviceId;
++        id->subSysID = adapter->desc.SubSysId;
++        id->revision = adapter->desc.Revision;
++        break;
++    }
++    case KmdModelVersion:
++        *(uint32_t *)buffer = kmd_version( adapter );
++        break;
++    case ComputePreemptionGranularity:
++    case GraphicsPreemptionGranularity:
++        /* between DMA buffers: what every driver can do */
++        *(uint16_t *)buffer = 100;
++        break;
++    case DedicatedAdapterMemory:
++        *(uint64_t *)buffer = adapter->desc.DedicatedVideoMemory;
++        break;
++    case DedicatedSystemMemory:
++        *(uint64_t *)buffer = adapter->desc.DedicatedSystemMemory;
++        break;
++    case SharedSystemMemory:
++        *(uint64_t *)buffer = adapter->desc.SharedSystemMemory;
++        break;
++    case AcgCompatible:
++        *(bool *)buffer = true;
++        break;
++    case IsHardware:
++        *(bool *)buffer = adapter_is_hardware( adapter );
++        break;
++    case IsIntegrated:
++        *(bool *)buffer = adapter_is_integrated( adapter );
++        break;
++    case IsDetachable:
++        *(bool *)buffer = false;
++        break;
++    case HardwareIDParts:
++    {
++        DXCoreHardwareIDParts *parts = buffer;
++        parts->vendorID = adapter->desc.VendorId;
++        parts->deviceID = adapter->desc.DeviceId;
++        parts->subSystemID = adapter->desc.SubSysId >> 16;
++        parts->subVendorID = adapter->desc.SubSysId & 0xffff;
++        parts->revisionID = adapter->desc.Revision;
++        break;
++    }
++    default:
++        return DXGI_ERROR_INVALID_CALL;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI adapter_GetPropertySize( IDXCoreAdapter *iface, DXCoreAdapterProperty property, size_t *size )
++{
++    struct adapter *adapter = impl_from_IDXCoreAdapter( iface );
++
++    TRACE( "iface %p, property %u, size %p.\n", iface, property, size );
++
++    if (!size) return E_POINTER;
++    if (!(*size = property_size( adapter, property ))) return DXGI_ERROR_INVALID_CALL;
++    return S_OK;
++}
++
++static BOOL WINAPI adapter_IsQueryStateSupported( IDXCoreAdapter *iface, DXCoreAdapterState state )
++{
++    TRACE( "iface %p, state %u.\n", iface, state );
++    return state == IsDriverUpdateInProgress || state == AdapterMemoryBudget;
++}
++
++static HRESULT WINAPI adapter_QueryState( IDXCoreAdapter *iface, DXCoreAdapterState state, size_t details_size,
++                                          const void *details, size_t size, void *buffer )
++{
++    struct adapter *adapter = impl_from_IDXCoreAdapter( iface );
++
++    TRACE( "iface %p, state %u, details_size %Iu, details %p, size %Iu, buffer %p.\n", iface, state, details_size,
++           details, size, buffer );
++
++    if (!buffer) return E_POINTER;
++    switch (state)
++    {
++    case IsDriverUpdateInProgress:
++        if (size < sizeof(bool)) return E_INVALIDARG;
++        *(bool *)buffer = false;
++        return S_OK;
++    case AdapterMemoryBudget:
++    {
++        const DXCoreAdapterMemoryBudgetNodeSegmentGroup *group = details;
++        DXCoreAdapterMemoryBudget *budget = buffer;
++        DXGI_QUERY_VIDEO_MEMORY_INFO info;
++        IDXGIAdapter3 *dxgi3;
++        IDXGIAdapter1 *dxgi;
++        HRESULT hr;
++
++        if (!details) return E_POINTER;
++        if (details_size < sizeof(*group) || size < sizeof(*budget)) return E_INVALIDARG;
++        if (!(dxgi = dxgi_adapter( &adapter->luid ))) return DXGI_ERROR_DEVICE_REMOVED;
++        hr = IDXGIAdapter1_QueryInterface( dxgi, &IID_IDXGIAdapter3, (void **)&dxgi3 );
++        IDXGIAdapter1_Release( dxgi );
++        if (FAILED(hr)) return DXGI_ERROR_UNSUPPORTED;
++        hr = IDXGIAdapter3_QueryVideoMemoryInfo( dxgi3, group->nodeIndex, group->segmentGroup == NonLocal ?
++                                                 DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL : DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
++                                                 &info );
++        IDXGIAdapter3_Release( dxgi3 );
++        if (FAILED(hr)) return hr;
++        budget->budget = info.Budget;
++        budget->currentUsage = info.CurrentUsage;
++        budget->availableForReservation = info.AvailableForReservation;
++        budget->currentReservation = info.CurrentReservation;
++        return S_OK;
++    }
++    default:
++        return DXGI_ERROR_UNSUPPORTED;
++    }
++}
++
++static BOOL WINAPI adapter_IsSetStateSupported( IDXCoreAdapter *iface, DXCoreAdapterState state )
++{
++    TRACE( "iface %p, state %u.\n", iface, state );
++    return FALSE;
++}
++
++static HRESULT WINAPI adapter_SetState( IDXCoreAdapter *iface, DXCoreAdapterState state, size_t details_size,
++                                        const void *details, size_t size, const void *buffer )
++{
++    TRACE( "iface %p, state %u, details_size %Iu, details %p, size %Iu, buffer %p.\n", iface, state, details_size,
++           details, size, buffer );
++    /* no adapter state can be set (IsSetStateSupported) */
++    return DXGI_ERROR_UNSUPPORTED;
++}
++
++static HRESULT WINAPI adapter_GetFactory( IDXCoreAdapter *iface, REFIID riid, void **out )
++{
++    struct adapter *adapter = impl_from_IDXCoreAdapter( iface );
++
++    TRACE( "iface %p, riid %s, out %p.\n", iface, debugstr_guid( riid ), out );
++
++    return adapter->factory->IDXCoreAdapterFactory_iface.lpVtbl->QueryInterface( &adapter->factory->IDXCoreAdapterFactory_iface,
++                                                                                riid, out );
++}
++
++static const IDXCoreAdapterVtbl adapter_vtbl =
++{
++    adapter_QueryInterface,
++    adapter_AddRef,
++    adapter_Release,
++    adapter_IsValid,
++    adapter_IsAttributeSupported,
++    adapter_IsPropertySupported,
++    adapter_GetProperty,
++    adapter_GetPropertySize,
++    adapter_IsQueryStateSupported,
++    adapter_QueryState,
++    adapter_IsSetStateSupported,
++    adapter_SetState,
++    adapter_GetFactory,
++};
++
++/* the factory's adapter for a DXGI adapter, made the first time */
++static struct adapter *factory_adapter( struct factory *factory, IDXGIAdapter1 *dxgi )
++{
++    DXGI_ADAPTER_DESC1 desc;
++    struct adapter *adapter;
++    UINT i;
++
++    if (FAILED(IDXGIAdapter1_GetDesc1( dxgi, &desc ))) return NULL;
++#ifndef SG_MUTANT_NEW_ADAPTER
++    for (i = 0; i < factory->count; i++)
++        if (luid_equal( &factory->adapters[i]->luid, &desc.AdapterLuid )) return factory->adapters[i];
++#endif
++    if (factory->count == MAX_ADAPTERS || !(adapter = calloc( 1, sizeof(*adapter) ))) return NULL;
++    adapter->IDXCoreAdapter_iface.lpVtbl = &adapter_vtbl;
++    adapter->factory = factory;
++    adapter->luid = desc.AdapterLuid;
++    adapter->desc = desc;
++    adapter->d3d12 = -1;
++    adapter->has_umd_version = SUCCEEDED(IDXGIAdapter1_CheckInterfaceSupport( dxgi, &IID_IDXGIDevice,
++                                                                             &adapter->umd_version ));
++    factory->adapters[factory->count++] = adapter;
++    return adapter;
++}
++
++/* ---- IDXCoreAdapterList ---------------------------------------------------- */
++
++static HRESULT WINAPI list_QueryInterface( IDXCoreAdapterList *iface, REFIID riid, void **out )
++{
++    TRACE( "iface %p, riid %s, out %p.\n", iface, debugstr_guid( riid ), out );
++
++    if (!out) return E_POINTER;
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IDXCoreAdapterList ))
++    {
++        *out = iface;
++        iface->lpVtbl->AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI list_AddRef( IDXCoreAdapterList *iface )
++{
++    return InterlockedIncrement( &impl_from_IDXCoreAdapterList( iface )->ref );
++}
++
++static ULONG WINAPI list_Release( IDXCoreAdapterList *iface )
++{
++    struct adapter_list *list = impl_from_IDXCoreAdapterList( iface );
++    ULONG ref = InterlockedDecrement( &list->ref );
++    UINT i;
++
++    if (!ref)
++    {
++        for (i = 0; i < list->count; i++)
++            list->adapters[i]->IDXCoreAdapter_iface.lpVtbl->Release( &list->adapters[i]->IDXCoreAdapter_iface );
++        list->factory->IDXCoreAdapterFactory_iface.lpVtbl->Release( &list->factory->IDXCoreAdapterFactory_iface );
++        free( list );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI list_GetAdapter( IDXCoreAdapterList *iface, uint32_t index, REFIID riid, void **out )
++{
++    struct adapter_list *list = impl_from_IDXCoreAdapterList( iface );
++
++    TRACE( "iface %p, index %u, riid %s, out %p.\n", iface, index, debugstr_guid( riid ), out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (index >= list->count) return E_INVALIDARG;
++    return adapter_QueryInterface( &list->adapters[index]->IDXCoreAdapter_iface, riid, out );
++}
++
++static uint32_t WINAPI list_GetAdapterCount( IDXCoreAdapterList *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return impl_from_IDXCoreAdapterList( iface )->count;
++}
++
++static BOOL WINAPI list_IsStale( IDXCoreAdapterList *iface )
++{
++    struct adapter_list *list = impl_from_IDXCoreAdapterList( iface );
++    LUID now[MAX_ADAPTERS];
++    UINT n, i;
++
++    TRACE( "iface %p.\n", iface );
++
++    n = current_luids( now, MAX_ADAPTERS );
++    if (n != list->nluids) return TRUE;
++    for (i = 0; i < n; i++) if (!luid_equal( &now[i], &list->luids[i] )) return TRUE;
++    return FALSE;
++}
++
++static HRESULT WINAPI list_GetFactory( IDXCoreAdapterList *iface, REFIID riid, void **out )
++{
++    struct adapter_list *list = impl_from_IDXCoreAdapterList( iface );
++
++    TRACE( "iface %p, riid %s, out %p.\n", iface, debugstr_guid( riid ), out );
++    return list->factory->IDXCoreAdapterFactory_iface.lpVtbl->QueryInterface( &list->factory->IDXCoreAdapterFactory_iface,
++                                                                             riid, out );
++}
++
++/* is a before b for the preference? 0: no opinion */
++static int prefer( struct adapter *a, struct adapter *b, DXCoreAdapterPreference preference )
++{
++    BOOL ia, ib;
++
++    switch (preference)
++    {
++    case Hardware:
++        ia = adapter_is_hardware( a );
++        ib = adapter_is_hardware( b );
++        return ia == ib ? 0 : ia ? -1 : 1;
++    case MinimumPower:
++        ia = adapter_is_integrated( a );
++        ib = adapter_is_integrated( b );
++        return ia == ib ? 0 : ia ? -1 : 1;
++    case HighPerformance:
++        ia = adapter_is_integrated( a );
++        ib = adapter_is_integrated( b );
++        if (ia != ib) return ia ? 1 : -1;
++        if (a->desc.DedicatedVideoMemory != b->desc.DedicatedVideoMemory)
++            return a->desc.DedicatedVideoMemory > b->desc.DedicatedVideoMemory ? -1 : 1;
++        return 0;
++    default:
++        return 0;
++    }
++}
++
++static HRESULT WINAPI list_Sort( IDXCoreAdapterList *iface, uint32_t count, const DXCoreAdapterPreference *preferences )
++{
++    struct adapter_list *list = impl_from_IDXCoreAdapterList( iface );
++    UINT i, j, k;
++
++    TRACE( "iface %p, count %u, preferences %p.\n", iface, count, preferences );
++
++    if (!count) return E_INVALIDARG;
++    if (!preferences) return E_POINTER;
++    for (k = 0; k < count; k++)
++        if (preferences[k] > HighPerformance) return E_INVALIDARG;
++    /* a stable insertion sort: the first preference that tells them apart decides */
++    for (i = 1; i < list->count; i++)
++    {
++        struct adapter *cur = list->adapters[i];
++        for (j = i; j > 0; j--)
++        {
++            int order = 0;
++            for (k = 0; k < count && !order; k++) order = prefer( cur, list->adapters[j - 1], preferences[k] );
++            if (order >= 0) break;
++            list->adapters[j] = list->adapters[j - 1];
++        }
++        list->adapters[j] = cur;
++    }
++    return S_OK;
++}
++
++static BOOL WINAPI list_IsAdapterPreferenceSupported( IDXCoreAdapterList *iface, DXCoreAdapterPreference preference )
++{
++    TRACE( "iface %p, preference %u.\n", iface, preference );
++    return preference <= HighPerformance;
++}
++
++static const IDXCoreAdapterListVtbl list_vtbl =
++{
++    list_QueryInterface,
++    list_AddRef,
++    list_Release,
++    list_GetAdapter,
++    list_GetAdapterCount,
++    list_IsStale,
++    list_GetFactory,
++    list_Sort,
++    list_IsAdapterPreferenceSupported,
++};
++
++/* ---- IDXCoreAdapterFactory ---------------------------------------------------- */
++
++static HRESULT WINAPI factory_QueryInterface( IDXCoreAdapterFactory *iface, REFIID riid, void **out )
++{
++    TRACE( "iface %p, riid %s, out %p.\n", iface, debugstr_guid( riid ), out );
++
++    if (!out) return E_POINTER;
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IDXCoreAdapterFactory ))
++    {
++        *out = iface;
++        iface->lpVtbl->AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IDXCoreAdapterFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_IDXCoreAdapterFactory( iface )->ref );
++}
++
++/* the factory lives as long as the process: DXCoreCreateAdapterFactory
++ * hands out this one */
++static ULONG WINAPI factory_Release( IDXCoreAdapterFactory *iface )
++{
++    return InterlockedDecrement( &impl_from_IDXCoreAdapterFactory( iface )->ref );
++}
++
++static HRESULT WINAPI factory_CreateAdapterList( IDXCoreAdapterFactory *iface, uint32_t count, const GUID *attributes,
++                                                 REFIID riid, void **out )
++{
++    struct factory *factory = impl_from_IDXCoreAdapterFactory( iface );
++    IDXGIFactory1 *dxgi_factory;
++    IDXGIAdapter1 *dxgi;
++    struct adapter_list *list;
++    struct adapter *adapter;
++    HRESULT hr;
++    UINT i, k;
++
++    TRACE( "iface %p, count %u, attributes %p, riid %s, out %p.\n", iface, count, attributes, debugstr_guid( riid ), out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (!count || !attributes) return E_INVALIDARG;
++    if (FAILED(hr = CreateDXGIFactory1( &IID_IDXGIFactory1, (void **)&dxgi_factory ))) return hr;
++    if (!(list = calloc( 1, sizeof(*list) )))
++    {
++        IDXGIFactory1_Release( dxgi_factory );
++        return E_OUTOFMEMORY;
++    }
++    list->IDXCoreAdapterList_iface.lpVtbl = &list_vtbl;
++    list->ref = 1;
++    list->factory = factory;
++    iface->lpVtbl->AddRef( iface );
++    EnterCriticalSection( &factory->cs );
++    for (i = 0; list->count < MAX_ADAPTERS && IDXGIFactory1_EnumAdapters1( dxgi_factory, i, &dxgi ) == S_OK; i++)
++    {
++        if ((adapter = factory_adapter( factory, dxgi )))
++        {
++            list->luids[list->nluids++] = adapter->luid;
++            for (k = 0; k < count; k++) if (!adapter_has_attribute( adapter, &attributes[k] )) break;
++            if (k == count)
++            {
++                adapter->IDXCoreAdapter_iface.lpVtbl->AddRef( &adapter->IDXCoreAdapter_iface );
++                list->adapters[list->count++] = adapter;
++            }
++        }
++        IDXGIAdapter1_Release( dxgi );
++    }
++    LeaveCriticalSection( &factory->cs );
++    IDXGIFactory1_Release( dxgi_factory );
++    hr = list_QueryInterface( &list->IDXCoreAdapterList_iface, riid, out );
++    list_Release( &list->IDXCoreAdapterList_iface );
++    return hr;
++}
++
++static HRESULT WINAPI factory_GetAdapterByLuid( IDXCoreAdapterFactory *iface, REFLUID luid, REFIID riid, void **out )
++{
++    struct factory *factory = impl_from_IDXCoreAdapterFactory( iface );
++    struct adapter *adapter = NULL;
++    IDXGIAdapter1 *dxgi;
++
++    TRACE( "iface %p, luid %p, riid %s, out %p.\n", iface, luid, debugstr_guid( riid ), out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (!luid) return E_INVALIDARG;
++    if (!(dxgi = dxgi_adapter( luid ))) return E_INVALIDARG;
++    EnterCriticalSection( &factory->cs );
++    adapter = factory_adapter( factory, dxgi );
++    LeaveCriticalSection( &factory->cs );
++    IDXGIAdapter1_Release( dxgi );
++    if (!adapter) return E_OUTOFMEMORY;
++    return adapter_QueryInterface( &adapter->IDXCoreAdapter_iface, riid, out );
++}
++
++static BOOL WINAPI factory_IsNotificationTypeSupported( IDXCoreAdapterFactory *iface, DXCoreNotificationType type )
++{
++    TRACE( "iface %p, type %u.\n", iface, type );
++    return type == AdapterListStale || type == AdapterNoLongerValid || type == AdapterBudgetChange;
++}
++
++/* the events are kept: adapters do not come and go while a process runs
++ * here, and budgets are asked for (QueryState), so none is sent */
++static HRESULT WINAPI factory_RegisterEventNotification( IDXCoreAdapterFactory *iface, IUnknown *object,
++                                                         DXCoreNotificationType type,
++                                                         PFN_DXCORE_NOTIFICATION_CALLBACK callback, void *context,
++                                                         uint32_t *cookie )
++{
++    struct factory *factory = impl_from_IDXCoreAdapterFactory( iface );
++    struct registration *regs;
++    IUnknown *probe;
++    HRESULT hr;
++
++    TRACE( "iface %p, object %p, type %u, callback %p, context %p, cookie %p.\n", iface, object, type, callback,
++           context, cookie );
++
++    if (!object || !callback || !cookie) return E_POINTER;
++    if (!factory_IsNotificationTypeSupported( iface, type )) return DXGI_ERROR_INVALID_CALL;
++    /* the list's event is for a list, the others for an adapter */
++    hr = object->lpVtbl->QueryInterface( object, type == AdapterListStale ? &IID_IDXCoreAdapterList : &IID_IDXCoreAdapter,
++                                         (void **)&probe );
++    if (FAILED(hr)) return DXGI_ERROR_INVALID_CALL;
++    probe->lpVtbl->Release( probe );
++    EnterCriticalSection( &factory->cs );
++    if (!(regs = realloc( factory->registrations, (factory->nregistrations + 1) * sizeof(*regs) )))
++    {
++        LeaveCriticalSection( &factory->cs );
++        return E_OUTOFMEMORY;
++    }
++    factory->registrations = regs;
++    regs[factory->nregistrations].cookie = *cookie = ++factory->next_cookie;
++    regs[factory->nregistrations].object = object;
++    regs[factory->nregistrations].type = type;
++    regs[factory->nregistrations].callback = callback;
++    regs[factory->nregistrations].context = context;
++    object->lpVtbl->AddRef( object );
++    factory->nregistrations++;
++    LeaveCriticalSection( &factory->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_UnregisterEventNotification( IDXCoreAdapterFactory *iface, uint32_t cookie )
++{
++    struct factory *factory = impl_from_IDXCoreAdapterFactory( iface );
++    IUnknown *object = NULL;
++    UINT i;
++
++    TRACE( "iface %p, cookie %u.\n", iface, cookie );
++
++    EnterCriticalSection( &factory->cs );
++    for (i = 0; i < factory->nregistrations; i++)
++    {
++        if (factory->registrations[i].cookie != cookie) continue;
++        object = factory->registrations[i].object;
++        factory->registrations[i] = factory->registrations[--factory->nregistrations];
++        break;
++    }
++    LeaveCriticalSection( &factory->cs );
++    if (!object) return DXGI_ERROR_NOT_FOUND;
++    object->lpVtbl->Release( object );
++    return S_OK;
++}
++
++static const IDXCoreAdapterFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_CreateAdapterList,
++    factory_GetAdapterByLuid,
++    factory_IsNotificationTypeSupported,
++    factory_RegisterEventNotification,
++    factory_UnregisterEventNotification,
++};
++
++HRESULT WINAPI DXCoreCreateAdapterFactory( REFIID riid, void **out )
++{
++    struct factory *factory;
++
++    TRACE( "riid %s, out %p.\n", debugstr_guid( riid ), out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    EnterCriticalSection( &factory_cs );
++    if (!the_factory && (factory = calloc( 1, sizeof(*factory) )))
++    {
++        factory->IDXCoreAdapterFactory_iface.lpVtbl = &factory_vtbl;
++        factory->ref = 1;
++        InitializeCriticalSectionEx( &factory->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++        factory->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": factory.cs");
++        the_factory = factory;
++    }
++    factory = the_factory;
++    LeaveCriticalSection( &factory_cs );
++    if (!factory) return E_OUTOFMEMORY;
++    return factory_QueryInterface( &factory->IDXCoreAdapterFactory_iface, riid, out );
++}
