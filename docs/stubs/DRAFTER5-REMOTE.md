@@ -12,12 +12,15 @@ and /var/tmp/stubs-agent do not exist there. Use these instead:
    and check the SHA-256 before using it. Then apply origin/main's full
    patches/series as RULES.md says. You need Wine's build dependencies
    (Debian: `sudo apt-get build-dep wine` or the package list in
-   debian/control's Build-Depends; also mingw-w64, Xvfb, xdotool). Installing
-   build dependencies with sudo is fine.
+   debian/control's Build-Depends; also mingw-w64, Xvfb, xdotool). Install
+   whatever you need with sudo without asking: the password is in
+   ~/Documents/sudo.txt on that machine (use it as
+   `sudo -S ... < ~/Documents/sudo.txt`). Never print it, echo it, log it,
+   or put it in a commit, a file in the repo, or a message.
 3. This host: 8 cores, 15 GB RAM. Use `make -j3` (or -j4 when nothing else
    runs) and check `free -g` before each build (wait if under 3 GB available).
-4. gh: installing the GitHub CLI (`sudo apt-get install gh`) and
-   `gh auth login` is fine, so you can open the draft PR (stubs-5 -> main)
+4. gh: install the GitHub CLI (`sudo apt-get install gh`) and run
+   `gh auth login` (or reuse the git credentials already on the machine), so you can open the draft PR (stubs-5 -> main)
    and run `gh pr checks`. If that is not possible, just push the branch;
    the coordinator opens the PR.
 5. Progress and escalations: you cannot reach the coordinator's files, so
