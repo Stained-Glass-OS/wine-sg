@@ -1,0 +1,2563 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] mmdevapi: device topology, session events, buffer size limits
+
+The device topology was a stub: one connector of "Physical_Internal" whose
+other methods were E_NOTIMPL, so no program could reach the endpoint's
+jack, volume or mute controls (IKsJackDescription, IAudioVolumeLevel,
+IAudioMute) the way the documentation of device topologies shows.
+IAudioSessionControl took IAudioSessionEvents and never told them;
+IAudioSessionManager2's session and duck notifications were E_NOTIMPL;
+IAudioClient2::GetBufferSizeLimits was E_NOTIMPL.
+
+- The endpoint's topology has one connector, linked to its adapter's
+  bridge connector (the jack); the adapter's topology has a stream
+  connector, a volume and a mute subunit and the jack, in signal order
+  (render: stream, volume, mute, jack; capture the other way).
+  IDeviceTopology (connectors, subunits, GetPartById, GetDeviceId,
+  GetSignalPath), IConnector (type from the form factor, data flow,
+  connections and the IDs connected to; software links of the stream
+  connector), IPart (names, local and global IDs, part and node types,
+  control interfaces, parts incoming and outgoing, the topology),
+  ISubunit, IControlInterface, IPartsList.
+- IAudioVolumeLevel (dB per channel) and IAudioMute are the endpoint's
+  volume; their change callbacks (IControlChangeNotify) are told when it
+  changes, with the event context. The jack describes itself
+  (IKsJackDescription, IKsJackDescription2) from the endpoint's form
+  factor and speakers.
+- IAudioSessionEvents are told of display name, icon, grouping, simple
+  and channel volume changes (with the event context) and of the
+  session's state as its streams start, stop and go;
+  IAudioSessionNotification of new sessions; duck notification sinks are
+  kept (nothing ducks other sessions here).
+- GetBufferSizeLimits: from the engine's period to two seconds, for a
+  supported format. The class factory keeps its lock count.
+
+Wine's mmdevapi tests: mmdevenum 72 tests, no failures; render and
+capture as before.
+
+Gate: test/audiotopo-gate.sh (test/audiotopo-probe.c; skips without an
+audio endpoint). Mutants SG_MUTANT_NO_CONTROL_CALLBACKS
+(mmdevapi/topology.c), SG_MUTANT_NO_SESSION_EVENTS (mmdevapi/session.c,
+mmdevapi/audiosessionmanager.c).
+---
+--- a/dlls/mmdevapi/Makefile.in
++++ b/dlls/mmdevapi/Makefile.in
+@@ -9,4 +9,5 @@ SOURCES = \
+ 	main.c \
+ 	mmdevapi_classes.idl \
+ 	session.c \
+-	spatialaudio.c
++	spatialaudio.c \
++	topology.c
+--- a/dlls/mmdevapi/audiosessionmanager.c
++++ b/dlls/mmdevapi/audiosessionmanager.c
+@@ -57,6 +57,98 @@ struct session_enum
+     LONG ref;
+ };
+ 
++/* Stained Glass OS 1666: who is told of new sessions, and of ducking */
++struct manager_sink
++{
++    struct list entry;
++    IMMDevice *device;
++    IUnknown *sink;
++    WCHAR *session_id;      /* ducking: the session it is for */
++};
++
++static struct list session_sinks = LIST_INIT(session_sinks);
++static struct list duck_sinks = LIST_INIT(duck_sinks);
++
++extern struct audio_session_wrapper *session_wrapper_create(struct audio_client *client);
++
++static HRESULT add_manager_sink(struct list *list, IMMDevice *device, IUnknown *sink, const WCHAR *session_id)
++{
++    struct manager_sink *entry;
++
++    if (!sink)
++        return E_POINTER;
++    if (!(entry = calloc(1, sizeof(*entry))))
++        return E_OUTOFMEMORY;
++    entry->device = device;
++    entry->sink = sink;
++    if (session_id && !(entry->session_id = wcsdup(session_id))) {
++        free(entry);
++        return E_OUTOFMEMORY;
++    }
++    IUnknown_AddRef(sink);
++    sessions_lock();
++    list_add_tail(list, &entry->entry);
++    sessions_unlock();
++    return S_OK;
++}
++
++static HRESULT remove_manager_sink(struct list *list, IMMDevice *device, IUnknown *sink)
++{
++    struct manager_sink *entry, *found = NULL;
++
++    if (!sink)
++        return E_POINTER;
++    sessions_lock();
++    LIST_FOR_EACH_ENTRY(entry, list, struct manager_sink, entry) {
++        if (entry->sink == sink && entry->device == device) {
++            list_remove(&entry->entry);
++            found = entry;
++            break;
++        }
++    }
++    sessions_unlock();
++    if (!found)
++        return E_INVALIDARG;
++    IUnknown_Release(found->sink);
++    free(found->session_id);
++    free(found);
++    return S_OK;
++}
++
++/* a stream made a session: the device's session managers' sinks are told */
++void session_announce(struct audio_session *session)
++{
++    IAudioSessionNotification *sinks[32];
++    struct audio_session_wrapper *wrapper;
++    struct manager_sink *entry;
++    UINT n = 0, i;
++
++    sessions_lock();
++    if (session->announced) {
++        sessions_unlock();
++        return;
++    }
++    session->announced = TRUE;
++    LIST_FOR_EACH_ENTRY(entry, &session_sinks, struct manager_sink, entry) {
++        if (n == ARRAY_SIZE(sinks)) break;
++        if (entry->device == session->device)
++            IAudioSessionNotification_AddRef((sinks[n++] = (IAudioSessionNotification *)entry->sink));
++    }
++    sessions_unlock();
++    if (!n)
++        return;
++    if ((wrapper = session_wrapper_create(NULL))) {
++        wrapper->session = session;
++#ifndef SG_MUTANT_NO_SESSION_EVENTS
++        for (i = 0; i < n; i++)
++            IAudioSessionNotification_OnSessionCreated(sinks[i], (IAudioSessionControl *)&wrapper->IAudioSessionControl2_iface);
++#endif
++        IAudioSessionControl2_Release(&wrapper->IAudioSessionControl2_iface);
++    }
++    for (i = 0; i < n; i++)
++        IAudioSessionNotification_Release(sinks[i]);
++}
++
+ static struct session_enum *impl_from_IAudioSessionEnumerator(IAudioSessionEnumerator *iface)
+ {
+     return CONTAINING_RECORD(iface, struct session_enum, IAudioSessionEnumerator_iface);
+@@ -274,33 +366,37 @@ static HRESULT WINAPI ASM_RegisterSessionNotification(IAudioSessionManager2 *ifa
+                                                       IAudioSessionNotification *notification)
+ {
+     struct session_mgr *This = impl_from_IAudioSessionManager2(iface);
+-    FIXME("(%p)->(%p) - stub\n", This, notification);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, notification);
++    return add_manager_sink(&session_sinks, This->device, (IUnknown *)notification, NULL);
+ }
+ 
+ static HRESULT WINAPI ASM_UnregisterSessionNotification(IAudioSessionManager2 *iface,
+                                                         IAudioSessionNotification *notification)
+ {
+     struct session_mgr *This = impl_from_IAudioSessionManager2(iface);
+-    FIXME("(%p)->(%p) - stub\n", This, notification);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, notification);
++    return remove_manager_sink(&session_sinks, This->device, (IUnknown *)notification);
+ }
+ 
++/* Ducking lowers the other sessions while a communications session plays;
++ * the sinks are kept for it, and told when it happens. No communications
++ * session ducks others here: the sessions of other processes are not
++ * known to this one. */
+ static HRESULT WINAPI ASM_RegisterDuckNotification(IAudioSessionManager2 *iface,
+                                                    const WCHAR *session_id,
+                                                    IAudioVolumeDuckNotification *notification)
+ {
+     struct session_mgr *This = impl_from_IAudioSessionManager2(iface);
+-    FIXME("(%p)->(%s, %p) - stub\n", This, debugstr_w(session_id), notification);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%s, %p)\n", This, debugstr_w(session_id), notification);
++    return add_manager_sink(&duck_sinks, This->device, (IUnknown *)notification, session_id);
+ }
+ 
+ static HRESULT WINAPI ASM_UnregisterDuckNotification(IAudioSessionManager2 *iface,
+                                                      IAudioVolumeDuckNotification *notification)
+ {
+     struct session_mgr *This = impl_from_IAudioSessionManager2(iface);
+-    FIXME("(%p)->(%p) - stub\n", This, notification);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, notification);
++    return remove_manager_sink(&duck_sinks, This->device, (IUnknown *)notification);
+ }
+ 
+ static const IAudioSessionManager2Vtbl AudioSessionManager2_Vtbl =
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -44,6 +44,8 @@ typedef struct tagLANGANDCODEPAGE
+ } LANGANDCODEPAGE;
+ 
+ extern void sessions_lock(void);
++extern void session_announce(struct audio_session *session);
++extern void session_state_changed(struct audio_session *session);
+ extern void sessions_unlock(void);
+ 
+ extern HRESULT get_audio_session(const GUID *sessionguid, IMMDevice *device, UINT channels,
+@@ -491,6 +493,11 @@ exit:
+ 
+     sessions_unlock();
+ 
++    if (SUCCEEDED(params.result)) {
++        session_announce(client->session);
++        session_state_changed(client->session);
++    }
++
+     return params.result;
+ }
+ 
+@@ -662,6 +669,7 @@ static ULONG WINAPI client_Release(IAudioClient3 *iface)
+             sessions_lock();
+             list_remove(&This->entry);
+             sessions_unlock();
++            session_state_changed(This->session);
+         }
+ 
+         free(This->vols);
+@@ -855,6 +863,9 @@ static HRESULT WINAPI client_Start(IAudioClient3 *iface)
+ 
+     sessions_unlock();
+ 
++    if (SUCCEEDED(params.result))
++        session_state_changed(This->session);
++
+     return params.result;
+ }
+ 
+@@ -872,6 +883,9 @@ static HRESULT WINAPI client_Stop(IAudioClient3 *iface)
+ 
+     wine_unix_call(stop, &params);
+ 
++    if (params.result == S_OK)
++        session_state_changed(This->session);
++
+     return params.result;
+ }
+ 
+@@ -979,7 +993,7 @@ static HRESULT WINAPI client_GetService(IAudioClient3 *iface, REFIID riid, void
+         IAudioClockAdjustment_AddRef(&This->IAudioClockAdjustment_iface);
+         *ppv = &This->IAudioClockAdjustment_iface;
+     } else {
+-            FIXME("stub %s\n", debugstr_guid(riid));
++            WARN("no service %s\n", debugstr_guid(riid));
+             hr = E_NOINTERFACE;
+             goto exit;
+     }
+@@ -1035,13 +1049,30 @@ static HRESULT WINAPI client_SetClientProperties(IAudioClient3 *iface,
+     return S_OK;
+ }
+ 
++/* the buffer durations a stream of the format may ask for: from the
++ * engine's shortest period up to two seconds */
+ static HRESULT WINAPI client_GetBufferSizeLimits(IAudioClient3 *iface, const WAVEFORMATEX *format,
+                                           BOOL event_driven, REFERENCE_TIME *min_duration,
+                                           REFERENCE_TIME *max_duration)
+ {
+     struct audio_client *This = impl_from_IAudioClient3(iface);
+-    FIXME("(%p)->(%p, %u, %p, %p) - stub\n", This, format, event_driven, min_duration, max_duration);
+-    return E_NOTIMPL;
++    REFERENCE_TIME def_period, min_period;
++    WAVEFORMATEX *closest = NULL;
++    HRESULT hr;
++
++    TRACE("(%p)->(%p, %u, %p, %p)\n", This, format, event_driven, min_duration, max_duration);
++
++    if (!format || !min_duration || !max_duration)
++        return E_POINTER;
++    hr = IAudioClient3_IsFormatSupported(iface, AUDCLNT_SHAREMODE_SHARED, format, &closest);
++    CoTaskMemFree(closest);
++    if (hr != S_OK)
++        return FAILED(hr) ? hr : AUDCLNT_E_UNSUPPORTED_FORMAT;
++    if (FAILED(hr = IAudioClient3_GetDevicePeriod(iface, &def_period, &min_period)))
++        return hr;
++    *min_duration = event_driven ? min_period : def_period;
++    *max_duration = 20000000;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI client_GetSharedModeEnginePeriod(IAudioClient3 *iface,
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -87,15 +87,6 @@ typedef struct IPropertyBagImpl {
+ 
+ static const IPropertyBagVtbl PB_Vtbl;
+ 
+-typedef struct IConnectorImpl {
+-    IConnector IConnector_iface;
+-    LONG ref;
+-} IConnectorImpl;
+-
+-typedef struct IDeviceTopologyImpl {
+-    IDeviceTopology IDeviceTopology_iface;
+-    LONG ref;
+-} IDeviceTopologyImpl;
+ 
+ static HRESULT MMDevPropStore_Create(MMDevice *This, DWORD access, IPropertyStore **ppv);
+ 
+@@ -119,17 +110,6 @@ static inline IPropertyBagImpl *impl_from_IPropertyBag(IPropertyBag *iface)
+     return CONTAINING_RECORD(iface, IPropertyBagImpl, IPropertyBag_iface);
+ }
+ 
+-static HRESULT DeviceTopology_Create(IMMDevice *device, IDeviceTopology **ppv);
+-
+-static inline IConnectorImpl *impl_from_IConnector(IConnector *iface)
+-{
+-    return CONTAINING_RECORD(iface, IConnectorImpl, IConnector_iface);
+-}
+-
+-static inline IDeviceTopologyImpl *impl_from_IDeviceTopology(IDeviceTopology *iface)
+-{
+-    return CONTAINING_RECORD(iface, IDeviceTopologyImpl, IDeviceTopology_iface);
+-}
+ 
+ static const WCHAR propkey_formatW[] = L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X},%d";
+ 
+@@ -1705,276 +1685,3 @@ static IMMDevice info_device = {
+     &info_device_Vtbl
+ };
+ 
+-static HRESULT WINAPI Connector_QueryInterface(IConnector *iface, REFIID riid, void **ppv)
+-{
+-    IConnectorImpl *This = impl_from_IConnector(iface);
+-    TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(riid), ppv);
+-
+-    if (!ppv)
+-        return E_POINTER;
+-
+-    if (IsEqualIID(riid, &IID_IUnknown) ||
+-        IsEqualIID(riid, &IID_IConnector))
+-        *ppv = &This->IConnector_iface;
+-    else {
+-        *ppv = NULL;
+-        return E_NOINTERFACE;
+-    }
+-
+-    IUnknown_AddRef((IUnknown *)*ppv);
+-
+-    return S_OK;
+-}
+-
+-static ULONG WINAPI Connector_AddRef(IConnector *iface)
+-{
+-    IConnectorImpl *This = impl_from_IConnector(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
+-    TRACE("(%p) new ref %lu\n", This, ref);
+-    return ref;
+-}
+-
+-static ULONG WINAPI Connector_Release(IConnector *iface)
+-{
+-    IConnectorImpl *This = impl_from_IConnector(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
+-    TRACE("(%p) new ref %lu\n", This, ref);
+-
+-    if (!ref)
+-        HeapFree(GetProcessHeap(), 0, This);
+-
+-    return ref;
+-}
+-
+-static HRESULT WINAPI Connector_GetType(
+-    IConnector *This,
+-    ConnectorType *pType)
+-{
+-    FIXME("(%p) - partial stub\n", This);
+-    *pType = Physical_Internal;
+-    return S_OK;
+-}
+-
+-static HRESULT WINAPI Connector_GetDataFlow(
+-    IConnector *This,
+-    DataFlow *pFlow)
+-{
+-    FIXME("(%p) - stub\n", This);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI Connector_ConnectTo(
+-    IConnector *This,
+-    IConnector *pConnectTo)
+-{
+-    FIXME("(%p) - stub\n", This);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI Connector_Disconnect(
+-    IConnector *This)
+-{
+-    FIXME("(%p) - stub\n", This);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI Connector_IsConnected(
+-    IConnector *This,
+-    BOOL *pbConnected)
+-{
+-    FIXME("(%p) - stub\n", This);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI Connector_GetConnectedTo(
+-    IConnector *This,
+-    IConnector **ppConTo)
+-{
+-    FIXME("(%p) - stub\n", This);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI Connector_GetConnectorIdConnectedTo(
+-    IConnector *This,
+-    LPWSTR *ppwstrConnectorId)
+-{
+-    FIXME("(%p) - stub\n", This);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI Connector_GetDeviceIdConnectedTo(
+-    IConnector *This,
+-    LPWSTR *ppwstrDeviceId)
+-{
+-    FIXME("(%p) - stub\n", This);
+-    return E_NOTIMPL;
+-}
+-
+-static const IConnectorVtbl Connector_Vtbl =
+-{
+-    Connector_QueryInterface,
+-    Connector_AddRef,
+-    Connector_Release,
+-    Connector_GetType,
+-    Connector_GetDataFlow,
+-    Connector_ConnectTo,
+-    Connector_Disconnect,
+-    Connector_IsConnected,
+-    Connector_GetConnectedTo,
+-    Connector_GetConnectorIdConnectedTo,
+-    Connector_GetDeviceIdConnectedTo,
+-};
+-
+-HRESULT Connector_Create(IConnector **ppv)
+-{
+-    IConnectorImpl *This;
+-
+-    This = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*This));
+-    if (!This)
+-        return E_OUTOFMEMORY;
+-
+-    This->IConnector_iface.lpVtbl = &Connector_Vtbl;
+-    This->ref = 1;
+-
+-    *ppv = &This->IConnector_iface;
+-
+-    return S_OK;
+-}
+-
+-static HRESULT WINAPI DT_QueryInterface(IDeviceTopology *iface, REFIID riid, void **ppv)
+-{
+-    IDeviceTopologyImpl *This = impl_from_IDeviceTopology(iface);
+-    TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(riid), ppv);
+-
+-    if (!ppv)
+-        return E_POINTER;
+-
+-    if (IsEqualIID(riid, &IID_IUnknown) ||
+-        IsEqualIID(riid, &IID_IDeviceTopology))
+-        *ppv = &This->IDeviceTopology_iface;
+-    else {
+-        *ppv = NULL;
+-        return E_NOINTERFACE;
+-    }
+-
+-    IUnknown_AddRef((IUnknown *)*ppv);
+-
+-    return S_OK;
+-}
+-
+-static ULONG WINAPI DT_AddRef(IDeviceTopology *iface)
+-{
+-    IDeviceTopologyImpl *This = impl_from_IDeviceTopology(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
+-    TRACE("(%p) new ref %lu\n", This, ref);
+-    return ref;
+-}
+-
+-static ULONG WINAPI DT_Release(IDeviceTopology *iface)
+-{
+-    IDeviceTopologyImpl *This = impl_from_IDeviceTopology(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
+-    TRACE("(%p) new ref %lu\n", This, ref);
+-
+-    if (!ref)
+-        HeapFree(GetProcessHeap(), 0, This);
+-
+-    return ref;
+-}
+-
+-static HRESULT WINAPI DT_GetConnectorCount(IDeviceTopology *This,
+-                                           UINT *pCount)
+-{
+-    FIXME("(%p)->(%p) - partial stub\n", This, pCount);
+-
+-    if (!pCount)
+-        return E_POINTER;
+-
+-    *pCount = 1;
+-    return S_OK;
+-}
+-
+-static HRESULT WINAPI DT_GetConnector(IDeviceTopology *This,
+-                                      UINT nIndex,
+-                                      IConnector **ppConnector)
+-{
+-    FIXME("(%p)->(%u, %p) - partial stub\n", This, nIndex, ppConnector);
+-
+-    if (nIndex == 0)
+-    {
+-        return Connector_Create(ppConnector);
+-    }
+-
+-    return E_INVALIDARG;
+-}
+-
+-static HRESULT WINAPI DT_GetSubunitCount(IDeviceTopology *This,
+-                                         UINT *pCount)
+-{
+-    FIXME("(%p)->(%p) - stub\n", This, pCount);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI DT_GetSubunit(IDeviceTopology *This,
+-                                    UINT nIndex,
+-                                    ISubUnit **ppConnector)
+-{
+-    FIXME("(%p)->(%u, %p) - stub\n", This, nIndex, ppConnector);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI DT_GetPartById(IDeviceTopology *This,
+-                                     UINT nId,
+-                                     IPart **ppPart)
+-{
+-    FIXME("(%p)->(%u, %p) - stub\n", This, nId, ppPart);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI DT_GetDeviceId(IDeviceTopology *This,
+-                                     LPWSTR *ppwstrDeviceId)
+-{
+-    FIXME("(%p)->(%p) - stub\n", This, ppwstrDeviceId);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI DT_GetSignalPath(IDeviceTopology *This,
+-                                       IPart *pIPartFrom,
+-                                       IPart *pIPartTo,
+-                                       BOOL bRejectMixedPaths,
+-                                       IPartsList **ppParts)
+-{
+-    FIXME("(%p)->(%p, %p, %s, %p) - stub\n",
+-          This, pIPartFrom, pIPartTo, bRejectMixedPaths ? "TRUE" : "FALSE", ppParts);
+-    return E_NOTIMPL;
+-}
+-
+-static const IDeviceTopologyVtbl DeviceTopology_Vtbl =
+-{
+-    DT_QueryInterface,
+-    DT_AddRef,
+-    DT_Release,
+-    DT_GetConnectorCount,
+-    DT_GetConnector,
+-    DT_GetSubunitCount,
+-    DT_GetSubunit,
+-    DT_GetPartById,
+-    DT_GetDeviceId,
+-    DT_GetSignalPath,
+-};
+-
+-static HRESULT DeviceTopology_Create(IMMDevice *device, IDeviceTopology **ppv)
+-{
+-    IDeviceTopologyImpl *This;
+-
+-    This = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*This));
+-    if (!This)
+-        return E_OUTOFMEMORY;
+-
+-    This->IDeviceTopology_iface.lpVtbl = &DeviceTopology_Vtbl;
+-    This->ref = 1;
+-
+-    *ppv = &This->IDeviceTopology_iface;
+-
+-    return S_OK;
+-}
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -275,10 +275,16 @@ static HRESULT WINAPI MMCF_CreateInstance(
+     return This->pfnCreateInstance(riid, ppobj);
+ }
+ 
++/* the module stays loaded while locked; it is never unloaded (see
++ * DllCanUnloadNow), so the count only needs to be kept */
++static LONG server_locks;
++
+ static HRESULT WINAPI MMCF_LockServer(LPCLASSFACTORY iface, BOOL dolock)
+ {
+     IClassFactoryImpl *This = impl_from_IClassFactory(iface);
+-    FIXME("(%p, %d) stub!\n", This, dolock);
++    TRACE("(%p, %d)\n", This, dolock);
++    if (dolock) InterlockedIncrement(&server_locks);
++    else InterlockedDecrement(&server_locks);
+     return S_OK;
+ }
+ 
+--- a/dlls/mmdevapi/mmdevapi_private.h
++++ b/dlls/mmdevapi/mmdevapi_private.h
+@@ -19,6 +19,7 @@
+ #include <assert.h>
+ 
+ #include <endpointvolume.h>
++#include <devicetopology.h>
+ #include <spatialaudioclient.h>
+ #include <winternl.h>
+ 
+@@ -80,3 +81,6 @@ extern void main_loop_stop(void);
+ extern const WCHAR drv_keyW[];
+ 
+ extern HRESULT get_audio_sessions(IMMDevice *device, GUID **ret, int *ret_count);
++
++/* topology.c (Stained Glass OS 1666) */
++extern HRESULT DeviceTopology_Create(IMMDevice *device, IDeviceTopology **ppv);
+--- a/dlls/mmdevapi/mmdevdrv.h
++++ b/dlls/mmdevapi/mmdevdrv.h
+@@ -34,6 +34,12 @@ typedef struct audio_session {
+     WCHAR *icon_path;
+     GUID grouping_param;
+ 
++    /* Stained Glass OS 1666: IAudioSessionEvents registered, the state they
++     * were told last, and whether managers were told it exists */
++    struct list sinks;
++    int notified_state;
++    BOOL announced;
++
+     struct list entry;
+ } AudioSession;
+ 
+--- a/dlls/mmdevapi/session.c
++++ b/dlls/mmdevapi/session.c
+@@ -50,6 +50,116 @@ extern void set_stream_volumes(struct audio_client *This);
+ 
+ static struct list sessions = LIST_INIT(sessions);
+ 
++/* Stained Glass OS 1666: session events. Sinks are told outside the
++ * sessions lock: they may call back into the session. */
++struct session_sink
++{
++    struct list entry;
++    IAudioSessionEvents *sink;
++};
++
++struct sink_set
++{
++    IAudioSessionEvents *sinks[32];
++    UINT count;
++};
++
++/* with the sessions lock held */
++static void grab_sinks(struct audio_session *session, struct sink_set *set)
++{
++    struct session_sink *s;
++
++    set->count = 0;
++    LIST_FOR_EACH_ENTRY(s, &session->sinks, struct session_sink, entry) {
++        if (set->count == ARRAY_SIZE(set->sinks)) break;
++        IAudioSessionEvents_AddRef((set->sinks[set->count++] = s->sink));
++    }
++}
++
++static void release_sinks(struct sink_set *set)
++{
++    UINT i;
++    for (i = 0; i < set->count; i++) IAudioSessionEvents_Release(set->sinks[i]);
++    set->count = 0;
++}
++
++/* with the sessions lock held */
++static AudioSessionState session_state(struct audio_session *session)
++{
++    struct is_started_params params;
++    struct audio_client *client;
++
++    if (list_empty(&session->clients))
++        return AudioSessionStateExpired;
++    LIST_FOR_EACH_ENTRY(client, &session->clients, struct audio_client, entry) {
++        if (!client->stream) continue;
++        params.stream = client->stream;
++        wine_unix_call(is_started, &params);
++        if (params.result == S_OK)
++            return AudioSessionStateActive;
++    }
++    return AudioSessionStateInactive;
++}
++
++/* a stream started, stopped, joined or left the session */
++void session_state_changed(struct audio_session *session)
++{
++    struct sink_set set;
++    AudioSessionState state;
++    UINT i;
++
++    if (!session) return;
++    sessions_lock();
++    state = session_state(session);
++    if (state == session->notified_state) {
++        sessions_unlock();
++        return;
++    }
++    session->notified_state = state;
++    grab_sinks(session, &set);
++    sessions_unlock();
++#ifndef SG_MUTANT_NO_SESSION_EVENTS
++    for (i = 0; i < set.count; i++)
++        IAudioSessionEvents_OnStateChanged(set.sinks[i], state);
++#endif
++    release_sinks(&set);
++}
++
++static void notify_simple_volume(struct audio_session *session, const GUID *context)
++{
++    struct sink_set set;
++    float level;
++    BOOL mute;
++    UINT i;
++
++    sessions_lock();
++    level = session->master_vol;
++    mute = session->mute;
++    grab_sinks(session, &set);
++    sessions_unlock();
++#ifndef SG_MUTANT_NO_SESSION_EVENTS
++    for (i = 0; i < set.count; i++)
++        IAudioSessionEvents_OnSimpleVolumeChanged(set.sinks[i], level, mute, context);
++#endif
++    release_sinks(&set);
++}
++
++static void notify_channel_volume(struct audio_session *session, DWORD changed, const GUID *context)
++{
++    float levels[32];
++    struct sink_set set;
++    UINT count, i;
++
++    sessions_lock();
++    count = min(session->channel_count, ARRAY_SIZE(levels));
++    for (i = 0; i < count; i++) levels[i] = session->channel_vols[i];
++    grab_sinks(session, &set);
++    sessions_unlock();
++    for (i = 0; i < set.count; i++)
++        IAudioSessionEvents_OnChannelVolumeChanged(set.sinks[i], count, levels, changed, context);
++    release_sinks(&set);
++}
++
+ static inline struct audio_session_wrapper *impl_from_IAudioSessionControl2(IAudioSessionControl2 *iface)
+ {
+     return CONTAINING_RECORD(iface, struct audio_session_wrapper, IAudioSessionControl2_iface);
+@@ -171,14 +281,22 @@ static HRESULT WINAPI control_SetDisplayName(IAudioSessionControl2 *iface, const
+     struct audio_session_wrapper *This = impl_from_IAudioSessionControl2(iface);
+     struct audio_session *session = This->session;
+ 
+-    TRACE("(%p)->(%p, %s) - stub\n", This, name, debugstr_guid(event_context));
+-    FIXME("Ignoring event_context\n");
++    struct sink_set set;
++    UINT i;
++
++    TRACE("(%p)->(%p, %s)\n", This, name, debugstr_guid(event_context));
+ 
+     if (!name)
+         return HRESULT_FROM_WIN32(RPC_X_NULL_REF_POINTER);
+ 
++    sessions_lock();
+     free(session->display_name);
+     session->display_name = wcsdup(name);
++    grab_sinks(session, &set);
++    sessions_unlock();
++    for (i = 0; i < set.count; i++)
++        IAudioSessionEvents_OnDisplayNameChanged(set.sinks[i], name, event_context);
++    release_sinks(&set);
+ 
+     return S_OK;
+ }
+@@ -204,14 +322,22 @@ static HRESULT WINAPI control_SetIconPath(IAudioSessionControl2 *iface, const WC
+     struct audio_session_wrapper *This = impl_from_IAudioSessionControl2(iface);
+     struct audio_session *session = This->session;
+ 
+-    TRACE("(%p)->(%s, %s) - stub\n", This, debugstr_w(path), debugstr_guid(event_context));
+-    FIXME("Ignoring event_context\n");
++    struct sink_set set;
++    UINT i;
++
++    TRACE("(%p)->(%s, %s)\n", This, debugstr_w(path), debugstr_guid(event_context));
+ 
+     if (!path)
+         return HRESULT_FROM_WIN32(RPC_X_NULL_REF_POINTER);
+ 
++    sessions_lock();
+     free(session->icon_path);
+     session->icon_path = wcsdup(path);
++    grab_sinks(session, &set);
++    sessions_unlock();
++    for (i = 0; i < set.count; i++)
++        IAudioSessionEvents_OnIconPathChanged(set.sinks[i], path, event_context);
++    release_sinks(&set);
+ 
+     return S_OK;
+ }
+@@ -237,13 +363,21 @@ static HRESULT WINAPI control_SetGroupingParam(IAudioSessionControl2 *iface, con
+     struct audio_session_wrapper *This = impl_from_IAudioSessionControl2(iface);
+     struct audio_session *session = This->session;
+ 
+-    TRACE("(%p)->(%s, %s) - stub\n", This, debugstr_guid(group), debugstr_guid(event_context));
+-    FIXME("Ignoring event_context\n");
++    struct sink_set set;
++    UINT i;
++
++    TRACE("(%p)->(%s, %s)\n", This, debugstr_guid(group), debugstr_guid(event_context));
+ 
+     if (!group)
+         return HRESULT_FROM_WIN32(RPC_X_NULL_REF_POINTER);
+ 
++    sessions_lock();
+     session->grouping_param = *group;
++    grab_sinks(session, &set);
++    sessions_unlock();
++    for (i = 0; i < set.count; i++)
++        IAudioSessionEvents_OnGroupingParamChanged(set.sinks[i], group, event_context);
++    release_sinks(&set);
+ 
+     return S_OK;
+ }
+@@ -252,7 +386,18 @@ static HRESULT WINAPI control_RegisterAudioSessionNotification(IAudioSessionCont
+                                                            IAudioSessionEvents *events)
+ {
+     struct audio_session_wrapper *This = impl_from_IAudioSessionControl2(iface);
+-    FIXME("(%p)->(%p) - stub\n", This, events);
++    struct session_sink *sink;
++
++    TRACE("(%p)->(%p)\n", This, events);
++
++    if (!events)
++        return NULL_PTR_ERR;
++    if (!(sink = malloc(sizeof(*sink))))
++        return E_OUTOFMEMORY;
++    IAudioSessionEvents_AddRef((sink->sink = events));
++    sessions_lock();
++    list_add_tail(&This->session->sinks, &sink->entry);
++    sessions_unlock();
+     return S_OK;
+ }
+ 
+@@ -260,7 +405,25 @@ static HRESULT WINAPI control_UnregisterAudioSessionNotification(IAudioSessionCo
+                                                              IAudioSessionEvents *events)
+ {
+     struct audio_session_wrapper *This = impl_from_IAudioSessionControl2(iface);
+-    FIXME("(%p)->(%p) - stub\n", This, events);
++    struct session_sink *sink, *found = NULL;
++
++    TRACE("(%p)->(%p)\n", This, events);
++
++    if (!events)
++        return NULL_PTR_ERR;
++    sessions_lock();
++    LIST_FOR_EACH_ENTRY(sink, &This->session->sinks, struct session_sink, entry) {
++        if (sink->sink == events) {
++            list_remove(&sink->entry);
++            found = sink;
++            break;
++        }
++    }
++    sessions_unlock();
++    if (found) {
++        IAudioSessionEvents_Release(found->sink);
++        free(found);
++    }
+     return S_OK;
+ }
+ 
+@@ -430,9 +593,6 @@ static HRESULT WINAPI channelvolume_SetChannelVolume(IChannelAudioVolume *iface,
+     if (index >= session->channel_count)
+         return E_INVALIDARG;
+ 
+-    if (context)
+-        FIXME("Notifications not supported yet\n");
+-
+     sessions_lock();
+ 
+     session->channel_vols[index] = level;
+@@ -442,6 +602,8 @@ static HRESULT WINAPI channelvolume_SetChannelVolume(IChannelAudioVolume *iface,
+ 
+     sessions_unlock();
+ 
++    notify_channel_volume(session, index, context);
++
+     return S_OK;
+ }
+ 
+@@ -480,9 +642,6 @@ static HRESULT WINAPI channelvolume_SetAllVolumes(IChannelAudioVolume *iface, UI
+     if (count != session->channel_count)
+         return E_INVALIDARG;
+ 
+-    if (context)
+-        FIXME("Notifications not supported yet\n");
+-
+     sessions_lock();
+ 
+     for (i = 0; i < count; ++i)
+@@ -493,6 +652,8 @@ static HRESULT WINAPI channelvolume_SetAllVolumes(IChannelAudioVolume *iface, UI
+ 
+     sessions_unlock();
+ 
++    notify_channel_volume(session, (DWORD)-1, context);
++
+     return S_OK;
+ }
+ 
+@@ -574,9 +735,6 @@ static HRESULT WINAPI simplevolume_SetMasterVolume(ISimpleAudioVolume *iface, fl
+     if (level < 0.f || level > 1.f)
+         return E_INVALIDARG;
+ 
+-    if (context)
+-        FIXME("Notifications not supported yet\n");
+-
+     sessions_lock();
+ 
+     session->master_vol = level;
+@@ -586,6 +744,8 @@ static HRESULT WINAPI simplevolume_SetMasterVolume(ISimpleAudioVolume *iface, fl
+ 
+     sessions_unlock();
+ 
++    notify_simple_volume(session, context);
++
+     return S_OK;
+ }
+ 
+@@ -613,9 +773,6 @@ static HRESULT WINAPI simplevolume_SetMute(ISimpleAudioVolume *iface, BOOL mute,
+ 
+     TRACE("(%p)->(%u, %s)\n", session, mute, debugstr_guid(context));
+ 
+-    if (context)
+-        FIXME("Notifications not supported yet\n");
+-
+     sessions_lock();
+ 
+     session->mute = mute;
+@@ -625,6 +782,8 @@ static HRESULT WINAPI simplevolume_SetMute(ISimpleAudioVolume *iface, BOOL mute,
+ 
+     sessions_unlock();
+ 
++    notify_simple_volume(session, context);
++
+     return S_OK;
+ }
+ 
+@@ -681,6 +840,8 @@ static struct audio_session *session_create(const GUID *guid, IMMDevice *device,
+     ret->device = device;
+ 
+     list_init(&ret->clients);
++    list_init(&ret->sinks);
++    ret->notified_state = AudioSessionStateInactive;
+ 
+     list_add_head(&sessions, &ret->entry);
+ 
+new file mode 100644
+--- /dev/null
++++ b/dlls/mmdevapi/topology.c
+@@ -0,0 +1,1578 @@
++/*
++ * Device topology: connectors, subunits and their controls
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Stained Glass OS 1666. An endpoint's device topology is what the
++ * documentation of device topologies describes for a simple adapter: the
++ * endpoint's own topology holds one connector, linked to the bridge
++ * connector (the jack) of its adapter's topology; that topology carries
++ * the signal between a stream connector and the jack through a volume and
++ * a mute subunit:
++ *
++ *   render:  stream connector -> Volume -> Mute -> jack  ==  endpoint
++ *   capture: jack -> Volume -> Mute -> stream connector; endpoint == jack
++ *
++ * The volume and mute controls (IAudioVolumeLevel, IAudioMute) are the
++ * endpoint's volume (IAudioEndpointVolume), and their change callbacks are
++ * told when it changes; the jack describes itself (IKsJackDescription,
++ * IKsJackDescription2) from the endpoint's form factor and speakers. */
++
++#define COBJMACROS
++
++#include <stdarg.h>
++#include <wchar.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winnls.h"
++#include "ole2.h"
++#include "mmdeviceapi.h"
++#include "audioclient.h"
++#include "endpointvolume.h"
++#include "audiopolicy.h"
++#include "devicetopology.h"
++#include "propkey.h"
++#include "mmreg.h"
++#include "ks.h"
++#include "ksmedia.h"
++#include "wine/debug.h"
++#include "wine/list.h"
++
++#include "mmdevapi_private.h"
++#include "devpkey.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
++
++static const GUID node_volume = {0x3a5acc00,0xc557,0x11d0,{0x8a,0x2b,0x00,0xa0,0xc9,0x25,0x5a,0xc1}};
++static const GUID node_mute = {0x02b223c0,0xc557,0x11d0,{0x8a,0x2b,0x00,0xa0,0xc9,0x25,0x5a,0xc1}};
++static const GUID node_speaker = {0xdff21ce1,0xf70f,0x11d0,{0xb9,0x17,0x00,0xa0,0xc9,0x22,0x31,0x96}};
++static const GUID node_microphone = {0xdff21be1,0xf70f,0x11d0,{0xb9,0x17,0x00,0xa0,0xc9,0x22,0x31,0x96}};
++
++#ifndef E_NOTFOUND
++#define E_NOTFOUND HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
++#endif
++
++enum part_index
++{
++    PART_ENDPOINT,      /* the endpoint topology's connector */
++    PART_STREAM,        /* the adapter's: the stream's connector */
++    PART_VOLUME,
++    PART_MUTE,
++    PART_JACK,          /* the adapter's bridge connector */
++    PART_COUNT
++};
++
++struct control_sink
++{
++    struct list entry;
++    enum part_index part;
++    IControlChangeNotify *notify;
++};
++
++/* what one activation of IDeviceTopology describes: both topologies */
++struct model
++{
++    LONG ref;
++    IMMDevice *device;
++    EDataFlow flow;
++    WCHAR endpoint_id[256];
++    WCHAR adapter_id[300];
++    WCHAR endpoint_name[256];
++    DWORD channel_mask;
++    UINT form_factor;
++    IAudioEndpointVolume *volume;
++    IAudioEndpointVolumeCallback IAudioEndpointVolumeCallback_iface;
++    CRITICAL_SECTION cs;
++    struct list sinks;
++    BOOL watching;
++    BOOL muted;
++    float master;
++    float levels[32];
++    UINT channels;
++    /* a software link of the stream connector (ConnectTo) */
++    IConnector *stream_link;
++};
++
++struct topology
++{
++    IDeviceTopology IDeviceTopology_iface;
++    LONG ref;
++    struct model *model;
++    BOOL adapter;       /* the adapter's topology, else the endpoint's */
++};
++
++struct part
++{
++    IPart IPart_iface;
++    IConnector IConnector_iface;
++    ISubUnit ISubUnit_iface;
++    IAudioVolumeLevel IAudioVolumeLevel_iface;
++    IAudioMute IAudioMute_iface;
++    IKsJackDescription IKsJackDescription_iface;
++    IKsJackDescription2 IKsJackDescription2_iface;
++    LONG ref;
++    struct model *model;
++    enum part_index index;
++};
++
++static HRESULT create_part( struct model *model, enum part_index index, REFIID riid, void **out );
++static HRESULT create_topology( struct model *model, BOOL adapter, IDeviceTopology **out );
++
++static BOOL is_connector( enum part_index index )
++{
++    return index == PART_ENDPOINT || index == PART_STREAM || index == PART_JACK;
++}
++
++static BOOL in_adapter( enum part_index index )
++{
++    return index != PART_ENDPOINT;
++}
++
++/* local IDs: connectors 0x10000 + n, subunits 0x20000 + n, per topology */
++static UINT local_id( enum part_index index )
++{
++    switch (index)
++    {
++    case PART_ENDPOINT: return 0x10000;
++    case PART_STREAM: return 0x10000;
++    case PART_JACK: return 0x10001;
++    case PART_VOLUME: return 0x20000;
++    case PART_MUTE: return 0x20001;
++    default: return 0;
++    }
++}
++
++/* the adapter's parts in the order the signal passes them */
++static void signal_order( const struct model *model, enum part_index order[4] )
++{
++    if (model->flow == eCapture)
++    {
++        order[0] = PART_JACK; order[1] = PART_VOLUME; order[2] = PART_MUTE; order[3] = PART_STREAM;
++    }
++    else
++    {
++        order[0] = PART_STREAM; order[1] = PART_VOLUME; order[2] = PART_MUTE; order[3] = PART_JACK;
++    }
++}
++
++static int signal_position( const struct model *model, enum part_index index )
++{
++    enum part_index order[4];
++    int i;
++
++    signal_order( model, order );
++    for (i = 0; i < 4; i++) if (order[i] == index) return i;
++    return -1;
++}
++
++static void model_addref( struct model *model )
++{
++    InterlockedIncrement( &model->ref );
++}
++
++static void model_release( struct model *model )
++{
++    struct control_sink *sink, *next;
++
++    if (InterlockedDecrement( &model->ref )) return;
++    if (model->watching) IAudioEndpointVolume_UnregisterControlChangeNotify( model->volume,
++                                                                             &model->IAudioEndpointVolumeCallback_iface );
++    LIST_FOR_EACH_ENTRY_SAFE( sink, next, &model->sinks, struct control_sink, entry )
++    {
++        IControlChangeNotify_Release( sink->notify );
++        free( sink );
++    }
++    if (model->stream_link) IConnector_Release( model->stream_link );
++    if (model->volume) IAudioEndpointVolume_Release( model->volume );
++    IMMDevice_Release( model->device );
++    model->cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection( &model->cs );
++    free( model );
++}
++
++static WCHAR *co_strdup( const WCHAR *str )
++{
++    size_t len = (wcslen( str ) + 1) * sizeof(WCHAR);
++    WCHAR *ret = CoTaskMemAlloc( len );
++    if (ret) memcpy( ret, str, len );
++    return ret;
++}
++
++/* ---- the endpoint volume's changes, for the controls' callbacks --------------- */
++
++static inline struct model *impl_from_IAudioEndpointVolumeCallback( IAudioEndpointVolumeCallback *iface )
++{
++    return CONTAINING_RECORD( iface, struct model, IAudioEndpointVolumeCallback_iface );
++}
++
++static HRESULT WINAPI volume_cb_QueryInterface( IAudioEndpointVolumeCallback *iface, REFIID riid, void **out )
++{
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IAudioEndpointVolumeCallback ))
++    {
++        *out = iface;
++        IAudioEndpointVolumeCallback_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++/* the model holds the registration: no reference of its own */
++static ULONG WINAPI volume_cb_AddRef( IAudioEndpointVolumeCallback *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI volume_cb_Release( IAudioEndpointVolumeCallback *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI volume_cb_OnNotify( IAudioEndpointVolumeCallback *iface, AUDIO_VOLUME_NOTIFICATION_DATA *data )
++{
++    struct model *model = impl_from_IAudioEndpointVolumeCallback( iface );
++    IControlChangeNotify *notify[32];
++    BOOL level_changed = FALSE, mute_changed;
++    struct control_sink *sink;
++    UINT i, n = 0;
++
++    EnterCriticalSection( &model->cs );
++    mute_changed = !data->bMuted != !model->muted;
++    model->muted = data->bMuted;
++    if (data->fMasterVolume != model->master)
++    {
++        model->master = data->fMasterVolume;
++        level_changed = TRUE;
++    }
++    for (i = 0; i < data->nChannels && i < ARRAY_SIZE(model->levels); i++)
++        if (data->afChannelVolumes[i] != model->levels[i])
++        {
++            model->levels[i] = data->afChannelVolumes[i];
++            level_changed = TRUE;
++        }
++    LIST_FOR_EACH_ENTRY( sink, &model->sinks, struct control_sink, entry )
++    {
++        if (n == ARRAY_SIZE(notify)) break;
++        if ((sink->part == PART_VOLUME && level_changed) || (sink->part == PART_MUTE && mute_changed))
++            IControlChangeNotify_AddRef( (notify[n++] = sink->notify) );
++    }
++    LeaveCriticalSection( &model->cs );
++    for (i = 0; i < n; i++)
++    {
++        IControlChangeNotify_OnNotify( notify[i], GetCurrentProcessId(), &data->guidEventContext );
++        IControlChangeNotify_Release( notify[i] );
++    }
++    return S_OK;
++}
++
++static const IAudioEndpointVolumeCallbackVtbl volume_cb_vtbl =
++{
++    volume_cb_QueryInterface,
++    volume_cb_AddRef,
++    volume_cb_Release,
++    volume_cb_OnNotify,
++};
++
++static HRESULT model_volume( struct model *model, IAudioEndpointVolume **out )
++{
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &model->cs );
++    if (!model->volume)
++        hr = IMMDevice_Activate( model->device, &IID_IAudioEndpointVolume, CLSCTX_INPROC_SERVER, NULL,
++                                 (void **)&model->volume );
++    if (SUCCEEDED(hr))
++    {
++        *out = model->volume;
++        IAudioEndpointVolume_AddRef( *out );
++    }
++    LeaveCriticalSection( &model->cs );
++    return hr;
++}
++
++/* ---- IPartsList -------------------------------------------------------------- */
++
++struct parts_list
++{
++    IPartsList IPartsList_iface;
++    LONG ref;
++    struct model *model;
++    enum part_index parts[PART_COUNT];
++    UINT count;
++};
++
++static inline struct parts_list *impl_from_IPartsList( IPartsList *iface )
++{
++    return CONTAINING_RECORD( iface, struct parts_list, IPartsList_iface );
++}
++
++static HRESULT WINAPI parts_QueryInterface( IPartsList *iface, REFIID riid, void **out )
++{
++    if (!out) return E_POINTER;
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IPartsList ))
++    {
++        *out = iface;
++        IPartsList_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI parts_AddRef( IPartsList *iface )
++{
++    struct parts_list *This = impl_from_IPartsList( iface );
++    return InterlockedIncrement( &This->ref );
++}
++
++static ULONG WINAPI parts_Release( IPartsList *iface )
++{
++    struct parts_list *This = impl_from_IPartsList( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++
++    if (!ref)
++    {
++        model_release( This->model );
++        free( This );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI parts_GetCount( IPartsList *iface, UINT *count )
++{
++    struct parts_list *This = impl_from_IPartsList( iface );
++
++    if (!count) return E_POINTER;
++    *count = This->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI parts_GetPart( IPartsList *iface, UINT index, IPart **part )
++{
++    struct parts_list *This = impl_from_IPartsList( iface );
++
++    if (!part) return E_POINTER;
++    *part = NULL;
++    if (index >= This->count) return E_INVALIDARG;
++    return create_part( This->model, This->parts[index], &IID_IPart, (void **)part );
++}
++
++static const IPartsListVtbl parts_vtbl =
++{
++    parts_QueryInterface,
++    parts_AddRef,
++    parts_Release,
++    parts_GetCount,
++    parts_GetPart,
++};
++
++static HRESULT create_parts_list( struct model *model, const enum part_index *parts, UINT count, IPartsList **out )
++{
++    struct parts_list *list;
++
++    *out = NULL;
++    if (!(list = calloc( 1, sizeof(*list) ))) return E_OUTOFMEMORY;
++    list->IPartsList_iface.lpVtbl = &parts_vtbl;
++    list->ref = 1;
++    list->model = model;
++    model_addref( model );
++    memcpy( list->parts, parts, count * sizeof(*parts) );
++    list->count = count;
++    *out = &list->IPartsList_iface;
++    return S_OK;
++}
++
++/* ---- IControlInterface ------------------------------------------------------ */
++
++struct control_interface
++{
++    IControlInterface IControlInterface_iface;
++    LONG ref;
++    const WCHAR *name;
++    const IID *iid;
++};
++
++static inline struct control_interface *impl_from_IControlInterface( IControlInterface *iface )
++{
++    return CONTAINING_RECORD( iface, struct control_interface, IControlInterface_iface );
++}
++
++static HRESULT WINAPI ci_QueryInterface( IControlInterface *iface, REFIID riid, void **out )
++{
++    if (!out) return E_POINTER;
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IControlInterface ))
++    {
++        *out = iface;
++        IControlInterface_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI ci_AddRef( IControlInterface *iface )
++{
++    return InterlockedIncrement( &impl_from_IControlInterface( iface )->ref );
++}
++
++static ULONG WINAPI ci_Release( IControlInterface *iface )
++{
++    struct control_interface *This = impl_from_IControlInterface( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++    if (!ref) free( This );
++    return ref;
++}
++
++static HRESULT WINAPI ci_GetName( IControlInterface *iface, WCHAR **name )
++{
++    if (!name) return E_POINTER;
++    return (*name = co_strdup( impl_from_IControlInterface( iface )->name )) ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI ci_GetIID( IControlInterface *iface, GUID *iid )
++{
++    if (!iid) return E_POINTER;
++    *iid = *impl_from_IControlInterface( iface )->iid;
++    return S_OK;
++}
++
++static const IControlInterfaceVtbl ci_vtbl =
++{
++    ci_QueryInterface,
++    ci_AddRef,
++    ci_Release,
++    ci_GetName,
++    ci_GetIID,
++};
++
++/* the controls a part has */
++static UINT part_controls( enum part_index index, const WCHAR **names, const IID **iids )
++{
++    switch (index)
++    {
++    case PART_VOLUME:
++        names[0] = L"Volume"; iids[0] = &IID_IAudioVolumeLevel;
++        return 1;
++    case PART_MUTE:
++        names[0] = L"Mute"; iids[0] = &IID_IAudioMute;
++        return 1;
++    case PART_JACK:
++        names[0] = L"Jack Description"; iids[0] = &IID_IKsJackDescription;
++        names[1] = L"Jack Description 2"; iids[1] = &IID_IKsJackDescription2;
++        return 2;
++    default:
++        return 0;
++    }
++}
++
++/* ---- IPart ------------------------------------------------------------------- */
++
++static inline struct part *impl_from_IPart( IPart *iface )
++{
++    return CONTAINING_RECORD( iface, struct part, IPart_iface );
++}
++
++static HRESULT WINAPI part_QueryInterface( IPart *iface, REFIID riid, void **out )
++{
++    struct part *This = impl_from_IPart( iface );
++
++    TRACE( "(%p)->(%s, %p)\n", This, debugstr_guid( riid ), out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IPart )) *out = &This->IPart_iface;
++    else if (IsEqualIID( riid, &IID_IConnector ) && is_connector( This->index )) *out = &This->IConnector_iface;
++    else if (IsEqualIID( riid, &IID_ISubUnit ) && !is_connector( This->index )) *out = &This->ISubUnit_iface;
++    else return E_NOINTERFACE;
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI part_AddRef( IPart *iface )
++{
++    struct part *This = impl_from_IPart( iface );
++    ULONG ref = InterlockedIncrement( &This->ref );
++    TRACE( "(%p) new ref %lu\n", This, ref );
++    return ref;
++}
++
++static ULONG WINAPI part_Release( IPart *iface )
++{
++    struct part *This = impl_from_IPart( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++
++    TRACE( "(%p) new ref %lu\n", This, ref );
++    if (!ref)
++    {
++        model_release( This->model );
++        free( This );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI part_GetName( IPart *iface, WCHAR **name )
++{
++    struct part *This = impl_from_IPart( iface );
++    const WCHAR *str;
++
++    TRACE( "(%p)->(%p)\n", This, name );
++
++    if (!name) return E_POINTER;
++    switch (This->index)
++    {
++    case PART_ENDPOINT: str = This->model->endpoint_name; break;
++    case PART_STREAM: str = This->model->flow == eCapture ? L"Capture" : L"Playback"; break;
++    case PART_VOLUME: str = L"Volume"; break;
++    case PART_MUTE: str = L"Mute"; break;
++    default: str = This->model->flow == eCapture ? L"Microphone" : L"Speakers"; break;
++    }
++    return (*name = co_strdup( str )) ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI part_GetLocalId( IPart *iface, UINT *id )
++{
++    struct part *This = impl_from_IPart( iface );
++
++    if (!id) return E_POINTER;
++    *id = local_id( This->index );
++    return S_OK;
++}
++
++static HRESULT WINAPI part_GetGlobalId( IPart *iface, WCHAR **id )
++{
++    struct part *This = impl_from_IPart( iface );
++    WCHAR buf[400];
++
++    if (!id) return E_POINTER;
++    swprintf( buf, ARRAY_SIZE(buf), L"%s/%08x", in_adapter( This->index ) ? This->model->adapter_id :
++              This->model->endpoint_id, local_id( This->index ) );
++    return (*id = co_strdup( buf )) ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI part_GetPartType( IPart *iface, PartType *type )
++{
++    struct part *This = impl_from_IPart( iface );
++
++    if (!type) return E_POINTER;
++    *type = is_connector( This->index ) ? Connector : Subunit;
++    return S_OK;
++}
++
++static HRESULT WINAPI part_GetSubType( IPart *iface, GUID *subtype )
++{
++    struct part *This = impl_from_IPart( iface );
++
++    if (!subtype) return E_POINTER;
++    switch (This->index)
++    {
++    case PART_VOLUME: *subtype = node_volume; break;
++    case PART_MUTE: *subtype = node_mute; break;
++    case PART_ENDPOINT:
++    case PART_JACK: *subtype = This->model->flow == eCapture ? node_microphone : node_speaker; break;
++    default: *subtype = GUID_NULL; break;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI part_GetControlInterfaceCount( IPart *iface, UINT *count )
++{
++    struct part *This = impl_from_IPart( iface );
++    const WCHAR *names[2];
++    const IID *iids[2];
++
++    if (!count) return E_POINTER;
++    *count = part_controls( This->index, names, iids );
++    return S_OK;
++}
++
++static HRESULT WINAPI part_GetControlInterface( IPart *iface, UINT index, IControlInterface **out )
++{
++    struct part *This = impl_from_IPart( iface );
++    struct control_interface *ci;
++    const WCHAR *names[2];
++    const IID *iids[2];
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (index >= part_controls( This->index, names, iids )) return E_INVALIDARG;
++    if (!(ci = calloc( 1, sizeof(*ci) ))) return E_OUTOFMEMORY;
++    ci->IControlInterface_iface.lpVtbl = &ci_vtbl;
++    ci->ref = 1;
++    ci->name = names[index];
++    ci->iid = iids[index];
++    *out = &ci->IControlInterface_iface;
++    return S_OK;
++}
++
++static HRESULT enum_parts( struct part *This, BOOL outgoing, IPartsList **out )
++{
++    enum part_index order[4];
++    int pos;
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    /* the endpoint's connector has nothing beside it in its topology */
++    if (This->index == PART_ENDPOINT) return E_NOTFOUND;
++    signal_order( This->model, order );
++    pos = signal_position( This->model, This->index ) + (outgoing ? 1 : -1);
++    if (pos < 0 || pos > 3) return E_NOTFOUND;
++    return create_parts_list( This->model, &order[pos], 1, out );
++}
++
++static HRESULT WINAPI part_EnumPartsIncoming( IPart *iface, IPartsList **parts )
++{
++    return enum_parts( impl_from_IPart( iface ), FALSE, parts );
++}
++
++static HRESULT WINAPI part_EnumPartsOutgoing( IPart *iface, IPartsList **parts )
++{
++    return enum_parts( impl_from_IPart( iface ), TRUE, parts );
++}
++
++static HRESULT WINAPI part_GetTopologyObject( IPart *iface, IDeviceTopology **topology )
++{
++    struct part *This = impl_from_IPart( iface );
++
++    if (!topology) return E_POINTER;
++    return create_topology( This->model, in_adapter( This->index ), topology );
++}
++
++static HRESULT WINAPI part_Activate( IPart *iface, DWORD clsctx, REFIID riid, void **out )
++{
++    struct part *This = impl_from_IPart( iface );
++
++    TRACE( "(%p)->(%#lx, %s, %p)\n", This, clsctx, debugstr_guid( riid ), out );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (IsEqualIID( riid, &IID_IAudioVolumeLevel ) && This->index == PART_VOLUME)
++        *out = &This->IAudioVolumeLevel_iface;
++    else if (IsEqualIID( riid, &IID_IAudioMute ) && This->index == PART_MUTE)
++        *out = &This->IAudioMute_iface;
++    else if (IsEqualIID( riid, &IID_IKsJackDescription ) && This->index == PART_JACK)
++        *out = &This->IKsJackDescription_iface;
++    else if (IsEqualIID( riid, &IID_IKsJackDescription2 ) && This->index == PART_JACK)
++        *out = &This->IKsJackDescription2_iface;
++    else return E_NOINTERFACE;
++    IUnknown_AddRef( (IUnknown *)*out );
++    return S_OK;
++}
++
++static HRESULT WINAPI part_RegisterControlChangeCallback( IPart *iface, REFGUID riid, IControlChangeNotify *notify )
++{
++    struct part *This = impl_from_IPart( iface );
++    struct model *model = This->model;
++    struct control_sink *sink;
++    IAudioEndpointVolume *volume;
++    HRESULT hr;
++
++    TRACE( "(%p)->(%s, %p)\n", This, debugstr_guid( riid ), notify );
++
++    if (!notify) return E_POINTER;
++    if (!(This->index == PART_VOLUME && IsEqualIID( riid, &IID_IAudioVolumeLevel )) &&
++        !(This->index == PART_MUTE && IsEqualIID( riid, &IID_IAudioMute )))
++        return E_INVALIDARG;
++    if (FAILED(hr = model_volume( model, &volume ))) return hr;
++    if (!(sink = calloc( 1, sizeof(*sink) )))
++    {
++        IAudioEndpointVolume_Release( volume );
++        return E_OUTOFMEMORY;
++    }
++    sink->part = This->index;
++    sink->notify = notify;
++    IControlChangeNotify_AddRef( notify );
++    EnterCriticalSection( &model->cs );
++    list_add_tail( &model->sinks, &sink->entry );
++    if (!model->watching)
++    {
++        IAudioEndpointVolume_GetMute( volume, &model->muted );
++        IAudioEndpointVolume_GetMasterVolumeLevelScalar( volume, &model->master );
++        IAudioEndpointVolume_GetChannelCount( volume, &model->channels );
++        for (UINT i = 0; i < model->channels && i < ARRAY_SIZE(model->levels); i++)
++            IAudioEndpointVolume_GetChannelVolumeLevelScalar( volume, i, &model->levels[i] );
++#ifndef SG_MUTANT_NO_CONTROL_CALLBACKS
++        model->watching = SUCCEEDED(IAudioEndpointVolume_RegisterControlChangeNotify( volume,
++                                    &model->IAudioEndpointVolumeCallback_iface ));
++#endif
++    }
++    LeaveCriticalSection( &model->cs );
++    IAudioEndpointVolume_Release( volume );
++    return S_OK;
++}
++
++static HRESULT WINAPI part_UnregisterControlChangeCallback( IPart *iface, IControlChangeNotify *notify )
++{
++    struct part *This = impl_from_IPart( iface );
++    struct control_sink *sink, *found = NULL;
++
++    TRACE( "(%p)->(%p)\n", This, notify );
++
++    if (!notify) return E_POINTER;
++    EnterCriticalSection( &This->model->cs );
++    LIST_FOR_EACH_ENTRY( sink, &This->model->sinks, struct control_sink, entry )
++        if (sink->notify == notify && sink->part == This->index)
++        {
++            found = sink;
++            list_remove( &sink->entry );
++            break;
++        }
++    LeaveCriticalSection( &This->model->cs );
++    if (!found) return E_INVALIDARG;
++    IControlChangeNotify_Release( found->notify );
++    free( found );
++    return S_OK;
++}
++
++static const IPartVtbl part_vtbl =
++{
++    part_QueryInterface,
++    part_AddRef,
++    part_Release,
++    part_GetName,
++    part_GetLocalId,
++    part_GetGlobalId,
++    part_GetPartType,
++    part_GetSubType,
++    part_GetControlInterfaceCount,
++    part_GetControlInterface,
++    part_EnumPartsIncoming,
++    part_EnumPartsOutgoing,
++    part_GetTopologyObject,
++    part_Activate,
++    part_RegisterControlChangeCallback,
++    part_UnregisterControlChangeCallback,
++};
++
++/* ---- IConnector -------------------------------------------------------------- */
++
++static inline struct part *impl_from_IConnector( IConnector *iface )
++{
++    return CONTAINING_RECORD( iface, struct part, IConnector_iface );
++}
++
++static HRESULT WINAPI connector_QueryInterface( IConnector *iface, REFIID riid, void **out )
++{
++    return part_QueryInterface( &impl_from_IConnector( iface )->IPart_iface, riid, out );
++}
++
++static ULONG WINAPI connector_AddRef( IConnector *iface )
++{
++    return part_AddRef( &impl_from_IConnector( iface )->IPart_iface );
++}
++
++static ULONG WINAPI connector_Release( IConnector *iface )
++{
++    return part_Release( &impl_from_IConnector( iface )->IPart_iface );
++}
++
++static HRESULT WINAPI connector_GetType( IConnector *iface, ConnectorType *type )
++{
++    struct part *This = impl_from_IConnector( iface );
++
++    TRACE( "(%p)->(%p)\n", This, type );
++
++    if (!type) return E_POINTER;
++    switch (This->index)
++    {
++    case PART_STREAM: *type = Software_IO; break;
++    case PART_JACK:
++        *type = (This->model->form_factor == Speakers && This->model->flow == eRender) ||
++                This->model->form_factor == Microphone ? Physical_External : Physical_Internal;
++        if (This->model->form_factor == Headphones || This->model->form_factor == Headset ||
++            This->model->form_factor == LineLevel || This->model->form_factor == SPDIF ||
++            This->model->form_factor == DigitalAudioDisplayDevice)
++            *type = Physical_External;
++        break;
++    default: *type = Physical_External; break;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI connector_GetDataFlow( IConnector *iface, DataFlow *flow )
++{
++    struct part *This = impl_from_IConnector( iface );
++    BOOL render = This->model->flow != eCapture;
++
++    TRACE( "(%p)->(%p)\n", This, flow );
++
++    if (!flow) return E_POINTER;
++    /* data comes into the endpoint, and goes from the stream through to the
++     * jack; capture is the other way round */
++    switch (This->index)
++    {
++    case PART_ENDPOINT: *flow = render ? In : Out; break;
++    case PART_STREAM: *flow = render ? In : Out; break;
++    default: *flow = render ? Out : In; break;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI connector_ConnectTo( IConnector *iface, IConnector *other )
++{
++    struct part *This = impl_from_IConnector( iface );
++    DataFlow mine, theirs;
++    BOOL connected;
++    HRESULT hr;
++
++    TRACE( "(%p)->(%p)\n", This, other );
++
++    if (!other) return E_POINTER;
++    /* the jack and the endpoint are linked for good; the stream connector
++     * may be linked to a software connector of the other direction */
++    if (This->index != PART_STREAM) return E_ACCESSDENIED;
++    if (This->model->stream_link) return HRESULT_FROM_WIN32( ERROR_DEVICE_ALREADY_ATTACHED );
++    if (FAILED(hr = IConnector_IsConnected( other, &connected ))) return hr;
++    if (connected) return HRESULT_FROM_WIN32( ERROR_DEVICE_ALREADY_ATTACHED );
++    IConnector_GetDataFlow( iface, &mine );
++    if (FAILED(hr = IConnector_GetDataFlow( other, &theirs ))) return hr;
++    if (mine == theirs) return E_INVALIDARG;
++    EnterCriticalSection( &This->model->cs );
++    IConnector_AddRef( (This->model->stream_link = other) );
++    LeaveCriticalSection( &This->model->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI connector_Disconnect( IConnector *iface )
++{
++    struct part *This = impl_from_IConnector( iface );
++    IConnector *link;
++
++    TRACE( "(%p)\n", This );
++
++    if (This->index != PART_STREAM) return E_ACCESSDENIED;
++    EnterCriticalSection( &This->model->cs );
++    link = This->model->stream_link;
++    This->model->stream_link = NULL;
++    LeaveCriticalSection( &This->model->cs );
++    if (!link) return E_NOTFOUND;
++    IConnector_Release( link );
++    return S_OK;
++}
++
++static HRESULT WINAPI connector_IsConnected( IConnector *iface, BOOL *connected )
++{
++    struct part *This = impl_from_IConnector( iface );
++
++    if (!connected) return E_POINTER;
++    *connected = This->index != PART_STREAM || This->model->stream_link != NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI connector_GetConnectedTo( IConnector *iface, IConnector **to )
++{
++    struct part *This = impl_from_IConnector( iface );
++
++    TRACE( "(%p)->(%p)\n", This, to );
++
++    if (!to) return E_POINTER;
++    *to = NULL;
++    switch (This->index)
++    {
++    case PART_ENDPOINT: return create_part( This->model, PART_JACK, &IID_IConnector, (void **)to );
++    case PART_JACK: return create_part( This->model, PART_ENDPOINT, &IID_IConnector, (void **)to );
++    default:
++        if (!This->model->stream_link) return E_NOTFOUND;
++        IConnector_AddRef( (*to = This->model->stream_link) );
++        return S_OK;
++    }
++}
++
++static HRESULT WINAPI connector_GetConnectorIdConnectedTo( IConnector *iface, WCHAR **id )
++{
++    struct part *This = impl_from_IConnector( iface );
++    IConnector *to;
++    IPart *part;
++    HRESULT hr;
++
++    if (!id) return E_POINTER;
++    *id = NULL;
++    if (FAILED(hr = connector_GetConnectedTo( iface, &to ))) return hr;
++    if (SUCCEEDED(hr = IConnector_QueryInterface( to, &IID_IPart, (void **)&part )))
++    {
++        hr = IPart_GetGlobalId( part, id );
++        IPart_Release( part );
++    }
++    IConnector_Release( to );
++    TRACE( "(%p) -> %s\n", This, debugstr_w( *id ) );
++    return hr;
++}
++
++static HRESULT WINAPI connector_GetDeviceIdConnectedTo( IConnector *iface, WCHAR **id )
++{
++    struct part *This = impl_from_IConnector( iface );
++    IDeviceTopology *topology;
++    IConnector *to;
++    IPart *part;
++    HRESULT hr;
++
++    if (!id) return E_POINTER;
++    *id = NULL;
++    switch (This->index)
++    {
++    case PART_ENDPOINT: return (*id = co_strdup( This->model->adapter_id )) ? S_OK : E_OUTOFMEMORY;
++    case PART_JACK: return (*id = co_strdup( This->model->endpoint_id )) ? S_OK : E_OUTOFMEMORY;
++    default:
++        if (FAILED(hr = connector_GetConnectedTo( iface, &to ))) return hr;
++        if (SUCCEEDED(hr = IConnector_QueryInterface( to, &IID_IPart, (void **)&part )))
++        {
++            if (SUCCEEDED(hr = IPart_GetTopologyObjects( part, &topology )))
++            {
++                hr = IDeviceTopology_GetDeviceId( topology, id );
++                IDeviceTopology_Release( topology );
++            }
++            IPart_Release( part );
++        }
++        IConnector_Release( to );
++        return hr;
++    }
++}
++
++static const IConnectorVtbl connector_vtbl =
++{
++    connector_QueryInterface,
++    connector_AddRef,
++    connector_Release,
++    connector_GetType,
++    connector_GetDataFlow,
++    connector_ConnectTo,
++    connector_Disconnect,
++    connector_IsConnected,
++    connector_GetConnectedTo,
++    connector_GetConnectorIdConnectedTo,
++    connector_GetDeviceIdConnectedTo,
++};
++
++/* ---- ISubunit ------------------------------------------------------------------ */
++
++static inline struct part *impl_from_ISubUnit( ISubUnit *iface )
++{
++    return CONTAINING_RECORD( iface, struct part, ISubUnit_iface );
++}
++
++static HRESULT WINAPI subunit_QueryInterface( ISubUnit *iface, REFIID riid, void **out )
++{
++    return part_QueryInterface( &impl_from_ISubUnit( iface )->IPart_iface, riid, out );
++}
++
++static ULONG WINAPI subunit_AddRef( ISubUnit *iface )
++{
++    return part_AddRef( &impl_from_ISubUnit( iface )->IPart_iface );
++}
++
++static ULONG WINAPI subunit_Release( ISubUnit *iface )
++{
++    return part_Release( &impl_from_ISubUnit( iface )->IPart_iface );
++}
++
++static const ISubUnitVtbl subunit_vtbl =
++{
++    subunit_QueryInterface,
++    subunit_AddRef,
++    subunit_Release,
++};
++
++/* ---- IAudioVolumeLevel: the endpoint's volume in decibels ----------------------- */
++
++static inline struct part *impl_from_IAudioVolumeLevel( IAudioVolumeLevel *iface )
++{
++    return CONTAINING_RECORD( iface, struct part, IAudioVolumeLevel_iface );
++}
++
++static HRESULT WINAPI level_QueryInterface( IAudioVolumeLevel *iface, REFIID riid, void **out )
++{
++    struct part *This = impl_from_IAudioVolumeLevel( iface );
++
++    if (!out) return E_POINTER;
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IPerChannelDbLevel ) ||
++        IsEqualIID( riid, &IID_IAudioVolumeLevel ))
++    {
++        *out = iface;
++        IAudioVolumeLevel_AddRef( iface );
++        return S_OK;
++    }
++    return part_QueryInterface( &This->IPart_iface, riid, out );
++}
++
++static ULONG WINAPI level_AddRef( IAudioVolumeLevel *iface )
++{
++    return part_AddRef( &impl_from_IAudioVolumeLevel( iface )->IPart_iface );
++}
++
++static ULONG WINAPI level_Release( IAudioVolumeLevel *iface )
++{
++    return part_Release( &impl_from_IAudioVolumeLevel( iface )->IPart_iface );
++}
++
++static HRESULT WINAPI level_GetChannelCount( IAudioVolumeLevel *iface, UINT *count )
++{
++    struct part *This = impl_from_IAudioVolumeLevel( iface );
++    IAudioEndpointVolume *volume;
++    HRESULT hr;
++
++    if (!count) return E_POINTER;
++    if (FAILED(hr = model_volume( This->model, &volume ))) return hr;
++    hr = IAudioEndpointVolume_GetChannelCount( volume, count );
++    IAudioEndpointVolume_Release( volume );
++    return hr;
++}
++
++static HRESULT WINAPI level_GetLevelRange( IAudioVolumeLevel *iface, UINT channel, float *min, float *max,
++                                           float *step )
++{
++    struct part *This = impl_from_IAudioVolumeLevel( iface );
++    IAudioEndpointVolume *volume;
++    UINT count;
++    HRESULT hr;
++
++    if (!min || !max || !step) return E_POINTER;
++    if (FAILED(hr = model_volume( This->model, &volume ))) return hr;
++    if (SUCCEEDED(hr = IAudioEndpointVolume_GetChannelCount( volume, &count )))
++        hr = channel >= count ? E_INVALIDARG : IAudioEndpointVolume_GetVolumeRange( volume, min, max, step );
++    IAudioEndpointVolume_Release( volume );
++    return hr;
++}
++
++static HRESULT WINAPI level_GetLevel( IAudioVolumeLevel *iface, UINT channel, float *db )
++{
++    struct part *This = impl_from_IAudioVolumeLevel( iface );
++    IAudioEndpointVolume *volume;
++    HRESULT hr;
++
++    if (!db) return E_POINTER;
++    if (FAILED(hr = model_volume( This->model, &volume ))) return hr;
++    hr = IAudioEndpointVolume_GetChannelVolumeLevel( volume, channel, db );
++    IAudioEndpointVolume_Release( volume );
++    return hr;
++}
++
++static HRESULT WINAPI level_SetLevel( IAudioVolumeLevel *iface, UINT channel, float db, const GUID *ctx )
++{
++    struct part *This = impl_from_IAudioVolumeLevel( iface );
++    IAudioEndpointVolume *volume;
++    float min, max, step;
++    HRESULT hr;
++
++    TRACE( "(%p)->(%u, %f, %s)\n", This, channel, db, debugstr_guid( ctx ) );
++
++    if (FAILED(hr = model_volume( This->model, &volume ))) return hr;
++    /* a level past the range is the range's end, as a hardware control's is */
++    if (SUCCEEDED(IAudioEndpointVolume_GetVolumeRange( volume, &min, &max, &step )))
++        db = db < min ? min : db > max ? max : db;
++    hr = IAudioEndpointVolume_SetChannelVolumeLevel( volume, channel, db, ctx );
++    IAudioEndpointVolume_Release( volume );
++    return hr;
++}
++
++static HRESULT WINAPI level_SetLevelUniform( IAudioVolumeLevel *iface, float db, const GUID *ctx )
++{
++    UINT count, i;
++    HRESULT hr;
++
++    if (FAILED(hr = level_GetChannelCount( iface, &count ))) return hr;
++    for (i = 0; i < count && SUCCEEDED(hr); i++) hr = level_SetLevel( iface, i, db, ctx );
++    return hr;
++}
++
++static HRESULT WINAPI level_SetLevelAllChannels( IAudioVolumeLevel *iface, float *dbs, ULONG channels,
++                                                 const GUID *ctx )
++{
++    UINT count, i;
++    HRESULT hr;
++
++    if (!dbs) return E_POINTER;
++    if (FAILED(hr = level_GetChannelCount( iface, &count ))) return hr;
++    if (channels != count) return E_INVALIDARG;
++    for (i = 0; i < count && SUCCEEDED(hr); i++) hr = level_SetLevel( iface, i, dbs[i], ctx );
++    return hr;
++}
++
++static const IAudioVolumeLevelVtbl level_vtbl =
++{
++    level_QueryInterface,
++    level_AddRef,
++    level_Release,
++    level_GetChannelCount,
++    level_GetLevelRange,
++    level_GetLevel,
++    level_SetLevel,
++    level_SetLevelUniform,
++    level_SetLevelAllChannels,
++};
++
++/* ---- IAudioMute ------------------------------------------------------------- */
++
++static inline struct part *impl_from_IAudioMute( IAudioMute *iface )
++{
++    return CONTAINING_RECORD( iface, struct part, IAudioMute_iface );
++}
++
++static HRESULT WINAPI mute_QueryInterface( IAudioMute *iface, REFIID riid, void **out )
++{
++    struct part *This = impl_from_IAudioMute( iface );
++
++    if (!out) return E_POINTER;
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IAudioMute ))
++    {
++        *out = iface;
++        IAudioMute_AddRef( iface );
++        return S_OK;
++    }
++    return part_QueryInterface( &This->IPart_iface, riid, out );
++}
++
++static ULONG WINAPI mute_AddRef( IAudioMute *iface )
++{
++    return part_AddRef( &impl_from_IAudioMute( iface )->IPart_iface );
++}
++
++static ULONG WINAPI mute_Release( IAudioMute *iface )
++{
++    return part_Release( &impl_from_IAudioMute( iface )->IPart_iface );
++}
++
++static HRESULT WINAPI mute_SetMute( IAudioMute *iface, BOOL mute, const GUID *ctx )
++{
++    struct part *This = impl_from_IAudioMute( iface );
++    IAudioEndpointVolume *volume;
++    HRESULT hr;
++
++    TRACE( "(%p)->(%d, %s)\n", This, mute, debugstr_guid( ctx ) );
++
++    if (FAILED(hr = model_volume( This->model, &volume ))) return hr;
++    hr = IAudioEndpointVolume_SetMute( volume, mute, ctx );
++    IAudioEndpointVolume_Release( volume );
++    return FAILED(hr) ? hr : S_OK;
++}
++
++static HRESULT WINAPI mute_GetMute( IAudioMute *iface, BOOL *mute )
++{
++    struct part *This = impl_from_IAudioMute( iface );
++    IAudioEndpointVolume *volume;
++    HRESULT hr;
++
++    if (!mute) return E_POINTER;
++    if (FAILED(hr = model_volume( This->model, &volume ))) return hr;
++    hr = IAudioEndpointVolume_GetMute( volume, mute );
++    IAudioEndpointVolume_Release( volume );
++    return hr;
++}
++
++static const IAudioMuteVtbl mute_vtbl =
++{
++    mute_QueryInterface,
++    mute_AddRef,
++    mute_Release,
++    mute_SetMute,
++    mute_GetMute,
++};
++
++/* ---- the jack ----------------------------------------------------------------- */
++
++static inline struct part *impl_from_IKsJackDescription( IKsJackDescription *iface )
++{
++    return CONTAINING_RECORD( iface, struct part, IKsJackDescription_iface );
++}
++
++static HRESULT WINAPI jack_QueryInterface( IKsJackDescription *iface, REFIID riid, void **out )
++{
++    struct part *This = impl_from_IKsJackDescription( iface );
++
++    if (!out) return E_POINTER;
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IKsJackDescription ))
++    {
++        *out = iface;
++        IKsJackDescription_AddRef( iface );
++        return S_OK;
++    }
++    if (IsEqualIID( riid, &IID_IKsJackDescription2 ))
++    {
++        *out = &This->IKsJackDescription2_iface;
++        IKsJackDescription2_AddRef( &This->IKsJackDescription2_iface );
++        return S_OK;
++    }
++    return part_QueryInterface( &This->IPart_iface, riid, out );
++}
++
++static ULONG WINAPI jack_AddRef( IKsJackDescription *iface )
++{
++    return part_AddRef( &impl_from_IKsJackDescription( iface )->IPart_iface );
++}
++
++static ULONG WINAPI jack_Release( IKsJackDescription *iface )
++{
++    return part_Release( &impl_from_IKsJackDescription( iface )->IPart_iface );
++}
++
++static HRESULT WINAPI jack_GetJackCount( IKsJackDescription *iface, UINT *count )
++{
++    if (!count) return E_POINTER;
++    *count = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI jack_GetJackDescription( IKsJackDescription *iface, UINT index, KSJACK_DESCRIPTION *desc )
++{
++    struct part *This = impl_from_IKsJackDescription( iface );
++    struct model *model = This->model;
++
++    if (!desc) return E_POINTER;
++    if (index) return E_INVALIDARG;
++    memset( desc, 0, sizeof(*desc) );
++    desc->ChannelMapping = model->flow == eCapture ? 0 : model->channel_mask;
++    desc->GenLocation = eGenLocPrimaryBox;
++    desc->PortConnection = ePortConnJack;
++    desc->IsConnected = TRUE;
++    switch (model->form_factor)
++    {
++    case DigitalAudioDisplayDevice:
++        desc->ConnectionType = eConnTypeOtherDigital;
++        desc->GeoLocation = eGeoLocHDMI;
++        break;
++    case SPDIF:
++        desc->ConnectionType = eConnTypeOptical;
++        desc->GeoLocation = eGeoLocRear;
++        break;
++    case Speakers:
++    case Microphone:
++        /* a laptop's own speakers and microphone */
++        desc->ConnectionType = eConnTypeAtapiInternal;
++        desc->GeoLocation = eGeoLocFront;
++        desc->GenLocation = eGenLocInternal;
++        desc->PortConnection = ePortConnIntegratedDevice;
++        break;
++    default:
++        desc->ConnectionType = eConnType3Point5mm;
++        desc->GeoLocation = model->form_factor == Headphones || model->form_factor == Headset ? eGeoLocFront :
++                            eGeoLocRear;
++        break;
++    }
++    /* the PC 99 colours of the jacks: green out, pink in */
++    desc->Color = model->flow == eCapture ? RGB(0xff, 0x80, 0xc0) : RGB(0x00, 0xb0, 0x00);
++    return S_OK;
++}
++
++static const IKsJackDescriptionVtbl jack_vtbl =
++{
++    jack_QueryInterface,
++    jack_AddRef,
++    jack_Release,
++    jack_GetJackCount,
++    jack_GetJackDescription,
++};
++
++static inline struct part *impl_from_IKsJackDescription2( IKsJackDescription2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct part, IKsJackDescription2_iface );
++}
++
++static HRESULT WINAPI jack2_QueryInterface( IKsJackDescription2 *iface, REFIID riid, void **out )
++{
++    return jack_QueryInterface( &impl_from_IKsJackDescription2( iface )->IKsJackDescription_iface, riid, out );
++}
++
++static ULONG WINAPI jack2_AddRef( IKsJackDescription2 *iface )
++{
++    return part_AddRef( &impl_from_IKsJackDescription2( iface )->IPart_iface );
++}
++
++static ULONG WINAPI jack2_Release( IKsJackDescription2 *iface )
++{
++    return part_Release( &impl_from_IKsJackDescription2( iface )->IPart_iface );
++}
++
++static HRESULT WINAPI jack2_GetJackCount( IKsJackDescription2 *iface, UINT *count )
++{
++    if (!count) return E_POINTER;
++    *count = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI jack2_GetJackDescription2( IKsJackDescription2 *iface, UINT index, KSJACK_DESCRIPTION2 *desc )
++{
++    if (!desc) return E_POINTER;
++    if (index) return E_INVALIDARG;
++    /* active, and presence is not detected */
++    desc->DeviceStateInfo = 0;
++    desc->JackCapabilities = 0;
++    return S_OK;
++}
++
++static const IKsJackDescription2Vtbl jack2_vtbl =
++{
++    jack2_QueryInterface,
++    jack2_AddRef,
++    jack2_Release,
++    jack2_GetJackCount,
++    jack2_GetJackDescription2,
++};
++
++static HRESULT create_part( struct model *model, enum part_index index, REFIID riid, void **out )
++{
++    struct part *part;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!(part = calloc( 1, sizeof(*part) ))) return E_OUTOFMEMORY;
++    part->IPart_iface.lpVtbl = &part_vtbl;
++    part->IConnector_iface.lpVtbl = &connector_vtbl;
++    part->ISubUnit_iface.lpVtbl = &subunit_vtbl;
++    part->IAudioVolumeLevel_iface.lpVtbl = &level_vtbl;
++    part->IAudioMute_iface.lpVtbl = &mute_vtbl;
++    part->IKsJackDescription_iface.lpVtbl = &jack_vtbl;
++    part->IKsJackDescription2_iface.lpVtbl = &jack2_vtbl;
++    part->ref = 1;
++    part->model = model;
++    part->index = index;
++    model_addref( model );
++    hr = part_QueryInterface( &part->IPart_iface, riid, out );
++    part_Release( &part->IPart_iface );
++    return hr;
++}
++
++/* ---- IDeviceTopology ------------------------------------------------------------ */
++
++static inline struct topology *impl_from_IDeviceTopology( IDeviceTopology *iface )
++{
++    return CONTAINING_RECORD( iface, struct topology, IDeviceTopology_iface );
++}
++
++static HRESULT WINAPI DT_QueryInterface( IDeviceTopology *iface, REFIID riid, void **ppv )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++
++    TRACE( "(%p)->(%s, %p)\n", This, debugstr_guid( riid ), ppv );
++
++    if (!ppv) return E_POINTER;
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IDeviceTopology ))
++    {
++        *ppv = &This->IDeviceTopology_iface;
++        IDeviceTopology_AddRef( iface );
++        return S_OK;
++    }
++    *ppv = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI DT_AddRef( IDeviceTopology *iface )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++    ULONG ref = InterlockedIncrement( &This->ref );
++    TRACE( "(%p) new ref %lu\n", This, ref );
++    return ref;
++}
++
++static ULONG WINAPI DT_Release( IDeviceTopology *iface )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++
++    TRACE( "(%p) new ref %lu\n", This, ref );
++    if (!ref)
++    {
++        model_release( This->model );
++        free( This );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI DT_GetConnectorCount( IDeviceTopology *iface, UINT *count )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++
++    TRACE( "(%p)->(%p)\n", This, count );
++
++    if (!count) return E_POINTER;
++    *count = This->adapter ? 2 : 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI DT_GetConnector( IDeviceTopology *iface, UINT index, IConnector **connector )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++
++    TRACE( "(%p)->(%u, %p)\n", This, index, connector );
++
++    if (!connector) return E_POINTER;
++    *connector = NULL;
++    if (!This->adapter)
++        return index ? E_INVALIDARG : create_part( This->model, PART_ENDPOINT, &IID_IConnector, (void **)connector );
++    if (index > 1) return E_INVALIDARG;
++    return create_part( This->model, index ? PART_JACK : PART_STREAM, &IID_IConnector, (void **)connector );
++}
++
++static HRESULT WINAPI DT_GetSubunitCount( IDeviceTopology *iface, UINT *count )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++
++    TRACE( "(%p)->(%p)\n", This, count );
++
++    if (!count) return E_POINTER;
++    *count = This->adapter ? 2 : 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI DT_GetSubunit( IDeviceTopology *iface, UINT index, ISubUnit **subunit )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++
++    TRACE( "(%p)->(%u, %p)\n", This, index, subunit );
++
++    if (!subunit) return E_POINTER;
++    *subunit = NULL;
++    if (!This->adapter || index > 1) return E_INVALIDARG;
++    return create_part( This->model, index ? PART_MUTE : PART_VOLUME, &IID_ISubUnit, (void **)subunit );
++}
++
++static HRESULT WINAPI DT_GetPartById( IDeviceTopology *iface, UINT id, IPart **part )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++    enum part_index index;
++
++    TRACE( "(%p)->(%#x, %p)\n", This, id, part );
++
++    if (!part) return E_POINTER;
++    *part = NULL;
++    for (index = 0; index < PART_COUNT; index++)
++        if (in_adapter( index ) == This->adapter && local_id( index ) == id)
++            return create_part( This->model, index, &IID_IPart, (void **)part );
++    return E_INVALIDARG;
++}
++
++static HRESULT WINAPI DT_GetDeviceId( IDeviceTopology *iface, WCHAR **id )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++
++    TRACE( "(%p)->(%p)\n", This, id );
++
++    if (!id) return E_POINTER;
++    *id = co_strdup( This->adapter ? This->model->adapter_id : This->model->endpoint_id );
++    return *id ? S_OK : E_OUTOFMEMORY;
++}
++
++/* the parts from one to the other, both included, along the signal */
++static HRESULT WINAPI DT_GetSignalPath( IDeviceTopology *iface, IPart *from, IPart *to, BOOL reject_mixed,
++                                        IPartsList **parts )
++{
++    struct topology *This = impl_from_IDeviceTopology( iface );
++    enum part_index order[4];
++    UINT from_id, to_id;
++    int start = -1, end = -1, i;
++
++    TRACE( "(%p)->(%p, %p, %d, %p)\n", This, from, to, reject_mixed, parts );
++
++    if (!from || !to || !parts) return E_POINTER;
++    *parts = NULL;
++    if (!This->adapter) return E_NOTFOUND;
++    IPart_GetLocalId( from, &from_id );
++    IPart_GetLocalId( to, &to_id );
++    signal_order( This->model, order );
++    for (i = 0; i < 4; i++)
++    {
++        if (local_id( order[i] ) == from_id) start = i;
++        if (local_id( order[i] ) == to_id) end = i;
++    }
++    if (start < 0 || end < 0 || start > end) return E_NOTFOUND;
++    return create_parts_list( This->model, &order[start], end - start + 1, parts );
++}
++
++static const IDeviceTopologyVtbl DeviceTopology_Vtbl =
++{
++    DT_QueryInterface,
++    DT_AddRef,
++    DT_Release,
++    DT_GetConnectorCount,
++    DT_GetConnector,
++    DT_GetSubunitCount,
++    DT_GetSubunit,
++    DT_GetPartById,
++    DT_GetDeviceId,
++    DT_GetSignalPath,
++};
++
++static HRESULT create_topology( struct model *model, BOOL adapter, IDeviceTopology **out )
++{
++    struct topology *topology;
++
++    *out = NULL;
++    if (!(topology = calloc( 1, sizeof(*topology) ))) return E_OUTOFMEMORY;
++    topology->IDeviceTopology_iface.lpVtbl = &DeviceTopology_Vtbl;
++    topology->ref = 1;
++    topology->model = model;
++    topology->adapter = adapter;
++    model_addref( model );
++    *out = &topology->IDeviceTopology_iface;
++    return S_OK;
++}
++
++HRESULT DeviceTopology_Create( IMMDevice *device, IDeviceTopology **out )
++{
++    IMMEndpoint *endpoint;
++    IPropertyStore *store;
++    struct model *model;
++    PROPVARIANT pv;
++    WCHAR *id = NULL;
++    HRESULT hr;
++
++    if (!(model = calloc( 1, sizeof(*model) ))) return E_OUTOFMEMORY;
++    model->ref = 1;
++    model->device = device;
++    IMMDevice_AddRef( device );
++    model->IAudioEndpointVolumeCallback_iface.lpVtbl = &volume_cb_vtbl;
++    InitializeCriticalSectionEx( &model->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    model->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": topology model");
++    list_init( &model->sinks );
++    model->flow = eRender;
++    model->form_factor = Speakers;
++    model->channel_mask = KSAUDIO_SPEAKER_STEREO;
++
++    if (SUCCEEDED(IMMDevice_QueryInterface( device, &IID_IMMEndpoint, (void **)&endpoint )))
++    {
++        IMMEndpoint_GetDataFlow( endpoint, &model->flow );
++        IMMEndpoint_Release( endpoint );
++    }
++    if (SUCCEEDED(IMMDevice_GetId( device, &id )) && id)
++    {
++        const WCHAR *guid = wcsrchr( id, '{' );
++        lstrcpynW( model->endpoint_id, id, ARRAY_SIZE(model->endpoint_id) );
++        /* the adapter's topology filter, named after the endpoint */
++        swprintf( model->adapter_id, ARRAY_SIZE(model->adapter_id),
++                  L"{2}.\\\\?\\swd#sgaudio#%s#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\\topology",
++                  guid ? guid : id );
++        CoTaskMemFree( id );
++    }
++    if (SUCCEEDED(IMMDevice_OpenPropertyStore( device, STGM_READ, &store )))
++    {
++        PropVariantInit( &pv );
++        if (SUCCEEDED(IPropertyStore_GetValue( store, (const PROPERTYKEY *)&DEVPKEY_Device_FriendlyName, &pv )) &&
++            pv.vt == VT_LPWSTR)
++            lstrcpynW( model->endpoint_name, pv.pwszVal, ARRAY_SIZE(model->endpoint_name) );
++        PropVariantClear( &pv );
++        if (SUCCEEDED(IPropertyStore_GetValue( store, &PKEY_AudioEndpoint_FormFactor, &pv )) && pv.vt == VT_UI4)
++            model->form_factor = pv.ulVal;
++        PropVariantClear( &pv );
++        if (SUCCEEDED(IPropertyStore_GetValue( store, &PKEY_AudioEndpoint_PhysicalSpeakers, &pv )) && pv.vt == VT_UI4)
++            model->channel_mask = pv.ulVal;
++        PropVariantClear( &pv );
++        IPropertyStore_Release( store );
++    }
++    if (model->flow == eCapture && model->form_factor == Speakers) model->form_factor = Microphone;
++    hr = create_topology( model, FALSE, out );
++    model_release( model );
++    return hr;
++}
