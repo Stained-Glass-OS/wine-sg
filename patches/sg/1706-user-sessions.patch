@@ -1,0 +1,288 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] server, ntdll: a session for each user of a shared prefix
+
+In a prefix shared between Unix users, every process had session 1: users
+signed in at once shared one WinSta0 (desktop, windows, clipboard) and one
+Local\ namespace, so one user's programs could find, message and read the
+other's windows and open its Local\ objects (single-instance mutexes,
+shared memory). On Windows each logon has a session of its own.
+
+Now each user has one, as each logon has on Windows:
+
+- A user's first process gets the user a session, kept for the server's
+  life: the first user shares the default session (1) with SYSTEM, whose
+  programs live in the service window station; later users get 2, 3, ...
+  Each session has its own BaseNamedObjects (Local\), window stations
+  (WinSta0 and its desktops, clipboard) and DOS devices; Global\ stays
+  shared, as on Windows. A process's children inherit its session.
+- SYSTEM (root or the prefix's owner) can start a program in a user's
+  session: SG_SESSION_UID=<uid> in its environment (sg-elevated-run sets it
+  for an elevated program, so its windows, tray icons and messages reach the
+  requesting user's desktop). The new set_process_info flag
+  SET_PROCESS_INFO_SESSION is honoured for SYSTEM only (anyone else:
+  STATUS_PRIVILEGE_NOT_HELD) and only before the process has a window
+  station. That stands in for SeTcbPrivilege, which only SYSTEM holds.
+- An administrator token granted to a process (grant_process_admin_token)
+  keeps the process's session.
+
+Single-user prefixes are unchanged: one session, 1.
+
+Gate: test/usersessions-gate.sh (sgsystem, sgtest1, sgtest2 against one
+machine wineserver). Mutant SG_MUTANT_ONE_SESSION.
+---
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1679,6 +1679,36 @@ size_t server_init_process(void)
+ 
+     if (ret) server_protocol_error( "init_first_thread failed with status %x\n", ret );
+ 
++    /* Stained Glass OS: a program SYSTEM starts for a user (sg-elevated-run,
++     * the broker's run-as) joins that user's session; the server allows it
++     * only for SYSTEM */
++    {
++        const char *uid_str = getenv( "SG_SESSION_UID" );
++
++        if (uid_str && *uid_str)
++        {
++            SERVER_START_REQ( set_process_info )
++            {
++                req->handle      = wine_server_obj_handle( GetCurrentProcess() );
++                req->mask        = SET_PROCESS_INFO_SESSION;
++                req->session_uid = strtoul( uid_str, NULL, 10 );
++                ret = wine_server_call( req );
++            }
++            SERVER_END_REQ;
++            if (!ret)
++            {
++                SERVER_START_REQ( get_process_info )
++                {
++                    req->handle = wine_server_obj_handle( GetCurrentProcess() );
++                    if (!wine_server_call( req )) peb->SessionId = reply->session_id;
++                }
++                SERVER_END_REQ;
++            }
++            unsetenv( "SG_SESSION_UID" );
++            ret = 0;
++        }
++    }
++
+     if (!supported_machines_count)
+         fatal_error( "'%s' is a 64-bit installation, it cannot be used with a 32-bit wineserver.\n",
+                      config_dir );
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1322,6 +1322,8 @@ struct set_process_info_request
+     affinity_t   affinity;
+     obj_handle_t token;
+     unsigned int child_policy;
++    unsigned int session_uid;
++    char __pad_44[4];
+ };
+ struct set_process_info_reply
+ {
+@@ -1331,6 +1333,7 @@ struct set_process_info_reply
+ #define SET_PROCESS_INFO_AFFINITY 0x02
+ #define SET_PROCESS_INFO_TOKEN    0x04
+ #define SET_PROCESS_INFO_CHILD_POLICY 0x08
++#define SET_PROCESS_INFO_SESSION  0x10
+ 
+ 
+ 
+@@ -6978,6 +6981,6 @@ union generic_reply
+     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 868
++#define SERVER_PROTOCOL_VERSION 869
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/directory.c
++++ b/server/directory.c
+@@ -281,6 +281,19 @@ struct object *get_directory_obj( struct process *process, obj_handle_t handle )
+ 
+ /* Global initialization */
+ 
++static void create_session( unsigned int id );
++
++/* Stained Glass OS: a session's namespace (its BaseNamedObjects, window
++ * stations, DOS devices) made when its first process appears */
++void sg_create_session( unsigned int id )
++{
++    static unsigned char created[256];
++
++    if (id >= ARRAY_SIZE(created) || created[id]) return;
++    created[id] = 1;
++    if (id && id != default_session_id) create_session( id );
++}
++
+ static void create_session( unsigned int id )
+ {
+     /* directories */
+--- a/server/process.c
++++ b/server/process.c
+@@ -783,7 +783,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+             process->token = token_create_for_uid( TRUE, -1,
+                                                    (!process->peer_uid || process->peer_uid == sg_system_prefix_uid)
+                                                    ? TokenElevationTypeFull : TokenElevationTypeDefault,
+-                                                   default_session_id, process->peer_uid );
++                                                   sg_session_for_uid( process->peer_uid ), process->peer_uid );
+         }
+         else
+             process->token = token_create_admin( TRUE, -1, TokenElevationTypeLimited, default_session_id );
+@@ -973,6 +973,34 @@ static int startup_info_signaled( struct object *obj, struct wait_queue_entry *e
+     return info->process && info->process->startup_state != STARTUP_IN_PROGRESS;
+ }
+ 
++/* Stained Glass OS: in a prefix shared between Unix users, each interactive
++ * user has a session of its own, as each logon has on Windows: its own
++ * BaseNamedObjects (Local\), window stations and desktops, so users logged on
++ * at once do not share WinSta0, see each other's windows or open each other's
++ * Local\ objects. SYSTEM (root, the prefix's owner) keeps the default session,
++ * as it always had, and the first user to appear shares it; later users get
++ * the next ones, kept for the server's life. Global\ objects are shared, as on
++ * Windows. */
++unsigned int sg_session_for_uid( uid_t uid )
++{
++    static struct { uid_t uid; unsigned int id; } map[200];
++    static unsigned int count, next = default_session_id;
++    unsigned int i, id;
++
++#ifdef SG_MUTANT_ONE_SESSION
++    return default_session_id;
++#endif
++    if (!sg_system_prefix || !uid || uid == sg_system_prefix_uid) return default_session_id;
++    for (i = 0; i < count; i++) if (map[i].uid == uid) return map[i].id;
++    if (count == ARRAY_SIZE(map)) return default_session_id;
++    id = next++;
++    map[count].uid = uid;
++    map[count].id = id;
++    count++;
++    sg_create_session( id );
++    return id;
++}
++
+ /* get a process from an id (and increment the refcount) */
+ struct process *get_process_from_id( process_id_t id )
+ {
+@@ -1768,6 +1796,24 @@ DECL_HANDLER(set_process_info)
+         if (req->mask & SET_PROCESS_INFO_AFFINITY) set_process_affinity( process, req->affinity );
+         /* a process restricts itself; a restriction is never lifted */
+         if (req->mask & SET_PROCESS_INFO_CHILD_POLICY) process->child_policy |= req->child_policy;
++        /* Stained Glass OS: SYSTEM puts a program it starts for a user into
++         * that user's session (an elevated program, a service's
++         * CreateProcessAsUser), before it has a window station */
++        if (req->mask & SET_PROCESS_INFO_SESSION)
++        {
++            unsigned int id;
++
++            /* only SYSTEM (sg_requester_is_admin); nobody else may make
++             * sessions, nor choose one */
++            if (!sg_requester_is_admin()) set_error( STATUS_PRIVILEGE_NOT_HELD );
++            else if ((id = sg_session_for_uid( req->session_uid )),
++                     process->winstation && id != process->session_id) set_error( STATUS_ACCESS_DENIED );
++            else
++            {
++                process->session_id = id;
++                token_set_session_id( process->token, id );
++            }
++        }
+         if (req->mask & SET_PROCESS_INFO_TOKEN)
+         {
+             struct token *token;
+@@ -1889,7 +1935,7 @@ DECL_HANDLER(grant_process_admin_token)
+         return;
+ 
+     if ((token = token_create_admin( TRUE, SecurityIdentification,
+-                                     TokenElevationTypeDefault, default_session_id )))
++                                     TokenElevationTypeDefault, process->session_id )))
+     {
+         release_object( process->token );
+         process->token = token;
+--- a/server/process.h
++++ b/server/process.h
+@@ -148,5 +148,7 @@ static inline int is_process_init_done( struct process *process )
+ }
+ 
+ static const unsigned int default_session_id = 1;
++extern void sg_create_session( unsigned int id );
++extern unsigned int sg_session_for_uid( uid_t uid );
+ 
+ #endif  /* __WINE_SERVER_PROCESS_H */
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1251,11 +1251,13 @@ struct obj_locator
+     affinity_t   affinity;     /* affinity mask */
+     obj_handle_t token;        /* primary token */
+     unsigned int child_policy; /* PROCESS_CREATION_CHILD_PROCESS_* to add */
++    unsigned int session_uid;  /* join the session of this Unix user (SYSTEM only) */
+ @END
+ #define SET_PROCESS_INFO_PRIORITY 0x01
+ #define SET_PROCESS_INFO_AFFINITY 0x02
+ #define SET_PROCESS_INFO_TOKEN    0x04
+ #define SET_PROCESS_INFO_CHILD_POLICY 0x08
++#define SET_PROCESS_INFO_SESSION  0x10
+ 
+ 
+ /* Retrieve information about a thread */
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -779,7 +779,8 @@ C_ASSERT( offsetof(struct set_process_info_request, priority) == 20 );
+ C_ASSERT( offsetof(struct set_process_info_request, affinity) == 24 );
+ C_ASSERT( offsetof(struct set_process_info_request, token) == 32 );
+ C_ASSERT( offsetof(struct set_process_info_request, child_policy) == 36 );
+-C_ASSERT( sizeof(struct set_process_info_request) == 40 );
++C_ASSERT( offsetof(struct set_process_info_request, session_uid) == 40 );
++C_ASSERT( sizeof(struct set_process_info_request) == 48 );
+ C_ASSERT( offsetof(struct get_thread_info_request, handle) == 12 );
+ C_ASSERT( offsetof(struct get_thread_info_request, access) == 16 );
+ C_ASSERT( sizeof(struct get_thread_info_request) == 24 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -270,6 +270,7 @@ static void dump_set_process_info_request( const struct set_process_info_request
+     dump_uint64( ", affinity=", &req->affinity );
+     fprintf( stderr, ", token=%04x", req->token );
+     fprintf( stderr, ", child_policy=%08x", req->child_policy );
++    fprintf( stderr, ", session_uid=%08x", req->session_uid );
+ }
+ 
+ static void dump_get_thread_info_request( const struct get_thread_info_request *req )
+@@ -4388,6 +4389,7 @@ static const struct
+     { "CANNOT_DELETE",               STATUS_CANNOT_DELETE },
+     { "CANT_OPEN_ANONYMOUS",         STATUS_CANT_OPEN_ANONYMOUS },
+     { "CHILD_MUST_BE_VOLATILE",      STATUS_CHILD_MUST_BE_VOLATILE },
++    { "CHILD_PROCESS_BLOCKED",       STATUS_CHILD_PROCESS_BLOCKED },
+     { "CONNECTION_ABORTED",          STATUS_CONNECTION_ABORTED },
+     { "CONNECTION_ACTIVE",           STATUS_CONNECTION_ACTIVE },
+     { "CONNECTION_REFUSED",          STATUS_CONNECTION_REFUSED },
+@@ -4493,6 +4495,7 @@ static const struct
+     { "PROCESS_IS_TERMINATING",      STATUS_PROCESS_IS_TERMINATING },
+     { "PROCESS_NOT_IN_JOB",          STATUS_PROCESS_NOT_IN_JOB },
+     { "QUOTA_EXCEEDED",              STATUS_QUOTA_EXCEEDED },
++    { "RANGE_NOT_LOCKED",            STATUS_RANGE_NOT_LOCKED },
+     { "REPARSE_POINT_NOT_RESOLVED",  STATUS_REPARSE_POINT_NOT_RESOLVED },
+     { "SECTION_TOO_BIG",             STATUS_SECTION_TOO_BIG },
+     { "SEMAPHORE_LIMIT_EXCEEDED",    STATUS_SEMAPHORE_LIMIT_EXCEEDED },
+--- a/server/security.h
++++ b/server/security.h
+@@ -86,6 +86,7 @@ extern int token_check_privileges( struct token *token, int all_required,
+                                    unsigned int count, struct luid_attr *usedprivs );
+ extern const struct acl *token_get_default_dacl( struct token *token );
+ extern const struct sid *token_get_owner( struct token *token );
++extern void token_set_session_id( struct token *token, unsigned int id );
+ /* Stained Glass OS: a token's integrity level (mandatory label RID) */
+ extern unsigned int token_get_integrity( struct token *token );
+ extern const struct sid *token_get_user( struct token *token );
+--- a/server/token.c
++++ b/server/token.c
+@@ -1935,6 +1935,11 @@ const struct sid *token_get_primary_group( struct token *token )
+     return token->primary_group;
+ }
+ 
++void token_set_session_id( struct token *token, unsigned int id )
++{
++    token->session_id = id;
++}
++
+ unsigned int token_get_session_id( struct token *token )
+ {
+     return token->session_id;
