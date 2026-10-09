@@ -25,7 +25,9 @@ mkdir -p "$BUILD_DIR"
 TARBALL="$BUILD_DIR/wine-$WINE_VERSION.tar.xz"
 if [[ ! -f "$TARBALL" ]]; then
     log "fetching Wine $WINE_VERSION"
-    curl -fsSL -o "$TARBALL.tmp" "$WINE_TARBALL_URL"
+    # retried: a short outage at dl.winehq.org failed CI's lint (2026-10-09)
+    curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 20 \
+        -o "$TARBALL.tmp" "$WINE_TARBALL_URL"
     mv "$TARBALL.tmp" "$TARBALL"
 fi
 
