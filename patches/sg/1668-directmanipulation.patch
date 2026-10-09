@@ -1,0 +1,3151 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] directmanipulation: viewports, contents, manipulation, inertia, updates
+
+Direct Manipulation was a shell: almost every method of the viewport,
+its contents, the manager, the update manager and the compositor was a
+FIXME that returned E_NOTIMPL or did nothing, so a program that hands its
+pointers to a viewport (as XAML-style scroll views and browsers' touch
+paths do) never saw its content move or its status change.
+
+- Viewports: status (building, enabled, disabled, running, inertia,
+  ready) told to their event handlers (OnViewportStatusChanged,
+  OnContentUpdated per content, OnViewportUpdated) and interaction
+  handlers (begin, manipulation or pinch, end); Enable, Disable, Stop,
+  Abandon; viewport rect, viewport and display transforms; tags;
+  configurations (added, removed, activated, checked), viewport options,
+  manual gestures, chaining, input and update modes; secondary contents;
+  behaviors.
+- The primary content's transform (a scale and a translation): content
+  rect, zoom boundaries and alignments keep it in the viewport;
+  ZoomToRect (at once, or animated); SyncContentTransform; snap
+  intervals and points (mandatory and optional, per motion, with their
+  coordinates); GetInertiaEndTransform, GetCenterPoint, the output
+  transform (secondary contents follow the primary's translation).
+- Manipulation: the contacts a program sets (SetContact) pan the content
+  (one pointer, along rails if asked) and zoom it about the pointers'
+  centre (two or more), from the activated window's pointer messages
+  (automatic input: the window does not see them) or ProcessInput
+  (manual); lifted, the content goes on with inertia and rests on a snap
+  point. Animations advance on a timer of the activated window, or on
+  the update manager's Update; RegisterWaitHandleCallback calls its
+  handler whenever the handle is signalled.
+- The compositor puts the contents' output transforms on their
+  DirectComposition visuals and commits them when flushed; its frame
+  information gives the frame's times.
+
+Wine's directmanipulation tests: as before.
+
+Gate: test/dmanip-gate.sh (Xvfb, test/dmanip-probe.c).
+Mutants SG_MUTANT_NO_CONTENT_EVENTS, SG_MUTANT_NO_POINTER_INPUT,
+SG_MUTANT_NO_UPDATE (directmanipulation/directmanipulation.c).
+---
+--- a/dlls/directmanipulation/Makefile.in
++++ b/dlls/directmanipulation/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = directmanipulation.dll
+-IMPORTS   = uuid
++IMPORTS   = uuid user32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+--- a/dlls/directmanipulation/directmanipulation.c
++++ b/dlls/directmanipulation/directmanipulation.c
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2019 Alistair Leslie-Hughes
++ * Copyright 2026 Stained Glass OS
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -15,261 +16,1110 @@
+  * License along with this library; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
++
++/* Stained Glass OS 1668: Direct Manipulation.
++ *
++ * A viewport shows its primary content through a transform (a scale and a
++ * translation, matrix [s 0 0 s tx ty]) that the user changes with the
++ * pointers the program hands it (SetContact) -- panning with one, zooming
++ * with two, within the configuration it activated -- and that goes on by
++ * itself after they lift (inertia) and settles on the snap points. Its
++ * event handlers hear of its status (enabled, running, inertia, ready, ...)
++ * and of each content update. Pointer input reaches the viewport through
++ * the activated window (automatic input) or ProcessInput (manual);
++ * animations advance on a timer of the window or on the update manager's
++ * Update. The compositor puts the transforms on DirectComposition
++ * visuals. */
++
+ #define COBJMACROS
+ 
+ #include <stdarg.h>
++#include <math.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "wingdi.h"
++#include "winuser.h"
+ #include "oleidl.h"
+ #include "rpcproxy.h"
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ #include "directmanipulation.h"
++#include "dcomp.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(manipulation);
+ 
+-struct directmanipulation
++static const GUID iid_composition_device = {0xc37ea93a,0xe7aa,0x450d,{0xb1,0x6f,0x97,0x46,0xcb,0x04,0x07,0xf3}};
++static const GUID iid_composition_visual = {0x4d93059d,0x097b,0x4651,{0x9a,0x60,0xf0,0xf2,0x51,0x16,0xe2,0xf3}};
++
++#define MAX_CONTACTS        10
++#define MAX_CONFIGURATIONS  32
++#define MOVE_THRESHOLD      3.0f        /* pixels before a contact manipulates */
++#define INERTIA_TAU         325.0f      /* ms: how fast inertia slows down */
++#define INERTIA_MIN_SPEED   0.05f       /* px/ms */
++#define ZOOM_DURATION       250.0f      /* ms: an animated ZoomToRect */
++#define TIMER_ID            0x444d4e50  /* "DMNP" */
++
++struct manager;
++struct viewport;
++
++/* ---- transforms ------------------------------------------------------------- */
++
++struct xform
+ {
+-    IDirectManipulationManager2 IDirectManipulationManager2_iface;
+-    IDirectManipulationUpdateManager *updatemanager;
++    float s, tx, ty;
++};
++
++static void xform_to_matrix( const struct xform *x, float *matrix, DWORD count )
++{
++    float m[6] = { x->s, 0.0f, 0.0f, x->s, x->tx, x->ty };
++    memcpy( matrix, m, min( count, 6 ) * sizeof(float) );
++}
++
++static BOOL xform_equal( const struct xform *a, const struct xform *b )
++{
++    return a->s == b->s && a->tx == b->tx && a->ty == b->ty;
++}
++
++/* milliseconds since the first call: small enough for a float's precision */
++static float now_ms(void)
++{
++    static LONGLONG base;
++    LARGE_INTEGER counter, freq;
++
++    QueryPerformanceCounter( &counter );
++    QueryPerformanceFrequency( &freq );
++    if (!base) base = counter.QuadPart;
++    return (float)((double)(counter.QuadPart - base) * 1000.0 / freq.QuadPart);
++}
++
++/* ---- contents ---------------------------------------------------------------- */
++
++struct snap
++{
++    float interval, offset;
++    float *points;
++    DWORD count;
++    DIRECTMANIPULATION_SNAPPOINT_TYPE type;
++    DIRECTMANIPULATION_SNAPPOINT_COORDINATE coordinate;
++    float origin;
++};
++
++struct content
++{
++    IDirectManipulationContent IDirectManipulationContent_iface;
++    IDirectManipulationPrimaryContent IDirectManipulationPrimaryContent_iface;
+     LONG ref;
++    BOOL primary;
++    struct viewport *viewport;      /* the primary's own (weak), a secondary's host */
++    struct list entry;              /* in the viewport's secondary contents */
++    RECT rect;
++    BOOL rect_set;
++    struct xform xform;             /* the content transform */
++    float zoom_min, zoom_max;
++    DIRECTMANIPULATION_HORIZONTALALIGNMENT halign;
++    DIRECTMANIPULATION_VERTICALALIGNMENT valign;
++    struct snap snap[3];            /* translate x, translate y, zoom */
++    float center_x, center_y;
++    IUnknown *tag;
++    UINT32 tag_id;
+ };
+ 
+-struct directupdatemanager
++/* ---- viewports ---------------------------------------------------------------- */
++
++struct handler
+ {
+-    IDirectManipulationUpdateManager IDirectManipulationUpdateManager_iface;
++    struct list entry;
++    DWORD cookie;
++    HWND window;
++    IDirectManipulationViewportEventHandler *handler;
++    IDirectManipulationInteractionEventHandler *interaction;
++};
++
++struct behavior
++{
++    struct list entry;
++    DWORD cookie;
++    IUnknown *behavior;
++};
++
++struct contact
++{
++    UINT32 id;
++    POINT pos;          /* in the viewport, from its window's client area */
++    BOOL down;
++};
++
++struct viewport
++{
++    IDirectManipulationViewport2 IDirectManipulationViewport2_iface;
+     LONG ref;
++    struct manager *manager;
++    struct list entry;              /* in the manager's viewports */
++    HWND window;
++    DIRECTMANIPULATION_STATUS status;
++    RECT rect;
++    float viewport_transform[6];
++    float display_transform[6];
++    struct content *primary;
++    struct list contents;
++    DIRECTMANIPULATION_CONFIGURATION configurations[MAX_CONFIGURATIONS];
++    UINT nconfigurations;
++    DIRECTMANIPULATION_CONFIGURATION active;
++    DIRECTMANIPULATION_VIEWPORT_OPTIONS options;
++    DIRECTMANIPULATION_GESTURE_CONFIGURATION gesture;
++    DIRECTMANIPULATION_MOTION_TYPES chaining;
++    DIRECTMANIPULATION_INPUT_MODE input_mode, update_mode;
++    struct list handlers;
++    struct list behaviors;
++    DWORD next_cookie;
++    IUnknown *tag;
++    UINT32 tag_id;
++    /* the manipulation */
++    struct contact contacts[MAX_CONTACTS];
++    UINT ncontacts;
++    BOOL manipulating;
++    struct xform start;             /* the transform when the contacts were set */
++    float start_cx, start_cy, start_dist;
++    float last_cx, last_cy, last_time;
++    float vx, vy;                   /* px/ms */
++    int rails;                      /* 0 not decided, 1 x, 2 y, 3 free */
++    /* an animation: inertia, or ZoomToRect */
++    BOOL animating;
++    struct xform anim_from, anim_to;
++    float anim_start, anim_duration;
++    BOOL anim_is_inertia;
+ };
+ 
+-static inline struct directmanipulation *impl_from_IDirectManipulationManager2(IDirectManipulationManager2 *iface)
++/* a window a manager activated */
++struct window_entry
+ {
+-    return CONTAINING_RECORD(iface, struct directmanipulation, IDirectManipulationManager2_iface);
++    struct list entry;
++    HWND window;
++    HWND hittest;
++    DIRECTMANIPULATION_HITTEST_TYPE hittest_type;
++};
++
++/* a window whose messages pass through here: once, whoever activated it */
++struct subclassed
++{
++    struct list entry;
++    HWND window;
++    WNDPROC old_proc;
++    LONG refs;
++};
++
++struct manager
++{
++    IDirectManipulationManager2 IDirectManipulationManager2_iface;
++    LONG ref;
++    struct list entry_all;
++    struct list viewports;
++    struct list windows;
++    struct update_manager *update;
++};
++
++static struct list all_managers = LIST_INIT( all_managers );
++static struct list subclassed_windows = LIST_INIT( subclassed_windows );
++static CRITICAL_SECTION dm_cs;
++static CRITICAL_SECTION_DEBUG dm_cs_debug =
++{
++    0, 0, &dm_cs,
++    { &dm_cs_debug.ProcessLocksList, &dm_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": dm_cs") }
++};
++static CRITICAL_SECTION dm_cs = { &dm_cs_debug, -1, 0, 0, 0, 0 };
++
++static inline struct viewport *impl_from_IDirectManipulationViewport2( IDirectManipulationViewport2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct viewport, IDirectManipulationViewport2_iface );
+ }
+ 
+-static inline struct directupdatemanager *impl_from_IDirectManipulationUpdateManager(IDirectManipulationUpdateManager *iface)
++static inline struct content *impl_from_IDirectManipulationContent( IDirectManipulationContent *iface )
+ {
+-    return CONTAINING_RECORD(iface, struct directupdatemanager, IDirectManipulationUpdateManager_iface);
++    return CONTAINING_RECORD( iface, struct content, IDirectManipulationContent_iface );
+ }
+ 
+-static HRESULT WINAPI update_manager_QueryInterface(IDirectManipulationUpdateManager *iface, REFIID riid,void **ppv)
++static inline struct content *impl_from_IDirectManipulationPrimaryContent( IDirectManipulationPrimaryContent *iface )
+ {
+-    struct directupdatemanager *This = impl_from_IDirectManipulationUpdateManager(iface);
++    return CONTAINING_RECORD( iface, struct content, IDirectManipulationPrimaryContent_iface );
++}
+ 
+-    TRACE("(%p)->(%s,%p)\n", This, debugstr_guid(riid), ppv);
++static inline struct manager *impl_from_IDirectManipulationManager2( IDirectManipulationManager2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct manager, IDirectManipulationManager2_iface );
++}
+ 
+-    if (IsEqualGUID(riid, &IID_IUnknown) ||
+-        IsEqualGUID(riid, &IID_IDirectManipulationUpdateManager)) {
+-        IUnknown_AddRef(iface);
+-        *ppv = iface;
+-        return S_OK;
++/* ---- events ---------------------------------------------------------------------- */
++
++/* the handlers, held while they are told (they may remove themselves) */
++static UINT grab_handlers( struct viewport *vp, struct handler **out, UINT max )
++{
++    struct handler *h;
++    UINT n = 0;
++
++    LIST_FOR_EACH_ENTRY( h, &vp->handlers, struct handler, entry )
++    {
++        if (n == max) break;
++        out[n] = h;
++        IDirectManipulationViewportEventHandler_AddRef( h->handler );
++        if (h->interaction) IDirectManipulationInteractionEventHandler_AddRef( h->interaction );
++        n++;
+     }
++    return n;
++}
+ 
+-    FIXME("(%p)->(%s,%p), not found\n", This, debugstr_guid(riid), ppv);
+-    return E_NOINTERFACE;
++static void release_handlers( struct handler **list, UINT n, IDirectManipulationViewportEventHandler **saved,
++                              IDirectManipulationInteractionEventHandler **saved_i )
++{
++    UINT i;
++    for (i = 0; i < n; i++)
++    {
++        IDirectManipulationViewportEventHandler_Release( saved[i] );
++        if (saved_i[i]) IDirectManipulationInteractionEventHandler_Release( saved_i[i] );
++    }
+ }
+ 
+-ULONG WINAPI update_manager_AddRef(IDirectManipulationUpdateManager *iface)
++static void set_status( struct viewport *vp, DIRECTMANIPULATION_STATUS status )
+ {
+-    struct directupdatemanager *This = impl_from_IDirectManipulationUpdateManager(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
++    IDirectManipulationViewportEventHandler *handlers[16];
++    IDirectManipulationInteractionEventHandler *interactions[16];
++    struct handler *list[16];
++    DIRECTMANIPULATION_STATUS previous = vp->status;
++    UINT n, i;
++
++    if (status == previous) return;
++    vp->status = status;
++    TRACE( "viewport %p: %u -> %u\n", vp, previous, status );
++    n = grab_handlers( vp, list, ARRAY_SIZE(list) );
++    for (i = 0; i < n; i++)
++    {
++        handlers[i] = list[i]->handler;
++        interactions[i] = list[i]->interaction;
++    }
++    for (i = 0; i < n; i++)
++        IDirectManipulationViewportEventHandler_OnViewportStatusChanged( handlers[i],
++                (IDirectManipulationViewport *)&vp->IDirectManipulationViewport2_iface, status, previous );
++    release_handlers( list, n, handlers, interactions );
++}
+ 
+-    TRACE("(%p) ref=%lu\n", This, ref);
++static void tell_interaction( struct viewport *vp, DIRECTMANIPULATION_INTERACTION_TYPE type )
++{
++    IDirectManipulationViewportEventHandler *handlers[16];
++    IDirectManipulationInteractionEventHandler *interactions[16];
++    struct handler *list[16];
++    UINT n, i;
+ 
+-    return ref;
++    n = grab_handlers( vp, list, ARRAY_SIZE(list) );
++    for (i = 0; i < n; i++)
++    {
++        handlers[i] = list[i]->handler;
++        interactions[i] = list[i]->interaction;
++    }
++    for (i = 0; i < n; i++)
++        if (interactions[i]) IDirectManipulationInteractionEventHandler_OnInteraction( interactions[i],
++                                    &vp->IDirectManipulationViewport2_iface, type );
++    release_handlers( list, n, handlers, interactions );
++}
++
++/* the contents were updated: each content, then the viewport */
++static void tell_updated( struct viewport *vp )
++{
++    IDirectManipulationViewportEventHandler *handlers[16];
++    IDirectManipulationInteractionEventHandler *interactions[16];
++    struct handler *list[16];
++    struct content *content;
++    UINT n, i;
++
++    n = grab_handlers( vp, list, ARRAY_SIZE(list) );
++    for (i = 0; i < n; i++)
++    {
++        handlers[i] = list[i]->handler;
++        interactions[i] = list[i]->interaction;
++    }
++    for (i = 0; i < n; i++)
++    {
++#ifndef SG_MUTANT_NO_CONTENT_EVENTS
++        if (vp->primary)
++            IDirectManipulationViewportEventHandler_OnContentUpdated( handlers[i],
++                    (IDirectManipulationViewport *)&vp->IDirectManipulationViewport2_iface,
++                    &vp->primary->IDirectManipulationContent_iface );
++        LIST_FOR_EACH_ENTRY( content, &vp->contents, struct content, entry )
++            IDirectManipulationViewportEventHandler_OnContentUpdated( handlers[i],
++                    (IDirectManipulationViewport *)&vp->IDirectManipulationViewport2_iface,
++                    &content->IDirectManipulationContent_iface );
++#endif
++        IDirectManipulationViewportEventHandler_OnViewportUpdated( handlers[i],
++                (IDirectManipulationViewport *)&vp->IDirectManipulationViewport2_iface );
++    }
++    release_handlers( list, n, handlers, interactions );
+ }
+ 
+-ULONG WINAPI update_manager_Release(IDirectManipulationUpdateManager *iface)
++/* ---- the manipulation --------------------------------------------------------------- */
++
++static float clampf( float v, float lo, float hi )
++{
++    return v < lo ? lo : v > hi ? hi : v;
++}
++
++/* the content kept in the viewport: edges past the viewport's are pulled
++ * back, smaller content goes where its alignment says */
++static void bound_xform( struct viewport *vp, struct xform *x )
+ {
+-    struct directupdatemanager *This = impl_from_IDirectManipulationUpdateManager(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
++    struct content *c = vp->primary;
++    float vw = vp->rect.right - vp->rect.left, vh = vp->rect.bottom - vp->rect.top;
++    float cw, ch, left, top;
+ 
+-    TRACE("(%p) ref=%lu\n", This, ref);
++    x->s = clampf( x->s, c->zoom_min, c->zoom_max );
++    if (!c->rect_set) return;
++    cw = (c->rect.right - c->rect.left) * x->s;
++    ch = (c->rect.bottom - c->rect.top) * x->s;
++    left = c->rect.left * x->s;
++    top = c->rect.top * x->s;
++    if (cw >= vw) x->tx = clampf( x->tx, vw - cw - left, -left );
++    else if (c->halign & DIRECTMANIPULATION_HORIZONTALALIGNMENT_CENTER) x->tx = (vw - cw) / 2 - left;
++    else if (c->halign & DIRECTMANIPULATION_HORIZONTALALIGNMENT_RIGHT) x->tx = vw - cw - left;
++    else if (c->halign & DIRECTMANIPULATION_HORIZONTALALIGNMENT_LEFT) x->tx = -left;
++    else x->tx = clampf( x->tx, -left, vw - cw - left );
++    if (ch >= vh) x->ty = clampf( x->ty, vh - ch - top, -top );
++    else if (c->valign & DIRECTMANIPULATION_VERTICALALIGNMENT_CENTER) x->ty = (vh - ch) / 2 - top;
++    else if (c->valign & DIRECTMANIPULATION_VERTICALALIGNMENT_BOTTOM) x->ty = vh - ch - top;
++    else if (c->valign & DIRECTMANIPULATION_VERTICALALIGNMENT_TOP) x->ty = -top;
++    else x->ty = clampf( x->ty, -top, vh - ch - top );
++}
+ 
+-    if (!ref)
++/* the snap point nearest a value, if the content has any for the motion */
++static float snap_value( const struct snap *snap, float value, BOOL *snapped )
++{
++    float best = value, dist = INFINITY, origin = snap->coordinate & DIRECTMANIPULATION_COORDINATE_ORIGIN ? snap->origin : 0;
++    DWORD i;
++
++    *snapped = FALSE;
++    if (snap->interval > 0)
+     {
+-        free(This);
++        float k = roundf( (value - origin - snap->offset) / snap->interval );
++        best = origin + snap->offset + k * snap->interval;
++        *snapped = TRUE;
+     }
+-    return ref;
++    else if (snap->count)
++    {
++        for (i = 0; i < snap->count; i++)
++        {
++            float p = origin + snap->points[i];
++            if (fabsf( p - value ) < dist)
++            {
++                dist = fabsf( p - value );
++                best = p;
++            }
++        }
++        *snapped = TRUE;
++    }
++    /* optional snap points only catch a value near them */
++    if (*snapped && (snap->type == DIRECTMANIPULATION_SNAPPOINT_OPTIONAL ||
++                     snap->type == DIRECTMANIPULATION_SNAPPOINT_OPTIONAL_SINGLE))
++    {
++        float reach = snap->interval > 0 ? snap->interval / 4 : 48.0f;
++        if (fabsf( best - value ) > reach)
++        {
++            *snapped = FALSE;
++            return value;
++        }
++    }
++    return best;
+ }
+ 
+-static HRESULT WINAPI update_manager_RegisterWaitHandleCallback(IDirectManipulationUpdateManager *iface, HANDLE handle,
+-            IDirectManipulationUpdateHandler *handler, DWORD *cookie)
++static void snap_xform( struct viewport *vp, struct xform *x )
+ {
+-    struct directupdatemanager *This = impl_from_IDirectManipulationUpdateManager(iface);
+-    FIXME("%p, %p, %p, %p\n", This, handle, handler, cookie);
+-    return E_NOTIMPL;
++    struct content *c = vp->primary;
++    BOOL snapped;
++    float pos;
++
++    pos = snap_value( &c->snap[2], x->s, &snapped );
++    if (snapped) x->s = pos;
++    /* translation snap points are scroll positions of the content */
++    pos = snap_value( &c->snap[0], -x->tx, &snapped );
++    if (snapped) x->tx = -pos;
++    pos = snap_value( &c->snap[1], -x->ty, &snapped );
++    if (snapped) x->ty = -pos;
+ }
+ 
+-static HRESULT WINAPI update_manager_UnregisterWaitHandleCallback(IDirectManipulationUpdateManager *iface, DWORD cookie)
++static void set_transform( struct viewport *vp, const struct xform *x )
+ {
+-    struct directupdatemanager *This = impl_from_IDirectManipulationUpdateManager(iface);
+-    FIXME("%p, %lx\n", This, cookie);
+-    return E_NOTIMPL;
++    if (!vp->primary || xform_equal( &vp->primary->xform, x )) return;
++    vp->primary->xform = *x;
++    tell_updated( vp );
+ }
+ 
+-static HRESULT WINAPI update_manager_Update(IDirectManipulationUpdateManager *iface, IDirectManipulationFrameInfoProvider *provider)
++static void start_animation( struct viewport *vp, const struct xform *to, float duration, BOOL inertia )
+ {
+-    struct directupdatemanager *This = impl_from_IDirectManipulationUpdateManager(iface);
+-    FIXME("%p, %p\n", This, provider);
+-    return E_NOTIMPL;
++    vp->anim_from = vp->primary->xform;
++    vp->anim_to = *to;
++    vp->anim_start = now_ms();
++    vp->anim_duration = duration;
++    vp->anim_is_inertia = inertia;
++    vp->animating = TRUE;
+ }
+ 
+-struct IDirectManipulationUpdateManagerVtbl updatemanagerVtbl =
++/* the contacts' centre and spread */
++static void contacts_center( struct viewport *vp, float *cx, float *cy, float *dist )
+ {
+-    update_manager_QueryInterface,
+-    update_manager_AddRef,
+-    update_manager_Release,
+-    update_manager_RegisterWaitHandleCallback,
+-    update_manager_UnregisterWaitHandleCallback,
+-    update_manager_Update
+-};
++    float x = 0, y = 0, d = 0;
++    UINT i;
++
++    for (i = 0; i < vp->ncontacts; i++)
++    {
++        x += vp->contacts[i].pos.x;
++        y += vp->contacts[i].pos.y;
++    }
++    if (vp->ncontacts)
++    {
++        x /= vp->ncontacts;
++        y /= vp->ncontacts;
++    }
++    for (i = 0; i < vp->ncontacts; i++)
++        d += sqrtf( (vp->contacts[i].pos.x - x) * (vp->contacts[i].pos.x - x) +
++                    (vp->contacts[i].pos.y - y) * (vp->contacts[i].pos.y - y) );
++    if (vp->ncontacts) d /= vp->ncontacts;
++    *cx = x;
++    *cy = y;
++    *dist = d;
++}
++
++/* the contacts changed: the manipulation goes on from here */
++static void rebase( struct viewport *vp )
++{
++    if (vp->primary) vp->start = vp->primary->xform;
++    contacts_center( vp, &vp->start_cx, &vp->start_cy, &vp->start_dist );
++    vp->last_cx = vp->start_cx;
++    vp->last_cy = vp->start_cy;
++    vp->last_time = now_ms();
++}
++
++static void manipulate( struct viewport *vp )
++{
++    DIRECTMANIPULATION_CONFIGURATION cfg = vp->active;
++    float cx, cy, dist, dx, dy, t = now_ms(), dt;
++    struct xform x;
++
++    if (!vp->primary || !vp->ncontacts) return;
++    if (vp->status != DIRECTMANIPULATION_ENABLED && vp->status != DIRECTMANIPULATION_READY &&
++        vp->status != DIRECTMANIPULATION_RUNNING && vp->status != DIRECTMANIPULATION_INERTIA)
++        return;
++    if (!(cfg & DIRECTMANIPULATION_CONFIGURATION_INTERACTION)) return;
++    contacts_center( vp, &cx, &cy, &dist );
++    dx = cx - vp->start_cx;
++    dy = cy - vp->start_cy;
++    if (!vp->manipulating)
++    {
++        if (fabsf( dx ) < MOVE_THRESHOLD && fabsf( dy ) < MOVE_THRESHOLD &&
++            fabsf( dist - vp->start_dist ) < MOVE_THRESHOLD)
++            return;
++        vp->manipulating = TRUE;
++        vp->animating = FALSE;
++        tell_interaction( vp, DIRECTMANIPULATION_INTERACTION_BEGIN );
++        set_status( vp, DIRECTMANIPULATION_RUNNING );
++        tell_interaction( vp, vp->ncontacts > 1 ? DIRECTMANIPULATION_INTERACTION_TYPE_GESTURE_PINCH_ZOOM :
++                                                  DIRECTMANIPULATION_INTERACTION_TYPE_MANIPULATION );
++        /* rails: a pan that starts along an axis keeps to it */
++        vp->rails = 3;
++        if ((cfg & DIRECTMANIPULATION_CONFIGURATION_RAILS_X) && fabsf( dx ) > 2 * fabsf( dy )) vp->rails = 1;
++        else if ((cfg & DIRECTMANIPULATION_CONFIGURATION_RAILS_Y) && fabsf( dy ) > 2 * fabsf( dx )) vp->rails = 2;
++    }
++
++    x = vp->start;
++    if ((cfg & DIRECTMANIPULATION_CONFIGURATION_SCALING) && vp->ncontacts > 1 && vp->start_dist > 0)
++        x.s = clampf( vp->start.s * dist / vp->start_dist, vp->primary->zoom_min, vp->primary->zoom_max );
++    /* the content point under the start centre goes with the centre */
++    {
++        float px = (vp->start_cx - vp->start.tx) / vp->start.s, py = (vp->start_cy - vp->start.ty) / vp->start.s;
++        float mx = (cfg & DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_X) && vp->rails != 2 ? cx : vp->start_cx;
++        float my = (cfg & DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_Y) && vp->rails != 1 ? cy : vp->start_cy;
++        x.tx = mx - x.s * px;
++        x.ty = my - x.s * py;
++        vp->primary->center_x = px;
++        vp->primary->center_y = py;
++    }
++    bound_xform( vp, &x );
+ 
+-static HRESULT create_update_manager(IDirectManipulationUpdateManager **obj)
++    dt = t - vp->last_time;
++    if (dt > 0)
++    {
++        /* a smoothed velocity, for inertia */
++        vp->vx = 0.6f * (cx - vp->last_cx) / dt + 0.4f * vp->vx;
++        vp->vy = 0.6f * (cy - vp->last_cy) / dt + 0.4f * vp->vy;
++    }
++    vp->last_cx = cx;
++    vp->last_cy = cy;
++    vp->last_time = t;
++    set_transform( vp, &x );
++}
++
++/* the last contact lifted: inertia, or ready */
++static void end_manipulation( struct viewport *vp )
+ {
+-    struct directupdatemanager *object;
++    DIRECTMANIPULATION_CONFIGURATION cfg = vp->active;
++    struct xform end;
+ 
+-    object = malloc(sizeof(*object));
+-    if(!object)
+-        return E_OUTOFMEMORY;
++    if (!vp->manipulating) return;
++    vp->manipulating = FALSE;
++    if (!vp->primary)
++    {
++        set_status( vp, DIRECTMANIPULATION_READY );
++        return;
++    }
++    end = vp->primary->xform;
++    if ((cfg & DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_INERTIA) &&
++        (fabsf( vp->vx ) > INERTIA_MIN_SPEED || fabsf( vp->vy ) > INERTIA_MIN_SPEED))
++    {
++        /* where the content would come to rest: v * tau */
++        if ((cfg & DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_X) && vp->rails != 2) end.tx += vp->vx * INERTIA_TAU;
++        if ((cfg & DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_Y) && vp->rails != 1) end.ty += vp->vy * INERTIA_TAU;
++    }
++    snap_xform( vp, &end );
++    bound_xform( vp, &end );
++    TRACE( "release at %f,%f px/ms: to %f,%f\n", vp->vx, vp->vy, end.tx, end.ty );
++    tell_interaction( vp, DIRECTMANIPULATION_INTERACTION_END );
++    if (!xform_equal( &end, &vp->primary->xform ))
++    {
++        start_animation( vp, &end, 3 * INERTIA_TAU, TRUE );
++        set_status( vp, DIRECTMANIPULATION_INERTIA );
++    }
++    else set_status( vp, DIRECTMANIPULATION_READY );
++}
+ 
+-    object->IDirectManipulationUpdateManager_iface.lpVtbl = &updatemanagerVtbl;
+-    object->ref = 1;
++/* an animation's next frame; TRUE while it goes on */
++static BOOL animate( struct viewport *vp, float t )
++{
++    float p, e;
++    struct xform x;
+ 
+-    *obj = &object->IDirectManipulationUpdateManager_iface;
++    if (!vp->animating || !vp->primary) return FALSE;
++    p = vp->anim_duration > 0 ? (t - vp->anim_start) / vp->anim_duration : 1.0f;
++    if (p >= 1.0f)
++    {
++        vp->animating = FALSE;
++        set_transform( vp, &vp->anim_to );
++        set_status( vp, DIRECTMANIPULATION_READY );
++        return FALSE;
++    }
++    if (p < 0) p = 0;
++    /* inertia slows exponentially; a zoom eases out */
++    e = vp->anim_is_inertia ? (1.0f - expf( -3.0f * p )) / (1.0f - expf( -3.0f )) : 1.0f - (1.0f - p) * (1.0f - p) * (1.0f - p);
++    x.s = vp->anim_from.s + (vp->anim_to.s - vp->anim_from.s) * e;
++    x.tx = vp->anim_from.tx + (vp->anim_to.tx - vp->anim_from.tx) * e;
++    x.ty = vp->anim_from.ty + (vp->anim_to.ty - vp->anim_from.ty) * e;
++    set_transform( vp, &x );
++    return TRUE;
++}
+ 
+-    return S_OK;
++/* every viewport of the manager one frame on; TRUE while any animates */
++static BOOL update_viewports( struct manager *manager, float t )
++{
++    struct viewport *vp, *next;
++    BOOL busy = FALSE;
++
++    LIST_FOR_EACH_ENTRY_SAFE( vp, next, &manager->viewports, struct viewport, entry )
++    {
++        IDirectManipulationViewport2_AddRef( &vp->IDirectManipulationViewport2_iface );
++        if (animate( vp, t )) busy = TRUE;
++        IDirectManipulationViewport2_Release( &vp->IDirectManipulationViewport2_iface );
++    }
++    return busy;
+ }
+ 
+-struct primarycontext
++static struct window_entry *find_window( struct manager *manager, HWND hwnd )
+ {
+-    IDirectManipulationPrimaryContent IDirectManipulationPrimaryContent_iface;
+-    IDirectManipulationContent IDirectManipulationContent_iface;
+-    LONG ref;
+-};
++    struct window_entry *w;
++    LIST_FOR_EACH_ENTRY( w, &manager->windows, struct window_entry, entry ) if (w->window == hwnd) return w;
++    return NULL;
++}
+ 
+-static inline struct primarycontext *impl_from_IDirectManipulationPrimaryContent(IDirectManipulationPrimaryContent *iface)
++/* an animation on an activated window runs on its timer (unless the
++ * program updates the viewport itself) */
++static void start_timer( struct viewport *vp )
+ {
+-    return CONTAINING_RECORD(iface, struct primarycontext, IDirectManipulationPrimaryContent_iface);
++    if (vp->options & DIRECTMANIPULATION_VIEWPORT_OPTIONS_MANUALUPDATE) return;
++    if (vp->window && find_window( vp->manager, vp->window )) SetTimer( vp->window, TIMER_ID, 15, NULL );
+ }
+ 
+-static inline struct primarycontext *impl_from_IDirectManipulationContent(IDirectManipulationContent *iface)
++/* a pointer message for the viewports: TRUE if a viewport took it */
++static BOOL handle_pointer( struct manager *manager, const MSG *msg )
+ {
+-    return CONTAINING_RECORD(iface, struct primarycontext, IDirectManipulationContent_iface);
++    UINT32 id = GET_POINTERID_WPARAM( msg->wParam );
++    struct viewport *vp, *next;
++    BOOL handled = FALSE;
++    POINT pt;
++    UINT i;
++
++    pt.x = (short)LOWORD( msg->lParam );
++    pt.y = (short)HIWORD( msg->lParam );
++    LIST_FOR_EACH_ENTRY_SAFE( vp, next, &manager->viewports, struct viewport, entry )
++    {
++        POINT local = pt;
++
++        for (i = 0; i < vp->ncontacts; i++) if (vp->contacts[i].id == id) break;
++        if (i == vp->ncontacts) continue;
++        IDirectManipulationViewport2_AddRef( &vp->IDirectManipulationViewport2_iface );
++        if (vp->window) ScreenToClient( vp->window, &local );
++        local.x -= vp->rect.left;
++        local.y -= vp->rect.top;
++        switch (msg->message)
++        {
++        case WM_POINTERDOWN:
++        case WM_POINTERUPDATE:
++            vp->contacts[i].pos = local;
++            if (!vp->contacts[i].down)
++            {
++                vp->contacts[i].down = TRUE;
++                rebase( vp );
++            }
++            else manipulate( vp );
++            break;
++        case WM_POINTERUP:
++        case WM_POINTERCAPTURECHANGED:
++            vp->contacts[i].pos = local;
++            if (msg->message == WM_POINTERUP) manipulate( vp );
++            memmove( &vp->contacts[i], &vp->contacts[i + 1], (vp->ncontacts - i - 1) * sizeof(vp->contacts[0]) );
++            vp->ncontacts--;
++            if (vp->ncontacts) rebase( vp );
++            else
++            {
++                end_manipulation( vp );
++                if (vp->animating) start_timer( vp );
++            }
++            break;
++        }
++        handled = TRUE;
++        IDirectManipulationViewport2_Release( &vp->IDirectManipulationViewport2_iface );
++    }
++    return handled;
+ }
+ 
+-static HRESULT WINAPI primary_QueryInterface(IDirectManipulationPrimaryContent *iface, REFIID riid, void **ppv)
++/* automatic input: the activated window's pointer messages go to the
++ * viewports holding the pointers */
++static LRESULT CALLBACK subclass_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    TRACE("(%p)->(%s,%p)\n", This, debugstr_guid(riid), ppv);
++    struct manager *managers[8], *manager;
++    struct subclassed *sc;
++    WNDPROC old = NULL;
++    UINT n = 0, i;
++    BOOL handled = FALSE;
+ 
+-    if (IsEqualGUID(riid, &IID_IUnknown) ||
+-        IsEqualGUID(riid, &IID_IDirectManipulationPrimaryContent))
++    EnterCriticalSection( &dm_cs );
++    LIST_FOR_EACH_ENTRY( sc, &subclassed_windows, struct subclassed, entry )
++        if (sc->window == hwnd) old = sc->old_proc;
++    LIST_FOR_EACH_ENTRY( manager, &all_managers, struct manager, entry_all )
+     {
+-        IDirectManipulationPrimaryContent_AddRef(&This->IDirectManipulationPrimaryContent_iface);
+-        *ppv = &This->IDirectManipulationPrimaryContent_iface;
+-        return S_OK;
++        if (n < ARRAY_SIZE(managers) && find_window( manager, hwnd ))
++        {
++            managers[n++] = manager;
++            IDirectManipulationManager2_AddRef( &manager->IDirectManipulationManager2_iface );
++        }
+     }
+-    else if(IsEqualGUID(riid, &IID_IDirectManipulationContent))
++    LeaveCriticalSection( &dm_cs );
++    if (!old) return DefWindowProcW( hwnd, msg, wparam, lparam );
++
++    if (msg == WM_TIMER && wparam == TIMER_ID)
+     {
+-        IUnknown_AddRef(iface);
++        BOOL busy = FALSE;
++        for (i = 0; i < n; i++) if (update_viewports( managers[i], now_ms() )) busy = TRUE;
++        if (!busy) KillTimer( hwnd, TIMER_ID );
++        handled = TRUE;
++    }
++    else if (msg == WM_POINTERDOWN || msg == WM_POINTERUPDATE || msg == WM_POINTERUP ||
++             msg == WM_POINTERCAPTURECHANGED)
++    {
++        MSG m = { hwnd, msg, wparam, lparam };
++        for (i = 0; i < n; i++)
++        {
++            struct viewport *vp;
++            BOOL automatic = FALSE;
++            LIST_FOR_EACH_ENTRY( vp, &managers[i]->viewports, struct viewport, entry )
++                if (vp->input_mode == DIRECTMANIPULATION_INPUT_MODE_AUTOMATIC) automatic = TRUE;
++#ifndef SG_MUTANT_NO_POINTER_INPUT
++            if (automatic && handle_pointer( managers[i], &m )) handled = TRUE;
++#endif
++        }
++    }
++    for (i = 0; i < n; i++) IDirectManipulationManager2_Release( &managers[i]->IDirectManipulationManager2_iface );
++    if (handled) return 0;
++    return CallWindowProcW( old, hwnd, msg, wparam, lparam );
++}
++
++/* ---- IDirectManipulationContent / IDirectManipulationPrimaryContent ---------------- */
++
++static HRESULT WINAPI content_QueryInterface( IDirectManipulationContent *iface, REFIID riid, void **ppv )
++{
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++
++    TRACE( "(%p)->(%s,%p)\n", This, debugstr_guid( riid ), ppv );
++
++    if (!ppv) return E_POINTER;
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IDirectManipulationContent ))
+         *ppv = &This->IDirectManipulationContent_iface;
+-        return S_OK;
++    else if (IsEqualGUID( riid, &IID_IDirectManipulationPrimaryContent ) && This->primary)
++        *ppv = &This->IDirectManipulationPrimaryContent_iface;
++    else
++    {
++        WARN( "(%p)->(%s,%p), not found\n", This, debugstr_guid( riid ), ppv );
++        *ppv = NULL;
++        return E_NOINTERFACE;
+     }
++    IUnknown_AddRef( (IUnknown *)*ppv );
++    return S_OK;
++}
+ 
+-    FIXME("(%p)->(%s,%p),not found\n", This, debugstr_guid(riid), ppv);
+-    return E_NOINTERFACE;
++static void free_snap( struct snap *snap )
++{
++    free( snap->points );
++    snap->points = NULL;
++    snap->count = 0;
++}
++
++static ULONG WINAPI content_AddRef( IDirectManipulationContent *iface )
++{
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++
++    /* the primary content lives as long as its viewport */
++    if (This->primary && This->viewport)
++        return IDirectManipulationViewport2_AddRef( &This->viewport->IDirectManipulationViewport2_iface );
++    return InterlockedIncrement( &This->ref );
+ }
+ 
+-static ULONG WINAPI primary_AddRef(IDirectManipulationPrimaryContent *iface)
++static void destroy_content( struct content *This )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
++    UINT i;
++
++    for (i = 0; i < ARRAY_SIZE(This->snap); i++) free_snap( &This->snap[i] );
++    if (This->tag) IUnknown_Release( This->tag );
++    free( This );
++}
+ 
+-    TRACE("(%p) ref=%lu\n", This, ref);
++static ULONG WINAPI content_Release( IDirectManipulationContent *iface )
++{
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++    ULONG ref;
+ 
++    if (This->primary && This->viewport)
++        return IDirectManipulationViewport2_Release( &This->viewport->IDirectManipulationViewport2_iface );
++    if (!(ref = InterlockedDecrement( &This->ref ))) destroy_content( This );
+     return ref;
+ }
+ 
+-static ULONG WINAPI primary_Release(IDirectManipulationPrimaryContent *iface)
++static HRESULT WINAPI content_GetContentRect( IDirectManipulationContent *iface, RECT *size )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
++    struct content *This = impl_from_IDirectManipulationContent( iface );
+ 
+-    TRACE("(%p) ref=%lu\n", This, ref);
++    TRACE( "%p, %p\n", This, size );
+ 
+-    if (!ref)
++    if (!size) return E_POINTER;
++    *size = This->rect;
++    return S_OK;
++}
++
++static HRESULT WINAPI content_SetContentRect( IDirectManipulationContent *iface, const RECT *size )
++{
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++
++    TRACE( "%p, %s\n", This, wine_dbgstr_rect( size ) );
++
++    if (!size) return E_POINTER;
++    if (size->right < size->left || size->bottom < size->top) return E_INVALIDARG;
++    This->rect = *size;
++    This->rect_set = TRUE;
++    if (This->primary && This->viewport)
+     {
+-        free(This);
++        struct xform x = This->xform;
++        bound_xform( This->viewport, &x );
++        set_transform( This->viewport, &x );
+     }
+-    return ref;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI primary_SetSnapInterval(IDirectManipulationPrimaryContent *iface, DIRECTMANIPULATION_MOTION_TYPES motion,
+-            float interval, float offset)
++static HRESULT WINAPI content_GetViewport( IDirectManipulationContent *iface, REFIID riid, void **object )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    FIXME("%p, %d, %f, %f\n", This, motion, interval, offset);
+-    return E_NOTIMPL;
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++
++    TRACE( "%p, %s, %p\n", This, debugstr_guid( riid ), object );
++
++    if (!object) return E_POINTER;
++    *object = NULL;
++    if (!This->viewport) return E_FAIL;
++    return IDirectManipulationViewport2_QueryInterface( &This->viewport->IDirectManipulationViewport2_iface, riid, object );
+ }
+ 
+-static HRESULT WINAPI primary_SetSnapPoints(IDirectManipulationPrimaryContent *iface, DIRECTMANIPULATION_MOTION_TYPES motion,
+-            const float *points, DWORD count)
++static HRESULT WINAPI content_GetTag( IDirectManipulationContent *iface, REFIID riid, void **object, UINT32 *id )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    FIXME("%p, %d, %p, %ld\n", This, motion, points, count);
+-    return E_NOTIMPL;
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++
++    TRACE( "%p, %s, %p, %p\n", This, debugstr_guid( riid ), object, id );
++
++    if (id) *id = This->tag_id;
++    if (!object) return S_OK;
++    *object = NULL;
++    if (!This->tag) return S_OK;
++    return IUnknown_QueryInterface( This->tag, riid, object );
+ }
+ 
+-static HRESULT WINAPI primary_SetSnapType(IDirectManipulationPrimaryContent *iface, DIRECTMANIPULATION_MOTION_TYPES motion,
+-            DIRECTMANIPULATION_SNAPPOINT_TYPE type)
++static HRESULT WINAPI content_SetTag( IDirectManipulationContent *iface, IUnknown *object, UINT32 id )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    FIXME("%p, %d, %d\n", This, motion, type);
+-    return E_NOTIMPL;
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++
++    TRACE( "%p, %p, %u\n", This, object, id );
++
++    if (object) IUnknown_AddRef( object );
++    if (This->tag) IUnknown_Release( This->tag );
++    This->tag = object;
++    This->tag_id = id;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI primary_SetSnapCoordinate(IDirectManipulationPrimaryContent *iface, DIRECTMANIPULATION_MOTION_TYPES motion,
+-            DIRECTMANIPULATION_SNAPPOINT_COORDINATE coordinate, float origin)
++/* a secondary content follows the primary's translation (as an indicator
++ * or a parallax layer does); the primary's output is its transform */
++static void content_output( struct content *This, struct xform *x )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    FIXME("%p, %d, %d, %f\n", This, motion, coordinate, origin);
+-    return E_NOTIMPL;
++    if (This->primary || !This->viewport || !This->viewport->primary) *x = This->xform;
++    else
++    {
++        x->s = 1.0f;
++        x->tx = This->viewport->primary->xform.tx + This->xform.tx;
++        x->ty = This->viewport->primary->xform.ty + This->xform.ty;
++    }
+ }
+ 
+-static HRESULT WINAPI primary_SetZoomBoundaries(IDirectManipulationPrimaryContent *iface, float minimum, float maximum)
++static HRESULT WINAPI content_GetOutputTransform( IDirectManipulationContent *iface, float *matrix, DWORD count )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    FIXME("%p, %f, %f\n", This, minimum, maximum);
+-    return E_NOTIMPL;
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++    struct xform x;
++
++    TRACE( "%p, %p, %lu\n", This, matrix, count );
++
++    if (!matrix) return E_POINTER;
++    if (count < 6) return E_INVALIDARG;
++    content_output( This, &x );
++    xform_to_matrix( &x, matrix, count );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI primary_SetHorizontalAlignment(IDirectManipulationPrimaryContent *iface, DIRECTMANIPULATION_HORIZONTALALIGNMENT alignment)
++static HRESULT WINAPI content_GetContentTransform( IDirectManipulationContent *iface, float *matrix, DWORD count )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    FIXME("%p, %d\n", This, alignment);
+-    return E_NOTIMPL;
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++
++    TRACE( "%p, %p, %lu\n", This, matrix, count );
++
++    if (!matrix) return E_POINTER;
++    if (count < 6) return E_INVALIDARG;
++    xform_to_matrix( &This->xform, matrix, count );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI primary_SetVerticalAlignment(IDirectManipulationPrimaryContent *iface, DIRECTMANIPULATION_VERTICALALIGNMENT alignment)
++/* the program moved the content itself */
++static HRESULT WINAPI content_SyncContentTransform( IDirectManipulationContent *iface, const float *matrix, DWORD count )
++{
++    struct content *This = impl_from_IDirectManipulationContent( iface );
++    struct xform x;
++
++    TRACE( "%p, %p, %lu\n", This, matrix, count );
++
++    if (!matrix) return E_POINTER;
++    if (count < 6) return E_INVALIDARG;
++    x.s = matrix[0] > 0 ? matrix[0] : 1.0f;
++    x.tx = matrix[4];
++    x.ty = matrix[5];
++    if (This->primary && This->viewport)
++    {
++        This->viewport->animating = FALSE;
++        if (This->viewport->manipulating) rebase( This->viewport );
++        set_transform( This->viewport, &x );
++        if (This->viewport->manipulating) This->viewport->start = x;
++    }
++    else This->xform = x;
++    return S_OK;
++}
++
++static const IDirectManipulationContentVtbl contentVtbl =
++{
++    content_QueryInterface,
++    content_AddRef,
++    content_Release,
++    content_GetContentRect,
++    content_SetContentRect,
++    content_GetViewport,
++    content_GetTag,
++    content_SetTag,
++    content_GetOutputTransform,
++    content_GetContentTransform,
++    content_SyncContentTransform,
++};
++
++static HRESULT WINAPI primary_QueryInterface( IDirectManipulationPrimaryContent *iface, REFIID riid, void **ppv )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    FIXME("%p, %d\n", This, alignment);
+-    return E_NOTIMPL;
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++    return content_QueryInterface( &This->IDirectManipulationContent_iface, riid, ppv );
+ }
+ 
+-static HRESULT WINAPI primary_GetInertiaEndTransform(IDirectManipulationPrimaryContent *iface, float *matrix, DWORD count)
++static ULONG WINAPI primary_AddRef( IDirectManipulationPrimaryContent *iface )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    FIXME("%p,  %p, %ld\n", This, matrix, count);
+-    return E_NOTIMPL;
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++    return content_AddRef( &This->IDirectManipulationContent_iface );
+ }
+ 
+-static HRESULT WINAPI primary_GetCenterPoint(IDirectManipulationPrimaryContent *iface, float *x, float *y)
++static ULONG WINAPI primary_Release( IDirectManipulationPrimaryContent *iface )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationPrimaryContent(iface);
+-    FIXME("%p, %p, %p\n", This, x, y);
+-    return E_NOTIMPL;
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++    return content_Release( &This->IDirectManipulationContent_iface );
++}
++
++/* which snap settings a motion names: one motion at a time */
++static struct snap *motion_snap( struct content *This, DIRECTMANIPULATION_MOTION_TYPES motion )
++{
++    switch (motion)
++    {
++    case DIRECTMANIPULATION_MOTION_TRANSLATEX: return &This->snap[0];
++    case DIRECTMANIPULATION_MOTION_TRANSLATEY: return &This->snap[1];
++    case DIRECTMANIPULATION_MOTION_ZOOM: return &This->snap[2];
++    default: return NULL;
++    }
++}
++
++static HRESULT WINAPI primary_SetSnapInterval( IDirectManipulationPrimaryContent *iface,
++                                               DIRECTMANIPULATION_MOTION_TYPES motion, float interval, float offset )
++{
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++    struct snap *snap = motion_snap( This, motion );
++
++    TRACE( "%p, %d, %f, %f\n", This, motion, interval, offset );
++
++    if (!snap || interval < 0 || (interval > 0 && offset < 0)) return E_INVALIDARG;
++    free_snap( snap );
++    snap->interval = interval;
++    snap->offset = offset;
++    return S_OK;
++}
++
++static HRESULT WINAPI primary_SetSnapPoints( IDirectManipulationPrimaryContent *iface,
++                                             DIRECTMANIPULATION_MOTION_TYPES motion, const float *points, DWORD count )
++{
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++    struct snap *snap = motion_snap( This, motion );
++    DWORD i;
++
++    TRACE( "%p, %d, %p, %ld\n", This, motion, points, count );
++
++    if (!snap || (count && !points)) return E_INVALIDARG;
++    /* points must ascend */
++    for (i = 1; i < count; i++) if (points[i] <= points[i - 1]) return E_INVALIDARG;
++    free_snap( snap );
++    snap->interval = 0;
++    if (count)
++    {
++        if (!(snap->points = malloc( count * sizeof(float) ))) return E_OUTOFMEMORY;
++        memcpy( snap->points, points, count * sizeof(float) );
++        snap->count = count;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI primary_SetSnapType( IDirectManipulationPrimaryContent *iface,
++                                           DIRECTMANIPULATION_MOTION_TYPES motion, DIRECTMANIPULATION_SNAPPOINT_TYPE type )
++{
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++    struct snap *snap = motion_snap( This, motion );
++
++    TRACE( "%p, %d, %d\n", This, motion, type );
++
++    if (!snap || type > DIRECTMANIPULATION_SNAPPOINT_OPTIONAL_SINGLE) return E_INVALIDARG;
++    snap->type = type;
++    return S_OK;
++}
++
++static HRESULT WINAPI primary_SetSnapCoordinate( IDirectManipulationPrimaryContent *iface,
++                                                 DIRECTMANIPULATION_MOTION_TYPES motion,
++                                                 DIRECTMANIPULATION_SNAPPOINT_COORDINATE coordinate, float origin )
++{
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++    struct snap *snap = motion_snap( This, motion );
++
++    TRACE( "%p, %d, %d, %f\n", This, motion, coordinate, origin );
++
++    /* zoom snap points are always scales */
++    if (!snap || motion == DIRECTMANIPULATION_MOTION_ZOOM) return E_INVALIDARG;
++    snap->coordinate = coordinate;
++    snap->origin = origin;
++    return S_OK;
++}
++
++static HRESULT WINAPI primary_SetZoomBoundaries( IDirectManipulationPrimaryContent *iface, float minimum, float maximum )
++{
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++
++    TRACE( "%p, %f, %f\n", This, minimum, maximum );
++
++    if (minimum < 0.1f || maximum > 1000.0f || minimum > maximum) return E_INVALIDARG;
++    This->zoom_min = minimum;
++    This->zoom_max = maximum;
++    if (This->viewport)
++    {
++        struct xform x = This->xform;
++        bound_xform( This->viewport, &x );
++        set_transform( This->viewport, &x );
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI primary_SetHorizontalAlignment( IDirectManipulationPrimaryContent *iface,
++                                                      DIRECTMANIPULATION_HORIZONTALALIGNMENT alignment )
++{
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++    DWORD where = alignment & (DIRECTMANIPULATION_HORIZONTALALIGNMENT_LEFT | DIRECTMANIPULATION_HORIZONTALALIGNMENT_CENTER |
++                               DIRECTMANIPULATION_HORIZONTALALIGNMENT_RIGHT);
++
++    TRACE( "%p, %d\n", This, alignment );
++
++    if (where & (where - 1)) return E_INVALIDARG;
++    This->halign = alignment;
++    return S_OK;
++}
++
++static HRESULT WINAPI primary_SetVerticalAlignment( IDirectManipulationPrimaryContent *iface,
++                                                    DIRECTMANIPULATION_VERTICALALIGNMENT alignment )
++{
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++    DWORD where = alignment & (DIRECTMANIPULATION_VERTICALALIGNMENT_TOP | DIRECTMANIPULATION_VERTICALALIGNMENT_CENTER |
++                               DIRECTMANIPULATION_VERTICALALIGNMENT_BOTTOM);
++
++    TRACE( "%p, %d\n", This, alignment );
++
++    if (where & (where - 1)) return E_INVALIDARG;
++    This->valign = alignment;
++    return S_OK;
++}
++
++static HRESULT WINAPI primary_GetInertiaEndTransform( IDirectManipulationPrimaryContent *iface, float *matrix,
++                                                      DWORD count )
++{
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++
++    TRACE( "%p, %p, %ld\n", This, matrix, count );
++
++    if (!matrix) return E_POINTER;
++    if (count < 6) return E_INVALIDARG;
++    /* where the content comes to rest; it is at rest unless it moves on */
++    xform_to_matrix( This->viewport && This->viewport->animating ? &This->viewport->anim_to : &This->xform, matrix, count );
++    return S_OK;
++}
++
++static HRESULT WINAPI primary_GetCenterPoint( IDirectManipulationPrimaryContent *iface, float *x, float *y )
++{
++    struct content *This = impl_from_IDirectManipulationPrimaryContent( iface );
++
++    TRACE( "%p, %p, %p\n", This, x, y );
++
++    if (!x || !y) return E_POINTER;
++    *x = This->center_x;
++    *y = This->center_y;
++    return S_OK;
+ }
+ 
+ static const IDirectManipulationPrimaryContentVtbl primaryVtbl =
+@@ -285,395 +1135,611 @@ static const IDirectManipulationPrimaryContentVtbl primaryVtbl =
+     primary_SetHorizontalAlignment,
+     primary_SetVerticalAlignment,
+     primary_GetInertiaEndTransform,
+-    primary_GetCenterPoint
++    primary_GetCenterPoint,
+ };
+ 
++static struct content *create_content( BOOL primary )
++{
++    struct content *c = calloc( 1, sizeof(*c) );
++
++    if (!c) return NULL;
++    c->IDirectManipulationContent_iface.lpVtbl = &contentVtbl;
++    c->IDirectManipulationPrimaryContent_iface.lpVtbl = &primaryVtbl;
++    c->ref = 1;
++    c->primary = primary;
++    c->xform.s = 1.0f;
++    c->zoom_min = 0.1f;
++    c->zoom_max = 5.0f;
++    list_init( &c->entry );
++    return c;
++}
+ 
+-static HRESULT WINAPI content_QueryInterface(IDirectManipulationContent *iface, REFIID riid, void **ppv)
++/* ---- IDirectManipulationViewport2 ------------------------------------------------ */
++
++static HRESULT WINAPI viewport_QueryInterface( IDirectManipulationViewport2 *iface, REFIID riid, void **ppv )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    TRACE("(%p)->(%s,%p)\n", This, debugstr_guid(riid), ppv);
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "(%p)->(%s,%p)\n", This, debugstr_guid( riid ), ppv );
+ 
+-    return IDirectManipulationPrimaryContent_QueryInterface(&This->IDirectManipulationPrimaryContent_iface,
+-            riid, ppv);
++    if (!ppv) return E_POINTER;
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IDirectManipulationViewport ) ||
++        IsEqualGUID( riid, &IID_IDirectManipulationViewport2 ))
++    {
++        IUnknown_AddRef( iface );
++        *ppv = iface;
++        return S_OK;
++    }
++    WARN( "(%p)->(%s,%p), not found\n", This, debugstr_guid( riid ), ppv );
++    *ppv = NULL;
++    return E_NOINTERFACE;
+ }
+ 
+-static ULONG WINAPI content_AddRef(IDirectManipulationContent *iface)
++static ULONG WINAPI viewport_AddRef( IDirectManipulationViewport2 *iface )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    return IDirectManipulationPrimaryContent_AddRef(&This->IDirectManipulationPrimaryContent_iface);
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    ULONG ref = InterlockedIncrement( &This->ref );
++    TRACE( "(%p) ref=%lu\n", This, ref );
++    return ref;
+ }
+ 
+-static ULONG WINAPI content_Release(IDirectManipulationContent *iface)
++static void clear_viewport( struct viewport *This )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    return IDirectManipulationPrimaryContent_Release(&This->IDirectManipulationPrimaryContent_iface);
++    struct handler *h, *hnext;
++    struct behavior *b, *bnext;
++    struct content *c, *cnext;
++
++    LIST_FOR_EACH_ENTRY_SAFE( h, hnext, &This->handlers, struct handler, entry )
++    {
++        list_remove( &h->entry );
++        IDirectManipulationViewportEventHandler_Release( h->handler );
++        if (h->interaction) IDirectManipulationInteractionEventHandler_Release( h->interaction );
++        free( h );
++    }
++    LIST_FOR_EACH_ENTRY_SAFE( b, bnext, &This->behaviors, struct behavior, entry )
++    {
++        list_remove( &b->entry );
++        IUnknown_Release( b->behavior );
++        free( b );
++    }
++    LIST_FOR_EACH_ENTRY_SAFE( c, cnext, &This->contents, struct content, entry )
++    {
++        list_remove( &c->entry );
++        list_init( &c->entry );
++        c->viewport = NULL;
++        IDirectManipulationContent_Release( &c->IDirectManipulationContent_iface );
++    }
++    This->ncontacts = 0;
++    This->manipulating = FALSE;
++    This->animating = FALSE;
+ }
+ 
+-static HRESULT WINAPI content_GetContentRect(IDirectManipulationContent *iface, RECT *size)
++static ULONG WINAPI viewport_Release( IDirectManipulationViewport2 *iface )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    FIXME("%p, %p\n", This, size);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++
++    TRACE( "(%p) ref=%lu\n", This, ref );
++
++    if (!ref)
++    {
++        EnterCriticalSection( &dm_cs );
++        list_remove( &This->entry );
++        LeaveCriticalSection( &dm_cs );
++        clear_viewport( This );
++        if (This->tag) IUnknown_Release( This->tag );
++        if (This->primary)
++        {
++            This->primary->viewport = NULL;
++            destroy_content( This->primary );
++        }
++        IDirectManipulationManager2_Release( &This->manager->IDirectManipulationManager2_iface );
++        free( This );
++    }
++    return ref;
+ }
+ 
+-static HRESULT WINAPI content_SetContentRect(IDirectManipulationContent *iface, const RECT *size)
++static HRESULT WINAPI viewport_Enable( IDirectManipulationViewport2 *iface )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    FIXME("%p, %p\n", This, size);
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p\n", This );
++
++    if (This->status == DIRECTMANIPULATION_BUILDING || This->status == DIRECTMANIPULATION_DISABLED ||
++        This->status == DIRECTMANIPULATION_SUSPENDED)
++        set_status( This, DIRECTMANIPULATION_ENABLED );
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI content_GetViewport(IDirectManipulationContent *iface, REFIID riid, void **object)
++static HRESULT WINAPI viewport_Disable( IDirectManipulationViewport2 *iface )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    FIXME("%p, %s, %p\n", This, debugstr_guid(riid), object);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p\n", This );
++
++    This->ncontacts = 0;
++    This->manipulating = FALSE;
++    This->animating = FALSE;
++    set_status( This, DIRECTMANIPULATION_DISABLED );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI content_GetTag(IDirectManipulationContent *iface, REFIID riid, void **object, UINT32 *id)
++static HRESULT WINAPI viewport_SetContact( IDirectManipulationViewport2 *iface, UINT32 id )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    FIXME("%p, %s, %p, %p\n", This, debugstr_guid(riid), object, id);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    POINTER_INFO info;
++    UINT i;
++
++    TRACE( "%p, %u\n", This, id );
++
++    if (This->status == DIRECTMANIPULATION_DISABLED || This->status == DIRECTMANIPULATION_BUILDING)
++        return E_INVALIDARG;
++    for (i = 0; i < This->ncontacts; i++) if (This->contacts[i].id == id) return S_OK;
++    if (This->ncontacts == MAX_CONTACTS) return E_INVALIDARG;
++    This->contacts[This->ncontacts].id = id;
++    This->contacts[This->ncontacts].down = FALSE;
++    /* where the pointer is now, if the system knows it */
++    if (GetPointerInfo( id, &info ))
++    {
++        POINT pt = info.ptPixelLocation;
++        if (This->window) ScreenToClient( This->window, &pt );
++        pt.x -= This->rect.left;
++        pt.y -= This->rect.top;
++        This->contacts[This->ncontacts].pos = pt;
++        This->contacts[This->ncontacts].down = TRUE;
++    }
++    This->ncontacts++;
++    /* a contact during inertia catches the content */
++    if (This->animating)
++    {
++        This->animating = FALSE;
++        set_status( This, DIRECTMANIPULATION_READY );
++    }
++    rebase( This );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI content_SetTag(IDirectManipulationContent *iface, IUnknown *object, UINT32 id)
++static HRESULT WINAPI viewport_ReleaseContact( IDirectManipulationViewport2 *iface, UINT32 id )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    FIXME("%p, %p, %d\n", This, object, id);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    UINT i;
++
++    TRACE( "%p, %u\n", This, id );
++
++    for (i = 0; i < This->ncontacts; i++) if (This->contacts[i].id == id) break;
++    if (i == This->ncontacts) return E_INVALIDARG;
++    memmove( &This->contacts[i], &This->contacts[i + 1], (This->ncontacts - i - 1) * sizeof(This->contacts[0]) );
++    This->ncontacts--;
++    if (This->ncontacts) rebase( This );
++    else
++    {
++        end_manipulation( This );
++        if (This->animating) start_timer( This );
++    }
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI content_GetOutputTransform(IDirectManipulationContent *iface,
+-                    float *matrix, DWORD count)
++static HRESULT WINAPI viewport_ReleaseAllContacts( IDirectManipulationViewport2 *iface )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    FIXME("%p, %p, %ld\n", This, matrix, count);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p\n", This );
++
++    This->ncontacts = 0;
++    end_manipulation( This );
++    if (This->animating) start_timer( This );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI content_GetContentTransform(IDirectManipulationContent *iface,
+-                    float *matrix, DWORD count)
++static HRESULT WINAPI viewport_GetStatus( IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_STATUS *status )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    FIXME("%p, %p, %ld\n", This, matrix, count);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p, %p\n", This, status );
++
++    if (!status) return E_POINTER;
++    *status = This->status;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI content_SyncContentTransform(IDirectManipulationContent *iface,
+-                    const float *matrix, DWORD count)
++static HRESULT WINAPI viewport_GetTag( IDirectManipulationViewport2 *iface, REFIID riid, void **object, UINT32 *id )
+ {
+-    struct primarycontext *This = impl_from_IDirectManipulationContent(iface);
+-    FIXME("%p, %p, %ld\n", This, matrix, count);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p, %s, %p, %p\n", This, debugstr_guid( riid ), object, id );
++
++    if (id) *id = This->tag_id;
++    if (!object) return S_OK;
++    *object = NULL;
++    if (!This->tag) return S_OK;
++    return IUnknown_QueryInterface( This->tag, riid, object );
+ }
+ 
+-static const IDirectManipulationContentVtbl contentVtbl =
++static HRESULT WINAPI viewport_SetTag( IDirectManipulationViewport2 *iface, IUnknown *object, UINT32 id )
+ {
+-    content_QueryInterface,
+-    content_AddRef,
+-    content_Release,
+-    content_GetContentRect,
+-    content_SetContentRect,
+-    content_GetViewport,
+-    content_GetTag,
+-    content_SetTag,
+-    content_GetOutputTransform,
+-    content_GetContentTransform,
+-    content_SyncContentTransform
+-};
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
+ 
+-struct directviewport
++    TRACE( "%p, %p, %u\n", This, object, id );
++
++    if (object) IUnknown_AddRef( object );
++    if (This->tag) IUnknown_Release( This->tag );
++    This->tag = object;
++    This->tag_id = id;
++    return S_OK;
++}
++
++static HRESULT WINAPI viewport_GetViewportRect( IDirectManipulationViewport2 *iface, RECT *viewport )
+ {
+-    IDirectManipulationViewport2 IDirectManipulationViewport2_iface;
+-    LONG ref;
+-};
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p, %p\n", This, viewport );
+ 
+-static inline struct directviewport *impl_from_IDirectManipulationViewport2(IDirectManipulationViewport2 *iface)
++    if (!viewport) return E_POINTER;
++    *viewport = This->rect;
++    return S_OK;
++}
++
++static HRESULT WINAPI viewport_SetViewportRect( IDirectManipulationViewport2 *iface, const RECT *viewport )
+ {
+-    return CONTAINING_RECORD(iface, struct directviewport, IDirectManipulationViewport2_iface);
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p, %s\n", This, wine_dbgstr_rect( viewport ) );
++
++    if (!viewport) return E_POINTER;
++    if (viewport->right < viewport->left || viewport->bottom < viewport->top) return E_INVALIDARG;
++    This->rect = *viewport;
++    if (This->primary)
++    {
++        struct xform x = This->primary->xform;
++        bound_xform( This, &x );
++        set_transform( This, &x );
++    }
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_QueryInterface(IDirectManipulationViewport2 *iface, REFIID riid, void **ppv)
++/* the rectangle of the content (in its own units) fills the viewport */
++static HRESULT WINAPI viewport_ZoomToRect( IDirectManipulationViewport2 *iface, const float left, const float top,
++                                           const float right, const float bottom, BOOL animate )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    TRACE("(%p)->(%s,%p)\n", This, debugstr_guid(riid), ppv);
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    float vw = This->rect.right - This->rect.left, vh = This->rect.bottom - This->rect.top;
++    struct xform x;
++
++    TRACE( "%p, %f, %f, %f, %f, %d\n", This, left, top, right, bottom, animate );
+ 
+-    if (IsEqualGUID(riid, &IID_IUnknown) ||
+-        IsEqualGUID(riid, &IID_IDirectManipulationViewport) ||
+-        IsEqualGUID(riid, &IID_IDirectManipulationViewport2))
++    if (right <= left || bottom <= top) return E_INVALIDARG;
++    if (This->status == DIRECTMANIPULATION_DISABLED || This->status == DIRECTMANIPULATION_BUILDING)
++        return E_INVALIDARG;
++    if (!This->primary) return E_FAIL;
++    x.s = vw > 0 && vh > 0 ? min( vw / (right - left), vh / (bottom - top) ) : 1.0f;
++    x.s = clampf( x.s, This->primary->zoom_min, This->primary->zoom_max );
++    x.tx = -left * x.s;
++    x.ty = -top * x.s;
++    bound_xform( This, &x );
++    This->manipulating = FALSE;
++    This->ncontacts = 0;
++    if (animate && !xform_equal( &x, &This->primary->xform ))
+     {
+-        IDirectManipulationViewport2_AddRef(&This->IDirectManipulationViewport2_iface);
+-        *ppv = &This->IDirectManipulationViewport2_iface;
+-        return S_OK;
++        start_animation( This, &x, ZOOM_DURATION, FALSE );
++        set_status( This, DIRECTMANIPULATION_INERTIA );
++        start_timer( This );
++    }
++    else
++    {
++        This->animating = FALSE;
++        set_transform( This, &x );
++        if (This->status == DIRECTMANIPULATION_RUNNING || This->status == DIRECTMANIPULATION_INERTIA)
++            set_status( This, DIRECTMANIPULATION_READY );
+     }
++    return S_OK;
++}
+ 
+-    FIXME("(%p)->(%s,%p),not found\n", This, debugstr_guid(riid), ppv);
+-    return E_NOINTERFACE;
++static HRESULT WINAPI viewport_SetViewportTransform( IDirectManipulationViewport2 *iface, const float *matrix,
++                                                     DWORD count )
++{
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p, %p, %ld\n", This, matrix, count );
++
++    if (!matrix) return E_POINTER;
++    if (count < 6) return E_INVALIDARG;
++    memcpy( This->viewport_transform, matrix, sizeof(This->viewport_transform) );
++    return S_OK;
++}
++
++static HRESULT WINAPI viewport_SyncDisplayTransform( IDirectManipulationViewport2 *iface, const float *matrix,
++                                                     DWORD count )
++{
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p, %p, %ld\n", This, matrix, count );
++
++    if (!matrix) return E_POINTER;
++    if (count < 6) return E_INVALIDARG;
++    memcpy( This->display_transform, matrix, sizeof(This->display_transform) );
++    return S_OK;
++}
++
++static HRESULT WINAPI viewport_GetPrimaryContent( IDirectManipulationViewport2 *iface, REFIID riid, void **object )
++{
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p, %s, %p\n", This, debugstr_guid( riid ), object );
++
++    if (!object) return E_POINTER;
++    *object = NULL;
++    if (!This->primary) return E_FAIL;
++    return content_QueryInterface( &This->primary->IDirectManipulationContent_iface, riid, object );
++}
++
++static HRESULT WINAPI viewport_AddContent( IDirectManipulationViewport2 *iface, IDirectManipulationContent *content )
++{
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    struct content *c;
++
++    TRACE( "%p, %p\n", This, content );
++
++    if (!content) return E_POINTER;
++    if (content->lpVtbl != &contentVtbl) return E_INVALIDARG;
++    c = impl_from_IDirectManipulationContent( content );
++    if (c->primary || c->viewport) return E_INVALIDARG;
++    IDirectManipulationContent_AddRef( content );
++    c->viewport = This;
++    list_add_tail( &This->contents, &c->entry );
++    return S_OK;
+ }
+ 
+-static ULONG WINAPI viewport_AddRef(IDirectManipulationViewport2 *iface)
++static HRESULT WINAPI viewport_RemoveContent( IDirectManipulationViewport2 *iface, IDirectManipulationContent *content )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    struct content *c;
+ 
+-    TRACE("(%p) ref=%lu\n", This, ref);
++    TRACE( "%p, %p\n", This, content );
+ 
+-    return ref;
++    if (!content) return E_POINTER;
++    if (content->lpVtbl != &contentVtbl) return E_INVALIDARG;
++    c = impl_from_IDirectManipulationContent( content );
++    if (c->primary || c->viewport != This) return E_INVALIDARG;
++    list_remove( &c->entry );
++    list_init( &c->entry );
++    c->viewport = NULL;
++    IDirectManipulationContent_Release( content );
++    return S_OK;
+ }
+ 
+-static ULONG WINAPI viewport_Release(IDirectManipulationViewport2 *iface)
++static HRESULT WINAPI viewport_SetViewportOptions( IDirectManipulationViewport2 *iface,
++                                                   DIRECTMANIPULATION_VIEWPORT_OPTIONS options )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
+ 
+-    TRACE("(%p) ref=%lu\n", This, ref);
++    TRACE( "%p, %d\n", This, options );
+ 
+-    if (!ref)
+-    {
+-        free(This);
+-    }
+-    return ref;
++    if (options & ~0x1f) return E_INVALIDARG;
++    This->options = options;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_Enable(IDirectManipulationViewport2 *iface)
++static BOOL valid_configuration( DIRECTMANIPULATION_CONFIGURATION configuration )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
++    if (configuration & ~0x3b7) return FALSE;
++    /* inertia goes with the motion it continues; rails with translation */
++    if ((configuration & DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_INERTIA) &&
++        !(configuration & (DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_X | DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_Y)))
++        return FALSE;
++    if ((configuration & DIRECTMANIPULATION_CONFIGURATION_SCALING_INERTIA) &&
++        !(configuration & DIRECTMANIPULATION_CONFIGURATION_SCALING))
++        return FALSE;
++    return TRUE;
+ }
+ 
+-static HRESULT WINAPI viewport_Disable(IDirectManipulationViewport2 *iface)
++static HRESULT WINAPI viewport_AddConfiguration( IDirectManipulationViewport2 *iface,
++                                                 DIRECTMANIPULATION_CONFIGURATION configuration )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
+-}
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    UINT i;
+ 
+-static HRESULT WINAPI viewport_SetContact(IDirectManipulationViewport2 *iface, UINT32 id)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, id);
+-    return E_NOTIMPL;
+-}
++    TRACE( "%p, %d\n", This, configuration );
+ 
+-static HRESULT WINAPI viewport_ReleaseContact(IDirectManipulationViewport2 *iface, UINT32 id)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, id);
+-    return E_NOTIMPL;
++    if (!valid_configuration( configuration )) return E_INVALIDARG;
++    for (i = 0; i < This->nconfigurations; i++) if (This->configurations[i] == configuration) return S_OK;
++    if (This->nconfigurations == MAX_CONFIGURATIONS) return E_OUTOFMEMORY;
++    This->configurations[This->nconfigurations++] = configuration;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_ReleaseAllContacts(IDirectManipulationViewport2 *iface)
++static HRESULT WINAPI viewport_RemoveConfiguration( IDirectManipulationViewport2 *iface,
++                                                    DIRECTMANIPULATION_CONFIGURATION configuration )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
+-}
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    UINT i;
+ 
+-static HRESULT WINAPI viewport_GetStatus(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_STATUS *status)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p\n", This, status);
+-    return E_NOTIMPL;
+-}
++    TRACE( "%p, %d\n", This, configuration );
+ 
+-static HRESULT WINAPI viewport_GetTag(IDirectManipulationViewport2 *iface, REFIID riid, void **object, UINT32 *id)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %s, %p, %p\n", This, debugstr_guid(riid), object, id);
+-    return E_NOTIMPL;
++    /* the active one stays */
++    if (configuration == This->active && This->status == DIRECTMANIPULATION_RUNNING) return E_INVALIDARG;
++    for (i = 0; i < This->nconfigurations; i++) if (This->configurations[i] == configuration) break;
++    if (i == This->nconfigurations) return E_INVALIDARG;
++    memmove( &This->configurations[i], &This->configurations[i + 1],
++             (This->nconfigurations - i - 1) * sizeof(This->configurations[0]) );
++    This->nconfigurations--;
++    if (This->active == configuration) This->active = DIRECTMANIPULATION_CONFIGURATION_NONE;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_SetTag(IDirectManipulationViewport2 *iface, IUnknown *object, UINT32 id)
++static HRESULT WINAPI viewport_ActivateConfiguration( IDirectManipulationViewport2 *iface,
++                                                      DIRECTMANIPULATION_CONFIGURATION configuration )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p, %u\n", This, object, id);
+-    return E_NOTIMPL;
+-}
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    UINT i;
+ 
+-static HRESULT WINAPI viewport_GetViewportRect(IDirectManipulationViewport2 *iface, RECT *viewport)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p\n", This, viewport);
+-    return E_NOTIMPL;
+-}
++    TRACE( "%p, %d\n", This, configuration );
+ 
+-static HRESULT WINAPI viewport_SetViewportRect(IDirectManipulationViewport2 *iface, const RECT *viewport)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p\n", This, viewport);
++    if (!valid_configuration( configuration )) return E_INVALIDARG;
++    /* a configuration not added yet is added */
++    for (i = 0; i < This->nconfigurations; i++) if (This->configurations[i] == configuration) break;
++    if (i == This->nconfigurations && FAILED(viewport_AddConfiguration( iface, configuration ))) return E_OUTOFMEMORY;
++    This->active = configuration;
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_ZoomToRect(IDirectManipulationViewport2 *iface, const float left,
+-                    const float top, const float right, const float bottom, BOOL animate)
++static HRESULT WINAPI viewport_SetManualGesture( IDirectManipulationViewport2 *iface,
++                                                 DIRECTMANIPULATION_GESTURE_CONFIGURATION configuration )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %f, %f, %f, %f, %d\n", This, left, top, right, bottom, animate);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p, %d\n", This, configuration );
++
++    if (configuration & ~0x38) return E_INVALIDARG;
++    This->gesture = configuration;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_SetViewportTransform(IDirectManipulationViewport2 *iface,
+-                    const float *matrix, DWORD count)
++static HRESULT WINAPI viewport_SetChaining( IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_MOTION_TYPES enabledTypes )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p, %ld\n", This, matrix, count);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++
++    TRACE( "%p, %d\n", This, enabledTypes );
++
++    if (enabledTypes & ~DIRECTMANIPULATION_MOTION_ALL) return E_INVALIDARG;
++    This->chaining = enabledTypes;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_SyncDisplayTransform(IDirectManipulationViewport2 *iface,
+-                    const float *matrix, DWORD count)
++static HRESULT WINAPI viewport_AddEventHandler( IDirectManipulationViewport2 *iface, HWND window,
++                                                IDirectManipulationViewportEventHandler *eventHandler, DWORD *cookie )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p, %ld\n", This, matrix, count);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    struct handler *h;
++
++    TRACE( "%p, %p, %p, %p\n", This, window, eventHandler, cookie );
++
++    if (!eventHandler || !cookie) return E_POINTER;
++    if (!(h = calloc( 1, sizeof(*h) ))) return E_OUTOFMEMORY;
++    h->cookie = *cookie = ++This->next_cookie;
++    h->window = window;
++    h->handler = eventHandler;
++    IDirectManipulationViewportEventHandler_AddRef( eventHandler );
++    if (FAILED(IDirectManipulationViewportEventHandler_QueryInterface( eventHandler,
++               &IID_IDirectManipulationInteractionEventHandler, (void **)&h->interaction )))
++        h->interaction = NULL;
++    list_add_tail( &This->handlers, &h->entry );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_GetPrimaryContent(IDirectManipulationViewport2 *iface, REFIID riid, void **object)
++static HRESULT WINAPI viewport_RemoveEventHandler( IDirectManipulationViewport2 *iface, DWORD cookie )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    TRACE("%p, %s, %p\n", This, debugstr_guid(riid), object);
+-    if(IsEqualGUID(riid, &IID_IDirectManipulationPrimaryContent))
+-    {
+-        struct primarycontext *primary;
+-        TRACE("IDirectManipulationPrimaryContent\n");
+-        primary = malloc( sizeof(*primary));
+-        if(!primary)
+-            return E_OUTOFMEMORY;
+-
+-        primary->IDirectManipulationPrimaryContent_iface.lpVtbl = &primaryVtbl;
+-        primary->IDirectManipulationContent_iface.lpVtbl = &contentVtbl;
+-        primary->ref = 1;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    struct handler *h;
+ 
+-        *object = &primary->IDirectManipulationPrimaryContent_iface;
++    TRACE( "%p, %ld\n", This, cookie );
+ 
++    LIST_FOR_EACH_ENTRY( h, &This->handlers, struct handler, entry )
++    {
++        if (h->cookie != cookie) continue;
++        list_remove( &h->entry );
++        IDirectManipulationViewportEventHandler_Release( h->handler );
++        if (h->interaction) IDirectManipulationInteractionEventHandler_Release( h->interaction );
++        free( h );
+         return S_OK;
+     }
+-    else
+-        FIXME("Unsupported interface %s\n", debugstr_guid(riid));
+-    return E_NOTIMPL;
++    return E_INVALIDARG;
+ }
+ 
+-static HRESULT WINAPI viewport_AddContent(IDirectManipulationViewport2 *iface, IDirectManipulationContent *content)
++static HRESULT WINAPI viewport_SetInputMode( IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_INPUT_MODE mode )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p\n", This, content);
+-    return E_NOTIMPL;
+-}
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
+ 
+-static HRESULT WINAPI viewport_RemoveContent(IDirectManipulationViewport2 *iface, IDirectManipulationContent *content)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p\n", This, content);
+-    return E_NOTIMPL;
+-}
++    TRACE( "%p, %d\n", This, mode );
+ 
+-static HRESULT WINAPI viewport_SetViewportOptions(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_VIEWPORT_OPTIONS options)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, options);
++    if (mode > DIRECTMANIPULATION_INPUT_MODE_MANUAL) return E_INVALIDARG;
++    This->input_mode = mode;
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_AddConfiguration(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_CONFIGURATION configuration)
++static HRESULT WINAPI viewport_SetUpdateMode( IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_INPUT_MODE mode )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, configuration);
+-    return E_NOTIMPL;
+-}
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
+ 
+-static HRESULT WINAPI viewport_RemoveConfiguration(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_CONFIGURATION configuration)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, configuration);
+-    return E_NOTIMPL;
+-}
++    TRACE( "%p, %d\n", This, mode );
+ 
+-static HRESULT WINAPI viewport_ActivateConfiguration(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_CONFIGURATION configuration)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, configuration);
++    if (mode > DIRECTMANIPULATION_INPUT_MODE_MANUAL) return E_INVALIDARG;
++    This->update_mode = mode;
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_SetManualGesture(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_GESTURE_CONFIGURATION configuration)
++static HRESULT WINAPI viewport_Stop( IDirectManipulationViewport2 *iface )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, configuration);
+-    return E_NOTIMPL;
+-}
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
+ 
+-static HRESULT WINAPI viewport_SetChaining(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_MOTION_TYPES enabledTypes)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, enabledTypes);
+-    return E_NOTIMPL;
+-}
++    TRACE( "%p\n", This );
+ 
+-static HRESULT WINAPI viewport_AddEventHandler(IDirectManipulationViewport2 *iface, HWND window,
+-                    IDirectManipulationViewportEventHandler *eventHandler, DWORD *cookie)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p, %p, %p\n", This, window, eventHandler, cookie);
+-    return E_NOTIMPL;
++    if (This->status != DIRECTMANIPULATION_RUNNING && This->status != DIRECTMANIPULATION_INERTIA) return S_OK;
++    This->ncontacts = 0;
++    This->manipulating = FALSE;
++    This->animating = FALSE;
++    set_status( This, DIRECTMANIPULATION_READY );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_RemoveEventHandler(IDirectManipulationViewport2 *iface, DWORD cookie)
++static HRESULT WINAPI viewport_Abandon( IDirectManipulationViewport2 *iface )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %ld\n", This, cookie);
+-    return E_NOTIMPL;
+-}
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
+ 
+-static HRESULT WINAPI viewport_SetInputMode(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_INPUT_MODE mode)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, mode);
+-    return E_NOTIMPL;
+-}
++    TRACE( "%p\n", This );
+ 
+-static HRESULT WINAPI viewport_SetUpdateMode(IDirectManipulationViewport2 *iface, DIRECTMANIPULATION_INPUT_MODE mode)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %d\n", This, mode);
+-    return E_NOTIMPL;
++    clear_viewport( This );
++    This->status = DIRECTMANIPULATION_BUILDING;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_Stop(IDirectManipulationViewport2 *iface)
++static HRESULT WINAPI viewport_AddBehavior( IDirectManipulationViewport2 *iface, IUnknown *behavior, DWORD *cookie )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
+-}
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    struct behavior *b;
+ 
+-static HRESULT WINAPI viewport_Abandon(IDirectManipulationViewport2 *iface)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
+-}
++    TRACE( "%p, %p, %p\n", This, behavior, cookie );
+ 
+-static HRESULT WINAPI viewport_AddBehavior(IDirectManipulationViewport2 *iface, IUnknown *behavior, DWORD *cookie)
+-{
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %p, %p\n", This, behavior, cookie);
+-    return E_NOTIMPL;
++    if (!behavior || !cookie) return E_POINTER;
++    if (!(b = calloc( 1, sizeof(*b) ))) return E_OUTOFMEMORY;
++    b->cookie = *cookie = ++This->next_cookie;
++    b->behavior = behavior;
++    IUnknown_AddRef( behavior );
++    list_add_tail( &This->behaviors, &b->entry );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI viewport_RemoveBehavior(IDirectManipulationViewport2 *iface, DWORD cookie)
++static HRESULT WINAPI viewport_RemoveBehavior( IDirectManipulationViewport2 *iface, DWORD cookie )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p, %ld\n", This, cookie);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    struct behavior *b;
++
++    TRACE( "%p, %ld\n", This, cookie );
++
++    LIST_FOR_EACH_ENTRY( b, &This->behaviors, struct behavior, entry )
++    {
++        if (b->cookie != cookie) continue;
++        list_remove( &b->entry );
++        IUnknown_Release( b->behavior );
++        free( b );
++        return S_OK;
++    }
++    return E_INVALIDARG;
+ }
+ 
+-static HRESULT WINAPI viewport_RemoveAllBehaviors(IDirectManipulationViewport2 *iface)
++static HRESULT WINAPI viewport_RemoveAllBehaviors( IDirectManipulationViewport2 *iface )
+ {
+-    struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
++    struct viewport *This = impl_from_IDirectManipulationViewport2( iface );
++    struct behavior *b, *next;
++
++    TRACE( "%p\n", This );
++
++    LIST_FOR_EACH_ENTRY_SAFE( b, next, &This->behaviors, struct behavior, entry )
++    {
++        list_remove( &b->entry );
++        IUnknown_Release( b->behavior );
++        free( b );
++    }
++    return S_OK;
+ }
+ 
+ static const IDirectManipulationViewport2Vtbl viewportVtbl =
+@@ -714,152 +1780,413 @@ static const IDirectManipulationViewport2Vtbl viewportVtbl =
+     viewport_RemoveAllBehaviors
+ };
+ 
+-static HRESULT create_viewport(IDirectManipulationViewport2 **obj)
++static HRESULT create_viewport( struct manager *manager, HWND window, struct viewport **out )
+ {
+-    struct directviewport *object;
++    static const float identity[6] = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
++    struct viewport *vp;
+ 
+-    object = malloc(sizeof(*object));
+-    if(!object)
++    *out = NULL;
++    if (!(vp = calloc( 1, sizeof(*vp) ))) return E_OUTOFMEMORY;
++    if (!(vp->primary = create_content( TRUE )))
++    {
++        free( vp );
+         return E_OUTOFMEMORY;
++    }
++    vp->IDirectManipulationViewport2_iface.lpVtbl = &viewportVtbl;
++    vp->ref = 1;
++    vp->manager = manager;
++    IDirectManipulationManager2_AddRef( &manager->IDirectManipulationManager2_iface );
++    vp->window = window;
++    vp->status = DIRECTMANIPULATION_BUILDING;
++    vp->primary->viewport = vp;
++    memcpy( vp->viewport_transform, identity, sizeof(identity) );
++    memcpy( vp->display_transform, identity, sizeof(identity) );
++    list_init( &vp->contents );
++    list_init( &vp->handlers );
++    list_init( &vp->behaviors );
++    if (window)
++    {
++        RECT rc;
++        if (GetClientRect( window, &rc )) vp->rect = rc;
++    }
++    EnterCriticalSection( &dm_cs );
++    list_add_tail( &manager->viewports, &vp->entry );
++    LeaveCriticalSection( &dm_cs );
++    *out = vp;
++    return S_OK;
++}
+ 
+-    object->IDirectManipulationViewport2_iface.lpVtbl = &viewportVtbl;
+-    object->ref = 1;
++/* ---- IDirectManipulationUpdateManager --------------------------------------------- */
+ 
+-    *obj = &object->IDirectManipulationViewport2_iface;
++struct wait_callback
++{
++    struct list entry;
++    DWORD cookie;
++    HANDLE wait;
++    IDirectManipulationUpdateHandler *handler;
++};
+ 
+-    return S_OK;
++struct update_manager
++{
++    IDirectManipulationUpdateManager IDirectManipulationUpdateManager_iface;
++    LONG ref;
++    struct manager *manager;        /* weak: the manager owns this */
++    CRITICAL_SECTION cs;
++    struct list callbacks;
++    DWORD next_cookie;
++};
++
++static inline struct update_manager *impl_from_IDirectManipulationUpdateManager( IDirectManipulationUpdateManager *iface )
++{
++    return CONTAINING_RECORD( iface, struct update_manager, IDirectManipulationUpdateManager_iface );
+ }
+ 
+-static HRESULT WINAPI direct_manip_QueryInterface(IDirectManipulationManager2 *iface, REFIID riid, void **ppv)
++static HRESULT WINAPI update_manager_QueryInterface( IDirectManipulationUpdateManager *iface, REFIID riid, void **ppv )
+ {
+-    if (IsEqualGUID(riid, &IID_IUnknown) ||
+-        IsEqualGUID(riid, &IID_IDirectManipulationManager) ||
+-        IsEqualGUID(riid, &IID_IDirectManipulationManager2)) {
+-        IUnknown_AddRef(iface);
++    struct update_manager *This = impl_from_IDirectManipulationUpdateManager( iface );
++
++    TRACE( "(%p)->(%s,%p)\n", This, debugstr_guid( riid ), ppv );
++
++    if (!ppv) return E_POINTER;
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IDirectManipulationUpdateManager ))
++    {
++        IUnknown_AddRef( iface );
+         *ppv = iface;
+         return S_OK;
+     }
+-
+-    FIXME("(%p)->(%s,%p),not found\n", iface, debugstr_guid(riid), ppv);
++    WARN( "(%p)->(%s,%p), not found\n", This, debugstr_guid( riid ), ppv );
++    *ppv = NULL;
+     return E_NOINTERFACE;
+ }
+ 
+-static ULONG WINAPI direct_manip_AddRef(IDirectManipulationManager2 *iface)
++static ULONG WINAPI update_manager_AddRef( IDirectManipulationUpdateManager *iface )
+ {
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
++    struct update_manager *This = impl_from_IDirectManipulationUpdateManager( iface );
++    return IDirectManipulationManager2_AddRef( &This->manager->IDirectManipulationManager2_iface );
++}
+ 
+-    TRACE("(%p) ref=%lu\n", This, ref);
++static ULONG WINAPI update_manager_Release( IDirectManipulationUpdateManager *iface )
++{
++    struct update_manager *This = impl_from_IDirectManipulationUpdateManager( iface );
++    return IDirectManipulationManager2_Release( &This->manager->IDirectManipulationManager2_iface );
++}
+ 
+-    return ref;
++static void CALLBACK wait_callback_proc( void *arg, BOOLEAN timed_out )
++{
++    IDirectManipulationUpdateHandler *handler = arg;
++    IDirectManipulationUpdateHandler_Update( handler );
+ }
+ 
+-static ULONG WINAPI direct_manip_Release(IDirectManipulationManager2 *iface)
++static HRESULT WINAPI update_manager_RegisterWaitHandleCallback( IDirectManipulationUpdateManager *iface, HANDLE handle,
++                                                                 IDirectManipulationUpdateHandler *handler, DWORD *cookie )
+ {
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
++    struct update_manager *This = impl_from_IDirectManipulationUpdateManager( iface );
++    struct wait_callback *cb;
+ 
+-    TRACE("(%p) ref=%lu\n", This, ref);
++    TRACE( "%p, %p, %p, %p\n", This, handle, handler, cookie );
+ 
+-    if (!ref)
++    if (!handle || !handler || !cookie) return E_INVALIDARG;
++    if (!(cb = calloc( 1, sizeof(*cb) ))) return E_OUTOFMEMORY;
++    cb->handler = handler;
++    IDirectManipulationUpdateHandler_AddRef( handler );
++    if (!RegisterWaitForSingleObject( &cb->wait, handle, wait_callback_proc, handler, INFINITE, WT_EXECUTEDEFAULT ))
+     {
+-        if(This->updatemanager)
+-            IDirectManipulationUpdateManager_Release(This->updatemanager);
+-        free(This);
++        IDirectManipulationUpdateHandler_Release( handler );
++        free( cb );
++        return HRESULT_FROM_WIN32( GetLastError() );
+     }
+-    return ref;
++    EnterCriticalSection( &This->cs );
++    cb->cookie = *cookie = ++This->next_cookie;
++    list_add_tail( &This->callbacks, &cb->entry );
++    LeaveCriticalSection( &This->cs );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI direct_manip_Activate(IDirectManipulationManager2 *iface, HWND window)
++static HRESULT WINAPI update_manager_UnregisterWaitHandleCallback( IDirectManipulationUpdateManager *iface, DWORD cookie )
+ {
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    FIXME("%p, %p\n", This, window);
+-    return E_NOTIMPL;
++    struct update_manager *This = impl_from_IDirectManipulationUpdateManager( iface );
++    struct wait_callback *cb, *found = NULL;
++
++    TRACE( "%p, %lx\n", This, cookie );
++
++    EnterCriticalSection( &This->cs );
++    LIST_FOR_EACH_ENTRY( cb, &This->callbacks, struct wait_callback, entry )
++        if (cb->cookie == cookie)
++        {
++            found = cb;
++            list_remove( &cb->entry );
++            break;
++        }
++    LeaveCriticalSection( &This->cs );
++    if (!found) return E_INVALIDARG;
++    UnregisterWaitEx( found->wait, INVALID_HANDLE_VALUE );
++    IDirectManipulationUpdateHandler_Release( found->handler );
++    free( found );
++    return S_OK;
++}
++
++static HRESULT WINAPI update_manager_Update( IDirectManipulationUpdateManager *iface,
++                                             IDirectManipulationFrameInfoProvider *provider )
++{
++    struct update_manager *This = impl_from_IDirectManipulationUpdateManager( iface );
++    ULONGLONG time = 0, process, composition;
++    float t = now_ms();
++
++    TRACE( "%p, %p\n", This, provider );
++
++    /* the frame's time, in milliseconds, from the provider if there is one */
++    if (provider && SUCCEEDED(IDirectManipulationFrameInfoProvider_GetNextFrameInfo( provider, &time, &process,
++                                                                                     &composition )) && time)
++        TRACE( "frame at %I64u\n", time );
++#ifndef SG_MUTANT_NO_UPDATE
++    update_viewports( This->manager, t );
++#endif
++    return S_OK;
++}
++
++static const struct IDirectManipulationUpdateManagerVtbl updatemanagerVtbl =
++{
++    update_manager_QueryInterface,
++    update_manager_AddRef,
++    update_manager_Release,
++    update_manager_RegisterWaitHandleCallback,
++    update_manager_UnregisterWaitHandleCallback,
++    update_manager_Update
++};
++
++static void destroy_update_manager( struct update_manager *This )
++{
++    struct wait_callback *cb, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( cb, next, &This->callbacks, struct wait_callback, entry )
++    {
++        UnregisterWaitEx( cb->wait, INVALID_HANDLE_VALUE );
++        IDirectManipulationUpdateHandler_Release( cb->handler );
++        free( cb );
++    }
++    This->cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection( &This->cs );
++    free( This );
+ }
+ 
+-static HRESULT WINAPI direct_manip_Deactivate(IDirectManipulationManager2 *iface, HWND window)
++/* ---- IDirectManipulationManager2 --------------------------------------------------- */
++
++static HRESULT WINAPI direct_manip_QueryInterface( IDirectManipulationManager2 *iface, REFIID riid, void **ppv )
+ {
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    FIXME("%p, %p\n", This, window);
+-    return E_NOTIMPL;
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++
++    TRACE( "(%p)->(%s,%p)\n", This, debugstr_guid( riid ), ppv );
++
++    if (!ppv) return E_POINTER;
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IDirectManipulationManager ) ||
++        IsEqualGUID( riid, &IID_IDirectManipulationManager2 ))
++    {
++        IUnknown_AddRef( iface );
++        *ppv = iface;
++        return S_OK;
++    }
++    WARN( "(%p)->(%s,%p), not found\n", This, debugstr_guid( riid ), ppv );
++    *ppv = NULL;
++    return E_NOINTERFACE;
+ }
+ 
+-static HRESULT WINAPI direct_manip_RegisterHitTestTarget(IDirectManipulationManager2 *iface, HWND window,
+-                HWND hittest, DIRECTMANIPULATION_HITTEST_TYPE type)
++static ULONG WINAPI direct_manip_AddRef( IDirectManipulationManager2 *iface )
+ {
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    FIXME("%p, %p, %p, %d\n", This, window, hittest, type);
+-    return E_NOTIMPL;
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++    ULONG ref = InterlockedIncrement( &This->ref );
++    TRACE( "(%p) ref=%lu\n", This, ref );
++    return ref;
+ }
+ 
+-static HRESULT WINAPI direct_manip_ProcessInput(IDirectManipulationManager2 *iface, const MSG *msg, BOOL *handled)
++static void unsubclass( HWND window )
+ {
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    FIXME("%p, %p, %p\n", This, msg, handled);
+-    return E_NOTIMPL;
++    struct subclassed *sc;
++
++    LIST_FOR_EACH_ENTRY( sc, &subclassed_windows, struct subclassed, entry )
++    {
++        if (sc->window != window) continue;
++        if (--sc->refs) return;
++        if (IsWindow( window ) && (WNDPROC)GetWindowLongPtrW( window, GWLP_WNDPROC ) == subclass_proc)
++            SetWindowLongPtrW( window, GWLP_WNDPROC, (LONG_PTR)sc->old_proc );
++        list_remove( &sc->entry );
++        free( sc );
++        return;
++    }
+ }
+ 
+-static HRESULT WINAPI direct_manip_GetUpdateManager(IDirectManipulationManager2 *iface, REFIID riid, void **obj)
++static ULONG WINAPI direct_manip_Release( IDirectManipulationManager2 *iface )
+ {
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    HRESULT hr = E_FAIL;
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++    struct window_entry *w, *next;
+ 
+-    TRACE("%p, %s, %p\n", This, debugstr_guid(riid), obj);
++    TRACE( "(%p) ref=%lu\n", This, ref );
+ 
+-    *obj = NULL;
+-    if(IsEqualGUID(riid, &IID_IDirectManipulationUpdateManager))
++    if (!ref)
+     {
+-        if(!This->updatemanager)
+-        {
+-            hr = create_update_manager(&This->updatemanager);
+-        }
+-        else
++        EnterCriticalSection( &dm_cs );
++        list_remove( &This->entry_all );
++        LIST_FOR_EACH_ENTRY_SAFE( w, next, &This->windows, struct window_entry, entry )
+         {
+-            hr = S_OK;
++            unsubclass( w->window );
++            list_remove( &w->entry );
++            free( w );
+         }
++        LeaveCriticalSection( &dm_cs );
++        if (This->update) destroy_update_manager( This->update );
++        free( This );
++    }
++    return ref;
++}
+ 
+-        if(hr == S_OK)
+-        {
+-            IDirectManipulationUpdateManager_AddRef(This->updatemanager);
+-            *obj = This->updatemanager;
+-        }
++static HRESULT WINAPI direct_manip_Activate( IDirectManipulationManager2 *iface, HWND window )
++{
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++    struct window_entry *w;
++    struct subclassed *sc;
++    DWORD pid;
++
++    TRACE( "%p, %p\n", This, window );
++
++    if (!IsWindow( window )) return E_INVALIDARG;
++    /* only the process's own windows */
++    GetWindowThreadProcessId( window, &pid );
++    if (pid != GetCurrentProcessId()) return E_INVALIDARG;
++    EnterCriticalSection( &dm_cs );
++    if (find_window( This, window ))
++    {
++        LeaveCriticalSection( &dm_cs );
++        return S_OK;
+     }
+-    else
+-        FIXME("Interface %s currently not supported.\n", debugstr_guid(riid));
++    if (!(w = calloc( 1, sizeof(*w) )))
++    {
++        LeaveCriticalSection( &dm_cs );
++        return E_OUTOFMEMORY;
++    }
++    w->window = window;
++    list_add_tail( &This->windows, &w->entry );
++    LIST_FOR_EACH_ENTRY( sc, &subclassed_windows, struct subclassed, entry )
++        if (sc->window == window) break;
++    if (&sc->entry != &subclassed_windows) sc->refs++;
++    else if ((sc = calloc( 1, sizeof(*sc) )))
++    {
++        sc->window = window;
++        sc->refs = 1;
++        sc->old_proc = (WNDPROC)SetWindowLongPtrW( window, GWLP_WNDPROC, (LONG_PTR)subclass_proc );
++        list_add_tail( &subclassed_windows, &sc->entry );
++    }
++    LeaveCriticalSection( &dm_cs );
++    return S_OK;
++}
+ 
+-    return hr;
++static HRESULT WINAPI direct_manip_Deactivate( IDirectManipulationManager2 *iface, HWND window )
++{
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++    struct window_entry *w;
++
++    TRACE( "%p, %p\n", This, window );
++
++    EnterCriticalSection( &dm_cs );
++    if ((w = find_window( This, window )))
++    {
++        unsubclass( window );
++        list_remove( &w->entry );
++        free( w );
++    }
++    LeaveCriticalSection( &dm_cs );
++    return w ? S_OK : E_INVALIDARG;
+ }
+ 
+-static HRESULT WINAPI direct_manip_CreateViewport(IDirectManipulationManager2 *iface, IDirectManipulationFrameInfoProvider *frame,
+-                HWND window, REFIID riid, void **obj)
++static HRESULT WINAPI direct_manip_RegisterHitTestTarget( IDirectManipulationManager2 *iface, HWND window,
++                                                          HWND hittest, DIRECTMANIPULATION_HITTEST_TYPE type )
+ {
+-    HRESULT hr = E_NOTIMPL;
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    TRACE("%p, %p, %p, %s, %p\n", This, frame, window, debugstr_guid(riid), obj);
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++    struct window_entry *w;
++
++    TRACE( "%p, %p, %p, %d\n", This, window, hittest, type );
+ 
+-    if(IsEqualGUID(riid, &IID_IDirectManipulationViewport) ||
+-       IsEqualGUID(riid, &IID_IDirectManipulationViewport2) )
++    if (type > DIRECTMANIPULATION_HITTEST_TYPE_AUTO_SYNCHRONOUS) return E_INVALIDARG;
++    EnterCriticalSection( &dm_cs );
++    if ((w = find_window( This, window )))
+     {
+-        hr = create_viewport( (IDirectManipulationViewport2**)obj);
++        w->hittest = hittest;
++        w->hittest_type = type;
+     }
+-    else
+-        FIXME("Unsupported interface %s\n", debugstr_guid(riid));
++    LeaveCriticalSection( &dm_cs );
++    return w ? S_OK : E_INVALIDARG;
++}
++
++static HRESULT WINAPI direct_manip_ProcessInput( IDirectManipulationManager2 *iface, const MSG *msg, BOOL *handled )
++{
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++
++    TRACE( "%p, %p, %p\n", This, msg, handled );
++
++    if (!msg || !handled) return E_POINTER;
++    *handled = FALSE;
++    if (msg->message == WM_POINTERDOWN || msg->message == WM_POINTERUPDATE || msg->message == WM_POINTERUP ||
++        msg->message == WM_POINTERCAPTURECHANGED)
++        *handled = handle_pointer( This, msg );
++    return S_OK;
++}
++
++static HRESULT WINAPI direct_manip_GetUpdateManager( IDirectManipulationManager2 *iface, REFIID riid, void **obj )
++{
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++
++    TRACE( "(%p)->(%s, %p)\n", This, debugstr_guid( riid ), obj );
++
++    if (!obj) return E_POINTER;
++    *obj = NULL;
++    return update_manager_QueryInterface( &This->update->IDirectManipulationUpdateManager_iface, riid, obj );
++}
++
++static HRESULT WINAPI direct_manip_CreateViewport( IDirectManipulationManager2 *iface,
++                                                   IDirectManipulationFrameInfoProvider *frame, HWND window,
++                                                   REFIID riid, void **obj )
++{
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++    struct viewport *vp;
++    HRESULT hr;
++
++    TRACE( "%p, %p, %p, %s, %p\n", This, frame, window, debugstr_guid( riid ), obj );
++
++    if (!obj) return E_POINTER;
++    *obj = NULL;
++    if (window && !IsWindow( window )) return E_INVALIDARG;
++    if (FAILED(hr = create_viewport( This, window, &vp ))) return hr;
++    hr = viewport_QueryInterface( &vp->IDirectManipulationViewport2_iface, riid, obj );
++    viewport_Release( &vp->IDirectManipulationViewport2_iface );
+     return hr;
+ }
+ 
+-static HRESULT WINAPI direct_manip_CreateContent(IDirectManipulationManager2 *iface, IDirectManipulationFrameInfoProvider *frame,
+-                REFCLSID clsid, REFIID riid, void **obj)
++static HRESULT WINAPI direct_manip_CreateContent( IDirectManipulationManager2 *iface,
++                                                  IDirectManipulationFrameInfoProvider *frame, REFCLSID clsid,
++                                                  REFIID riid, void **obj )
+ {
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    FIXME("%p, %p,  %s, %p\n", This, frame, debugstr_guid(riid), obj);
+-    return E_NOTIMPL;
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++
++    TRACE( "%p, %p, %s, %s, %p\n", This, frame, debugstr_guid( clsid ), debugstr_guid( riid ), obj );
++
++    if (!obj) return E_POINTER;
++    *obj = NULL;
++    /* the secondary content classes (indicators, virtual viewports) are not
++     * known here */
++    WARN( "content class %s is not available\n", debugstr_guid( clsid ) );
++    return CLASS_E_CLASSNOTAVAILABLE;
+ }
+ 
+-static HRESULT WINAPI direct_manip_CreateBehavior(IDirectManipulationManager2 *iface, REFCLSID clsid, REFIID riid, void **obj)
++static HRESULT WINAPI direct_manip_CreateBehavior( IDirectManipulationManager2 *iface, REFCLSID clsid, REFIID riid,
++                                                   void **obj )
+ {
+-    struct directmanipulation *This = impl_from_IDirectManipulationManager2(iface);
+-    FIXME("%p, %s,  %s, %p\n", This, debugstr_guid(clsid), debugstr_guid(riid), obj);
+-    return E_NOTIMPL;
++    struct manager *This = impl_from_IDirectManipulationManager2( iface );
++
++    TRACE( "%p, %s, %s, %p\n", This, debugstr_guid( clsid ), debugstr_guid( riid ), obj );
++
++    if (!obj) return E_POINTER;
++    *obj = NULL;
++    WARN( "behavior class %s is not available\n", debugstr_guid( clsid ) );
++    return CLASS_E_CLASSNOTAVAILABLE;
+ }
+ 
+ static const struct IDirectManipulationManager2Vtbl directmanipVtbl =
+@@ -877,136 +2204,223 @@ static const struct IDirectManipulationManager2Vtbl directmanipVtbl =
+     direct_manip_CreateBehavior
+ };
+ 
+-static HRESULT WINAPI DirectManipulation_CreateInstance(IClassFactory *iface, IUnknown *outer, REFIID riid, void **ppv)
++static HRESULT WINAPI DirectManipulation_CreateInstance( IClassFactory *iface, IUnknown *outer, REFIID riid, void **ppv )
+ {
+-    struct directmanipulation *object;
+-    HRESULT ret;
++    struct manager *object;
++    HRESULT hr;
+ 
+-    TRACE("(%p, %s, %p)\n", outer, debugstr_guid(riid), ppv);
++    TRACE( "(%p, %s, %p)\n", outer, debugstr_guid( riid ), ppv );
+ 
+     *ppv = NULL;
+-
+-    object = calloc(1, sizeof(*object));
+-    if (!object)
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (!(object = calloc( 1, sizeof(*object) ))) return E_OUTOFMEMORY;
++    if (!(object->update = calloc( 1, sizeof(*object->update) )))
++    {
++        free( object );
+         return E_OUTOFMEMORY;
+-
++    }
+     object->IDirectManipulationManager2_iface.lpVtbl = &directmanipVtbl;
+     object->ref = 1;
++    list_init( &object->viewports );
++    list_init( &object->windows );
++    object->update->IDirectManipulationUpdateManager_iface.lpVtbl = &updatemanagerVtbl;
++    object->update->manager = object;
++    list_init( &object->update->callbacks );
++    InitializeCriticalSectionEx( &object->update->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    object->update->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": update_manager.cs");
++    EnterCriticalSection( &dm_cs );
++    list_add_tail( &all_managers, &object->entry_all );
++    LeaveCriticalSection( &dm_cs );
++
++    hr = direct_manip_QueryInterface( &object->IDirectManipulationManager2_iface, riid, ppv );
++    direct_manip_Release( &object->IDirectManipulationManager2_iface );
++    return hr;
++}
+ 
+-    ret = direct_manip_QueryInterface(&object->IDirectManipulationManager2_iface, riid, ppv);
+-    direct_manip_Release(&object->IDirectManipulationManager2_iface);
++/* ---- the DirectComposition compositor -------------------------------------------- */
+ 
+-    return ret;
+-}
++struct compositor_content
++{
++    struct list entry;
++    IDirectManipulationContent *content;
++    IDCompositionDevice *device;
++    IDCompositionVisual *child;
++};
+ 
+ struct directcompositor
+ {
+     IDirectManipulationCompositor2 IDirectManipulationCompositor2_iface;
+     IDirectManipulationFrameInfoProvider IDirectManipulationFrameInfoProvider_iface;
+     IDirectManipulationUpdateManager *manager;
++    struct list contents;
+     LONG ref;
+ };
+ 
+-static inline struct directcompositor *impl_from_IDirectManipulationCompositor2(IDirectManipulationCompositor2 *iface)
++static inline struct directcompositor *impl_from_IDirectManipulationCompositor2( IDirectManipulationCompositor2 *iface )
+ {
+-    return CONTAINING_RECORD(iface, struct directcompositor, IDirectManipulationCompositor2_iface);
++    return CONTAINING_RECORD( iface, struct directcompositor, IDirectManipulationCompositor2_iface );
+ }
+ 
+-static inline struct directcompositor *impl_from_IDirectManipulationFrameInfoProvider(IDirectManipulationFrameInfoProvider *iface)
++static inline struct directcompositor *impl_from_IDirectManipulationFrameInfoProvider( IDirectManipulationFrameInfoProvider *iface )
+ {
+-    return CONTAINING_RECORD(iface, struct directcompositor, IDirectManipulationFrameInfoProvider_iface);
++    return CONTAINING_RECORD( iface, struct directcompositor, IDirectManipulationFrameInfoProvider_iface );
+ }
+ 
+-static HRESULT WINAPI compositor_QueryInterface(IDirectManipulationCompositor2 *iface, REFIID riid, void **ppv)
++static HRESULT WINAPI compositor_QueryInterface( IDirectManipulationCompositor2 *iface, REFIID riid, void **ppv )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationCompositor2(iface);
++    struct directcompositor *This = impl_from_IDirectManipulationCompositor2( iface );
+ 
+-    if (IsEqualGUID(riid, &IID_IUnknown) ||
+-        IsEqualGUID(riid, &IID_IDirectManipulationCompositor) ||
+-        IsEqualGUID(riid, &IID_IDirectManipulationCompositor2))
+-    {
+-        IUnknown_AddRef(iface);
+-        *ppv = iface;
+-        return S_OK;
+-    }
+-    else if(IsEqualGUID(riid, &IID_IDirectManipulationFrameInfoProvider))
+-    {
+-        IUnknown_AddRef(iface);
++    TRACE( "(%p)->(%s,%p)\n", This, debugstr_guid( riid ), ppv );
++
++    if (!ppv) return E_POINTER;
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IDirectManipulationCompositor ) ||
++        IsEqualGUID( riid, &IID_IDirectManipulationCompositor2 ))
++        *ppv = &This->IDirectManipulationCompositor2_iface;
++    else if (IsEqualGUID( riid, &IID_IDirectManipulationFrameInfoProvider ))
+         *ppv = &This->IDirectManipulationFrameInfoProvider_iface;
+-        return S_OK;
++    else
++    {
++        WARN( "(%p)->(%s,%p), not found\n", This, debugstr_guid( riid ), ppv );
++        *ppv = NULL;
++        return E_NOINTERFACE;
+     }
+-
+-    FIXME("(%p)->(%s,%p),not found\n", iface, debugstr_guid(riid), ppv);
+-    return E_NOINTERFACE;
++    IUnknown_AddRef( (IUnknown *)*ppv );
++    return S_OK;
+ }
+ 
+-static ULONG WINAPI compositor_AddRef(IDirectManipulationCompositor2 *iface)
++static ULONG WINAPI compositor_AddRef( IDirectManipulationCompositor2 *iface )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationCompositor2(iface);
+-    ULONG ref = InterlockedIncrement(&This->ref);
+-
+-    TRACE("(%p) ref=%lu\n", This, ref);
+-
++    struct directcompositor *This = impl_from_IDirectManipulationCompositor2( iface );
++    ULONG ref = InterlockedIncrement( &This->ref );
++    TRACE( "(%p) ref=%lu\n", This, ref );
+     return ref;
+ }
+ 
+-static ULONG WINAPI compositor_Release(IDirectManipulationCompositor2 *iface)
++static void free_compositor_content( struct compositor_content *cc )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationCompositor2(iface);
+-    ULONG ref = InterlockedDecrement(&This->ref);
++    IDirectManipulationContent_Release( cc->content );
++    if (cc->device) IDCompositionDevice_Release( cc->device );
++    if (cc->child) IDCompositionVisual_Release( cc->child );
++    free( cc );
++}
++
++static ULONG WINAPI compositor_Release( IDirectManipulationCompositor2 *iface )
++{
++    struct directcompositor *This = impl_from_IDirectManipulationCompositor2( iface );
++    ULONG ref = InterlockedDecrement( &This->ref );
++    struct compositor_content *cc, *next;
+ 
+-    TRACE("(%p) ref=%lu\n", This, ref);
++    TRACE( "(%p) ref=%lu\n", This, ref );
+ 
+     if (!ref)
+     {
+-        if(This->manager)
+-            IDirectManipulationUpdateManager_Release(This->manager);
+-        free(This);
++        LIST_FOR_EACH_ENTRY_SAFE( cc, next, &This->contents, struct compositor_content, entry )
++            free_compositor_content( cc );
++        if (This->manager) IDirectManipulationUpdateManager_Release( This->manager );
++        free( This );
+     }
+     return ref;
+ }
+ 
+-static HRESULT WINAPI compositor_AddContent(IDirectManipulationCompositor2 *iface, IDirectManipulationContent *content,
+-                IUnknown *device, IUnknown *parent, IUnknown *child)
++static HRESULT WINAPI compositor_AddContent( IDirectManipulationCompositor2 *iface, IDirectManipulationContent *content,
++                                            IUnknown *device, IUnknown *parent, IUnknown *child )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationCompositor2(iface);
+-    FIXME("%p, %p, %p, %p, %p\n", This, content, device, parent, child);
+-    return E_NOTIMPL;
++    struct directcompositor *This = impl_from_IDirectManipulationCompositor2( iface );
++    struct compositor_content *cc;
++
++    TRACE( "%p %p %p %p %p\n", This, content, device, parent, child );
++
++    if (!content || !device || !parent || !child) return E_INVALIDARG;
++    LIST_FOR_EACH_ENTRY( cc, &This->contents, struct compositor_content, entry )
++        if (cc->content == content) return E_INVALIDARG;
++    if (!(cc = calloc( 1, sizeof(*cc) ))) return E_OUTOFMEMORY;
++    cc->content = content;
++    IDirectManipulationContent_AddRef( content );
++    if (FAILED(IUnknown_QueryInterface( device, &iid_composition_device, (void **)&cc->device ))) cc->device = NULL;
++    if (FAILED(IUnknown_QueryInterface( child, &iid_composition_visual, (void **)&cc->child ))) cc->child = NULL;
++    list_add_tail( &This->contents, &cc->entry );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI compositor_RemoveContent(IDirectManipulationCompositor2 *iface, IDirectManipulationContent *content)
++static HRESULT WINAPI compositor_RemoveContent( IDirectManipulationCompositor2 *iface, IDirectManipulationContent *content )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationCompositor2(iface);
+-    FIXME("%p, %p\n", This, content);
+-    return E_NOTIMPL;
++    struct directcompositor *This = impl_from_IDirectManipulationCompositor2( iface );
++    struct compositor_content *cc;
++
++    TRACE( "%p %p\n", This, content );
++
++    LIST_FOR_EACH_ENTRY( cc, &This->contents, struct compositor_content, entry )
++    {
++        if (cc->content != content) continue;
++        list_remove( &cc->entry );
++        free_compositor_content( cc );
++        return S_OK;
++    }
++    return E_INVALIDARG;
+ }
+ 
+-static HRESULT WINAPI compositor_SetUpdateManager(IDirectManipulationCompositor2 *iface, IDirectManipulationUpdateManager *manager)
++static HRESULT WINAPI compositor_SetUpdateManager( IDirectManipulationCompositor2 *iface,
++                                                   IDirectManipulationUpdateManager *manager )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationCompositor2(iface);
+-    TRACE("%p, %p\n", This, manager);
++    struct directcompositor *This = impl_from_IDirectManipulationCompositor2( iface );
+ 
+-    if(!manager)
+-        return E_INVALIDARG;
++    TRACE( "%p %p\n", This, manager );
+ 
++    if (manager) IDirectManipulationUpdateManager_AddRef( manager );
++    if (This->manager) IDirectManipulationUpdateManager_Release( This->manager );
+     This->manager = manager;
+-    IDirectManipulationUpdateManager_AddRef(This->manager);
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI compositor_Flush(IDirectManipulationCompositor2 *iface)
++/* the contents' output transforms go onto their visuals */
++static HRESULT WINAPI compositor_Flush( IDirectManipulationCompositor2 *iface )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationCompositor2(iface);
+-    FIXME("%p\n", This);
+-    return E_NOTIMPL;
++    struct directcompositor *This = impl_from_IDirectManipulationCompositor2( iface );
++    struct compositor_content *cc;
++    IDCompositionDevice *devices[16];
++    UINT ndevices = 0, i;
++
++    TRACE( "%p\n", This );
++
++    if (This->manager) IDirectManipulationUpdateManager_Update( This->manager,
++                                                                &This->IDirectManipulationFrameInfoProvider_iface );
++    LIST_FOR_EACH_ENTRY( cc, &This->contents, struct compositor_content, entry )
++    {
++        float m[6];
++        D2D_MATRIX_3X2_F matrix;
++
++        if (!cc->child || FAILED(IDirectManipulationContent_GetOutputTransform( cc->content, m, 6 ))) continue;
++        matrix._11 = m[0]; matrix._12 = m[1];
++        matrix._21 = m[2]; matrix._22 = m[3];
++        matrix._31 = m[4]; matrix._32 = m[5];
++        IDCompositionVisual_SetTransform( cc->child, &matrix );
++        if (cc->device)
++        {
++            for (i = 0; i < ndevices; i++) if (devices[i] == cc->device) break;
++            if (i == ndevices && ndevices < ARRAY_SIZE(devices)) devices[ndevices++] = cc->device;
++        }
++    }
++    for (i = 0; i < ndevices; i++) IDCompositionDevice_Commit( devices[i] );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI compositor_AddContentWithCrossProcessChaining(IDirectManipulationCompositor2 *iface,
+-                IDirectManipulationPrimaryContent *content, IUnknown *device, IUnknown *parentvisual, IUnknown *childvisual)
++static HRESULT WINAPI compositor_AddContentWithCrossProcessChaining( IDirectManipulationCompositor2 *iface,
++        IDirectManipulationPrimaryContent *content, IUnknown *device, IUnknown *parentvisual, IUnknown *childvisual )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationCompositor2(iface);
+-    FIXME("%p %p %p %p %p\n", This, content, device, parentvisual, childvisual);
+-    return E_NOTIMPL;
++    struct directcompositor *This = impl_from_IDirectManipulationCompositor2( iface );
++    IDirectManipulationContent *c;
++    HRESULT hr;
++
++    TRACE( "%p %p %p %p %p\n", This, content, device, parentvisual, childvisual );
++
++    /* there is no other process to chain to: the content is added as usual */
++    if (!content) return E_INVALIDARG;
++    if (FAILED(hr = IDirectManipulationPrimaryContent_QueryInterface( content, &IID_IDirectManipulationContent,
++                                                                      (void **)&c )))
++        return hr;
++    hr = compositor_AddContent( iface, c, device, parentvisual, childvisual );
++    IDirectManipulationContent_Release( c );
++    return hr;
+ }
+ 
+ static const struct IDirectManipulationCompositor2Vtbl compositorVtbl =
+@@ -1021,30 +2435,38 @@ static const struct IDirectManipulationCompositor2Vtbl compositorVtbl =
+     compositor_AddContentWithCrossProcessChaining
+ };
+ 
+-static HRESULT WINAPI provider_QueryInterface(IDirectManipulationFrameInfoProvider *iface, REFIID riid, void **ppv)
++static HRESULT WINAPI provider_QueryInterface( IDirectManipulationFrameInfoProvider *iface, REFIID riid, void **ppv )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationFrameInfoProvider(iface);
+-    return IDirectManipulationCompositor2_QueryInterface(&This->IDirectManipulationCompositor2_iface, riid, ppv);
++    struct directcompositor *This = impl_from_IDirectManipulationFrameInfoProvider( iface );
++    return IDirectManipulationCompositor2_QueryInterface( &This->IDirectManipulationCompositor2_iface, riid, ppv );
+ }
+ 
+-static ULONG WINAPI provider_AddRef(IDirectManipulationFrameInfoProvider *iface)
++static ULONG WINAPI provider_AddRef( IDirectManipulationFrameInfoProvider *iface )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationFrameInfoProvider(iface);
+-    return IDirectManipulationCompositor2_AddRef(&This->IDirectManipulationCompositor2_iface);
++    struct directcompositor *This = impl_from_IDirectManipulationFrameInfoProvider( iface );
++    return IDirectManipulationCompositor2_AddRef( &This->IDirectManipulationCompositor2_iface );
+ }
+ 
+-static ULONG WINAPI provider_Release(IDirectManipulationFrameInfoProvider *iface)
++static ULONG WINAPI provider_Release( IDirectManipulationFrameInfoProvider *iface )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationFrameInfoProvider(iface);
+-    return IDirectManipulationCompositor2_Release(&This->IDirectManipulationCompositor2_iface);
++    struct directcompositor *This = impl_from_IDirectManipulationFrameInfoProvider( iface );
++    return IDirectManipulationCompositor2_Release( &This->IDirectManipulationCompositor2_iface );
+ }
+ 
+-static HRESULT WINAPI provider_GetNextFrameInfo(IDirectManipulationFrameInfoProvider *iface, ULONGLONG *time,
+-            ULONGLONG *process, ULONGLONG *composition)
++/* the frame's time: now, and the next display refresh for composition */
++static HRESULT WINAPI provider_GetNextFrameInfo( IDirectManipulationFrameInfoProvider *iface, ULONGLONG *time,
++                                                 ULONGLONG *process, ULONGLONG *composition )
+ {
+-    struct directcompositor *This = impl_from_IDirectManipulationFrameInfoProvider(iface);
+-    FIXME("%p, %p, %p, %p\n", This, time, process, composition);
+-    return E_NOTIMPL;
++    struct directcompositor *This = impl_from_IDirectManipulationFrameInfoProvider( iface );
++    ULONGLONG t = (ULONGLONG)now_ms();
++
++    TRACE( "%p, %p, %p, %p\n", This, time, process, composition );
++
++    if (!time || !process || !composition) return E_POINTER;
++    *time = t;
++    *process = t;
++    *composition = t + 16;
++    return S_OK;
+ }
+ 
+ static const struct IDirectManipulationFrameInfoProviderVtbl providerVtbl =
+@@ -1055,65 +2477,61 @@ static const struct IDirectManipulationFrameInfoProviderVtbl providerVtbl =
+     provider_GetNextFrameInfo
+ };
+ 
+-static HRESULT WINAPI DirectCompositor_CreateInstance(IClassFactory *iface, IUnknown *outer, REFIID riid, void **ppv)
++static HRESULT WINAPI DirectCompositor_CreateInstance( IClassFactory *iface, IUnknown *outer, REFIID riid, void **ppv )
+ {
+     struct directcompositor *object;
+     HRESULT ret;
+ 
+-    TRACE("(%p, %s, %p)\n", outer, debugstr_guid(riid), ppv);
++    TRACE( "(%p, %s, %p)\n", outer, debugstr_guid( riid ), ppv );
+ 
+     *ppv = NULL;
+-
+-    object = calloc(1, sizeof(*object));
+-    if (!object)
+-        return E_OUTOFMEMORY;
+-
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (!(object = calloc( 1, sizeof(*object) ))) return E_OUTOFMEMORY;
+     object->IDirectManipulationCompositor2_iface.lpVtbl = &compositorVtbl;
+     object->IDirectManipulationFrameInfoProvider_iface.lpVtbl = &providerVtbl;
+     object->ref = 1;
+-
+-    ret = compositor_QueryInterface(&object->IDirectManipulationCompositor2_iface, riid, ppv);
+-    compositor_Release(&object->IDirectManipulationCompositor2_iface);
+-
++    list_init( &object->contents );
++    ret = compositor_QueryInterface( &object->IDirectManipulationCompositor2_iface, riid, ppv );
++    compositor_Release( &object->IDirectManipulationCompositor2_iface );
+     return ret;
+ }
+ 
+-static HRESULT WINAPI ClassFactory_QueryInterface(IClassFactory *iface, REFIID riid, void **ppv)
++/* ---- class factories ------------------------------------------------------------------ */
++
++static HRESULT WINAPI ClassFactory_QueryInterface( IClassFactory *iface, REFIID riid, void **ppv )
+ {
+     *ppv = NULL;
+ 
+-    if(IsEqualGUID(&IID_IUnknown, riid) || IsEqualGUID(&IID_IClassFactory, riid)) {
++    if (IsEqualGUID( &IID_IUnknown, riid ) || IsEqualGUID( &IID_IClassFactory, riid ))
++    {
+         *ppv = iface;
+-    }
+-
+-    if(*ppv) {
+-        IUnknown_AddRef((IUnknown*)*ppv);
++        IUnknown_AddRef( (IUnknown *)*ppv );
+         return S_OK;
+     }
+-
+-    WARN("(%p)->(%s %p)\n", iface, debugstr_guid(riid), ppv);
++    WARN( "(%p)->(%s %p)\n", iface, debugstr_guid( riid ), ppv );
+     return E_NOINTERFACE;
+ }
+ 
+-static ULONG WINAPI ClassFactory_AddRef(IClassFactory *iface)
++static ULONG WINAPI ClassFactory_AddRef( IClassFactory *iface )
+ {
+-    TRACE("(%p)\n", iface);
++    TRACE( "(%p)\n", iface );
+     return 2;
+ }
+ 
+-static ULONG WINAPI ClassFactory_Release(IClassFactory *iface)
++static ULONG WINAPI ClassFactory_Release( IClassFactory *iface )
+ {
+-    TRACE("(%p)\n", iface);
++    TRACE( "(%p)\n", iface );
+     return 1;
+ }
+ 
+-static HRESULT WINAPI ClassFactory_LockServer(IClassFactory *iface, BOOL fLock)
++static HRESULT WINAPI ClassFactory_LockServer( IClassFactory *iface, BOOL fLock )
+ {
+-    TRACE("(%p)->(%x)\n", iface, fLock);
++    TRACE( "(%p)->(%x)\n", iface, fLock );
+     return S_OK;
+ }
+ 
+-static const IClassFactoryVtbl DirectFactoryVtbl = {
++static const IClassFactoryVtbl DirectFactoryVtbl =
++{
+     ClassFactory_QueryInterface,
+     ClassFactory_AddRef,
+     ClassFactory_Release,
+@@ -1121,7 +2539,8 @@ static const IClassFactoryVtbl DirectFactoryVtbl = {
+     ClassFactory_LockServer
+ };
+ 
+-static const IClassFactoryVtbl DirectCompositorVtbl = {
++static const IClassFactoryVtbl DirectCompositorVtbl =
++{
+     ClassFactory_QueryInterface,
+     ClassFactory_AddRef,
+     ClassFactory_Release,
+@@ -1132,18 +2551,19 @@ static const IClassFactoryVtbl DirectCompositorVtbl = {
+ static IClassFactory direct_factory = { &DirectFactoryVtbl };
+ static IClassFactory compositor_factory = { &DirectCompositorVtbl };
+ 
+-HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID *ppv)
++HRESULT WINAPI DllGetClassObject( REFCLSID rclsid, REFIID riid, LPVOID *ppv )
+ {
+-    if(IsEqualGUID(&CLSID_DirectManipulationManager, rclsid) ||
+-       IsEqualGUID(&CLSID_DirectManipulationSharedManager, rclsid) ) {
+-        TRACE("(CLSID_DirectManipulationManager %s %p)\n", debugstr_guid(riid), ppv);
+-        return IClassFactory_QueryInterface(&direct_factory, riid, ppv);
++    if (IsEqualGUID( &CLSID_DirectManipulationManager, rclsid ) ||
++        IsEqualGUID( &CLSID_DirectManipulationSharedManager, rclsid ))
++    {
++        TRACE( "(CLSID_DirectManipulationManager %s %p)\n", debugstr_guid( riid ), ppv );
++        return IClassFactory_QueryInterface( &direct_factory, riid, ppv );
+     }
+-    else if(IsEqualGUID(&CLSID_DCompManipulationCompositor, rclsid)) {
+-        TRACE("(CLSID_DCompManipulationCompositor %s %p)\n", debugstr_guid(riid), ppv);
+-        return IClassFactory_QueryInterface(&compositor_factory, riid, ppv);
++    if (IsEqualGUID( &CLSID_DCompManipulationCompositor, rclsid ))
++    {
++        TRACE( "(CLSID_DCompManipulationCompositor %s %p)\n", debugstr_guid( riid ), ppv );
++        return IClassFactory_QueryInterface( &compositor_factory, riid, ppv );
+     }
+-
+-    FIXME("%s %s %p\n", debugstr_guid(rclsid), debugstr_guid(riid), ppv);
++    WARN( "%s %s %p\n", debugstr_guid( rclsid ), debugstr_guid( riid ), ppv );
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
