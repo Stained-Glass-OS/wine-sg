@@ -1,0 +1,610 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dwrite: IDWriteTextLayout hit testing (HitTestTextRange, HitTestTextPosition, HitTestPoint)
+
+The three hit testing methods of IDWriteTextLayout returned E_NOTIMPL, so text
+editors and selection code built on DirectWrite (rich edit controls, XAML/WPF
+text boxes, browsers, Direct2D applications) got no caret positions, no
+selection rectangles and no click positions.
+
+They work from the laid out clusters: the effective runs give the line, the
+direction and the origin of each piece of text, the cluster metrics give the
+widths, and the inline objects now remember the text positions they stand for.
+ - HitTestTextRange returns one rectangle per piece of a line: the text of
+   neighbouring runs of one line and one level is one rectangle (even with
+   different font sizes), an inline object is a rectangle of its own that is not
+   text, the range is cut at the end of the text, and a range that starts past the
+   text is an empty rectangle at its end. Too small a buffer is
+   E_NOT_SUFFICIENT_BUFFER with the needed count. The origin is added.
+ - HitTestTextPosition gives the leading or trailing edge of the cluster at a text
+   position (right to left clusters are the other way round) and the cluster's
+   rectangle; a position past the end is the end of the last cluster.
+ - HitTestPoint finds the line at the height of the point (the first or last one
+   outside), then the cluster at its horizontal position, whether the point is in
+   the second half of it (trailing) and whether it is inside the cluster.
+White space at the end of a line hangs outside the runs; it is counted into the
+last rectangle of the line for ranges.
+---
+--- a/dlls/dwrite/layout.c
++++ b/dlls/dwrite/layout.c
+@@ -178,6 +178,8 @@ struct layout_effective_inline {
+     BOOL  is_sideways;            /* vertical flow direction flag passed to Draw */
+     BOOL  is_rtl;                 /* bidi flag passed to Draw */
+     UINT32 line;                  /* 0-based line index in line metrics array */
++    UINT32 start;                 /* text position the object stands for, ~0u for a trimming sign */
++    UINT32 length;                /* number of text positions it replaces */
+ };
+ 
+ struct layout_underline {
+@@ -1381,6 +1383,10 @@ static HRESULT layout_add_effective_run(struct dwrite_textlayout *layout, const
+         inlineobject->is_sideways = FALSE;
+         inlineobject->is_rtl = FALSE;
+         inlineobject->line = line;
++        inlineobject->start = layout->clusters[first_cluster].position + r->start_position;
++        inlineobject->length = 0;
++        for (i = first_cluster; i < first_cluster + cluster_count; ++i)
++            inlineobject->length += layout->clustermetrics[i].length;
+ 
+         /* effect assigned from start position and on is used for inline objects */
+         inlineobject->effect = layout_get_effect_from_pos(layout, layout->clusters[first_cluster].position +
+@@ -2055,6 +2061,8 @@ static void layout_add_line(struct dwrite_textlayout *layout, UINT32 first_clust
+         trimming_sign->is_sideways = FALSE;
+         trimming_sign->is_rtl = FALSE;
+         trimming_sign->line = line;
++        trimming_sign->start = ~0u;
++        trimming_sign->length = 0;
+ 
+         trimming_sign->effect = layout_get_effect_from_pos(layout, layout->clusters[i].position +
+                 layout->clusters[i].run->start_position);
+@@ -3963,30 +3971,504 @@ width_done:
+     return S_OK;
+ }
+ 
++/* A rectangle of the laid out text: a run, a part of a run, or a single cluster. */
++struct hit_segment
++{
++    UINT32 position;
++    UINT32 length;
++    float left;
++    float top;
++    float width;
++    float height;
++    UINT32 line;
++    UINT32 level;
++    BOOL is_text;
++};
++
++static UINT32 layout_cluster_text_position(const struct dwrite_textlayout *layout, UINT32 cluster)
++{
++    return layout->clusters[cluster].run->start_position + layout->clusters[cluster].position;
++}
++
++/* First cluster that starts at or after a text position. */
++static UINT32 layout_find_cluster(const struct dwrite_textlayout *layout, UINT32 position)
++{
++    UINT32 lo = 0, hi = layout->cluster_count;
++
++    while (lo < hi)
++    {
++        UINT32 mid = lo + (hi - lo) / 2;
++
++        if (layout_cluster_text_position(layout, mid) < position)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++
++    return lo;
++}
++
++static BOOL hit_segments_add(struct hit_segment **segments, size_t *count, size_t *size,
++        const struct hit_segment *segment)
++{
++    if (*count == *size)
++    {
++        size_t new_size = *size ? *size * 2 : 8;
++        struct hit_segment *new_segments;
++
++        if (!(new_segments = realloc(*segments, new_size * sizeof(**segments))))
++            return FALSE;
++        *segments = new_segments;
++        *size = new_size;
++    }
++
++    (*segments)[(*count)++] = *segment;
++    return TRUE;
++}
++
++static int __cdecl hit_segment_compare(const void *a, const void *b)
++{
++    const struct hit_segment *left = a, *right = b;
++
++    if (left->line != right->line)
++        return left->line < right->line ? -1 : 1;
++    if (left->left != right->left)
++        return left->left < right->left ? -1 : 1;
++    return 0;
++}
++
++/* The rectangles of the text positions [start, end), by run (a part of a run that is selected is one rectangle),
++ * or by cluster. They are sorted by line and then left to right. */
++static HRESULT layout_get_hit_segments(struct dwrite_textlayout *layout, UINT32 start, UINT32 end, BOOL per_cluster,
++        struct hit_segment **ret, size_t *ret_count)
++{
++    struct layout_effective_inline *inlineobject;
++    struct layout_effective_run *erun;
++    struct hit_segment *segments = NULL;
++    size_t count = 0, size = 0;
++    HRESULT hr;
++
++    *ret = NULL;
++    *ret_count = 0;
++
++    if (FAILED(hr = layout_compute_effective_runs(layout)))
++        return hr;
++
++    LIST_FOR_EACH_ENTRY(erun, &layout->eruns, struct layout_effective_run, entry)
++    {
++        const struct layout_line *line = &layout->lines[erun->line];
++        UINT32 run_start = erun->run->start_position + erun->start, run_end = run_start + erun->length;
++        BOOL rtl = is_run_rtl(erun);
++        float run_left, before = 0.0f;
++        struct hit_segment piece;
++        BOOL have_piece = FALSE;
++        UINT32 c;
++
++        if (run_end <= start || run_start >= end)
++            continue;
++
++#ifdef SG_MUTANT_HIT_RTL_AS_LTR
++        run_left = erun->origin.x + erun->align_dx;
++#else
++        run_left = (rtl ? erun->origin.x - erun->width : erun->origin.x) + erun->align_dx;
++#endif
++
++        memset(&piece, 0, sizeof(piece));
++        for (c = layout_find_cluster(layout, run_start); c < layout->cluster_count; ++c)
++        {
++            UINT32 pos = layout_cluster_text_position(layout, c);
++            float width = layout->clustermetrics[c].width;
++            UINT32 length = layout->clustermetrics[c].length;
++
++            if (pos >= run_end)
++                break;
++
++            if (pos < end && pos + length > start)
++            {
++                if (per_cluster)
++                {
++                    struct hit_segment cluster = { 0 };
++
++                    cluster.position = pos;
++                    cluster.length = length;
++                    cluster.left = run_left + (rtl ? erun->width - before - width : before);
++                    cluster.top = erun->origin.y - line->metrics.baseline;
++                    cluster.width = width;
++                    cluster.height = line->metrics.height;
++                    cluster.line = erun->line;
++                    cluster.level = erun->run->u.regular.run.bidiLevel;
++                    cluster.is_text = TRUE;
++                    if (!hit_segments_add(&segments, &count, &size, &cluster))
++                    {
++                        free(segments);
++                        return E_OUTOFMEMORY;
++                    }
++                }
++                else if (!have_piece)
++                {
++                    piece.position = pos;
++                    piece.length = length;
++                    piece.left = before;
++                    piece.width = width;
++                    have_piece = TRUE;
++                }
++                else
++                {
++                    piece.length += length;
++                    piece.width += width;
++                }
++            }
++
++            before += width;
++        }
++
++        if (have_piece)
++        {
++            piece.left = run_left + (rtl ? erun->width - piece.left - piece.width : piece.left);
++            piece.top = erun->origin.y - line->metrics.baseline;
++            piece.height = line->metrics.height;
++            piece.line = erun->line;
++            piece.level = erun->run->u.regular.run.bidiLevel;
++            piece.is_text = TRUE;
++            if (!hit_segments_add(&segments, &count, &size, &piece))
++            {
++                free(segments);
++                return E_OUTOFMEMORY;
++            }
++        }
++    }
++
++    LIST_FOR_EACH_ENTRY(inlineobject, &layout->inlineobjects, struct layout_effective_inline, entry)
++    {
++        const struct layout_line *line = &layout->lines[inlineobject->line];
++        struct hit_segment object = { 0 };
++
++        if (inlineobject->start == ~0u || inlineobject->start >= end || inlineobject->start + inlineobject->length <= start)
++            continue;
++
++        object.position = inlineobject->start;
++        object.length = inlineobject->length;
++        object.left = inlineobject->origin.x + inlineobject->align_dx;
++        object.top = inlineobject->origin.y + inlineobject->baseline - line->metrics.baseline;
++        object.width = inlineobject->width;
++        object.height = line->metrics.height;
++        object.line = inlineobject->line;
++        object.level = inlineobject->is_rtl ? 1 : 0;
++        object.is_text = FALSE;
++        if (!hit_segments_add(&segments, &count, &size, &object))
++        {
++            free(segments);
++            return E_OUTOFMEMORY;
++        }
++    }
++
++    if (count > 1)
++        qsort(segments, count, sizeof(*segments), hit_segment_compare);
++
++    /* Neighbours that are text on the same line and level, and follow each other in the text, are one rectangle. */
++    if (!per_cluster && count > 1)
++    {
++        size_t i, out = 0;
++
++        for (i = 1; i < count; ++i)
++        {
++            struct hit_segment *a = &segments[out], *b = &segments[i];
++            BOOL touching = fabsf(a->left + a->width - b->left) < 0.01f;
++            BOOL follows = (a->level & 1) ? b->position + b->length == a->position : a->position + a->length == b->position;
++
++#ifdef SG_MUTANT_HIT_NO_MERGE
++            if (0)
++#else
++            if (a->is_text && b->is_text && a->line == b->line && a->level == b->level && touching && follows)
++#endif
++            {
++                a->position = min(a->position, b->position);
++                a->length += b->length;
++                a->width += b->width;
++            }
++            else
++                segments[++out] = *b;
++        }
++        count = out + 1;
++    }
++
++    /* White space at the end of a line is not part of any run (it hangs outside), but it is part of the line:
++     * the last piece of text of a line is taken to cover it as far as the range goes. */
++    if (!per_cluster && count)
++    {
++        size_t i;
++
++        for (i = 0; i < count; ++i)
++        {
++            struct hit_segment *s = &segments[i];
++            UINT32 line_start = 0, line_end, seg_end = s->position + s->length, new_end, l;
++
++            if (!s->is_text || (i + 1 < count && segments[i + 1].line == s->line))
++                continue;
++
++            for (l = 0; l < s->line; ++l)
++                line_start += layout->lines[l].metrics.length;
++            line_end = line_start + layout->lines[s->line].metrics.length;
++
++            new_end = min(line_end, end);
++            if (seg_end < new_end && !(s->level & 1))
++                s->length += new_end - seg_end;
++        }
++    }
++
++    *ret = segments;
++    *ret_count = count;
++    return S_OK;
++}
++
++static void hit_segment_to_metrics(const struct hit_segment *segment, float origin_x, float origin_y,
++        DWRITE_HIT_TEST_METRICS *metrics)
++{
++    metrics->textPosition = segment->position;
++    metrics->length = segment->length;
++    metrics->left = segment->left + origin_x;
++    metrics->top = segment->top + origin_y;
++    metrics->width = segment->width;
++    metrics->height = segment->height;
++    metrics->bidiLevel = segment->level;
++    metrics->isText = segment->is_text;
++    metrics->isTrimmed = FALSE;
++}
++
+ static HRESULT WINAPI dwritetextlayout_HitTestPoint(IDWriteTextLayout4 *iface,
+     FLOAT pointX, FLOAT pointY, BOOL* is_trailinghit, BOOL* is_inside, DWRITE_HIT_TEST_METRICS *metrics)
+ {
+-    FIXME("%p, %.8e, %.8e, %p, %p, %p): stub\n", iface, pointX, pointY, is_trailinghit, is_inside, metrics);
++    struct dwrite_textlayout *layout = impl_from_IDWriteTextLayout4(iface);
++    struct hit_segment *segments, *hit = NULL;
++    size_t count, i;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %.8e, %.8e, %p, %p, %p.\n", iface, pointX, pointY, is_trailinghit, is_inside, metrics);
++
++    if (!is_trailinghit || !is_inside || !metrics)
++        return E_INVALIDARG;
++
++    *is_trailinghit = *is_inside = FALSE;
++    memset(metrics, 0, sizeof(*metrics));
++
++    if (!layout->len)
++        return layout_compute_effective_runs(layout);
++
++    if (FAILED(hr = layout_get_hit_segments(layout, 0, layout->len, TRUE, &segments, &count)))
++        return hr;
++
++    if (!count)
++    {
++        free(segments);
++        return S_OK;
++    }
++
++    /* The line: the one at the height of the point, the first or the last for a point above or below. */
++    {
++        UINT32 line = segments[0].line;
++
++        for (i = 0; i < count; ++i)
++        {
++            if (pointY >= segments[i].top)
++                line = segments[i].line;
++            else
++                break;
++        }
++
++        /* then the cluster of that line; before the first one it is the first, after the last one the last */
++        for (i = 0; i < count; ++i)
++        {
++            const struct hit_segment *s = &segments[i];
++
++            if (s->line != line) continue;
++
++            if (!hit)
++                hit = &segments[i];
++            if (pointX >= s->left)
++                hit = &segments[i];
++            if (pointX < s->left + s->width)
++                break;
++        }
++    }
++
++    if (hit)
++    {
++        size_t last = count - 1;
++
++        hit_segment_to_metrics(hit, 0.0f, 0.0f, metrics);
++
++#ifdef SG_MUTANT_HIT_TRAILING_FLIPPED
++        *is_trailinghit = (hit->level & 1) ? pointX >= hit->left + hit->width / 2.0f : pointX < hit->left + hit->width / 2.0f;
++#else
++        *is_trailinghit = (hit->level & 1) ? pointX < hit->left + hit->width / 2.0f : pointX >= hit->left + hit->width / 2.0f;
++#endif
++        *is_inside = pointY >= segments[0].top && pointY < segments[last].top + segments[last].height &&
++                pointX >= hit->left && pointX < hit->left + hit->width;
++    }
++
++    free(segments);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *iface,
+         UINT32 textPosition, BOOL is_trailinghit, FLOAT *pointX, FLOAT *pointY, DWRITE_HIT_TEST_METRICS *metrics)
+ {
+-    FIXME("%p, %u, %d, %p, %p, %p): stub\n", iface, textPosition, is_trailinghit, pointX, pointY, metrics);
++    struct dwrite_textlayout *layout = impl_from_IDWriteTextLayout4(iface);
++    struct hit_segment *segments;
++    size_t count;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %u, %d, %p, %p, %p.\n", iface, textPosition, is_trailinghit, pointX, pointY, metrics);
++
++    if (!pointX || !pointY || !metrics)
++        return E_INVALIDARG;
++
++    *pointX = *pointY = 0.0f;
++    memset(metrics, 0, sizeof(*metrics));
++
++    if (!layout->len)
++        return layout_compute_effective_runs(layout);
++
++    /* A position past the text is the end of the last cluster. */
++    if (textPosition >= layout->len)
++    {
++        textPosition = layout->len - 1;
++        is_trailinghit = TRUE;
++    }
++
++    if (FAILED(hr = layout_get_hit_segments(layout, textPosition, textPosition + 1, TRUE, &segments, &count)))
++        return hr;
++
++    if (!count)
++    {
++        /* white space at the end of a line hangs behind the last piece of it */
++        free(segments);
++        if (FAILED(hr = layout_get_hit_segments(layout, 0, textPosition, TRUE, &segments, &count)))
++            return hr;
++        if (count)
++        {
++            struct hit_segment last = segments[count - 1];
++            UINT32 c = layout_find_cluster(layout, textPosition);
++
++            last.position = textPosition;
++            last.length = c < layout->cluster_count ? layout->clustermetrics[c].length : 1;
++            last.left = (last.level & 1) ? last.left : last.left + last.width;
++            last.width = 0.0f;
++            segments[0] = last;
++            count = 1;
++        }
++    }
++
++    if (count)
++    {
++        const struct hit_segment *s = &segments[0];
++#ifdef SG_MUTANT_HIT_POSITION_IGNORES_TRAILING
++        BOOL right = (s->level & 1);
++#else
++        BOOL right = (s->level & 1) ? !is_trailinghit : is_trailinghit;
++#endif
++
++        hit_segment_to_metrics(s, 0.0f, 0.0f, metrics);
++        *pointX = right ? s->left + s->width : s->left;
++        *pointY = s->top;
++    }
++
++    free(segments);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dwritetextlayout_HitTestTextRange(IDWriteTextLayout4 *iface,
+     UINT32 textPosition, UINT32 textLength, FLOAT originX, FLOAT originY,
+     DWRITE_HIT_TEST_METRICS *metrics, UINT32 max_metricscount, UINT32* actual_metricscount)
+ {
+-    FIXME("%p, %u, %u, %f, %f, %p, %u, %p): stub\n", iface, textPosition, textLength, originX, originY, metrics,
++    struct dwrite_textlayout *layout = impl_from_IDWriteTextLayout4(iface);
++    struct hit_segment *segments, dummy;
++    size_t count, i;
++    HRESULT hr;
++
++    TRACE("%p, %u, %u, %f, %f, %p, %u, %p.\n", iface, textPosition, textLength, originX, originY, metrics,
+         max_metricscount, actual_metricscount);
+ 
+-    return E_NOTIMPL;
++    if (!actual_metricscount)
++        return E_INVALIDARG;
++
++    *actual_metricscount = 0;
++
++    if (FAILED(hr = layout_compute_effective_runs(layout)))
++        return hr;
++
++    if (textPosition >= layout->len)
++    {
++        /* Past the text the range is empty and sits at the end of it, as text if the end is text. */
++        memset(&dummy, 0, sizeof(dummy));
++#ifdef SG_MUTANT_HIT_END_POSITION
++        dummy.position = 0;
++#else
++        dummy.position = layout->len;
++#endif
++        dummy.is_text = TRUE;
++
++        if (layout->len && layout->lines)
++        {
++            if (SUCCEEDED(hr = layout_get_hit_segments(layout, layout->len - 1, layout->len, TRUE, &segments, &count)) && count)
++            {
++                const struct hit_segment *last = &segments[count - 1];
++
++                dummy = *last;
++#ifdef SG_MUTANT_HIT_END_POSITION
++                dummy.position = 0;
++#else
++                dummy.position = layout->len;
++#endif
++                dummy.length = 0;
++                dummy.left = (last->level & 1) ? last->left : last->left + last->width;
++                dummy.width = 0.0f;
++                dummy.is_text = last->is_text;
++            }
++            if (SUCCEEDED(hr))
++                free(segments);
++        }
++
++        *actual_metricscount = 1;
++        if (max_metricscount < 1 || !metrics)
++            return E_NOT_SUFFICIENT_BUFFER;
++        hit_segment_to_metrics(&dummy, originX, originY, metrics);
++        return S_OK;
++    }
++
++#ifndef SG_MUTANT_HIT_NO_CLIP
++    if (textLength > layout->len - textPosition)
++        textLength = layout->len - textPosition;
++#endif
++
++    if (!textLength)
++    {
++        *actual_metricscount = 0;
++        return S_OK;
++    }
++
++    if (FAILED(hr = layout_get_hit_segments(layout, textPosition, textPosition + textLength, FALSE, &segments, &count)))
++        return hr;
++
++    *actual_metricscount = count;
++#ifdef SG_MUTANT_HIT_BUFFER_OK
++    if (0)
++#else
++    if (count > max_metricscount || (count && !metrics))
++#endif
++    {
++        if (metrics)
++            for (i = 0; i < max_metricscount; ++i)
++                hit_segment_to_metrics(&segments[i], originX, originY, &metrics[i]);
++        free(segments);
++        return E_NOT_SUFFICIENT_BUFFER;
++    }
++
++    for (i = 0; i < count; ++i)
++        hit_segment_to_metrics(&segments[i], originX, originY, &metrics[i]);
++
++    free(segments);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dwritetextlayout1_SetPairKerning(IDWriteTextLayout4 *iface, BOOL is_pairkerning_enabled,
+--- a/dlls/dwrite/tests/layout.c
++++ b/dlls/dwrite/tests/layout.c
+@@ -7008,7 +7008,6 @@ static void test_HitTestTextRange(void)
+     /* Start index exceeding layout text length, dummy range returned. */
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 7, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {
+@@ -7020,7 +7019,6 @@ if (SUCCEEDED(hr))
+     /* Length exceeding layout text length, trimmed. */
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {
+@@ -7037,7 +7035,6 @@ if (SUCCEEDED(hr))
+ 
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 6, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {
+@@ -7059,7 +7056,6 @@ if (SUCCEEDED(hr))
+ 
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 6, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {
+@@ -7073,7 +7069,6 @@ if (SUCCEEDED(hr))
+ }
+     count = 0;
+     hr = IDWriteTextLayout_HitTestTextRange(layout, 7, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ if (SUCCEEDED(hr))
+ {

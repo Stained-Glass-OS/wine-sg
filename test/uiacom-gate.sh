@@ -1,19 +1,18 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# dxgi: ResizeBuffers1 of a Direct3D 11 swap chain (node masks, present queues), FindClosestMatchingMode with
-# an empty mode and a device (patches/sg/2628): test/dxgiswap-probe.c, under Xvfb.
+# IUIAutomationElement: the Cached* getters, the element and array valued properties, SetFocus,
+# GetRuntimeId, GetClickablePoint, GetCachedPropertyValue (patches/sg/2631): test/uiacom-probe.c, under Xvfb.
 #
-#   WINE=/opt/wine-sg/bin/wine test/dxgiswap-gate.sh
+#   WINE=/opt/wine-sg/bin/wine test/uiacom-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
-# Mutants (dxgi): SG_MUTANT_DXGI_RESIZE1_MASKS, SG_MUTANT_DXGI_RESIZE1_QUEUE (swapchain.c),
-# SG_MUTANT_DXGI_FIND_UNKNOWN (output.c).
-# The probe needs the DXGI 1.4 headers: Wine's own are used when the system ones lack them.
+# Mutants (uiautomationcore, uia_com_client.c): SG_MUTANT_UIACOM_CACHED_STUB, SG_MUTANT_UIACOM_BOOL_INVERTED,
+# SG_MUTANT_UIACOM_NO_FOCUS, SG_MUTANT_UIACOM_CLICK_CORNER, SG_MUTANT_UIACOM_ARRAY_NULL.
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 [ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
-DPY="${DXGISWAP_DPY:-246}"
+DPY="${UIACOM_DPY:-246}"
 while [ -e "/tmp/.X${DPY}-lock" ] || [ -e "/tmp/.X11-unix/X${DPY}" ]; do DPY=$((DPY + 1)); done
 XP=""
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -21,7 +20,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 for need in Xvfb xdpyinfo "$MINGW"; do command -v "$need" >/dev/null || { echo "SKIP: $need missing"; exit 77; }; done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 
-T=$(mktemp -d /var/tmp/sg-dxgiswap.XXXXXX)
+T=$(mktemp -d /var/tmp/sg-uiacom.XXXXXX)
 cleanup() {
     [ -n "$XP" ] && kill "$XP" 2>/dev/null
     rm -f "/tmp/.X${DPY}-lock"
@@ -32,8 +31,8 @@ trap cleanup EXIT INT TERM
 
 built=
 for inc in "" "-I$(dirname "$WINE")/include" "-I$HERE/../../obj/include" "-I/opt/wine-sg/include/wine/windows"; do
-    TMPDIR=/var/tmp "$MINGW" -O2 -mwindows $inc -o "$T/dxgiswap-probe.exe" "$HERE/dxgiswap-probe.c" \
-        -ld3d11 -ldxgi -luuid -ldxguid -luser32 2>/dev/null && { built=1; break; }
+    TMPDIR=/var/tmp "$MINGW" -O2 -mwindows $inc -o "$T/uiacom-probe.exe" "$HERE/uiacom-probe.c" \
+        -lole32 -loleaut32 -luuid -luser32 2>/dev/null && { built=1; break; }
 done
 [ -n "$built" ] || { echo "FAIL  the probe did not build"; exit 1; }
 
@@ -46,7 +45,7 @@ timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 
 # a crashed probe leaves wine helpers holding a pipe: go through a file
-timeout -s KILL 60 "$WINE" "$T/dxgiswap-probe.exe" >"$T/out.raw" 2>/dev/null </dev/null
+timeout -s KILL 60 "$WINE" "$T/uiacom-probe.exe" >"$T/out.raw" 2>/dev/null </dev/null
 tr -d '\r' <"$T/out.raw" >"$T/out"
 cat "$T/out"
 grep -qx 'RESULT: PASS' "$T/out" && ! grep -q '^FAIL' "$T/out" && exit 0

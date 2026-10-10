@@ -236,7 +236,7 @@ static void test_variant(enum variant v, const char *label)
                 PropVariantInit(&id); PropVariantInit(&val);
                 hr = IWICMetadataReader_GetValueByIndex(app1, 0, NULL, &id, &val);
                 sprintf(what, "%s: the app1 item is an ifd reader", label);
-                check(hr == S_OK && id.vt == VT_CLSID && IsEqualGUID(id.puuid, &my_GUID_MetadataFormatIfd) && val.vt == VT_UNKNOWN, what);
+                check(hr == S_OK && id.vt == VT_UI2 && id.uiVal == 0 && val.vt == VT_UNKNOWN, what);
                 if (hr == S_OK && val.vt == VT_UNKNOWN && SUCCEEDED(IUnknown_QueryInterface(val.punkVal, &my_IID_IWICMetadataReader, (void **)&ifd)))
                 {
                     count = 77;
