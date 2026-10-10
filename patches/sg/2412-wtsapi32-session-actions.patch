@@ -1,0 +1,344 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] wtsapi32: log off, disconnect, send a message to, and shut down
+
+WTSLogoffSession, WTSDisconnectSession, WTSSendMessageA/W and
+WTSShutdownSystem only logged a FIXME. They now act, with the rights
+Windows asks for:
+
+- One's own session (WTS_CURRENT_SESSION or its number) needs no rights.
+  Any other session needs an administrator (ERROR_ACCESS_DENIED
+  otherwise); an administrator is told the services session (0) is not to
+  be touched (ERROR_ACCESS_DENIED) and that other numbers are not there
+  (ERROR_NOT_FOUND). A server we cannot reach is RPC_S_SERVER_UNAVAILABLE.
+- WTSLogoffSession signs the session out through the same ExitWindowsEx
+  path as the Start menu. WTSDisconnectSession keeps the session and
+  locks it.
+- WTSSendMessage shows a message box in the caller's session on a thread
+  of its own: bWait waits for the answer, otherwise it returns at once
+  with IDASYNC; Timeout (seconds) ends an unanswered box with IDTIMEOUT.
+  Titles and texts are cut to the lengths given.
+- WTSShutdownSystem needs the shutdown privilege
+  (ERROR_PRIVILEGE_NOT_HELD) and goes through ExitWindowsEx: logoff,
+  shutdown, reboot or power off; the power helper does the rest.
+---
+--- a/dlls/wtsapi32/wtsapi32.c
++++ b/dlls/wtsapi32/wtsapi32.c
+@@ -26,6 +26,7 @@
+ #include "lmcons.h"
+ #include "winuser.h"
+ #include "wtsapi32.h"
++#include "reason.h"
+ #include "wine/debug.h"
+ #include "wine/list.h"
+ #include "unixlib.h"
+@@ -330,13 +331,188 @@ BOOL WINAPI WTSConnectSessionW(ULONG LogonId, ULONG TargetLogonId, PWSTR pPasswo
+    return TRUE;
+ }
+ 
++/* Actions on a session (log off, disconnect, send a message). One's own
++ * session needs no rights. Any other session needs an administrator,
++ * who then finds that the only one besides it, the services session, is not
++ * something to log off or write to, and that others do not exist. */
++static BOOL wts_caller_is_admin(void)
++{
++    SID_IDENTIFIER_AUTHORITY nt = { SECURITY_NT_AUTHORITY };
++    PSID admins;
++    BOOL member = FALSE;
++
++    if (!AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
++                                  0, 0, 0, 0, 0, 0, &admins)) return FALSE;
++#ifdef SG_MUTANT_WTSACT_NOADMIN
++    member = TRUE;
++#else
++    if (!CheckTokenMembership(NULL, admins, &member)) member = FALSE;
++#endif
++    FreeSid(admins);
++    return member;
++}
++
++static BOOL wts_action_session(HANDLE server, DWORD session_id, DWORD *out_id)
++{
++    DWORD current;
++
++    if (!wts_server_is_local(server))
++    {
++        SetLastError(RPC_S_SERVER_UNAVAILABLE);
++        return FALSE;
++    }
++    if (!ProcessIdToSessionId(GetCurrentProcessId(), &current)) return FALSE;
++    if (session_id == WTS_ANY_SESSION)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    if (session_id == WTS_CURRENT_SESSION || session_id == current)
++    {
++        *out_id = current;
++        return TRUE;
++    }
++    if (!wts_caller_is_admin())
++    {
++        SetLastError(ERROR_ACCESS_DENIED);
++        return FALSE;
++    }
++    SetLastError(session_id == 0 ? ERROR_ACCESS_DENIED : ERROR_NOT_FOUND);
++    return FALSE;
++}
++
++#ifndef IDTIMEOUT
++#define IDTIMEOUT 32000
++#endif
++#ifndef IDASYNC
++#define IDASYNC 32001
++#endif
++
++struct wts_message
++{
++    WCHAR *title, *text;
++    DWORD style, timeout_ms, response;
++    BOOL async;
++};
++
++static BOOL CALLBACK wts_end_message_proc(HWND hwnd, LPARAM lparam)
++{
++    WCHAR cls[16];
++
++    if (GetClassNameW(hwnd, cls, ARRAY_SIZE(cls)) && !wcscmp(cls, L"#32770"))
++    {
++        EndDialog(hwnd, IDTIMEOUT);
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static void CALLBACK wts_message_timer(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
++{
++    KillTimer(NULL, id);
++    EnumThreadWindows(GetCurrentThreadId(), wts_end_message_proc, 0);
++}
++
++static DWORD WINAPI wts_message_thread(void *arg)
++{
++    struct wts_message *m = arg;
++    HMODULE module = NULL;
++    UINT_PTR timer = 0;
++
++    /* the timeout is the message box's own: a timer on this thread, run by the box's message loop */
++#ifdef SG_MUTANT_WTSACT_NOTIMER
++    m->timeout_ms = 0;
++#endif
++    if (m->timeout_ms) timer = SetTimer(NULL, 0, m->timeout_ms, wts_message_timer);
++    m->response = MessageBoxW(NULL, m->text, m->title, m->style | MB_SETFOREGROUND);
++    if (timer) KillTimer(NULL, timer);
++    if (m->async)
++    {
++        free(m->title); free(m->text); free(m);
++        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (const WCHAR *)wts_message_thread, &module);
++        if (module) FreeLibraryAndExitThread(module, 0);
++    }
++    return 0;
++}
++
++static WCHAR *wts_message_string(const void *str, DWORD len, BOOL ansi)
++{
++    WCHAR *ret;
++    DWORD n;
++
++    if (!str) len = 0;
++    if (ansi) n = len ? MultiByteToWideChar(CP_ACP, 0, str, len, NULL, 0) : 0;
++    else n = len / sizeof(WCHAR);
++    if (!(ret = malloc((n + 1) * sizeof(WCHAR)))) return NULL;
++    if (ansi) { if (n) MultiByteToWideChar(CP_ACP, 0, str, len, ret, n); }
++    else memcpy(ret, str, n * sizeof(WCHAR));
++    ret[n] = 0;
++    return ret;
++}
++
++static BOOL wts_send_message(HANDLE server, DWORD session_id, const void *title, DWORD title_len, const void *text,
++                             DWORD text_len, DWORD style, DWORD timeout, DWORD *response, BOOL wait, BOOL ansi)
++{
++    struct wts_message *m;
++    HMODULE module;
++    HANDLE thread;
++    DWORD id;
++
++    if (!wts_action_session(server, session_id, &id)) return FALSE;
++    if (!response || !text)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    if (!(m = calloc(1, sizeof(*m))) ||
++        !(m->title = wts_message_string(title, title_len, ansi)) ||
++        !(m->text = wts_message_string(text, text_len, ansi)))
++    {
++        if (m) { free(m->title); free(m->text); free(m); }
++        SetLastError(ERROR_OUTOFMEMORY);
++        return FALSE;
++    }
++    m->style = style;
++    m->timeout_ms = timeout > 0xffffffff / 1000 ? 0xffffffff : timeout * 1000;
++#ifdef SG_MUTANT_WTSACT_ASYNCWAIT
++    wait = TRUE;
++#endif
++    m->async = !wait;
++    if (m->async && !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (const WCHAR *)wts_message_thread, &module))
++        module = NULL;
++    if (!(thread = CreateThread(NULL, 0, wts_message_thread, m, 0, NULL)))
++    {
++        if (m->async && module) FreeLibrary(module);
++        free(m->title); free(m->text); free(m);
++        return FALSE;
++    }
++    if (m->async)
++    {
++        CloseHandle(thread);
++        *response = IDASYNC;
++        return TRUE;
++    }
++    WaitForSingleObject(thread, INFINITE);
++    CloseHandle(thread);
++    *response = m->response;
++    free(m->title); free(m->text); free(m);
++    return TRUE;
++}
++
+ /************************************************************
+  *                WTSDisconnectSession  (WTSAPI32.@)
+  */
+ BOOL WINAPI WTSDisconnectSession(HANDLE hServer, DWORD SessionId, BOOL bWait)
+ {
+-    FIXME("Stub %p 0x%08lx %d\n", hServer, SessionId, bWait);
+-    return TRUE;
++    DWORD id;
++
++    TRACE("%p 0x%08lx %d\n", hServer, SessionId, bWait);
++
++    if (!wts_action_session(hServer, SessionId, &id)) return FALSE;
++    /* Disconnecting a session keeps it and its programs and shows the logon
++     * screen. On this desktop that is locking it (the compositor locks);
++     * bWait has nothing to wait for. */
++    return LockWorkStation();
+ }
+ 
+ /************************************************************
+@@ -912,9 +1088,15 @@ BOOL WINAPI WTSFreeMemoryExW(WTS_TYPE_CLASS type, void *ptr, ULONG nmemb)
+  */
+ BOOL WINAPI WTSLogoffSession(HANDLE hserver, DWORD session_id, BOOL bwait)
+ {
+-    FIXME("(%p, 0x%lx, %d): stub\n", hserver, session_id, bwait);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return FALSE;
++    DWORD id;
++
++    TRACE("(%p, 0x%lx, %d)\n", hserver, session_id, bwait);
++
++    if (!wts_action_session(hserver, session_id, &id)) return FALSE;
++    /* the same sign-out as the Start menu's: wineboot ends the programs
++     * (a hung one is forced) and the shell. It runs on after this returns,
++     * and with bWait the caller is among what it ends. */
++    return ExitWindowsEx(EWX_LOGOFF | EWX_FORCEIFHUNG, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED);
+ }
+ 
+ 
+@@ -1600,8 +1782,10 @@ BOOL WINAPI WTSRegisterSessionNotificationEx(HANDLE hServer, HWND hWnd, DWORD dw
+ BOOL WINAPI WTSSendMessageA(HANDLE hServer, DWORD SessionId, LPSTR pTitle, DWORD TitleLength, LPSTR pMessage,
+    DWORD MessageLength, DWORD Style, DWORD Timeout, DWORD *pResponse, BOOL bWait)
+ {
+-   FIXME("Stub %p 0x%08lx (%s) %ld (%s) %ld 0x%08lx %ld %p %d\n", hServer, SessionId, debugstr_a(pTitle), TitleLength, debugstr_a(pMessage), MessageLength, Style, Timeout, pResponse, bWait);
+-   return FALSE;
++    TRACE("%p 0x%08lx (%s) %ld (%s) %ld 0x%08lx %ld %p %d\n", hServer, SessionId, debugstr_an(pTitle, TitleLength),
++          TitleLength, debugstr_an(pMessage, MessageLength), MessageLength, Style, Timeout, pResponse, bWait);
++    return wts_send_message(hServer, SessionId, pTitle, TitleLength, pMessage, MessageLength, Style, Timeout,
++                            pResponse, bWait, TRUE);
+ }
+ 
+ /************************************************************
+@@ -1610,8 +1794,11 @@ BOOL WINAPI WTSSendMessageA(HANDLE hServer, DWORD SessionId, LPSTR pTitle, DWORD
+ BOOL WINAPI WTSSendMessageW(HANDLE hServer, DWORD SessionId, LPWSTR pTitle, DWORD TitleLength, LPWSTR pMessage,
+    DWORD MessageLength, DWORD Style, DWORD Timeout, DWORD *pResponse, BOOL bWait)
+ {
+-   FIXME("Stub %p 0x%08lx (%s) %ld (%s) %ld 0x%08lx %ld %p %d\n", hServer, SessionId, debugstr_w(pTitle), TitleLength, debugstr_w(pMessage), MessageLength, Style, Timeout, pResponse, bWait);
+-   return FALSE;
++    TRACE("%p 0x%08lx (%s) %ld (%s) %ld 0x%08lx %ld %p %d\n", hServer, SessionId,
++          debugstr_wn(pTitle, TitleLength / sizeof(WCHAR)), TitleLength,
++          debugstr_wn(pMessage, MessageLength / sizeof(WCHAR)), MessageLength, Style, Timeout, pResponse, bWait);
++    return wts_send_message(hServer, SessionId, pTitle, TitleLength, pMessage, MessageLength, Style, Timeout,
++                            pResponse, bWait, FALSE);
+ }
+ 
+ /************************************************************
+@@ -1642,8 +1829,56 @@ BOOL WINAPI WTSSetUserConfigW(LPWSTR pServerName, LPWSTR pUserName, WTS_CONFIG_C
+  */
+ BOOL WINAPI WTSShutdownSystem(HANDLE hServer, DWORD ShutdownFlag)
+ {
+-   FIXME("Stub %p 0x%08lx\n", hServer,ShutdownFlag);
+-   return FALSE;
++    TOKEN_PRIVILEGES tp;
++    HANDLE token;
++    UINT ewx;
++    BOOL ret;
++
++    TRACE("%p 0x%08lx\n", hServer, ShutdownFlag);
++
++    if (!wts_server_is_local(hServer))
++    {
++        SetLastError(RPC_S_SERVER_UNAVAILABLE);
++        return FALSE;
++    }
++    if (!ShutdownFlag || (ShutdownFlag & ~(WTS_WSD_LOGOFF | WTS_WSD_SHUTDOWN | WTS_WSD_REBOOT | WTS_WSD_POWEROFF |
++                                           WTS_WSD_FASTREBOOT)))
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    /* one action; if several are asked for the most drastic wins */
++#ifdef SG_MUTANT_WTSACT_MAP
++    if (ShutdownFlag & (WTS_WSD_REBOOT | WTS_WSD_FASTREBOOT)) ewx = EWX_POWEROFF;
++#else
++    if (ShutdownFlag & (WTS_WSD_REBOOT | WTS_WSD_FASTREBOOT)) ewx = EWX_REBOOT;
++#endif
++    else if (ShutdownFlag & WTS_WSD_POWEROFF) ewx = EWX_POWEROFF;
++    else if (ShutdownFlag & WTS_WSD_SHUTDOWN) ewx = EWX_SHUTDOWN;
++    else ewx = EWX_LOGOFF;
++
++    /* the shutdown privilege, which the caller has to hold (it is enabled for the call) */
++    if (!OpenThreadToken(GetCurrentThread(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, TRUE, &token) &&
++        !OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) return FALSE;
++    tp.PrivilegeCount = 1;
++    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
++    if (!LookupPrivilegeValueW(NULL, L"SeShutdownPrivilege", &tp.Privileges[0].Luid))
++    {
++        CloseHandle(token);
++        return FALSE;
++    }
++    SetLastError(0);
++    ret = AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
++    CloseHandle(token);
++    if (!ret) return FALSE;
++#ifndef SG_MUTANT_WTSACT_NOPRIV
++    if (GetLastError() == ERROR_NOT_ALL_ASSIGNED)
++    {
++        SetLastError(ERROR_PRIVILEGE_NOT_HELD);
++        return FALSE;
++    }
++#endif
++    return ExitWindowsEx(ewx | EWX_FORCEIFHUNG, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED);
+ }
+ 
+ /************************************************************
+--- a/include/wtsapi32.h
++++ b/include/wtsapi32.h
+@@ -314,6 +314,12 @@ typedef struct _WTS_CLIENT_DISPLAY
+ 
+ #define WTS_CURRENT_SERVER_HANDLE ((HANDLE)NULL)
+ #define WTS_CURRENT_SESSION (~0u)
++
++#define WTS_WSD_LOGOFF      0x00000001
++#define WTS_WSD_SHUTDOWN    0x00000002
++#define WTS_WSD_REBOOT      0x00000004
++#define WTS_WSD_POWEROFF    0x00000008
++#define WTS_WSD_FASTREBOOT  0x00000010
+ #define WTS_ANY_SESSION ((DWORD)-2)
+ 
+ void WINAPI WTSCloseServer(HANDLE);

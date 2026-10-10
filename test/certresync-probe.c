@@ -177,7 +177,9 @@ static void test_services(const WCHAR *self)
 
     SetLastError(0);
     store = CertOpenStore(CERT_STORE_PROV_SYSTEM_REGISTRY_W, 0, 0, CERT_SYSTEM_STORE_CURRENT_SERVICE, L"My");
-    check(!store && GetLastError() == ERROR_FILE_NOT_FOUND, "a process that is no service has no current-service store");
+    /* Wine's store test records from Windows that CertRegisterSystemStore works for CURRENT_SERVICE from a
+     * plain process: it stands in for a service, under its program name */
+    check(store != NULL, "a process that is no service has a current-service store under its program name");
     if (store) CertCloseStore(store, 0);
 
     scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);

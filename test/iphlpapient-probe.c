@@ -13,6 +13,8 @@
 #include <netioapi.h>
 #include <ipifcons.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static int failures;
 static void check(int ok, const char *what)
@@ -96,46 +98,130 @@ static int count_family( ADDRESS_FAMILY fam )
     return n;
 }
 
-static void test_multicast(void)
+/* the kernel's own lists, read here with a parser of the probe's own */
+struct grp { DWORD index; int fam; BYTE addr[16]; };
+static struct grp expected[512];
+static int nexpected;
+
+static char *slurp(const WCHAR *path)
+{
+    HANDLE f = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
+    char *buf = HeapAlloc( GetProcessHeap(), 0, 1 << 20 );
+    DWORD n = 0, got;
+
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    while (n < (1 << 20) - 1 && ReadFile( f, buf + n, (1 << 20) - 1 - n, &got, NULL ) && got) n += got;
+    buf[n] = 0;
+    CloseHandle( f );
+    return buf;
+}
+
+static void load_expected(void)
+{
+    char *t = slurp( L"\\\\?\\unix\\proc\\net\\igmp" ), *p, *e;
+    DWORD idx = 0;
+
+    for (p = t; p && *p; p = e ? e + 1 : NULL)
+    {
+        unsigned a, u;
+        e = strchr( p, '\n' );
+        if (e) *e = 0;
+        if (*p >= '0' && *p <= '9') { idx = strtoul( p, NULL, 10 ); continue; }
+        if (idx && sscanf( p, " %x %u", &a, &u ) == 2 && nexpected < 512)
+        {
+            struct grp *g = expected + nexpected++;
+            g->index = idx; g->fam = AF_INET;
+            memcpy( g->addr, &a, 4 );
+        }
+    }
+    t = slurp( L"\\\\?\\unix\\proc\\net\\igmp6" );
+    for (p = t; p && *p; p = e ? e + 1 : NULL)
+    {
+        unsigned ix, i, b;
+        char name[64], hex[64];
+        e = strchr( p, '\n' );
+        if (e) *e = 0;
+        if (sscanf( p, "%u %63s %32s", &ix, name, hex ) == 3 && strlen( hex ) == 32 && nexpected < 512)
+        {
+            struct grp *g = expected + nexpected++;
+            g->index = ix; g->fam = AF_INET6;
+            for (i = 0; i < 16; i++) { sscanf( hex + 2 * i, "%2x", &b ); g->addr[i] = b; }
+        }
+    }
+}
+
+static int row_is(const MIB_MULTICASTIPADDRESS_ROW *r, DWORD index, int fam, const BYTE *addr)
+{
+    if (r->InterfaceIndex != index || r->Address.si_family != fam) return 0;
+    if (fam == AF_INET) return !memcmp( &r->Address.Ipv4.sin_addr, addr, 4 );
+    return !memcmp( &r->Address.Ipv6.sin6_addr, addr, 16 );
+}
+
+static int has_interface(ADDRESS_FAMILY fam, DWORD index)
+{
+    MIB_IPINTERFACE_TABLE *t;
+    ULONG i;
+    int found = 0;
+    if (GetIpInterfaceTable( fam, &t )) return 0;
+    for (i = 0; i < t->NumEntries; i++) if (t->Table[i].InterfaceIndex == index) found = 1;
+    FreeMibTable( t );
+    return found;
+}
+
+static void test_multicast(int join4, int join6)
 {
     tbl_fn get = (tbl_fn)fn( "GetMulticastIpAddressTable" );
     row_fn getrow = (row_fn)fn( "GetMulticastIpAddressEntry" );
     static const ADDRESS_FAMILY fams[] = { AF_INET, AF_INET6, AF_UNSPEC };
-    int n4 = count_family( AF_INET ), n6 = count_family( AF_INET6 );
+    static const BYTE join4addr[4] = { 239, 77, 88, 99 };
+    static const BYTE join6addr[16] = { 0xff, 0x15, [14] = 0x77, [15] = 0x88 };
+    static const BYTE unjoined[4] = { 232, 254, 253, 252 };
     unsigned f;
-    ULONG i;
+    int i, n4 = count_family( AF_INET );
+    ULONG k;
 
     if (!get || !getrow) return;
     check(n4 >= 1, "the host has an IPv4 interface");
+    load_expected();
+    check(nexpected > 0, "the kernel lists joined groups (/proc/net/igmp, igmp6)");
     for (f = 0; f < 3; f++)
     {
         MIB_MULTICASTIPADDRESS_TABLE *t = NULL;
-        int want = fams[f] == AF_INET ? n4 : fams[f] == AF_INET6 ? 2 * n6 : n4 + 2 * n6;
-        int v4 = 0, v6 = 0, ok = 1;
-        char msg[128];
+        int want = 0, ok = 1, found_all = 1;
+        char msg[160];
 
+        for (i = 0; i < nexpected; i++)
+            if ((fams[f] == AF_UNSPEC || fams[f] == expected[i].fam) && has_interface( expected[i].fam, expected[i].index ))
+                want++;
         check(!get( fams[f], (void **)&t ) && t, "the multicast table is returned");
         if (!t) continue;
-        sprintf( msg, "family %u has %d groups (got %lu)", fams[f], want, t->NumEntries );
+        sprintf( msg, "family %u has the %d groups the kernel lists for IP interfaces (got %lu)", fams[f], want, t->NumEntries );
         check(t->NumEntries == (ULONG)want, msg);
-        for (i = 0; i < t->NumEntries; i++)
+        for (i = 0; i < nexpected; i++)
         {
-            MIB_MULTICASTIPADDRESS_ROW *r = t->Table + i, copy;
+            int present = 0;
+            if (!(fams[f] == AF_UNSPEC || fams[f] == expected[i].fam) || !has_interface( expected[i].fam, expected[i].index )) continue;
+            for (k = 0; k < t->NumEntries; k++)
+                if (row_is( t->Table + k, expected[i].index, expected[i].fam, expected[i].addr )) present = 1;
+            if (!present) found_all = 0;
+        }
+        check(found_all, "every group the kernel lists is in the table");
+        for (k = 0; k < t->NumEntries; k++)
+        {
+            MIB_MULTICASTIPADDRESS_ROW *r = t->Table + k, copy;
+            int fam = r->Address.si_family, listed = 0;
+            const BYTE *a6 = r->Address.Ipv6.sin6_addr.s6_addr;
             if (!r->InterfaceIndex || !r->InterfaceLuid.Value) ok = 0;
-            if (r->Address.si_family == AF_INET)
+            if (fam != AF_INET && fam != AF_INET6) ok = 0;
+            for (i = 0; i < nexpected; i++)
+                if (row_is( r, expected[i].index, expected[i].fam, expected[i].addr )) listed = 1;
+            if (!listed) ok = 0;
+            if (fam == AF_INET6)
             {
-                v4++;
-                if (r->Address.Ipv4.sin_addr.s_addr != htonl( 0xe0000001 )) ok = 0;
+                if (a6[0] != 0xff) ok = 0;
+                if (r->ScopeId.Level != (a6[1] & 0xf)) ok = 0;
+                if (r->ScopeId.Zone != (r->ScopeId.Level <= 2 ? r->InterfaceIndex : 0)) ok = 0;
             }
-            else if (r->Address.si_family == AF_INET6)
-            {
-                const BYTE *a = r->Address.Ipv6.sin6_addr.s6_addr;
-                BYTE zero[14] = {0};
-                v6++;
-                if (a[0] != 0xff || (a[1] != 1 && a[1] != 2) || a[15] != 1 || memcmp( a + 2, zero, 13 )) ok = 0;
-                if (r->ScopeId.Level != (a[1] == 1 ? 1 : 2) || r->ScopeId.Zone != r->InterfaceIndex) ok = 0;
-            }
-            else ok = 0;
             /* look each one up by index, and by LUID alone */
             memset( &copy, 0, sizeof(copy) );
             copy.Address = r->Address;
@@ -152,10 +238,23 @@ static void test_multicast(void)
             copy.InterfaceIndex = r->InterfaceIndex + 1000;
             if (getrow( &copy ) != ERROR_NOT_FOUND) ok = 0;
         }
-        check(ok, "multicast rows are well-formed and found by index and by LUID but not on a wrong interface");
-        sprintf( msg, "the families split as %d IPv4 and %d IPv6", fams[f] == AF_INET6 ? 0 : n4,
-                 fams[f] == AF_INET ? 0 : 2 * n6 );
-        check(v4 == (fams[f] == AF_INET6 ? 0 : n4) && v6 == (fams[f] == AF_INET ? 0 : 2 * n6), msg);
+        check(ok, "rows name only groups the kernel lists, scoped by their address, and are found by index and by LUID but not on a wrong interface");
+        if (fams[f] != AF_INET6 && join4)
+        {
+            int present = 0;
+            for (k = 0; k < t->NumEntries; k++) if (row_is( t->Table + k, 1, AF_INET, join4addr )) present = 1;
+            check(present, "a group joined by another process (239.77.88.99 on lo) is in the table");
+        }
+        if (fams[f] != AF_INET && join6)
+        {
+            int present = 0;
+            for (k = 0; k < t->NumEntries; k++)
+                if (row_is( t->Table + k, 1, AF_INET6, join6addr ))
+                {
+                    present = t->Table[k].ScopeId.Level == 5 && t->Table[k].ScopeId.Zone == 0;
+                }
+            check(present, "and an IPv6 one (ff15::7788 on lo), with site scope");
+        }
         FreeMibTable( t );
     }
 
@@ -166,8 +265,13 @@ static void test_multicast(void)
         r.Address.Ipv4.sin_addr.s_addr = htonl( 0xe0000001 );
         check(getrow( &r ) == ERROR_INVALID_PARAMETER, "a multicast row naming no interface is invalid");
         r.InterfaceIndex = 1;
-        r.Address.Ipv4.sin_addr.s_addr = htonl( 0xe00000fb );
+        memcpy( &r.Address.Ipv4.sin_addr, unjoined, 4 );
         check(getrow( &r ) == ERROR_NOT_FOUND, "a group the interface did not join is not found");
+        if (join4)
+        {
+            memcpy( &r.Address.Ipv4.sin_addr, join4addr, 4 );
+            check(getrow( &r ) == NO_ERROR, "and one it did join is found");
+        }
     }
 }
 
@@ -556,14 +660,14 @@ static void test_arp(void)
     check(((BYTE *)mac)[0] == 0 && ((BYTE *)mac)[2] == 0, "and nothing is written to it");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     WSADATA wsa;
     WSAStartup( MAKEWORD(2, 2), &wsa );
     iph = LoadLibraryA( "iphlpapi.dll" );
     if (!iph) { printf("FAIL  no iphlpapi\n"); return 1; }
     test_params();
-    test_multicast();
+    test_multicast(argc > 1 && strstr( argv[1], "join4" ), argc > 1 && strstr( argv[1], "join6" ));
     test_anycast_path_stack();
     test_entries();
     test_init();
