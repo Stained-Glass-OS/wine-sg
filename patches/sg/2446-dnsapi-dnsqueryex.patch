@@ -1,0 +1,235 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dnsapi: DnsQueryEx and DnsCancelQuery
+
+DnsQueryEx answered DNS_ERROR_RCODE_NOT_IMPLEMENTED for everything. It now checks the request and result versions and the name; without a completion callback it runs the query (DnsQuery_W, with the IPv4 servers of the request's list) and returns the status with the records in the result; with one it returns DNS_REQUEST_PENDING, fills the cancel handle, runs the query in a work item and calls back with the very result structure it was given. DnsCancelQuery (new export) answers a query that is still running at once with ERROR_CANCELLED; a finished or cancelled handle is harmless.
+---
+--- a/dlls/dnsapi/dnsapi.spec
++++ b/dlls/dnsapi/dnsapi.spec
+@@ -79,6 +79,7 @@
+ @ stub DnsNotifyResolver
+ @ stdcall DnsQuery_A(str long long ptr ptr ptr)
+ @ stdcall DnsQueryConfig(long long wstr ptr ptr ptr)
++@ stdcall DnsCancelQuery(ptr)
+ @ stdcall DnsQueryEx(ptr ptr ptr)
+ @ stdcall DnsQuery_UTF8(str long long ptr ptr ptr)
+ @ stdcall DnsQuery_W(wstr long long ptr ptr ptr)
+--- a/dlls/dnsapi/query.c
++++ b/dlls/dnsapi/query.c
+@@ -30,6 +30,7 @@
+ #include "in6addr.h"
+ #include "inaddr.h"
+ #include "ip2string.h"
++#include "wine/list.h"
+ 
+ #include "wine/debug.h"
+ #include "dnsapi.h"
+@@ -118,14 +119,207 @@ static const char *debugstr_query_request(const DNS_QUERY_REQUEST *req)
+             req->pQueryCompletionCallback, req->pQueryContext);
+ }
+ 
++/* A DnsQueryEx request that runs in the background, kept until it has been answered or cancelled
++ * so that DnsCancelQuery can find it by the id in the caller's cancel handle. */
++struct query_ex
++{
++    struct list entry;
++    ULONG64 id;
++    LONG ref;
++    BOOL finished;     /* the result has been delivered (answer or cancellation) */
++    WCHAR *name;
++    WORD type;
++    DWORD options;
++    IP4_ARRAY *servers;
++    PDNS_QUERY_COMPLETION_ROUTINE callback;
++    void *context;
++    DNS_QUERY_RESULT *result;
++};
++
++static CRITICAL_SECTION query_ex_cs;
++static CRITICAL_SECTION_DEBUG query_ex_cs_debug =
++{
++    0, 0, &query_ex_cs,
++    { &query_ex_cs_debug.ProcessLocksList, &query_ex_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": query_ex_cs") }
++};
++static CRITICAL_SECTION query_ex_cs = { &query_ex_cs_debug, -1, 0, 0, 0, 0 };
++static struct list query_ex_list = LIST_INIT( query_ex_list );
++static ULONG64 query_ex_next_id = 1;
++
++static void query_ex_release( struct query_ex *q )
++{
++    if (InterlockedDecrement( &q->ref )) return;
++    free( q->name );
++    free( q->servers );
++    free( q );
++}
++
++static IP4_ARRAY *servers_from_addr_array( const DNS_ADDR_ARRAY *list )
++{
++    IP4_ARRAY *ret;
++    DWORD i, count = 0;
++
++    if (!list) return NULL;
++    for (i = 0; i < list->AddrCount; i++)
++        if (((const SOCKADDR_IN *)list->AddrArray[i].MaxSa)->sin_family == AF_INET) count++;
++    if (!count) return NULL;
++    if (!(ret = malloc( FIELD_OFFSET(IP4_ARRAY, AddrArray[count]) ))) return NULL;
++    ret->AddrCount = 0;
++    for (i = 0; i < list->AddrCount; i++)
++    {
++        const SOCKADDR_IN *sin = (const SOCKADDR_IN *)list->AddrArray[i].MaxSa;
++        if (sin->sin_family == AF_INET) ret->AddrArray[ret->AddrCount++] = sin->sin_addr.s_addr;
++    }
++    return ret;
++}
++
++static DWORD WINAPI query_ex_thread( void *arg )
++{
++    struct query_ex *q = arg;
++    DNS_RECORDW *records = NULL;
++    DNS_STATUS status;
++    BOOL deliver;
++
++    status = DnsQuery_W( q->name, q->type, q->options, q->servers, &records, NULL );
++
++    EnterCriticalSection( &query_ex_cs );
++    deliver = !q->finished;
++    if (deliver)
++    {
++        q->finished = TRUE;
++        list_remove( &q->entry );
++        q->result->QueryStatus = status;
++        q->result->pQueryRecords = status ? NULL : (DNS_RECORD *)records;
++    }
++    LeaveCriticalSection( &query_ex_cs );
++
++    if (deliver)
++    {
++        q->callback( q->context, q->result );
++        query_ex_release( q );    /* the list's */
++    }
++    else if (records) DnsRecordListFree( (DNS_RECORD *)records, DnsFreeRecordList );   /* cancelled meanwhile */
++    query_ex_release( q );        /* the thread's */
++    return 0;
++}
++
+ /******************************************************************************
+  * DnsQueryEx           [DNSAPI.@]
+  *
+  */
+ DNS_STATUS WINAPI DnsQueryEx(DNS_QUERY_REQUEST *request, DNS_QUERY_RESULT *result, DNS_QUERY_CANCEL *cancel)
+ {
+-    FIXME("(%s, %p, %p)\n", debugstr_query_request(request), result, cancel);
+-    return DNS_ERROR_RCODE_NOT_IMPLEMENTED;
++    DNS_RECORDW *records = NULL;
++    DNS_STATUS status;
++    IP4_ARRAY *servers;
++    struct query_ex *q;
++
++    TRACE("(%s, %p, %p)\n", debugstr_query_request(request), result, cancel);
++
++    if (!request || !result || request->Version != DNS_QUERY_REQUEST_VERSION1 ||
++        result->Version != DNS_QUERY_RESULTS_VERSION1 || !request->QueryName || !request->QueryName[0])
++        return ERROR_INVALID_PARAMETER;
++
++    servers = servers_from_addr_array( request->pDnsServerList );
++
++    if (!request->pQueryCompletionCallback)
++    {
++        /* synchronous: the answer comes back in the result */
++        status = DnsQuery_W( request->QueryName, request->QueryType, (DWORD)request->QueryOptions, servers,
++                             &records, NULL );
++        free( servers );
++        result->QueryStatus = status;
++        result->QueryOptions = request->QueryOptions;
++#ifdef SG_MUTANT_DNSEX_SYNC
++        status = DNS_ERROR_RCODE_NOT_IMPLEMENTED;
++#endif
++        result->pQueryRecords = status ? NULL : (DNS_RECORD *)records;
++        return status;
++    }
++
++    /* asynchronous: pending now, the callback gets the result */
++    if (!(q = calloc( 1, sizeof(*q) )) || !(q->name = wcsdup( request->QueryName )))
++    {
++        free( q );
++        free( servers );
++        return ERROR_NOT_ENOUGH_MEMORY;
++    }
++    q->ref = 2;   /* the thread and the list */
++    q->type = request->QueryType;
++    q->options = (DWORD)request->QueryOptions;
++    q->servers = servers;
++    q->callback = request->pQueryCompletionCallback;
++    q->context = request->pQueryContext;
++    q->result = result;
++    result->QueryStatus = DNS_REQUEST_PENDING;
++    result->QueryOptions = request->QueryOptions;
++    result->pQueryRecords = NULL;
++
++    EnterCriticalSection( &query_ex_cs );
++    q->id = query_ex_next_id++;
++    list_add_tail( &query_ex_list, &q->entry );
++    if (cancel)
++    {
++        memset( cancel, 0, sizeof(*cancel) );
++        memcpy( cancel->Reserved, &q->id, sizeof(q->id) );
++    }
++    LeaveCriticalSection( &query_ex_cs );
++
++    if (!QueueUserWorkItem( query_ex_thread, q, WT_EXECUTELONGFUNCTION ))
++    {
++        EnterCriticalSection( &query_ex_cs );
++        list_remove( &q->entry );
++        LeaveCriticalSection( &query_ex_cs );
++        query_ex_release( q );
++        query_ex_release( q );
++        return ERROR_NOT_ENOUGH_MEMORY;
++    }
++    return DNS_REQUEST_PENDING;
++}
++
++/******************************************************************************
++ * DnsCancelQuery       [DNSAPI.@]
++ *
++ * A query that is still running is answered at once with ERROR_CANCELLED.
++ */
++DNS_STATUS WINAPI DnsCancelQuery(DNS_QUERY_CANCEL *cancel)
++{
++    struct query_ex *q, *found = NULL;
++    ULONG64 id;
++
++    TRACE("(%p)\n", cancel);
++
++    if (!cancel) return ERROR_INVALID_PARAMETER;
++    memcpy( &id, cancel->Reserved, sizeof(id) );
++
++#ifdef SG_MUTANT_DNSEX_CANCEL
++    return ERROR_SUCCESS;
++#endif
++    EnterCriticalSection( &query_ex_cs );
++    LIST_FOR_EACH_ENTRY( q, &query_ex_list, struct query_ex, entry )
++    {
++        if (q->id != id) continue;
++        if (!q->finished)
++        {
++            q->finished = TRUE;
++            list_remove( &q->entry );
++            q->result->QueryStatus = ERROR_CANCELLED;
++            q->result->pQueryRecords = NULL;
++            found = q;
++            InterlockedIncrement( &found->ref );
++        }
++        break;
++    }
++    LeaveCriticalSection( &query_ex_cs );
++
++    if (found)
++    {
++        found->callback( found->context, found->result );
++        query_ex_release( found );     /* ours */
++        query_ex_release( found );     /* the list's: the thread keeps its own until it ends */
++    }
++    return ERROR_SUCCESS;
+ }
+ 
+ /******************************************************************************
