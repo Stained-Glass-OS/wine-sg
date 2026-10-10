@@ -47,3 +47,7 @@ Notes: 2862 and 2960 had only part of their mutants run before the session ended
 ## 2026-10-09 night: second pass (integrator merged up to 10.0-399 meanwhile)
 Not yet integrated (this branch on top of origin/main 6e16d8e): 2839 (dinput Escape/SendDeviceData), 2873/2874 (mf, mfreadwrite todo_wine ground truth), 2875 (dinput device types/names/properties from the conformance tests), 2941-2944 (quartz filter mapper, dsound renderer, video overlay, video window), 2961-2963 (dmband, dmstyle style object, dmcompos), 2970-2972 (dmsynth, dmusic, xact).
 Still open (escalate-5.md): dmscript, dmstyle playback, quartz AddSourceFilter/collections, wmvcore writer (a helper may deliver 2863+), mf sequencer source, MFPluginControl, dinput JoyConfig8, wm_reader async parts.
+
+## 2026-10-10
+Added: 2876-2878 (dinput JoyConfig8, effect files, HID/mouse FIXMEs), 2802-2804 (winmm mmio parse + MCI parser, mixer callbacks + midi streams; dsound effects/format/status/channels).
+Left (outside winmm/dsound code or no contract): mciwave/mciavi32/mcicda todo_wine groups, midiConnect/midiDisconnect, mf sequencer source, MFPluginControl, dmscript, dmstyle playback, quartz AddSourceFilter/collections, wm_reader async parts, wmvcore system profiles/encoder.
