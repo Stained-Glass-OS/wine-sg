@@ -64,6 +64,8 @@ static const GUID IID_Vector = { 0xd44662bc, 0xdce3, 0x59a8, { 0x92, 0x72, 0x4b,
 static const GUID IID_Iterable = { 0xcb0492b6, 0x4113, 0x55cf, { 0xb2, 0xc5, 0x99, 0xeb, 0x42, 0x8b, 0xa4, 0x93 } };
 static const GUID IID_Map = { 0xc9d9a725, 0x786b, 0x5113, { 0xb4, 0xb7, 0x9b, 0x61, 0x76, 0x4c, 0x22, 0x0b } };
 static const GUID IID_IterablePairs = { 0xdfabb6e1, 0x0411, 0x5a8f, { 0xaa, 0x87, 0x35, 0x4e, 0x71, 0x10, 0xf0, 0x99 } };
+static const GUID IID_VectorView = { 0xcffabb0f, 0x6bc4, 0x5ff6, { 0x9b, 0x9e, 0x7a, 0x9d, 0xf6, 0xc6, 0x87, 0xc8 } };
+static const GUID IID_MapView = { 0xeecd690c, 0x1ff3, 0x529f, { 0x92, 0x3f, 0x9b, 0x1c, 0x31, 0xfd, 0x3d, 0x0f } };
 #define ERR_CHANGED ((HRESULT)0x8000000c)
 
 enum { Null, Boolean, Number, String, Array, Object };
@@ -513,6 +515,92 @@ static void test_map(void)
     rel(num); rel(map); rel(it); rel(val);
 }
 
+/* GetView: read-only looks at an array and at an object */
+static void test_views(void)
+{
+    typedef struct { Base b; HRESULT (WINAPI *GetAt)(void *, UINT32, void **); HRESULT (WINAPI *get_Size)(void *, UINT32 *);
+                     HRESULT (WINAPI *IndexOf)(void *, void *, UINT32 *, unsigned char *);
+                     HRESULT (WINAPI *GetMany)(void *, UINT32, UINT32, void **, UINT32 *); } VViewVtbl;
+    typedef struct { Base b; HRESULT (WINAPI *Lookup)(void *, HSTRING, void **); HRESULT (WINAPI *get_Size)(void *, UINT32 *);
+                     HRESULT (WINAPI *HasKey)(void *, HSTRING, unsigned char *);
+                     HRESULT (WINAPI *Split)(void *, void **, void **); } MViewVtbl;
+#define VV(o) ((const VViewVtbl *)((Obj *)(o))->vtbl)
+#define MV(o) ((const MViewVtbl *)((Obj *)(o))->vtbl)
+    HRESULT hr;
+    void *arr = parse(L"[1,2,3]", &hr), *vec = NULL, *view = NULL, *it = NULL, *x = NULL, *first = (void *)1, *second = (void *)1;
+    void *obj = parse(L"{\"a\":1,\"b\":\"two\"}", &hr), *map = NULL, *mview = NULL;
+    UINT32 size = 99, idx = 99, n = 0;
+    unsigned char found = 7;
+    void *many[4];
+    HSTRING key;
+
+    BASE(arr)->QueryInterface(arr, &IID_Vector, &vec);
+    checkhr(VEC(vec)->GetView(vec, &view), S_OK, "IVector::GetView");
+    check(view != NULL, "the view");
+    checkhr(VEC(vec)->GetView(vec, NULL), E_POINTER, "GetView(NULL)");
+    check(S_OK == VV(view)->get_Size(view, &size) && size == 3, "view size");
+    check(S_OK == VV(view)->GetAt(view, 2, &x) && type_is(x, Number), "view GetAt(2)");
+    rel(x);
+    checkhr(VV(view)->GetAt(view, 3, &x), ERR_BOUNDS, "view GetAt past the end");
+    {
+        void *two = NULL;
+        VEC(vec)->GetAt(vec, 1, &two);
+        checkhr(VV(view)->IndexOf(view, two, &idx, &found), S_OK, "view IndexOf");
+        check(found == 1 && idx == 1, "view IndexOf finds the item");
+        rel(two);
+    }
+    checkhr(VV(view)->GetMany(view, 1, 4, many, &n), S_OK, "view GetMany");
+    check(n == 2, "view GetMany count");
+    rel(many[0]); rel(many[1]);
+    checkhr(BASE(view)->QueryInterface(view, &IID_VectorView, &x), S_OK, "QI IVectorView on the view");
+    rel(x);
+    checkhr(BASE(view)->QueryInterface(view, &IID_Iterable, &it), S_OK, "QI IIterable on the view");
+    {
+        void *iter = NULL;
+        check(S_OK == ITB(it)->First(it, &iter) && iter != NULL, "iterating through the view");
+        rel(iter);
+    }
+    rel(it);
+    checkhr(BASE(view)->QueryInterface(view, &IID_Map, &x), E_NOINTERFACE, "the view of an array is no map");
+    /* the view follows the array */
+    {
+        void *extra = mkstr(L"new");
+        VEC(vec)->Append(vec, extra);
+        check(S_OK == VV(view)->get_Size(view, &size) && size == 4, "the view sees an item appended");
+        rel(extra);
+    }
+    rel(vec);
+    rel(arr);
+    check(S_OK == VV(view)->get_Size(view, &size) && size == 4, "the view keeps the array alive");
+    rel(view);
+
+    BASE(obj)->QueryInterface(obj, &IID_Map, &map);
+    checkhr(MAP(map)->GetView(map, &mview), S_OK, "IMap::GetView");
+    checkhr(MAP(map)->GetView(map, NULL), E_POINTER, "IMap::GetView(NULL)");
+    check(S_OK == MV(mview)->get_Size(mview, &size) && size == 2, "map view size");
+    key = hs(L"b");
+    check(S_OK == MV(mview)->HasKey(mview, key, &found) && found == 1, "map view HasKey");
+    check(S_OK == MV(mview)->Lookup(mview, key, &x) && type_is(x, String), "map view Lookup");
+    rel(x);
+    WindowsDeleteString(key);
+    key = hs(L"nope");
+    check(S_OK == MV(mview)->HasKey(mview, key, &found) && found == 0, "map view HasKey of a missing key");
+    checkhr(MV(mview)->Lookup(mview, key, &x), ERR_BOUNDS, "map view Lookup of a missing key");
+    WindowsDeleteString(key);
+    checkhr(MV(mview)->Split(mview, &first, &second), S_OK, "map view Split");
+    check(first == NULL && second == NULL, "Split of one view gives none");
+    checkhr(BASE(mview)->QueryInterface(mview, &IID_MapView, &x), S_OK, "QI IMapView on the view");
+    rel(x);
+    checkhr(BASE(mview)->QueryInterface(mview, &IID_IterablePairs, &it), S_OK, "QI IIterable of pairs on the view");
+    rel(it);
+    checkhr(BASE(mview)->QueryInterface(mview, &IID_Vector, &x), E_NOINTERFACE, "the view of an object is no vector");
+    rel(map);
+    rel(obj);
+    rel(mview);
+#undef VV
+#undef MV
+}
+
 static void test_activation_and_names(void)
 {
     static const WCHAR *objname = L"Windows.Data.Json.JsonObject", *arrname = L"Windows.Data.Json.JsonArray";
@@ -595,6 +683,7 @@ int main(void)
     test_array();
     test_vector();
     test_map();
+    test_views();
     test_activation_and_names();
 
     rel(statics);
