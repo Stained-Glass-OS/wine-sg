@@ -1,0 +1,839 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] server, ntdll, advapi32: running a program as another account
+
+CreateProcessWithLogonW was a stub that failed. CreateProcessWithTokenW and
+CreateProcessAsUser started the program as the caller, under the other
+account's Windows token: on disk it was still the caller.
+
+Each process of a shared prefix runs as its Unix account, so a program for
+another account has to be started as that account. Now the elevation
+broker's root monitor starts it (sg-session 0.1.0-192):
+
+- A new server request, make_launch_ticket, makes a one-time launch ticket
+  for a token's account. It does so only for SYSTEM (CreateProcessAsUser:
+  SeAssignPrimaryTokenPrivilege, so a service can start a program on a
+  logged-on user's desktop with WTSQueryUserToken's token), or for the
+  caller LogonUser gave that token to. Never for root, SYSTEM or another
+  system account (below 1000).
+- advapi32 sends the ticket, the program and its arguments, and the
+  working directory to the broker ("@launch"). The broker's root monitor
+  starts the program as that account, with an environment made from the
+  account alone, never the caller's.
+- The new process names its ticket when it starts (register_launch, from
+  ntdll). claim_launch then gives the caller handles to the process and its
+  first thread, with full access. CreateProcessWithLogonW and friends wait
+  for that and return PROCESS_INFORMATION; the exit code works as usual.
+- CreateProcessWithLogonW logs on with LogonUser (1709). With
+  LOGON_NETCREDENTIALS_ONLY it starts the program as the caller.
+- A program for the caller's own account takes the usual path.
+  advapi32's CreateProcessAsUserW is now its own function, no longer a
+  forward to kernel32.
+
+The started program's environment, creation flags and startup information
+are its account's own. Its display is the account's own session's, when the
+account is logged on. Showing a program on the caller's display for an
+account that is not logged on is still to come.
+
+Gate: test/runasuser-gate.sh (sgsystem, sgtest1, sgtest2, the broker as
+root; SG_SESSION_SRC). Broker mutants SG_MUTANT_LAUNCH_ANY_REQUESTER and
+SG_MUTANT_SPAWN_SYSTEM_ACCOUNTS (SG_BROKER_CFLAGS).
+---
+--- a/dlls/advapi32/advapi32.spec
++++ b/dlls/advapi32/advapi32.spec
+@@ -139,7 +139,7 @@
+ @ stdcall -import CreatePrivateObjectSecurityWithMultipleInheritance(ptr ptr ptr ptr long long long long ptr)
+ @ stdcall CreateProcessAsUserA(long str str ptr ptr long long ptr str ptr ptr) kernel32.CreateProcessAsUserA
+ # @ stub CreateProcessAsUserSecure
+-@ stdcall CreateProcessAsUserW(long wstr wstr ptr ptr long long ptr wstr ptr ptr) kernel32.CreateProcessAsUserW
++@ stdcall CreateProcessAsUserW(long wstr wstr ptr ptr long long ptr wstr ptr ptr)
+ @ stdcall CreateProcessWithLogonW(wstr wstr wstr long wstr wstr long ptr wstr ptr ptr)
+ @ stdcall CreateProcessWithTokenW(long long wstr wstr long ptr wstr ptr ptr)
+ @ stdcall -import CreateRestrictedToken(long long long ptr long ptr long ptr ptr)
+--- a/dlls/advapi32/cred_unix.c
++++ b/dlls/advapi32/cred_unix.c
+@@ -412,6 +412,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     unix_keyring_delete,
+     unix_keyring_enumerate,
+     logon_ticket,
++    launch_request,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_cred_keyring_funcs_count );
+@@ -453,6 +454,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     wow64_keyring_delete,
+     wow64_keyring_enumerate,
+     logon_ticket,
++    launch_request,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_cred_keyring_funcs_count );
+--- a/dlls/advapi32/cred_unix.h
++++ b/dlls/advapi32/cred_unix.h
+@@ -60,6 +60,7 @@ enum cred_keyring_funcs
+     unix_cred_keyring_delete,
+     unix_cred_keyring_enumerate,
+     unix_logon_ticket,
++    unix_launch_request,
+     unix_cred_keyring_funcs_count
+ };
+ 
+@@ -78,3 +79,17 @@ struct logon_ticket_params
+ };
+ 
+ extern NTSTATUS logon_ticket( void *args );
++
++/* Stained Glass OS (1711): ask the broker to start a program as a launch
++ * ticket's account. No pointers. Returns STATUS_SUCCESS (started),
++ * STATUS_ACCESS_DENIED (refused), STATUS_NO_LOGON_SERVERS (no broker) or
++ * STATUS_UNSUCCESSFUL. */
++struct launch_request_params
++{
++    char         ticket[40];   /* 32 hex digits */
++    char         cwd[1024];    /* Unix path, UTF-8; "" for the account's home */
++    unsigned int args_len;     /* bytes of args used */
++    char         args[8192];   /* the command line's arguments, UTF-8, each NUL-terminated */
++};
++
++extern NTSTATUS launch_request( void *args );
+--- a/dlls/advapi32/logon_unix.c
++++ b/dlls/advapi32/logon_unix.c
+@@ -128,3 +128,38 @@ NTSTATUS logon_ticket( void *args )
+     strcpy( params->ticket, line + 7 );
+     return STATUS_SUCCESS;
+ }
++
++/* The broker's request to start a program for a launch ticket (1711):
++ * "@launch", LAUNCH_TICKET and LAUNCH_CWD, an empty string, then the
++ * program's arguments; the answer a status byte (0 started). */
++NTSTATUS launch_request( void *args )
++{
++    struct launch_request_params *params = args;
++    struct sockaddr_un addr = { .sun_family = AF_UNIX };
++    const char *path = getenv( "SG_BROKER_SOCK" );
++    char blob[sizeof(params->args) + sizeof(params->cwd) + 128];
++    unsigned char status = 2;
++    uint32_t len;
++    int fd, ret;
++
++    if (!path || !*path) path = "/run/stained-glass-broker/broker.sock";
++    if (strlen( path ) >= sizeof(addr.sun_path)) return STATUS_NO_LOGON_SERVERS;
++    strcpy( addr.sun_path, path );
++    params->ticket[sizeof(params->ticket) - 1] = 0;
++    params->cwd[sizeof(params->cwd) - 1] = 0;
++    if (params->args_len > sizeof(params->args) || !params->args_len) return STATUS_INVALID_PARAMETER;
++
++    ret = snprintf( blob, sizeof(blob), "@launch%cLAUNCH_TICKET=%s%cLAUNCH_CWD=%s%c",
++                    0, params->ticket, 0, params->cwd, 0 );
++    if (ret < 0 || (size_t)ret + 1 + params->args_len > sizeof(blob)) return STATUS_INVALID_PARAMETER;
++    memcpy( blob + ret + 1, params->args, params->args_len );
++    len = ret + 1 + params->args_len;
++
++    if ((fd = socket( AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0 )) < 0) return STATUS_NO_LOGON_SERVERS;
++    if (connect( fd, (struct sockaddr *)&addr, sizeof(addr) ) < 0) { close( fd ); return STATUS_NO_LOGON_SERVERS; }
++    if (write_all( fd, &len, sizeof(len) ) || write_all( fd, blob, len )) { close( fd ); return STATUS_UNSUCCESSFUL; }
++    while ((ret = read( fd, &status, 1 )) < 0 && errno == EINTR) ;
++    close( fd );
++    if (ret != 1) return STATUS_UNSUCCESSFUL;
++    return !status ? STATUS_SUCCESS : status == 1 ? STATUS_ACCESS_DENIED : STATUS_UNSUCCESSFUL;
++}
+--- a/dlls/advapi32/security.c
++++ b/dlls/advapi32/security.c
+@@ -42,6 +42,8 @@
+ #include "winefs.h"
+ 
+ #include "wine/server.h"
++#include "wine/unixlib.h"
++#include "cred_unix.h"
+ #include "wine/exception.h"
+ #include "wine/debug.h"
+ 
+@@ -3112,6 +3114,181 @@ BOOL WINAPI ConvertSidToStringSidA(PSID pSid, LPSTR *pstr)
+     return TRUE;
+ }
+ 
++/******************************************************************************
++ * CreateProcessWithLogonW
++ */
++/* Stained Glass OS (1711): a program for another account. Each process of
++ * a shared prefix runs as its Unix account, so a program for another account
++ * is started by the elevation broker's root monitor, as that account, with
++ * an environment made from that account alone: given a launch ticket, which
++ * the wineserver makes only for SYSTEM (CreateProcessAsUser:
++ * SeAssignPrimaryTokenPrivilege) or for whoever LogonUser gave the token to,
++ * and never for root, SYSTEM or another system account. The new process
++ * names the ticket when it starts; this waits for it and returns its
++ * handles. Its environment, creation flags and startup information are its
++ * account's own, not the caller's. */
++static BOOL token_is_other_account( HANDLE token )
++{
++    char mine[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE], theirs[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
++    DWORD len;
++
++    if (!token) return FALSE;
++    if (!GetTokenInformation( GetCurrentProcessToken(), TokenUser, mine, sizeof(mine), &len ) ||
++        !GetTokenInformation( token, TokenUser, theirs, sizeof(theirs), &len ))
++        return FALSE;
++    return !EqualSid( ((TOKEN_USER *)mine)->User.Sid, ((TOKEN_USER *)theirs)->User.Sid );
++}
++
++/* one argument of a command line, as the C runtime splits it */
++static const WCHAR *next_arg( const WCHAR *p, WCHAR *out, DWORD max )
++{
++    DWORD n = 0;
++    BOOL quoted = FALSE;
++
++    while (*p == ' ' || *p == '\t') p++;
++    if (!*p) return NULL;
++    while (*p && (quoted || (*p != ' ' && *p != '\t')))
++    {
++        if (*p == '\\')
++        {
++            unsigned int bs = 0;
++            while (*p == '\\') { bs++; p++; }
++            if (*p == '"')
++            {
++                while (bs >= 2 && n + 1 < max) { out[n++] = '\\'; bs -= 2; }
++                if (bs) { if (n + 1 < max) out[n++] = '"'; p++; }
++            }
++            else while (bs-- && n + 1 < max) out[n++] = '\\';
++            continue;
++        }
++        if (*p == '"')
++        {
++            if (quoted && p[1] == '"') { if (n + 1 < max) out[n++] = '"'; p += 2; continue; }
++            quoted = !quoted;
++            p++;
++            continue;
++        }
++        if (n + 1 < max) out[n++] = *p;
++        p++;
++    }
++    out[n] = 0;
++    return p;
++}
++
++static BOOL add_launch_arg( struct launch_request_params *params, const WCHAR *arg )
++{
++    int n = WideCharToMultiByte( CP_UTF8, 0, arg, -1, params->args + params->args_len,
++                                 sizeof(params->args) - params->args_len, NULL, NULL );
++    if (!n) return FALSE;
++    params->args_len += n;
++    return TRUE;
++}
++
++static INIT_ONCE launch_once = INIT_ONCE_STATIC_INIT;
++static BOOL launch_unix_ready;
++
++static BOOL CALLBACK launch_init( INIT_ONCE *once, void *param, void **context )
++{
++    launch_unix_ready = !__wine_init_unix_call();
++    return TRUE;
++}
++
++static BOOL launch_as( HANDLE token, const WCHAR *app, const WCHAR *cmdline, const WCHAR *dir,
++                       PROCESS_INFORMATION *info )
++{
++    struct launch_request_params *params;
++    WCHAR arg[MAX_PATH * 2], cwd[MAX_PATH];
++    const WCHAR *p = cmdline;
++    static char * (CDECL *get_unix_name)( const WCHAR * );
++    char *unix_cwd;
++    NTSTATUS status;
++    DWORD i;
++
++    if (!(params = calloc( 1, sizeof(*params) ))) { SetLastError( ERROR_NOT_ENOUGH_MEMORY ); return FALSE; }
++    SERVER_START_REQ( make_launch_ticket )
++    {
++        req->token = wine_server_obj_handle( token );
++        wine_server_set_reply( req, params->ticket, sizeof(params->ticket) - 1 );
++        status = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    if (status) { free( params ); SetLastError( RtlNtStatusToDosError( status ) ); return FALSE; }
++
++    /* the program, then its arguments */
++    if (app && *app)
++    {
++        add_launch_arg( params, app );
++        if (p) p = next_arg( p, arg, ARRAY_SIZE(arg) );  /* the command line's own first word */
++    }
++    else if (!p || !(p = next_arg( p, arg, ARRAY_SIZE(arg) )) || !add_launch_arg( params, arg ))
++    {
++        free( params );
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    while (p && (p = next_arg( p, arg, ARRAY_SIZE(arg) )))
++        if (!add_launch_arg( params, arg )) { free( params ); SetLastError( ERROR_INVALID_PARAMETER ); return FALSE; }
++
++    if (!dir && GetCurrentDirectoryW( ARRAY_SIZE(cwd), cwd )) dir = cwd;
++    if (!get_unix_name)
++        get_unix_name = (void *)GetProcAddress( GetModuleHandleW( L"kernel32" ), "wine_get_unix_file_name" );
++    if (dir && get_unix_name && (unix_cwd = get_unix_name( dir )))
++    {
++        lstrcpynA( params->cwd, unix_cwd, sizeof(params->cwd) );
++        HeapFree( GetProcessHeap(), 0, unix_cwd );
++    }
++
++    InitOnceExecuteOnce( &launch_once, launch_init, NULL, NULL );
++    status = launch_unix_ready ? WINE_UNIX_CALL( unix_launch_request, params ) : STATUS_NO_LOGON_SERVERS;
++    if (status)
++    {
++        free( params );
++        SetLastError( status == STATUS_ACCESS_DENIED ? ERROR_ACCESS_DENIED :
++                      status == STATUS_NO_LOGON_SERVERS ? ERROR_SERVICE_NOT_ACTIVE : ERROR_NOT_SUPPORTED );
++        return FALSE;
++    }
++
++    /* the new process names its ticket when it starts */
++    for (i = 0; i < 600; i++)
++    {
++        SERVER_START_REQ( claim_launch )
++        {
++            wine_server_add_data( req, params->ticket, 32 );
++            if (!(status = wine_server_call( req )))
++            {
++                info->hProcess = wine_server_ptr_handle( reply->process );
++                info->hThread = wine_server_ptr_handle( reply->thread );
++                info->dwProcessId = reply->pid;
++                info->dwThreadId = reply->tid;
++            }
++        }
++        SERVER_END_REQ;
++        if (status != STATUS_PENDING) break;
++        Sleep( 50 );
++    }
++    free( params );
++    if (status)
++    {
++        SetLastError( status == STATUS_PENDING ? ERROR_TIMEOUT : RtlNtStatusToDosError( status ) );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/******************************************************************************
++ * CreateProcessAsUserW   [ADVAPI32.@]
++ */
++BOOL WINAPI CreateProcessAsUserW( HANDLE token, const WCHAR *app, WCHAR *cmdline, SECURITY_ATTRIBUTES *process_attr,
++                                  SECURITY_ATTRIBUTES *thread_attr, BOOL inherit, DWORD flags, void *env,
++                                  const WCHAR *dir, STARTUPINFOW *startup, PROCESS_INFORMATION *info )
++{
++    TRACE( "%p %s %s %#lx\n", token, debugstr_w(app), debugstr_w(cmdline), flags );
++
++    if (token_is_other_account( token )) return launch_as( token, app, cmdline, dir, info );
++    return CreateProcessInternalW( token, app, cmdline, process_attr, thread_attr, inherit, flags, env,
++                                   dir, startup, info, NULL );
++}
++
+ /******************************************************************************
+  * CreateProcessWithLogonW
+  */
+@@ -3119,22 +3296,36 @@ BOOL WINAPI CreateProcessWithLogonW( LPCWSTR lpUsername, LPCWSTR lpDomain, LPCWS
+     LPCWSTR lpApplicationName, LPWSTR lpCommandLine, DWORD dwCreationFlags, LPVOID lpEnvironment,
+     LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation )
+ {
+-    FIXME("%s %s %p 0x%08lx %s %s 0x%08lx %p %s %p %p stub\n", debugstr_w(lpUsername), debugstr_w(lpDomain),
+-          lpPassword, dwLogonFlags, debugstr_w(lpApplicationName), debugstr_w(lpCommandLine), dwCreationFlags,
+-          lpEnvironment, debugstr_w(lpCurrentDirectory), lpStartupInfo, lpProcessInformation);
++    HANDLE token;
++    BOOL ret;
+ 
+-    return FALSE;
++    TRACE( "%s %s %#lx %s %s %#lx\n", debugstr_w(lpUsername), debugstr_w(lpDomain), dwLogonFlags,
++           debugstr_w(lpApplicationName), debugstr_w(lpCommandLine), dwCreationFlags );
++
++    /* LOGON_NETCREDENTIALS_ONLY: the caller itself, other credentials for
++     * the network only */
++    if (!LogonUserW( lpUsername, lpDomain, lpPassword,
++                     (dwLogonFlags & LOGON_NETCREDENTIALS_ONLY) ? LOGON32_LOGON_NEW_CREDENTIALS : LOGON32_LOGON_INTERACTIVE,
++                     LOGON32_PROVIDER_DEFAULT, &token ))
++        return FALSE;
++    if (token_is_other_account( token ))
++        ret = launch_as( token, lpApplicationName, lpCommandLine, lpCurrentDirectory, lpProcessInformation );
++    else
++        ret = CreateProcessW( lpApplicationName, lpCommandLine, NULL, NULL, FALSE, dwCreationFlags, lpEnvironment,
++                              lpCurrentDirectory, lpStartupInfo, lpProcessInformation );
++    CloseHandle( token );
++    return ret;
+ }
+ 
+ BOOL WINAPI CreateProcessWithTokenW(HANDLE token, DWORD logon_flags, LPCWSTR application_name, LPWSTR command_line,
+         DWORD creation_flags, void *environment, LPCWSTR current_directory, STARTUPINFOW *startup_info,
+         PROCESS_INFORMATION *process_information )
+ {
+-    FIXME("%p 0x%08lx %s %s 0x%08lx %p %s %p %p - semi-stub\n", token,
+-          logon_flags, debugstr_w(application_name), debugstr_w(command_line),
+-          creation_flags, environment, debugstr_w(current_directory),
+-          startup_info, process_information);
++    TRACE( "%p %#lx %s %s %#lx\n", token, logon_flags, debugstr_w(application_name), debugstr_w(command_line),
++           creation_flags );
+ 
++    if (token_is_other_account( token ))
++        return launch_as( token, application_name, command_line, current_directory, process_information );
+     /* FIXME: check if handles should be inherited */
+     return CreateProcessAsUserW( token, application_name, command_line, NULL, NULL, FALSE, creation_flags,
+                                  environment, current_directory, startup_info, process_information );
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1709,6 +1709,24 @@ size_t server_init_process(void)
+         }
+     }
+ 
++    /* Stained Glass OS (1711): a program the elevation broker started as
++     * this account for someone (CreateProcessWithLogonW and friends) names
++     * its launch ticket, so they get handles to it */
++    {
++        const char *ticket = getenv( "SG_LAUNCH_TICKET" );
++
++        if (ticket && *ticket)
++        {
++            SERVER_START_REQ( register_launch )
++            {
++                wine_server_add_data( req, ticket, strlen( ticket ) );
++                wine_server_call( req );
++            }
++            SERVER_END_REQ;
++            unsetenv( "SG_LAUNCH_TICKET" );
++        }
++    }
++
+     if (!supported_machines_count)
+         fatal_error( "'%s' is a 64-bit installation, it cannot be used with a 32-bit wineserver.\n",
+                      config_dir );
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -5452,6 +5452,49 @@ struct logon_ticket_token_reply
+ 
+ 
+ 
++struct make_launch_ticket_request
++{
++    struct request_header __header;
++    obj_handle_t token;
++};
++struct make_launch_ticket_reply
++{
++    struct reply_header __header;
++    /* VARARG(ticket,string); */
++};
++
++
++
++struct register_launch_request
++{
++    struct request_header __header;
++    /* VARARG(ticket,string); */
++    char __pad_12[4];
++};
++struct register_launch_reply
++{
++    struct reply_header __header;
++};
++
++
++
++struct claim_launch_request
++{
++    struct request_header __header;
++    /* VARARG(ticket,string); */
++    char __pad_12[4];
++};
++struct claim_launch_reply
++{
++    struct reply_header __header;
++    process_id_t pid;
++    thread_id_t  tid;
++    obj_handle_t process;
++    obj_handle_t thread;
++};
++
++
++
+ struct get_session_user_token_request
+ {
+     struct request_header __header;
+@@ -6357,6 +6400,9 @@ enum request
+     REQ_make_process_system,
+     REQ_grant_process_admin_token,
+     REQ_logon_ticket_token,
++    REQ_make_launch_ticket,
++    REQ_register_launch,
++    REQ_claim_launch,
+     REQ_get_session_user_token,
+     REQ_get_token_info,
+     REQ_get_token_label,
+@@ -6666,6 +6712,9 @@ union generic_request
+     struct make_process_system_request make_process_system_request;
+     struct grant_process_admin_token_request grant_process_admin_token_request;
+     struct logon_ticket_token_request logon_ticket_token_request;
++    struct make_launch_ticket_request make_launch_ticket_request;
++    struct register_launch_request register_launch_request;
++    struct claim_launch_request claim_launch_request;
+     struct get_session_user_token_request get_session_user_token_request;
+     struct get_token_info_request get_token_info_request;
+     struct get_token_label_request get_token_label_request;
+@@ -6973,6 +7022,9 @@ union generic_reply
+     struct make_process_system_reply make_process_system_reply;
+     struct grant_process_admin_token_reply grant_process_admin_token_reply;
+     struct logon_ticket_token_reply logon_ticket_token_reply;
++    struct make_launch_ticket_reply make_launch_ticket_reply;
++    struct register_launch_reply register_launch_reply;
++    struct claim_launch_reply claim_launch_reply;
+     struct get_session_user_token_reply get_session_user_token_reply;
+     struct get_token_info_reply get_token_info_reply;
+     struct get_token_label_reply get_token_label_reply;
+@@ -7016,6 +7068,6 @@ union generic_reply
+     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 871
++#define SERVER_PROTOCOL_VERSION 872
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -3849,6 +3849,31 @@ struct handle_info
+ @END
+ 
+ 
++/* Stained Glass OS (1711): a launch ticket for running a program as a token's account */
++@REQ(make_launch_ticket)
++    obj_handle_t token;           /* the account's token */
++@REPLY
++    VARARG(ticket,string);        /* the ticket's name: 32 hex digits */
++@END
++
++
++/* Stained Glass OS (1711): a process started for a launch ticket names it */
++@REQ(register_launch)
++    VARARG(ticket,string);        /* the ticket's name */
++@END
++
++
++/* Stained Glass OS (1711): the requester of a launch ticket gets the process started for it */
++@REQ(claim_launch)
++    VARARG(ticket,string);        /* the ticket's name */
++@REPLY
++    process_id_t pid;             /* the process's id */
++    thread_id_t  tid;             /* its first thread's id */
++    obj_handle_t process;         /* handle to the process */
++    obj_handle_t thread;          /* handle to its first thread */
++@END
++
++
+ /* Stained Glass OS (1708): the primary token of the user logged on to a session (WTSQueryUserToken) */
+ @REQ(get_session_user_token)
+     unsigned int session_id;      /* the session, or 0xffffffff for the caller's */
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -268,6 +268,9 @@ DECL_HANDLER(get_kernel_object_handle);
+ DECL_HANDLER(make_process_system);
+ DECL_HANDLER(grant_process_admin_token);
+ DECL_HANDLER(logon_ticket_token);
++DECL_HANDLER(make_launch_ticket);
++DECL_HANDLER(register_launch);
++DECL_HANDLER(claim_launch);
+ DECL_HANDLER(get_session_user_token);
+ DECL_HANDLER(get_token_info);
+ DECL_HANDLER(get_token_label);
+@@ -574,6 +577,9 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_make_process_system,
+     (req_handler)req_grant_process_admin_token,
+     (req_handler)req_logon_ticket_token,
++    (req_handler)req_make_launch_ticket,
++    (req_handler)req_register_launch,
++    (req_handler)req_claim_launch,
+     (req_handler)req_get_session_user_token,
+     (req_handler)req_get_token_info,
+     (req_handler)req_get_token_label,
+@@ -2148,6 +2154,16 @@ C_ASSERT( offsetof(struct logon_ticket_token_request, type) == 12 );
+ C_ASSERT( sizeof(struct logon_ticket_token_request) == 16 );
+ C_ASSERT( offsetof(struct logon_ticket_token_reply, token) == 8 );
+ C_ASSERT( sizeof(struct logon_ticket_token_reply) == 16 );
++C_ASSERT( offsetof(struct make_launch_ticket_request, token) == 12 );
++C_ASSERT( sizeof(struct make_launch_ticket_request) == 16 );
++C_ASSERT( sizeof(struct make_launch_ticket_reply) == 8 );
++C_ASSERT( sizeof(struct register_launch_request) == 16 );
++C_ASSERT( sizeof(struct claim_launch_request) == 16 );
++C_ASSERT( offsetof(struct claim_launch_reply, pid) == 8 );
++C_ASSERT( offsetof(struct claim_launch_reply, tid) == 12 );
++C_ASSERT( offsetof(struct claim_launch_reply, process) == 16 );
++C_ASSERT( offsetof(struct claim_launch_reply, thread) == 20 );
++C_ASSERT( sizeof(struct claim_launch_reply) == 24 );
+ C_ASSERT( offsetof(struct get_session_user_token_request, session_id) == 12 );
+ C_ASSERT( sizeof(struct get_session_user_token_request) == 16 );
+ C_ASSERT( offsetof(struct get_session_user_token_reply, token) == 8 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3069,6 +3069,34 @@ static void dump_logon_ticket_token_reply( const struct logon_ticket_token_reply
+     fprintf( stderr, " token=%04x", req->token );
+ }
+ 
++static void dump_make_launch_ticket_request( const struct make_launch_ticket_request *req )
++{
++    fprintf( stderr, " token=%04x", req->token );
++}
++
++static void dump_make_launch_ticket_reply( const struct make_launch_ticket_reply *req )
++{
++    dump_varargs_string( " ticket=", cur_size );
++}
++
++static void dump_register_launch_request( const struct register_launch_request *req )
++{
++    dump_varargs_string( " ticket=", cur_size );
++}
++
++static void dump_claim_launch_request( const struct claim_launch_request *req )
++{
++    dump_varargs_string( " ticket=", cur_size );
++}
++
++static void dump_claim_launch_reply( const struct claim_launch_reply *req )
++{
++    fprintf( stderr, " pid=%04x", req->pid );
++    fprintf( stderr, ", tid=%04x", req->tid );
++    fprintf( stderr, ", process=%04x", req->process );
++    fprintf( stderr, ", thread=%04x", req->thread );
++}
++
+ static void dump_get_session_user_token_request( const struct get_session_user_token_request *req )
+ {
+     fprintf( stderr, " session_id=%08x", req->session_id );
+@@ -3742,6 +3770,9 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_make_process_system_request,
+     (dump_func)dump_grant_process_admin_token_request,
+     (dump_func)dump_logon_ticket_token_request,
++    (dump_func)dump_make_launch_ticket_request,
++    (dump_func)dump_register_launch_request,
++    (dump_func)dump_claim_launch_request,
+     (dump_func)dump_get_session_user_token_request,
+     (dump_func)dump_get_token_info_request,
+     (dump_func)dump_get_token_label_request,
+@@ -4048,6 +4079,9 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_make_process_system_reply,
+     NULL,
+     (dump_func)dump_logon_ticket_token_reply,
++    (dump_func)dump_make_launch_ticket_reply,
++    NULL,
++    (dump_func)dump_claim_launch_reply,
+     (dump_func)dump_get_session_user_token_reply,
+     (dump_func)dump_get_token_info_reply,
+     (dump_func)dump_get_token_label_reply,
+@@ -4354,6 +4388,9 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "make_process_system",
+     "grant_process_admin_token",
+     "logon_ticket_token",
++    "make_launch_ticket",
++    "register_launch",
++    "claim_launch",
+     "get_session_user_token",
+     "get_token_info",
+     "get_token_label",
+@@ -4535,6 +4572,7 @@ static const struct
+     { "TIMEOUT",                     STATUS_TIMEOUT },
+     { "TOKEN_ALREADY_IN_USE",        STATUS_TOKEN_ALREADY_IN_USE },
+     { "TOO_MANY_OPENED_FILES",       STATUS_TOO_MANY_OPENED_FILES },
++    { "TOO_MANY_SECRETS",            STATUS_TOO_MANY_SECRETS },
+     { "UNSUCCESSFUL",                STATUS_UNSUCCESSFUL },
+     { "USER_APC",                    STATUS_USER_APC },
+     { "USER_MAPPED_FILE",            STATUS_USER_MAPPED_FILE },
+--- a/server/token.c
++++ b/server/token.c
+@@ -34,6 +34,7 @@
+ #include <fcntl.h>
+ #include <dirent.h>
+ #include <time.h>
++#include <sys/random.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -146,6 +147,10 @@ struct token
+     struct sid    *capabilities;    /* capability SIDs, back to back */
+     unsigned int   capability_count;
+     unsigned int   capability_size;
++    /* Stained Glass OS (1711): the Unix account this token is for (~0: not
++     * known), and the requester a LogonUser token was given to (~0: none) */
++    unsigned int   sg_unix_uid;
++    unsigned int   sg_logon_for;
+ };
+ 
+ struct privilege
+@@ -973,6 +978,8 @@ static struct token *create_token( unsigned int primary, unsigned int session_id
+         token->restricted_count = 0;
+         token->restricted_size = 0;
+         token->write_restricted = 0;
++        token->sg_unix_uid = ~0u;
++        token->sg_logon_for = ~0u;
+         token->user_deny_only = 0;
+         token->package_sid = NULL;
+         token->capabilities = NULL;
+@@ -1105,6 +1112,8 @@ struct token *token_duplicate( struct token *src_token, unsigned primary,
+                           NULL, 0, src_token->default_dacl, modified_id,
+                           0, impersonation_level, src_token->elevation );
+     if (!token) return token;
++    token->sg_unix_uid = src_token->sg_unix_uid;
++    token->sg_logon_for = src_token->sg_logon_for;
+ 
+     if (src_token->restricted_count)
+     {
+@@ -1569,6 +1578,7 @@ struct token *token_create_for_uid( unsigned primary, int impersonation_level,
+                           is_admin ? ARRAY_SIZE( admin_privs ) : ARRAY_SIZE( user_privs ),
+                           default_dacl, NULL, primary_group,
+                           impersonation_level, elevation );
++    if (token) token->sg_unix_uid = uid;
+     free( all_groups );
+     free( default_dacl );
+     if (!token) return NULL;
+@@ -3037,6 +3047,7 @@ DECL_HANDLER(logon_ticket_token)
+         if (!strncmp( p, "uid=", 4 )) uid = strtoul( p + 4, NULL, 10 );
+         else if (!strncmp( p, "for=", 4 )) for_uid = strtoul( p + 4, NULL, 10 );
+         else if (!strncmp( p, "expires=", 8 )) expires = strtoll( p + 8, NULL, 10 );
++        else if (!strncmp( p, "kind=", 5 )) return;  /* a launch ticket (1711) is not a logon */
+     }
+     /* only for whoever asked the broker, once, while it is fresh */
+ #ifndef SG_MUTANT_TICKET_ANY_REQUESTER
+@@ -3047,6 +3058,7 @@ DECL_HANDLER(logon_ticket_token)
+     clear_error();
+     if (!(token = token_create_for_uid( TRUE, -1, TokenElevationTypeDefault, current->process->session_id, uid )))
+         return;
++    token->sg_logon_for = current->process->peer_uid;  /* may run programs as it (1711) */
+     if (req->type == 3 /* LOGON32_LOGON_NETWORK */)
+     {
+         tok2 = token_duplicate( token, FALSE, SecurityImpersonation, NULL, NULL, 0, NULL, 0 );
+@@ -3058,3 +3070,134 @@ DECL_HANDLER(logon_ticket_token)
+     reply->token = alloc_handle_no_access_check( current->process, token, TOKEN_ALL_ACCESS, 0 );
+     release_object( token );
+ }
++
++/* Stained Glass OS (1711): running a program as another account
++ * (CreateProcessAsUser, CreateProcessWithTokenW, CreateProcessWithLogonW). A
++ * process of this server runs as its Unix account, so a program for another
++ * account is started by the elevation broker's root monitor, as that account
++ * -- given a launch ticket made here, which says who may have what: SYSTEM
++ * (SeAssignPrimaryTokenPrivilege: a service starting a program on a user's
++ * desktop with WTSQueryUserToken's token), or whoever LogonUser gave the
++ * token to. Never root, the SYSTEM account or another system account
++ * (below 1000). The new process names its ticket when it starts
++ * (register_launch); the requester then gets handles to it (claim_launch). */
++#define SG_LAUNCH_MAX 32
++#define SG_LAUNCH_LIFETIME 30
++static struct sg_launch
++{
++    char            name[33];
++    unsigned int    uid;
++    struct process *requester;   /* not referenced: compared only */
++    process_id_t    requester_id;
++    struct process *process;     /* the started process, referenced */
++    time_t          expires;
++} sg_launches[SG_LAUNCH_MAX];
++
++static const char *sg_ticket_dir(void)
++{
++    static const char *dir;
++    if (!dir && !(dir = getenv( "SG_LOGON_TICKET_DIR" ))) dir = "/run/stained-glass-broker/tickets";
++    return dir;
++}
++
++static void sg_launch_free( struct sg_launch *l )
++{
++    if (l->process) release_object( l->process );
++    memset( l, 0, sizeof(*l) );
++}
++
++static struct sg_launch *sg_launch_find( const char *name, data_size_t len )
++{
++    unsigned int i;
++    time_t now = time( NULL );
++
++    for (i = 0; i < SG_LAUNCH_MAX; i++)
++    {
++        if (!sg_launches[i].name[0]) continue;
++        if (sg_launches[i].expires < now) { sg_launch_free( &sg_launches[i] ); continue; }
++        if (len == 32 && !memcmp( sg_launches[i].name, name, 32 )) return &sg_launches[i];
++    }
++    return NULL;
++}
++
++DECL_HANDLER(make_launch_ticket)
++{
++    struct token *token;
++    struct sg_launch *l = NULL;
++    unsigned char rnd[16];
++    char path[512], text[160];
++    unsigned int i;
++    int fd, n, allowed;
++
++    if (!sg_system_prefix) { set_error( STATUS_NOT_SUPPORTED ); return; }
++    if (!(token = (struct token *)get_handle_obj( current->process, req->token,
++                                                   TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE, &token_ops )))
++        return;
++    allowed = sg_requester_is_admin() || token->sg_logon_for == current->process->peer_uid;
++    if (!allowed) set_error( STATUS_PRIVILEGE_NOT_HELD );
++    else if (token->sg_unix_uid == ~0u || token->sg_unix_uid < 1000 || token->sg_unix_uid == sg_system_prefix_uid)
++        set_error( STATUS_ACCESS_DENIED );
++    else
++    {
++        sg_launch_find( "", 0 );  /* drop expired ones */
++        for (i = 0; i < SG_LAUNCH_MAX && !l; i++) if (!sg_launches[i].name[0]) l = &sg_launches[i];
++        if (!l) set_error( STATUS_TOO_MANY_SECRETS );
++    }
++    if (get_error() || !l) { release_object( token ); return; }
++
++    if (getrandom( rnd, sizeof(rnd), 0 ) != sizeof(rnd)) { set_error( STATUS_UNSUCCESSFUL ); release_object( token ); return; }
++    for (i = 0; i < 16; i++) snprintf( l->name + 2 * i, 3, "%02x", rnd[i] );
++    l->uid = token->sg_unix_uid;
++    l->requester = current->process;
++    l->requester_id = current->process->id;
++    l->expires = time( NULL ) + SG_LAUNCH_LIFETIME;
++    release_object( token );
++
++    snprintf( path, sizeof(path), "%s/%s", sg_ticket_dir(), l->name );
++    n = snprintf( text, sizeof(text), "kind=launch\nuid=%u\nfor=%u\nexpires=%lld\n", l->uid,
++                  (unsigned int)current->process->peer_uid, (long long)l->expires );
++    if ((fd = open( path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600 )) < 0 ||
++        write( fd, text, n ) != n)
++    {
++        if (fd >= 0) { close( fd ); unlink( path ); }
++        memset( l, 0, sizeof(*l) );
++        set_error( STATUS_UNSUCCESSFUL );
++        return;
++    }
++    close( fd );
++    set_reply_data( l->name, 32 );
++}
++
++/* the started process names its ticket: only a process of the account the
++ * ticket is for, once */
++DECL_HANDLER(register_launch)
++{
++    struct sg_launch *l = sg_launch_find( get_req_data(), get_req_data_size() );
++
++    if (!l || l->process || l->uid != current->process->peer_uid) { set_error( STATUS_ACCESS_DENIED ); return; }
++    l->process = (struct process *)grab_object( current->process );
++}
++
++/* the requester gets the started process and its first thread, with full
++ * access, as CreateProcess gives them; STATUS_PENDING until it has started */
++DECL_HANDLER(claim_launch)
++{
++    struct sg_launch *l = sg_launch_find( get_req_data(), get_req_data_size() );
++    struct thread *thread;
++
++    if (!l || l->requester != current->process || l->requester_id != current->process->id)
++    {
++        set_error( STATUS_NOT_FOUND );
++        return;
++    }
++    if (!l->process) { set_error( STATUS_PENDING ); return; }
++    reply->pid = get_process_id( l->process );
++    reply->process = alloc_handle_no_access_check( current->process, l->process, PROCESS_ALL_ACCESS, 0 );
++    if (!list_empty( &l->process->thread_list ) &&
++        (thread = LIST_ENTRY( list_head( &l->process->thread_list ), struct thread, proc_entry )))
++    {
++        reply->tid = get_thread_id( thread );
++        reply->thread = alloc_handle_no_access_check( current->process, thread, THREAD_ALL_ACCESS, 0 );
++    }
++    sg_launch_free( l );
++}
