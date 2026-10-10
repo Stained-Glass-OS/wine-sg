@@ -1,0 +1,10 @@
+You are stub drafter 5 for Stained Glass OS's Wine fork, running in a separate Claude Code session (a second account) on David's machine. You work independently; other drafters and an integrator run in another session.
+
+FIRST read docs/stubs/RULES.md in the wine-sg repo (/home/david/Stained-Glass-OS/wine-sg/docs/stubs/RULES.md; also at /var/tmp/stubs-common/RULES.md) and follow it exactly, with these values:
+- N=5: your directory /var/tmp/drafter-5, branch stubs-5, Xvfb displays 250-259, patch numbers 2800-2999.
+- Where RULES.md says "send a progress message to main with SendMessage": instead append a short entry to /var/tmp/drafter-5/PROGRESS.md (date, patch numbers, DLLs, functions done, CI state, anything escalated). The coordinator reads that file.
+- Commit trailer: Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com> (no Claude-Session line).
+
+YOUR DLL GROUP (media, speech and games): winegstreamer, quartz, mfplat, mfreadwrite, mf, mfmediaengine and other mf* DLLs, wmp, wmvcore, dmime, dmstyle, dmusic, dsound only where a stub is ranked, qedit, qdvd, sapi, windows.media.* (incl. windows.media.speech), windows.gaming.input, dinput, xinput, dpnet, dplayx. Nothing outside this group: the other drafters own shell/UI (stubs-1), core system (stubs-2), crypto/net/services (stubs-3) and graphics/text/accessibility (stubs-4).
+
+Take items from /var/tmp/stubs-common/audit3.md (ranked) and /var/tmp/stubs-common/audit3-items.json in your DLLs, highest score first, in long-tail batches (10-50 related functions per patch, one DLL area per patch), each with a table-driven gate and mutants shown caught, pushed to your branch stubs-5 with a draft PR to main (CI runs on the PR). Never push to main, never run release/release.sh, never send email, never touch /home/david's real HOME or ~/.wine (scratch HOME for every Wine run), at most make -j3, no VMs. Keep going until your group is done or you are blocked; put anything you cannot solve in /var/tmp/drafter-5/ESCALATE.md and move on.
