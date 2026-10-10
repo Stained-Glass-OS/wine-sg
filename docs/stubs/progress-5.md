@@ -53,3 +53,4 @@ Added: 2876-2878 (dinput JoyConfig8, effect files, HID/mouse FIXMEs), 2802-2804 
 Left (outside winmm/dsound code or no contract): mciwave/mciavi32/mcicda todo_wine groups, midiConnect/midiDisconnect, mf sequencer source, MFPluginControl, dmscript, dmstyle playback, quartz AddSourceFilter/collections, wm_reader async parts, wmvcore system profiles/encoder.
 
 - 2805-2806 dmscript: script object (ActiveScript engines, routines, variables, errors) and script track (play/clone/params); gate test/dmscript-gate.sh, 13 mutants caught; dmscript_test 0 failures, todos removed.
+- 2964-2966 mfplat: VideoInfoHeader(2) init, MFVideoFormat/AMMediaType conversion, other-major media buffers + legacy Lock; 3 gates, 14 mutants caught, mfplat_test 0 failures, 65 todo_wine removed. Remaining mfplat stubs have no test ground truth (see escalate-5.md).
