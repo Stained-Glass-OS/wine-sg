@@ -1,14 +1,14 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# RegisterShellHookWindow / DeregisterShellHookWindow and the SHELLHOOK
-# messages (patches/sg/2207): test/shellhook-probe.c registers a window and
-# checks it is posted created/destroyed/activated/redraw/flash/appcommand for
-# top-level windows (and nothing for owned/child ones), from this process and
-# from a second one (64- and 32-bit), and that slots are pruned and bounded.
-# Both functions were stubs returning FALSE.
+# ntdll argument/handle validation that the conformance tests mark todo_wine
+# (patches/sg/2209): test/ntinfoval-probe.c -- VM counters length, PARTIAL_COPY for
+# unreadable remote memory, SetSystemInformation length, unreported processor
+# relations, ThreadEnableAlignmentFaultFixup handle check, NtOpenThread CID check.
 #
-#   WINE=/opt/wine-sg/bin/wine test/shellhook-gate.sh
-# Mutants (win32u/hook.c): SG_MUTANT_NO_SHELL_POST, SG_MUTANT_NO_SHELL_PRUNE.
+#   WINE=/opt/wine-sg/bin/wine test/ntinfoval-gate.sh
+# Mutants: SG_MUTANT_NO_PARTIAL_COPY (unix/virtual.c), SG_MUTANT_NO_SETSYS_LENGTH and
+# SG_MUTANT_NO_UNKNOWN_RELATION (unix/system.c), SG_MUTANT_NO_ALIGN_HANDLE_CHECK and
+# SG_MUTANT_NO_CID_CHECK (unix/thread.c), SG_MUTANT_VM_LEN (wow64/process.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -19,15 +19,15 @@ for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
 done
 command -v Xvfb >/dev/null || { echo "SKIP: needs Xvfb"; exit 77; }
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
-T=$(mktemp -d /var/tmp/sg-shellhook.XXXXXX)
+T=$(mktemp -d /var/tmp/sg-ntinfoval.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
-DISP=:227
+DISP=:229
 Xvfb "$DISP" -screen 0 1024x768x24 >"$T/xvfb.log" 2>&1 &
 XPID=$!
 cleanup() { pkill -9 -f "$T/probe-" 2>/dev/null; "$WINESERVER" -k 2>/dev/null; kill "$XPID" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 for a in x86_64 i686; do
-    TMPDIR=/var/tmp $a-w64-mingw32-gcc -O1 -o "$T/probe-$a.exe" "$HERE/shellhook-probe.c" -luser32 -lkernel32 \
+    TMPDIR=/var/tmp $a-w64-mingw32-gcc -O1 -o "$T/probe-$a.exe" "$HERE/ntinfoval-probe.c" -lkernel32 \
         || { echo "FAIL  probe did not build"; exit 1; }
 done
 mkdir -p "$WINEPREFIX"
@@ -37,7 +37,7 @@ RC=0
 for a in x86_64 i686; do
     o=$([ $a = x86_64 ] && echo i686 || echo x86_64)
     echo "== $a (other process: $o)"
-    out=$(cd "$T" && timeout -s KILL 240 env DISPLAY="$DISP" "$WINE" "$T/probe-$a.exe" "$T/probe-$o.exe" 2>/dev/null </dev/null | tr -d '\r')
+    out=$(cd "$T" && timeout -s KILL 240 env DISPLAY="$DISP" "$WINE" "$T/probe-$a.exe" 2>/dev/null </dev/null | tr -d '\r')
     printf '%s\n' "$out" | sed 's/^/      /'
     printf '%s\n' "$out" | grep -qx 'RESULT: PASS' || RC=1
 done

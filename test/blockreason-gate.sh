@@ -25,7 +25,7 @@ export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;w
 DISP=:224
 Xvfb "$DISP" -screen 0 1024x768x24 >"$T/xvfb.log" 2>&1 &
 XPID=$!
-cleanup() { "$WINESERVER" -k 2>/dev/null; kill "$XPID" 2>/dev/null; rm -rf "$T"; }
+cleanup() { pkill -9 -f "$T/probe-" 2>/dev/null; "$WINESERVER" -k 2>/dev/null; kill "$XPID" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 for a in x86_64 i686; do
     TMPDIR=/var/tmp $a-w64-mingw32-gcc -O1 -o "$T/probe-$a.exe" "$HERE/blockreason-probe.c" -luser32 -lkernel32 \

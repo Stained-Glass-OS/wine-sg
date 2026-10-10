@@ -151,7 +151,7 @@ static int child_register( HWND parent_hook )
     h = make_window( L"SgShellHookWnd", WS_OVERLAPPED, NULL, 0, 0, 10, 10 );
     if (!RegisterShellHookWindow( h )) return 2;
     PostMessageW( parent_hook, MSG_REGISTERED, (WPARAM)h, 0 );
-    for (;;) pump( 1000 );
+    { int n; for (n = 0; n < 120; n++) pump( 1000 ); }
     return 0;
 }
 

@@ -1,0 +1,327 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll, kernelbase, user32: file cache size, thread DPI hosting behavior
+
+GetSystemFileCacheSize returned ERROR_CALL_NOT_IMPLEMENTED,
+SetSystemFileCacheSize likewise, SystemFileCacheInformation was all zeros,
+and the thread DPI hosting pair returned a constant.  The cache
+information now comes from the Linux page cache (/proc/meminfo Cached,
+limits in pages, default no hard limit over physical memory);
+Get/SetSystemFileCacheSize validate the flags and min/max as documented and
+keep hard limits in a volatile registry key so every process sees them
+(SetSystemFileCacheSize needs SeIncreaseQuotaPrivilege enabled: ERROR_PRIVILEGE_NOT_HELD).  Get/SetThreadDpiHostingBehavior keep a
+per-thread value and reject unknown values with DPI_HOSTING_BEHAVIOR_INVALID.
+
+---
+--- a/dlls/kernelbase/memory.c
++++ b/dlls/kernelbase/memory.c
+@@ -29,6 +29,7 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winnls.h"
++#include "winreg.h"
+ #include "winternl.h"
+ #include "winerror.h"
+ #include "ddk/wdm.h"
+@@ -244,14 +245,103 @@ void WINAPI DECLSPEC_HOTPATCH GetSystemInfo( SYSTEM_INFO *si )
+ }
+ 
+ 
++/* Stained Glass OS: the hard limits set with SetSystemFileCacheSize live in a
++ * volatile key of the registry (the wineserver), so every process sees what
++ * any other one set, as on Windows where the limits are system wide. */
++static const WCHAR file_cache_key[] = L"System\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\SgFileCache";
++
++#define FILE_CACHE_MAX_HARD_ENABLE  0x01
++#define FILE_CACHE_MAX_HARD_DISABLE 0x02
++#define FILE_CACHE_MIN_HARD_ENABLE  0x04
++#define FILE_CACHE_MIN_HARD_DISABLE 0x08
++
++static inline ULONGLONG min_u64( ULONGLONG a, ULONGLONG b ) { return a < b ? a : b; }
++
++static BOOL read_file_cache_limits( SIZE_T *mincache, SIZE_T *maxcache, DWORD *flags )
++{
++    HKEY key;
++    ULONGLONG min, max;
++    DWORD size, type, fl;
++    BOOL ret = FALSE;
++
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, file_cache_key, 0, KEY_READ, &key )) return FALSE;
++    size = sizeof(min);
++    if (!RegQueryValueExW( key, L"Minimum", NULL, &type, (BYTE *)&min, &size ) && type == REG_QWORD)
++    {
++        size = sizeof(max);
++        if (!RegQueryValueExW( key, L"Maximum", NULL, &type, (BYTE *)&max, &size ) && type == REG_QWORD)
++        {
++            size = sizeof(fl);
++            if (!RegQueryValueExW( key, L"Flags", NULL, &type, (BYTE *)&fl, &size ) && type == REG_DWORD)
++            {
++                *mincache = min;
++                *maxcache = max;
++                *flags = fl;
++                ret = TRUE;
++            }
++        }
++    }
++    RegCloseKey( key );
++    return ret;
++}
++
++/* Stained Glass OS: the caller needs SeIncreaseQuotaPrivilege, enabled (the
++ * thread's token if it impersonates, else the process's) */
++static BOOL has_increase_quota_privilege(void)
++{
++    PRIVILEGE_SET privs;
++    HANDLE token;
++    BOOLEAN result = FALSE;
++    NTSTATUS status;
++
++#ifdef SG_MUTANT_FCACHE_NO_PRIV
++    return TRUE;
++#endif
++    privs.PrivilegeCount = 1;
++    privs.Control = PRIVILEGE_SET_ALL_NECESSARY;
++    privs.Privilege[0].Luid.LowPart = SE_INCREASE_QUOTA_PRIVILEGE;
++    privs.Privilege[0].Luid.HighPart = 0;
++    privs.Privilege[0].Attributes = 0;
++    if (NtOpenThreadToken( GetCurrentThread(), TOKEN_QUERY, TRUE, &token ) &&
++        NtOpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &token ))
++        return FALSE;
++    status = NtPrivilegeCheck( token, &privs, &result );
++    NtClose( token );
++    return !status && result;
++}
++
+ /***********************************************************************
+  *          GetSystemFileCacheSize   (kernelbase.@)
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH GetSystemFileCacheSize( SIZE_T *mincache, SIZE_T *maxcache, DWORD *flags )
+ {
+-    FIXME( "stub: %p %p %p\n", mincache, maxcache, flags );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    SYSTEM_BASIC_INFORMATION basic;
++    SYSTEM_CACHE_INFORMATION info;
++    NTSTATUS status;
++
++    TRACE( "%p %p %p\n", mincache, maxcache, flags );
++
++    if (!mincache || !maxcache || !flags)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if ((status = NtQuerySystemInformation( SystemFileCacheInformation, &info, sizeof(info), NULL )) ||
++        (status = NtQuerySystemInformation( SystemBasicInformation, &basic, sizeof(basic), NULL )))
++        return set_ntstatus( status );
++
++    if (!read_file_cache_limits( mincache, maxcache, flags ))
++    {
++        /* a 32-bit process cannot see more than its address space: clamp to whole pages */
++        ULONGLONG min = (ULONGLONG)info.MinimumWorkingSet * basic.PageSize;
++        ULONGLONG max = (ULONGLONG)info.MaximumWorkingSet * basic.PageSize;
++        ULONGLONG limit = (SIZE_T)-1 & ~(ULONGLONG)(basic.PageSize - 1);
++
++        *mincache = min_u64( min, limit );
++        *maxcache = min_u64( max, limit );
++        *flags = info.Flags;
++    }
++    return TRUE;
+ }
+ 
+ 
+@@ -368,9 +458,51 @@ UINT WINAPI DECLSPEC_HOTPATCH ResetWriteWatch( void *base, SIZE_T size )
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH SetSystemFileCacheSize( SIZE_T mincache, SIZE_T maxcache, DWORD flags )
+ {
+-    FIXME( "stub: %Id %Id %ld\n", mincache, maxcache, flags );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    const DWORD valid = FILE_CACHE_MAX_HARD_ENABLE | FILE_CACHE_MAX_HARD_DISABLE |
++                        FILE_CACHE_MIN_HARD_ENABLE | FILE_CACHE_MIN_HARD_DISABLE;
++    ULONGLONG min = mincache, max = maxcache;
++    HKEY key;
++    DWORD ret;
++
++    TRACE( "%Id %Id %#lx\n", mincache, maxcache, flags );
++
++    if (!has_increase_quota_privilege())
++    {
++        SetLastError( ERROR_PRIVILEGE_NOT_HELD );
++        return FALSE;
++    }
++
++    /* (-1, -1) only asks the system to flush the cache; the kernel's page
++     * cache is not ours to trim */
++    if (mincache == (SIZE_T)-1 && maxcache == (SIZE_T)-1 && !flags) return TRUE;
++
++    if ((flags & ~valid) ||
++        ((flags & FILE_CACHE_MAX_HARD_ENABLE) && (flags & FILE_CACHE_MAX_HARD_DISABLE)) ||
++        ((flags & FILE_CACHE_MIN_HARD_ENABLE) && (flags & FILE_CACHE_MIN_HARD_DISABLE)) ||
++        mincache > maxcache)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++#ifdef SG_MUTANT_FCACHE_NO_STORE
++    return TRUE;
++#endif
++    if ((ret = RegCreateKeyExW( HKEY_LOCAL_MACHINE, file_cache_key, 0, NULL, REG_OPTION_VOLATILE,
++                                KEY_WRITE, NULL, &key, NULL )))
++    {
++        SetLastError( ret );
++        return FALSE;
++    }
++    ret = RegSetValueExW( key, L"Minimum", 0, REG_QWORD, (const BYTE *)&min, sizeof(min) );
++    if (!ret) ret = RegSetValueExW( key, L"Maximum", 0, REG_QWORD, (const BYTE *)&max, sizeof(max) );
++    if (!ret) ret = RegSetValueExW( key, L"Flags", 0, REG_DWORD, (const BYTE *)&flags, sizeof(flags) );
++    RegCloseKey( key );
++    if (ret)
++    {
++        SetLastError( ret );
++        return FALSE;
++    }
++    return TRUE;
+ }
+ 
+ 
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -3050,6 +3050,44 @@ C_ASSERT( sizeof(struct process_info) <= sizeof(SYSTEM_PROCESS_INFORMATION) );
+     return ret;
+ }
+ 
++/* Stained Glass OS: the file cache is the kernel's page cache.  Sizes are
++ * bytes for the current/peak size and pages for the working set limits, as
++ * the memory manager keeps them; the limits default to "no hard limit"
++ * (FILE_CACHE_MIN_HARD_DISABLE | FILE_CACHE_MAX_HARD_DISABLE) over the whole
++ * of physical memory, with a floor of 1 MB. */
++static void sg_get_file_cache_info( SYSTEM_CACHE_INFORMATION *sci )
++{
++    unsigned long long cached = 0, total = 0, value;
++    SIZE_T page = page_size;
++
++#ifdef linux
++    FILE *fp;
++
++    if ((fp = fopen( "/proc/meminfo", "r" )))
++    {
++        char line[64];
++
++        while (fgets( line, sizeof(line), fp ))
++        {
++            if (sscanf( line, "MemTotal: %llu kB", &value ) == 1) total = value * 1024;
++            else if (sscanf( line, "Cached: %llu kB", &value ) == 1) cached = value * 1024;
++        }
++        fclose( fp );
++    }
++#endif
++    if (!page) page = 4096;
++#ifdef SG_MUTANT_FCACHE_ZERO
++    return;
++#endif
++    sci->CurrentSize = cached;
++    sci->PeakSize = cached;
++    sci->CurrentSizeIncludingTransitionInPages = cached / page;
++    sci->PeakSizeIncludingTransitionInPages = cached / page;
++    sci->MinimumWorkingSet = (1024 * 1024) / page;
++    sci->MaximumWorkingSet = max( total / page, sci->MinimumWorkingSet );
++    sci->Flags = 0x0a;  /* FILE_CACHE_MAX_HARD_DISABLE | FILE_CACHE_MIN_HARD_DISABLE */
++}
++
+ /* Stained Glass OS: the firmware facts behind SystemBootEnvironmentInformation
+  * and SystemSecureBootInformation come from the same places a Linux user looks
+  * at: /sys/firmware/efi exists only when booted through UEFI, the SecureBoot
+@@ -3420,10 +3458,13 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
+         if (size >= len)
+         {
+             if (!info) ret = STATUS_ACCESS_VIOLATION;
+-            else memcpy( info, &sci, len);
++            else
++            {
++                sg_get_file_cache_info( &sci );
++                memcpy( info, &sci, len);
++            }
+         }
+         else ret = STATUS_INFO_LENGTH_MISMATCH;
+-        FIXME("info_class SYSTEM_CACHE_INFORMATION\n");
+         break;
+     }
+ 
+--- a/dlls/user32/sysparams.c
++++ b/dlls/user32/sysparams.c
+@@ -843,13 +843,43 @@ DPI_AWARENESS_CONTEXT WINAPI SetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT
+     return ULongToHandle( set_thread_dpi_awareness_context( get_ntuser_dpi_context( context ) ) );
+ }
+ 
++/* Stained Glass OS: the hosting behavior is a per-thread setting that only
++ * this thread reads back (GetThreadDpiHostingBehavior); it is a plain value
++ * in a TLS slot, so nothing needs freeing when the thread exits. */
++static LONG dpi_hosting_tls = -1;
++#ifdef SG_MUTANT_DPI_HOST_GLOBAL
++static DPI_HOSTING_BEHAVIOR mutant_global_dpi_hosting;
++#endif
++
++static DWORD get_dpi_hosting_tls(void)
++{
++
++    LONG index = ReadAcquire( &dpi_hosting_tls );
++
++    if (index == -1)
++    {
++        DWORD new_index = TlsAlloc();
++        if (new_index == TLS_OUT_OF_INDEXES) return TLS_OUT_OF_INDEXES;
++        index = InterlockedCompareExchange( &dpi_hosting_tls, new_index, -1 );
++        if (index != -1) TlsFree( new_index );  /* lost the race */
++        else index = new_index;
++    }
++    return index;
++}
++
+ /**********************************************************************
+  *              GetThreadDpiHostingBehavior   (USER32.@)
+  */
+ DPI_HOSTING_BEHAVIOR WINAPI GetThreadDpiHostingBehavior( void )
+ {
+-    FIXME("(): stub\n");
+-    return DPI_HOSTING_BEHAVIOR_DEFAULT;
++    DWORD index = get_dpi_hosting_tls();
++
++    if (index == TLS_OUT_OF_INDEXES) return DPI_HOSTING_BEHAVIOR_DEFAULT;
++#ifdef SG_MUTANT_DPI_HOST_GLOBAL
++    return mutant_global_dpi_hosting;
++#else
++    return (DPI_HOSTING_BEHAVIOR)(INT_PTR)TlsGetValue( index );
++#endif
+ }
+ 
+ /**********************************************************************
+@@ -857,8 +887,27 @@ DPI_HOSTING_BEHAVIOR WINAPI GetThreadDpiHostingBehavior( void )
+  */
+ DPI_HOSTING_BEHAVIOR WINAPI SetThreadDpiHostingBehavior( DPI_HOSTING_BEHAVIOR value )
+ {
+-    FIXME("(%d): stub\n", value);
+-    return DPI_HOSTING_BEHAVIOR_DEFAULT;
++    DWORD index;
++    DPI_HOSTING_BEHAVIOR old;
++
++    if (value != DPI_HOSTING_BEHAVIOR_DEFAULT && value != DPI_HOSTING_BEHAVIOR_MIXED)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return DPI_HOSTING_BEHAVIOR_INVALID;
++    }
++    if ((index = get_dpi_hosting_tls()) == TLS_OUT_OF_INDEXES)
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return DPI_HOSTING_BEHAVIOR_INVALID;
++    }
++#ifdef SG_MUTANT_DPI_HOST_GLOBAL
++    old = mutant_global_dpi_hosting;
++    mutant_global_dpi_hosting = value;
++#else
++    old = (DPI_HOSTING_BEHAVIOR)(INT_PTR)TlsGetValue( index );
++    TlsSetValue( index, (void *)(INT_PTR)value );
++#endif
++    return old;
+ }
+ 
+ /***********************************************************************
