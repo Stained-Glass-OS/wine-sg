@@ -1,7 +1,7 @@
 /* mfplat's byte stream and property store stubs (patches/sg/2831), run by
  * test/mfplat-bytestream-gate.sh: a file byte stream's SetLength, Flush,
  * Close and IMFGetService, MFCreateMFByteStreamOnStreamEx and the property
- * store's Commit (E_NOTIMPL and a FIXME before).
+ * store's Commit (left E_NOTIMPL: the conformance test says so).
  *
  *   mfplat-bytestream-probe.exe */
 #define COBJMACROS
@@ -170,7 +170,7 @@ static void test_property_store(void)
     hr = IPropertyStore_SetValue(store, &key, &value);
     CHECKF(hr == S_OK, "SetValue (%#lx)", hr);
     hr = IPropertyStore_Commit(store);
-    CHECKF(hr == S_OK, "Commit is S_OK (%#lx)", hr);
+    CHECKF(hr == E_NOTIMPL, "Commit is E_NOTIMPL, as in dlls/mfplat/tests (%#lx)", hr);
     PropVariantInit(&got);
     hr = IPropertyStore_GetValue(store, &key, &got);
     CHECKF(hr == S_OK && got.vt == VT_I4 && got.lVal == 42, "the value is still there after Commit (%#lx)", hr);

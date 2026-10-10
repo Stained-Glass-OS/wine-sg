@@ -1,5 +1,5 @@
 /* RtlQueryRegistryValues SUBKEY / NOVALUE-with-name / REQUIRED-with-default, and
- * NtOpenKey with no access (patches/sg/2213).  Runs against a key of its own
+ * NtOpenKey with no access still opening (patches/sg/2213).  Runs against a key of its own
  * under HKLM\Software. */
 #include <windows.h>
 #include <stdio.h>
@@ -124,10 +124,13 @@ int main(void)
     st = pRtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE, path, q, &s, NULL);
     check(st == STATUS_OBJECT_NAME_NOT_FOUND && s.calls == 0, "REQUIRED without a default is STATUS_OBJECT_NAME_NOT_FOUND");
 
-    /* NtOpenKey with no access */
-    h = (HANDLE)0xdeadbeef;
+    /* NtOpenKey with no access: Windows refuses it, but Wine's own DLLs
+     * (devenum's filter categories) open keys so, and every DirectShow
+     * graph needs them: it stays open (integrator, round 3) */
+    h = NULL;
     st = pNtOpenKey(&h, 0, &oa);
-    check(st == STATUS_ACCESS_DENIED_ && !h, "NtOpenKey with an empty access mask is STATUS_ACCESS_DENIED and no handle");
+    check(st == STATUS_SUCCESS && h, "NtOpenKey with an empty access mask still opens (Wine's DLLs rely on it)");
+    if (h) pNtClose(h);
     h = NULL;
     st = pNtOpenKey(&h, KEY_READ, &oa);
     check(st == STATUS_SUCCESS && h, "...with KEY_READ it opens");

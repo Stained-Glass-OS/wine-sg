@@ -1,0 +1,804 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] evr: presenter display control, rate support, statistics, quality advise, messages, position mapper
+
+The default video presenter (MFCreateVideoPresenter) had these as E_NOTIMPL stubs:
+
+- IMFVideoDisplayControl: Set/GetBorderColor (black by default), SetRenderingPrefs
+  (E_INVALIDARG outside the defined flags), GetIdealVideoSize (the native size,
+  E_POINTER for two NULLs, MF_E_SHUTDOWN), RepaintVideo (shows the last frame
+  again, not counted as a new frame). Set/GetFullscreen stay E_NOTIMPL, the
+  documented answer, without the FIXME.
+- IMFRateSupport: GetFastestRate and IsRateSupported (display refresh rate over
+  the frame rate, unlimited when thinning or with no frame rate, MF_E_UNSUPPORTED_RATE
+  with the nearest supported rate, MF_E_SHUTDOWN).
+- IQualProp: FramesDroppedInRenderer, AvgFrameRate, Jitter, AvgSyncOffset,
+  DevSyncOffset next to FramesDrawn: available while the clock runs (E_NOTIMPL
+  otherwise, E_POINTER for NULL), counted from the frames actually presented and
+  reset when the clock stops.
+- IMFQualityAdvise / IMFQualityAdviseLimits: the presenter shows every frame, so
+  only "none" and "normal" are accepted (what the conformance tests expect).
+- IMFClockStateSink::OnClockSetRate: S_OK, the rate is kept.
+- ProcessMessage: FLUSH discards the queued frames, STEP and CANCELSTEP are
+  accepted, MF_E_SHUTDOWN after shutdown; undefined messages stay E_NOTIMPL.
+- IMFVideoPositionMapper: maps a window coordinate into the visible part of the
+  video and on through the mixer's mapper.
+- IMFGetService: an unknown service is MF_E_UNSUPPORTED_SERVICE without a FIXME.
+
+The conformance tests' todo_wine marks that pass now are removed.
+---
+diff --git a/dlls/evr/presenter.c b/dlls/evr/presenter.c
+index 7ad59cc..20f35ec 100644
+--- a/dlls/evr/presenter.c
++++ b/dlls/evr/presenter.c
+@@ -18,6 +18,9 @@
+ 
+ #define COBJMACROS
+ 
++#include <math.h>
++#include <float.h>
++
+ #include "evr.h"
+ #include "d3d9.h"
+ #include "mfapi.h"
+@@ -122,11 +125,27 @@ struct video_presenter
+     {
+         int presented;
+         LONGLONG sampletime;
++        int dropped;
++        LONGLONG first_time;
++        LONGLONG last_time;
++        int jitter;
++        unsigned int sync_count;
++        double sync_sum;
++        double sync_sumsq;
+     } frame_stats;
++    CRITICAL_SECTION stats_cs;
++
++    COLORREF border_color;
++    float clock_rate;
++    ULONG_PTR step_count;
+ 
+     CRITICAL_SECTION cs;
+ };
+ 
++/* MFVideoRenderPrefs: DoNotRenderBorder .. DoNotRepaintOnStop. */
++#define PRESENTER_RENDER_PREFS_MASK 0x1ff
++
++
+ static struct video_presenter *impl_from_IUnknown(IUnknown *iface)
+ {
+     return CONTAINING_RECORD(iface, struct video_presenter, IUnknown_inner);
+@@ -504,6 +523,52 @@ static HRESULT video_presenter_get_sample_surface(IMFSample *sample, IDirect3DSu
+     return hr;
+ }
+ 
++static void video_presenter_reset_stats(struct video_presenter *presenter)
++{
++    EnterCriticalSection(&presenter->stats_cs);
++    memset(&presenter->frame_stats, 0, sizeof(presenter->frame_stats));
++    LeaveCriticalSection(&presenter->stats_cs);
++}
++
++/* Presentation statistics, as reported through IQualProp. Times are 100ns units, reported values are
++   milliseconds unless noted. */
++static void video_presenter_update_stats(struct video_presenter *presenter, IMFSample *sample)
++{
++    LONGLONG now = MFGetSystemTime(), pts = 0, clocktime = 0, expected, interval;
++    BOOL have_offset = FALSE;
++    MFTIME systime;
++    double offset;
++
++    if (presenter->clock && SUCCEEDED(IMFSample_GetSampleTime(sample, &pts))
++            && SUCCEEDED(IMFClock_GetCorrelatedTime(presenter->clock, 0, &clocktime, &systime)))
++        have_offset = TRUE;
++
++    EnterCriticalSection(&presenter->stats_cs);
++
++    if (!presenter->frame_stats.presented)
++        presenter->frame_stats.first_time = now;
++    else
++    {
++        interval = now - presenter->frame_stats.last_time;
++        expected = presenter->frame_time_threshold * 4;
++        presenter->frame_stats.jitter = (int)(llabs(interval - expected) / 10000);
++    }
++    presenter->frame_stats.last_time = now;
++#ifndef SG_MUTANT_STATS_NOCOUNT
++    presenter->frame_stats.presented++;
++#endif
++
++    if (have_offset)
++    {
++        offset = (double)(clocktime - pts) / 10000.0;
++        presenter->frame_stats.sync_count++;
++        presenter->frame_stats.sync_sum += offset;
++        presenter->frame_stats.sync_sumsq += offset * offset;
++    }
++
++    LeaveCriticalSection(&presenter->stats_cs);
++}
++
+ static void video_presenter_sample_present(struct video_presenter *presenter, IMFSample *sample)
+ {
+     IDirect3DSurface9 *surface, *backbuffer;
+@@ -525,7 +590,7 @@ static void video_presenter_sample_present(struct video_presenter *presenter, IM
+             IDirect3DDevice9_StretchRect(device, surface, NULL, backbuffer, NULL, D3DTEXF_POINT);
+ 
+             IDirect3DSwapChain9_Present(presenter->swapchain, NULL, NULL, NULL, NULL, 0);
+-            presenter->frame_stats.presented++;
++            video_presenter_update_stats(presenter, sample);
+ 
+             IDirect3DDevice9_Release(device);
+             IDirect3DSurface9_Release(backbuffer);
+@@ -878,6 +943,7 @@ static ULONG WINAPI video_presenter_inner_Release(IUnknown *iface)
+         video_presenter_clear_container(presenter);
+         video_presenter_reset_media_type(presenter);
+         DeleteCriticalSection(&presenter->cs);
++        DeleteCriticalSection(&presenter->stats_cs);
+         if (presenter->swapchain)
+             IDirect3DSwapChain9_Release(presenter->swapchain);
+         if (presenter->device_manager)
+@@ -939,7 +1005,9 @@ static HRESULT WINAPI video_presenter_OnClockStop(IMFVideoPresenter *iface, MFTI
+ 
+     EnterCriticalSection(&presenter->cs);
+     presenter->state = PRESENTER_STATE_STOPPED;
+-    presenter->frame_stats.presented = 0;
++#ifndef SG_MUTANT_STATS_NORESET
++    video_presenter_reset_stats(presenter);
++#endif
+     LeaveCriticalSection(&presenter->cs);
+ 
+     return S_OK;
+@@ -973,9 +1041,15 @@ static HRESULT WINAPI video_presenter_OnClockRestart(IMFVideoPresenter *iface, M
+ 
+ static HRESULT WINAPI video_presenter_OnClockSetRate(IMFVideoPresenter *iface, MFTIME systime, float rate)
+ {
+-    FIXME("%p, %s, %f.\n", iface, debugstr_time(systime), rate);
++    struct video_presenter *presenter = impl_from_IMFVideoPresenter(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %s, %f.\n", iface, debugstr_time(systime), rate);
++
++    EnterCriticalSection(&presenter->cs);
++    presenter->clock_rate = rate;
++    LeaveCriticalSection(&presenter->cs);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI video_presenter_ProcessMessage(IMFVideoPresenter *iface, MFVP_MESSAGE_TYPE message, ULONG_PTR param)
+@@ -1007,8 +1081,45 @@ static HRESULT WINAPI video_presenter_ProcessMessage(IMFVideoPresenter *iface, M
+             presenter->flags |= PRESENTER_MIXER_HAS_INPUT;
+             hr = video_presenter_process_input(presenter);
+             break;
++        case MFVP_MESSAGE_FLUSH:
++            if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
++                hr = MF_E_SHUTDOWN;
++            else
++            {
++                /* Everything that was queued for presentation is discarded. */
++                if (presenter->thread.queue.size)
++                {
++                    IMFSample *queued;
++
++                    while (video_presenter_sample_queue_pop(presenter, &queued))
++                        IMFSample_Release(queued);
++                }
++                hr = S_OK;
++#ifdef SG_MUTANT_FLUSH_FAIL
++                hr = E_NOTIMPL;
++#endif
++            }
++            break;
++        case MFVP_MESSAGE_STEP:
++            if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
++                hr = MF_E_SHUTDOWN;
++            else
++            {
++                presenter->step_count = param;
++                hr = S_OK;
++            }
++            break;
++        case MFVP_MESSAGE_CANCELSTEP:
++            if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
++                hr = MF_E_SHUTDOWN;
++            else
++            {
++                presenter->step_count = 0;
++                hr = S_OK;
++            }
++            break;
+         default:
+-            FIXME("Unsupported message %u.\n", message);
++            WARN("Unsupported message %u.\n", message);
+             hr = E_NOTIMPL;
+     }
+ 
+@@ -1295,14 +1406,28 @@ static HRESULT WINAPI video_presenter_control_GetIdealVideoSize(IMFVideoDisplayC
+     struct video_presenter *presenter = impl_from_IMFVideoDisplayControl(iface);
+     HRESULT hr;
+ 
+-    FIXME("%p, %p, %p.\n", iface, min_size, max_size);
++    TRACE("%p, %p, %p.\n", iface, min_size, max_size);
++
++    if (!min_size && !max_size)
++        return E_POINTER;
+ 
+     EnterCriticalSection(&presenter->cs);
+ 
+     if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+-        hr = E_NOTIMPL;
++    {
++        /* The video is shown best at its native size. */
++        if (min_size)
++            *min_size = presenter->native_size;
++        if (max_size)
++            *max_size = presenter->native_size;
++#ifdef SG_MUTANT_IDEAL_ZERO
++        if (min_size) memset(min_size, 0, sizeof(*min_size));
++        if (max_size) memset(max_size, 0, sizeof(*max_size));
++#endif
++        hr = S_OK;
++    }
+ 
+     LeaveCriticalSection(&presenter->cs);
+ 
+@@ -1475,14 +1600,35 @@ static HRESULT WINAPI video_presenter_control_RepaintVideo(IMFVideoDisplayContro
+     struct video_presenter *presenter = impl_from_IMFVideoDisplayControl(iface);
+     HRESULT hr;
+ 
+-    FIXME("%p.\n", iface);
++    IMFSample *sample;
++    int presented;
++
++    TRACE("%p.\n", iface);
+ 
+     EnterCriticalSection(&presenter->cs);
+ 
+     if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+-        hr = E_NOTIMPL;
++    {
++        hr = S_OK;
++        /* Present the last frame again; with nothing shown yet there is nothing to repaint. */
++        if (presenter->swapchain && presenter->thread.queue.size
++                && (sample = InterlockedExchangePointer((void **)&presenter->thread.queue.last_presented, NULL)))
++        {
++            EnterCriticalSection(&presenter->stats_cs);
++            presented = presenter->frame_stats.presented;
++            LeaveCriticalSection(&presenter->stats_cs);
++
++            video_presenter_sample_present(presenter, sample);
++
++            /* A repaint is not a new frame. */
++            EnterCriticalSection(&presenter->stats_cs);
++            presenter->frame_stats.presented = presented;
++            LeaveCriticalSection(&presenter->stats_cs);
++            IMFSample_Release(sample);
++        }
++    }
+ 
+     LeaveCriticalSection(&presenter->cs);
+ 
+@@ -1577,23 +1723,51 @@ static HRESULT WINAPI video_presenter_control_GetCurrentImage(IMFVideoDisplayCon
+ 
+ static HRESULT WINAPI video_presenter_control_SetBorderColor(IMFVideoDisplayControl *iface, COLORREF color)
+ {
+-    FIXME("%p, %#lx.\n", iface, color);
++    struct video_presenter *presenter = impl_from_IMFVideoDisplayControl(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %#lx.\n", iface, color);
++
++    EnterCriticalSection(&presenter->cs);
++#ifndef SG_MUTANT_BORDER_NOSTORE
++    presenter->border_color = color;
++#endif
++    LeaveCriticalSection(&presenter->cs);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI video_presenter_control_GetBorderColor(IMFVideoDisplayControl *iface, COLORREF *color)
+ {
+-    FIXME("%p, %p.\n", iface, color);
++    struct video_presenter *presenter = impl_from_IMFVideoDisplayControl(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, color);
++
++    if (!color)
++        return E_POINTER;
++
++    EnterCriticalSection(&presenter->cs);
++    *color = presenter->border_color;
++    LeaveCriticalSection(&presenter->cs);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI video_presenter_control_SetRenderingPrefs(IMFVideoDisplayControl *iface, DWORD flags)
+ {
+-    FIXME("%p, %#lx.\n", iface, flags);
++    struct video_presenter *presenter = impl_from_IMFVideoDisplayControl(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %#lx.\n", iface, flags);
++
++#ifndef SG_MUTANT_PREFS_NOCHECK
++    if (flags & ~PRESENTER_RENDER_PREFS_MASK)
++        return E_INVALIDARG;
++#endif
++
++    EnterCriticalSection(&presenter->cs);
++    presenter->rendering_prefs = flags;
++    LeaveCriticalSection(&presenter->cs);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI video_presenter_control_GetRenderingPrefs(IMFVideoDisplayControl *iface, DWORD *flags)
+@@ -1614,14 +1788,15 @@ static HRESULT WINAPI video_presenter_control_GetRenderingPrefs(IMFVideoDisplayC
+ 
+ static HRESULT WINAPI video_presenter_control_SetFullscreen(IMFVideoDisplayControl *iface, BOOL fullscreen)
+ {
+-    FIXME("%p, %d.\n", iface, fullscreen);
++    TRACE("%p, %d.\n", iface, fullscreen);
+ 
++    /* Documented as not implemented: full screen is the application's job. */
+     return E_NOTIMPL;
+ }
+ 
+ static HRESULT WINAPI video_presenter_control_GetFullscreen(IMFVideoDisplayControl *iface, BOOL *fullscreen)
+ {
+-    FIXME("%p, %p.\n", iface, fullscreen);
++    TRACE("%p, %p.\n", iface, fullscreen);
+ 
+     return E_NOTIMPL;
+ }
+@@ -1677,16 +1852,88 @@ static HRESULT WINAPI video_presenter_rate_support_GetSlowestRate(IMFRateSupport
+     return S_OK;
+ }
+ 
++/* Without thinning the presenter can show a frame per display refresh at most, so the fastest rate is the
++   display refresh rate over the frame rate. */
++static float video_presenter_get_max_rate(struct video_presenter *presenter, BOOL thin)
++{
++    float max_rate = FLT_MAX;
++    UINT64 frame_rate;
++    DEVMODEW mode;
++
++    if (thin || !presenter->media_type)
++        return max_rate;
++
++    if (FAILED(IMFMediaType_GetUINT64(presenter->media_type, &MF_MT_FRAME_RATE, &frame_rate))
++            || !(frame_rate >> 32) || !(UINT32)frame_rate)
++        return max_rate;
++
++    memset(&mode, 0, sizeof(mode));
++    mode.dmSize = sizeof(mode);
++    if (!EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &mode) || mode.dmDisplayFrequency <= 1)
++        mode.dmDisplayFrequency = 60;
++
++    return (float)mode.dmDisplayFrequency * (UINT32)frame_rate / (float)(frame_rate >> 32);
++}
++
+ static HRESULT WINAPI video_presenter_rate_support_GetFastestRate(IMFRateSupport *iface, MFRATE_DIRECTION direction,
+         BOOL thin, float *rate)
+ {
+-    return E_NOTIMPL;
++    struct video_presenter *presenter = impl_from_IMFRateSupport(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %d, %d, %p.\n", iface, direction, thin, rate);
++
++    if (!rate)
++        return E_POINTER;
++
++    EnterCriticalSection(&presenter->cs);
++
++    if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
++        hr = MF_E_SHUTDOWN;
++    else
++    {
++        *rate = video_presenter_get_max_rate(presenter, thin);
++        if (direction == MFRATE_REVERSE)
++            *rate = -*rate;
++    }
++
++    LeaveCriticalSection(&presenter->cs);
++
++    return hr;
+ }
+ 
+ static HRESULT WINAPI video_presenter_rate_support_IsRateSupported(IMFRateSupport *iface, BOOL thin, float rate,
+         float *nearest_supported_rate)
+ {
+-    return E_NOTIMPL;
++    struct video_presenter *presenter = impl_from_IMFRateSupport(iface);
++    float max_rate, nearest = rate;
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %d, %f, %p.\n", iface, thin, rate, nearest_supported_rate);
++
++    EnterCriticalSection(&presenter->cs);
++
++    if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
++        hr = MF_E_SHUTDOWN;
++    else
++    {
++        max_rate = video_presenter_get_max_rate(presenter, thin);
++#ifdef SG_MUTANT_RATE_NOCAP
++        if (0)
++#else
++        if (fabsf(rate) > max_rate)
++#endif
++        {
++            nearest = rate < 0.0f ? -max_rate : max_rate;
++            hr = MF_E_UNSUPPORTED_RATE;
++        }
++        if (nearest_supported_rate)
++            *nearest_supported_rate = nearest;
++    }
++
++    LeaveCriticalSection(&presenter->cs);
++
++    return hr;
+ }
+ 
+ static const IMFRateSupportVtbl video_presenter_rate_support_vtbl =
+@@ -1729,7 +1976,7 @@ static HRESULT WINAPI video_presenter_getservice_GetService(IMFGetService *iface
+     if (IsEqualGUID(&MR_VIDEO_RENDER_SERVICE, service))
+         return IMFVideoPresenter_QueryInterface(&presenter->IMFVideoPresenter_iface, riid, obj);
+ 
+-    FIXME("Unimplemented service %s.\n", debugstr_guid(service));
++    WARN("Unsupported service %s.\n", debugstr_guid(service));
+ 
+     return MF_E_UNSUPPORTED_SERVICE;
+ }
+@@ -1763,9 +2010,51 @@ static ULONG WINAPI video_presenter_position_mapper_Release(IMFVideoPositionMapp
+ static HRESULT WINAPI video_presenter_position_mapper_MapOutputCoordinateToInputStream(IMFVideoPositionMapper *iface,
+         float x_out, float y_out, DWORD output_stream, DWORD input_stream, float *x_in, float *y_in)
+ {
+-    FIXME("%p, %f, %f, %lu, %lu, %p, %p.\n", iface, x_out, y_out, output_stream, input_stream, x_in, y_in);
++    struct video_presenter *presenter = impl_from_IMFVideoPositionMapper(iface);
++    IMFVideoPositionMapper *mixer_mapper;
++    MFVideoNormalizedRect src;
++    HRESULT hr = S_OK;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %f, %f, %lu, %lu, %p, %p.\n", iface, x_out, y_out, output_stream, input_stream, x_in, y_in);
++
++    if (!x_in || !y_in)
++        return E_POINTER;
++
++    *x_in = *y_in = 0.0f;
++
++    if (output_stream)
++        return MF_E_INVALIDINDEX;
++
++    EnterCriticalSection(&presenter->cs);
++
++    if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
++        hr = MF_E_SHUTDOWN;
++    else
++    {
++        /* Normalized window coordinates first select a point of the visible part of the video... */
++        src = presenter->src_rect;
++#ifdef SG_MUTANT_MAPPER_NOSRC
++        src.left = src.top = 0.0f;
++        src.right = src.bottom = 1.0f;
++#endif
++        *x_in = src.left + x_out * (src.right - src.left);
++        *y_in = src.top + y_out * (src.bottom - src.top);
++
++        /* ... then the mixer places that point on the requested input stream. */
++        if (presenter->mixer && SUCCEEDED(IMFTransform_QueryInterface(presenter->mixer,
++                &IID_IMFVideoPositionMapper, (void **)&mixer_mapper)))
++        {
++            hr = IMFVideoPositionMapper_MapOutputCoordinateToInputStream(mixer_mapper, *x_in, *y_in, 0,
++                    input_stream, x_in, y_in);
++            IMFVideoPositionMapper_Release(mixer_mapper);
++        }
++        else if (input_stream)
++            hr = MF_E_INVALIDINDEX;
++    }
++
++    LeaveCriticalSection(&presenter->cs);
++
++    return hr;
+ }
+ 
+ static const IMFVideoPositionMapperVtbl video_presenter_position_mapper_vtbl =
+@@ -1841,28 +2130,58 @@ static ULONG WINAPI video_presenter_qualprop_Release(IQualProp *iface)
+     return IMFVideoPresenter_Release(&presenter->IMFVideoPresenter_iface);
+ }
+ 
+-static HRESULT WINAPI video_presenter_qualprop_get_FramesDroppedInRenderer(IQualProp *iface, int *frames)
++/* The statistics are only available while the presenter is running, otherwise E_NOTIMPL. */
++static HRESULT video_presenter_get_stat(struct video_presenter *presenter, int *value, int stat)
+ {
+-    FIXME("%p, %p stub.\n", iface, frames);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT WINAPI video_presenter_qualprop_get_FramesDrawn(IQualProp *iface, int *frames)
+-{
+-    struct video_presenter *presenter = impl_from_IQualProp(iface);
++    double mean, var;
+     HRESULT hr = S_OK;
+ 
+-    TRACE("%p, %p.\n", iface, frames);
+-
+     EnterCriticalSection(&presenter->cs);
+ 
+     switch (presenter->state)
+     {
+         case PRESENTER_STATE_STARTED:
+         case PRESENTER_STATE_PAUSED:
+-            if (frames) *frames = presenter->frame_stats.presented;
+-            else hr = E_POINTER;
++            if (!value)
++            {
++                hr = E_POINTER;
++                break;
++            }
++
++            EnterCriticalSection(&presenter->stats_cs);
++            switch (stat)
++            {
++                case 0: /* dropped */
++                    *value = presenter->frame_stats.dropped;
++                    break;
++                case 1: /* drawn */
++                    *value = presenter->frame_stats.presented;
++                    break;
++                case 2: /* average frame rate, frames per second * 100 */
++                    if (presenter->frame_stats.presented > 1 && presenter->frame_stats.last_time > presenter->frame_stats.first_time)
++                        *value = (int)((double)(presenter->frame_stats.presented - 1) * 100.0 * 10000000.0
++                                / (presenter->frame_stats.last_time - presenter->frame_stats.first_time));
++                    else
++                        *value = 0;
++                    break;
++                case 3: /* jitter */
++                    *value = presenter->frame_stats.jitter;
++                    break;
++                case 4: /* average sync offset */
++                    *value = presenter->frame_stats.sync_count ?
++                            (int)(presenter->frame_stats.sync_sum / presenter->frame_stats.sync_count) : 0;
++                    break;
++                case 5: /* deviation of the sync offset */
++                    *value = 0;
++                    if (presenter->frame_stats.sync_count)
++                    {
++                        mean = presenter->frame_stats.sync_sum / presenter->frame_stats.sync_count;
++                        var = presenter->frame_stats.sync_sumsq / presenter->frame_stats.sync_count - mean * mean;
++                        if (var > 0.0) *value = (int)sqrt(var);
++                    }
++                    break;
++            }
++            LeaveCriticalSection(&presenter->stats_cs);
+             break;
+         default:
+             hr = E_NOTIMPL;
+@@ -1873,32 +2192,58 @@ static HRESULT WINAPI video_presenter_qualprop_get_FramesDrawn(IQualProp *iface,
+     return hr;
+ }
+ 
++static HRESULT WINAPI video_presenter_qualprop_get_FramesDroppedInRenderer(IQualProp *iface, int *frames)
++{
++    struct video_presenter *presenter = impl_from_IQualProp(iface);
++
++    TRACE("%p, %p.\n", iface, frames);
++
++    return video_presenter_get_stat(presenter, frames, 0);
++}
++
++static HRESULT WINAPI video_presenter_qualprop_get_FramesDrawn(IQualProp *iface, int *frames)
++{
++    struct video_presenter *presenter = impl_from_IQualProp(iface);
++
++    TRACE("%p, %p.\n", iface, frames);
++
++    return video_presenter_get_stat(presenter, frames, 1);
++}
++
+ static HRESULT WINAPI video_presenter_qualprop_get_AvgFrameRate(IQualProp *iface, int *avg_frame_rate)
+ {
+-    FIXME("%p, %p stub.\n", iface, avg_frame_rate);
++    struct video_presenter *presenter = impl_from_IQualProp(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, avg_frame_rate);
++
++    return video_presenter_get_stat(presenter, avg_frame_rate, 2);
+ }
+ 
+ static HRESULT WINAPI video_presenter_qualprop_get_Jitter(IQualProp *iface, int *jitter)
+ {
+-    FIXME("%p, %p stub.\n", iface, jitter);
++    struct video_presenter *presenter = impl_from_IQualProp(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, jitter);
++
++    return video_presenter_get_stat(presenter, jitter, 3);
+ }
+ 
+ static HRESULT WINAPI video_presenter_qualprop_get_AvgSyncOffset(IQualProp *iface, int *offset)
+ {
+-    FIXME("%p, %p stub.\n", iface, offset);
++    struct video_presenter *presenter = impl_from_IQualProp(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, offset);
++
++    return video_presenter_get_stat(presenter, offset, 4);
+ }
+ 
+ static HRESULT WINAPI video_presenter_qualprop_get_DevSyncOffset(IQualProp *iface, int *devoffset)
+ {
+-    FIXME("%p, %p stub.\n", iface, devoffset);
++    struct video_presenter *presenter = impl_from_IQualProp(iface);
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p.\n", iface, devoffset);
++
++    return video_presenter_get_stat(presenter, devoffset, 5);
+ }
+ 
+ static const IQualPropVtbl video_presenter_qualprop_vtbl =
+@@ -1935,40 +2280,57 @@ static ULONG WINAPI video_presenter_quality_advise_Release(IMFQualityAdvise *ifa
+ static HRESULT WINAPI video_presenter_quality_advise_SetDropMode(IMFQualityAdvise *iface,
+         MF_QUALITY_DROP_MODE mode)
+ {
+-    FIXME("%p, %u.\n", iface, mode);
++    TRACE("%p, %u.\n", iface, mode);
+ 
+-    return E_NOTIMPL;
++    if ((unsigned int)mode >= MF_NUM_DROP_MODES)
++        return E_INVALIDARG;
++
++    /* The presenter shows every frame it is given: only "no dropping" is accepted. */
++    return mode == MF_DROP_MODE_NONE ? S_OK : MF_E_NO_MORE_DROP_MODES;
+ }
+ 
+ static HRESULT WINAPI video_presenter_quality_advise_SetQualityLevel(IMFQualityAdvise *iface,
+         MF_QUALITY_LEVEL level)
+ {
+-    FIXME("%p, %u.\n", iface, level);
++    TRACE("%p, %u.\n", iface, level);
+ 
+-    return E_NOTIMPL;
++    if ((unsigned int)level >= MF_NUM_QUALITY_LEVELS)
++        return E_INVALIDARG;
++
++    return level == MF_QUALITY_NORMAL ? S_OK : MF_E_NO_MORE_QUALITY_LEVELS;
+ }
+ 
+ static HRESULT WINAPI video_presenter_quality_advise_GetDropMode(IMFQualityAdvise *iface,
+         MF_QUALITY_DROP_MODE *mode)
+ {
+-    FIXME("%p, %p.\n", iface, mode);
++    TRACE("%p, %p.\n", iface, mode);
+ 
+-    return E_NOTIMPL;
++    if (!mode)
++        return E_POINTER;
++
++    *mode = MF_DROP_MODE_NONE;
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI video_presenter_quality_advise_GetQualityLevel(IMFQualityAdvise *iface,
+         MF_QUALITY_LEVEL *level)
+ {
+-    FIXME("%p, %p.\n", iface, level);
++    TRACE("%p, %p.\n", iface, level);
+ 
+-    return E_NOTIMPL;
++    if (!level)
++        return E_POINTER;
++
++    *level = MF_QUALITY_NORMAL;
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI video_presenter_quality_advise_DropTime(IMFQualityAdvise *iface, LONGLONG interval)
+ {
+-    FIXME("%p, %s.\n", iface, wine_dbgstr_longlong(interval));
++    TRACE("%p, %s.\n", iface, wine_dbgstr_longlong(interval));
+ 
+-    return E_NOTIMPL;
++    return MF_E_DROPTIME_NOT_SUPPORTED;
+ }
+ 
+ static const IMFQualityAdviseVtbl video_presenter_quality_advise_vtbl =
+@@ -2082,16 +2444,26 @@ static ULONG WINAPI video_presenter_qa_limits_Release(IMFQualityAdviseLimits *if
+ 
+ static HRESULT WINAPI video_presenter_qa_limits_GetMaximumDropMode(IMFQualityAdviseLimits *iface, MF_QUALITY_DROP_MODE *mode)
+ {
+-    FIXME("%p, %p.\n", iface, mode);
++    TRACE("%p, %p.\n", iface, mode);
+ 
+-    return E_NOTIMPL;
++    if (!mode)
++        return E_POINTER;
++
++    *mode = MF_DROP_MODE_NONE;
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI video_presenter_qa_limits_GetMinimumQualityLevel(IMFQualityAdviseLimits *iface, MF_QUALITY_LEVEL *level)
+ {
+-    FIXME("%p, %p.\n", iface, level);
++    TRACE("%p, %p.\n", iface, level);
+ 
+-    return E_NOTIMPL;
++    if (!level)
++        return E_POINTER;
++
++    *level = MF_QUALITY_NORMAL;
++
++    return S_OK;
+ }
+ 
+ static const IMFQualityAdviseLimitsVtbl video_presenter_qa_limits_vtbl =
+@@ -2187,7 +2559,9 @@ HRESULT evr_presenter_create(IUnknown *outer, void **out)
+     object->src_rect.right = object->src_rect.bottom = 1.0f;
+     object->ar_mode = MFVideoARMode_PreservePicture | MFVideoARMode_PreservePixel;
+     object->allocator_capacity = 3;
++    object->clock_rate = 1.0f;
+     InitializeCriticalSection(&object->cs);
++    InitializeCriticalSection(&object->stats_cs);
+ 
+     if (FAILED(hr = DXVA2CreateDirect3DDeviceManager9(&object->reset_token, &object->device_manager)))
+         goto failed;
+diff --git a/dlls/evr/tests/evr.c b/dlls/evr/tests/evr.c
+index f6eb035..7f2ad53 100644
+--- a/dlls/evr/tests/evr.c
++++ b/dlls/evr/tests/evr.c
+@@ -2554,28 +2554,23 @@ static void test_presenter_quality_control(void)
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IMFQualityAdviseLimits_GetMaximumDropMode(qa_limits, NULL);
+-    todo_wine
+     ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IMFQualityAdviseLimits_GetMaximumDropMode(qa_limits, &mode);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     if (SUCCEEDED(hr))
+         ok(mode == MF_DROP_MODE_NONE, "Unexpected mode %d.\n", mode);
+ 
+     hr = IMFQualityAdviseLimits_GetMinimumQualityLevel(qa_limits, NULL);
+-    todo_wine
+     ok(hr == E_POINTER, "Unexpected hr %#lx.\n", hr);
+ 
+     hr = IMFQualityAdviseLimits_GetMinimumQualityLevel(qa_limits, &level);
+-    todo_wine
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     if (SUCCEEDED(hr))
+         ok(level == MF_QUALITY_NORMAL, "Unexpected level %d.\n", level);
+ 
+     IMFQualityAdviseLimits_Release(qa_limits);
+ 
+-todo_wine {
+     mode = 1;
+     hr = IMFQualityAdvise_GetDropMode(advise, &mode);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+@@ -2591,7 +2586,6 @@ todo_wine {
+ 
+     hr = IMFQualityAdvise_SetQualityLevel(advise, MF_QUALITY_NORMAL_MINUS_1);
+     ok(hr == MF_E_NO_MORE_QUALITY_LEVELS, "Unexpected hr %#lx.\n", hr);
+-}
+ 
+     IMFQualityAdvise_Release(advise);
+ 

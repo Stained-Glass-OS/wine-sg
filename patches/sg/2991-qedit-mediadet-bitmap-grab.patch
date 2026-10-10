@@ -1,0 +1,539 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] qedit: IMediaDet bitmap grabbing; drop FIXMEs on correct returns
+
+IMediaDet::EnterBitmapGrabMode builds a sample grabber (24-bit RGB) and a null
+renderer behind the current video stream and seeks to the requested time.
+GetBitmapBits seeks, runs the graph for one frame and returns a bottom-up
+24-bit DIB (header and pixels) of the requested size (0 means the native size;
+rows are 4-byte aligned, scaling is nearest-neighbour); with no buffer it only
+reports the size. WriteBitmapBits writes the same bitmap as a .bmp file and
+GetSampleGrabber hands out the grabber once grab mode is on
+(VFW_E_WRONG_STATE before). Changing the current stream leaves grab mode.
+SampleGrabber's IMemInputPin::GetAllocatorRequirements (E_NOTIMPL when it is
+not connected to a downstream pin, as the conformance test expects) and the
+class factory's LockServer no longer log FIXMEs.
+---
+diff --git a/dlls/qedit/main.c b/dlls/qedit/main.c
+index 652da93..4542292 100644
+--- a/dlls/qedit/main.c
++++ b/dlls/qedit/main.c
+@@ -122,7 +122,7 @@ static HRESULT WINAPI DSCF_CreateInstance(IClassFactory *iface, IUnknown *pOuter
+ static HRESULT WINAPI DSCF_LockServer(IClassFactory *iface, BOOL dolock)
+ {
+     IClassFactoryImpl *This = impl_from_IClassFactory(iface);
+-    FIXME("(%p)->(%d),stub!\n",This,dolock);
++    TRACE("(%p)->(%d)\n",This,dolock);
+     return S_OK;
+ }
+ 
+diff --git a/dlls/qedit/mediadet.c b/dlls/qedit/mediadet.c
+index 5fbd931..8b4650a 100644
+--- a/dlls/qedit/mediadet.c
++++ b/dlls/qedit/mediadet.c
+@@ -44,6 +44,9 @@ typedef struct MediaDetImpl {
+     LONG num_streams;
+     LONG cur_stream;
+     IPin *cur_pin;
++    IBaseFilter *grabber_filter;
++    ISampleGrabber *grabber;
++    IBaseFilter *null_renderer;
+ } MediaDetImpl;
+ 
+ static inline MediaDetImpl *impl_from_IUnknown(IUnknown *iface)
+@@ -56,8 +59,38 @@ static inline MediaDetImpl *impl_from_IMediaDet(IMediaDet *iface)
+     return CONTAINING_RECORD(iface, MediaDetImpl, IMediaDet_iface);
+ }
+ 
++static void exit_grab_mode(MediaDetImpl *This)
++{
++    IMediaControl *control;
++
++    if (!This->grabber)
++        return;
++
++    if (This->graph && SUCCEEDED(IGraphBuilder_QueryInterface(This->graph,
++            &IID_IMediaControl, (void **)&control)))
++    {
++        IMediaControl_Stop(control);
++        IMediaControl_Release(control);
++    }
++
++    if (This->graph)
++    {
++        if (This->cur_pin)
++            IGraphBuilder_Disconnect(This->graph, This->cur_pin);
++        IGraphBuilder_RemoveFilter(This->graph, This->grabber_filter);
++        IGraphBuilder_RemoveFilter(This->graph, This->null_renderer);
++    }
++    ISampleGrabber_Release(This->grabber);
++    IBaseFilter_Release(This->grabber_filter);
++    IBaseFilter_Release(This->null_renderer);
++    This->grabber = NULL;
++    This->grabber_filter = NULL;
++    This->null_renderer = NULL;
++}
++
+ static void MD_cleanup(MediaDetImpl *This)
+ {
++    exit_grab_mode(This);
+     if (This->cur_pin) IPin_Release(This->cur_pin);
+     This->cur_pin = NULL;
+     if (This->source) IBaseFilter_Release(This->source);
+@@ -477,6 +510,10 @@ static HRESULT WINAPI MediaDet_put_CurrentStream(IMediaDet* iface, LONG newVal)
+     if (newVal < 0 || This->num_streams <= newVal)
+         return E_INVALIDARG;
+ 
++#ifndef SG_MUTANT_MD_EXIT
++    exit_grab_mode(This);
++#endif
++
+     hr = SetCurPin(This, newVal);
+     if (FAILED(hr))
+         return hr;
+@@ -617,15 +654,346 @@ static HRESULT WINAPI MediaDet_put_Filename(IMediaDet *iface, BSTR filename)
+     return MediaDet_put_CurrentStream(iface, 0);
+ }
+ 
++/* Native frame size of the current video stream, from the splitter pin's media type. */
++static HRESULT get_video_size(MediaDetImpl *This, LONG *width, LONG *height)
++{
++    const VIDEOINFOHEADER *vih;
++    AM_MEDIA_TYPE mt;
++    HRESULT hr;
++
++    if (!This->cur_pin)
++        return E_INVALIDARG;
++    if (FAILED(hr = get_pin_media_type(This->cur_pin, &mt)))
++        return hr;
++
++    if (!IsEqualGUID(&mt.majortype, &MEDIATYPE_Video) || !mt.pbFormat
++            || (!IsEqualGUID(&mt.formattype, &FORMAT_VideoInfo)
++                && !IsEqualGUID(&mt.formattype, &FORMAT_VideoInfo2))
++            || mt.cbFormat < sizeof(VIDEOINFOHEADER))
++    {
++        FreeMediaType(&mt);
++        return VFW_E_INVALIDMEDIATYPE;
++    }
++
++    vih = (const VIDEOINFOHEADER *)mt.pbFormat;
++    *width = vih->bmiHeader.biWidth;
++    *height = abs(vih->bmiHeader.biHeight);
++    FreeMediaType(&mt);
++    return S_OK;
++}
++
++static HRESULT seek_to(MediaDetImpl *This, double time)
++{
++    IMediaSeeking *seeking;
++    LONGLONG position;
++    HRESULT hr;
++
++    if (FAILED(hr = IGraphBuilder_QueryInterface(This->graph, &IID_IMediaSeeking, (void **)&seeking)))
++        return hr;
++
++    position = (LONGLONG)(time * 10000000.0);
++#ifdef SG_MUTANT_MD_SEEK
++    IMediaSeeking_Release(seeking);
++    return S_OK;
++#endif
++    hr = IMediaSeeking_SetPositions(seeking, &position, AM_SEEKING_AbsolutePositioning,
++            NULL, AM_SEEKING_NoPositioning);
++    IMediaSeeking_Release(seeking);
++    return hr;
++}
++
++/* Puts a sample grabber and a null renderer behind the current video stream. */
++static HRESULT enter_grab_mode(MediaDetImpl *This, double seek_time)
++{
++    IBaseFilter *grabber_filter = NULL, *renderer = NULL;
++    ISampleGrabber *grabber = NULL;
++    IPin *grabber_in = NULL, *grabber_out = NULL, *renderer_in = NULL;
++    AM_MEDIA_TYPE mt = {{0}};
++    LONG width, height;
++    IUnknown *unk;
++    HRESULT hr;
++
++    if (!This->graph || !This->cur_pin)
++        return E_INVALIDARG;
++    if (seek_time < 0.0)
++        return E_INVALIDARG;
++    if (FAILED(hr = get_video_size(This, &width, &height)))
++        return hr;
++
++    if (This->grabber)
++        return seek_to(This, seek_time);
++
++    if (FAILED(hr = sample_grabber_create(NULL, &unk)))
++        return hr;
++    hr = IUnknown_QueryInterface(unk, &IID_IBaseFilter, (void **)&grabber_filter);
++    if (SUCCEEDED(hr))
++        hr = IUnknown_QueryInterface(unk, &IID_ISampleGrabber, (void **)&grabber);
++    IUnknown_Release(unk);
++    if (FAILED(hr))
++        goto fail;
++
++    if (FAILED(hr = null_renderer_create(NULL, &unk)))
++        goto fail;
++    hr = IUnknown_QueryInterface(unk, &IID_IBaseFilter, (void **)&renderer);
++    IUnknown_Release(unk);
++    if (FAILED(hr))
++        goto fail;
++
++    /* Frames are always delivered as 24-bit RGB; the graph inserts converters. */
++    mt.majortype = MEDIATYPE_Video;
++    mt.subtype = MEDIASUBTYPE_RGB24;
++    if (FAILED(hr = ISampleGrabber_SetMediaType(grabber, &mt)))
++        goto fail;
++    ISampleGrabber_SetOneShot(grabber, TRUE);
++    ISampleGrabber_SetBufferSamples(grabber, TRUE);
++
++    if (FAILED(hr = IGraphBuilder_AddFilter(This->graph, grabber_filter, L"Grabber")))
++        goto fail;
++    if (FAILED(hr = IGraphBuilder_AddFilter(This->graph, renderer, L"Null Renderer")))
++    {
++        IGraphBuilder_RemoveFilter(This->graph, grabber_filter);
++        goto fail;
++    }
++
++    if (FAILED(hr = IBaseFilter_FindPin(grabber_filter, L"In", &grabber_in))
++            || FAILED(hr = IBaseFilter_FindPin(grabber_filter, L"Out", &grabber_out))
++            || FAILED(hr = IBaseFilter_FindPin(renderer, L"In", &renderer_in))
++            || FAILED(hr = IGraphBuilder_Connect(This->graph, This->cur_pin, grabber_in))
++            || FAILED(hr = IGraphBuilder_Connect(This->graph, grabber_out, renderer_in)))
++    {
++        IGraphBuilder_Disconnect(This->graph, This->cur_pin);
++        IGraphBuilder_RemoveFilter(This->graph, grabber_filter);
++        IGraphBuilder_RemoveFilter(This->graph, renderer);
++        goto fail;
++    }
++    IPin_Release(grabber_in);
++    IPin_Release(grabber_out);
++    IPin_Release(renderer_in);
++
++    This->grabber_filter = grabber_filter;
++    This->grabber = grabber;
++    This->null_renderer = renderer;
++
++    if (FAILED(hr = seek_to(This, seek_time)))
++    {
++        exit_grab_mode(This);
++        return hr;
++    }
++    return S_OK;
++
++fail:
++    if (grabber_in) IPin_Release(grabber_in);
++    if (grabber_out) IPin_Release(grabber_out);
++    if (renderer_in) IPin_Release(renderer_in);
++    if (grabber) ISampleGrabber_Release(grabber);
++    if (grabber_filter) IBaseFilter_Release(grabber_filter);
++    if (renderer) IBaseFilter_Release(renderer);
++    return hr;
++}
++
++static LONG dib_stride(LONG width)
++{
++#ifdef SG_MUTANT_MD_STRIDE
++    return width * 3;
++#endif
++    return ((width * 24 + 31) >> 3) & ~3;
++}
++
++/* Grabs the frame at the given time and returns it as a 24-bit bottom-up DIB
++ * (header followed by pixels) of the requested size; free() the result. */
++static HRESULT grab_bitmap(MediaDetImpl *This, double time, LONG width, LONG height,
++        BITMAPINFOHEADER **out, DWORD *out_size)
++{
++    IMediaControl *control;
++    IMediaEvent *event;
++    AM_MEDIA_TYPE mt;
++    const VIDEOINFOHEADER *vih;
++    BITMAPINFOHEADER *dib = NULL;
++    LONG src_size = 0, evcode, src_width, src_height;
++    void *src_bits = NULL;
++    HRESULT hr;
++
++    if (FAILED(hr = enter_grab_mode(This, time)))
++        return hr;
++
++    /* Wait for exactly one new frame. */
++    ISampleGrabber_SetBufferSamples(This->grabber, FALSE);
++    ISampleGrabber_SetBufferSamples(This->grabber, TRUE);
++    ISampleGrabber_SetOneShot(This->grabber, TRUE);
++
++    if (FAILED(hr = IGraphBuilder_QueryInterface(This->graph, &IID_IMediaControl, (void **)&control)))
++        return hr;
++    if (FAILED(hr = IGraphBuilder_QueryInterface(This->graph, &IID_IMediaEvent, (void **)&event)))
++    {
++        IMediaControl_Release(control);
++        return hr;
++    }
++
++    /* Forget completion events of earlier grabs. */
++    {
++        LONG code;
++        LONG_PTR p1, p2;
++
++        while (SUCCEEDED(IMediaEvent_GetEvent(event, &code, &p1, &p2, 0)))
++            IMediaEvent_FreeEventParams(event, code, p1, p2);
++    }
++
++    hr = IMediaControl_Run(control);
++    if (SUCCEEDED(hr))
++    {
++        DWORD deadline = GetTickCount() + 10000;
++        BOOL completed = FALSE;
++
++        /* The frame is there once the grabber holds a buffer; the graph
++         * reporting completion without one means there was no frame. */
++        for (;;)
++        {
++            if (SUCCEEDED(ISampleGrabber_GetCurrentBuffer(This->grabber, &src_size, NULL)) && src_size)
++                break;
++            if ((LONG)(GetTickCount() - deadline) > 0)
++            {
++                hr = E_FAIL;
++                break;
++            }
++            if (completed)
++            {
++                Sleep(50);
++                if (!(SUCCEEDED(ISampleGrabber_GetCurrentBuffer(This->grabber, &src_size, NULL)) && src_size))
++                    hr = E_FAIL;
++                break;
++            }
++            completed = (IMediaEvent_WaitForCompletion(event, 0, &evcode) == S_OK);
++            if (!completed)
++                Sleep(2);
++        }
++        IMediaControl_Stop(control);
++    }
++    IMediaEvent_Release(event);
++    IMediaControl_Release(control);
++    if (FAILED(hr))
++        return hr;
++
++    if (FAILED(hr = ISampleGrabber_GetConnectedMediaType(This->grabber, &mt)))
++        return hr;
++    if (!IsEqualGUID(&mt.formattype, &FORMAT_VideoInfo) || mt.cbFormat < sizeof(VIDEOINFOHEADER))
++    {
++        FreeMediaType(&mt);
++        return VFW_E_INVALIDMEDIATYPE;
++    }
++    vih = (const VIDEOINFOHEADER *)mt.pbFormat;
++    src_width = vih->bmiHeader.biWidth;
++    src_height = vih->bmiHeader.biHeight;
++
++    if (FAILED(hr = ISampleGrabber_GetCurrentBuffer(This->grabber, &src_size, NULL)) || !src_size)
++        goto done;
++    if (!(src_bits = malloc(src_size)))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    if (FAILED(hr = ISampleGrabber_GetCurrentBuffer(This->grabber, &src_size, src_bits)))
++        goto done;
++
++    if (!width) width = src_width;
++    if (!height) height = abs(src_height);
++
++    *out_size = sizeof(BITMAPINFOHEADER) + dib_stride(width) * height;
++    if (!(dib = calloc(1, *out_size)))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    dib->biSize = sizeof(BITMAPINFOHEADER);
++    dib->biWidth = width;
++    dib->biHeight = height;
++    dib->biPlanes = 1;
++    dib->biBitCount = 24;
++    dib->biCompression = BI_RGB;
++    dib->biSizeImage = dib_stride(width) * height;
++
++    {
++        /* Nearest-neighbour scaling, sampling in top-down coordinates; the
++         * result is a bottom-up DIB whatever the orientation of the source. */
++        LONG src_stride = dib_stride(src_width), dst_stride = dib_stride(width);
++        LONG abs_src_height = abs(src_height), x, y;
++        BYTE *dst = (BYTE *)(dib + 1);
++        const BYTE *src = src_bits;
++
++        if (src_stride * abs_src_height > src_size)
++        {
++            hr = E_FAIL;
++            goto done;
++        }
++
++        for (y = 0; y < height; ++y)
++        {
++            LONG top = height - 1 - y;
++            LONG src_top = (LONG)((LONGLONG)top * abs_src_height / height);
++#ifdef SG_MUTANT_MD_FLIP
++            LONG src_y = (src_height < 0) ? abs_src_height - 1 - src_top : src_top;
++#else
++            LONG src_y = (src_height > 0) ? abs_src_height - 1 - src_top : src_top;
++#endif
++            const BYTE *src_row = src + src_y * src_stride;
++
++            for (x = 0; x < width; ++x)
++                memcpy(dst + y * dst_stride + x * 3, src_row + ((LONGLONG)x * src_width / width) * 3, 3);
++        }
++    }
++
++    *out = dib;
++    dib = NULL;
++    hr = S_OK;
++
++done:
++    free(dib);
++    free(src_bits);
++    FreeMediaType(&mt);
++    return hr;
++}
++
+ static HRESULT WINAPI MediaDet_GetBitmapBits(IMediaDet* iface,
+                                              double StreamTime,
+                                              LONG *pBufferSize, char *pBuffer,
+                                              LONG Width, LONG Height)
+ {
+     MediaDetImpl *This = impl_from_IMediaDet(iface);
+-    FIXME("(%p)->(%.16e %p %p %ld %ld): not implemented!\n", This, StreamTime, pBufferSize, pBuffer,
+-          Width, Height);
+-    return E_NOTIMPL;
++    BITMAPINFOHEADER *dib;
++    DWORD size;
++    HRESULT hr;
++
++    TRACE("(%p)->(%.16e %p %p %ld %ld)\n", This, StreamTime, pBufferSize, pBuffer, Width, Height);
++
++    if (!pBufferSize)
++        return E_POINTER;
++    if (Width < 0 || Height < 0)
++        return E_INVALIDARG;
++
++    if (!pBuffer)
++    {
++        LONG native_w, native_h;
++
++        /* Only the size of the result is asked for. */
++        if (FAILED(hr = get_video_size(This, &native_w, &native_h)))
++            return hr;
++        *pBufferSize = sizeof(BITMAPINFOHEADER) + dib_stride(Width ? Width : native_w) * (Height ? Height : native_h);
++        return S_OK;
++    }
++
++    if (FAILED(hr = grab_bitmap(This, StreamTime, Width, Height, &dib, &size)))
++        return hr;
++
++    if (*pBufferSize < (LONG)size)
++    {
++        free(dib);
++        *pBufferSize = size;
++        return E_INVALIDARG;
++    }
++
++    memcpy(pBuffer, dib, size);
++    *pBufferSize = size;
++    free(dib);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI MediaDet_WriteBitmapBits(IMediaDet* iface,
+@@ -633,8 +1001,44 @@ static HRESULT WINAPI MediaDet_WriteBitmapBits(IMediaDet* iface,
+                                                LONG Height, BSTR Filename)
+ {
+     MediaDetImpl *This = impl_from_IMediaDet(iface);
+-    FIXME("(%p)->(%.16e %ld %ld %p): not implemented!\n", This, StreamTime, Width, Height, Filename);
+-    return E_NOTIMPL;
++    BITMAPFILEHEADER file_header = {0};
++    BITMAPINFOHEADER *dib;
++    DWORD size, written;
++    HANDLE file;
++    BOOL ok;
++    HRESULT hr;
++
++    TRACE("(%p)->(%.16e %ld %ld %s)\n", This, StreamTime, Width, Height, debugstr_w(Filename));
++
++    if (!Filename)
++        return E_POINTER;
++    if (Width < 0 || Height < 0)
++        return E_INVALIDARG;
++
++    if (FAILED(hr = grab_bitmap(This, StreamTime, Width, Height, &dib, &size)))
++        return hr;
++
++    file = CreateFileW(Filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (file == INVALID_HANDLE_VALUE)
++    {
++        hr = HRESULT_FROM_WIN32(GetLastError());
++        free(dib);
++        return hr;
++    }
++
++    file_header.bfType = 0x4d42; /* "BM" */
++#ifdef SG_MUTANT_MD_FILE
++    file_header.bfOffBits = sizeof(file_header);
++#else
++    file_header.bfOffBits = sizeof(file_header) + sizeof(BITMAPINFOHEADER);
++#endif
++    file_header.bfSize = sizeof(file_header) + size;
++    ok = WriteFile(file, &file_header, sizeof(file_header), &written, NULL)
++            && WriteFile(file, dib, size, &written, NULL);
++    hr = ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
++    CloseHandle(file);
++    free(dib);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI MediaDet_get_StreamMediaType(IMediaDet* iface,
+@@ -657,8 +1061,21 @@ static HRESULT WINAPI MediaDet_GetSampleGrabber(IMediaDet* iface,
+                                                 ISampleGrabber **ppVal)
+ {
+     MediaDetImpl *This = impl_from_IMediaDet(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, ppVal);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, ppVal);
++
++    if (!ppVal)
++        return E_POINTER;
++
++    /* The grabber only exists once bitmap grab mode has been entered. */
++    if (!This->grabber)
++    {
++        *ppVal = NULL;
++        return VFW_E_WRONG_STATE;
++    }
++
++    ISampleGrabber_AddRef(*ppVal = This->grabber);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI MediaDet_get_FrameRate(IMediaDet* iface, double *pVal)
+@@ -694,8 +1111,10 @@ static HRESULT WINAPI MediaDet_EnterBitmapGrabMode(IMediaDet* iface,
+                                                    double SeekTime)
+ {
+     MediaDetImpl *This = impl_from_IMediaDet(iface);
+-    FIXME("(%p)->(%f): not implemented!\n", This, SeekTime);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%f)\n", This, SeekTime);
++
++    return enter_grab_mode(This, SeekTime);
+ }
+ 
+ static const IMediaDetVtbl IMediaDet_VTable =
+diff --git a/dlls/qedit/samplegrabber.c b/dlls/qedit/samplegrabber.c
+index cefb2f3..ee9aec1 100644
+--- a/dlls/qedit/samplegrabber.c
++++ b/dlls/qedit/samplegrabber.c
+@@ -378,7 +378,7 @@ static HRESULT WINAPI
+ SampleGrabber_IMemInputPin_GetAllocatorRequirements(IMemInputPin *iface, ALLOCATOR_PROPERTIES *props)
+ {
+     struct sample_grabber *This = impl_from_IMemInputPin(iface);
+-    FIXME("(%p)->(%p): semi-stub\n", This, props);
++    TRACE("(%p)->(%p)\n", This, props);
+     if (!props)
+         return E_POINTER;
+     return This->source.pMemInputPin ? IMemInputPin_GetAllocatorRequirements(This->source.pMemInputPin, props) : E_NOTIMPL;

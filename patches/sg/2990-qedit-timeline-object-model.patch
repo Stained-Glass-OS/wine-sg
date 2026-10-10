@@ -1,0 +1,1663 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] qedit: implement the editing timeline object model
+
+The timeline object had no state: its group list, insert mode, enable flags,
+frame rate, default transition/effect, interest range, dirty tracking and the
+per-node properties all returned E_NOTIMPL. Now:
+
+IAMTimeline keeps an ordered list of group nodes (AddGroup takes a reference
+and refuses non-group nodes, nodes that are already in a timeline and foreign
+objects with E_INVALIDARG; RemGroupFromList, ClearAllGroups, GetGroup with
+index checks, GetGroupCount), the insert mode (insert by default, overlay
+accepted), transition and effect enables (on by default), default frame rate
+(15), interest range, default transition/effect as GUID or string,
+duration (the latest group end), dirty flag and range collected from the
+groups, GetCountOfType and ValidateSourceNames (there are no source nodes).
+
+IAMTimelineObj stores start/stop (negative or reversed times are
+E_INVALIDARG, REFERENCE_TIME and seconds variants, FixTimes snaps to the frame
+grid of the group or timeline), dirty range (changes mark the old and new
+extent dirty), muted/locked flags, user id and a per-node generation id, user
+name, user data, property setter, sub-object (an object or a CLSID that is
+instantiated on first use), Remove/RemoveAll, GetGroupIBelongTo and
+GetEmbedDepth. IAMTimelineGroup is only exposed on group nodes and keeps
+output frame rate, name, preview mode, buffering, media type (copied with its
+format block), the smart-recompression format with its dirty flag, and the
+group's priority/timeline back references. A group outlives its timeline.
+SetRecompFormatFromSource still reports E_NOTIMPL: it needs source nodes.
+---
+diff --git a/dlls/qedit/timeline.c b/dlls/qedit/timeline.c
+index c084ecc..fb5d131 100644
+--- a/dlls/qedit/timeline.c
++++ b/dlls/qedit/timeline.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <assert.h>
++#include <math.h>
+ #include <stdarg.h>
+ 
+ #define COBJMACROS
+@@ -32,11 +33,27 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(quartz);
+ 
++#define TIMELINE_INSERT_MODE_INSERT  1
++#define TIMELINE_INSERT_MODE_OVERLAY 2
++
++#define DEFAULT_FPS 15.0
++#define DEFAULT_OUTPUT_BUFFERING 30
++
++typedef struct TimelineObjImpl TimelineObjImpl;
++
+ typedef struct {
+     IUnknown IUnknown_inner;
+     IAMTimeline IAMTimeline_iface;
+     IUnknown *outer_unk;
+     LONG ref;
++
++    TimelineObjImpl **groups;
++    LONG group_count, groups_size;
++    LONG insert_mode;
++    BOOL transitions_enabled, effects_enabled;
++    REFERENCE_TIME interest_start, interest_stop;
++    double fps;
++    GUID default_transition, default_effect;
+ } TimelineImpl;
+ 
+ static inline TimelineImpl *impl_from_IUnknown(IUnknown *iface)
+@@ -49,12 +66,36 @@ static inline TimelineImpl *impl_from_IAMTimeline(IAMTimeline *iface)
+     return CONTAINING_RECORD(iface, TimelineImpl, IAMTimeline_iface);
+ }
+ 
+-typedef struct {
++struct TimelineObjImpl {
+     IAMTimelineObj IAMTimelineObj_iface;
+     IAMTimelineGroup IAMTimelineGroup_iface;
+     LONG ref;
+     TIMELINE_MAJOR_TYPE timeline_type;
+-} TimelineObjImpl;
++    TimelineImpl *timeline; /* not referenced; cleared when the timeline goes away */
++
++    REFERENCE_TIME start, stop;
++    BOOL dirty;
++    REFERENCE_TIME dirty_start, dirty_stop;
++    BOOL muted, locked;
++    IPropertySetter *setter;
++    IUnknown *subobject;
++    GUID subobject_guid;
++    LONG user_id, gen_id;
++    BSTR user_name;
++    BYTE *user_data;
++    LONG user_data_size;
++
++    /* group data */
++    AM_MEDIA_TYPE mt;
++    double output_fps;
++    BSTR group_name;
++    BOOL preview;
++    int buffering;
++    AM_MEDIA_TYPE *recomp;
++    BOOL recomp_dirty;
++};
++
++static LONG next_gen_id;
+ 
+ static inline TimelineObjImpl *impl_from_IAMTimelineObj(IAMTimelineObj *iface)
+ {
+@@ -69,6 +110,58 @@ static inline TimelineObjImpl *impl_from_IAMTimelineGroup(IAMTimelineGroup *ifac
+ static const IAMTimelineObjVtbl IAMTimelineObj_VTable;
+ static const IAMTimelineGroupVtbl IAMTimelineGroup_VTable;
+ 
++static BOOL is_our_obj(IAMTimelineObj *obj)
++{
++    return obj->lpVtbl == &IAMTimelineObj_VTable;
++}
++
++static void clear_obj_state(TimelineObjImpl *obj);
++
++static void obj_mark_dirty(TimelineObjImpl *obj, REFERENCE_TIME start, REFERENCE_TIME stop)
++{
++    if (obj->dirty)
++    {
++        if (start < obj->dirty_start) obj->dirty_start = start;
++        if (stop > obj->dirty_stop) obj->dirty_stop = stop;
++    }
++    else
++    {
++        obj->dirty = TRUE;
++        obj->dirty_start = start;
++        obj->dirty_stop = stop;
++    }
++}
++
++static HRESULT guid_to_bstr(const GUID *guid, BSTR *out)
++{
++    WCHAR buffer[40];
++
++    StringFromGUID2(guid, buffer, ARRAY_SIZE(buffer));
++    if (!(*out = SysAllocString(buffer)))
++        return E_OUTOFMEMORY;
++    return S_OK;
++}
++
++static HRESULT bstr_to_guid(BSTR str, GUID *guid)
++{
++    if (!str)
++        return E_POINTER;
++    if (FAILED(CLSIDFromString(str, guid)))
++        return E_INVALIDARG;
++    return S_OK;
++}
++
++static REFERENCE_TIME round_to_frame(REFERENCE_TIME time, double fps)
++{
++    double frames = (double)time * fps / 10000000.0;
++    return (REFERENCE_TIME)(floor(frames + 0.5) * 10000000.0 / fps + 0.5);
++}
++
++static void detach_group(TimelineObjImpl *group)
++{
++    group->timeline = NULL;
++}
++
+ /* Timeline inner IUnknown */
+ 
+ static HRESULT WINAPI Timeline_QueryInterface(IUnknown *iface, REFIID riid, void **ppv)
+@@ -109,11 +202,20 @@ static ULONG WINAPI Timeline_Release(IUnknown *iface)
+ {
+     TimelineImpl *timeline = impl_from_IUnknown(iface);
+     ULONG refcount = InterlockedDecrement(&timeline->ref);
++    LONG i;
+ 
+     TRACE("%p decreasing refcount to %lu.\n", timeline, refcount);
+ 
+     if (!refcount)
++    {
++        for (i = 0; i < timeline->group_count; ++i)
++        {
++            detach_group(timeline->groups[i]);
++            IAMTimelineObj_Release(&timeline->groups[i]->IAMTimelineObj_iface);
++        }
++        free(timeline->groups);
+         CoTaskMemFree(timeline);
++    }
+ 
+     return refcount;
+ }
+@@ -174,7 +276,11 @@ static HRESULT WINAPI Timeline_IAMTimeline_CreateEmptyNode(IAMTimeline *iface, I
+         *obj = NULL;
+         return E_OUTOFMEMORY;
+     }
++    memset(obj_impl, 0, sizeof(*obj_impl));
+ 
++    obj_impl->output_fps = DEFAULT_FPS;
++    obj_impl->buffering = DEFAULT_OUTPUT_BUFFERING;
++    obj_impl->gen_id = InterlockedIncrement(&next_gen_id);
+     obj_impl->ref = 1;
+     obj_impl->IAMTimelineObj_iface.lpVtbl = &IAMTimelineObj_VTable;
+     obj_impl->IAMTimelineGroup_iface.lpVtbl = &IAMTimelineGroup_VTable;
+@@ -187,202 +293,427 @@ static HRESULT WINAPI Timeline_IAMTimeline_CreateEmptyNode(IAMTimeline *iface, I
+ static HRESULT WINAPI Timeline_IAMTimeline_AddGroup(IAMTimeline *iface, IAMTimelineObj *group)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, group);
+-    return E_NOTIMPL;
++    TimelineObjImpl *obj;
++
++    TRACE("(%p)->(%p)\n", This, group);
++
++    if (!group)
++        return E_POINTER;
++    if (!is_our_obj(group))
++        return E_INVALIDARG;
++    obj = impl_from_IAMTimelineObj(group);
++    if (obj->timeline_type != TIMELINE_MAJOR_TYPE_GROUP || obj->timeline)
++        return E_INVALIDARG;
++
++    if (This->group_count == This->groups_size)
++    {
++        LONG new_size = max(4, This->groups_size * 2);
++        TimelineObjImpl **groups = realloc(This->groups, new_size * sizeof(*groups));
++        if (!groups)
++            return E_OUTOFMEMORY;
++        This->groups = groups;
++        This->groups_size = new_size;
++    }
++
++#ifdef SG_MUTANT_TL_ORDER
++    memmove(&This->groups[1], &This->groups[0], This->group_count * sizeof(*This->groups));
++    This->groups[0] = obj;
++    This->group_count++;
++#else
++    This->groups[This->group_count++] = obj;
++#endif
++#ifndef SG_MUTANT_TL_REFS
++    IAMTimelineObj_AddRef(group);
++#endif
++    obj->timeline = This;
++    obj_mark_dirty(obj, obj->start, obj->stop);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_RemGroupFromList(IAMTimeline *iface, IAMTimelineObj *group)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, group);
+-    return E_NOTIMPL;
++    LONG i;
++
++    TRACE("(%p)->(%p)\n", This, group);
++
++    if (!group)
++        return E_POINTER;
++    if (!is_our_obj(group))
++        return E_INVALIDARG;
++
++    for (i = 0; i < This->group_count; ++i)
++    {
++        if (&This->groups[i]->IAMTimelineObj_iface == group)
++        {
++            TimelineObjImpl *obj = This->groups[i];
++
++            memmove(&This->groups[i], &This->groups[i + 1], (This->group_count - i - 1) * sizeof(*This->groups));
++            --This->group_count;
++            detach_group(obj);
++            IAMTimelineObj_Release(group);
++            return S_OK;
++        }
++    }
++    return E_INVALIDARG;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetGroup(IAMTimeline *iface, IAMTimelineObj **group, LONG index)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p,%ld): not implemented!\n", This, group, index);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p,%ld)\n", This, group, index);
++
++    if (!group)
++        return E_POINTER;
++    *group = NULL;
++    if (index < 0 || index >= This->group_count)
++        return E_INVALIDARG;
++
++    *group = &This->groups[index]->IAMTimelineObj_iface;
++    IAMTimelineObj_AddRef(*group);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetGroupCount(IAMTimeline *iface, LONG *count)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, count);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, count);
++
++    if (!count)
++        return E_POINTER;
++    *count = This->group_count;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_ClearAllGroups(IAMTimeline *iface)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p): not implemented!\n", This);
+-    return E_NOTIMPL;
++    LONG i;
++
++    TRACE("(%p)\n", This);
++
++    for (i = 0; i < This->group_count; ++i)
++    {
++        detach_group(This->groups[i]);
++        IAMTimelineObj_Release(&This->groups[i]->IAMTimelineObj_iface);
++    }
++    This->group_count = 0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetInsertMode(IAMTimeline *iface, LONG *mode)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, mode);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, mode);
++
++    if (!mode)
++        return E_POINTER;
++    *mode = This->insert_mode;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_SetInsertMode(IAMTimeline *iface, LONG mode)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%ld): not implemented!\n", This, mode);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%ld)\n", This, mode);
++
++    if (mode != TIMELINE_INSERT_MODE_INSERT && mode != TIMELINE_INSERT_MODE_OVERLAY)
++        return E_INVALIDARG;
++    This->insert_mode = mode;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_EnableTransitions(IAMTimeline *iface, BOOL enabled)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%d): not implemented!\n", This, enabled);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%d)\n", This, enabled);
++
++    This->transitions_enabled = !!enabled;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_TransitionsEnabled(IAMTimeline *iface, BOOL *enabled)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, enabled);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, enabled);
++
++    if (!enabled)
++        return E_POINTER;
++    *enabled = This->transitions_enabled;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_EnableEffects(IAMTimeline *iface, BOOL enabled)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%d): not implemented!\n", This, enabled);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%d)\n", This, enabled);
++
++    This->effects_enabled = !!enabled;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_EffectsEnabled(IAMTimeline *iface, BOOL *enabled)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, enabled);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, enabled);
++
++    if (!enabled)
++        return E_POINTER;
++    *enabled = This->effects_enabled;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_SetInterestRange(IAMTimeline *iface, REFERENCE_TIME start,
+                                                             REFERENCE_TIME stop)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%s,%s): not implemented!\n", This, wine_dbgstr_longlong(start),
+-          wine_dbgstr_longlong(stop));
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%s,%s)\n", This, wine_dbgstr_longlong(start), wine_dbgstr_longlong(stop));
++
++    if (start < 0 || stop < start)
++        return E_INVALIDARG;
++    This->interest_start = start;
++    This->interest_stop = stop;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetDuration(IAMTimeline *iface, REFERENCE_TIME *duration)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, duration);
+-    return E_NOTIMPL;
++    REFERENCE_TIME max_stop = 0;
++    LONG i;
++
++    TRACE("(%p)->(%p)\n", This, duration);
++
++    if (!duration)
++        return E_POINTER;
++    for (i = 0; i < This->group_count; ++i)
++        max_stop = max(max_stop, This->groups[i]->stop);
++    *duration = max_stop;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetDuration2(IAMTimeline *iface, double *duration)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, duration);
+-    return E_NOTIMPL;
++    REFERENCE_TIME time;
++    HRESULT hr;
++
++    TRACE("(%p)->(%p)\n", This, duration);
++
++    if (!duration)
++        return E_POINTER;
++    if (FAILED(hr = IAMTimeline_GetDuration(iface, &time)))
++        return hr;
++    *duration = time / 10000000.0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_SetDefaultFPS(IAMTimeline *iface, double fps)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%f): not implemented!\n", This, fps);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%f)\n", This, fps);
++
++    if (!(fps > 0.0))
++        return E_INVALIDARG;
++    This->fps = fps;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetDefaultFPS(IAMTimeline *iface, double *fps)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, fps);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, fps);
++
++    if (!fps)
++        return E_POINTER;
++    *fps = This->fps;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_IsDirty(IAMTimeline *iface, BOOL *dirty)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, dirty);
+-    return E_NOTIMPL;
++    LONG i;
++
++    TRACE("(%p)->(%p)\n", This, dirty);
++
++    if (!dirty)
++        return E_POINTER;
++    *dirty = FALSE;
++    for (i = 0; i < This->group_count; ++i)
++        if (This->groups[i]->dirty)
++            *dirty = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetDirtyRange(IAMTimeline *iface, REFERENCE_TIME *start,
+                                                          REFERENCE_TIME *stop)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p,%p): not implemented!\n", This, start, stop);
+-    return E_NOTIMPL;
++    REFERENCE_TIME dirty_start = 0, dirty_stop = 0;
++    BOOL found = FALSE;
++    LONG i;
++
++    TRACE("(%p)->(%p,%p)\n", This, start, stop);
++
++    if (!start || !stop)
++        return E_POINTER;
++
++    for (i = 0; i < This->group_count; ++i)
++    {
++        const TimelineObjImpl *group = This->groups[i];
++
++        if (!group->dirty)
++            continue;
++        if (!found || group->dirty_start < dirty_start) dirty_start = group->dirty_start;
++        if (!found || group->dirty_stop > dirty_stop) dirty_stop = group->dirty_stop;
++        found = TRUE;
++    }
++    *start = dirty_start;
++    *stop = dirty_stop;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetCountOfType(IAMTimeline *iface, LONG group, LONG *value,
+                                                           LONG *value_with_comps, TIMELINE_MAJOR_TYPE type)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%ld,%p,%p,%#x): not implemented!\n", This, group, value, value_with_comps, type);
+-    return E_NOTIMPL;
++    LONG count;
++
++    TRACE("(%p)->(%ld,%p,%p,%#x)\n", This, group, value, value_with_comps, type);
++
++    if (!value && !value_with_comps)
++        return E_POINTER;
++    if (group < 0 || group >= This->group_count)
++        return E_INVALIDARG;
++
++    /* Groups cannot contain any other objects yet. */
++    count = (type == TIMELINE_MAJOR_TYPE_GROUP) ? 1 : 0;
++    if (value) *value = count;
++    if (value_with_comps) *value_with_comps = count;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_ValidateSourceNames(IAMTimeline *iface, LONG flags, IMediaLocator *override,
+                                                                LONG_PTR notify_event)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%ld,%p,%#Ix): not implemented!\n", This, flags, override, notify_event);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%ld,%p,%#Ix)\n", This, flags, override, notify_event);
++
++    /* There are no source objects to validate. */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_SetDefaultTransition(IAMTimeline *iface, GUID *guid)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%s): not implemented!\n", This, wine_dbgstr_guid(guid));
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%s)\n", This, debugstr_guid(guid));
++
++    if (!guid)
++        return E_POINTER;
++#ifndef SG_MUTANT_TL_GUID
++    This->default_transition = *guid;
++#endif
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetDefaultTransition(IAMTimeline *iface, GUID *guid)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%s): not implemented!\n", This, wine_dbgstr_guid(guid));
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, guid);
++
++    if (!guid)
++        return E_POINTER;
++    *guid = This->default_transition;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_SetDefaultEffect(IAMTimeline *iface, GUID *guid)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%s): not implemented!\n", This, wine_dbgstr_guid(guid));
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%s)\n", This, debugstr_guid(guid));
++
++    if (!guid)
++        return E_POINTER;
++    This->default_effect = *guid;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetDefaultEffect(IAMTimeline *iface, GUID *guid)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%s): not implemented!\n", This, wine_dbgstr_guid(guid));
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, guid);
++
++    if (!guid)
++        return E_POINTER;
++    *guid = This->default_effect;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_SetDefaultTransitionB(IAMTimeline *iface, BSTR guidb)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, guidb);
+-    return E_NOTIMPL;
++    GUID guid;
++    HRESULT hr;
++
++    TRACE("(%p)->(%s)\n", This, debugstr_w(guidb));
++
++    if (FAILED(hr = bstr_to_guid(guidb, &guid)))
++        return hr;
++    This->default_transition = guid;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetDefaultTransitionB(IAMTimeline *iface, BSTR *guidb)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, guidb);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, guidb);
++
++    if (!guidb)
++        return E_POINTER;
++    return guid_to_bstr(&This->default_transition, guidb);
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_SetDefaultEffectB(IAMTimeline *iface, BSTR guidb)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, guidb);
+-    return E_NOTIMPL;
++    GUID guid;
++    HRESULT hr;
++
++    TRACE("(%p)->(%s)\n", This, debugstr_w(guidb));
++
++    if (FAILED(hr = bstr_to_guid(guidb, &guid)))
++        return hr;
++    This->default_effect = guid;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Timeline_IAMTimeline_GetDefaultEffectB(IAMTimeline *iface, BSTR *guidb)
+ {
+     TimelineImpl *This = impl_from_IAMTimeline(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, guidb);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, guidb);
++
++    if (!guidb)
++        return E_POINTER;
++    return guid_to_bstr(&This->default_effect, guidb);
+ }
+ 
+ static const IAMTimelineVtbl IAMTimeline_VTable =
+@@ -437,6 +768,10 @@ HRESULT timeline_create(IUnknown *pUnkOuter, IUnknown **ppv)
+     obj->ref = 1;
+     obj->IUnknown_inner.lpVtbl = &timeline_vtbl;
+     obj->IAMTimeline_iface.lpVtbl = &IAMTimeline_VTable;
++    obj->insert_mode = TIMELINE_INSERT_MODE_INSERT;
++    obj->transitions_enabled = TRUE;
++    obj->effects_enabled = TRUE;
++    obj->fps = DEFAULT_FPS;
+ 
+     if (pUnkOuter)
+         obj->outer_unk = pUnkOuter;
+@@ -447,6 +782,22 @@ HRESULT timeline_create(IUnknown *pUnkOuter, IUnknown **ppv)
+     return S_OK;
+ }
+ 
++
++static void clear_obj_state(TimelineObjImpl *obj)
++{
++    if (obj->setter) IPropertySetter_Release(obj->setter);
++    if (obj->subobject) IUnknown_Release(obj->subobject);
++    SysFreeString(obj->user_name);
++    free(obj->user_data);
++    SysFreeString(obj->group_name);
++    FreeMediaType(&obj->mt);
++    if (obj->recomp)
++    {
++        FreeMediaType(obj->recomp);
++        CoTaskMemFree(obj->recomp);
++    }
++}
++
+ /* IAMTimelineObj implementation */
+ 
+ static HRESULT WINAPI TimelineObj_QueryInterface(IAMTimelineObj *iface, REFIID riid, void **ppv)
+@@ -461,7 +812,7 @@ static HRESULT WINAPI TimelineObj_QueryInterface(IAMTimelineObj *iface, REFIID r
+     *ppv = NULL;
+     if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IAMTimelineObj))
+         *ppv = &This->IAMTimelineObj_iface;
+-    else if (IsEqualIID(riid, &IID_IAMTimelineGroup))
++    else if (IsEqualIID(riid, &IID_IAMTimelineGroup) && This->timeline_type == TIMELINE_MAJOR_TYPE_GROUP)
+         *ppv = &This->IAMTimelineGroup_iface;
+     else
+         WARN("(%p, %s,%p): not found\n", This, debugstr_guid(riid), ppv);
+@@ -491,7 +842,10 @@ static ULONG WINAPI TimelineObj_Release(IAMTimelineObj *iface)
+     TRACE("%p decreasing refcount to %lu.\n", obj, refcount);
+ 
+     if (!refcount)
++    {
++        clear_obj_state(obj);
+         CoTaskMemFree(obj);
++    }
+ 
+     return refcount;
+ }
+@@ -499,106 +853,232 @@ static ULONG WINAPI TimelineObj_Release(IAMTimelineObj *iface)
+ static HRESULT WINAPI TimelineObj_GetStartStop(IAMTimelineObj *iface, REFERENCE_TIME *start, REFERENCE_TIME *stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p,%p): not implemented!\n", This, start, stop);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p,%p)\n", This, start, stop);
++
++    if (!start || !stop)
++        return E_POINTER;
++    *start = This->start;
++    *stop = This->stop;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetStartStop2(IAMTimelineObj *iface, REFTIME *start, REFTIME *stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p,%p): not implemented!\n", This, start, stop);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p,%p)\n", This, start, stop);
++
++    if (!start || !stop)
++        return E_POINTER;
++    *start = This->start / 10000000.0;
++    *stop = This->stop / 10000000.0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_FixTimes(IAMTimelineObj *iface, REFERENCE_TIME *start, REFERENCE_TIME *stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p,%p): not implemented!\n", This, start, stop);
+-    return E_NOTIMPL;
++    double fps;
++
++    TRACE("(%p)->(%p,%p)\n", This, start, stop);
++
++    /* Times are snapped to frame boundaries of the group (or timeline) frame
++     * rate; an object outside of any timeline leaves them alone. */
++    if (This->timeline_type == TIMELINE_MAJOR_TYPE_GROUP)
++        fps = This->output_fps;
++    else if (This->timeline)
++        fps = This->timeline->fps;
++    else
++        return S_OK;
++
++#ifdef SG_MUTANT_TL_FIX
++    return S_OK;
++#endif
++    if (start) *start = round_to_frame(*start, fps);
++    if (stop) *stop = round_to_frame(*stop, fps);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_FixTimes2(IAMTimelineObj *iface, REFTIME *start, REFTIME *stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p,%p): not implemented!\n", This, start, stop);
+-    return E_NOTIMPL;
++    REFERENCE_TIME rt_start, rt_stop;
++    HRESULT hr;
++
++    TRACE("(%p)->(%p,%p)\n", This, start, stop);
++
++    rt_start = start ? (REFERENCE_TIME)(*start * 10000000.0 + (*start < 0 ? -0.5 : 0.5)) : 0;
++    rt_stop = stop ? (REFERENCE_TIME)(*stop * 10000000.0 + (*stop < 0 ? -0.5 : 0.5)) : 0;
++    if (FAILED(hr = IAMTimelineObj_FixTimes(iface, start ? &rt_start : NULL, stop ? &rt_stop : NULL)))
++        return hr;
++    if (start) *start = rt_start / 10000000.0;
++    if (stop) *stop = rt_stop / 10000000.0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetStartStop(IAMTimelineObj *iface, REFERENCE_TIME start, REFERENCE_TIME stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%s,%s): not implemented!\n", This, wine_dbgstr_longlong(start), wine_dbgstr_longlong(stop));
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%s,%s)\n", This, wine_dbgstr_longlong(start), wine_dbgstr_longlong(stop));
++
++#ifndef SG_MUTANT_TL_RANGE
++    if (start < 0 || stop < start)
++        return E_INVALIDARG;
++#endif
++
++    /* Both the old and the new extent need to be refreshed. */
++#ifndef SG_MUTANT_TL_DIRTY
++    obj_mark_dirty(This, min(This->start, start), max(This->stop, stop));
++#endif
++    This->start = start;
++    This->stop = stop;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetStartStop2(IAMTimelineObj *iface, REFTIME start, REFTIME stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%f,%f): not implemented!\n", This, start, stop);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%f,%f)\n", This, start, stop);
++
++    return IAMTimelineObj_SetStartStop(iface, (REFERENCE_TIME)(start * 10000000.0 + (start < 0 ? -0.5 : 0.5)),
++            (REFERENCE_TIME)(stop * 10000000.0 + (stop < 0 ? -0.5 : 0.5)));
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetPropertySetter(IAMTimelineObj *iface, IPropertySetter **setter)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, setter);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, setter);
++
++    if (!setter)
++        return E_POINTER;
++    if ((*setter = This->setter))
++        IPropertySetter_AddRef(*setter);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetPropertySetter(IAMTimelineObj *iface, IPropertySetter *setter)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, setter);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, setter);
++
++    if (setter)
++        IPropertySetter_AddRef(setter);
++    if (This->setter)
++        IPropertySetter_Release(This->setter);
++    This->setter = setter;
++    obj_mark_dirty(This, This->start, This->stop);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetSubObject(IAMTimelineObj *iface, IUnknown **obj)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, obj);
+-    return E_NOTIMPL;
++    HRESULT hr;
++
++    TRACE("(%p)->(%p)\n", This, obj);
++
++    if (!obj)
++        return E_POINTER;
++
++    /* A sub-object that was only named by CLSID is created on first use. */
++    if (!This->subobject && !IsEqualGUID(&This->subobject_guid, &GUID_NULL))
++    {
++        if (FAILED(hr = CoCreateInstance(&This->subobject_guid, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IUnknown, (void **)&This->subobject)))
++        {
++            *obj = NULL;
++            return hr;
++        }
++    }
++
++    if ((*obj = This->subobject))
++        IUnknown_AddRef(*obj);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetSubObject(IAMTimelineObj *iface, IUnknown *obj)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, obj);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, obj);
++
++    if (obj)
++        IUnknown_AddRef(obj);
++    if (This->subobject)
++        IUnknown_Release(This->subobject);
++    This->subobject = obj;
++    obj_mark_dirty(This, This->start, This->stop);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetSubObjectGUID(IAMTimelineObj *iface, GUID guid)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%s): not implemented!\n", This, wine_dbgstr_guid(&guid));
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%s)\n", This, debugstr_guid(&guid));
++
++    /* Naming a new class drops any object created from the previous one. */
++    if (This->subobject)
++    {
++        IUnknown_Release(This->subobject);
++        This->subobject = NULL;
++    }
++    This->subobject_guid = guid;
++    obj_mark_dirty(This, This->start, This->stop);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetSubObjectGUIDB(IAMTimelineObj *iface, BSTR guidb)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%s): not implemented!\n", This, wine_dbgstr_w(guidb));
+-    return E_NOTIMPL;
++    GUID guid;
++    HRESULT hr;
++
++    TRACE("(%p)->(%s)\n", This, debugstr_w(guidb));
++
++    if (FAILED(hr = bstr_to_guid(guidb, &guid)))
++        return hr;
++    return IAMTimelineObj_SetSubObjectGUID(iface, guid);
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetSubObjectGUID(IAMTimelineObj *iface, GUID *guid)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, guid);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, guid);
++
++    if (!guid)
++        return E_POINTER;
++    *guid = This->subobject_guid;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetSubObjectGUIDB(IAMTimelineObj *iface, BSTR *guidb)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, guidb);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, guidb);
++
++    if (!guidb)
++        return E_POINTER;
++    return guid_to_bstr(&This->subobject_guid, guidb);
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetSubObjectLoaded(IAMTimelineObj *iface, BOOL *loaded)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, loaded);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, loaded);
++
++    if (!loaded)
++        return E_POINTER;
++    *loaded = !!This->subobject;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetTimelineType(IAMTimelineObj *iface, TIMELINE_MAJOR_TYPE *type)
+@@ -622,127 +1102,249 @@ static HRESULT WINAPI TimelineObj_SetTimelineType(IAMTimelineObj *iface, TIMELIN
+ static HRESULT WINAPI TimelineObj_GetUserID(IAMTimelineObj *iface, LONG *id)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, id);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, id);
++
++    if (!id)
++        return E_POINTER;
++    *id = This->user_id;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetUserID(IAMTimelineObj *iface, LONG id)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%ld): not implemented!\n", This, id);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%ld)\n", This, id);
++
++    This->user_id = id;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetGenID(IAMTimelineObj *iface, LONG *id)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, id);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, id);
++
++    if (!id)
++        return E_POINTER;
++    *id = This->gen_id;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetUserName(IAMTimelineObj *iface, BSTR *name)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, name);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, name);
++
++    if (!name)
++        return E_POINTER;
++    *name = NULL;
++    if (This->user_name && !(*name = SysAllocStringLen(This->user_name, SysStringLen(This->user_name))))
++        return E_OUTOFMEMORY;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetUserName(IAMTimelineObj *iface, BSTR name)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%s): not implemented!\n", This, wine_dbgstr_w(name));
+-    return E_NOTIMPL;
++    BSTR copy = NULL;
++
++    TRACE("(%p)->(%s)\n", This, debugstr_w(name));
++
++    if (name && !(copy = SysAllocStringLen(name, SysStringLen(name))))
++        return E_OUTOFMEMORY;
++    SysFreeString(This->user_name);
++    This->user_name = copy;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetUserData(IAMTimelineObj *iface, BYTE *data, LONG *size)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p,%p): not implemented!\n", This, data, size);
+-    return E_NOTIMPL;
++    LONG capacity;
++
++    TRACE("(%p)->(%p,%p)\n", This, data, size);
++
++    if (!size)
++        return E_POINTER;
++
++    /* *size is the capacity of the caller's buffer on input and the amount of
++     * stored data on output; a NULL buffer just queries the size. */
++    capacity = *size;
++    *size = This->user_data_size;
++    if (data && This->user_data_size)
++        memcpy(data, This->user_data, min(capacity, This->user_data_size));
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetUserData(IAMTimelineObj *iface, BYTE *data, LONG size)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p,%ld): not implemented!\n", This, data, size);
+-    return E_NOTIMPL;
++    BYTE *copy = NULL;
++
++    TRACE("(%p)->(%p,%ld)\n", This, data, size);
++
++    if (size < 0)
++        return E_INVALIDARG;
++    if (size && !data)
++        return E_POINTER;
++    if (size)
++    {
++        if (!(copy = malloc(size)))
++            return E_OUTOFMEMORY;
++#ifndef SG_MUTANT_TL_USERDATA
++        memcpy(copy, data, size);
++#endif
++    }
++    free(This->user_data);
++    This->user_data = copy;
++    This->user_data_size = size;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetMuted(IAMTimelineObj *iface, BOOL *muted)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, muted);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, muted);
++
++    if (!muted)
++        return E_POINTER;
++    *muted = This->muted;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetMuted(IAMTimelineObj *iface, BOOL muted)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%d): not implemented!\n", This, muted);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%d)\n", This, muted);
++
++    muted = !!muted;
++    if (muted != This->muted)
++    {
++        This->muted = muted;
++        obj_mark_dirty(This, This->start, This->stop);
++    }
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetLocked(IAMTimelineObj *iface, BOOL *locked)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, locked);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, locked);
++
++    if (!locked)
++        return E_POINTER;
++    *locked = This->locked;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetLocked(IAMTimelineObj *iface, BOOL locked)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%d): not implemented!\n", This, locked);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%d)\n", This, locked);
++
++    This->locked = !!locked;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetDirtyRange(IAMTimelineObj *iface, REFERENCE_TIME *start, REFERENCE_TIME *stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p,%p): not implemented!\n", This, start, stop);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p,%p)\n", This, start, stop);
++
++    if (!start || !stop)
++        return E_POINTER;
++    *start = This->dirty ? This->dirty_start : 0;
++    *stop = This->dirty ? This->dirty_stop : 0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetDirtyRange2(IAMTimelineObj *iface, REFTIME *start, REFTIME *stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p,%p): not implemented!\n", This, start, stop);
+-    return E_NOTIMPL;
++    REFERENCE_TIME rt_start, rt_stop;
++
++    TRACE("(%p)->(%p,%p)\n", This, start, stop);
++
++    if (!start || !stop)
++        return E_POINTER;
++    IAMTimelineObj_GetDirtyRange(iface, &rt_start, &rt_stop);
++    *start = rt_start / 10000000.0;
++    *stop = rt_stop / 10000000.0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetDirtyRange(IAMTimelineObj *iface, REFERENCE_TIME start, REFERENCE_TIME stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%s,%s): not implemented!\n", This, wine_dbgstr_longlong(start), wine_dbgstr_longlong(stop));
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%s,%s)\n", This, wine_dbgstr_longlong(start), wine_dbgstr_longlong(stop));
++
++    if (start < 0 || stop < start)
++        return E_INVALIDARG;
++    This->dirty = TRUE;
++    This->dirty_start = start;
++    This->dirty_stop = stop;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_SetDirtyRange2(IAMTimelineObj *iface, REFTIME start, REFTIME stop)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%f,%f): not implemented!\n", This, start, stop);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%f,%f)\n", This, start, stop);
++
++    return IAMTimelineObj_SetDirtyRange(iface, (REFERENCE_TIME)(start * 10000000.0 + (start < 0 ? -0.5 : 0.5)),
++            (REFERENCE_TIME)(stop * 10000000.0 + (stop < 0 ? -0.5 : 0.5)));
+ }
+ 
+ static HRESULT WINAPI TimelineObj_ClearDirty(IAMTimelineObj *iface)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p): not implemented!\n", This);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)\n", This);
++
++    This->dirty = FALSE;
++    This->dirty_start = This->dirty_stop = 0;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_Remove(IAMTimelineObj *iface)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p): not implemented!\n", This);
+-    return E_NOTIMPL;
++    HRESULT hr = S_OK;
++
++    TRACE("(%p)\n", This);
++
++    /* Only groups can be members of a timeline at the moment; an object that
++     * is not part of one has nothing to be removed from. */
++    if (This->timeline)
++    {
++        IAMTimeline *timeline = &This->timeline->IAMTimeline_iface;
++
++        IAMTimelineObj_AddRef(iface);
++        hr = IAMTimeline_RemGroupFromList(timeline, iface);
++        IAMTimelineObj_Release(iface);
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_RemoveAll(IAMTimelineObj *iface)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p): not implemented!\n", This);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)\n", This);
++
++    /* No object can have children yet, so this is the same as Remove(). */
++    return IAMTimelineObj_Remove(iface);
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetTimelineNoRef(IAMTimelineObj *iface, IAMTimeline **timeline)
+@@ -758,15 +1360,30 @@ static HRESULT WINAPI TimelineObj_GetTimelineNoRef(IAMTimelineObj *iface, IAMTim
+ static HRESULT WINAPI TimelineObj_GetGroupIBelongTo(IAMTimelineObj *iface, IAMTimelineGroup **group)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, group);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, group);
++
++    if (!group)
++        return E_POINTER;
++    *group = NULL;
++    if (This->timeline_type != TIMELINE_MAJOR_TYPE_GROUP)
++        return E_NOINTERFACE;
++
++    *group = &This->IAMTimelineGroup_iface;
++    IAMTimelineGroup_AddRef(*group);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI TimelineObj_GetEmbedDepth(IAMTimelineObj *iface, LONG *depth)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineObj(iface);
+-    FIXME("(%p)->(%p): not implemented!\n", This, depth);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, depth);
++
++    if (!depth)
++        return E_POINTER;
++    *depth = 0;
++    return S_OK;
+ }
+ 
+ static const IAMTimelineObjVtbl IAMTimelineObj_VTable =
+@@ -835,140 +1452,301 @@ static ULONG WINAPI timelinegrp_Release(IAMTimelineGroup *iface)
+ static HRESULT WINAPI timelinegrp_SetTimeline(IAMTimelineGroup *iface, IAMTimeline *timeline)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, timeline);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, timeline);
++
++    /* The group is attached by IAMTimeline::AddGroup(); a timeline pointer
++     * cannot be assigned independently of the timeline's own list. */
++    if (timeline != (This->timeline ? &This->timeline->IAMTimeline_iface : NULL))
++        return E_INVALIDARG;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_GetTimeline(IAMTimelineGroup *iface, IAMTimeline **timeline)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, timeline);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, timeline);
++
++    if (!timeline)
++        return E_POINTER;
++    if (!This->timeline)
++    {
++        *timeline = NULL;
++        return E_NOINTERFACE;
++    }
++    *timeline = &This->timeline->IAMTimeline_iface;
++    IAMTimeline_AddRef(*timeline);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_GetPriority(IAMTimelineGroup *iface, LONG *priority)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, priority);
+-    return E_NOTIMPL;
++    LONG i;
++
++    TRACE("(%p)->(%p)\n", This, priority);
++
++    if (!priority)
++        return E_POINTER;
++    if (!This->timeline)
++        return E_NOINTERFACE;
++
++    /* Priority is the position in the timeline's group list. */
++    for (i = 0; i < This->timeline->group_count; ++i)
++    {
++        if (This->timeline->groups[i] == This)
++        {
++            *priority = i;
++            return S_OK;
++        }
++    }
++    return E_NOINTERFACE;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_GetMediaType(IAMTimelineGroup *iface, AM_MEDIA_TYPE *mediatype)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, mediatype);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, mediatype);
++
++    if (!mediatype)
++        return E_POINTER;
++    return CopyMediaType(mediatype, &This->mt);
+ }
+ 
+ static HRESULT WINAPI timelinegrp_SetMediaType(IAMTimelineGroup *iface, AM_MEDIA_TYPE *mediatype)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, mediatype);
+-    return E_NOTIMPL;
++    AM_MEDIA_TYPE mt;
++    HRESULT hr;
++
++    TRACE("(%p)->(%p)\n", This, mediatype);
++
++    if (!mediatype)
++        return E_POINTER;
++    if (FAILED(hr = CopyMediaType(&mt, mediatype)))
++        return hr;
++    FreeMediaType(&This->mt);
++    This->mt = mt;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_SetOutputFPS(IAMTimelineGroup *iface, double fps)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%f)\n", This, fps);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%f)\n", This, fps);
++
++    if (!(fps > 0.0))
++        return E_INVALIDARG;
++    This->output_fps = fps;
++    obj_mark_dirty(This, This->start, This->stop);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_GetOutputFPS(IAMTimelineGroup *iface, double *fps)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, fps);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, fps);
++
++    if (!fps)
++        return E_POINTER;
++    *fps = This->output_fps;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_SetGroupName(IAMTimelineGroup *iface, BSTR name)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%s)\n", This, debugstr_w(name));
+-    return E_NOTIMPL;
++    BSTR copy = NULL;
++
++    TRACE("(%p)->(%s)\n", This, debugstr_w(name));
++
++    if (name && !(copy = SysAllocStringLen(name, SysStringLen(name))))
++        return E_OUTOFMEMORY;
++    SysFreeString(This->group_name);
++    This->group_name = copy;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_GetGroupName(IAMTimelineGroup *iface, BSTR *name)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, name);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, name);
++
++    if (!name)
++        return E_POINTER;
++    *name = NULL;
++    if (This->group_name && !(*name = SysAllocStringLen(This->group_name, SysStringLen(This->group_name))))
++        return E_OUTOFMEMORY;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_SetPreviewMode(IAMTimelineGroup *iface, BOOL preview)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%d)\n", This, preview);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%d)\n", This, preview);
++
++    This->preview = !!preview;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_GetPreviewMode(IAMTimelineGroup *iface, BOOL *preview)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, preview);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, preview);
++
++    if (!preview)
++        return E_POINTER;
++    *preview = This->preview;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_SetMediaTypeForVB(IAMTimelineGroup *iface, LONG type)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%ld)\n", This, type);
+-    return E_NOTIMPL;
++    AM_MEDIA_TYPE mt = {{0}};
++
++    TRACE("(%p)->(%ld)\n", This, type);
++
++    /* Automation clients select the major type with 0 (video) or 1 (audio). */
++    if (type == 0)
++        mt.majortype = MEDIATYPE_Video;
++    else if (type == 1)
++        mt.majortype = MEDIATYPE_Audio;
++    else
++        return E_INVALIDARG;
++
++    return IAMTimelineGroup_SetMediaType(iface, &mt);
+ }
+ 
+ static HRESULT WINAPI timelinegrp_GetOutputBuffering(IAMTimelineGroup *iface, int *buffer)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, buffer);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, buffer);
++
++    if (!buffer)
++        return E_POINTER;
++    *buffer = This->buffering;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_SetOutputBuffering(IAMTimelineGroup *iface, int buffer)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%d)\n", This, buffer);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%d)\n", This, buffer);
++
++    if (buffer < 1)
++        return E_INVALIDARG;
++    This->buffering = buffer;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_SetSmartRecompressFormat(IAMTimelineGroup *iface, LONG *format)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, format);
+-    return E_NOTIMPL;
++    AM_MEDIA_TYPE *mt;
++
++    TRACE("(%p)->(%p)\n", This, format);
++
++    if (!format)
++        return E_POINTER;
++
++    /* The parameter is a media type passed through an automation-friendly pointer. */
++    if (!(mt = CoTaskMemAlloc(sizeof(*mt))))
++        return E_OUTOFMEMORY;
++    if (FAILED(CopyMediaType(mt, (const AM_MEDIA_TYPE *)format)))
++    {
++        CoTaskMemFree(mt);
++        return E_OUTOFMEMORY;
++    }
++    if (This->recomp)
++    {
++        FreeMediaType(This->recomp);
++        CoTaskMemFree(This->recomp);
++    }
++    This->recomp = mt;
++    This->recomp_dirty = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_GetSmartRecompressFormat(IAMTimelineGroup *iface, LONG **format)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, format);
+-    return E_NOTIMPL;
++    AM_MEDIA_TYPE *mt;
++
++    TRACE("(%p)->(%p)\n", This, format);
++
++    if (!format)
++        return E_POINTER;
++    *format = NULL;
++    if (!This->recomp)
++        return S_FALSE;
++
++    if (!(mt = CoTaskMemAlloc(sizeof(*mt))))
++        return E_OUTOFMEMORY;
++    if (FAILED(CopyMediaType(mt, This->recomp)))
++    {
++        CoTaskMemFree(mt);
++        return E_OUTOFMEMORY;
++    }
++    *format = (LONG *)mt;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_IsSmartRecompressFormatSet(IAMTimelineGroup *iface, BOOL *set)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, set);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, set);
++
++    if (!set)
++        return E_POINTER;
++    *set = !!This->recomp;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_IsRecompressFormatDirty(IAMTimelineGroup *iface, BOOL *dirty)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, dirty);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%p)\n", This, dirty);
++
++    if (!dirty)
++        return E_POINTER;
++    *dirty = This->recomp_dirty;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_ClearRecompressFormatDirty(IAMTimelineGroup *iface)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->()\n", This);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)\n", This);
++
++    This->recomp_dirty = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI timelinegrp_SetRecompFormatFromSource(IAMTimelineGroup *iface, IAMTimelineSrc *source)
+ {
+     TimelineObjImpl *This = impl_from_IAMTimelineGroup(iface);
+-    FIXME("(%p)->(%p)\n", This, source);
++
++    TRACE("(%p)->(%p)\n", This, source);
++
++    if (!source)
++        return E_POINTER;
++
++    /* The format would be read from the source's media file; no source
++     * objects exist, so any pointer here is foreign and cannot be probed. */
++    FIXME("Source objects are not supported.\n");
+     return E_NOTIMPL;
+ }
+ 

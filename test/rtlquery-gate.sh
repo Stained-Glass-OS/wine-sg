@@ -1,12 +1,11 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
 # RtlQueryRegistryValues (SUBKEY, NOVALUE with a name, REQUIRED with a default) and
-# NtOpenKey with no access (patches/sg/2213): test/rtlquery-probe.c.  Uses a key of its
+# NtOpenKey with no access still opening (patches/sg/2213): test/rtlquery-probe.c.  Uses a key of its
 # own under HKLM\Software; no child process.
 #
 #   WINE=/opt/wine-sg/bin/wine test/rtlquery-gate.sh
-# Mutants: SG_MUTANT_SUBKEY_OLD, SG_MUTANT_REQUIRED_ALWAYS (ntdll/reg.c),
-# SG_MUTANT_OPENKEY_ZERO_ACCESS (ntdll/unix/registry.c).
+# Mutants: SG_MUTANT_SUBKEY_OLD, SG_MUTANT_REQUIRED_ALWAYS (ntdll/reg.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"

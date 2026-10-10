@@ -1,0 +1,1350 @@
+From: Stained Glass OS drafter 5 <noreply@anthropic.com>
+Subject: [PATCH] qdvd: implement the DVD navigator and graph builder without a disc
+
+The navigator has no navigation engine, so it never leaves the stop domain.
+IDvdControl2 playback, menu, button and stream commands validate their
+arguments (E_POINTER, E_INVALIDARG for unknown command flags, titles, chapters,
+times, streams, angles, buttons, menus) and then fail with
+VFW_E_DVD_INVALIDDOMAIN, clearing the IDvdCmd out pointer; Stop succeeds.
+The settings that may be changed while stopped are stored and read back through
+IDvdInfo2: parental level and country, default menu/audio/sub-picture
+languages (and extensions), options, and the DVD directory (validated by the
+presence of VIDEO_TS\VIDEO_TS.IFO, else VFW_E_DVD_INVALID_DISC). The IDvdInfo2
+queries return VFW_E_DVD_INVALIDDOMAIN after pointer and index checks;
+GetCurrentDomain reports DVD_DOMAIN_Stop and GetDecoderCaps an empty set.
+IDvdGraphBuilder owns a filter graph (GetFiltergraph), GetDvdInterface returns
+VFW_E_DVD_GRAPHNOTREADY until a volume has been rendered, then the navigator's
+or the graph's interfaces, and RenderDvdVideoVolume validates its flags,
+puts the navigator in the graph for a valid volume and reports
+VFW_E_DVD_RENDERFAIL with the AM_DVD_RENDERSTATUS fields set.
+---
+diff --git a/dlls/qdvd/graph.c b/dlls/qdvd/graph.c
+index ab9ea85..adda955 100644
+--- a/dlls/qdvd/graph.c
++++ b/dlls/qdvd/graph.c
+@@ -29,8 +29,16 @@ struct graph_builder
+ 
+     IUnknown *outer_unk;
+     LONG refcount;
++
++    CRITICAL_SECTION cs;
++    IGraphBuilder *graph;
++    IBaseFilter *navigator;
+ };
+ 
++#define DVD_RENDER_DECODER_FLAGS (AM_DVD_HWDEC_PREFER | AM_DVD_HWDEC_ONLY | AM_DVD_SWDEC_PREFER | AM_DVD_SWDEC_ONLY)
++#define DVD_RENDER_KNOWN_FLAGS (DVD_RENDER_DECODER_FLAGS | AM_DVD_NOVPE | AM_DVD_DO_NOT_CLEAR | AM_DVD_VMR9_ONLY \
++        | AM_DVD_EVR_ONLY | AM_DVD_EVR_QOS | AM_DVD_ADAPT_GRAPH)
++
+ static struct graph_builder *impl_from_IUnknown(IUnknown *iface)
+ {
+     return CONTAINING_RECORD(iface, struct graph_builder, IUnknown_inner);
+@@ -50,7 +58,14 @@ static ULONG WINAPI inner_Release(IUnknown *iface)
+     ULONG refcount = InterlockedDecrement(&builder->refcount);
+     TRACE("%p decreasing refcount to %lu.\n", builder, refcount);
+     if (!refcount)
++    {
++        if (builder->navigator)
++            IBaseFilter_Release(builder->navigator);
++        if (builder->graph)
++            IGraphBuilder_Release(builder->graph);
++        DeleteCriticalSection(&builder->cs);
+         free(builder);
++    }
+     return refcount;
+ }
+ 
+@@ -105,22 +120,155 @@ static HRESULT WINAPI graph_builder_QueryInterface(IDvdGraphBuilder *iface, REFI
+     return IUnknown_QueryInterface(builder->outer_unk, iid, out);
+ }
+ 
++/* The builder owns one filter graph manager, created when first needed. */
++static HRESULT builder_get_graph(struct graph_builder *builder, IGraphBuilder **graph)
++{
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection(&builder->cs);
++    if (!builder->graph)
++        hr = CoCreateInstance(&CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IGraphBuilder, (void **)&builder->graph);
++    if (SUCCEEDED(hr))
++    {
++        *graph = builder->graph;
++        IGraphBuilder_AddRef(*graph);
++    }
++    LeaveCriticalSection(&builder->cs);
++    return hr;
++}
++
+ static HRESULT WINAPI graph_builder_GetFiltergraph(IDvdGraphBuilder *iface, IGraphBuilder **graph)
+ {
+-    FIXME("iface %p, graph %p, stub!\n", iface, graph);
+-    return E_NOTIMPL;
++    struct graph_builder *builder = impl_from_IDvdGraphBuilder(iface);
++
++    TRACE("iface %p, graph %p.\n", iface, graph);
++
++    if (!graph)
++        return E_POINTER;
++    *graph = NULL;
++    return builder_get_graph(builder, graph);
+ }
+ 
+ static HRESULT WINAPI graph_builder_GetDvdInterface(IDvdGraphBuilder *iface, REFIID iid, void **out)
+ {
+-    FIXME("iface %p, iid %s, out %p, stub!\n", iface, debugstr_guid(iid), out);
+-    return E_NOTIMPL;
++    struct graph_builder *builder = impl_from_IDvdGraphBuilder(iface);
++    IBaseFilter *navigator;
++    IGraphBuilder *graph;
++    HRESULT hr;
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (!out || !iid)
++        return E_POINTER;
++    *out = NULL;
++
++    EnterCriticalSection(&builder->cs);
++    if ((navigator = builder->navigator))
++        IBaseFilter_AddRef(navigator);
++    if ((graph = builder->graph))
++        IGraphBuilder_AddRef(graph);
++    LeaveCriticalSection(&builder->cs);
++
++    /* the DVD volume has to have been rendered first */
++    if (!navigator)
++    {
++        if (graph)
++            IGraphBuilder_Release(graph);
++        return VFW_E_DVD_GRAPHNOTREADY;
++    }
++
++    /* the navigator's own interfaces first, then the graph's (IMediaControl, IVideoWindow ...) */
++    hr = IBaseFilter_QueryInterface(navigator, iid, out);
++    if (FAILED(hr) && graph)
++        hr = IGraphBuilder_QueryInterface(graph, iid, out);
++    IBaseFilter_Release(navigator);
++    if (graph)
++        IGraphBuilder_Release(graph);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI graph_builder_RenderDvdVideoVolume(IDvdGraphBuilder *iface, const WCHAR *path, DWORD flags, AM_DVD_RENDERSTATUS *status)
+ {
+-    FIXME("iface %p, path %s, flags %#lx, status %p, stub!\n", iface, debugstr_w(path), flags, status);
+-    return E_NOTIMPL;
++    struct graph_builder *builder = impl_from_IDvdGraphBuilder(iface);
++    IBaseFilter *navigator = NULL;
++    IDvdControl2 *control;
++    IGraphBuilder *graph;
++    HRESULT hr;
++
++    TRACE("iface %p, path %s, flags %#lx, status %p.\n", iface, debugstr_w(path), flags, status);
++
++    if (!status)
++        return E_POINTER;
++    memset(status, 0, sizeof(*status));
++
++#ifndef SG_MUTANT_BUILDER
++    if ((flags & ~DVD_RENDER_KNOWN_FLAGS) || ((flags & DVD_RENDER_DECODER_FLAGS) & ((flags & DVD_RENDER_DECODER_FLAGS) - 1)))
++        return E_INVALIDARG;
++#endif
++
++    if (FAILED(hr = builder_get_graph(builder, &graph)))
++        return hr;
++
++    /* There is no DVD drive to default to, so without a path no volume is known. */
++    if (!path)
++    {
++        status->bDvdVolUnknown = TRUE;
++        IGraphBuilder_Release(graph);
++        return VFW_E_DVD_RENDERFAIL;
++    }
++
++    EnterCriticalSection(&builder->cs);
++    if (builder->navigator)
++    {
++        navigator = builder->navigator;
++        IBaseFilter_AddRef(navigator);
++    }
++    LeaveCriticalSection(&builder->cs);
++
++    if (!navigator && FAILED(hr = CoCreateInstance(&CLSID_DVDNavigator, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IBaseFilter, (void **)&navigator)))
++    {
++        IGraphBuilder_Release(graph);
++        return hr;
++    }
++
++    hr = IBaseFilter_QueryInterface(navigator, &IID_IDvdControl2, (void **)&control);
++    if (SUCCEEDED(hr))
++    {
++        hr = IDvdControl2_SetDVDDirectory(control, path);
++        IDvdControl2_Release(control);
++    }
++    if (FAILED(hr))
++    {
++        /* not a DVD volume: nothing was built */
++        status->bDvdVolInvalid = (hr == VFW_E_DVD_INVALID_DISC);
++        IBaseFilter_Release(navigator);
++        IGraphBuilder_Release(graph);
++        return VFW_E_DVD_RENDERFAIL;
++    }
++
++    EnterCriticalSection(&builder->cs);
++    if (!builder->navigator)
++    {
++        if (SUCCEEDED(hr = IGraphBuilder_AddFilter(graph, navigator, L"DVD Navigator")))
++        {
++            builder->navigator = navigator;
++            IBaseFilter_AddRef(navigator);
++        }
++    }
++    LeaveCriticalSection(&builder->cs);
++    IBaseFilter_Release(navigator);
++    IGraphBuilder_Release(graph);
++    if (FAILED(hr))
++        return hr;
++
++    /* The navigator has no output pins and no decoders exist to connect to:
++     * the video, audio and sub-picture streams could not be rendered. */
++    status->iNumStreams = 3;
++    status->iNumStreamsFailed = 3;
++    status->dwFailedStreamsFlag = AM_DVD_STREAM_VIDEO | AM_DVD_STREAM_AUDIO | AM_DVD_STREAM_SUBPIC;
++    return VFW_E_DVD_RENDERFAIL;
+ }
+ 
+ static const struct IDvdGraphBuilderVtbl graph_builder_vtbl =
+@@ -143,6 +291,7 @@ HRESULT graph_builder_create(IUnknown *outer, IUnknown **out)
+     builder->IDvdGraphBuilder_iface.lpVtbl = &graph_builder_vtbl;
+     builder->IUnknown_inner.lpVtbl = &inner_vtbl;
+     builder->refcount = 1;
++    InitializeCriticalSectionEx(&builder->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     builder->outer_unk = outer ? outer : &builder->IUnknown_inner;
+ 
+     TRACE("Created DVD graph builder %p.\n", builder);
+diff --git a/dlls/qdvd/navigator.c b/dlls/qdvd/navigator.c
+index 4ce11e2..4329e38 100644
+--- a/dlls/qdvd/navigator.c
++++ b/dlls/qdvd/navigator.c
+@@ -28,8 +28,67 @@ struct navigator
+     struct strmbase_filter filter;
+     IDvdControl2 IDvdControl2_iface;
+     IDvdInfo2 IDvdInfo2_iface;
++
++    /* There is no navigation engine: the navigator never leaves the stop domain.
++     * What the application can set while stopped is only stored. */
++    DVD_DOMAIN domain;
++    WCHAR *directory;
++    ULONG parental_level;
++    BYTE parental_country[2];
++    LCID menu_language;
++    LCID audio_language;
++    DVD_AUDIO_LANG_EXT audio_extension;
++    LCID subpicture_language;
++    DVD_SUBPICTURE_LANG_EXT subpicture_extension;
++    ULONG karaoke_mode;
++    ULONG video_preference;
++    DWORD options;
++    WORD gprm[16];
+ };
+ 
++#define DVD_CMD_FLAGS_MASK 0x1f
++
++static BOOL volume_exists(const WCHAR *path)
++{
++    static const WCHAR ifo[] = L"\\VIDEO_TS\\VIDEO_TS.IFO";
++    WCHAR buffer[MAX_PATH + 32];
++    size_t len = wcslen(path);
++
++    if (!len || len >= MAX_PATH)
++        return FALSE;
++    wcscpy(buffer, path);
++    if (buffer[len - 1] == '\\' || buffer[len - 1] == '/')
++        buffer[--len] = 0;
++    wcscpy(buffer + len, ifo);
++    return GetFileAttributesW(buffer) != INVALID_FILE_ATTRIBUTES;
++}
++
++/* Playback and selection commands need a started disc; in the stop domain
++ * (the only state this navigator has) they fail with VFW_E_DVD_INVALIDDOMAIN. */
++static HRESULT nav_domain_check(struct navigator *filter)
++{
++#ifdef SG_MUTANT_DOMAIN
++    return S_OK;
++#endif
++    return filter->domain == DVD_DOMAIN_Stop ? VFW_E_DVD_INVALIDDOMAIN : S_OK;
++}
++
++static HRESULT nav_cmd(struct navigator *filter, DWORD flags, IDvdCmd **cmd)
++{
++    if (cmd)
++        *cmd = NULL;
++#ifndef SG_MUTANT_ARGS
++    if (flags & ~DVD_CMD_FLAGS_MASK)
++        return E_INVALIDARG;
++#endif
++    return nav_domain_check(filter);
++}
++
++static BOOL bad_time(const DVD_HMSF_TIMECODE *time)
++{
++    return time->bMinutes > 59 || time->bSeconds > 59 || time->bFrames > 29;
++}
++
+ static inline struct navigator *impl_from_strmbase_filter(struct strmbase_filter *filter)
+ {
+     return CONTAINING_RECORD(filter, struct navigator, filter);
+@@ -60,6 +119,7 @@ static void navigator_destroy(struct strmbase_filter *iface)
+     struct navigator *filter = impl_from_strmbase_filter(iface);
+ 
+     strmbase_filter_cleanup(&filter->filter);
++    free(filter->directory);
+     free(filter);
+ }
+ 
+@@ -97,9 +157,8 @@ static HRESULT WINAPI dvd_control2_PlayTitle(IDvdControl2 *iface, ULONG title, D
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, title %lu, flags %#lx, cmd %p.\n", filter, title, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (!title || title > 99) { if (cmd) *cmd = NULL; return E_INVALIDARG; }
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayChapterInTitle(IDvdControl2 *iface, ULONG title, ULONG chapter,
+@@ -107,9 +166,8 @@ static HRESULT WINAPI dvd_control2_PlayChapterInTitle(IDvdControl2 *iface, ULONG
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, title %lu, chapter %lu, flags %#lx, cmd %p.\n", filter, title, chapter, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (!title || title > 99 || !chapter) { if (cmd) *cmd = NULL; return E_INVALIDARG; }
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayTimeInTitle(IDvdControl2 *iface, ULONG title, DVD_HMSF_TIMECODE *time,
+@@ -117,261 +175,264 @@ static HRESULT WINAPI dvd_control2_PlayTimeInTitle(IDvdControl2 *iface, ULONG ti
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, title %lu, time %p, flags %#lx, cmd %p.\n", filter, title, time, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (cmd) *cmd = NULL;
++    if (!time) return E_POINTER;
++    if (!title || title > 99 || bad_time(time)) return E_INVALIDARG;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_Stop(IDvdControl2 *iface)
+ {
+-    struct navigator *filter = impl_from_IDvdControl2(iface);
+-
+-    FIXME("filter %p.\n", filter);
+-
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_control2_ReturnFromSubmenu(IDvdControl2 *iface, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, flags %#lx, cmd %p.\n", filter, flags, cmd);
+-
+-    return E_NOTIMPL;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayAtTime(IDvdControl2 *iface, DVD_HMSF_TIMECODE *time, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, time %p, flags %#lx, cmd %p.\n", filter, time, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (cmd) *cmd = NULL;
++    if (!time) return E_POINTER;
++    if (bad_time(time)) return E_INVALIDARG;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayChapter(IDvdControl2 *iface, ULONG chapter, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, chapter %lu, flags %#lx, cmd %p.\n", filter, chapter, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (!chapter) { if (cmd) *cmd = NULL; return E_INVALIDARG; }
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayPrevChapter(IDvdControl2 *iface, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, flags %#lx, cmd %p.\n", filter, flags, cmd);
+-
+-    return E_NOTIMPL;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_ReplayChapter(IDvdControl2 *iface, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, flags %#lx, cmd %p.\n", filter, flags, cmd);
+-
+-    return E_NOTIMPL;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayNextChapter(IDvdControl2 *iface, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, flags %#lx, cmd %p.\n", filter, flags, cmd);
+-
+-    return E_NOTIMPL;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayForwards(IDvdControl2 *iface, double speed, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, speed %.16e, flags %#lx, cmd %p.\n", filter, speed, flags, cmd);
+-
+-    return E_NOTIMPL;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayBackwards(IDvdControl2 *iface, double speed, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, speed %.16e, flags %#lx, cmd %p.\n", filter, speed, flags, cmd);
+-
+-    return E_NOTIMPL;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_ShowMenu(IDvdControl2 *iface, DVD_MENU_ID id, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, id %d, flags %#lx, cmd %p.\n", filter, id, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (id < DVD_MENU_Title || id > DVD_MENU_Chapter) { if (cmd) *cmd = NULL; return E_INVALIDARG; }
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_Resume(IDvdControl2 *iface, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, flags %#lx, cmd %p.\n", filter, flags, cmd);
+-
+-    return E_NOTIMPL;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectRelativeButton(IDvdControl2 *iface, DVD_RELATIVE_BUTTON button)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, button %d.\n", filter, button);
+-
+-    return E_NOTIMPL;
++    if (button < DVD_Relative_Upper || button > DVD_Relative_Right) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_ActivateButton(IDvdControl2 *iface)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p.\n", filter);
+-
+-    return E_NOTIMPL;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectButton(IDvdControl2 *iface, ULONG button)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, button %lu.\n", filter, button);
+-
+-    return E_NOTIMPL;
++    if (button < 1 || button > 36) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectAndActivateButton(IDvdControl2 *iface, ULONG button)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, button %lu.\n", filter, button);
+-
+-    return E_NOTIMPL;
++    if (button < 1 || button > 36) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_StillOff(IDvdControl2 *iface)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p.\n", filter);
+-
+-    return E_NOTIMPL;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_Pause(IDvdControl2 *iface, BOOL enable)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, enable %d.\n", filter, enable);
+-
+-    return E_NOTIMPL;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectAudioStream(IDvdControl2 *iface, ULONG stream, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, stream %lu, flags %#lx, cmd %p.\n", filter, stream, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (stream > 7 && stream != ~0u) { if (cmd) *cmd = NULL; return E_INVALIDARG; }
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectSubpictureStream(IDvdControl2 *iface, ULONG stream, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, stream %lu, flags %#lx, cmd %p.\n", filter, stream, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (stream > 31 && stream != ~0u) { if (cmd) *cmd = NULL; return E_INVALIDARG; }
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SetSubpictureState(IDvdControl2 *iface, BOOL enable, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, enable %d, flags %#lx, cmd %p.\n", filter, enable, flags, cmd);
+-
+-    return E_NOTIMPL;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectAngle(IDvdControl2 *iface, ULONG angle, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, angle %lu, flags %#lx, cmd %p.\n", filter, angle, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (angle < 1 || angle > 9) { if (cmd) *cmd = NULL; return E_INVALIDARG; }
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectParentalLevel(IDvdControl2 *iface, ULONG level)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, level %lu.\n", filter, level);
+-
+-    return E_NOTIMPL;
++#ifndef SG_MUTANT_ARGS
++    if (level != ~0u && (level < 1 || level > 8)) return E_INVALIDARG;
++#endif
++    EnterCriticalSection(&filter->filter.filter_cs);
++#ifndef SG_MUTANT_STATE
++    filter->parental_level = level;
++#endif
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectParentalCountry(IDvdControl2 *iface, BYTE country[2])
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, country %p.\n", filter, country);
+-
+-    return E_NOTIMPL;
++    if (!country) return E_POINTER;
++#ifndef SG_MUTANT_ARGS
++    if (0) return E_INVALIDARG;
++#endif
++    EnterCriticalSection(&filter->filter.filter_cs);
++#ifndef SG_MUTANT_STATE
++    memcpy(filter->parental_country, country, 2);
++#endif
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectKaraokeAudioPresentationMode(IDvdControl2 *iface, ULONG mode)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, mode %lu.\n", filter, mode);
+-
+-    return E_NOTIMPL;
++#ifndef SG_MUTANT_ARGS
++    if (0) return E_INVALIDARG;
++#endif
++    EnterCriticalSection(&filter->filter.filter_cs);
++#ifndef SG_MUTANT_STATE
++    filter->karaoke_mode = mode;
++#endif
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectVideoModePreference(IDvdControl2 *iface, ULONG mode)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, mode %lu.\n", filter, mode);
+-
+-    return E_NOTIMPL;
++#ifndef SG_MUTANT_ARGS
++    if (mode > DISPLAY_4x3_LETTERBOX_PREFERRED) return E_INVALIDARG;
++#endif
++    EnterCriticalSection(&filter->filter.filter_cs);
++#ifndef SG_MUTANT_STATE
++    filter->video_preference = mode;
++#endif
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SetDVDDirectory(IDvdControl2 *iface, const WCHAR *path)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, path %s.\n", filter, debugstr_w(path));
++    WCHAR *copy;
+ 
+-    return E_NOTIMPL;
++    if (!path)
++        return E_POINTER;
++    if (!volume_exists(path))
++        return VFW_E_DVD_INVALID_DISC;
++    if (!(copy = wcsdup(path)))
++        return E_OUTOFMEMORY;
++    EnterCriticalSection(&filter->filter.filter_cs);
++#ifndef SG_MUTANT_STATE
++    free(filter->directory);
++    filter->directory = copy;
++#else
++    free(copy);
++#endif
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_control2_ActivateAtPosition(IDvdControl2 *iface, POINT point)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, point %s.\n", filter, wine_dbgstr_point(&point));
+-
+-    return E_NOTIMPL;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectAtPosition(IDvdControl2 *iface, POINT point)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, point %s.\n", filter, wine_dbgstr_point(&point));
+-
+-    return E_NOTIMPL;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayChaptersAutoStop(IDvdControl2 *iface, ULONG title, ULONG chapter, ULONG count,
+@@ -379,36 +440,39 @@ static HRESULT WINAPI dvd_control2_PlayChaptersAutoStop(IDvdControl2 *iface, ULO
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, title %lu, chapter %lu, count %lu, flags %#lx, cmd %p.\n", filter, title, chapter, count, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (!title || title > 99 || !chapter || !count) { if (cmd) *cmd = NULL; return E_INVALIDARG; }
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_AcceptParentalLevelChange(IDvdControl2 *iface, BOOL accept)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, accept %d.\n", filter, accept);
+-
+-    return E_NOTIMPL;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SetOption(IDvdControl2 *iface, DVD_OPTION_FLAG flag, BOOL option)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, flag %d, option %d.\n", filter, flag, option);
+-
+-    return E_NOTIMPL;
++#ifndef SG_MUTANT_ARGS
++    if (flag < DVD_ResetOnStop || flag > DVD_EnableCC) return E_INVALIDARG;
++#endif
++    EnterCriticalSection(&filter->filter.filter_cs);
++#ifndef SG_MUTANT_STATE
++    if (option) filter->options |= 1u << flag; else filter->options &= ~(1u << flag);
++#endif
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SetState(IDvdControl2 *iface, IDvdState *state, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, state %p, flags %#lx, cmd %p.\n", filter, state, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (cmd) *cmd = NULL;
++    if (!state) return E_POINTER;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_PlayPeriodInTitleAutoStop(IDvdControl2 *iface, ULONG title,
+@@ -416,28 +480,34 @@ static HRESULT WINAPI dvd_control2_PlayPeriodInTitleAutoStop(IDvdControl2 *iface
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, title %lu, start_time %p, end_time %p, flags %#lx, cmd %p.\n",
+-            filter, title, start_time, end_time, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (cmd) *cmd = NULL;
++    if (!start_time || !end_time) return E_POINTER;
++    if (!title || title > 99 || bad_time(start_time) || bad_time(end_time)) return E_INVALIDARG;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SetGRPM(IDvdControl2 *iface, ULONG index, WORD value, DWORD flags, IDvdCmd **cmd)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, index %lu, value %d, flags %#lx, cmd %p.\n", filter, index, value, flags, cmd);
+-
+-    return E_NOTIMPL;
++    if (cmd) *cmd = NULL;
++    if (index >= 16) return E_INVALIDARG;
++    return nav_cmd(filter, flags, cmd);
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectDefaultMenuLanguage(IDvdControl2 *iface, LCID language)
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, language %#lx.\n", filter, language);
+-
+-    return E_NOTIMPL;
++#ifndef SG_MUTANT_ARGS
++    if (!IsValidLocale(language, LCID_SUPPORTED)) return E_INVALIDARG;
++#endif
++    EnterCriticalSection(&filter->filter.filter_cs);
++#ifndef SG_MUTANT_STATE
++    filter->menu_language = language;
++#endif
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectDefaultAudioLanguage(IDvdControl2 *iface, LCID language,
+@@ -445,9 +515,15 @@ static HRESULT WINAPI dvd_control2_SelectDefaultAudioLanguage(IDvdControl2 *ifac
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, language %#lx, extension %d.\n", filter, language, extension);
+-
+-    return E_NOTIMPL;
++#ifndef SG_MUTANT_ARGS
++    if (!IsValidLocale(language, LCID_SUPPORTED) || extension < DVD_AUD_EXT_NotSpecified || extension > DVD_AUD_EXT_DirectorComments2) return E_INVALIDARG;
++#endif
++    EnterCriticalSection(&filter->filter.filter_cs);
++#ifndef SG_MUTANT_STATE
++    filter->audio_language = language; filter->audio_extension = extension;
++#endif
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_control2_SelectDefaultSubpictureLanguage(IDvdControl2 *iface, LCID language,
+@@ -455,9 +531,15 @@ static HRESULT WINAPI dvd_control2_SelectDefaultSubpictureLanguage(IDvdControl2
+ {
+     struct navigator *filter = impl_from_IDvdControl2(iface);
+ 
+-    FIXME("filter %p, language %#lx, extension %d.\n", filter, language, extension);
+-
+-    return E_NOTIMPL;
++#ifndef SG_MUTANT_ARGS
++    if (!IsValidLocale(language, LCID_SUPPORTED) || extension < 0 || extension > DVD_SP_EXT_DirectorComments_Children || extension == 4 || extension == 8 || (extension > 9 && extension < 13)) return E_INVALIDARG;
++#endif
++    EnterCriticalSection(&filter->filter.filter_cs);
++#ifndef SG_MUTANT_STATE
++    filter->subpicture_language = language; filter->subpicture_extension = extension;
++#endif
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static const struct IDvdControl2Vtbl dvd_control2_vtbl =
+@@ -534,108 +616,105 @@ static HRESULT WINAPI dvd_info2_GetCurrentDomain(IDvdInfo2 *iface, DVD_DOMAIN *d
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, domain %p.\n", filter, domain);
+-
+-    return E_NOTIMPL;
++    if (!domain) return E_POINTER;
++    *domain = filter->domain;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetCurrentLocation(IDvdInfo2 *iface, DVD_PLAYBACK_LOCATION2 *location)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, location %p.\n", filter, location);
+-
+-    return E_NOTIMPL;
++    if (!location) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetTotalTitleTime(IDvdInfo2 *iface, DVD_HMSF_TIMECODE *time, ULONG *flags)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, time %p, flags %p.\n", filter, time, flags);
+-
+-    return E_NOTIMPL;
++    if (!time) return E_POINTER;
++    if (!flags) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetCurrentButton(IDvdInfo2 *iface, ULONG *count, ULONG *current)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, count %p, current %p.\n", filter, count, current);
+-
+-    return E_NOTIMPL;
++    if (!count) return E_POINTER;
++    if (!current) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetCurrentAngle(IDvdInfo2 *iface, ULONG *count, ULONG *current)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, count %p, current %p.\n", filter, count, current);
+-
+-    return E_NOTIMPL;
++    if (!count) return E_POINTER;
++    if (!current) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetCurrentAudio(IDvdInfo2 *iface, ULONG *count, ULONG *current)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, count %p, current %p.\n", filter, count, current);
+-
+-    return E_NOTIMPL;
++    if (!count) return E_POINTER;
++    if (!current) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetCurrentSubpicture(IDvdInfo2 *iface, ULONG *count, ULONG *current, BOOL *enable)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, count %p, current %p, enable %p.\n", filter, count, current, enable);
+-
+-    return E_NOTIMPL;
++    if (!count) return E_POINTER;
++    if (!current) return E_POINTER;
++    if (!enable) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetCurrentUOPS(IDvdInfo2 *iface, ULONG *uops)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, uops %p.\n", filter, uops);
+-
+-    return E_NOTIMPL;
++    if (!uops) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetAllSPRMs(IDvdInfo2 *iface, SPRMARRAY *regs)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, regs %p.\n", filter, regs);
+-
+-    return E_NOTIMPL;
++    if (!regs) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetAllGPRMs(IDvdInfo2 *iface, GPRMARRAY *regs)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, regs %p.\n", filter, regs);
+-
+-    return E_NOTIMPL;
++    if (!regs) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetAudioLanguage(IDvdInfo2 *iface, ULONG stream, LCID *language)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, stream %lu, language %p.\n", filter, stream, language);
+-
+-    return E_NOTIMPL;
++    if (!language) return E_POINTER;
++    if (stream > 7) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetSubpictureLanguage(IDvdInfo2 *iface, ULONG stream, LCID *language)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, stream %lu, language %p.\n", filter, stream, language);
+-
+-    return E_NOTIMPL;
++    if (!language) return E_POINTER;
++    if (stream > 31) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetTitleAttributes(IDvdInfo2 *iface, ULONG index,
+@@ -643,45 +722,43 @@ static HRESULT WINAPI dvd_info2_GetTitleAttributes(IDvdInfo2 *iface, ULONG index
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, index %lu, menu %p, title %p.\n", filter, index, menu, title);
+-
+-    return E_NOTIMPL;
++    if (!title) return E_POINTER;
++    if (index > 99 && index != ~0u) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetVMGAttributes(IDvdInfo2 *iface, DVD_MenuAttributes *attr)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, attr %p.\n", filter, attr);
+-
+-    return E_NOTIMPL;
++    if (!attr) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetVideoAttributes(IDvdInfo2 *iface, DVD_VideoAttributes *attr)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, attr %p.\n", filter, attr);
+-
+-    return E_NOTIMPL;
++    if (!attr) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetAudioAttributes(IDvdInfo2 *iface, ULONG stream, DVD_AudioAttributes *attr)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, stream %lu, attr %p.\n", filter, stream, attr);
+-
+-    return E_NOTIMPL;
++    if (!attr) return E_POINTER;
++    if (stream > 7 && stream != ~0u) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetKaraokeAttributes(IDvdInfo2 *iface, ULONG stream, DVD_KaraokeAttributes *attr)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, stream %lu, attr %p.\n", filter, stream, attr);
+-
+-    return E_NOTIMPL;
++    if (!attr) return E_POINTER;
++    if (stream > 7) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetSubpictureAttributes(IDvdInfo2 *iface, ULONG stream,
+@@ -689,9 +766,9 @@ static HRESULT WINAPI dvd_info2_GetSubpictureAttributes(IDvdInfo2 *iface, ULONG
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, stream %lu, attr %p.\n", filter, stream, attr);
+-
+-    return E_NOTIMPL;
++    if (!attr) return E_POINTER;
++    if (stream > 31 && stream != ~0u) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetCurrentVolumeInfo(IDvdInfo2 *iface, ULONG *volume_count, ULONG *current,
+@@ -699,19 +776,19 @@ static HRESULT WINAPI dvd_info2_GetCurrentVolumeInfo(IDvdInfo2 *iface, ULONG *vo
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, volume_count %p, current %p, side %p, title_count %p.\n",
+-            filter, volume_count, current, side, title_count);
+-
+-    return E_NOTIMPL;
++    if (!volume_count) return E_POINTER;
++    if (!current) return E_POINTER;
++    if (!side) return E_POINTER;
++    if (!title_count) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetDVDTextNumberOfLanguages(IDvdInfo2 *iface, ULONG *count)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, count %p.\n", filter, count);
+-
+-    return E_NOTIMPL;
++    if (!count) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetDVDTextLanguageInfo(IDvdInfo2 *iface, ULONG index, ULONG *string_count,
+@@ -719,10 +796,10 @@ static HRESULT WINAPI dvd_info2_GetDVDTextLanguageInfo(IDvdInfo2 *iface, ULONG i
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, index %lu, string_count %p, language %p, character_set %p.\n",
+-            filter, index, string_count, language, character_set);
+-
+-    return E_NOTIMPL;
++    if (!string_count) return E_POINTER;
++    if (!language) return E_POINTER;
++    if (!character_set) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetDVDTextStringAsNative(IDvdInfo2 *iface, ULONG lang_index, ULONG string_index,
+@@ -730,10 +807,10 @@ static HRESULT WINAPI dvd_info2_GetDVDTextStringAsNative(IDvdInfo2 *iface, ULONG
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, lang_index %lu, string_index %lu, string %p, size %lu, ret_size %p, type %p.\n",
+-            filter, lang_index, string_index, string, size, ret_size, type);
+-
+-    return E_NOTIMPL;
++    if (!ret_size) return E_POINTER;
++    if (!type) return E_POINTER;
++    if (!string && size) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetDVDTextStringAsUnicode(IDvdInfo2 *iface, ULONG lang_index, ULONG string_index,
+@@ -741,63 +818,97 @@ static HRESULT WINAPI dvd_info2_GetDVDTextStringAsUnicode(IDvdInfo2 *iface, ULON
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, lang_index %lu, string_index %lu, string %p, size %lu, ret_size %p, type %p.\n",
+-            filter, lang_index, string_index, string, size, ret_size, type);
+-
+-    return E_NOTIMPL;
++    if (!ret_size) return E_POINTER;
++    if (!type) return E_POINTER;
++    if (!string && size) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetPlayerParentalLevel(IDvdInfo2 *iface, ULONG *level, BYTE country_code[2])
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, level %p, country_code %p.\n", filter, level, country_code);
+-
+-    return E_NOTIMPL;
++    if (!level || !country_code)
++        return E_POINTER;
++    EnterCriticalSection(&filter->filter.filter_cs);
++    *level = filter->parental_level;
++    memcpy(country_code, filter->parental_country, 2);
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetNumberOfChapters(IDvdInfo2 *iface, ULONG title, ULONG *count)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, title %lu, count %p.\n", filter, title, count);
+-
+-    return E_NOTIMPL;
++    if (!count) return E_POINTER;
++    if (!title || title > 99) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetTitleParentalLevels(IDvdInfo2 *iface, ULONG title, ULONG *levels)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, title %lu, levels %p.\n", filter, title, levels);
+-
+-    return E_NOTIMPL;
++    if (!levels) return E_POINTER;
++    if (title > 99) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetDVDDirectory(IDvdInfo2 *iface, WCHAR *path, ULONG size, ULONG *ret_size)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, path %p, size %lu, ret_size %p.\n", filter, path, size, ret_size);
++    HRESULT hr = S_OK;
++    ULONG len;
+ 
+-    return E_NOTIMPL;
++    if (!ret_size)
++        return E_POINTER;
++    *ret_size = 0;
++    EnterCriticalSection(&filter->filter.filter_cs);
++    if (!filter->directory)
++        hr = VFW_E_DVD_INVALID_DISC;
++    else
++    {
++        len = wcslen(filter->directory) + 1;
++        *ret_size = len;
++        if (!path)
++            hr = E_POINTER;
++        else if (size < len)
++            hr = E_INVALIDARG;
++        else
++            memcpy(path, filter->directory, len * sizeof(WCHAR));
++    }
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI dvd_info2_IsAudioStreamEnabled(IDvdInfo2 *iface, ULONG stream, BOOL *enable)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, stream %lu, enable %p.\n", filter, stream, enable);
+-
+-    return E_NOTIMPL;
++    if (!enable) return E_POINTER;
++    if (stream > 7) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetDiscID(IDvdInfo2 *iface, const WCHAR *path, ULONGLONG *id)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, path %s, id %p.\n", filter, debugstr_w(path), id);
+-
++    if (!id)
++        return E_POINTER;
++    *id = 0;
++    EnterCriticalSection(&filter->filter.filter_cs);
++    if (!path)
++        path = filter->directory;
++    if (!path || !volume_exists(path))
++    {
++        LeaveCriticalSection(&filter->filter.filter_cs);
++        return VFW_E_DVD_INVALID_DISC;
++    }
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    FIXME("Disc identifier computation is not implemented.\n");
+     return E_NOTIMPL;
+ }
+ 
+@@ -805,45 +916,44 @@ static HRESULT WINAPI dvd_info2_GetState(IDvdInfo2 *iface, IDvdState **state)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, state %p.\n", filter, state);
+-
+-    return E_NOTIMPL;
++    if (!state) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetMenuLanguages(IDvdInfo2 *iface, LCID *languages, ULONG count, ULONG *ret_count)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, languages %p, count %lu, ret_count %p.\n", filter, languages, count, ret_count);
+-
+-    return E_NOTIMPL;
++    if (!ret_count) return E_POINTER;
++    if (count && !languages) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetButtonAtPosition(IDvdInfo2 *iface, POINT point, ULONG *button)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, point %s, button %p.\n", filter, wine_dbgstr_point(&point), button);
+-
+-    return E_NOTIMPL;
++    if (!button) return E_POINTER;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetCmdFromEvent(IDvdInfo2 *iface, LONG_PTR param, IDvdCmd **cmd)
+ {
+-    struct navigator *filter = impl_from_IDvdInfo2(iface);
+-
+-    FIXME("filter %p, param %#Ix, cmd %p.\n", filter, param, cmd);
+ 
+-    return E_NOTIMPL;
++    if (!cmd) return E_POINTER;
++    *cmd = NULL;
++    return E_INVALIDARG;
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetDefaultMenuLanguage(IDvdInfo2 *iface, LCID *language)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, language %p.\n", filter, language);
+-
+-    return E_NOTIMPL;
++    if (!language) return E_POINTER;
++    EnterCriticalSection(&filter->filter.filter_cs);
++    *language = filter->menu_language;
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetDefaultAudioLanguage(IDvdInfo2 *iface, LCID *language,
+@@ -851,9 +961,12 @@ static HRESULT WINAPI dvd_info2_GetDefaultAudioLanguage(IDvdInfo2 *iface, LCID *
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, language %p, extension %p.\n", filter, language, extension);
+-
+-    return E_NOTIMPL;
++    if (!language || !extension) return E_POINTER;
++    EnterCriticalSection(&filter->filter.filter_cs);
++    *language = filter->audio_language;
++    *extension = filter->audio_extension;
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_info2_SelectDefaultSubpictureLanguage(IDvdInfo2 *iface, LCID *language,
+@@ -861,36 +974,40 @@ static HRESULT WINAPI dvd_info2_SelectDefaultSubpictureLanguage(IDvdInfo2 *iface
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, language %p, extension %p.\n", filter, language, extension);
+-
+-    return E_NOTIMPL;
++    if (!language || !extension) return E_POINTER;
++    EnterCriticalSection(&filter->filter.filter_cs);
++    *language = filter->subpicture_language;
++    *extension = filter->subpicture_extension;
++    LeaveCriticalSection(&filter->filter.filter_cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetDecoderCaps(IDvdInfo2 *iface, DVD_DECODER_CAPS *caps)
+ {
+-    struct navigator *filter = impl_from_IDvdInfo2(iface);
+-
+-    FIXME("filter %p, caps %p.\n", filter, caps);
+ 
+-    return E_NOTIMPL;
++    if (!caps) return E_POINTER;
++    if (caps->dwSize != sizeof(*caps)) return E_INVALIDARG;
++    /* no decoders are available to the navigator: nothing is supported */
++    memset((char *)caps + sizeof(caps->dwSize), 0, sizeof(*caps) - sizeof(caps->dwSize));
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI dvd_info2_GetButtonRect(IDvdInfo2 *iface, ULONG button, RECT *rect)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, button %lu, rect %p.\n", filter, button, rect);
+-
+-    return E_NOTIMPL;
++    if (!rect) return E_POINTER;
++    if (button < 1 || button > 36) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static HRESULT WINAPI dvd_info2_IsSubpictureStreamEnabled(IDvdInfo2 *iface, ULONG stream, BOOL *enable)
+ {
+     struct navigator *filter = impl_from_IDvdInfo2(iface);
+ 
+-    FIXME("filter %p, stream %lu, enable %p.\n", filter, stream, enable);
+-
+-    return E_NOTIMPL;
++    if (!enable) return E_POINTER;
++    if (stream > 31) return E_INVALIDARG;
++    return nav_domain_check(filter);
+ }
+ 
+ static const struct IDvdInfo2Vtbl dvd_info2_vtbl =
+@@ -949,6 +1066,11 @@ HRESULT navigator_create(IUnknown *outer, IUnknown **out)
+     strmbase_filter_init(&object->filter, outer, &CLSID_DVDNavigator, &filter_ops);
+     object->IDvdControl2_iface.lpVtbl = &dvd_control2_vtbl;
+     object->IDvdInfo2_iface.lpVtbl = &dvd_info2_vtbl;
++    object->domain = DVD_DOMAIN_Stop;
++    object->parental_level = ~0u;
++    object->parental_country[0] = 'U';
++    object->parental_country[1] = 'S';
++    object->menu_language = object->audio_language = object->subpicture_language = GetUserDefaultLCID();
+ 
+     TRACE("Created DVD Navigator filter %p.\n", object);
+     *out = &object->filter.IUnknown_inner;

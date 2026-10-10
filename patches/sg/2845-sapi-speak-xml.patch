@@ -1,0 +1,673 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] sapi: Speak parses the XML markup of SAPI
+
+sapi: Speak parses the XML markup of SAPI
+
+ISpVoice::Speak (and SpeakStream, and ISpeechVoice) refused SPF_IS_XML,
+SPF_PERSIST_XML and SPF_PARSE_SAPI with E_NOTIMPL ("flags not implemented").
+They give the engine a list of text fragments now (new speak_text.c):
+
+- volume (level, absvolume; kept within 0 to 100), rate (speed adds,
+  absspeed replaces), pitch (middle and range add, absmiddle and absrange
+  replace), emph, spell, pron (sym), lang (langid), context (id) and
+  partofsp (part) set the state of the fragments for their content, and
+  the state is restored at the closing tag; self closing tags set it for the
+  rest of the enclosing element.
+- silence (msec) and bookmark (mark) are fragments of their own, with the
+  actions SPVA_Silence and SPVA_Bookmark; a tag that is not SAPI's goes to
+  the engine as an SPVA_ParseUnknownTag fragment holding the tag text.
+- Character references (the five named ones and numeric ones) are decoded,
+  tag and attribute names are not case sensitive, and every text fragment
+  knows its offset in the source text.
+- Malformed markup (unclosed or stray tags, attributes without a quoted
+  value, an unfinished tag) is SPERR_XML_BAD_SYNTAX and the engine is not
+  called. SSML (SPF_PARSE_SSML) is still E_NOTIMPL, the voice tag does not
+  change the voice mid text, and without the XML flags the text is spoken
+  as it is, tags included, as before.
+
+---
+diff --git a/dlls/sapi/Makefile.in b/dlls/sapi/Makefile.in
+index 5059846..72e9e9d 100644
+--- a/dlls/sapi/Makefile.in
++++ b/dlls/sapi/Makefile.in
+@@ -14,6 +14,7 @@ SOURCES = \
+ 	sapi.rc \
+ 	sapi_classes.idl \
+ 	sapi_typelib.idl \
++	speak_text.c \
+ 	stream.c \
+ 	token.c \
+ 	tts.c \
+diff --git a/dlls/sapi/sapi_private.h b/dlls/sapi/sapi_private.h
+index 640bcbc..530f5c4 100644
+--- a/dlls/sapi/sapi_private.h
++++ b/dlls/sapi/sapi_private.h
+@@ -150,3 +150,8 @@ HRESULT voice_find_connection_point( struct voice_dispatcher *dispatcher, IConne
+ HRESULT voice_enum_connection_points( struct voice_dispatcher *dispatcher, IConnectionPointContainer *container,
+                                       IEnumConnectionPoints **ret );
+ void voice_events_cleanup( void );
++
++/* Text fragments for the engine (speak_text.c) */
++HRESULT voice_plain_frag( const WCHAR *text, SIZE_T len, SPVTEXTFRAG **frag );
++HRESULT voice_xml_frags( const WCHAR *text, SPVTEXTFRAG **list );
++void voice_free_frags( SPVTEXTFRAG *list );
+diff --git a/dlls/sapi/speak_text.c b/dlls/sapi/speak_text.c
+new file mode 100644
+index 0000000..5102721
+--- /dev/null
++++ b/dlls/sapi/speak_text.c
+@@ -0,0 +1,521 @@
++/*
++ * Speech API (SAPI) text fragments for the engine: plain text and the XML
++ * markup of SAPI (volume, rate, pitch, emph, spell, silence, bookmark,
++ * pron, lang, context, partofsp; unknown tags are handed to the engine).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "objbase.h"
++
++#include "sapiddk.h"
++#include "sperror.h"
++
++#include "sapi_private.h"
++
++#define MAX_DEPTH 64
++
++struct attr
++{
++    WCHAR *name;
++    WCHAR *value;
++};
++
++struct tag
++{
++    WCHAR *name;
++    struct attr attrs[8];
++    unsigned int attr_count;
++    BOOL closing, self_closing;
++    const WCHAR *end;       /* after the '>' */
++};
++
++struct frame
++{
++    WCHAR *name;
++    SPVSTATE saved;
++};
++
++struct parser
++{
++    SPVTEXTFRAG *head, **tail;
++    SPVSTATE state;
++    struct frame stack[MAX_DEPTH];
++    unsigned int depth;
++    WCHAR **arena;      /* strings the state points to */
++    unsigned int arena_count;
++    HRESULT hr;
++};
++
++void voice_free_frags(SPVTEXTFRAG *list)
++{
++    SPVTEXTFRAG *next;
++
++    for (; list; list = next)
++    {
++        next = list->pNext;
++        free(list);
++    }
++}
++
++/* One fragment with its strings in the same allocation. */
++static SPVTEXTFRAG *new_frag(const SPVSTATE *state, const WCHAR *text, ULONG len, ULONG src_offset)
++{
++    SIZE_T text_size = (len + 1) * sizeof(WCHAR);
++    SIZE_T phones_size = state->pPhoneIds ? (wcslen((WCHAR *)state->pPhoneIds) + 1) * sizeof(WCHAR) : 0;
++    SIZE_T cat_size = state->Context.pCategory ? (wcslen(state->Context.pCategory) + 1) * sizeof(WCHAR) : 0;
++    SPVTEXTFRAG *frag;
++    char *ptr;
++
++    if (!(frag = calloc(1, sizeof(*frag) + text_size + phones_size + cat_size)))
++        return NULL;
++
++    ptr = (char *)(frag + 1);
++    frag->State = *state;
++    frag->pTextStart = (WCHAR *)ptr;
++    if (text) memcpy(ptr, text, len * sizeof(WCHAR));
++    ((WCHAR *)ptr)[len] = 0;
++    frag->ulTextLen = len;
++    frag->ulTextSrcOffset = src_offset;
++#ifdef SG_MUTANT_SAPIXML_SRC_OFFSET
++    frag->ulTextSrcOffset = 0;
++#endif
++    ptr += text_size;
++    if (phones_size)
++    {
++        memcpy(ptr, state->pPhoneIds, phones_size);
++        frag->State.pPhoneIds = (SPPHONEID *)ptr;
++        ptr += phones_size;
++    }
++    if (cat_size)
++    {
++        memcpy(ptr, state->Context.pCategory, cat_size);
++        frag->State.Context.pCategory = (WCHAR *)ptr;
++    }
++    return frag;
++}
++
++static void init_state(SPVSTATE *state)
++{
++    memset(state, 0, sizeof(*state));
++    state->eAction = SPVA_Speak;
++    state->Volume = 100;
++}
++
++HRESULT voice_plain_frag(const WCHAR *text, SIZE_T len, SPVTEXTFRAG **frag)
++{
++    SPVSTATE state;
++
++    init_state(&state);
++    if (!(*frag = new_frag(&state, text, len, 0)))
++        return E_OUTOFMEMORY;
++    return S_OK;
++}
++
++static void add_frag(struct parser *p, SPVTEXTFRAG *frag)
++{
++    if (!frag)
++    {
++        p->hr = E_OUTOFMEMORY;
++        return;
++    }
++    *p->tail = frag;
++    p->tail = &frag->pNext;
++}
++
++static WCHAR *keep_string(struct parser *p, WCHAR *str)
++{
++    WCHAR **new_arena;
++
++    if (!(new_arena = realloc(p->arena, (p->arena_count + 1) * sizeof(*new_arena))))
++    {
++        p->hr = E_OUTOFMEMORY;
++        return NULL;
++    }
++    p->arena = new_arena;
++    p->arena[p->arena_count++] = str;
++    return str;
++}
++
++/* Replaces the character references in the text; returns a new string. */
++static WCHAR *decode_entities(const WCHAR *text, SIZE_T len, SIZE_T *out_len)
++{
++    WCHAR *out = malloc((len + 1) * sizeof(WCHAR)), *dst = out;
++    SIZE_T i = 0;
++
++    if (!out) return NULL;
++    while (i < len)
++    {
++#ifdef SG_MUTANT_SAPIXML_NO_DECODE
++        if (0)
++#else
++        if (text[i] == '&')
++#endif
++        {
++            static const struct { const WCHAR *name; WCHAR ch; } named[] =
++            { { L"amp;", '&' }, { L"lt;", '<' }, { L"gt;", '>' }, { L"quot;", '"' }, { L"apos;", '\'' } };
++            unsigned int n;
++            BOOL done = FALSE;
++
++            for (n = 0; n < ARRAY_SIZE(named); n++)
++            {
++                SIZE_T l = wcslen(named[n].name);
++                if (i + 1 + l <= len && !wcsncmp(text + i + 1, named[n].name, l))
++                {
++                    *dst++ = named[n].ch;
++                    i += 1 + l;
++                    done = TRUE;
++                    break;
++                }
++            }
++            if (!done && i + 2 < len && text[i + 1] == '#')
++            {
++                WCHAR *end;
++                unsigned long value = text[i + 2] == 'x' ? wcstoul(text + i + 3, &end, 16) : wcstoul(text + i + 2, &end, 10);
++
++                if (end > text + i + 2 && end < text + len && *end == ';' && value && value < 0x10000)
++                {
++                    *dst++ = value;
++                    i = end - text + 1;
++                    done = TRUE;
++                }
++            }
++            if (done) continue;
++        }
++        *dst++ = text[i++];
++    }
++    *dst = 0;
++    *out_len = dst - out;
++    return out;
++}
++
++static void free_tag(struct tag *tag)
++{
++    unsigned int i;
++
++    free(tag->name);
++    for (i = 0; i < tag->attr_count; i++)
++    {
++        free(tag->attrs[i].name);
++        free(tag->attrs[i].value);
++    }
++}
++
++static BOOL is_name_char(WCHAR c)
++{
++    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == ':' || c == '.';
++}
++
++static WCHAR *dup_range(const WCHAR *start, SIZE_T len)
++{
++    WCHAR *ret = malloc((len + 1) * sizeof(WCHAR));
++
++    if (!ret) return NULL;
++    memcpy(ret, start, len * sizeof(WCHAR));
++    ret[len] = 0;
++    return ret;
++}
++
++/* Reads the tag at text, which points at '<'. */
++static HRESULT parse_tag(const WCHAR *text, struct tag *tag)
++{
++    const WCHAR *p = text + 1, *start;
++
++    memset(tag, 0, sizeof(*tag));
++    if (*p == '/')
++    {
++        tag->closing = TRUE;
++        p++;
++    }
++    start = p;
++    while (is_name_char(*p)) p++;
++    if (p == start) return SPERR_XML_BAD_SYNTAX;
++    if (!(tag->name = dup_range(start, p - start))) return E_OUTOFMEMORY;
++
++    for (;;)
++    {
++        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
++        if (*p == '>')
++        {
++            tag->end = p + 1;
++            return S_OK;
++        }
++        if (*p == '/' && p[1] == '>')
++        {
++            tag->self_closing = TRUE;
++            tag->end = p + 2;
++            return S_OK;
++        }
++        if (tag->closing || tag->attr_count == ARRAY_SIZE(tag->attrs)) return SPERR_XML_BAD_SYNTAX;
++
++        {
++            struct attr *attr = &tag->attrs[tag->attr_count];
++            WCHAR quote;
++            SIZE_T len;
++
++            start = p;
++            while (is_name_char(*p)) p++;
++            if (p == start) return SPERR_XML_BAD_SYNTAX;
++            if (!(attr->name = dup_range(start, p - start))) return E_OUTOFMEMORY;
++            tag->attr_count++;
++
++            while (*p == ' ') p++;
++            if (*p++ != '=') return SPERR_XML_BAD_SYNTAX;
++            while (*p == ' ') p++;
++            if (*p != '"' && *p != '\'') return SPERR_XML_BAD_SYNTAX;
++            quote = *p++;
++            start = p;
++            while (*p && *p != quote) p++;
++            if (*p != quote) return SPERR_XML_BAD_SYNTAX;
++            if (!(attr->value = decode_entities(start, p - start, &len))) return E_OUTOFMEMORY;
++            p++;
++        }
++    }
++}
++
++static const WCHAR *get_attr(const struct tag *tag, const WCHAR *name)
++{
++    unsigned int i;
++
++    for (i = 0; i < tag->attr_count; i++)
++        if (!wcsicmp(tag->attrs[i].name, name)) return tag->attrs[i].value;
++    return NULL;
++}
++
++static LONG get_number(const struct tag *tag, const WCHAR *name, BOOL *found)
++{
++    const WCHAR *value = get_attr(tag, name);
++
++    *found = value != NULL;
++    return value ? wcstol(value, NULL, 10) : 0;
++}
++
++/* Applies the tag to the state (opening it, or a self closing one). */
++static void apply_tag(struct parser *p, const struct tag *tag, const WCHAR *src_start)
++{
++    SPVSTATE *state = &p->state;
++    BOOL found;
++    LONG n;
++    const WCHAR *value;
++
++    if (!wcsicmp(tag->name, L"volume"))
++    {
++        if (get_attr(tag, L"level") || get_attr(tag, L"absvolume"))
++        {
++            n = get_number(tag, L"level", &found);
++            if (!found) n = get_number(tag, L"absvolume", &found);
++#ifdef SG_MUTANT_SAPIXML_VOLUME_CLAMP
++            state->Volume = n;
++#else
++            state->Volume = max(0, min(100, n));
++#endif
++        }
++    }
++    else if (!wcsicmp(tag->name, L"rate"))
++    {
++        n = get_number(tag, L"speed", &found);
++        if (found) state->RateAdj += n;
++        n = get_number(tag, L"absspeed", &found);
++        if (found) state->RateAdj = n;
++    }
++    else if (!wcsicmp(tag->name, L"pitch"))
++    {
++        n = get_number(tag, L"middle", &found);
++#ifdef SG_MUTANT_SAPIXML_PITCH_ABS
++        if (found) state->PitchAdj.MiddleAdj = n;
++#else
++        if (found) state->PitchAdj.MiddleAdj += n;
++#endif
++        n = get_number(tag, L"absmiddle", &found);
++        if (found) state->PitchAdj.MiddleAdj = n;
++        n = get_number(tag, L"range", &found);
++        if (found) state->PitchAdj.RangeAdj += n;
++        n = get_number(tag, L"absrange", &found);
++        if (found) state->PitchAdj.RangeAdj = n;
++    }
++    else if (!wcsicmp(tag->name, L"emph"))
++        state->EmphAdj = 1;
++    else if (!wcsicmp(tag->name, L"spell"))
++        state->eAction = SPVA_SpellOut;
++    else if (!wcsicmp(tag->name, L"pron"))
++    {
++        if ((value = get_attr(tag, L"sym")))
++        {
++            state->eAction = SPVA_Pronounce;
++            state->pPhoneIds = (SPPHONEID *)keep_string(p, wcsdup(value));
++        }
++    }
++    else if (!wcsicmp(tag->name, L"lang"))
++    {
++        if ((value = get_attr(tag, L"langid")))
++            state->LangID = wcstoul(value, NULL, 16);
++    }
++    else if (!wcsicmp(tag->name, L"context"))
++    {
++        if ((value = get_attr(tag, L"id")))
++            state->Context.pCategory = keep_string(p, wcsdup(value));
++    }
++    else if (!wcsicmp(tag->name, L"partofsp"))
++    {
++        static const struct { const WCHAR *name; SPPARTOFSPEECH part; } parts[] =
++        {
++            { L"unknown", SPPS_Unknown }, { L"noun", SPPS_Noun }, { L"verb", SPPS_Verb }, { L"modifier", SPPS_Modifier },
++            { L"function", SPPS_Function }, { L"interjection", SPPS_Interjection }, { L"noncontent", SPPS_Noncontent },
++            { L"lma", SPPS_LMA }, { L"suppressword", SPPS_SuppressWord },
++        };
++        unsigned int i;
++
++        if ((value = get_attr(tag, L"part")))
++            for (i = 0; i < ARRAY_SIZE(parts); i++)
++                if (!wcsicmp(value, parts[i].name)) state->ePartOfSpeech = parts[i].part;
++    }
++    /* The voice and sapi tags do not change what is spoken here. */
++}
++
++static HRESULT parse_xml(const WCHAR *text, SPVTEXTFRAG **list)
++{
++    struct parser p = { 0 };
++    const WCHAR *cur = text;
++    unsigned int i;
++    HRESULT hr;
++
++    p.tail = &p.head;
++    init_state(&p.state);
++    p.hr = S_OK;
++
++    while (*cur && SUCCEEDED(p.hr))
++    {
++        if (*cur != '<')
++        {
++            const WCHAR *start = cur;
++            WCHAR *decoded;
++            SIZE_T len;
++
++            while (*cur && *cur != '<') cur++;
++            if (!(decoded = decode_entities(start, cur - start, &len)))
++            {
++                p.hr = E_OUTOFMEMORY;
++                break;
++            }
++            add_frag(&p, new_frag(&p.state, decoded, len, start - text));
++            free(decoded);
++            continue;
++        }
++
++        {
++            struct tag tag;
++            const WCHAR *value;
++
++            if (FAILED(hr = parse_tag(cur, &tag)))
++            {
++                free_tag(&tag);
++                p.hr = hr;
++                break;
++            }
++
++            if (tag.closing)
++            {
++                if (!p.depth || wcsicmp(p.stack[p.depth - 1].name, tag.name))
++                    p.hr = SPERR_XML_BAD_SYNTAX;
++                else
++                {
++                    p.depth--;
++#ifndef SG_MUTANT_SAPIXML_NO_RESTORE
++                    p.state = p.stack[p.depth].saved;
++#endif
++                    free(p.stack[p.depth].name);
++                }
++            }
++            else if (!wcsicmp(tag.name, L"silence"))
++            {
++                SPVSTATE state = p.state;
++                BOOL found;
++
++                state.eAction = SPVA_Silence;
++                state.SilenceMSecs = max(0, get_number(&tag, L"msec", &found));
++                add_frag(&p, new_frag(&state, NULL, 0, cur - text));
++            }
++            else if (!wcsicmp(tag.name, L"bookmark"))
++            {
++                SPVSTATE state = p.state;
++
++                state.eAction = SPVA_Bookmark;
++                value = get_attr(&tag, L"mark");
++                add_frag(&p, new_frag(&state, value ? value : L"", value ? wcslen(value) : 0, cur - text));
++            }
++            else
++            {
++                BOOL known = !wcsicmp(tag.name, L"volume") || !wcsicmp(tag.name, L"rate") || !wcsicmp(tag.name, L"pitch") ||
++                             !wcsicmp(tag.name, L"emph") || !wcsicmp(tag.name, L"spell") || !wcsicmp(tag.name, L"pron") ||
++                             !wcsicmp(tag.name, L"lang") || !wcsicmp(tag.name, L"context") || !wcsicmp(tag.name, L"partofsp") ||
++                             !wcsicmp(tag.name, L"voice") || !wcsicmp(tag.name, L"sapi");
++
++                if (!known)
++                {
++                    /* A tag that is not SAPI's goes to the engine as it is. */
++                    SPVSTATE state = p.state;
++
++                    state.eAction = SPVA_ParseUnknownTag;
++                    add_frag(&p, new_frag(&state, cur, tag.end - cur, cur - text));
++                }
++                if (!tag.self_closing)
++                {
++                    if (p.depth == MAX_DEPTH) p.hr = SPERR_XML_BAD_SYNTAX;
++                    else
++                    {
++                        p.stack[p.depth].name = wcsdup(tag.name);
++                        p.stack[p.depth].saved = p.state;
++                        p.depth++;
++                    }
++                }
++                if (known) apply_tag(&p, &tag, cur);
++            }
++            cur = tag.end;
++            free_tag(&tag);
++        }
++    }
++
++#ifndef SG_MUTANT_SAPIXML_ACCEPT_BAD
++    if (SUCCEEDED(p.hr) && p.depth)
++        p.hr = SPERR_XML_BAD_SYNTAX;
++#endif
++
++    for (i = 0; i < p.depth; i++) free(p.stack[i].name);
++    for (i = 0; i < p.arena_count; i++) free(p.arena[i]);
++    free(p.arena);
++
++    if (FAILED(p.hr))
++    {
++        voice_free_frags(p.head);
++        return p.hr;
++    }
++    *list = p.head;
++    return S_OK;
++}
++
++HRESULT voice_xml_frags(const WCHAR *text, SPVTEXTFRAG **list)
++{
++    HRESULT hr;
++
++    *list = NULL;
++    if (FAILED(hr = parse_xml(text, list))) return hr;
++    /* Markup without anything to say still has to give the engine a fragment. */
++    if (!*list) return voice_plain_frag(L"", 0, list);
++    return S_OK;
++}
+diff --git a/dlls/sapi/tts.c b/dlls/sapi/tts.c
+index 2a78eb2..94f316f 100644
+--- a/dlls/sapi/tts.c
++++ b/dlls/sapi/tts.c
+@@ -1394,7 +1394,7 @@ done:
+     }
+     CoTaskMemFree(wfx);
+     ISpTTSEngine_Release(speak_task->engine);
+-    free(speak_task->frag_list);
++    voice_free_frags(speak_task->frag_list);
+     ISpTTSEngineSite_Release(speak_task->site);
+     InterlockedDecrement(&This->pending);
+ 
+@@ -1415,7 +1415,7 @@ static HRESULT WINAPI spvoice_Speak(ISpVoice *iface, const WCHAR *contents, DWOR
+     SPVTEXTFRAG *frag;
+     struct speak_task *speak_task = NULL;
+     struct async_result *result = NULL;
+-    size_t contents_len, contents_size;
++    size_t contents_len;
+     ULONG stream_num;
+     HRESULT hr;
+ 
+@@ -1437,10 +1437,11 @@ static HRESULT WINAPI spvoice_Speak(ISpVoice *iface, const WCHAR *contents, DWOR
+     }
+     flags &= ~SPF_IS_FILENAME;
+ 
+-    if (flags & ~(SPF_ASYNC | SPF_PURGEBEFORESPEAK | SPF_NLP_SPEAK_PUNC))
++    if (flags & ~(SPF_ASYNC | SPF_PURGEBEFORESPEAK | SPF_NLP_SPEAK_PUNC | SPF_IS_XML | SPF_PERSIST_XML | SPF_PARSE_SAPI))
+     {
+-        /* XML markup would have to be parsed into fragments for the engine. */
+-        WARN("flags %#lx not implemented.\n", flags & ~(SPF_ASYNC | SPF_PURGEBEFORESPEAK | SPF_NLP_SPEAK_PUNC));
++        /* SSML is not parsed. */
++        WARN("flags %#lx not implemented.\n",
++             flags & ~(SPF_ASYNC | SPF_PURGEBEFORESPEAK | SPF_NLP_SPEAK_PUNC | SPF_IS_XML | SPF_PERSIST_XML | SPF_PARSE_SAPI));
+         return E_NOTIMPL;
+     }
+ 
+@@ -1472,7 +1473,6 @@ static HRESULT WINAPI spvoice_Speak(ISpVoice *iface, const WCHAR *contents, DWOR
+         return E_POINTER;
+ 
+     contents_len = wcslen(contents);
+-    contents_size = sizeof(WCHAR) * (contents_len + 1);
+ 
+     if (!This->output)
+     {
+@@ -1504,15 +1504,16 @@ static HRESULT WINAPI spvoice_Speak(ISpVoice *iface, const WCHAR *contents, DWOR
+ 
+     LeaveCriticalSection(&This->cs);
+ 
+-    if (!(frag = malloc(sizeof(*frag) + contents_size)))
+-        return E_OUTOFMEMORY;
+-    memset(frag, 0, sizeof(*frag));
+-    memcpy(frag + 1, contents, contents_size);
+-    frag->State.eAction = SPVA_Speak;
+-    frag->State.Volume  = 100;
+-    frag->pTextStart    = (WCHAR *)(frag + 1);
+-    frag->ulTextLen     = contents_len;
+-    frag->ulTextSrcOffset = 0;
++    /* The text is spoken as it is, or is markup that gives a list of fragments. */
++    if (flags & (SPF_IS_XML | SPF_PARSE_SAPI))
++        hr = voice_xml_frags(contents, &frag);
++    else
++        hr = voice_plain_frag(contents, contents_len, &frag);
++    if (FAILED(hr))
++    {
++        ISpTTSEngine_Release(engine);
++        return hr;
++    }
+ 
+     stream_num = InterlockedIncrement(&This->cur_stream_num);
+     if (FAILED(hr = ttsenginesite_create(This, stream_num, &site)))
+@@ -1568,7 +1569,7 @@ static HRESULT WINAPI spvoice_Speak(ISpVoice *iface, const WCHAR *contents, DWOR
+ fail:
+     if (site) ISpTTSEngineSite_Release(site);
+     if (engine) ISpTTSEngine_Release(engine);
+-    free(frag);
++    voice_free_frags(frag);
+     free(speak_task);
+     if (result)
+     {
+@@ -1767,9 +1768,10 @@ static HRESULT WINAPI spvoice_SpeakStream(ISpVoice *iface, IStream *stream, DWOR
+     }
+     if (!stream)
+         return E_POINTER;
+-    if (flags & ~(SPF_ASYNC | SPF_NLP_SPEAK_PUNC))
++    /* The markup flags go on to Speak with the text. */
++    if (flags & ~(SPF_ASYNC | SPF_NLP_SPEAK_PUNC | SPF_IS_XML | SPF_PERSIST_XML | SPF_PARSE_SAPI))
+     {
+-        WARN("flags %#lx not implemented.\n", flags & ~(SPF_ASYNC | SPF_NLP_SPEAK_PUNC));
++        WARN("flags %#lx not implemented.\n", flags & ~(SPF_ASYNC | SPF_NLP_SPEAK_PUNC | SPF_IS_XML | SPF_PERSIST_XML | SPF_PARSE_SAPI));
+         return E_NOTIMPL;
+     }
+ 
