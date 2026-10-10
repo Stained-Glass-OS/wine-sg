@@ -11,7 +11,8 @@ key=$( { cat "$HERE/wine-version" "$HERE/patches/series"; cat "$HERE"/patches/*/
 dest="${TMPDIR:-/var/tmp}/sg-lint-tree-$key"
 if [[ ! -f "$dest/.done" ]]; then
     mkdir -p "$HERE/build"
-    [[ -f "$TARBALL" ]] || curl -fsSL -o "$TARBALL" "$WINE_TARBALL_URL"
+    [[ -f "$TARBALL" ]] || { mkdir -p "$(dirname "$TARBALL")"; curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
+        --connect-timeout 20 -o "$TARBALL.tmp" "$WINE_TARBALL_URL" && mv "$TARBALL.tmp" "$TARBALL"; }
     echo "$WINE_SHA256  $TARBALL" | sha256sum -c - >/dev/null
     rm -rf "$dest"; mkdir -p "$dest"
     tar -C "$dest" -xf "$TARBALL"
