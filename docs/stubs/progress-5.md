@@ -51,3 +51,5 @@ Still open (escalate-5.md): dmscript, dmstyle playback, quartz AddSourceFilter/c
 ## 2026-10-10
 Added: 2876-2878 (dinput JoyConfig8, effect files, HID/mouse FIXMEs), 2802-2804 (winmm mmio parse + MCI parser, mixer callbacks + midi streams; dsound effects/format/status/channels).
 Left (outside winmm/dsound code or no contract): mciwave/mciavi32/mcicda todo_wine groups, midiConnect/midiDisconnect, mf sequencer source, MFPluginControl, dmscript, dmstyle playback, quartz AddSourceFilter/collections, wm_reader async parts, wmvcore system profiles/encoder.
+
+- 2805-2806 dmscript: script object (ActiveScript engines, routines, variables, errors) and script track (play/clone/params); gate test/dmscript-gate.sh, 13 mutants caught; dmscript_test 0 failures, todos removed.
