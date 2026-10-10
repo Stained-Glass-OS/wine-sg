@@ -19,8 +19,8 @@ export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mshtml=;winemenub
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 
-pass() { echo "      PASS  $1"; }
-fail() { echo "      FAIL  $1"; RC=1; }
+pass() { printf "      PASS  %s\n" "$1"; }
+fail() { printf "      FAIL  %s\n" "$1"; RC=1; }
 check() { # check NAME CONDITION-exit-status
     if [ "$2" = 0 ]; then pass "$1"; else fail "$1"; fi
 }
