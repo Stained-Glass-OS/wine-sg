@@ -129,6 +129,14 @@ for who in sgnosuchuser root "$SG_SYSTEM"; do
     [ "$q" = "0 1326" ] && pass "$who, even with the password: ERROR_LOGON_FAILURE" || fail "$who: $q"
 done
 
+# the Security log (sg-session 0.1.0-191): the logon, by whom and from which
+# program -- a broker that writes 4624 events names the probe
+if sudo -n sh -c 'ls "$1"/*.evt' sh "$W/audit" >/dev/null 2>&1; then
+    sudo -n sh -c 'grep -l "^ID 4624$" "$1"/*.evt | xargs grep -h "^STRING LogonUser by"' sh "$W/audit" 2>/dev/null \
+        | grep -q "LogonUser by $SG_USER1, .*logonuser-probe.exe (pid" \
+        && pass "the logon is in the Security log, with $SG_USER1's program" || fail "no 4624 naming the probe"
+fi
+
 # tickets the wineserver is offered by name
 uid1=$(id -u "$SG_USER1"); uid2=$(id -u "$SG_USER2"); uids=$(id -u "$SG_SYSTEM")
 plant() { # NAME OWNER UID FOR EXPIRES [MODE]
