@@ -72,3 +72,11 @@ Old note:
 - dmscript: AutoImp*/SourceCodeLoader helper classes: no method names/DISPIDs/IIDs available; create_unimpl_instance keeps its FIXME.
 - dmcompos: chord map chdt/chpl/spsq layouts undocumented (progressions are diatonic triads from the chord map scale); chord-map track Compose stays E_NOTIMPL (test says so); template object Load undocumented.
 - evr: MFCreateVideoPresenter2 / MFCreateVideoOTA need a signature from an allowed source (wrapping the existing presenter creation is small once known).
+
+## 2026-10-12 (group 1, 4000-4030)
+- avifil32: AVIFILE_SaveFile rewrites the header assuming AVI_HEADERSIZE of room before 'movi'; saving an existing AVI with a smaller header (any write to a RW-opened file) produced a file starting with idx1. 4029's SetInfo therefore does not mark the file dirty. Needs a save path that moves 'movi' or pads with JUNK.
+- winegstreamer media_sink.c sink_class_factory_create_media_sink writes *out without a NULL check (crashes on NULL out).
+- IIDs written from memory, unverified against SDK metadata: IImageDisplayProperties/IVideoDisplayProperties(2) (4008), IMFTranscodeProfile/IMFPMPServer (4010).
+- qdvd GetDiscID follows the publicly described CRC-64 disc id scheme; equality with Windows' value for a real disc unverified.
+- Not done (need engines, dialogs or undocumented signatures): mf ASF*/transcode topology/aggregate source/credential cache/proxy locator, dxva2 DXVAHD_CreateDevice, msacm32 acmFilterChoose, mciavi32 Configure, avifil32 Delete/clipboard/format changes, msvfw32 OPENINTERFACE/preview pane/ICMThunk/StretchDIB, mfplay FrameStep, sapi line ids, dplayx DPSYS_SECUREMESSAGE, mf3216, winmm mmioInstallIOProc16, dmusic32 legacy exports, dmsynth articulation extensions.
+- winmm:mci 64-bit hung 3 times after mci.c:1274 (auto-open / mpegvideo part) under heavy parallel load with group 1 applied; 6 later runs passed (0 hangs in 4 base runs, run without load). Cause not found; watch it in the integrator's runs (notes/4021.txt).

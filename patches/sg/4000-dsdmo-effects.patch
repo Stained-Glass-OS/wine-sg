@@ -1,0 +1,3210 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dsdmo: Implement the DirectSound effect DMOs.
+
+The DirectSound effect DMOs (chorus, compressor, distortion, echo,
+flanger, gargle, I3DL2 reverb, parametric EQ, waves reverb) were a shell
+around IMediaObject. They now process audio: each object keeps its
+parameters behind IMediaParams/IMediaParamInfo (ranges, defaults, curve
+envelopes, GUID_TIME_REFERENCE), Set/GetAllParameters of the
+IDirectSoundFX* interfaces check ranges, the I3DL2 reverb has its presets
+and quality, and ProcessInput/ProcessOutput/Process run the effect over 8,
+16 bit and float PCM in place. Removes ten todo_wine marks of the dsdmo
+test.
+---
+ dlls/dsdmo/Makefile.in   |    2 +-
+ dlls/dsdmo/main.c        | 2403 ++++++++++++++++++++++++++++++++++++----------
+ dlls/dsdmo/tests/dsdmo.c |   20 +-
+ 3 files changed, 1929 insertions(+), 496 deletions(-)
+
+diff --git a/dlls/dsdmo/Makefile.in b/dlls/dsdmo/Makefile.in
+index 5442e8d..c58e512 100644
+--- a/dlls/dsdmo/Makefile.in
++++ b/dlls/dsdmo/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = dsdmo.dll
+-IMPORTS   = dmoguids strmiids uuid
++IMPORTS   = dmoguids strmiids uuid ole32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+diff --git a/dlls/dsdmo/main.c b/dlls/dsdmo/main.c
+index d6f36b5..02bf2ac 100644
+--- a/dlls/dsdmo/main.c
++++ b/dlls/dsdmo/main.c
+@@ -16,6 +16,9 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <math.h>
++#include <stddef.h>
++
+ #define COBJMACROS
+ #include "dmo.h"
+ #include "mmreg.h"
+@@ -31,6 +34,45 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dsdmo);
+ 
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
++/* not in the Wine headers */
++#ifndef DWORD_MAX
++#define DWORD_MAX 0xffffffff
++#endif
++#define DMO_INPUT_STREAMF_WHOLE_SAMPLES      0x00000001
++#define DMO_INPUT_STREAMF_FIXED_SAMPLE_SIZE  0x00000004
++#define DMO_OUTPUT_STREAMF_WHOLE_SAMPLES     0x00000001
++#define DMO_OUTPUT_STREAMF_FIXED_SAMPLE_SIZE 0x00000004
++#define MP_CAPS_CURVE_JUMP      MP_CURVE_JUMP
++#define MP_CAPS_CURVE_LINEAR    MP_CURVE_LINEAR
++#define MP_CAPS_CURVE_SQUARE    MP_CURVE_SQUARE
++#define MP_CAPS_CURVE_INVSQUARE MP_CURVE_INVSQUARE
++#define MP_CAPS_CURVE_SINE      MP_CURVE_SINE
++DEFINE_GUID(GUID_TIME_REFERENCE, 0x93ad712b, 0xdaa0, 0x4ffe, 0xbc, 0x81, 0xb0, 0xce, 0x50, 0x0f, 0xcd, 0xd9);
++
++/* A parameter of an effect, as IMediaParams and IMediaParamInfo see it: a float
++ * or integer member of the effect's DSFX parameter structure. */
++struct effect_param
++{
++    size_t offset;
++    BOOL integer;
++    MP_TYPE type;
++    float min, max, neutral;
++    const WCHAR *label;
++    const WCHAR *unit;
++    const WCHAR *enums; /* for MPT_ENUM: names separated by '\0' */
++};
++
++/* A segment of an IMediaParams envelope. */
++struct envelope
++{
++    MP_ENVELOPE_SEGMENT *segments;
++    DWORD count;
++};
++
+ struct effect
+ {
+     IMediaObject IMediaObject_iface;
+@@ -43,6 +85,16 @@ struct effect
+ 
+     CRITICAL_SECTION cs;
+     WAVEFORMATEX format;
++    BOOL output_set;
++    REFERENCE_TIME max_latency;
++    LONG lock;
++
++    IMediaBuffer *input;
++    DWORD input_pos;
++    REFERENCE_TIME input_time;
++    BOOL input_time_valid;
++
++    struct envelope *envelopes;
+ 
+     const struct effect_ops *ops;
+ };
+@@ -51,6 +103,17 @@ struct effect_ops
+ {
+     void *(*query_interface)(struct effect *effect, REFIID iid);
+     void (*destroy)(struct effect *effect);
++    HRESULT (*create)(IUnknown *outer, IUnknown **out);
++    /* the DSFX parameter structure */
++    void *(*params)(struct effect *effect);
++    size_t params_size;
++    const struct effect_param *param_info;
++    DWORD param_count;
++    /* (re)initialise the processing state for effect->format and the parameters */
++    void (*reset)(struct effect *effect);
++    /* process interleaved float frames in place */
++    void (*process)(struct effect *effect, float *data, DWORD frames, unsigned int channels);
++    void (*copy)(struct effect *dst, struct effect *src);
+ };
+ 
+ static struct effect *impl_from_IUnknown(IUnknown *iface)
+@@ -93,6 +156,18 @@ static ULONG WINAPI effect_inner_AddRef(IUnknown *iface)
+     return refcount;
+ }
+ 
++static void effect_free_envelopes(struct effect *effect)
++{
++    DWORD i;
++
++    if (!effect->envelopes)
++        return;
++    for (i = 0; i < effect->ops->param_count; ++i)
++        free(effect->envelopes[i].segments);
++    free(effect->envelopes);
++    effect->envelopes = NULL;
++}
++
+ static ULONG WINAPI effect_inner_Release(IUnknown *iface)
+ {
+     struct effect *effect = impl_from_IUnknown(iface);
+@@ -102,6 +177,9 @@ static ULONG WINAPI effect_inner_Release(IUnknown *iface)
+ 
+     if (!refcount)
+     {
++        if (effect->input)
++            IMediaBuffer_Release(effect->input);
++        effect_free_envelopes(effect);
+         effect->cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&effect->cs);
+         effect->ops->destroy(effect);
+@@ -116,6 +194,151 @@ static const IUnknownVtbl effect_inner_vtbl =
+     effect_inner_Release,
+ };
+ 
++/* Sample conversion: the effects work on floats in [-1, 1]. */
++static void effect_to_float(const WAVEFORMATEX *format, const BYTE *data, float *out, DWORD samples)
++{
++    DWORD i;
++
++    if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
++        memcpy(out, data, samples * sizeof(float));
++    else if (format->wBitsPerSample == 16)
++        for (i = 0; i < samples; ++i) out[i] = ((const short *)data)[i] / 32768.0f;
++    else
++        for (i = 0; i < samples; ++i) out[i] = (data[i] - 128) / 128.0f;
++}
++
++static void effect_from_float(const WAVEFORMATEX *format, const float *in, BYTE *data, DWORD samples)
++{
++    DWORD i;
++    float v;
++
++    if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
++        memcpy(data, in, samples * sizeof(float));
++    else if (format->wBitsPerSample == 16)
++    {
++        for (i = 0; i < samples; ++i)
++        {
++            v = in[i] * 32768.0f;
++            ((short *)data)[i] = v >= 32767.0f ? 32767 : v <= -32768.0f ? -32768 : (short)lrintf(v);
++        }
++    }
++    else
++    {
++        for (i = 0; i < samples; ++i)
++        {
++            v = in[i] * 128.0f + 128.0f;
++            data[i] = v >= 255.0f ? 255 : v <= 0.0f ? 0 : (BYTE)lrintf(v);
++        }
++    }
++}
++
++static float effect_get_param(struct effect *effect, const struct effect_param *param)
++{
++    BYTE *params = effect->ops->params(effect);
++
++    if (param->integer)
++        return *(LONG *)(params + param->offset);
++    return *(float *)(params + param->offset);
++}
++
++static void effect_set_param(struct effect *effect, const struct effect_param *param, float value)
++{
++    BYTE *params = effect->ops->params(effect);
++
++    if (param->integer)
++        *(LONG *)(params + param->offset) = lrintf(value);
++    else
++        *(float *)(params + param->offset) = value;
++}
++
++static BOOL effect_param_valid(const struct effect_param *param, float value)
++{
++    return value >= param->min && value <= param->max;
++}
++
++/* Value of an envelope at "time", or FALSE when the envelope does not cover it. */
++static BOOL envelope_value(const struct envelope *envelope, REFERENCE_TIME time, float *value)
++{
++    const MP_ENVELOPE_SEGMENT *segment;
++    double x;
++    DWORD i;
++
++    for (i = 0; i < envelope->count; ++i)
++    {
++        segment = &envelope->segments[i];
++        if (time < segment->rtStart || time > segment->rtEnd)
++            continue;
++
++        x = segment->rtEnd > segment->rtStart ? (double)(time - segment->rtStart) / (segment->rtEnd - segment->rtStart) : 1.0;
++        switch (segment->iCurve)
++        {
++            case MP_CURVE_JUMP: x = 1.0; break;
++            case MP_CURVE_LINEAR: break;
++            case MP_CURVE_SQUARE: x = x * x; break;
++            case MP_CURVE_INVSQUARE: x = sqrt(x); break;
++            case MP_CURVE_SINE: x = (1.0 - cos(x * M_PI)) / 2.0; break;
++        }
++        *value = segment->valStart + (segment->valEnd - segment->valStart) * x;
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/* Called with the lock held: applies the envelopes at "time" to the parameters. */
++static void effect_apply_envelopes(struct effect *effect, REFERENCE_TIME time)
++{
++    const struct effect_param *param;
++    BOOL changed = FALSE;
++    float value;
++    DWORD i;
++
++    if (!effect->envelopes)
++        return;
++
++    for (i = 0; i < effect->ops->param_count; ++i)
++    {
++        param = &effect->ops->param_info[i];
++        if (!envelope_value(&effect->envelopes[i], time, &value))
++            continue;
++        value = max(param->min, min(param->max, value));
++        if (value != effect_get_param(effect, param))
++        {
++            effect_set_param(effect, param, value);
++            changed = TRUE;
++        }
++    }
++
++    if (changed && effect->format.nSamplesPerSec)
++        effect->ops->reset(effect);
++}
++
++/* Called with the lock held. */
++static void effect_process_data(struct effect *effect, BYTE *data, DWORD size, REFERENCE_TIME time, BOOL time_valid)
++{
++    DWORD frames, samples, chunk;
++    unsigned int channels;
++    float buffer[4096];
++
++    if (!effect->format.nBlockAlign)
++        return;
++
++    if (time_valid)
++        effect_apply_envelopes(effect, time);
++
++    channels = effect->format.nChannels;
++    frames = size / effect->format.nBlockAlign;
++    while (frames)
++    {
++        chunk = min(frames, ARRAY_SIZE(buffer) / channels);
++        samples = chunk * channels;
++        effect_to_float(&effect->format, data, buffer, samples);
++        effect->ops->process(effect, buffer, chunk, channels);
++        effect_from_float(&effect->format, buffer, data, samples);
++        data += chunk * effect->format.nBlockAlign;
++        frames -= chunk;
++    }
++}
++
+ static struct effect *impl_from_IMediaObject(IMediaObject *iface)
+ {
+     return CONTAINING_RECORD(iface, struct effect, IMediaObject_iface);
+@@ -141,32 +364,83 @@ static ULONG WINAPI effect_Release(IMediaObject *iface)
+ 
+ static HRESULT WINAPI effect_GetStreamCount(IMediaObject *iface, DWORD *input, DWORD *output)
+ {
+-    FIXME("iface %p, input %p, output %p, stub!\n", iface, input, output);
+-    return E_NOTIMPL;
++    TRACE("iface %p, input %p, output %p.\n", iface, input, output);
++
++    if (!input || !output)
++        return E_POINTER;
++    *input = *output = 1;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_GetInputStreamInfo(IMediaObject *iface, DWORD index, DWORD *flags)
+ {
+-    FIXME("iface %p, index %lu, flags %p, stub!\n", iface, index, flags);
+-    return E_NOTIMPL;
++    TRACE("iface %p, index %lu, flags %p.\n", iface, index, flags);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    if (!flags)
++        return E_POINTER;
++    *flags = DMO_INPUT_STREAMF_WHOLE_SAMPLES | DMO_INPUT_STREAMF_FIXED_SAMPLE_SIZE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_GetOutputStreamInfo(IMediaObject *iface, DWORD index, DWORD *flags)
+ {
+-    FIXME("iface %p, index %lu, flags %p, stub!\n", iface, index, flags);
+-    return E_NOTIMPL;
++    TRACE("iface %p, index %lu, flags %p.\n", iface, index, flags);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    if (!flags)
++        return E_POINTER;
++    *flags = DMO_OUTPUT_STREAMF_WHOLE_SAMPLES | DMO_OUTPUT_STREAMF_FIXED_SAMPLE_SIZE;
++    return S_OK;
+ }
+ 
++/* The effects take any 8/16-bit integer or 32-bit float PCM; they offer no input
++ * types of their own, and output the input type. */
+ static HRESULT WINAPI effect_GetInputType(IMediaObject *iface, DWORD index, DWORD type_index, DMO_MEDIA_TYPE *type)
+ {
+-    FIXME("iface %p, index %lu, type_index %lu, type %p, stub!\n", iface, index, type_index, type);
+-    return E_NOTIMPL;
++    TRACE("iface %p, index %lu, type_index %lu, type %p.\n", iface, index, type_index, type);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    return DMO_E_NO_MORE_ITEMS;
++}
++
++static HRESULT effect_init_media_type(const WAVEFORMATEX *format, DMO_MEDIA_TYPE *type)
++{
++    memset(type, 0, sizeof(*type));
++    if (!(type->pbFormat = CoTaskMemAlloc(sizeof(*format))))
++        return E_OUTOFMEMORY;
++    memcpy(type->pbFormat, format, sizeof(*format));
++    ((WAVEFORMATEX *)type->pbFormat)->cbSize = 0;
++    type->cbFormat = sizeof(*format);
++    type->majortype = MEDIATYPE_Audio;
++    type->subtype = format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ? MEDIASUBTYPE_IEEE_FLOAT : MEDIASUBTYPE_PCM;
++    type->formattype = FORMAT_WaveFormatEx;
++    type->bFixedSizeSamples = TRUE;
++    type->lSampleSize = format->nBlockAlign;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_GetOutputType(IMediaObject *iface, DWORD index, DWORD type_index, DMO_MEDIA_TYPE *type)
+ {
+-    FIXME("iface %p, index %lu, type_index %lu, type %p, stub!\n", iface, index, type_index, type);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, index %lu, type_index %lu, type %p.\n", iface, index, type_index, type);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++
++    EnterCriticalSection(&effect->cs);
++    if (type_index || !effect->format.nBlockAlign)
++        hr = DMO_E_NO_MORE_ITEMS;
++    else
++        hr = type ? effect_init_media_type(&effect->format, type) : S_OK;
++    LeaveCriticalSection(&effect->cs);
++
++    return hr;
+ }
+ 
+ static HRESULT WINAPI effect_SetInputType(IMediaObject *iface, DWORD index, const DMO_MEDIA_TYPE *type, DWORD flags)
+@@ -180,6 +454,7 @@ static HRESULT WINAPI effect_SetInputType(IMediaObject *iface, DWORD index, cons
+     {
+         EnterCriticalSection(&effect->cs);
+         memset(&effect->format, 0, sizeof(effect->format));
++        effect->output_set = FALSE;
+         LeaveCriticalSection(&effect->cs);
+         return S_OK;
+     }
+@@ -223,8 +498,14 @@ static HRESULT WINAPI effect_SetInputType(IMediaObject *iface, DWORD index, cons
+         return DMO_E_TYPE_NOT_ACCEPTED;
+     }
+ 
++    if (flags & DMO_SET_TYPEF_TEST_ONLY)
++        return S_OK;
++
+     EnterCriticalSection(&effect->cs);
+     effect->format = *format;
++    effect->format.cbSize = 0;
++    effect->output_set = FALSE;
++    effect->ops->reset(effect);
+     LeaveCriticalSection(&effect->cs);
+ 
+     return S_OK;
+@@ -238,7 +519,12 @@ static HRESULT WINAPI effect_SetOutputType(IMediaObject *iface, DWORD index, con
+     TRACE("iface %p, index %lu, type %p, flags %#lx.\n", iface, index, type, flags);
+ 
+     if (flags & DMO_SET_TYPEF_CLEAR)
++    {
++        EnterCriticalSection(&effect->cs);
++        effect->output_set = FALSE;
++        LeaveCriticalSection(&effect->cs);
+         return S_OK;
++    }
+ 
+     if (!IsEqualGUID(&type->majortype, &MEDIATYPE_Audio))
+         return DMO_E_TYPE_NOT_ACCEPTED;
+@@ -251,7 +537,9 @@ static HRESULT WINAPI effect_SetOutputType(IMediaObject *iface, DWORD index, con
+         return DMO_E_TYPE_NOT_ACCEPTED;
+ 
+     EnterCriticalSection(&effect->cs);
+-    hr = memcmp(type->pbFormat, &effect->format, sizeof(WAVEFORMATEX)) ? DMO_E_TYPE_NOT_ACCEPTED : S_OK;
++    hr = memcmp(type->pbFormat, &effect->format, offsetof(WAVEFORMATEX, cbSize)) ? DMO_E_TYPE_NOT_ACCEPTED : S_OK;
++    if (hr == S_OK && !(flags & DMO_SET_TYPEF_TEST_ONLY))
++        effect->output_set = TRUE;
+     LeaveCriticalSection(&effect->cs);
+ 
+     return hr;
+@@ -259,90 +547,336 @@ static HRESULT WINAPI effect_SetOutputType(IMediaObject *iface, DWORD index, con
+ 
+ static HRESULT WINAPI effect_GetInputCurrentType(IMediaObject *iface, DWORD index, DMO_MEDIA_TYPE *type)
+ {
+-    FIXME("iface %p, index %lu, type %p, stub!\n", iface, index, type);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, index %lu, type %p.\n", iface, index, type);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    if (!type)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->cs);
++    if (!effect->format.nBlockAlign)
++        hr = DMO_E_TYPE_NOT_SET;
++    else
++        hr = effect_init_media_type(&effect->format, type);
++    LeaveCriticalSection(&effect->cs);
++
++    return hr;
+ }
+ 
+ static HRESULT WINAPI effect_GetOutputCurrentType(IMediaObject *iface, DWORD index, DMO_MEDIA_TYPE *type)
+ {
+-    FIXME("iface %p, index %lu, type %p, stub!\n", iface, index, type);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, index %lu, type %p.\n", iface, index, type);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    if (!type)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->cs);
++    if (!effect->format.nBlockAlign || !effect->output_set)
++        hr = DMO_E_TYPE_NOT_SET;
++    else
++        hr = effect_init_media_type(&effect->format, type);
++    LeaveCriticalSection(&effect->cs);
++
++    return hr;
+ }
+ 
+ static HRESULT WINAPI effect_GetInputSizeInfo(IMediaObject *iface, DWORD index,
+         DWORD *size, DWORD *lookahead, DWORD *alignment)
+ {
+-    FIXME("iface %p, index %lu, size %p, lookahead %p, alignment %p, stub!\n", iface, index, size, lookahead, alignment);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, index %lu, size %p, lookahead %p, alignment %p.\n", iface, index, size, lookahead, alignment);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    if (!size || !lookahead || !alignment)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->cs);
++    if (!effect->format.nBlockAlign)
++        hr = DMO_E_TYPE_NOT_SET;
++    else
++    {
++        *size = effect->format.nBlockAlign;
++        *lookahead = 0;
++        *alignment = 1;
++    }
++    LeaveCriticalSection(&effect->cs);
++
++    return hr;
+ }
+ 
+ static HRESULT WINAPI effect_GetOutputSizeInfo(IMediaObject *iface, DWORD index, DWORD *size, DWORD *alignment)
+ {
+-    FIXME("iface %p, index %lu, size %p, alignment %p, stub!\n", iface, index, size, alignment);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, index %lu, size %p, alignment %p.\n", iface, index, size, alignment);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    if (!size || !alignment)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->cs);
++    if (!effect->format.nBlockAlign || !effect->output_set)
++        hr = DMO_E_TYPE_NOT_SET;
++    else
++    {
++        *size = effect->format.nBlockAlign;
++        *alignment = 1;
++    }
++    LeaveCriticalSection(&effect->cs);
++
++    return hr;
+ }
+ 
+ static HRESULT WINAPI effect_GetInputMaxLatency(IMediaObject *iface, DWORD index, REFERENCE_TIME *latency)
+ {
+-    FIXME("iface %p, index %lu, latency %p, stub!\n", iface, index, latency);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++
++    TRACE("iface %p, index %lu, latency %p.\n", iface, index, latency);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    if (!latency)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->cs);
++    *latency = effect->max_latency;
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_SetInputMaxLatency(IMediaObject *iface, DWORD index, REFERENCE_TIME latency)
+ {
+-    FIXME("iface %p, index %lu, latency %s, stub!\n", iface, index, wine_dbgstr_longlong(latency));
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++
++    TRACE("iface %p, index %lu, latency %s.\n", iface, index, wine_dbgstr_longlong(latency));
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++
++    /* output is produced as soon as input arrives, any latency is met */
++    EnterCriticalSection(&effect->cs);
++    effect->max_latency = latency;
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_Flush(IMediaObject *iface)
+ {
+-    FIXME("iface %p, stub!\n", iface);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++
++    TRACE("iface %p.\n", iface);
++
++    EnterCriticalSection(&effect->cs);
++    if (effect->input)
++    {
++        IMediaBuffer_Release(effect->input);
++        effect->input = NULL;
++    }
++    if (effect->format.nBlockAlign)
++        effect->ops->reset(effect);
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_Discontinuity(IMediaObject *iface, DWORD index)
+ {
+-    FIXME("iface %p, index %lu, stub!\n", iface, index);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, index %lu.\n", iface, index);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++
++    EnterCriticalSection(&effect->cs);
++    if (!effect->format.nBlockAlign)
++        hr = DMO_E_TYPE_NOT_SET;
++    LeaveCriticalSection(&effect->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI effect_AllocateStreamingResources(IMediaObject *iface)
+ {
+-    FIXME("iface %p, stub!\n", iface);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p.\n", iface);
++
++    /* the processing state is set up with the media type */
++    EnterCriticalSection(&effect->cs);
++    if (!effect->format.nBlockAlign)
++        hr = DMO_E_TYPE_NOT_SET;
++    LeaveCriticalSection(&effect->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI effect_FreeStreamingResources(IMediaObject *iface)
+ {
+-    FIXME("iface %p, stub!\n", iface);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++
++    TRACE("iface %p.\n", iface);
++
++    EnterCriticalSection(&effect->cs);
++    if (effect->input)
++    {
++        IMediaBuffer_Release(effect->input);
++        effect->input = NULL;
++    }
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_GetInputStatus(IMediaObject *iface, DWORD index, DWORD *flags)
+ {
+-    FIXME("iface %p, index %lu, flags %p, stub!\n", iface, index, flags);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++
++    TRACE("iface %p, index %lu, flags %p.\n", iface, index, flags);
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    if (!flags)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->cs);
++    *flags = effect->input ? 0 : DMO_INPUT_STATUSF_ACCEPT_DATA;
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_ProcessInput(IMediaObject *iface, DWORD index,
+     IMediaBuffer *buffer, DWORD flags, REFERENCE_TIME timestamp, REFERENCE_TIME timelength)
+ {
+-    FIXME("iface %p, index %lu, buffer %p, flags %#lx, timestamp %s, timelength %s, stub!\n",
++    struct effect *effect = impl_from_IMediaObject(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("iface %p, index %lu, buffer %p, flags %#lx, timestamp %s, timelength %s.\n",
+             iface, index, buffer, flags, wine_dbgstr_longlong(timestamp), wine_dbgstr_longlong(timelength));
+-    return E_NOTIMPL;
++
++    if (index)
++        return DMO_E_INVALIDSTREAMINDEX;
++    if (!buffer)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->cs);
++    if (!effect->format.nBlockAlign || !effect->output_set)
++        hr = DMO_E_TYPE_NOT_SET;
++    else if (effect->input)
++        hr = DMO_E_NOTACCEPTING;
++    else
++    {
++        effect->input = buffer;
++        IMediaBuffer_AddRef(buffer);
++        effect->input_pos = 0;
++        effect->input_time = timestamp;
++        effect->input_time_valid = !!(flags & DMO_INPUT_DATA_BUFFERF_TIME);
++    }
++    LeaveCriticalSection(&effect->cs);
++
++    return hr;
+ }
+ 
+ static HRESULT WINAPI effect_ProcessOutput(IMediaObject *iface, DWORD flags,
+         DWORD count, DMO_OUTPUT_DATA_BUFFER *buffers, DWORD *status)
+ {
+-    FIXME("iface %p, flags %#lx, count %lu, buffers %p, status %p, stub!\n", iface, flags, count, buffers, status);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++    DWORD in_size, out_size, out_max, size;
++    BYTE *in_data, *out_data;
++    HRESULT hr;
++
++    TRACE("iface %p, flags %#lx, count %lu, buffers %p, status %p.\n", iface, flags, count, buffers, status);
++
++    if (count != 1 || !buffers)
++        return E_INVALIDARG;
++    if (status)
++        *status = 0;
++    buffers[0].dwStatus = 0;
++
++    EnterCriticalSection(&effect->cs);
++
++    if (!effect->input)
++    {
++        LeaveCriticalSection(&effect->cs);
++        return S_FALSE;
++    }
++
++    if (!buffers[0].pBuffer)
++    {
++        /* the caller only wants to discard */
++        IMediaBuffer_Release(effect->input);
++        effect->input = NULL;
++        LeaveCriticalSection(&effect->cs);
++        return S_FALSE;
++    }
++
++    if (FAILED(hr = IMediaBuffer_GetBufferAndLength(effect->input, &in_data, &in_size))
++            || FAILED(hr = IMediaBuffer_GetBufferAndLength(buffers[0].pBuffer, &out_data, &out_size))
++            || FAILED(hr = IMediaBuffer_GetMaxLength(buffers[0].pBuffer, &out_max)))
++    {
++        LeaveCriticalSection(&effect->cs);
++        return hr;
++    }
++
++    size = min(in_size - effect->input_pos, out_max - out_size);
++    size -= size % effect->format.nBlockAlign;
++    memcpy(out_data + out_size, in_data + effect->input_pos, size);
++    effect_process_data(effect, out_data + out_size, size, effect->input_time, effect->input_time_valid);
++
++    if (effect->input_time_valid)
++    {
++        buffers[0].dwStatus |= DMO_OUTPUT_DATA_BUFFERF_TIME | DMO_OUTPUT_DATA_BUFFERF_TIMELENGTH;
++        buffers[0].rtTimestamp = effect->input_time;
++        buffers[0].rtTimelength = (LONGLONG)size * 10000000 / effect->format.nAvgBytesPerSec;
++        effect->input_time += buffers[0].rtTimelength;
++    }
++    buffers[0].dwStatus |= DMO_OUTPUT_DATA_BUFFERF_SYNCPOINT;
++    IMediaBuffer_SetLength(buffers[0].pBuffer, out_size + size);
++
++    effect->input_pos += size;
++    if (in_size - effect->input_pos < effect->format.nBlockAlign)
++    {
++        IMediaBuffer_Release(effect->input);
++        effect->input = NULL;
++    }
++    else
++        buffers[0].dwStatus |= DMO_OUTPUT_DATA_BUFFERF_INCOMPLETE;
++
++    LeaveCriticalSection(&effect->cs);
++    return size ? S_OK : S_FALSE;
+ }
+ 
+ static HRESULT WINAPI effect_Lock(IMediaObject *iface, LONG lock)
+ {
+-    FIXME("iface %p, lock %ld, stub!\n", iface, lock);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaObject(iface);
++
++    TRACE("iface %p, lock %ld.\n", iface, lock);
++
++    if (lock)
++    {
++        EnterCriticalSection(&effect->cs);
++        effect->lock++;
++    }
++    else
++    {
++        if (!effect->lock)
++            return E_FAIL;
++        effect->lock--;
++        LeaveCriticalSection(&effect->cs);
++    }
++    return S_OK;
+ }
+ 
+ static const IMediaObjectVtbl effect_vtbl =
+@@ -399,37 +933,76 @@ static ULONG WINAPI effect_inplace_Release(IMediaObjectInPlace *iface)
+ static HRESULT WINAPI effect_inplace_Process(IMediaObjectInPlace *iface, ULONG size,
+         BYTE *data, REFERENCE_TIME start, DWORD flags)
+ {
+-    static unsigned int once;
++    struct effect *effect = impl_from_IMediaObjectInPlace(iface);
++    HRESULT hr = S_OK;
+ 
+-    if (!once++)
+-    {
+-        FIXME("iface %p, size %lu, data %p, start %s, flags %#lx, stub!\n",
+-                iface, size, data, wine_dbgstr_longlong(start), flags);
+-    }
++    TRACE("iface %p, size %lu, data %p, start %s, flags %#lx.\n",
++            iface, size, data, wine_dbgstr_longlong(start), flags);
++
++    if (!data)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->cs);
++    if (!effect->format.nBlockAlign)
++        hr = DMO_E_TYPE_NOT_SET;
+     else
+     {
+-        WARN("iface %p, size %lu, data %p, start %s, flags %#lx, stub!\n",
+-               iface, size, data, wine_dbgstr_longlong(start), flags);
++        /* DMO_INPLACE_ZERO: the data is silence, only the effect's tail is heard */
++        if (flags & DMO_INPLACE_ZERO)
++            memset(data, effect->format.wBitsPerSample == 8 ? 0x80 : 0, size);
++        effect_process_data(effect, data, size, start, TRUE);
+     }
++    LeaveCriticalSection(&effect->cs);
+ 
+-    return E_NOTIMPL;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI effect_inplace_Clone(IMediaObjectInPlace *iface, IMediaObjectInPlace **out)
+ {
+-    FIXME("iface %p, out %p, stub!\n", iface, out);
+-    return E_NOTIMPL;
+-}
++    struct effect *effect = impl_from_IMediaObjectInPlace(iface), *clone;
++    IUnknown *unk;
++    HRESULT hr;
+ 
+-static HRESULT WINAPI effect_inplace_GetLatency(IMediaObjectInPlace *iface, REFERENCE_TIME *latency)
+-{
+-    FIXME("iface %p, latency %p, stub!\n", iface, latency);
+-    return E_NOTIMPL;
+-}
++    TRACE("iface %p, out %p.\n", iface, out);
+ 
+-static const IMediaObjectInPlaceVtbl effect_inplace_vtbl =
+-{
+-    effect_inplace_QueryInterface,
++    if (!out)
++        return E_POINTER;
++    *out = NULL;
++
++    if (FAILED(hr = effect->ops->create(NULL, &unk)))
++        return hr;
++    clone = impl_from_IUnknown(unk);
++
++    /* same parameters and media types, fresh processing state */
++    EnterCriticalSection(&effect->cs);
++    memcpy(clone->ops->params(clone), effect->ops->params(effect), effect->ops->params_size);
++    if (effect->ops->copy)
++        effect->ops->copy(clone, effect);
++    clone->format = effect->format;
++    clone->output_set = effect->output_set;
++    if (clone->format.nBlockAlign)
++        clone->ops->reset(clone);
++    LeaveCriticalSection(&effect->cs);
++
++    hr = IUnknown_QueryInterface(unk, &IID_IMediaObjectInPlace, (void **)out);
++    IUnknown_Release(unk);
++    return hr;
++}
++
++static HRESULT WINAPI effect_inplace_GetLatency(IMediaObjectInPlace *iface, REFERENCE_TIME *latency)
++{
++    TRACE("iface %p, latency %p.\n", iface, latency);
++
++    if (!latency)
++        return E_POINTER;
++    /* output for a sample is produced with it */
++    *latency = 0;
++    return S_OK;
++}
++
++static const IMediaObjectInPlaceVtbl effect_inplace_vtbl =
++{
++    effect_inplace_QueryInterface,
+     effect_inplace_AddRef,
+     effect_inplace_Release,
+     effect_inplace_Process,
+@@ -462,36 +1035,134 @@ static ULONG WINAPI effect_media_params_Release(IMediaParams *iface)
+ 
+ static HRESULT WINAPI effect_media_params_GetParam(IMediaParams *iface, DWORD index, MP_DATA *data)
+ {
+-    FIXME("iface %p, index %lu, data %p, stub!\n", iface, index, data);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaParams(iface);
++
++    TRACE("iface %p, index %lu, data %p.\n", iface, index, data);
++
++    if (!data)
++        return E_POINTER;
++    if (index >= effect->ops->param_count)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&effect->cs);
++    *data = effect_get_param(effect, &effect->ops->param_info[index]);
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_media_params_SetParam(IMediaParams *iface, DWORD index, MP_DATA data)
+ {
+-    FIXME("iface %p, index %lu, data %f, stub!\n", iface, index, data);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaParams(iface);
++
++    TRACE("iface %p, index %lu, data %f.\n", iface, index, data);
++
++    if (index >= effect->ops->param_count)
++        return E_INVALIDARG;
++    if (!effect_param_valid(&effect->ops->param_info[index], data))
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&effect->cs);
++    effect_set_param(effect, &effect->ops->param_info[index], data);
++    if (effect->format.nBlockAlign)
++        effect->ops->reset(effect);
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_media_params_AddEnvelope(IMediaParams *iface, DWORD index, DWORD count,
+                                                       MP_ENVELOPE_SEGMENT *segments)
+ {
+-    FIXME("iface %p, index %lu, count %lu, segments %p, stub!\n", iface, index, count, segments);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaParams(iface);
++    MP_ENVELOPE_SEGMENT *list;
++    struct envelope *envelope;
++    DWORD i, first, last;
++
++    TRACE("iface %p, index %lu, count %lu, segments %p.\n", iface, index, count, segments);
++
++    if (count && !segments)
++        return E_POINTER;
++    if (index != DWORD_MAX && index >= effect->ops->param_count)
++        return E_INVALIDARG;
++    for (i = 0; i < count; ++i)
++    {
++        if (segments[i].rtEnd < segments[i].rtStart)
++            return E_INVALIDARG;
++        if (!(segments[i].iCurve & (MP_CURVE_JUMP | MP_CURVE_LINEAR | MP_CURVE_SQUARE | MP_CURVE_INVSQUARE | MP_CURVE_SINE)))
++            return E_INVALIDARG;
++    }
++
++    EnterCriticalSection(&effect->cs);
++
++    if (!effect->envelopes && !(effect->envelopes = calloc(effect->ops->param_count, sizeof(*effect->envelopes))))
++    {
++        LeaveCriticalSection(&effect->cs);
++        return E_OUTOFMEMORY;
++    }
++
++    /* DWORD_MAX applies the segments to every parameter */
++    first = index == DWORD_MAX ? 0 : index;
++    last = index == DWORD_MAX ? effect->ops->param_count - 1 : index;
++    for (i = first; i <= last; ++i)
++    {
++        envelope = &effect->envelopes[i];
++        if (!(list = realloc(envelope->segments, (envelope->count + count) * sizeof(*list))))
++        {
++            LeaveCriticalSection(&effect->cs);
++            return E_OUTOFMEMORY;
++        }
++        memcpy(list + envelope->count, segments, count * sizeof(*list));
++        envelope->segments = list;
++        envelope->count += count;
++    }
++
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_media_params_FlushEnvelope(IMediaParams *iface, DWORD index,
+                                                         REFERENCE_TIME start, REFERENCE_TIME end)
+ {
+-    FIXME("iface %p, index %lu, start %s, end %s, stub!\n", iface, index,
++    struct effect *effect = impl_from_IMediaParams(iface);
++    struct envelope *envelope;
++    DWORD i, j, kept, first, last;
++
++    TRACE("iface %p, index %lu, start %s, end %s.\n", iface, index,
+           wine_dbgstr_longlong(start), wine_dbgstr_longlong(end));
+-    return E_NOTIMPL;
++
++    if (index != DWORD_MAX && index >= effect->ops->param_count)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&effect->cs);
++    if (effect->envelopes)
++    {
++        first = index == DWORD_MAX ? 0 : index;
++        last = index == DWORD_MAX ? effect->ops->param_count - 1 : index;
++        for (i = first; i <= last; ++i)
++        {
++            envelope = &effect->envelopes[i];
++            /* segments overlapping the range are removed */
++            for (j = kept = 0; j < envelope->count; ++j)
++            {
++                if (envelope->segments[j].rtEnd >= start && envelope->segments[j].rtStart <= end)
++                    continue;
++                envelope->segments[kept++] = envelope->segments[j];
++            }
++            envelope->count = kept;
++        }
++    }
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_media_params_SetTimeFormat(IMediaParams *iface, GUID guid,
+                                                         MP_TIMEDATA time_data)
+ {
+-    FIXME("iface %p, guid %s, time_data %lx, stub!\n", iface, wine_dbgstr_guid(&guid), time_data);
+-    return E_NOTIMPL;
++    TRACE("iface %p, guid %s, time_data %lx.\n", iface, wine_dbgstr_guid(&guid), time_data);
++
++    /* times are always reference (100 ns) times */
++    if (!IsEqualGUID(&guid, &GUID_TIME_REFERENCE))
++        return E_INVALIDARG;
++    return S_OK;
+ }
+ 
+ static const IMediaParamsVtbl effect_media_params_vtbl =
+@@ -531,38 +1202,106 @@ static ULONG WINAPI effect_media_param_info_Release(IMediaParamInfo *iface)
+ 
+ static HRESULT WINAPI effect_media_param_info_GetParamCount(IMediaParamInfo *iface, DWORD *count)
+ {
+-    FIXME("iface %p, count %p, stub!\n", iface, count);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaParamInfo(iface);
++
++    TRACE("iface %p, count %p.\n", iface, count);
++
++    if (!count)
++        return E_POINTER;
++    *count = effect->ops->param_count;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_media_param_info_GetParamInfo(IMediaParamInfo *iface, DWORD index, MP_PARAMINFO *info)
+ {
+-    FIXME("iface %p, index %lu, info %p, stub!\n", iface, index, info);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaParamInfo(iface);
++    const struct effect_param *param;
++
++    TRACE("iface %p, index %lu, info %p.\n", iface, index, info);
++
++    if (!info)
++        return E_POINTER;
++    if (index >= effect->ops->param_count)
++        return E_INVALIDARG;
++
++    param = &effect->ops->param_info[index];
++    memset(info, 0, sizeof(*info));
++    info->mpType = param->type;
++    info->mopCaps = param->type == MPT_FLOAT
++            ? MP_CAPS_CURVE_JUMP | MP_CAPS_CURVE_LINEAR | MP_CAPS_CURVE_SQUARE | MP_CAPS_CURVE_INVSQUARE | MP_CAPS_CURVE_SINE
++            : MP_CAPS_CURVE_JUMP;
++    info->mpdMinValue = param->min;
++    info->mpdMaxValue = param->max;
++    info->mpdNeutralValue = param->neutral;
++    lstrcpynW(info->szUnitText, param->unit, ARRAY_SIZE(info->szUnitText));
++    lstrcpynW(info->szLabel, param->label, ARRAY_SIZE(info->szLabel));
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_media_param_info_GetParamText(IMediaParamInfo *iface, DWORD index, WCHAR **text)
+ {
+-    FIXME("iface %p, index %lu, text %p, stub!\n", iface, index, text);
+-    return E_NOTIMPL;
++    struct effect *effect = impl_from_IMediaParamInfo(iface);
++    const struct effect_param *param;
++    size_t label_len, unit_len, enums_len = 0;
++    const WCHAR *p;
++    WCHAR *out;
++
++    TRACE("iface %p, index %lu, text %p.\n", iface, index, text);
++
++    if (!text)
++        return E_POINTER;
++    if (index >= effect->ops->param_count)
++        return E_INVALIDARG;
++
++    /* label, unit, then the enumeration names, each terminated, and an empty string */
++    param = &effect->ops->param_info[index];
++    label_len = wcslen(param->label) + 1;
++    unit_len = wcslen(param->unit) + 1;
++    if ((p = param->enums))
++        while (*p) { enums_len += wcslen(p) + 1; p += wcslen(p) + 1; }
++
++    if (!(out = CoTaskMemAlloc((label_len + unit_len + enums_len + 1) * sizeof(WCHAR))))
++        return E_OUTOFMEMORY;
++    memcpy(out, param->label, label_len * sizeof(WCHAR));
++    memcpy(out + label_len, param->unit, unit_len * sizeof(WCHAR));
++    if (enums_len)
++        memcpy(out + label_len + unit_len, param->enums, enums_len * sizeof(WCHAR));
++    out[label_len + unit_len + enums_len] = 0;
++    *text = out;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_media_param_info_GetNumTimeFormats(IMediaParamInfo *iface, DWORD *count)
+ {
+-    FIXME("iface %p, count %p, stub!\n", iface, count);
+-    return E_NOTIMPL;
++    TRACE("iface %p, count %p.\n", iface, count);
++
++    if (!count)
++        return E_POINTER;
++    *count = 1;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_media_param_info_GetSupportedTimeFormat(IMediaParamInfo *iface, DWORD index, GUID *guid)
+ {
+-    FIXME("iface %p, index %lu, guid %p, stub!\n", iface, index, guid);
+-    return E_NOTIMPL;
++    TRACE("iface %p, index %lu, guid %p.\n", iface, index, guid);
++
++    if (!guid)
++        return E_POINTER;
++    if (index)
++        return E_INVALIDARG;
++    *guid = GUID_TIME_REFERENCE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI effect_media_param_info_GetCurrentTimeFormat(IMediaParamInfo *iface, GUID *guid, MP_TIMEDATA *time_data)
+ {
+-    FIXME("iface %p, guid %p, time_data %p, stub!\n", iface, guid, time_data);
+-    return E_NOTIMPL;
++    TRACE("iface %p, guid %p, time_data %p.\n", iface, guid, time_data);
++
++    if (!guid || !time_data)
++        return E_POINTER;
++    *guid = GUID_TIME_REFERENCE;
++    *time_data = 0;
++    return S_OK;
+ }
+ 
+ static const IMediaParamInfoVtbl effect_media_param_info_vtbl =
+@@ -594,60 +1333,239 @@ static void effect_init(struct effect *effect, IUnknown *outer, const struct eff
+     effect->ops = ops;
+ }
+ 
+-struct eq
++/* Sets all of an effect's parameters after checking them against the ranges. */
++static HRESULT effect_set_all_params(struct effect *effect, const void *params)
+ {
+-    struct effect effect;
+-    IDirectSoundFXParamEq IDirectSoundFXParamEq_iface;
+-    DSFXParamEq params;
++    const struct effect_param *param;
++    const BYTE *data = params;
++    float value;
++    DWORD i;
++
++    if (!params)
++        return E_POINTER;
++
++    for (i = 0; i < effect->ops->param_count; ++i)
++    {
++        param = &effect->ops->param_info[i];
++        value = param->integer ? *(const LONG *)(data + param->offset) : *(const float *)(data + param->offset);
++        if (!effect_param_valid(param, value))
++            return E_INVALIDARG;
++    }
++
++    EnterCriticalSection(&effect->cs);
++    memcpy(effect->ops->params(effect), params, effect->ops->params_size);
++    if (effect->format.nBlockAlign)
++        effect->ops->reset(effect);
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
++}
++
++static HRESULT effect_get_all_params(struct effect *effect, void *params)
++{
++    if (!params)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->cs);
++    memcpy(params, effect->ops->params(effect), effect->ops->params_size);
++    LeaveCriticalSection(&effect->cs);
++    return S_OK;
++}
++
++/* DSP building blocks */
++
++struct delay_line
++{
++    float *buffer;
++    unsigned int size, pos;
++};
++
++static BOOL delay_line_init(struct delay_line *line, unsigned int size)
++{
++    float *buffer;
++
++    size = max(size, 2);
++    if (line->size != size)
++    {
++        if (!(buffer = calloc(size, sizeof(*buffer))))
++            return FALSE;
++        free(line->buffer);
++        line->buffer = buffer;
++        line->size = size;
++    }
++    else
++        memset(line->buffer, 0, size * sizeof(*line->buffer));
++    line->pos = 0;
++    return TRUE;
++}
++
++static void delay_line_free(struct delay_line *line)
++{
++    free(line->buffer);
++    line->buffer = NULL;
++    line->size = 0;
++}
++
++/* The sample written "delay" samples ago (1 is the last one written), with
++ * linear interpolation between samples. */
++static float delay_line_read(const struct delay_line *line, float delay)
++{
++    unsigned int base, newer, older;
++    float frac;
++
++    if (!line->buffer)
++        return 0.0f;
++    delay = max(1.0f, min(delay, line->size - 1.0f));
++    base = (unsigned int)delay;
++    frac = delay - base;
++    newer = (line->pos + line->size - base) % line->size;
++    older = (newer + line->size - 1) % line->size;
++    return line->buffer[newer] * (1.0f - frac) + line->buffer[older] * frac;
++}
++
++static void delay_line_write(struct delay_line *line, float value)
++{
++    if (!line->buffer)
++        return;
++    line->buffer[line->pos] = value;
++    line->pos = (line->pos + 1) % line->size;
++}
++
++struct biquad
++{
++    float b0, b1, b2, a1, a2;
++    float x1[2], x2[2], y1[2], y2[2];
+ };
+ 
+-static struct eq *impl_from_IDirectSoundFXParamEq(IDirectSoundFXParamEq *iface)
++static void biquad_reset(struct biquad *f)
+ {
+-    return CONTAINING_RECORD(iface, struct eq, IDirectSoundFXParamEq_iface);
++    memset(f->x1, 0, sizeof(f->x1));
++    memset(f->x2, 0, sizeof(f->x2));
++    memset(f->y1, 0, sizeof(f->y1));
++    memset(f->y2, 0, sizeof(f->y2));
+ }
+ 
+-static HRESULT WINAPI eq_params_QueryInterface(IDirectSoundFXParamEq *iface, REFIID iid, void **out)
++static void biquad_set(struct biquad *f, double b0, double b1, double b2, double a0, double a1, double a2)
+ {
+-    struct eq *effect = impl_from_IDirectSoundFXParamEq(iface);
+-    return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
++    f->b0 = b0 / a0;
++    f->b1 = b1 / a0;
++    f->b2 = b2 / a0;
++    f->a1 = a1 / a0;
++    f->a2 = a2 / a0;
+ }
+ 
+-static ULONG WINAPI eq_params_AddRef(IDirectSoundFXParamEq *iface)
++/* Peaking filter: gain in dB at "center", width in octaves. */
++static void biquad_peaking(struct biquad *f, double rate, double center, double octaves, double gain)
+ {
+-    struct eq *effect = impl_from_IDirectSoundFXParamEq(iface);
+-    return IUnknown_AddRef(effect->effect.outer_unk);
++    double a = pow(10.0, gain / 40.0), w = 2.0 * M_PI * min(center, rate * 0.49) / rate;
++    double alpha = sin(w) * sinh(log(2.0) / 2.0 * octaves * w / sin(w));
++
++    biquad_set(f, 1.0 + alpha * a, -2.0 * cos(w), 1.0 - alpha * a, 1.0 + alpha / a, -2.0 * cos(w), 1.0 - alpha / a);
+ }
+ 
+-static ULONG WINAPI eq_params_Release(IDirectSoundFXParamEq *iface)
++static void biquad_lowpass(struct biquad *f, double rate, double cutoff)
+ {
+-    struct eq *effect = impl_from_IDirectSoundFXParamEq(iface);
+-    return IUnknown_Release(effect->effect.outer_unk);
++    double w = 2.0 * M_PI * min(cutoff, rate * 0.49) / rate, alpha = sin(w) / (2.0 * M_SQRT1_2);
++
++    biquad_set(f, (1.0 - cos(w)) / 2.0, 1.0 - cos(w), (1.0 - cos(w)) / 2.0, 1.0 + alpha, -2.0 * cos(w), 1.0 - alpha);
+ }
+ 
+-static HRESULT WINAPI eq_params_SetAllParameters(IDirectSoundFXParamEq *iface, const DSFXParamEq *params)
++/* Band pass of constant peak gain, "bandwidth" in Hz around "center". */
++static void biquad_bandpass(struct biquad *f, double rate, double center, double bandwidth)
+ {
+-    struct eq *effect = impl_from_IDirectSoundFXParamEq(iface);
++    double w = 2.0 * M_PI * min(center, rate * 0.49) / rate, q = max(center / bandwidth, 0.1), alpha = sin(w) / (2.0 * q);
++
++    biquad_set(f, alpha, 0.0, -alpha, 1.0 + alpha, -2.0 * cos(w), 1.0 - alpha);
++}
+ 
+-    TRACE("effect %p, params %p.\n", effect, params);
++static float biquad_run(struct biquad *f, unsigned int c, float x)
++{
++    float y = f->b0 * x + f->b1 * f->x1[c] + f->b2 * f->x2[c] - f->a1 * f->y1[c] - f->a2 * f->y2[c];
+ 
+-    EnterCriticalSection(&effect->effect.cs);
+-    effect->params = *params;
+-    LeaveCriticalSection(&effect->effect.cs);
+-    return S_OK;
++    f->x2[c] = f->x1[c];
++    f->x1[c] = x;
++    f->y2[c] = f->y1[c];
++    f->y1[c] = y;
++    return y;
+ }
+ 
+-static HRESULT WINAPI eq_params_GetAllParameters(IDirectSoundFXParamEq *iface, DSFXParamEq *params)
++/* Low frequency oscillator in [-1, 1]. */
++static float lfo_value(double phase, BOOL triangle)
+ {
+-    struct eq *effect = impl_from_IDirectSoundFXParamEq(iface);
++    phase -= floor(phase);
++    if (triangle)
++        return phase < 0.5 ? 4.0 * phase - 1.0 : 3.0 - 4.0 * phase;
++    return sin(2.0 * M_PI * phase);
++}
+ 
+-    TRACE("effect %p, params %p.\n", effect, params);
++static float db_to_gain(float db)
++{
++    return powf(10.0f, db / 20.0f);
++}
+ 
+-    EnterCriticalSection(&effect->effect.cs);
+-    *params = effect->params;
+-    LeaveCriticalSection(&effect->effect.cs);
+-    return S_OK;
++static float mb_to_gain(LONG mb)
++{
++    return powf(10.0f, mb / 2000.0f);
+ }
+ 
++/* The IDirectSoundFX* interface of an effect: SetAllParameters() checks every
++ * value against the documented range, GetAllParameters() returns them. */
++#define DEFINE_FX_PARAMS_IFACE(name, iface_type, impl_type, params_type) \
++    static impl_type *impl_from_##iface_type(iface_type *iface) \
++    { \
++        return CONTAINING_RECORD(iface, impl_type, iface_type##_iface); \
++    } \
++    static HRESULT WINAPI name##_params_QueryInterface(iface_type *iface, REFIID iid, void **out) \
++    { \
++        impl_type *effect = impl_from_##iface_type(iface); \
++        return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out); \
++    } \
++    static ULONG WINAPI name##_params_AddRef(iface_type *iface) \
++    { \
++        impl_type *effect = impl_from_##iface_type(iface); \
++        return IUnknown_AddRef(effect->effect.outer_unk); \
++    } \
++    static ULONG WINAPI name##_params_Release(iface_type *iface) \
++    { \
++        impl_type *effect = impl_from_##iface_type(iface); \
++        return IUnknown_Release(effect->effect.outer_unk); \
++    } \
++    static HRESULT WINAPI name##_params_SetAllParameters(iface_type *iface, const params_type *params) \
++    { \
++        impl_type *effect = impl_from_##iface_type(iface); \
++        TRACE("effect %p, params %p.\n", effect, params); \
++        return effect_set_all_params(&effect->effect, params); \
++    } \
++    static HRESULT WINAPI name##_params_GetAllParameters(iface_type *iface, params_type *params) \
++    { \
++        impl_type *effect = impl_from_##iface_type(iface); \
++        TRACE("effect %p, params %p.\n", effect, params); \
++        return effect_get_all_params(&effect->effect, params); \
++    }
++
++#define FLOAT_PARAM(type, member, min, max, def, label, unit) \
++    {offsetof(type, member), FALSE, MPT_FLOAT, min, max, def, label, unit, NULL}
++#define INT_PARAM(type, member, mptype, min, max, def, label, unit, enums) \
++    {offsetof(type, member), TRUE, mptype, min, max, def, label, unit, enums}
++
++/* Parametric equalizer: one peaking band. */
++
++struct eq
++{
++    struct effect effect;
++    IDirectSoundFXParamEq IDirectSoundFXParamEq_iface;
++    DSFXParamEq params;
++    struct biquad filter;
++};
++
++static const struct effect_param eq_param_info[] =
++{
++    FLOAT_PARAM(DSFXParamEq, fCenter, DSFXPARAMEQ_CENTER_MIN, DSFXPARAMEQ_CENTER_MAX, 8000.0f, L"Center", L"Hz"),
++    FLOAT_PARAM(DSFXParamEq, fBandwidth, DSFXPARAMEQ_BANDWIDTH_MIN, DSFXPARAMEQ_BANDWIDTH_MAX, 12.0f, L"Bandwidth", L"Semitones"),
++    FLOAT_PARAM(DSFXParamEq, fGain, DSFXPARAMEQ_GAIN_MIN, DSFXPARAMEQ_GAIN_MAX, 0.0f, L"Gain", L"dB"),
++};
++
++DEFINE_FX_PARAMS_IFACE(eq, IDirectSoundFXParamEq, struct eq, DSFXParamEq)
++
+ static const IDirectSoundFXParamEqVtbl eq_params_vtbl =
+ {
+     eq_params_QueryInterface,
+@@ -672,16 +1590,48 @@ static void *eq_query_interface(struct effect *iface, REFIID iid)
+ }
+ 
+ static void eq_destroy(struct effect *iface)
++{
++    free(impl_eq_from_effect(iface));
++}
++
++static void *eq_params(struct effect *iface)
++{
++    return &impl_eq_from_effect(iface)->params;
++}
++
++static void eq_reset(struct effect *iface)
+ {
+     struct eq *effect = impl_eq_from_effect(iface);
+ 
+-    free(effect);
++    biquad_peaking(&effect->filter, effect->effect.format.nSamplesPerSec, effect->params.fCenter,
++            effect->params.fBandwidth / 12.0, effect->params.fGain);
++    biquad_reset(&effect->filter);
++}
++
++static void eq_process(struct effect *iface, float *data, DWORD frames, unsigned int channels)
++{
++    struct eq *effect = impl_eq_from_effect(iface);
++    unsigned int c;
++    DWORD i;
++
++    for (i = 0; i < frames; ++i)
++        for (c = 0; c < channels; ++c)
++            data[i * channels + c] = biquad_run(&effect->filter, c, data[i * channels + c]);
+ }
+ 
++static HRESULT eq_create(IUnknown *outer, IUnknown **out);
++
+ static const struct effect_ops eq_ops =
+ {
+     .destroy = eq_destroy,
+     .query_interface = eq_query_interface,
++    .create = eq_create,
++    .params = eq_params,
++    .params_size = sizeof(DSFXParamEq),
++    .param_info = eq_param_info,
++    .param_count = ARRAY_SIZE(eq_param_info),
++    .reset = eq_reset,
++    .process = eq_process,
+ };
+ 
+ static HRESULT eq_create(IUnknown *outer, IUnknown **out)
+@@ -703,94 +1653,288 @@ static HRESULT eq_create(IUnknown *outer, IUnknown **out)
+     return S_OK;
+ }
+ 
+-struct reverb
++/* A small reverberator shared by the I3DL2 and Waves reverbs: parallel damped
++ * comb filters feeding series all-pass diffusers, with early reflection taps. */
++
++#define REVERB_COMBS 6
++#define REVERB_ALLPASSES 3
++#define REVERB_TAPS 4
++
++struct reverberator
+ {
+-    struct effect effect;
+-    IDirectSoundFXI3DL2Reverb IDirectSoundFXI3DL2Reverb_iface;
+-    DSFXI3DL2Reverb params;
++    struct delay_line predelay;
++    struct delay_line early;
++    struct delay_line comb[2][REVERB_COMBS];
++    struct delay_line allpass[2][REVERB_ALLPASSES];
++    float comb_delay[REVERB_COMBS];
++    float comb_feedback[REVERB_COMBS];
++    float comb_state[2][REVERB_COMBS];
++    float damping;
++    float allpass_feedback;
++    float early_delay[REVERB_TAPS];
++    float early_gain, late_gain, predelay_samples;
+ };
+ 
+-static struct reverb *impl_from_IDirectSoundFXI3DL2Reverb(IDirectSoundFXI3DL2Reverb *iface)
+-{
+-    return CONTAINING_RECORD(iface, struct reverb, IDirectSoundFXI3DL2Reverb_iface);
+-}
++/* comb lengths in ms (mutually prime-ish), offset for the right channel */
++static const float reverb_comb_ms[REVERB_COMBS] = {25.31f, 26.94f, 28.96f, 30.75f, 32.24f, 33.81f};
++static const float reverb_allpass_ms[REVERB_ALLPASSES] = {5.0f, 1.68f, 0.48f};
++static const float reverb_tap_ms[REVERB_TAPS] = {0.0f, 4.3f, 9.7f, 17.1f};
+ 
+-static HRESULT WINAPI reverb_params_QueryInterface(IDirectSoundFXI3DL2Reverb *iface, REFIID iid, void **out)
++static void reverberator_free(struct reverberator *r)
+ {
+-    struct reverb *effect = impl_from_IDirectSoundFXI3DL2Reverb(iface);
+-    return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
++    unsigned int c, i;
++
++    delay_line_free(&r->predelay);
++    delay_line_free(&r->early);
++    for (c = 0; c < 2; ++c)
++    {
++        for (i = 0; i < REVERB_COMBS; ++i)
++            delay_line_free(&r->comb[c][i]);
++        for (i = 0; i < REVERB_ALLPASSES; ++i)
++            delay_line_free(&r->allpass[c][i]);
++    }
+ }
+ 
+-static ULONG WINAPI reverb_params_AddRef(IDirectSoundFXI3DL2Reverb *iface)
++/* decay: time to fall by 60 dB (s), hf_ratio: high frequency decay ratio,
++ * density/diffusion in percent, delays in s. */
++static void reverberator_init(struct reverberator *r, float rate, float decay, float hf_ratio,
++        float diffusion, float density, float reflections_delay, float reverb_delay,
++        float early_gain, float late_gain)
+ {
+-    struct reverb *effect = impl_from_IDirectSoundFXI3DL2Reverb(iface);
+-    return IUnknown_AddRef(effect->effect.outer_unk);
++    float scale = 0.5f + density / 200.0f;
++    unsigned int c, i;
++
++    r->predelay_samples = reflections_delay * rate;
++    delay_line_init(&r->predelay, r->predelay_samples + 2);
++    r->early_gain = early_gain;
++    r->late_gain = late_gain;
++    for (i = 0; i < REVERB_TAPS; ++i)
++        r->early_delay[i] = reverb_tap_ms[i] * rate / 1000.0f + 1.0f;
++    delay_line_init(&r->early, reverb_delay * rate + reverb_tap_ms[REVERB_TAPS - 1] * rate / 1000.0f + 2);
++    r->early_delay[REVERB_TAPS - 1] = max(r->early_delay[REVERB_TAPS - 1], reverb_delay * rate);
++
++    for (i = 0; i < REVERB_COMBS; ++i)
++    {
++        r->comb_delay[i] = reverb_comb_ms[i] * scale * rate / 1000.0f;
++        /* gain per pass for a 60 dB fall over "decay" seconds */
++        r->comb_feedback[i] = powf(10.0f, -3.0f * (r->comb_delay[i] / rate) / max(decay, 0.01f));
++        for (c = 0; c < 2; ++c)
++        {
++            delay_line_init(&r->comb[c][i], r->comb_delay[i] + c * 23 + 2);
++            r->comb_state[c][i] = 0.0f;
++        }
++    }
++    /* less high frequency decay damps the combs more */
++    r->damping = max(0.0f, min(0.9f, 1.0f - hf_ratio)) * 0.6f;
++    r->allpass_feedback = 0.3f + diffusion / 100.0f * 0.4f;
++    for (c = 0; c < 2; ++c)
++        for (i = 0; i < REVERB_ALLPASSES; ++i)
++            delay_line_init(&r->allpass[c][i], reverb_allpass_ms[i] * rate / 1000.0f + c * 7 + 2);
+ }
+ 
+-static ULONG WINAPI reverb_params_Release(IDirectSoundFXI3DL2Reverb *iface)
++/* Takes the mono input, returns the reverberated signal for channel c. */
++static float reverberator_run(struct reverberator *r, unsigned int c, float in, BOOL write)
+ {
+-    struct reverb *effect = impl_from_IDirectSoundFXI3DL2Reverb(iface);
+-    return IUnknown_Release(effect->effect.outer_unk);
++    float early = 0.0f, late = 0.0f, x, y, delayed;
++    unsigned int i;
++
++    if (write)
++        delay_line_write(&r->predelay, in);
++    delayed = delay_line_read(&r->predelay, r->predelay_samples + 1.0f);
++    if (write)
++        delay_line_write(&r->early, delayed);
++
++    for (i = 0; i < REVERB_TAPS - 1; ++i)
++        early += delay_line_read(&r->early, r->early_delay[i]) * (1.0f - i * 0.2f);
++    early *= r->early_gain / (REVERB_TAPS - 1);
++
++    x = delay_line_read(&r->early, r->early_delay[REVERB_TAPS - 1]);
++    for (i = 0; i < REVERB_COMBS; ++i)
++    {
++        y = delay_line_read(&r->comb[c][i], r->comb_delay[i] + c * 23);
++        late += y;
++        r->comb_state[c][i] = y * (1.0f - r->damping) + r->comb_state[c][i] * r->damping;
++        delay_line_write(&r->comb[c][i], x + r->comb_state[c][i] * r->comb_feedback[i]);
++    }
++    late /= REVERB_COMBS;
++    for (i = 0; i < REVERB_ALLPASSES; ++i)
++    {
++        float delayed_ap = delay_line_read(&r->allpass[c][i], r->allpass[c][i].size - 1.0f);
++        float v = late + delayed_ap * r->allpass_feedback;
++
++        delay_line_write(&r->allpass[c][i], v);
++        late = delayed_ap - v * r->allpass_feedback;
++    }
++
++    return early + late * r->late_gain;
+ }
+ 
+-static HRESULT WINAPI reverb_params_SetAllParameters(IDirectSoundFXI3DL2Reverb *iface, const DSFXI3DL2Reverb *params)
++/* Runs a block: dry signal plus the room signal scaled by "room". */
++static void reverberator_process(struct reverberator *r, float *data, DWORD frames, unsigned int channels,
++        float dry, float room)
+ {
+-    struct reverb *effect = impl_from_IDirectSoundFXI3DL2Reverb(iface);
++    float mono, out;
++    unsigned int c;
++    DWORD i;
+ 
+-    TRACE("effect %p, params %p.\n", effect, params);
++    for (i = 0; i < frames; ++i)
++    {
++        mono = 0.0f;
++        for (c = 0; c < channels; ++c)
++            mono += data[i * channels + c];
++        mono /= channels;
+ 
+-    EnterCriticalSection(&effect->effect.cs);
+-    effect->params = *params;
+-    LeaveCriticalSection(&effect->effect.cs);
+-    return S_OK;
++        for (c = 0; c < channels; ++c)
++        {
++            out = reverberator_run(r, channels == 1 ? 0 : c, mono, c == 0);
++            data[i * channels + c] = data[i * channels + c] * dry + out * room;
++        }
++    }
+ }
+ 
+-static HRESULT WINAPI reverb_params_GetAllParameters(IDirectSoundFXI3DL2Reverb *iface, DSFXI3DL2Reverb *params)
++/* I3DL2 reverb */
++
++struct reverb
+ {
+-    struct reverb *effect = impl_from_IDirectSoundFXI3DL2Reverb(iface);
++    struct effect effect;
++    IDirectSoundFXI3DL2Reverb IDirectSoundFXI3DL2Reverb_iface;
++    DSFXI3DL2Reverb params;
++    LONG preset, quality;
++    struct reverberator r;
++};
+ 
+-    TRACE("effect %p, params %p.\n", effect, params);
++static const struct effect_param reverb_param_info[] =
++{
++    INT_PARAM(DSFXI3DL2Reverb, lRoom, MPT_INT, DSFX_I3DL2REVERB_ROOM_MIN, DSFX_I3DL2REVERB_ROOM_MAX,
++            DSFX_I3DL2REVERB_ROOM_DEFAULT, L"Room", L"mB", NULL),
++    INT_PARAM(DSFXI3DL2Reverb, lRoomHF, MPT_INT, DSFX_I3DL2REVERB_ROOMHF_MIN, DSFX_I3DL2REVERB_ROOMHF_MAX,
++            DSFX_I3DL2REVERB_ROOMHF_DEFAULT, L"RoomHF", L"mB", NULL),
++    FLOAT_PARAM(DSFXI3DL2Reverb, flRoomRolloffFactor, DSFX_I3DL2REVERB_ROOMROLLOFFFACTOR_MIN,
++            DSFX_I3DL2REVERB_ROOMROLLOFFFACTOR_MAX, DSFX_I3DL2REVERB_ROOMROLLOFFFACTOR_DEFAULT, L"RoomRolloffFactor", L""),
++    FLOAT_PARAM(DSFXI3DL2Reverb, flDecayTime, DSFX_I3DL2REVERB_DECAYTIME_MIN, DSFX_I3DL2REVERB_DECAYTIME_MAX,
++            DSFX_I3DL2REVERB_DECAYTIME_DEFAULT, L"DecayTime", L"s"),
++    FLOAT_PARAM(DSFXI3DL2Reverb, flDecayHFRatio, DSFX_I3DL2REVERB_DECAYHFRATIO_MIN, DSFX_I3DL2REVERB_DECAYHFRATIO_MAX,
++            DSFX_I3DL2REVERB_DECAYHFRATIO_DEFAULT, L"DecayHFRatio", L""),
++    INT_PARAM(DSFXI3DL2Reverb, lReflections, MPT_INT, DSFX_I3DL2REVERB_REFLECTIONS_MIN, DSFX_I3DL2REVERB_REFLECTIONS_MAX,
++            DSFX_I3DL2REVERB_REFLECTIONS_DEFAULT, L"Reflections", L"mB", NULL),
++    FLOAT_PARAM(DSFXI3DL2Reverb, flReflectionsDelay, DSFX_I3DL2REVERB_REFLECTIONSDELAY_MIN,
++            DSFX_I3DL2REVERB_REFLECTIONSDELAY_MAX, DSFX_I3DL2REVERB_REFLECTIONSDELAY_DEFAULT, L"ReflectionsDelay", L"s"),
++    INT_PARAM(DSFXI3DL2Reverb, lReverb, MPT_INT, DSFX_I3DL2REVERB_REVERB_MIN, DSFX_I3DL2REVERB_REVERB_MAX,
++            DSFX_I3DL2REVERB_REVERB_DEFAULT, L"Reverb", L"mB", NULL),
++    FLOAT_PARAM(DSFXI3DL2Reverb, flReverbDelay, DSFX_I3DL2REVERB_REVERBDELAY_MIN, DSFX_I3DL2REVERB_REVERBDELAY_MAX,
++            DSFX_I3DL2REVERB_REVERBDELAY_DEFAULT, L"ReverbDelay", L"s"),
++    FLOAT_PARAM(DSFXI3DL2Reverb, flDiffusion, DSFX_I3DL2REVERB_DIFFUSION_MIN, DSFX_I3DL2REVERB_DIFFUSION_MAX,
++            DSFX_I3DL2REVERB_DIFFUSION_DEFAULT, L"Diffusion", L"%"),
++    FLOAT_PARAM(DSFXI3DL2Reverb, flDensity, DSFX_I3DL2REVERB_DENSITY_MIN, DSFX_I3DL2REVERB_DENSITY_MAX,
++            DSFX_I3DL2REVERB_DENSITY_DEFAULT, L"Density", L"%"),
++    FLOAT_PARAM(DSFXI3DL2Reverb, flHFReference, DSFX_I3DL2REVERB_HFREFERENCE_MIN, DSFX_I3DL2REVERB_HFREFERENCE_MAX,
++            DSFX_I3DL2REVERB_HFREFERENCE_DEFAULT, L"HFReference", L"Hz"),
++};
+ 
+-    EnterCriticalSection(&effect->effect.cs);
+-    *params = effect->params;
+-    LeaveCriticalSection(&effect->effect.cs);
+-    return S_OK;
+-}
++/* The I3DL2 environment presets, in DSFX_I3DL2_ENVIRONMENT_PRESET order. */
++static const DSFXI3DL2Reverb reverb_presets[] =
++{
++    {I3DL2_ENVIRONMENT_PRESET_DEFAULT},
++    {I3DL2_ENVIRONMENT_PRESET_GENERIC},
++    {I3DL2_ENVIRONMENT_PRESET_PADDEDCELL},
++    {I3DL2_ENVIRONMENT_PRESET_ROOM},
++    {I3DL2_ENVIRONMENT_PRESET_BATHROOM},
++    {I3DL2_ENVIRONMENT_PRESET_LIVINGROOM},
++    {I3DL2_ENVIRONMENT_PRESET_STONEROOM},
++    {I3DL2_ENVIRONMENT_PRESET_AUDITORIUM},
++    {I3DL2_ENVIRONMENT_PRESET_CONCERTHALL},
++    {I3DL2_ENVIRONMENT_PRESET_CAVE},
++    {I3DL2_ENVIRONMENT_PRESET_ARENA},
++    {I3DL2_ENVIRONMENT_PRESET_HANGAR},
++    {I3DL2_ENVIRONMENT_PRESET_CARPETEDHALLWAY},
++    {I3DL2_ENVIRONMENT_PRESET_HALLWAY},
++    {I3DL2_ENVIRONMENT_PRESET_STONECORRIDOR},
++    {I3DL2_ENVIRONMENT_PRESET_ALLEY},
++    {I3DL2_ENVIRONMENT_PRESET_FOREST},
++    {I3DL2_ENVIRONMENT_PRESET_CITY},
++    {I3DL2_ENVIRONMENT_PRESET_MOUNTAINS},
++    {I3DL2_ENVIRONMENT_PRESET_QUARRY},
++    {I3DL2_ENVIRONMENT_PRESET_PLAIN},
++    {I3DL2_ENVIRONMENT_PRESET_PARKINGLOT},
++    {I3DL2_ENVIRONMENT_PRESET_SEWERPIPE},
++    {I3DL2_ENVIRONMENT_PRESET_UNDERWATER},
++    {I3DL2_ENVIRONMENT_PRESET_SMALLROOM},
++    {I3DL2_ENVIRONMENT_PRESET_MEDIUMROOM},
++    {I3DL2_ENVIRONMENT_PRESET_LARGEROOM},
++    {I3DL2_ENVIRONMENT_PRESET_MEDIUMHALL},
++    {I3DL2_ENVIRONMENT_PRESET_LARGEHALL},
++    {I3DL2_ENVIRONMENT_PRESET_PLATE},
++};
++
++DEFINE_FX_PARAMS_IFACE(reverb, IDirectSoundFXI3DL2Reverb, struct reverb, DSFXI3DL2Reverb)
+ 
+ static HRESULT WINAPI reverb_params_SetPreset(IDirectSoundFXI3DL2Reverb *iface, DWORD preset)
+ {
+     struct reverb *effect = impl_from_IDirectSoundFXI3DL2Reverb(iface);
++    HRESULT hr;
+ 
+-    FIXME("effect %p, preset %lu, stub!\n", effect, preset);
++    TRACE("effect %p, preset %lu.\n", effect, preset);
+ 
+-    return E_NOTIMPL;
++    if (preset >= ARRAY_SIZE(reverb_presets))
++        return E_INVALIDARG;
++
++    if (SUCCEEDED(hr = effect_set_all_params(&effect->effect, &reverb_presets[preset])))
++    {
++        EnterCriticalSection(&effect->effect.cs);
++        effect->preset = preset;
++        LeaveCriticalSection(&effect->effect.cs);
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI reverb_params_GetPreset(IDirectSoundFXI3DL2Reverb *iface, DWORD *preset)
+ {
+     struct reverb *effect = impl_from_IDirectSoundFXI3DL2Reverb(iface);
++    HRESULT hr = S_OK;
+ 
+-    FIXME("effect %p, preset %p, stub!\n", effect, preset);
++    TRACE("effect %p, preset %p.\n", effect, preset);
+ 
+-    return E_NOTIMPL;
++    if (!preset)
++        return E_POINTER;
++
++    /* the preset last set, as long as the parameters still match it */
++    EnterCriticalSection(&effect->effect.cs);
++    if (effect->preset < 0 || memcmp(&effect->params, &reverb_presets[effect->preset], sizeof(effect->params)))
++        hr = E_FAIL;
++    else
++        *preset = effect->preset;
++    LeaveCriticalSection(&effect->effect.cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI reverb_params_SetQuality(IDirectSoundFXI3DL2Reverb *iface, LONG quality)
+ {
+     struct reverb *effect = impl_from_IDirectSoundFXI3DL2Reverb(iface);
+ 
+-    FIXME("effect %p, quality %lu, stub!\n", effect, quality);
++    TRACE("effect %p, quality %ld.\n", effect, quality);
+ 
+-    return E_NOTIMPL;
++    if (quality < DSFX_I3DL2REVERB_QUALITY_MIN || quality > DSFX_I3DL2REVERB_QUALITY_MAX)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&effect->effect.cs);
++    effect->quality = quality;
++    LeaveCriticalSection(&effect->effect.cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI reverb_params_GetQuality(IDirectSoundFXI3DL2Reverb *iface, LONG *quality)
+ {
+     struct reverb *effect = impl_from_IDirectSoundFXI3DL2Reverb(iface);
+ 
+-    FIXME("effect %p, quality %p, stub!\n", effect, quality);
++    TRACE("effect %p, quality %p.\n", effect, quality);
+ 
+-    return E_NOTIMPL;
++    if (!quality)
++        return E_POINTER;
++
++    EnterCriticalSection(&effect->effect.cs);
++    *quality = effect->quality;
++    LeaveCriticalSection(&effect->effect.cs);
++    return S_OK;
+ }
+ 
+ static const IDirectSoundFXI3DL2ReverbVtbl reverb_params_vtbl =
+@@ -824,13 +1968,54 @@ static void reverb_destroy(struct effect *iface)
+ {
+     struct reverb *effect = impl_reverb_from_effect(iface);
+ 
++    reverberator_free(&effect->r);
+     free(effect);
+ }
+ 
++static void *reverb_params(struct effect *iface)
++{
++    return &impl_reverb_from_effect(iface)->params;
++}
++
++static void reverb_reset(struct effect *iface)
++{
++    struct reverb *effect = impl_reverb_from_effect(iface);
++    const DSFXI3DL2Reverb *p = &effect->params;
++
++    /* room HF attenuation and the HF reference shape the comb damping */
++    reverberator_init(&effect->r, effect->effect.format.nSamplesPerSec, p->flDecayTime,
++            p->flDecayHFRatio * mb_to_gain(p->lRoomHF) * min(1.0f, p->flHFReference / 5000.0f),
++            p->flDiffusion, p->flDensity, p->flReflectionsDelay, p->flReverbDelay,
++            mb_to_gain(p->lReflections), mb_to_gain(p->lReverb));
++}
++
++static void reverb_process(struct effect *iface, float *data, DWORD frames, unsigned int channels)
++{
++    struct reverb *effect = impl_reverb_from_effect(iface);
++
++    reverberator_process(&effect->r, data, frames, channels, 1.0f, mb_to_gain(effect->params.lRoom));
++}
++
++static void reverb_copy(struct effect *dst, struct effect *src)
++{
++    impl_reverb_from_effect(dst)->preset = impl_reverb_from_effect(src)->preset;
++    impl_reverb_from_effect(dst)->quality = impl_reverb_from_effect(src)->quality;
++}
++
++static HRESULT reverb_create(IUnknown *outer, IUnknown **out);
++
+ static const struct effect_ops reverb_ops =
+ {
+     .destroy = reverb_destroy,
+     .query_interface = reverb_query_interface,
++    .create = reverb_create,
++    .params = reverb_params,
++    .params_size = sizeof(DSFXI3DL2Reverb),
++    .param_info = reverb_param_info,
++    .param_count = ARRAY_SIZE(reverb_param_info),
++    .reset = reverb_reset,
++    .process = reverb_process,
++    .copy = reverb_copy,
+ };
+ 
+ static HRESULT reverb_create(IUnknown *outer, IUnknown **out)
+@@ -855,93 +2040,106 @@ static HRESULT reverb_create(IUnknown *outer, IUnknown **out)
+     object->params.flDiffusion          = DSFX_I3DL2REVERB_DIFFUSION_DEFAULT;
+     object->params.flDensity            = DSFX_I3DL2REVERB_DENSITY_DEFAULT;
+     object->params.flHFReference        = DSFX_I3DL2REVERB_HFREFERENCE_DEFAULT;
++    object->preset = DSFX_I3DL2_ENVIRONMENT_PRESET_DEFAULT;
++    object->quality = DSFX_I3DL2REVERB_QUALITY_DEFAULT;
+ 
+     TRACE("Created I3DL2 reverb effect %p.\n", object);
+     *out = &object->effect.IUnknown_inner;
+     return S_OK;
+ }
+ 
++/* Waves reverb */
++
+ struct waves_reverb
+ {
+     struct effect effect;
+     IDirectSoundFXWavesReverb IDirectSoundFXWavesReverb_iface;
++    DSFXWavesReverb params;
++    struct reverberator r;
+ };
+ 
+-static struct waves_reverb *impl_from_IDirectSoundFXWavesReverb(IDirectSoundFXWavesReverb *iface)
+-{
+-    return CONTAINING_RECORD(iface, struct waves_reverb, IDirectSoundFXWavesReverb_iface);
+-}
+-
+-static HRESULT WINAPI waves_reverb_params_QueryInterface(IDirectSoundFXWavesReverb *iface, REFIID iid, void **out)
++static const struct effect_param waves_reverb_param_info[] =
+ {
+-    struct waves_reverb *effect = impl_from_IDirectSoundFXWavesReverb(iface);
+-    return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
+-}
++    FLOAT_PARAM(DSFXWavesReverb, fInGain, DSFX_WAVESREVERB_INGAIN_MIN, DSFX_WAVESREVERB_INGAIN_MAX,
++            DSFX_WAVESREVERB_INGAIN_DEFAULT, L"InGain", L"dB"),
++    FLOAT_PARAM(DSFXWavesReverb, fReverbMix, DSFX_WAVESREVERB_REVERBMIX_MIN, DSFX_WAVESREVERB_REVERBMIX_MAX,
++            DSFX_WAVESREVERB_REVERBMIX_DEFAULT, L"ReverbMix", L"dB"),
++    FLOAT_PARAM(DSFXWavesReverb, fReverbTime, DSFX_WAVESREVERB_REVERBTIME_MIN, DSFX_WAVESREVERB_REVERBTIME_MAX,
++            DSFX_WAVESREVERB_REVERBTIME_DEFAULT, L"ReverbTime", L"ms"),
++    FLOAT_PARAM(DSFXWavesReverb, fHighFreqRTRatio, DSFX_WAVESREVERB_HIGHFREQRTRATIO_MIN,
++            DSFX_WAVESREVERB_HIGHFREQRTRATIO_MAX, DSFX_WAVESREVERB_HIGHFREQRTRATIO_DEFAULT, L"HighFreqRTRatio", L""),
++};
+ 
+-static ULONG WINAPI waves_reverb_params_AddRef(IDirectSoundFXWavesReverb *iface)
+-{
+-    struct waves_reverb *effect = impl_from_IDirectSoundFXWavesReverb(iface);
+-    return IUnknown_AddRef(effect->effect.outer_unk);
+-}
++DEFINE_FX_PARAMS_IFACE(waves_reverb, IDirectSoundFXWavesReverb, struct waves_reverb, DSFXWavesReverb)
+ 
+-static ULONG WINAPI waves_reverb_params_Release(IDirectSoundFXWavesReverb *iface)
++static const IDirectSoundFXWavesReverbVtbl waves_reverb_params_vtbl =
+ {
+-    struct waves_reverb *effect = impl_from_IDirectSoundFXWavesReverb(iface);
+-    return IUnknown_Release(effect->effect.outer_unk);
+-}
++    waves_reverb_params_QueryInterface,
++    waves_reverb_params_AddRef,
++    waves_reverb_params_Release,
++    waves_reverb_params_SetAllParameters,
++    waves_reverb_params_GetAllParameters,
++};
+ 
+-static HRESULT WINAPI waves_reverb_params_SetAllParameters(IDirectSoundFXWavesReverb *iface, const DSFXWavesReverb *params)
++static struct waves_reverb *impl_waves_reverb_from_effect(struct effect *iface)
+ {
+-    struct waves_reverb *effect = impl_from_IDirectSoundFXWavesReverb(iface);
+-
+-    FIXME("effect %p, params %p, stub!\n", effect, params);
+-
+-    return E_NOTIMPL;
++    return CONTAINING_RECORD(iface, struct waves_reverb, effect);
+ }
+ 
+-static HRESULT WINAPI waves_reverb_params_GetAllParameters(IDirectSoundFXWavesReverb *iface, DSFXWavesReverb *params)
++static void *waves_reverb_query_interface(struct effect *iface, REFIID iid)
+ {
+-    struct waves_reverb *effect = impl_from_IDirectSoundFXWavesReverb(iface);
+-
+-    FIXME("effect %p, params %p, stub!\n", effect, params);
++    struct waves_reverb *effect = impl_waves_reverb_from_effect(iface);
+ 
+-    return E_NOTIMPL;
++    if (IsEqualGUID(iid, &IID_IDirectSoundFXWavesReverb))
++        return &effect->IDirectSoundFXWavesReverb_iface;
++    return NULL;
+ }
+ 
+-static const IDirectSoundFXWavesReverbVtbl waves_reverb_params_vtbl =
++static void waves_reverb_destroy(struct effect *iface)
+ {
+-    waves_reverb_params_QueryInterface,
+-    waves_reverb_params_AddRef,
+-    waves_reverb_params_Release,
+-    waves_reverb_params_SetAllParameters,
+-    waves_reverb_params_GetAllParameters,
+-};
++    struct waves_reverb *effect = impl_waves_reverb_from_effect(iface);
+ 
+-static struct waves_reverb *impl_waves_reverb_from_effect(struct effect *iface)
++    reverberator_free(&effect->r);
++    free(effect);
++}
++
++static void *waves_reverb_params(struct effect *iface)
+ {
+-    return CONTAINING_RECORD(iface, struct waves_reverb, effect);
++    return &impl_waves_reverb_from_effect(iface)->params;
+ }
+ 
+-static void *waves_reverb_query_interface(struct effect *iface, REFIID iid)
++static void waves_reverb_reset(struct effect *iface)
+ {
+     struct waves_reverb *effect = impl_waves_reverb_from_effect(iface);
+ 
+-    if (IsEqualGUID(iid, &IID_IDirectSoundFXWavesReverb))
+-        return &effect->IDirectSoundFXWavesReverb_iface;
+-    return NULL;
++    reverberator_init(&effect->r, effect->effect.format.nSamplesPerSec, effect->params.fReverbTime / 1000.0f,
++            effect->params.fHighFreqRTRatio, 100.0f, 100.0f, 0.0f, 0.01f, 0.5f, 1.0f);
+ }
+ 
+-static void waves_reverb_destroy(struct effect *iface)
++static void waves_reverb_process(struct effect *iface, float *data, DWORD frames, unsigned int channels)
+ {
+     struct waves_reverb *effect = impl_waves_reverb_from_effect(iface);
++    float in_gain = db_to_gain(effect->params.fInGain);
++    DWORD i;
+ 
+-    free(effect);
++    for (i = 0; i < frames * channels; ++i)
++        data[i] *= in_gain;
++    reverberator_process(&effect->r, data, frames, channels, 1.0f, db_to_gain(effect->params.fReverbMix));
+ }
+ 
++static HRESULT waves_reverb_create(IUnknown *outer, IUnknown **out);
++
+ static const struct effect_ops waves_reverb_ops =
+ {
+     .destroy = waves_reverb_destroy,
+     .query_interface = waves_reverb_query_interface,
++    .create = waves_reverb_create,
++    .params = waves_reverb_params,
++    .params_size = sizeof(DSFXWavesReverb),
++    .param_info = waves_reverb_param_info,
++    .param_count = ARRAY_SIZE(waves_reverb_param_info),
++    .reset = waves_reverb_reset,
++    .process = waves_reverb_process,
+ };
+ 
+ static HRESULT waves_reverb_create(IUnknown *outer, IUnknown **out)
+@@ -954,468 +2152,521 @@ static HRESULT waves_reverb_create(IUnknown *outer, IUnknown **out)
+     effect_init(&object->effect, outer, &waves_reverb_ops);
+     object->IDirectSoundFXWavesReverb_iface.lpVtbl = &waves_reverb_params_vtbl;
+ 
++    object->params.fInGain = DSFX_WAVESREVERB_INGAIN_DEFAULT;
++    object->params.fReverbMix = DSFX_WAVESREVERB_REVERBMIX_DEFAULT;
++    object->params.fReverbTime = DSFX_WAVESREVERB_REVERBTIME_DEFAULT;
++    object->params.fHighFreqRTRatio = DSFX_WAVESREVERB_HIGHFREQRTRATIO_DEFAULT;
++
+     TRACE("Created waves reverb effect %p.\n", object);
+     *out = &object->effect.IUnknown_inner;
+     return S_OK;
+ }
+ 
+-struct dmo_echofx
++/* Echo: a delay line per channel with feedback; PanDelay swaps the left and
++ * right delays on each repeat. */
++
++struct echo
+ {
+     struct effect effect;
+-    IDirectSoundFXEcho  IDirectSoundFXEcho_iface;
++    IDirectSoundFXEcho IDirectSoundFXEcho_iface;
++    DSFXEcho params;
++    struct delay_line line[2];
+ };
+ 
+-static inline struct dmo_echofx *impl_from_IDirectSoundFXEcho(IDirectSoundFXEcho *iface)
++static const struct effect_param echo_param_info[] =
+ {
+-    return CONTAINING_RECORD(iface, struct dmo_echofx, IDirectSoundFXEcho_iface);
+-}
++    FLOAT_PARAM(DSFXEcho, fWetDryMix, DSFXECHO_WETDRYMIX_MIN, DSFXECHO_WETDRYMIX_MAX, 50.0f, L"WetDryMix", L"%"),
++    FLOAT_PARAM(DSFXEcho, fFeedback, DSFXECHO_FEEDBACK_MIN, DSFXECHO_FEEDBACK_MAX, 50.0f, L"Feedback", L"%"),
++    FLOAT_PARAM(DSFXEcho, fLeftDelay, DSFXECHO_LEFTDELAY_MIN, DSFXECHO_LEFTDELAY_MAX, 500.0f, L"LeftDelay", L"ms"),
++    FLOAT_PARAM(DSFXEcho, fRightDelay, DSFXECHO_RIGHTDELAY_MIN, DSFXECHO_RIGHTDELAY_MAX, 500.0f, L"RightDelay", L"ms"),
++    INT_PARAM(DSFXEcho, lPanDelay, MPT_BOOL, DSFXECHO_PANDELAY_MIN, DSFXECHO_PANDELAY_MAX, 0.0f, L"PanDelay", L"", NULL),
++};
+ 
+-static HRESULT WINAPI echofx_QueryInterface(IDirectSoundFXEcho *iface, REFIID iid, void **out)
+-{
+-    struct dmo_echofx *effect = impl_from_IDirectSoundFXEcho(iface);
+-    return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
+-}
++DEFINE_FX_PARAMS_IFACE(echo, IDirectSoundFXEcho, struct echo, DSFXEcho)
+ 
+-static ULONG WINAPI echofx_AddRef(IDirectSoundFXEcho *iface)
++static const struct IDirectSoundFXEchoVtbl echo_params_vtbl =
+ {
+-    struct dmo_echofx *effect = impl_from_IDirectSoundFXEcho(iface);
+-    return IUnknown_AddRef(effect->effect.outer_unk);
+-}
++    echo_params_QueryInterface,
++    echo_params_AddRef,
++    echo_params_Release,
++    echo_params_SetAllParameters,
++    echo_params_GetAllParameters,
++};
+ 
+-static ULONG WINAPI echofx_Release(IDirectSoundFXEcho *iface)
++static struct echo *impl_echo_from_effect(struct effect *iface)
+ {
+-    struct dmo_echofx *effect = impl_from_IDirectSoundFXEcho(iface);
+-    return IUnknown_Release(effect->effect.outer_unk);
++    return CONTAINING_RECORD(iface, struct echo, effect);
+ }
+ 
+-static HRESULT WINAPI echofx_SetAllParameters(IDirectSoundFXEcho *iface, const DSFXEcho *echo)
++static void *echo_query_interface(struct effect *iface, REFIID iid)
+ {
+-    struct dmo_echofx *effect = impl_from_IDirectSoundFXEcho(iface);
+-    FIXME("(%p) %p\n", effect, echo);
++    struct echo *effect = impl_echo_from_effect(iface);
+ 
+-    return E_NOTIMPL;
++    if (IsEqualGUID(iid, &IID_IDirectSoundFXEcho))
++        return &effect->IDirectSoundFXEcho_iface;
++    return NULL;
+ }
+ 
+-static HRESULT WINAPI echofx_GetAllParameters(IDirectSoundFXEcho *iface, DSFXEcho *echo)
++static void echo_destroy(struct effect *iface)
+ {
+-    struct dmo_echofx *effect = impl_from_IDirectSoundFXEcho(iface);
+-    FIXME("(%p) %p\n", effect, echo);
++    struct echo *effect = impl_echo_from_effect(iface);
+ 
+-    return E_NOTIMPL;
++    delay_line_free(&effect->line[0]);
++    delay_line_free(&effect->line[1]);
++    free(effect);
+ }
+ 
+-static const struct IDirectSoundFXEchoVtbl echofx_vtbl =
+-{
+-    echofx_QueryInterface,
+-    echofx_AddRef,
+-    echofx_Release,
+-    echofx_SetAllParameters,
+-    echofx_GetAllParameters
+-};
+-
+-static struct dmo_echofx *impl_echo_from_effect(struct effect *iface)
++static void *echo_params(struct effect *iface)
+ {
+-    return CONTAINING_RECORD(iface, struct dmo_echofx, effect);
++    return &impl_echo_from_effect(iface)->params;
+ }
+ 
+-static void *echo_query_interface(struct effect *iface, REFIID iid)
++static void echo_reset(struct effect *iface)
+ {
+-    struct dmo_echofx *effect = impl_echo_from_effect(iface);
++    struct echo *effect = impl_echo_from_effect(iface);
++    unsigned int size = DSFXECHO_LEFTDELAY_MAX * effect->effect.format.nSamplesPerSec / 1000 + 2;
+ 
+-    if (IsEqualGUID(iid, &IID_IDirectSoundFXEcho))
+-        return &effect->IDirectSoundFXEcho_iface;
+-    return NULL;
++    delay_line_init(&effect->line[0], size);
++    delay_line_init(&effect->line[1], size);
+ }
+ 
+-static void echo_destroy(struct effect *iface)
++static void echo_process(struct effect *iface, float *data, DWORD frames, unsigned int channels)
+ {
+-    struct dmo_echofx *effect = impl_echo_from_effect(iface);
++    struct echo *effect = impl_echo_from_effect(iface);
++    float rate = effect->effect.format.nSamplesPerSec, wet = effect->params.fWetDryMix / 100.0f;
++    float feedback = effect->params.fFeedback / 100.0f, delayed[2], in;
++    float delays[2] = {effect->params.fLeftDelay * rate / 1000.0f, effect->params.fRightDelay * rate / 1000.0f};
++    unsigned int c;
++    DWORD i;
+ 
+-    free(effect);
++    for (i = 0; i < frames; ++i)
++    {
++        for (c = 0; c < channels; ++c)
++            delayed[c] = delay_line_read(&effect->line[c], delays[c]);
++        for (c = 0; c < channels; ++c)
++        {
++            in = data[i * channels + c];
++            /* with PanDelay the repeats cross over to the other channel */
++            if (effect->params.lPanDelay && channels == 2)
++                delay_line_write(&effect->line[c], in + delayed[1 - c] * feedback);
++            else
++                delay_line_write(&effect->line[c], in + delayed[c] * feedback);
++            data[i * channels + c] = in * (1.0f - wet) + delayed[c] * wet;
++        }
++    }
+ }
+ 
++static HRESULT echo_create(IUnknown *outer, IUnknown **out);
++
+ static const struct effect_ops echo_ops =
+ {
+     .destroy = echo_destroy,
+     .query_interface = echo_query_interface,
++    .create = echo_create,
++    .params = echo_params,
++    .params_size = sizeof(DSFXEcho),
++    .param_info = echo_param_info,
++    .param_count = ARRAY_SIZE(echo_param_info),
++    .reset = echo_reset,
++    .process = echo_process,
+ };
+ 
+ static HRESULT echo_create(IUnknown *outer, IUnknown **out)
+ {
+-    struct dmo_echofx *object;
++    struct echo *object;
+ 
+     if (!(object = calloc(1, sizeof(*object))))
+         return E_OUTOFMEMORY;
+ 
+     effect_init(&object->effect, outer, &echo_ops);
+-    object->IDirectSoundFXEcho_iface.lpVtbl = &echofx_vtbl;
++    object->IDirectSoundFXEcho_iface.lpVtbl = &echo_params_vtbl;
++
++    object->params.fWetDryMix = 50.0f;
++    object->params.fFeedback = 50.0f;
++    object->params.fLeftDelay = 500.0f;
++    object->params.fRightDelay = 500.0f;
++    object->params.lPanDelay = 0;
+ 
+     TRACE("Created echo effect %p.\n", object);
+     *out = &object->effect.IUnknown_inner;
+     return S_OK;
+ }
+ 
+-struct dmo_compressorfx
+-{
+-    struct effect effect;
+-    IDirectSoundFXCompressor IDirectSoundFXCompressor_iface;
+-};
+-
+-static inline struct dmo_compressorfx *impl_from_IDirectSoundFXCompressor(IDirectSoundFXCompressor *iface)
+-{
+-    return CONTAINING_RECORD(iface, struct dmo_compressorfx, IDirectSoundFXCompressor_iface);
+-}
+-
+-static HRESULT WINAPI compressorfx_QueryInterface(IDirectSoundFXCompressor *iface, REFIID iid, void **out)
+-{
+-    struct dmo_compressorfx *effect = impl_from_IDirectSoundFXCompressor(iface);
+-    return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
+-}
++/* Chorus and flanger: a delay modulated by a low frequency oscillator, with the
++ * right channel's oscillator offset by the phase differential. */
+ 
+-static ULONG WINAPI compressorfx_AddRef(IDirectSoundFXCompressor *iface)
++struct modulated_delay
+ {
+-    struct dmo_compressorfx *effect = impl_from_IDirectSoundFXCompressor(iface);
+-    return IUnknown_AddRef(effect->effect.outer_unk);
+-}
++    struct delay_line line[2];
++    double phase;
++};
+ 
+-static ULONG WINAPI compressorfx_Release(IDirectSoundFXCompressor *iface)
+-{
+-    struct dmo_compressorfx *effect = impl_from_IDirectSoundFXCompressor(iface);
+-    return IUnknown_Release(effect->effect.outer_unk);
+-}
++static const float lfo_phase_offset[] = {-0.5f, -0.25f, 0.0f, 0.25f, 0.5f};
+ 
+-static HRESULT WINAPI compressorfx_SetAllParameters(IDirectSoundFXCompressor *iface, const DSFXCompressor *compressor)
++static void modulated_delay_reset(struct modulated_delay *m, unsigned int size)
+ {
+-    struct dmo_compressorfx *This = impl_from_IDirectSoundFXCompressor(iface);
+-    FIXME("(%p) %p\n", This, compressor);
+-
+-    return E_NOTIMPL;
++    delay_line_init(&m->line[0], size);
++    delay_line_init(&m->line[1], size);
++    m->phase = 0.0;
+ }
+ 
+-static HRESULT WINAPI compressorfx_GetAllParameters(IDirectSoundFXCompressor *iface, DSFXCompressor *compressor)
++static void modulated_delay_process(struct modulated_delay *m, float *data, DWORD frames, unsigned int channels,
++        float rate, float wet_dry, float depth, float feedback, float frequency, LONG waveform, float delay, LONG phase)
+ {
+-    struct dmo_compressorfx *This = impl_from_IDirectSoundFXCompressor(iface);
+-    FIXME("(%p) %p\n", This, compressor);
++    float wet = wet_dry / 100.0f, center = delay * rate / 1000.0f, swing, delayed, in, lfo;
++    unsigned int c;
++    DWORD i;
+ 
+-    return E_NOTIMPL;
++    /* depth is the share of the delay the oscillator swings over */
++    swing = center * depth / 100.0f;
++    for (i = 0; i < frames; ++i)
++    {
++        for (c = 0; c < channels; ++c)
++        {
++            lfo = lfo_value(m->phase + (c ? lfo_phase_offset[phase] : 0.0f), waveform == DSFXCHORUS_WAVE_TRIANGLE);
++            delayed = delay_line_read(&m->line[c], 1.0f + center + swing * lfo);
++            in = data[i * channels + c];
++            delay_line_write(&m->line[c], in + delayed * feedback / 100.0f);
++            data[i * channels + c] = in * (1.0f - wet) + delayed * wet;
++        }
++        m->phase += frequency / rate;
++        if (m->phase >= 1.0)
++            m->phase -= 1.0;
++    }
+ }
+ 
+-static const struct IDirectSoundFXCompressorVtbl compressor_vtbl =
++struct chorus
+ {
+-    compressorfx_QueryInterface,
+-    compressorfx_AddRef,
+-    compressorfx_Release,
+-    compressorfx_SetAllParameters,
+-    compressorfx_GetAllParameters
++    struct effect effect;
++    IDirectSoundFXChorus IDirectSoundFXChorus_iface;
++    DSFXChorus params;
++    struct modulated_delay m;
+ };
+ 
+-static struct dmo_compressorfx *impl_compressor_from_effect(struct effect *iface)
+-{
+-    return CONTAINING_RECORD(iface, struct dmo_compressorfx, effect);
+-}
+-
+-static void *compressor_query_interface(struct effect *iface, REFIID iid)
+-{
+-    struct dmo_compressorfx *effect = impl_compressor_from_effect(iface);
+-
+-    if (IsEqualGUID(iid, &IID_IDirectSoundFXCompressor))
+-        return &effect->IDirectSoundFXCompressor_iface;
+-    return NULL;
+-}
+-
+-static void compressor_destroy(struct effect *iface)
+-{
+-    struct dmo_compressorfx *effect = impl_compressor_from_effect(iface);
+-
+-    free(effect);
+-}
++static const WCHAR waveform_enums[] = L"Triangle\0Sine\0";
++static const WCHAR phase_enums[] = L"-180\0-90\0" L"0\0" L"90\0" L"180\0";
+ 
+-static const struct effect_ops compressor_ops =
++static const struct effect_param chorus_param_info[] =
+ {
+-    .destroy = compressor_destroy,
+-    .query_interface = compressor_query_interface,
++    FLOAT_PARAM(DSFXChorus, fWetDryMix, DSFXCHORUS_WETDRYMIX_MIN, DSFXCHORUS_WETDRYMIX_MAX, 50.0f, L"WetDryMix", L"%"),
++    FLOAT_PARAM(DSFXChorus, fDepth, DSFXCHORUS_DEPTH_MIN, DSFXCHORUS_DEPTH_MAX, 10.0f, L"Depth", L"%"),
++    FLOAT_PARAM(DSFXChorus, fFeedback, DSFXCHORUS_FEEDBACK_MIN, DSFXCHORUS_FEEDBACK_MAX, 25.0f, L"Feedback", L"%"),
++    FLOAT_PARAM(DSFXChorus, fFrequency, DSFXCHORUS_FREQUENCY_MIN, DSFXCHORUS_FREQUENCY_MAX, 1.1f, L"Frequency", L"Hz"),
++    INT_PARAM(DSFXChorus, lWaveform, MPT_ENUM, DSFXCHORUS_WAVE_TRIANGLE, DSFXCHORUS_WAVE_SIN, DSFXCHORUS_WAVE_SIN,
++            L"WaveShape", L"", waveform_enums),
++    FLOAT_PARAM(DSFXChorus, fDelay, DSFXCHORUS_DELAY_MIN, DSFXCHORUS_DELAY_MAX, 16.0f, L"Delay", L"ms"),
++    INT_PARAM(DSFXChorus, lPhase, MPT_ENUM, DSFXCHORUS_PHASE_MIN, DSFXCHORUS_PHASE_MAX, DSFXCHORUS_PHASE_90,
++            L"Phase", L"", phase_enums),
+ };
+ 
+-static HRESULT compressor_create(IUnknown *outer, IUnknown **out)
+-{
+-    struct dmo_compressorfx *object;
+-
+-    if (!(object = calloc(1, sizeof(*object))))
+-        return E_OUTOFMEMORY;
+-
+-    effect_init(&object->effect, outer, &compressor_ops);
+-    object->IDirectSoundFXCompressor_iface.lpVtbl = &compressor_vtbl;
+-
+-    TRACE("Created compressor effect %p.\n", object);
+-    *out = &object->effect.IUnknown_inner;
+-    return S_OK;
+-}
++DEFINE_FX_PARAMS_IFACE(chorus, IDirectSoundFXChorus, struct chorus, DSFXChorus)
+ 
+-struct dmochorusfx
++static const struct IDirectSoundFXChorusVtbl chorus_params_vtbl =
+ {
+-    struct effect effect;
+-    IDirectSoundFXChorus IDirectSoundFXChorus_iface;
++    chorus_params_QueryInterface,
++    chorus_params_AddRef,
++    chorus_params_Release,
++    chorus_params_SetAllParameters,
++    chorus_params_GetAllParameters,
+ };
+ 
+-static inline struct dmochorusfx *impl_from_IDirectSoundFXChorus(IDirectSoundFXChorus *iface)
++static struct chorus *impl_chorus_from_effect(struct effect *iface)
+ {
+-    return CONTAINING_RECORD(iface, struct dmochorusfx, IDirectSoundFXChorus_iface);
++    return CONTAINING_RECORD(iface, struct chorus, effect);
+ }
+ 
+-static HRESULT WINAPI chorusfx_QueryInterface(IDirectSoundFXChorus *iface, REFIID iid, void **out)
++static void *chorus_query_interface(struct effect *iface, REFIID iid)
+ {
+-    struct dmochorusfx *effect = impl_from_IDirectSoundFXChorus(iface);
+-    return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
+-}
++    struct chorus *effect = impl_chorus_from_effect(iface);
+ 
+-static ULONG WINAPI chorusfx_AddRef(IDirectSoundFXChorus *iface)
+-{
+-    struct dmochorusfx *effect = impl_from_IDirectSoundFXChorus(iface);
+-    return IUnknown_AddRef(effect->effect.outer_unk);
++    if (IsEqualGUID(iid, &IID_IDirectSoundFXChorus))
++        return &effect->IDirectSoundFXChorus_iface;
++    return NULL;
+ }
+ 
+-static ULONG WINAPI chorusfx_Release(IDirectSoundFXChorus *iface)
++static void chorus_destroy(struct effect *iface)
+ {
+-    struct dmochorusfx *effect = impl_from_IDirectSoundFXChorus(iface);
+-    return IUnknown_Release(effect->effect.outer_unk);
+-}
++    struct chorus *effect = impl_chorus_from_effect(iface);
+ 
+-static HRESULT WINAPI chorusfx_SetAllParameters(IDirectSoundFXChorus *iface, const DSFXChorus *compressor)
+-{
+-    struct dmochorusfx *This = impl_from_IDirectSoundFXChorus(iface);
+-    FIXME("(%p) %p\n", This, compressor);
+-    return E_NOTIMPL;
++    delay_line_free(&effect->m.line[0]);
++    delay_line_free(&effect->m.line[1]);
++    free(effect);
+ }
+ 
+-static HRESULT WINAPI chorusfx_GetAllParameters(IDirectSoundFXChorus *iface, DSFXChorus *compressor)
++static void *chorus_params(struct effect *iface)
+ {
+-    struct dmochorusfx *This = impl_from_IDirectSoundFXChorus(iface);
+-    FIXME("(%p) %p\n", This, compressor);
+-    return E_NOTIMPL;
++    return &impl_chorus_from_effect(iface)->params;
+ }
+ 
+-static const struct IDirectSoundFXChorusVtbl chorus_vtbl =
++static void chorus_reset(struct effect *iface)
+ {
+-    chorusfx_QueryInterface,
+-    chorusfx_AddRef,
+-    chorusfx_Release,
+-    chorusfx_SetAllParameters,
+-    chorusfx_GetAllParameters
+-};
++    struct chorus *effect = impl_chorus_from_effect(iface);
+ 
+-static struct dmochorusfx *implchorus_from_effect(struct effect *iface)
+-{
+-    return CONTAINING_RECORD(iface, struct dmochorusfx, effect);
++    modulated_delay_reset(&effect->m, 2 * DSFXCHORUS_DELAY_MAX * effect->effect.format.nSamplesPerSec / 1000 + 4);
+ }
+ 
+-static void *chorus_query_interface(struct effect *iface, REFIID iid)
++static void chorus_process(struct effect *iface, float *data, DWORD frames, unsigned int channels)
+ {
+-    struct dmochorusfx *effect = implchorus_from_effect(iface);
++    struct chorus *effect = impl_chorus_from_effect(iface);
++    const DSFXChorus *p = &effect->params;
+ 
+-    if (IsEqualGUID(iid, &IID_IDirectSoundFXChorus))
+-        return &effect->IDirectSoundFXChorus_iface;
+-    return NULL;
++    modulated_delay_process(&effect->m, data, frames, channels, effect->effect.format.nSamplesPerSec,
++            p->fWetDryMix, p->fDepth, p->fFeedback, p->fFrequency, p->lWaveform, p->fDelay, p->lPhase);
+ }
+ 
+-static void chorus_destroy(struct effect *iface)
+-{
+-    struct dmochorusfx *effect = implchorus_from_effect(iface);
+-
+-    free(effect);
+-}
++static HRESULT chorus_create(IUnknown *outer, IUnknown **out);
+ 
+ static const struct effect_ops chorus_ops =
+ {
+     .destroy = chorus_destroy,
+     .query_interface = chorus_query_interface,
++    .create = chorus_create,
++    .params = chorus_params,
++    .params_size = sizeof(DSFXChorus),
++    .param_info = chorus_param_info,
++    .param_count = ARRAY_SIZE(chorus_param_info),
++    .reset = chorus_reset,
++    .process = chorus_process,
+ };
+ 
+ static HRESULT chorus_create(IUnknown *outer, IUnknown **out)
+ {
+-    struct dmochorusfx *object;
++    struct chorus *object;
+ 
+     if (!(object = calloc(1, sizeof(*object))))
+         return E_OUTOFMEMORY;
+ 
+     effect_init(&object->effect, outer, &chorus_ops);
+-    object->IDirectSoundFXChorus_iface.lpVtbl = &chorus_vtbl;
++    object->IDirectSoundFXChorus_iface.lpVtbl = &chorus_params_vtbl;
++
++    object->params.fWetDryMix = 50.0f;
++    object->params.fDepth = 10.0f;
++    object->params.fFeedback = 25.0f;
++    object->params.fFrequency = 1.1f;
++    object->params.lWaveform = DSFXCHORUS_WAVE_SIN;
++    object->params.fDelay = 16.0f;
++    object->params.lPhase = DSFXCHORUS_PHASE_90;
+ 
+     TRACE("Created chorus effect %p.\n", object);
+     *out = &object->effect.IUnknown_inner;
+     return S_OK;
+ }
+ 
+-struct dmo_flangerfx
++struct flanger
+ {
+     struct effect effect;
+     IDirectSoundFXFlanger IDirectSoundFXFlanger_iface;
++    DSFXFlanger params;
++    struct modulated_delay m;
+ };
+ 
+-static inline struct dmo_flangerfx *impl_from_IDirectSoundFXFlanger(IDirectSoundFXFlanger *iface)
+-{
+-    return CONTAINING_RECORD(iface, struct dmo_flangerfx, IDirectSoundFXFlanger_iface);
+-}
++static const struct effect_param flanger_param_info[] =
++{
++    FLOAT_PARAM(DSFXFlanger, fWetDryMix, DSFXFLANGER_WETDRYMIX_MIN, DSFXFLANGER_WETDRYMIX_MAX, 50.0f, L"WetDryMix", L"%"),
++    FLOAT_PARAM(DSFXFlanger, fDepth, DSFXFLANGER_DEPTH_MIN, DSFXFLANGER_DEPTH_MAX, 100.0f, L"Depth", L"%"),
++    FLOAT_PARAM(DSFXFlanger, fFeedback, DSFXFLANGER_FEEDBACK_MIN, DSFXFLANGER_FEEDBACK_MAX, -50.0f, L"Feedback", L"%"),
++    FLOAT_PARAM(DSFXFlanger, fFrequency, DSFXFLANGER_FREQUENCY_MIN, DSFXFLANGER_FREQUENCY_MAX, 0.25f, L"Frequency", L"Hz"),
++    INT_PARAM(DSFXFlanger, lWaveform, MPT_ENUM, DSFXFLANGER_WAVE_TRIANGLE, DSFXFLANGER_WAVE_SIN, DSFXFLANGER_WAVE_SIN,
++            L"WaveShape", L"", waveform_enums),
++    FLOAT_PARAM(DSFXFlanger, fDelay, DSFXFLANGER_DELAY_MIN, DSFXFLANGER_DELAY_MAX, 2.0f, L"Delay", L"ms"),
++    INT_PARAM(DSFXFlanger, lPhase, MPT_ENUM, DSFXFLANGER_PHASE_MIN, DSFXFLANGER_PHASE_MAX, DSFXFLANGER_PHASE_ZERO,
++            L"Phase", L"", phase_enums),
++};
+ 
+-static HRESULT WINAPI flangerfx_QueryInterface(IDirectSoundFXFlanger *iface, REFIID iid, void **out)
+-{
+-    struct dmo_flangerfx *effect = impl_from_IDirectSoundFXFlanger(iface);
+-    return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
+-}
++DEFINE_FX_PARAMS_IFACE(flanger, IDirectSoundFXFlanger, struct flanger, DSFXFlanger)
+ 
+-static ULONG WINAPI flangerfx_AddRef(IDirectSoundFXFlanger *iface)
++static const struct IDirectSoundFXFlangerVtbl flanger_params_vtbl =
+ {
+-    struct dmo_flangerfx *effect = impl_from_IDirectSoundFXFlanger(iface);
+-    return IUnknown_AddRef(effect->effect.outer_unk);
+-}
++    flanger_params_QueryInterface,
++    flanger_params_AddRef,
++    flanger_params_Release,
++    flanger_params_SetAllParameters,
++    flanger_params_GetAllParameters,
++};
+ 
+-static ULONG WINAPI flangerfx_Release(IDirectSoundFXFlanger *iface)
++static struct flanger *impl_flanger_from_effect(struct effect *iface)
+ {
+-    struct dmo_flangerfx *effect = impl_from_IDirectSoundFXFlanger(iface);
+-    return IUnknown_Release(effect->effect.outer_unk);
++    return CONTAINING_RECORD(iface, struct flanger, effect);
+ }
+ 
+-static HRESULT WINAPI flangerfx_SetAllParameters(IDirectSoundFXFlanger *iface, const DSFXFlanger *flanger)
++static void *flanger_query_interface(struct effect *iface, REFIID iid)
+ {
+-    struct dmo_flangerfx *This = impl_from_IDirectSoundFXFlanger(iface);
+-    FIXME("(%p) %p\n", This, flanger);
+-    return E_NOTIMPL;
+-}
++    struct flanger *effect = impl_flanger_from_effect(iface);
+ 
+-static HRESULT WINAPI flangerfx_GetAllParameters(IDirectSoundFXFlanger *iface, DSFXFlanger *flanger)
+-{
+-    struct dmo_flangerfx *This = impl_from_IDirectSoundFXFlanger(iface);
+-    FIXME("(%p) %p\n", This, flanger);
+-    return E_NOTIMPL;
++    if (IsEqualGUID(iid, &IID_IDirectSoundFXFlanger))
++        return &effect->IDirectSoundFXFlanger_iface;
++    return NULL;
+ }
+ 
+-static const struct IDirectSoundFXFlangerVtbl flanger_vtbl =
++static void flanger_destroy(struct effect *iface)
+ {
+-    flangerfx_QueryInterface,
+-    flangerfx_AddRef,
+-    flangerfx_Release,
+-    flangerfx_SetAllParameters,
+-    flangerfx_GetAllParameters
+-};
++    struct flanger *effect = impl_flanger_from_effect(iface);
++
++    delay_line_free(&effect->m.line[0]);
++    delay_line_free(&effect->m.line[1]);
++    free(effect);
++}
+ 
+-static struct dmo_flangerfx *impl_flanger_from_effect(struct effect *iface)
++static void *flanger_params(struct effect *iface)
+ {
+-    return CONTAINING_RECORD(iface, struct dmo_flangerfx, effect);
++    return &impl_flanger_from_effect(iface)->params;
+ }
+ 
+-static void *flanger_query_interface(struct effect *iface, REFIID iid)
++static void flanger_reset(struct effect *iface)
+ {
+-    struct dmo_flangerfx *effect = impl_flanger_from_effect(iface);
++    struct flanger *effect = impl_flanger_from_effect(iface);
+ 
+-    if (IsEqualGUID(iid, &IID_IDirectSoundFXFlanger))
+-        return &effect->IDirectSoundFXFlanger_iface;
+-    return NULL;
++    modulated_delay_reset(&effect->m, 2 * DSFXFLANGER_DELAY_MAX * effect->effect.format.nSamplesPerSec / 1000 + 4);
+ }
+ 
+-static void flanger_destroy(struct effect *iface)
++static void flanger_process(struct effect *iface, float *data, DWORD frames, unsigned int channels)
+ {
+-    struct dmo_flangerfx *effect = impl_flanger_from_effect(iface);
++    struct flanger *effect = impl_flanger_from_effect(iface);
++    const DSFXFlanger *p = &effect->params;
+ 
+-    free(effect);
++    modulated_delay_process(&effect->m, data, frames, channels, effect->effect.format.nSamplesPerSec,
++            p->fWetDryMix, p->fDepth, p->fFeedback, p->fFrequency, p->lWaveform, p->fDelay, p->lPhase);
+ }
+ 
++static HRESULT flanger_create(IUnknown *outer, IUnknown **out);
++
+ static const struct effect_ops flanger_ops =
+ {
+     .destroy = flanger_destroy,
+     .query_interface = flanger_query_interface,
++    .create = flanger_create,
++    .params = flanger_params,
++    .params_size = sizeof(DSFXFlanger),
++    .param_info = flanger_param_info,
++    .param_count = ARRAY_SIZE(flanger_param_info),
++    .reset = flanger_reset,
++    .process = flanger_process,
+ };
+ 
+ static HRESULT flanger_create(IUnknown *outer, IUnknown **out)
+ {
+-    struct dmo_flangerfx *object;
++    struct flanger *object;
+ 
+     if (!(object = calloc(1, sizeof(*object))))
+         return E_OUTOFMEMORY;
+ 
+     effect_init(&object->effect, outer, &flanger_ops);
+-    object->IDirectSoundFXFlanger_iface.lpVtbl = &flanger_vtbl;
++    object->IDirectSoundFXFlanger_iface.lpVtbl = &flanger_params_vtbl;
++
++    object->params.fWetDryMix = 50.0f;
++    object->params.fDepth = 100.0f;
++    object->params.fFeedback = -50.0f;
++    object->params.fFrequency = 0.25f;
++    object->params.lWaveform = DSFXFLANGER_WAVE_SIN;
++    object->params.fDelay = 2.0f;
++    object->params.lPhase = DSFXFLANGER_PHASE_ZERO;
+ 
+     TRACE("Created flanger effect %p.\n", object);
+     *out = &object->effect.IUnknown_inner;
+     return S_OK;
+ }
+ 
++/* Distortion: low pass, waveshaper driven by Edge, band pass around the post EQ
++ * center, output gain. */
++
+ struct distortion
+ {
+     struct effect effect;
+     IDirectSoundFXDistortion IDirectSoundFXDistortion_iface;
++    DSFXDistortion params;
++    struct biquad pre, post;
+ };
+ 
+-static inline struct distortion *impl_from_IDirectSoundFXDistortion(IDirectSoundFXDistortion *iface)
++static const struct effect_param distortion_param_info[] =
+ {
+-    return CONTAINING_RECORD(iface, struct distortion, IDirectSoundFXDistortion_iface);
+-}
++    FLOAT_PARAM(DSFXDistortion, fGain, DSFXDISTORTION_GAIN_MIN, DSFXDISTORTION_GAIN_MAX, -18.0f, L"Gain", L"dB"),
++    FLOAT_PARAM(DSFXDistortion, fEdge, DSFXDISTORTION_EDGE_MIN, DSFXDISTORTION_EDGE_MAX, 15.0f, L"Edge", L"%"),
++    FLOAT_PARAM(DSFXDistortion, fPostEQCenterFrequency, DSFXDISTORTION_POSTEQCENTERFREQUENCY_MIN,
++            DSFXDISTORTION_POSTEQCENTERFREQUENCY_MAX, 2400.0f, L"PostEQCenterFrequency", L"Hz"),
++    FLOAT_PARAM(DSFXDistortion, fPostEQBandwidth, DSFXDISTORTION_POSTEQBANDWIDTH_MIN,
++            DSFXDISTORTION_POSTEQBANDWIDTH_MAX, 2400.0f, L"PostEQBandwidth", L"Hz"),
++    FLOAT_PARAM(DSFXDistortion, fPreLowpassCutoff, DSFXDISTORTION_PRELOWPASSCUTOFF_MIN,
++            DSFXDISTORTION_PRELOWPASSCUTOFF_MAX, 8000.0f, L"PreLowpassCutoff", L"Hz"),
++};
+ 
+-static HRESULT WINAPI distortion_QueryInterface(IDirectSoundFXDistortion *iface, REFIID iid, void **out)
+-{
+-    struct distortion *effect = impl_from_IDirectSoundFXDistortion(iface);
+-    return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
+-}
++DEFINE_FX_PARAMS_IFACE(distortion, IDirectSoundFXDistortion, struct distortion, DSFXDistortion)
+ 
+-static ULONG WINAPI distortion_AddRef(IDirectSoundFXDistortion *iface)
++static const struct IDirectSoundFXDistortionVtbl distortion_params_vtbl =
+ {
+-    struct distortion *effect = impl_from_IDirectSoundFXDistortion(iface);
+-    return IUnknown_AddRef(effect->effect.outer_unk);
+-}
++    distortion_params_QueryInterface,
++    distortion_params_AddRef,
++    distortion_params_Release,
++    distortion_params_SetAllParameters,
++    distortion_params_GetAllParameters,
++};
+ 
+-static ULONG WINAPI distortion_Release(IDirectSoundFXDistortion *iface)
++static struct distortion *impl_distortion_from_effect(struct effect *iface)
+ {
+-    struct distortion *effect = impl_from_IDirectSoundFXDistortion(iface);
+-    return IUnknown_Release(effect->effect.outer_unk);
++    return CONTAINING_RECORD(iface, struct distortion, effect);
+ }
+ 
+-static HRESULT WINAPI distortion_SetAllParameters(IDirectSoundFXDistortion *iface, const DSFXDistortion *params)
++static void *distortion_query_interface(struct effect *iface, REFIID iid)
+ {
+-    struct distortion *This = impl_from_IDirectSoundFXDistortion(iface);
+-    FIXME("(%p) %p\n", This, params);
+-    return E_NOTIMPL;
+-}
++    struct distortion *effect = impl_distortion_from_effect(iface);
+ 
+-static HRESULT WINAPI distortion_GetAllParameters(IDirectSoundFXDistortion *iface, DSFXDistortion *params)
+-{
+-    struct distortion *This = impl_from_IDirectSoundFXDistortion(iface);
+-    FIXME("(%p) %p\n", This, params);
+-    return E_NOTIMPL;
++    if (IsEqualGUID(iid, &IID_IDirectSoundFXDistortion))
++        return &effect->IDirectSoundFXDistortion_iface;
++    return NULL;
+ }
+ 
+-static const struct IDirectSoundFXDistortionVtbl distortion_vtbl =
++static void distortion_destroy(struct effect *iface)
+ {
+-    distortion_QueryInterface,
+-    distortion_AddRef,
+-    distortion_Release,
+-    distortion_SetAllParameters,
+-    distortion_GetAllParameters
+-};
++    free(impl_distortion_from_effect(iface));
++}
+ 
+-static struct distortion *impl_distortion_from_effect(struct effect *iface)
++static void *distortion_params(struct effect *iface)
+ {
+-    return CONTAINING_RECORD(iface, struct distortion, effect);
++    return &impl_distortion_from_effect(iface)->params;
+ }
+ 
+-static void *distortion_query_interface(struct effect *iface, REFIID iid)
++static void distortion_reset(struct effect *iface)
+ {
+     struct distortion *effect = impl_distortion_from_effect(iface);
++    float rate = effect->effect.format.nSamplesPerSec;
+ 
+-    if (IsEqualGUID(iid, &IID_IDirectSoundFXDistortion))
+-        return &effect->IDirectSoundFXDistortion_iface;
+-    return NULL;
++    biquad_lowpass(&effect->pre, rate, effect->params.fPreLowpassCutoff);
++    biquad_bandpass(&effect->post, rate, effect->params.fPostEQCenterFrequency, effect->params.fPostEQBandwidth);
++    biquad_reset(&effect->pre);
++    biquad_reset(&effect->post);
+ }
+ 
+-static void distortion_destroy(struct effect *iface)
++static void distortion_process(struct effect *iface, float *data, DWORD frames, unsigned int channels)
+ {
+     struct distortion *effect = impl_distortion_from_effect(iface);
++    float drive = 1.0f + effect->params.fEdge * 0.5f, gain = db_to_gain(effect->params.fGain), x;
++    float norm = 1.0f / tanhf(drive);
++    unsigned int c;
++    DWORD i;
+ 
+-    free(effect);
++    for (i = 0; i < frames; ++i)
++    {
++        for (c = 0; c < channels; ++c)
++        {
++            x = biquad_run(&effect->pre, c, data[i * channels + c]);
++            x = tanhf(x * drive) * norm;
++            data[i * channels + c] = biquad_run(&effect->post, c, x) * gain;
++        }
++    }
+ }
+ 
++static HRESULT distortion_create(IUnknown *outer, IUnknown **out);
++
+ static const struct effect_ops distortion_ops =
+ {
+     .destroy = distortion_destroy,
+     .query_interface = distortion_query_interface,
++    .create = distortion_create,
++    .params = distortion_params,
++    .params_size = sizeof(DSFXDistortion),
++    .param_info = distortion_param_info,
++    .param_count = ARRAY_SIZE(distortion_param_info),
++    .reset = distortion_reset,
++    .process = distortion_process,
+ };
+ 
+ static HRESULT distortion_create(IUnknown *outer, IUnknown **out)
+@@ -1426,63 +2677,195 @@ static HRESULT distortion_create(IUnknown *outer, IUnknown **out)
+         return E_OUTOFMEMORY;
+ 
+     effect_init(&object->effect, outer, &distortion_ops);
+-    object->IDirectSoundFXDistortion_iface.lpVtbl = &distortion_vtbl;
++    object->IDirectSoundFXDistortion_iface.lpVtbl = &distortion_params_vtbl;
++
++    object->params.fGain = -18.0f;
++    object->params.fEdge = 15.0f;
++    object->params.fPostEQCenterFrequency = 2400.0f;
++    object->params.fPostEQBandwidth = 2400.0f;
++    object->params.fPreLowpassCutoff = 8000.0f;
+ 
+     TRACE("Created distortion effect %p.\n", object);
+     *out = &object->effect.IUnknown_inner;
+     return S_OK;
+ }
+ 
+-struct gargle
++/* Compressor: a peak envelope over the look ahead (pre-delay) controls the gain
++ * reduction above the threshold. */
++
++struct compressor
+ {
+     struct effect effect;
+-    IDirectSoundFXGargle IDirectSoundFXGargle_iface;
++    IDirectSoundFXCompressor IDirectSoundFXCompressor_iface;
++    DSFXCompressor params;
++    struct delay_line line[2];
++    float envelope;
++};
++
++static const struct effect_param compressor_param_info[] =
++{
++    FLOAT_PARAM(DSFXCompressor, fGain, DSFXCOMPRESSOR_GAIN_MIN, DSFXCOMPRESSOR_GAIN_MAX, 0.0f, L"Gain", L"dB"),
++    FLOAT_PARAM(DSFXCompressor, fAttack, DSFXCOMPRESSOR_ATTACK_MIN, DSFXCOMPRESSOR_ATTACK_MAX, 10.0f, L"Attack", L"ms"),
++    FLOAT_PARAM(DSFXCompressor, fRelease, DSFXCOMPRESSOR_RELEASE_MIN, DSFXCOMPRESSOR_RELEASE_MAX, 200.0f, L"Release", L"ms"),
++    FLOAT_PARAM(DSFXCompressor, fThreshold, DSFXCOMPRESSOR_THRESHOLD_MIN, DSFXCOMPRESSOR_THRESHOLD_MAX, -20.0f,
++            L"Threshold", L"dB"),
++    FLOAT_PARAM(DSFXCompressor, fRatio, DSFXCOMPRESSOR_RATIO_MIN, DSFXCOMPRESSOR_RATIO_MAX, 3.0f, L"Ratio", L""),
++    FLOAT_PARAM(DSFXCompressor, fPredelay, DSFXCOMPRESSOR_PREDELAY_MIN, DSFXCOMPRESSOR_PREDELAY_MAX, 4.0f,
++            L"Predelay", L"ms"),
+ };
+ 
+-static inline struct gargle *impl_from_IDirectSoundFXGargle(IDirectSoundFXGargle *iface)
++DEFINE_FX_PARAMS_IFACE(compressor, IDirectSoundFXCompressor, struct compressor, DSFXCompressor)
++
++static const struct IDirectSoundFXCompressorVtbl compressor_params_vtbl =
++{
++    compressor_params_QueryInterface,
++    compressor_params_AddRef,
++    compressor_params_Release,
++    compressor_params_SetAllParameters,
++    compressor_params_GetAllParameters,
++};
++
++static struct compressor *impl_compressor_from_effect(struct effect *iface)
++{
++    return CONTAINING_RECORD(iface, struct compressor, effect);
++}
++
++static void *compressor_query_interface(struct effect *iface, REFIID iid)
+ {
+-    return CONTAINING_RECORD(iface, struct gargle, IDirectSoundFXGargle_iface);
++    struct compressor *effect = impl_compressor_from_effect(iface);
++
++    if (IsEqualGUID(iid, &IID_IDirectSoundFXCompressor))
++        return &effect->IDirectSoundFXCompressor_iface;
++    return NULL;
+ }
+ 
+-static HRESULT WINAPI gargle_QueryInterface(IDirectSoundFXGargle *iface, REFIID iid, void **out)
++static void compressor_destroy(struct effect *iface)
+ {
+-    struct gargle *effect = impl_from_IDirectSoundFXGargle(iface);
+-    return IUnknown_QueryInterface(effect->effect.outer_unk, iid, out);
++    struct compressor *effect = impl_compressor_from_effect(iface);
++
++    delay_line_free(&effect->line[0]);
++    delay_line_free(&effect->line[1]);
++    free(effect);
+ }
+ 
+-static ULONG WINAPI gargle_AddRef(IDirectSoundFXGargle *iface)
++static void *compressor_params(struct effect *iface)
+ {
+-    struct gargle *effect = impl_from_IDirectSoundFXGargle(iface);
+-    return IUnknown_AddRef(effect->effect.outer_unk);
++    return &impl_compressor_from_effect(iface)->params;
+ }
+ 
+-static ULONG WINAPI gargle_Release(IDirectSoundFXGargle *iface)
++static void compressor_reset(struct effect *iface)
+ {
+-    struct gargle *effect = impl_from_IDirectSoundFXGargle(iface);
+-    return IUnknown_Release(effect->effect.outer_unk);
++    struct compressor *effect = impl_compressor_from_effect(iface);
++    unsigned int size = DSFXCOMPRESSOR_PREDELAY_MAX * effect->effect.format.nSamplesPerSec / 1000 + 2;
++
++    delay_line_init(&effect->line[0], size);
++    delay_line_init(&effect->line[1], size);
++    effect->envelope = 0.0f;
+ }
+ 
+-static HRESULT WINAPI gargle_SetAllParameters(IDirectSoundFXGargle *iface, const DSFXGargle *params)
++static void compressor_process(struct effect *iface, float *data, DWORD frames, unsigned int channels)
+ {
+-    struct gargle *This = impl_from_IDirectSoundFXGargle(iface);
+-    FIXME("(%p) %p\n", This, params);
+-    return E_NOTIMPL;
++    struct compressor *effect = impl_compressor_from_effect(iface);
++    const DSFXCompressor *p = &effect->params;
++    float rate = effect->effect.format.nSamplesPerSec;
++    float attack = expf(-1.0f / (p->fAttack / 1000.0f * rate)), release = expf(-1.0f / (p->fRelease / 1000.0f * rate));
++    float delay = p->fPredelay * rate / 1000.0f, makeup = db_to_gain(p->fGain), peak, level, over, gain, x;
++    unsigned int c;
++    DWORD i;
++
++    for (i = 0; i < frames; ++i)
++    {
++        peak = 0.0f;
++        for (c = 0; c < channels; ++c)
++            peak = max(peak, fabsf(data[i * channels + c]));
++        if (peak > effect->envelope)
++            effect->envelope = attack * effect->envelope + (1.0f - attack) * peak;
++        else
++            effect->envelope = release * effect->envelope + (1.0f - release) * peak;
++
++        gain = makeup;
++        if (effect->envelope > 1e-6f)
++        {
++            level = 20.0f * log10f(effect->envelope);
++            if ((over = level - p->fThreshold) > 0.0f)
++                gain *= db_to_gain(-over * (1.0f - 1.0f / p->fRatio));
++        }
++
++        for (c = 0; c < channels; ++c)
++        {
++            x = data[i * channels + c];
++            delay_line_write(&effect->line[c], x);
++            /* the signal is delayed so the gain reacts ahead of peaks */
++            data[i * channels + c] = (delay >= 1.0f ? delay_line_read(&effect->line[c], delay) : x) * gain;
++        }
++    }
+ }
+ 
+-static HRESULT WINAPI gargle_GetAllParameters(IDirectSoundFXGargle *iface, DSFXGargle *params)
++static HRESULT compressor_create(IUnknown *outer, IUnknown **out);
++
++static const struct effect_ops compressor_ops =
++{
++    .destroy = compressor_destroy,
++    .query_interface = compressor_query_interface,
++    .create = compressor_create,
++    .params = compressor_params,
++    .params_size = sizeof(DSFXCompressor),
++    .param_info = compressor_param_info,
++    .param_count = ARRAY_SIZE(compressor_param_info),
++    .reset = compressor_reset,
++    .process = compressor_process,
++};
++
++static HRESULT compressor_create(IUnknown *outer, IUnknown **out)
+ {
+-    struct gargle *This = impl_from_IDirectSoundFXGargle(iface);
+-    FIXME("(%p) %p\n", This, params);
+-    return E_NOTIMPL;
++    struct compressor *object;
++
++    if (!(object = calloc(1, sizeof(*object))))
++        return E_OUTOFMEMORY;
++
++    effect_init(&object->effect, outer, &compressor_ops);
++    object->IDirectSoundFXCompressor_iface.lpVtbl = &compressor_params_vtbl;
++
++    object->params.fGain = 0.0f;
++    object->params.fAttack = 10.0f;
++    object->params.fRelease = 200.0f;
++    object->params.fThreshold = -20.0f;
++    object->params.fRatio = 3.0f;
++    object->params.fPredelay = 4.0f;
++
++    TRACE("Created compressor effect %p.\n", object);
++    *out = &object->effect.IUnknown_inner;
++    return S_OK;
+ }
+ 
+-static const struct IDirectSoundFXGargleVtbl gargle_vtbl =
++/* Gargle: amplitude modulation by a triangle or square wave. */
++
++struct gargle
++{
++    struct effect effect;
++    IDirectSoundFXGargle IDirectSoundFXGargle_iface;
++    DSFXGargle params;
++    double phase;
++};
++
++static const WCHAR gargle_wave_enums[] = L"Triangle\0Square\0";
++
++static const struct effect_param gargle_param_info[] =
++{
++    INT_PARAM(DSFXGargle, dwRateHz, MPT_INT, DSFXGARGLE_RATEHZ_MIN, DSFXGARGLE_RATEHZ_MAX, 20.0f, L"Rate", L"Hz", NULL),
++    INT_PARAM(DSFXGargle, dwWaveShape, MPT_ENUM, DSFXGARGLE_WAVE_TRIANGLE, DSFXGARGLE_WAVE_SQUARE,
++            DSFXGARGLE_WAVE_TRIANGLE, L"WaveShape", L"", gargle_wave_enums),
++};
++
++DEFINE_FX_PARAMS_IFACE(gargle, IDirectSoundFXGargle, struct gargle, DSFXGargle)
++
++static const struct IDirectSoundFXGargleVtbl gargle_params_vtbl =
+ {
+-    gargle_QueryInterface,
+-    gargle_AddRef,
+-    gargle_Release,
+-    gargle_SetAllParameters,
+-    gargle_GetAllParameters
++    gargle_params_QueryInterface,
++    gargle_params_AddRef,
++    gargle_params_Release,
++    gargle_params_SetAllParameters,
++    gargle_params_GetAllParameters,
+ };
+ 
+ static struct gargle *impl_gargle_from_effect(struct effect *iface)
+@@ -1500,16 +2883,55 @@ static void *gargle_query_interface(struct effect *iface, REFIID iid)
+ }
+ 
+ static void gargle_destroy(struct effect *iface)
++{
++    free(impl_gargle_from_effect(iface));
++}
++
++static void *gargle_params(struct effect *iface)
++{
++    return &impl_gargle_from_effect(iface)->params;
++}
++
++static void gargle_reset(struct effect *iface)
++{
++    impl_gargle_from_effect(iface)->phase = 0.0;
++}
++
++static void gargle_process(struct effect *iface, float *data, DWORD frames, unsigned int channels)
+ {
+     struct gargle *effect = impl_gargle_from_effect(iface);
++    double step = (double)effect->params.dwRateHz / effect->effect.format.nSamplesPerSec;
++    unsigned int c;
++    float level;
++    DWORD i;
+ 
+-    free(effect);
++    for (i = 0; i < frames; ++i)
++    {
++        if (effect->params.dwWaveShape == DSFXGARGLE_WAVE_SQUARE)
++            level = effect->phase < 0.5 ? 1.0f : 0.0f;
++        else
++            level = (lfo_value(effect->phase, TRUE) + 1.0f) / 2.0f;
++        for (c = 0; c < channels; ++c)
++            data[i * channels + c] *= level;
++        effect->phase += step;
++        if (effect->phase >= 1.0)
++            effect->phase -= floor(effect->phase);
++    }
+ }
+ 
++static HRESULT gargle_create(IUnknown *outer, IUnknown **out);
++
+ static const struct effect_ops gargle_ops =
+ {
+     .destroy = gargle_destroy,
+     .query_interface = gargle_query_interface,
++    .create = gargle_create,
++    .params = gargle_params,
++    .params_size = sizeof(DSFXGargle),
++    .param_info = gargle_param_info,
++    .param_count = ARRAY_SIZE(gargle_param_info),
++    .reset = gargle_reset,
++    .process = gargle_process,
+ };
+ 
+ static HRESULT gargle_create(IUnknown *outer, IUnknown **out)
+@@ -1520,7 +2942,10 @@ static HRESULT gargle_create(IUnknown *outer, IUnknown **out)
+         return E_OUTOFMEMORY;
+ 
+     effect_init(&object->effect, outer, &gargle_ops);
+-    object->IDirectSoundFXGargle_iface.lpVtbl = &gargle_vtbl;
++    object->IDirectSoundFXGargle_iface.lpVtbl = &gargle_params_vtbl;
++
++    object->params.dwRateHz = 20;
++    object->params.dwWaveShape = DSFXGARGLE_WAVE_TRIANGLE;
+ 
+     TRACE("Created gargle effect %p.\n", object);
+     *out = &object->effect.IUnknown_inner;
+@@ -1586,9 +3011,17 @@ static HRESULT WINAPI class_factory_CreateInstance(IClassFactory *iface,
+     return hr;
+ }
+ 
++static LONG server_locks;
++
+ static HRESULT WINAPI class_factory_LockServer(IClassFactory *iface, BOOL lock)
+ {
+-    FIXME("lock %d, stub!\n", lock);
++    TRACE("lock %d.\n", lock);
++
++    /* the factories are static, the count is only kept for the record */
++    if (lock)
++        InterlockedIncrement(&server_locks);
++    else
++        InterlockedDecrement(&server_locks);
+     return S_OK;
+ }
+ 
+@@ -1631,6 +3064,6 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **out)
+             return IClassFactory_QueryInterface(&class_factories[i].factory.IClassFactory_iface, iid, out);
+     }
+ 
+-    FIXME("%s not available, returning CLASS_E_CLASSNOTAVAILABLE.\n", debugstr_guid(clsid));
++    WARN("%s not available, returning CLASS_E_CLASSNOTAVAILABLE.\n", debugstr_guid(clsid));
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
+diff --git a/dlls/dsdmo/tests/dsdmo.c b/dlls/dsdmo/tests/dsdmo.c
+index 6b486f6..01c0b9e 100644
+--- a/dlls/dsdmo/tests/dsdmo.c
++++ b/dlls/dsdmo/tests/dsdmo.c
+@@ -313,7 +313,7 @@ static void test_chorus_parameters(void)
+         return;
+ 
+     hr = IDirectSoundFXChorus_GetAllParameters(chorus, &params);
+-    todo_wine ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+     if (hr != S_OK)
+         return;
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+@@ -341,7 +341,7 @@ static void test_compressor_parameters(void)
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+ 
+     hr = IDirectSoundFXCompressor_GetAllParameters(compressor, &params);
+-    todo_wine ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+     if (hr != S_OK)
+         return;
+     ok(params.fGain == 0.0f, "Got gain %.8e dB.\n", params.fGain);
+@@ -368,7 +368,7 @@ static void test_distortion_parameters(void)
+         return;
+ 
+     hr = IDirectSoundFXDistortion_GetAllParameters(distortion, &params);
+-    todo_wine ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+     if (hr != S_OK)
+         return;
+     ok(params.fGain == -18.0f, "Got gain %.8e dB.\n", params.fGain);
+@@ -395,7 +395,7 @@ static void test_echo_parameters(void)
+         return;
+ 
+     hr = IDirectSoundFXEcho_GetAllParameters(echo, &params);
+-    todo_wine ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+     if (hr != S_OK)
+         return;
+     ok(params.fWetDryMix == 50.0f, "Got %.8e%% wetness.\n", params.fWetDryMix);
+@@ -422,7 +422,7 @@ static void test_flanger_parameters(void)
+         return;
+ 
+     hr = IDirectSoundFXFlanger_GetAllParameters(flanger, &params);
+-    todo_wine ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+     if (hr != S_OK)
+         return;
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+@@ -451,7 +451,7 @@ static void test_gargle_parameters(void)
+         return;
+ 
+     hr = IDirectSoundFXGargle_GetAllParameters(gargle, &params);
+-    todo_wine ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
+     if (hr != S_OK)
+         return;
+     ok(params.dwRateHz == 20, "Got rate %lu Hz.\n", params.dwRateHz);
+@@ -480,10 +480,10 @@ static void test_eq_parameters(void)
+ 
+     params.fCenter = 79.0f;
+     hr = IDirectSoundFXParamEq_SetAllParameters(eq, &params);
+-    todo_wine ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+     params.fCenter = 16001.0f;
+     hr = IDirectSoundFXParamEq_SetAllParameters(eq, &params);
+-    todo_wine ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+     params.fCenter = 738.0f;
+     hr = IDirectSoundFXParamEq_SetAllParameters(eq, &params);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+@@ -527,10 +527,10 @@ static void test_reverb_parameters(void)
+ 
+     params.lRoom = -10001;
+     hr = IDirectSoundFXI3DL2Reverb_SetAllParameters(reverb, &params);
+-    todo_wine ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+     params.lRoom = 1;
+     hr = IDirectSoundFXI3DL2Reverb_SetAllParameters(reverb, &params);
+-    todo_wine ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
+     params.lRoom = -900;
+     hr = IDirectSoundFXI3DL2Reverb_SetAllParameters(reverb, &params);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
