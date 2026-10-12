@@ -66,4 +66,37 @@ echo "== no invented identity strings"
 run 'wmic baseboard get Version /format:list'
 check "baseboard version is not the made-up 1.0 unless the board says so" \
   "$(v=$(sed -n 's/^Version=//p' "$T/o"); [ "$v" = "$(cat /sys/class/dmi/id/board_version 2>/dev/null)" ]; echo $?)"
+echo "== ipconfig /all"
+run 'ipconfig /all'
+if grep -q 'IPv4 address' "$T/o"; then
+    check "subnet mask follows an IPv4 address" "$(grep -q 'Subnet mask [. ]*: [0-9]*\.[0-9]*\.[0-9]*\.[0-9]*' "$T/o"; echo $?)"
+fi
+check "usage lists the options" "$(run 'ipconfig /?'; grep -q 'flushdns' "$T/o"; echo $?)"
+
+echo "== attrib"
+run 'mkdir c:\at\sub & echo x> c:\at\a.txt & echo x> c:\at\sub\b.txt & cd /d c:\at & attrib +r +h a.txt & attrib a.txt'
+check "+r +h both applied" "$(grep -q '^A   HR  *c:.at.a.txt' "$T/o"; echo $?)"
+run 'cd /d c:\at & attrib +a a.txt'
+check "changing a hidden file needs -h" "$(grep -q 'Not resetting hidden file' "$T/o"; echo $?)"
+run 'cd /d c:\at & attrib -h -r a.txt & attrib /s /d +a *.txt & attrib /s *.txt'
+check "/s reaches the subfolder" "$(grep -q 'at.sub.b.txt' "$T/o"; echo $?)"
+run 'attrib /x'
+check "invalid switch" "$(grep -q 'Invalid switch - /x' "$T/o"; echo $?)"
+run 'cd /d c:\at & attrib nothere.txt'
+check "file not found text" "$(grep -q 'File not found - nothere.txt' "$T/o"; echo $?)"
+
+echo "== xcopy /v /o /z"
+run 'mkdir c:\xs & echo hello> c:\xs\a.txt & xcopy /v /o /z /i /y c:\xs c:\xd & type c:\xd\a.txt'
+check "copied and verified" "$(grep -q '^hello' "$T/o" && grep -q '1 file(s) copied' "$T/o"; echo $?)"
+
+echo "== icacls /restore"
+run 'mkdir c:\ic & echo x> c:\ic\a.txt & cd /d c:\ic & icacls a.txt /save c:\ic.sav /q & icacls a.txt /grant Everyone:F /q & icacls c:\ic /restore c:\ic.sav & icacls a.txt'
+check "restore reports the file" "$(grep -q 'processed file: c:.ic.a.txt' "$T/o"; echo $?)"
+check "the grant is gone again" "$(awk '/processed file/{f=1} f' "$T/o" | grep -q 'Everyone:(RX)'; echo $?)"
+
+echo "== tasklist /fi modules, NetUserGetLocalGroups"
+run 'tasklist /fi "modules eq shell32.dll" /nh /fo csv'
+check "processes with shell32" "$(grep -q '^"cmd.exe"' "$T/o"; echo $?)"
+run "net user $me"
+check "net user shows local group memberships" "$(grep -q 'Local Group Memberships .*\*Users' "$T/o"; echo $?)"
 exit $RC
