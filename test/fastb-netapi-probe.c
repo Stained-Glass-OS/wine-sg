@@ -107,6 +107,45 @@ int main(void)
         ret = DsGetDcNameA(NULL, NULL, NULL, NULL, 0, NULL);
         check(ret == ERROR_INVALID_PARAMETER, "DsGetDcNameA argument check");
     }
+    {
+        DWORD type = 99;
+        WCHAR dev[] = L"C:\\data", host[] = L"\\\\other-host";
+
+        buf = (BYTE *)1; read = 99; total = 99;
+        ret = NetConnectionEnum(NULL, (LPWSTR)L"share", 1, &buf, MAX_PREFERRED_LENGTH, &read, &total, NULL);
+        check(ret == NERR_Success && read == 0 && total == 0 && buf == NULL, "NetConnectionEnum is empty");
+        ret = NetConnectionEnum(NULL, NULL, 1, &buf, MAX_PREFERRED_LENGTH, &read, &total, NULL);
+        check(ret == ERROR_INVALID_PARAMETER, "NetConnectionEnum needs a qualifier");
+        ret = NetConnectionEnum(NULL, (LPWSTR)L"share", 5, &buf, MAX_PREFERRED_LENGTH, &read, &total, NULL);
+        check(ret == ERROR_INVALID_LEVEL, "NetConnectionEnum level check");
+        ret = NetFileClose(NULL, 1);
+        check(ret == NERR_FileIdNotFound, "NetFileClose of an unknown id");
+        ret = NetFileGetInfo(NULL, 1, 3, &buf);
+        check(ret == NERR_FileIdNotFound, "NetFileGetInfo of an unknown id");
+        ret = NetFileGetInfo(NULL, 1, 7, &buf);
+        check(ret == ERROR_INVALID_LEVEL, "NetFileGetInfo level check");
+        ret = NetSessionDel(NULL, (LPWSTR)L"\\\\client", NULL);
+        check(ret == NERR_ClientNameNotFound, "NetSessionDel of an unknown session");
+        ret = NetSessionGetInfo(NULL, (LPWSTR)L"\\\\client", (LPWSTR)L"user", 10, &buf);
+        check(ret == NERR_ClientNameNotFound, "NetSessionGetInfo of an unknown session");
+        ret = NetSessionGetInfo(NULL, (LPWSTR)L"\\\\client", (LPWSTR)L"user", 99, &buf);
+        check(ret == ERROR_INVALID_LEVEL, "NetSessionGetInfo level check");
+        ret = NetShareCheck(NULL, dev, &type);
+        check(ret == NERR_DeviceNotShared, "NetShareCheck of an unshared device");
+        ret = NetShareCheck(NULL, NULL, &type);
+        check(ret == ERROR_INVALID_PARAMETER, "NetShareCheck needs a device");
+        ret = NetShareSetInfo(NULL, (LPWSTR)L"nosuch", 1004, (LPBYTE)&buf, NULL);
+        check(ret == NERR_NetNameNotFound, "NetShareSetInfo of an unknown share");
+        buf = (BYTE *)1; read = 99; total = 99;
+        ret = NetShareEnumSticky(NULL, 502, &buf, MAX_PREFERRED_LENGTH, &read, &total, NULL);
+        check(ret == NERR_Success && read == 0 && total == 0, "NetShareEnumSticky is empty");
+        ret = NetShareEnumSticky(NULL, 1, &buf, MAX_PREFERRED_LENGTH, &read, &total, NULL);
+        check(ret == ERROR_INVALID_LEVEL, "NetShareEnumSticky level check");
+        ret = NetShareDelSticky(NULL, (LPWSTR)L"nosuch", 0);
+        check(ret == NERR_NetNameNotFound, "NetShareDelSticky of an unknown share");
+        ret = NetFileClose(host, 1);
+        check(ret == ERROR_NOT_SUPPORTED, "a remote computer is not supported");
+    }
     printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
     return failures != 0;
 }

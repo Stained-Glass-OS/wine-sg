@@ -227,6 +227,44 @@ static void test_gif_blocks(void)
             check(hr == S_OK && qwriter, "query writer from a decoder's query reader");
             if (qwriter) IWICMetadataQueryWriter_Release(qwriter);
             IWICComponentFactory_Release(cf);
+            {
+                IEnumString *es = NULL, *clone = NULL;
+                LPOLESTR str;
+                UINT seen = 0, resolved = 0;
+
+                hr = IWICMetadataQueryReader_GetEnumerator(qreader, &es);
+                check(hr == S_OK && es, "query reader GetEnumerator");
+                if (es)
+                {
+                    while (IEnumString_Next(es, 1, &str, NULL) == S_OK)
+                    {
+                        PROPVARIANT pv;
+
+                        printf("  query: %ls\n", str);
+                        PropVariantInit(&pv);
+                        seen++;
+                        if (str[0] == '/' && IWICMetadataQueryReader_GetMetadataByName(qreader, str, &pv) == S_OK)
+                            resolved++;
+                        PropVariantClear(&pv);
+                        CoTaskMemFree(str);
+                    }
+                    check(seen && seen >= count, "enumerator lists the readers of the frame");
+                    check(resolved == seen, "every enumerated query resolves");
+                    IEnumString_Reset(es);
+                    hr = IEnumString_Clone(es, &clone);
+                    check(hr == S_OK && clone, "Clone");
+                    if (clone)
+                    {
+                        UINT again = 0;
+                        while (IEnumString_Next(clone, 1, &str, NULL) == S_OK) { again++; CoTaskMemFree(str); }
+                        check(again == seen, "clone enumerates the same list");
+                        IEnumString_Release(clone);
+                    }
+                    hr = IEnumString_Skip(es, seen + 1);
+                    check(hr == S_FALSE, "Skip past the end");
+                    IEnumString_Release(es);
+                }
+            }
             IWICMetadataQueryReader_Release(qreader);
         }
     }
