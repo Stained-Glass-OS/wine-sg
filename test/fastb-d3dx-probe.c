@@ -234,6 +234,63 @@ static void test_normal_map(void)
                 joined->lpVtbl->Release(joined);
             }
 
+
+            /* save to an .x file and load it back */
+            {
+                D3DXMATERIAL mat;
+                ID3DXMesh *loaded = NULL;
+                ID3DXBuffer *mats = NULL;
+                DWORD nmat = 0;
+                char path[MAX_PATH];
+
+                memset(&mat, 0, sizeof(mat));
+                mat.MatD3D.Diffuse.r = 0.25f; mat.MatD3D.Diffuse.g = 0.5f; mat.MatD3D.Diffuse.b = 0.75f; mat.MatD3D.Diffuse.a = 1.0f;
+                mat.pTextureFilename = (char *)"wall.bmp";
+                GetTempPathA(sizeof(path), path);
+                lstrcatA(path, "fastb-quad.x");
+                hr = D3DXSaveMeshToXA(path, quad, NULL, &mat, NULL, 1, D3DXF_FILEFORMAT_TEXT);
+                check(hr == S_OK, "D3DXSaveMeshToXA");
+                hr = D3DXLoadMeshFromXA(path, D3DXMESH_SYSTEMMEM, device, NULL, &mats, NULL, &nmat, &loaded);
+                check(hr == S_OK && loaded, "the saved file loads");
+                if (loaded)
+                {
+                    float *lv = NULL;
+                    D3DVERTEXELEMENT9 ld[MAX_FVF_DECL_SIZE];
+                    int has_normal = 0, has_tex = 0, e;
+
+                    check(loaded->lpVtbl->GetNumFaces(loaded) == 2, "two faces");
+                    check(loaded->lpVtbl->GetNumVertices(loaded) == 4, "four vertices");
+                    loaded->lpVtbl->GetDeclaration(loaded, ld);
+                    for (e = 0; ld[e].Stream != 0xff; e++)
+                    {
+                        if (ld[e].Usage == D3DDECLUSAGE_NORMAL) has_normal = 1;
+                        if (ld[e].Usage == D3DDECLUSAGE_TEXCOORD) has_tex = 1;
+                    }
+                    check(has_normal && has_tex, "normals and texture coordinates came back");
+                    loaded->lpVtbl->LockVertexBuffer(loaded, D3DLOCK_READONLY, (void **)&lv);
+                    if (lv)
+                    {
+                        UINT st = loaded->lpVtbl->GetNumBytesPerVertex(loaded) / 4, found = 0;
+                        for (k = 0; k < 4; k++)
+                            if (fabsf(lv[k * st] - 1.0f) < 1e-4 && fabsf(lv[k * st + 1] - 1.0f) < 1e-4) found = 1;
+                        check(found, "the vertex (1,1,0) is there");
+                    }
+                    loaded->lpVtbl->UnlockVertexBuffer(loaded);
+                    loaded->lpVtbl->Release(loaded);
+                }
+                check(nmat == 1 && mats, "one material");
+                if (mats && nmat == 1)
+                {
+                    D3DXMATERIAL *lm = ID3DXBuffer_GetBufferPointer(mats);
+                    check(lm->pTextureFilename && !strcmp(lm->pTextureFilename, "wall.bmp"), "the texture name");
+                    check(fabsf(lm->MatD3D.Diffuse.g - 0.5f) < 1e-3, "the diffuse colour");
+                }
+                if (mats) ID3DXBuffer_Release(mats);
+                DeleteFileA(path);
+                hr = D3DXSaveMeshToXA(path, quad, NULL, NULL, NULL, 0, 9);
+                check(hr == D3DERR_INVALIDCALL, "bad format");
+            }
+
             /* the copy path: ask for tangent and binormal on a mesh that has none */
             {
                 ID3DXMesh *plain = NULL;
