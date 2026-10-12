@@ -64,6 +64,35 @@ int main(void)
     body = strstr(resp, "\r\n\r\n");
     CHECK(body && total - (body + 4 - resp) == 4990 && !memcmp(body + 4, text + 10, 4990), "file body, total %d", total);
 
+    /* binding follows the URL host: localhost is loopback only, "+" and "*" are all interfaces,
+     * an IP address is that address. A bind to 127.0.0.2 tells the three apart. */
+    {
+        static const struct { const WCHAR *url; int port; int other_free; } cases[] =
+        {
+            { L"http://localhost:50240/", 50240, 1 },
+            { L"http://+:50241/", 50241, 0 },
+            { L"http://*:50242/", 50242, 0 },
+            { L"http://127.0.0.1:50243/", 50243, 1 },
+            { L"http://127.0.0.3:50244/", 50244, 1 },
+        };
+        int k;
+
+        for (k = 0; k < 5; k++)
+        {
+            struct sockaddr_in other = {.sin_family = AF_INET, .sin_port = htons(cases[k].port)};
+            SOCKET t = socket(AF_INET, SOCK_STREAM, 0);
+            int bound;
+
+            ret = HttpAddUrl(queue, cases[k].url, NULL);
+            CHECK(ret == 0, "addurl %ls: %lu", cases[k].url, ret);
+            other.sin_addr.s_addr = inet_addr("127.0.0.2");
+            bound = bind(t, (struct sockaddr *)&other, sizeof(other)) == 0;
+            CHECK(bound == cases[k].other_free, "%ls: bind to 127.0.0.2 gave %d", cases[k].url, bound);
+            closesocket(t);
+            HttpRemoveUrl(queue, cases[k].url);
+        }
+    }
+
     /* extra URLs in the service configuration store */
     {
         struct { WCHAR *prefix; WCHAR *sddl; } set = {L"http://+:50234/probe/", L"D:(A;;GX;;;WD)"};
