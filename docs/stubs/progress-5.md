@@ -90,3 +90,8 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4506 concrt140/msvcp: concurrent_queue _Internal_swap, _IsNonBlockingThread, _ExceptionHolder::ReportUnhandledError. Gate + 2 mutants.
 - 4507 msvcp100..140: error_category default_error_condition/equivalent (were stubs: every error_code == errc comparison was false; msvcp140 system errors now map to generic conditions). Gate (categories inside thrown system_error objects) + mutant.
 - Runtime suites before this push: same as before (only msvcp140 filesystem, pre-existing).
+- 4508 (fast) msvcm80/90 forwards to msvcp80/90; msvcp70 complex/string/misc exports from the msvcp90 sources; _LCosh/_LSinh; _Throw_Cpp_error from msvcp110. Smoke gate test/msvcp-old-exports-gate.sh.
+- 4509 msvcp70..140, msvcp_win, msvcp120_app: time_get<unsigned short> (own vtable, RTTI, ctors, _Getcat) and time_base. Gate + mutant.
+- 4510 msvcrt family, crtdll, ucrtbase: _ismbbkalnum/_ismbbkana/_ismbbkprint/_ismbbkpunct/_ismbbalnum/_ismbbalpha/_ismbbgraph/_ismbbprint/_ismbbpunct/_ismbbblank (+_l) and _ismbcblank (+_l). Gate (cp 932 and 1252 tables) + mutant.
+- 4511 msvcrt family, ucrtbase: _strset_s, __wcsncnt, _strerror_s, _umask_s, _lsearch_s, _mbsncoll/_mbsnicoll (+_l), _mbsninc_l, _mbsstr_l, _mbstrnlen (+_l), _mbsset_s, _mbsnset_s, _mbsnbset_s, _mbsncat_s (+_l). Gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
