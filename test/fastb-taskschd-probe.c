@@ -110,6 +110,18 @@ int main(void)
     HRESULT hr;
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    {
+        HRESULT (WINAPI *get_version)(void *) = (void *)GetProcAddress(LoadLibraryA("taskschd.dll"), "DllGetVersion");
+        DWORD info[5] = { 20, 0, 0, 0, 0 };
+
+        check(get_version != NULL, "DllGetVersion is exported");
+        if (get_version)
+        {
+            check(get_version(info) == S_OK && info[1] == 10 && info[3] != 0, "DllGetVersion fills the structure");
+            info[0] = 7;
+            check(get_version(info) == E_INVALIDARG, "DllGetVersion size check");
+        }
+    }
     hr = CoCreateInstance(&CLSID_TaskScheduler_, NULL, CLSCTX_INPROC_SERVER, &IID_IDispatch, (void **)&service);
     if (FAILED(hr)) { printf("FAIL  no task service %lx\n", hr); printf("RESULT: FAIL\n"); return 1; }
     V_VT(&args[0]) = VT_I4; V_I4(&args[0]) = 0;
