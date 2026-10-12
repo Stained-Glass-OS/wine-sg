@@ -1,0 +1,2107 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] diasymreader: SymWriter writes PDB files (3554)
+
+diasymreader: SymWriter writes real PDB files
+
+The symbol writer keeps documents (url, checksum, embedded source), methods with sequence points, scopes,
+locals, parameters, constants and namespace usings, and on Close/Commit writes an MSF 7.00 PDB to the
+file or IStream given to Initialize/Initialize2/IPdbWriter::SetPath: PDB info stream with GUID/age and
+named stream map, empty TPI/IPI, DBI with one module, a /names table, a module stream with managed
+procedure, block, slot, constant and namespace records plus C13 line and file checksum subsections.
+State errors (no open method/scope/namespace) return E_UNEXPECTED, bad arguments E_INVALIDARG.
+GetDebugInfo fills TimeDateStamp; Initialize2 records the final path; Abort drops the file.
+---
+--- a/dlls/diasymreader/Makefile.in
++++ b/dlls/diasymreader/Makefile.in
+@@ -7,4 +7,5 @@
+ 	diasymreader.idl \
+ 	diasymreader.rc \
+ 	main.c \
++	pdbfile.c \
+ 	writer.c
+--- a/dlls/diasymreader/diasymreader_private.h
++++ b/dlls/diasymreader/diasymreader_private.h
+@@ -22,3 +22,43 @@
+ #include "diasymreader.h"
+ 
+ HRESULT SymWriter_CreateInstance(REFIID iid, void **ppv);
++
++/* pdbfile.c: growable byte buffer and PDB (MSF) file builder */
++struct buf
++{
++    BYTE *data;
++    DWORD size, cap;
++    BOOL fail;
++};
++
++struct names_table
++{
++    struct buf strings;
++    DWORD *offsets;
++    DWORD count;
++};
++
++struct named_stream
++{
++    const char *name;
++    DWORD index;
++};
++
++BOOL buf_reserve(struct buf *b, DWORD extra);
++void buf_put(struct buf *b, const void *data, DWORD len);
++void buf_u8(struct buf *b, BYTE v);
++void buf_u16(struct buf *b, WORD v);
++void buf_u32(struct buf *b, DWORD v);
++void buf_u64(struct buf *b, UINT64 v);
++void buf_cstr(struct buf *b, const char *s);
++void buf_align4(struct buf *b);
++void buf_patch32(struct buf *b, DWORD pos, DWORD v);
++void buf_free(struct buf *b);
++DWORD pdb_hash_v1(const BYTE *s, DWORD len);
++void names_init(struct names_table *t);
++DWORD names_add(struct names_table *t, const char *s);
++void names_serialize(const struct names_table *t, struct buf *out);
++void names_free(struct names_table *t);
++void pdb_build_info(struct buf *out, DWORD timestamp, DWORD age, const GUID *guid,
++                    const struct named_stream *named, DWORD count);
++HRESULT msf_build(const struct buf *streams, DWORD count, struct buf *out);
+--- /dev/null
++++ b/dlls/diasymreader/pdbfile.c
+@@ -0,0 +1,291 @@
++/*
++ * Program database (PDB, MSF 7.00 container) file builder for the symbol writer
++ *
++ * Written from the publicly documented MSF/PDB file layout.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <string.h>
++#include <stdlib.h>
++
++#include "windef.h"
++#include "winbase.h"
++
++#include "diasymreader_private.h"
++
++#define MSF_BLOCK_SIZE 4096
++#define MSF_MAX_BLOCKS 4096   /* one free-block-map interval */
++
++static const char msf_magic[32] = "Microsoft C/C++ MSF 7.00\r\n\x1a" "DS\0\0\0";
++
++BOOL buf_reserve(struct buf *b, DWORD extra)
++{
++    BYTE *p;
++    DWORD cap;
++
++    if (b->fail) return FALSE;
++    if (b->size + extra < b->size) { b->fail = TRUE; return FALSE; }
++    if (b->size + extra <= b->cap) return TRUE;
++    cap = max(b->cap * 2, max(b->size + extra, 256));
++    p = realloc(b->data, cap);
++    if (!p) { b->fail = TRUE; return FALSE; }
++    b->data = p;
++    b->cap = cap;
++    return TRUE;
++}
++
++void buf_put(struct buf *b, const void *data, DWORD len)
++{
++    if (!len || !buf_reserve(b, len)) return;
++    if (data) memcpy(b->data + b->size, data, len);
++    else memset(b->data + b->size, 0, len);
++    b->size += len;
++}
++
++void buf_u8(struct buf *b, BYTE v)    { buf_put(b, &v, 1); }
++void buf_u16(struct buf *b, WORD v)   { buf_put(b, &v, 2); }
++void buf_u32(struct buf *b, DWORD v)  { buf_put(b, &v, 4); }
++void buf_u64(struct buf *b, UINT64 v) { buf_put(b, &v, 8); }
++
++void buf_cstr(struct buf *b, const char *s)
++{
++    buf_put(b, s, strlen(s) + 1);
++}
++
++void buf_align4(struct buf *b)
++{
++    static const BYTE zero[4];
++    if (b->size & 3) buf_put(b, zero, 4 - (b->size & 3));
++}
++
++void buf_patch32(struct buf *b, DWORD pos, DWORD v)
++{
++    if (!b->fail && pos + 4 <= b->size) memcpy(b->data + pos, &v, 4);
++}
++
++void buf_free(struct buf *b)
++{
++    free(b->data);
++    memset(b, 0, sizeof(*b));
++}
++
++/* The "version 1" string hash used by PDB name tables and the named stream map. */
++DWORD pdb_hash_v1(const BYTE *s, DWORD len)
++{
++    DWORD result = 0, i;
++
++    for (i = 0; i + 4 <= len; i += 4)
++    {
++        DWORD v;
++        memcpy(&v, s + i, 4);
++        result ^= v;
++    }
++    if (len - i >= 2)
++    {
++        WORD v;
++        memcpy(&v, s + i, 2);
++        result ^= v;
++        i += 2;
++    }
++    if (i < len) result ^= s[i];
++    result |= 0x20202020;
++    result ^= result >> 11;
++    return result ^ (result >> 16);
++}
++
++/* Build a "/names" string table.  Offsets of the added strings are those
++ * returned by names_add. */
++void names_init(struct names_table *t)
++{
++    memset(t, 0, sizeof(*t));
++    buf_u8(&t->strings, 0);   /* offset 0 is the empty string */
++}
++
++DWORD names_add(struct names_table *t, const char *s)
++{
++    DWORD i, off;
++
++    /* identical strings share one entry */
++    for (i = 0; i < t->count; i++)
++        if (!strcmp((const char *)t->strings.data + t->offsets[i], s)) return t->offsets[i];
++
++    if (!(t->count % 16))
++    {
++        DWORD *p = realloc(t->offsets, (t->count + 16) * sizeof(*p));
++        if (!p) { t->strings.fail = TRUE; return 0; }
++        t->offsets = p;
++    }
++    off = t->strings.size;
++    buf_cstr(&t->strings, s);
++    t->offsets[t->count++] = off;
++    return off;
++}
++
++void names_serialize(const struct names_table *t, struct buf *out)
++{
++    DWORD buckets, i, *table;
++
++    buckets = t->count * 2 + 1;
++    table = calloc(buckets, sizeof(*table));
++    if (!table) { out->fail = TRUE; return; }
++    for (i = 0; i < t->count; i++)
++    {
++        const char *s = (const char *)t->strings.data + t->offsets[i];
++        DWORD h = pdb_hash_v1((const BYTE *)s, strlen(s)) % buckets;
++        while (table[h]) h = (h + 1) % buckets;
++        table[h] = t->offsets[i];
++    }
++    buf_u32(out, 0xeffeeffe);
++    buf_u32(out, 1);
++    buf_u32(out, t->strings.size);
++    buf_put(out, t->strings.data, t->strings.size);
++    buf_u32(out, buckets);
++    buf_put(out, table, buckets * sizeof(*table));
++    buf_u32(out, t->count);
++    free(table);
++}
++
++void names_free(struct names_table *t)
++{
++    buf_free(&t->strings);
++    free(t->offsets);
++    memset(t, 0, sizeof(*t));
++}
++
++/* PDB info stream (stream 1) with the named stream map. */
++void pdb_build_info(struct buf *out, DWORD timestamp, DWORD age, const GUID *guid,
++                    const struct named_stream *named, DWORD count)
++{
++    struct buf strs = {0};
++    DWORD *offs, i, capacity, words, *keys, *vals, *present;
++
++    offs = calloc(max(count, 1), sizeof(*offs));
++    capacity = count * 3 / 2 + 1;
++    keys = calloc(capacity, sizeof(*keys));
++    vals = calloc(capacity, sizeof(*vals));
++    words = (capacity + 31) / 32;
++    present = calloc(words, sizeof(*present));
++    if (!offs || !keys || !vals || !present) { out->fail = TRUE; goto done; }
++
++    for (i = 0; i < count; i++)
++    {
++        offs[i] = strs.size;
++        buf_cstr(&strs, named[i].name);
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        DWORD h = pdb_hash_v1((const BYTE *)named[i].name, strlen(named[i].name)) % capacity;
++        while (present[h / 32] & (1u << (h % 32))) h = (h + 1) % capacity;
++        present[h / 32] |= 1u << (h % 32);
++        keys[h] = offs[i];
++        vals[h] = named[i].index;
++    }
++
++    buf_u32(out, 20000404);       /* VC70 */
++    buf_u32(out, timestamp);
++    buf_u32(out, age);
++    buf_put(out, guid, sizeof(*guid));
++    buf_u32(out, strs.size);
++    buf_put(out, strs.data, strs.size);
++    buf_u32(out, count);
++    buf_u32(out, capacity);
++    buf_u32(out, words);
++    buf_put(out, present, words * sizeof(*present));
++    buf_u32(out, 0);              /* no deleted entries */
++    for (i = 0; i < capacity; i++)
++    {
++        if (!(present[i / 32] & (1u << (i % 32)))) continue;
++        buf_u32(out, keys[i]);
++        buf_u32(out, vals[i]);
++    }
++    buf_u32(out, 0);              /* niMax */
++    buf_u32(out, 20140508);       /* feature: VC140 */
++
++done:
++    buf_free(&strs);
++    free(offs);
++    free(keys);
++    free(vals);
++    free(present);
++}
++
++/* Assemble the streams into an MSF container. */
++HRESULT msf_build(const struct buf *streams, DWORD count, struct buf *out)
++{
++    DWORD i, data_blocks = 0, dir_bytes, dir_blocks, num_blocks, block, j, fpm_bytes;
++    struct buf dir = {0};
++    BYTE *file;
++    DWORD next;
++
++    for (i = 0; i < count; i++)
++    {
++        if (streams[i].fail) return E_OUTOFMEMORY;
++        data_blocks += (streams[i].size + MSF_BLOCK_SIZE - 1) / MSF_BLOCK_SIZE;
++    }
++    dir_bytes = 4 + count * 4 + data_blocks * 4;
++    dir_blocks = (dir_bytes + MSF_BLOCK_SIZE - 1) / MSF_BLOCK_SIZE;
++    if (dir_blocks > MSF_BLOCK_SIZE / 4) return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
++    num_blocks = 4 + dir_blocks + data_blocks;
++    if (num_blocks > MSF_MAX_BLOCKS) return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
++
++    file = calloc(num_blocks, MSF_BLOCK_SIZE);
++    if (!file) return E_OUTOFMEMORY;
++
++    /* directory */
++    buf_u32(&dir, count);
++    for (i = 0; i < count; i++) buf_u32(&dir, streams[i].size);
++    next = 4 + dir_blocks;
++    for (i = 0; i < count; i++)
++    {
++        DWORD n = (streams[i].size + MSF_BLOCK_SIZE - 1) / MSF_BLOCK_SIZE;
++        for (j = 0; j < n; j++)
++        {
++            buf_u32(&dir, next);
++            memcpy(file + (size_t)next * MSF_BLOCK_SIZE + 0, streams[i].data + (size_t)j * MSF_BLOCK_SIZE,
++                   min(MSF_BLOCK_SIZE, streams[i].size - j * MSF_BLOCK_SIZE));
++            next++;
++        }
++    }
++    if (dir.fail) { free(file); return E_OUTOFMEMORY; }
++    memcpy(file + 4 * MSF_BLOCK_SIZE, dir.data, dir.size);
++    /* block map: the directory blocks */
++    for (i = 0; i < dir_blocks; i++)
++    {
++        DWORD v = 4 + i;
++        memcpy(file + 3 * MSF_BLOCK_SIZE + i * 4, &v, 4);
++    }
++    /* free block map: bit set = free */
++    fpm_bytes = MSF_BLOCK_SIZE;
++    memset(file + 1 * MSF_BLOCK_SIZE, 0xff, fpm_bytes);
++    for (block = 0; block < num_blocks; block++)
++        file[1 * MSF_BLOCK_SIZE + block / 8] &= ~(1u << (block % 8));
++    memcpy(file + 2 * MSF_BLOCK_SIZE, file + 1 * MSF_BLOCK_SIZE, fpm_bytes);
++    /* super block */
++    memcpy(file, msf_magic, 32);
++    ((DWORD *)(file + 32))[0] = MSF_BLOCK_SIZE;
++    ((DWORD *)(file + 32))[1] = 1;            /* free block map block */
++    ((DWORD *)(file + 32))[2] = num_blocks;
++    ((DWORD *)(file + 32))[3] = dir_bytes;
++    ((DWORD *)(file + 32))[4] = 0;
++    ((DWORD *)(file + 32))[5] = 3;            /* block map address */
++
++    buf_free(&dir);
++    out->data = file;
++    out->size = out->cap = num_blocks * MSF_BLOCK_SIZE;
++    return S_OK;
++}
+--- a/dlls/diasymreader/writer.c
++++ b/dlls/diasymreader/writer.c
+@@ -33,6 +33,83 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(diasymreader);
+ 
++/* symbol record kinds not in mscvpdb.h */
++#define SW_S_END         0x0006
++#define SW_S_BLOCK32     0x1103
++#define SW_S_MANSLOT     0x1120
++#define SW_S_UNAMESPACE  0x1124
++#define SW_S_GMANPROC    0x112a
++#define SW_S_MANCONSTANT 0x112d
++
++#define SW_DEBUG_S_LINES      0xf2
++#define SW_DEBUG_S_FILECHKSMS 0xf4
++
++#define SW_LF_CHAR      0x8000
++#define SW_LF_SHORT     0x8001
++#define SW_LF_USHORT    0x8002
++#define SW_LF_LONG      0x8003
++#define SW_LF_ULONG     0x8004
++#define SW_LF_REAL32    0x8005
++#define SW_LF_REAL64    0x8006
++#define SW_LF_QUADWORD  0x8009
++#define SW_LF_UQUADWORD 0x800a
++#define SW_LF_VARSTRING 0x8010
++
++static const GUID guid_md5    = {0x406ea660,0x64cf,0x4c82,{0xb6,0xf0,0x42,0xd4,0x81,0x72,0xa7,0x99}};
++static const GUID guid_sha1   = {0xff1816ec,0xaa5e,0x4d10,{0x87,0xf7,0x6f,0x49,0x63,0x83,0x34,0x60}};
++static const GUID guid_sha256 = {0x8829d00f,0x11b8,0x4213,{0x87,0x8b,0x77,0x0e,0x85,0x97,0xac,0x16}};
++
++typedef struct SymDocumentWriter {
++    ISymUnmanagedDocumentWriter iface;
++    LONG ref;
++    WCHAR *url;
++    GUID language, vendor, type;
++    GUID algorithm;
++    BYTE *checksum;
++    DWORD checksum_size;
++    BYTE *source;
++    DWORD source_size;
++} SymDocumentWriter;
++
++struct sw_point { ULONG32 offset, line, column, end_line, end_column; };
++
++struct sw_lines {
++    SymDocumentWriter *doc;
++    struct sw_point *points;
++    DWORD count, cap;
++};
++
++struct sw_scope { LONG parent; ULONG32 start, end; BOOL closed; };
++
++struct sw_var {
++    WCHAR *name;
++    DWORD attributes, addr_kind, addr1, addr2, addr3, start, end, sig_token, sequence;
++    LONG scope;
++    BOOL param;
++};
++
++struct sw_const {
++    WCHAR *name;
++    BYTE *leaf;
++    DWORD leaf_size, sig_token;
++    LONG scope;
++};
++
++struct sw_using { WCHAR *name; LONG scope; };
++
++struct sw_method {
++    DWORD token;
++    DWORD section, offset;
++    struct sw_lines *lines; DWORD lines_count, lines_cap;
++    struct sw_scope *scopes; DWORD scopes_count, scopes_cap;
++    struct sw_var *vars; DWORD vars_count, vars_cap;
++    struct sw_const *consts; DWORD consts_count, consts_cap;
++    struct sw_using *usings; DWORD usings_count, usings_cap;
++};
++
++struct sw_attr { DWORD parent; WCHAR *name; BYTE *data; DWORD size; };
++struct sw_remap { DWORD old_token, new_token; };
++
+ typedef struct SymWriter {
+     ISymUnmanagedWriter5 iface;
+     IPdbWriter IPdbWriter_iface;
+@@ -41,14 +118,24 @@
+     GUID pdb_guid;
+     DWORD pdb_timestamp;
+     DWORD pdb_age;
+-    WCHAR pdb_filename[MAX_PATH];
++    WCHAR pdb_filename[MAX_PATH];  /* the path recorded in the debug directory */
++    WCHAR write_filename[MAX_PATH]; /* where the file is written */
++    WCHAR module_name[MAX_PATH];
++    IStream *stream;
++    BOOL initialized, closed, aborted;
++    DWORD entry_point;
++
++    SymDocumentWriter **docs; DWORD docs_count, docs_cap;
++    struct sw_method *methods; DWORD methods_count, methods_cap;
++    LONG cur_method;   /* index of the open method, -1 for none */
++    LONG cur_scope;    /* innermost open scope of the open method, -1 for none */
++    WCHAR **namespaces; DWORD namespaces_count, namespaces_cap;
++    WCHAR **global_usings; DWORD global_usings_count, global_usings_cap;
++    struct sw_attr *attrs; DWORD attrs_count, attrs_cap;
++    struct sw_remap *remaps; DWORD remaps_count, remaps_cap;
++    BOOL map_spans_open;
+ } SymWriter;
+ 
+-typedef struct SymDocumentWriter {
+-    ISymUnmanagedDocumentWriter iface;
+-    LONG ref;
+-} SymDocumentWriter;
+-
+ static inline SymWriter *impl_from_ISymUnmanagedWriter5(ISymUnmanagedWriter5 *iface)
+ {
+     return CONTAINING_RECORD(iface, SymWriter, iface);
+@@ -64,6 +151,41 @@
+     return CONTAINING_RECORD(iface, SymDocumentWriter, iface);
+ }
+ 
++static const ISymUnmanagedDocumentWriterVtbl SymDocumentWriter_Vtbl;
++
++/* append one zeroed element to a growable array */
++static void *array_add(void **array, DWORD *count, DWORD *cap, size_t size)
++{
++    if (*count == *cap)
++    {
++        DWORD new_cap = *cap ? *cap * 2 : 8;
++        void *p = realloc(*array, (size_t)new_cap * size);
++        if (!p) return NULL;
++        *array = p;
++        *cap = new_cap;
++    }
++    memset((char *)*array + (size_t)*count * size, 0, size);
++    return (char *)*array + (size_t)(*count)++ * size;
++}
++
++static WCHAR *dup_wstr(const WCHAR *s)
++{
++    size_t len = wcslen(s) + 1;
++    WCHAR *r = malloc(len * sizeof(WCHAR));
++    if (r) memcpy(r, s, len * sizeof(WCHAR));
++    return r;
++}
++
++static char *wide_to_utf8(const WCHAR *s)
++{
++    int len = WideCharToMultiByte(CP_UTF8, 0, s, -1, NULL, 0, NULL, NULL);
++    char *r = malloc(max(len, 1));
++    if (!r) return NULL;
++    if (len) WideCharToMultiByte(CP_UTF8, 0, s, -1, r, len, NULL, NULL);
++    else r[0] = 0;
++    return r;
++}
++
+ static HRESULT WINAPI SymDocumentWriter_QueryInterface(ISymUnmanagedDocumentWriter *iface, REFIID iid,
+     void **ppv)
+ {
+@@ -106,6 +228,9 @@
+ 
+     if (ref == 0)
+     {
++        free(This->url);
++        free(This->checksum);
++        free(This->source);
+         free(This);
+     }
+ 
+@@ -115,14 +240,46 @@
+ static HRESULT WINAPI SymDocumentWriter_SetSource(ISymUnmanagedDocumentWriter *iface, ULONG32 sourceSize,
+     BYTE source[])
+ {
+-    FIXME("(%p,%u,%p)\n", iface, sourceSize, source);
++    SymDocumentWriter *This = impl_from_ISymUnmanagedDocumentWriter(iface);
++    BYTE *copy = NULL;
++
++    TRACE("(%p,%lu,%p)\n", iface, (ULONG)sourceSize, source);
++
++    if (sourceSize && !source) return E_INVALIDARG;
++
++    if (sourceSize)
++    {
++        copy = malloc(sourceSize);
++        if (!copy) return E_OUTOFMEMORY;
++        memcpy(copy, source, sourceSize);
++    }
++    free(This->source);
++    This->source = copy;
++    This->source_size = sourceSize;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI SymDocumentWriter_SetChecksum(ISymUnmanagedDocumentWriter *iface, GUID algorithmID,
+     ULONG32 checkSumSize, BYTE checkSum[])
+ {
+-    FIXME("(%p,%s,%u,%p)\n", iface, debugstr_guid(&algorithmID), checkSumSize, checkSum);
++    SymDocumentWriter *This = impl_from_ISymUnmanagedDocumentWriter(iface);
++    BYTE *copy = NULL;
++
++    TRACE("(%p,%s,%lu,%p)\n", iface, debugstr_guid(&algorithmID), (ULONG)checkSumSize, checkSum);
++
++    if (checkSumSize && !checkSum) return E_INVALIDARG;
++    if (checkSumSize > 255) return E_INVALIDARG;
++
++    if (checkSumSize)
++    {
++        copy = malloc(checkSumSize);
++        if (!copy) return E_OUTOFMEMORY;
++        memcpy(copy, checkSum, checkSumSize);
++    }
++    free(This->checksum);
++    This->checksum = copy;
++    This->checksum_size = checkSumSize;
++    This->algorithm = algorithmID;
+     return S_OK;
+ }
+ 
+@@ -134,6 +291,25 @@
+     SymDocumentWriter_SetChecksum
+ };
+ 
++static void method_free(struct sw_method *m)
++{
++    DWORD i;
++
++    for (i = 0; i < m->lines_count; i++)
++    {
++        free(m->lines[i].points);
++        if (m->lines[i].doc) ISymUnmanagedDocumentWriter_Release(&m->lines[i].doc->iface);
++    }
++    free(m->lines);
++    free(m->scopes);
++    for (i = 0; i < m->vars_count; i++) free(m->vars[i].name);
++    free(m->vars);
++    for (i = 0; i < m->consts_count; i++) { free(m->consts[i].name); free(m->consts[i].leaf); }
++    free(m->consts);
++    for (i = 0; i < m->usings_count; i++) free(m->usings[i].name);
++    free(m->usings);
++}
++
+ static HRESULT WINAPI SymWriter_QueryInterface(ISymUnmanagedWriter5 *iface, REFIID iid,
+     void **ppv)
+ {
+@@ -179,11 +355,24 @@
+ {
+     SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
+     ULONG ref = InterlockedDecrement(&This->ref);
++    DWORD i;
+ 
+     TRACE("(%p) refcount=%lu\n", iface, ref);
+ 
+     if (ref == 0)
+     {
++        for (i = 0; i < This->docs_count; i++) ISymUnmanagedDocumentWriter_Release(&This->docs[i]->iface);
++        free(This->docs);
++        for (i = 0; i < This->methods_count; i++) method_free(&This->methods[i]);
++        free(This->methods);
++        for (i = 0; i < This->namespaces_count; i++) free(This->namespaces[i]);
++        free(This->namespaces);
++        for (i = 0; i < This->global_usings_count; i++) free(This->global_usings[i]);
++        free(This->global_usings);
++        for (i = 0; i < This->attrs_count; i++) { free(This->attrs[i].name); free(This->attrs[i].data); }
++        free(This->attrs);
++        free(This->remaps);
++        if (This->stream) IStream_Release(This->stream);
+         This->lock.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&This->lock);
+         free(This);
+@@ -192,24 +381,66 @@
+     return ref;
+ }
+ 
++static struct sw_method *cur_method(SymWriter *This)
++{
++    return This->cur_method >= 0 ? &This->methods[This->cur_method] : NULL;
++}
++
+ static HRESULT WINAPI SymWriter_DefineDocument(ISymUnmanagedWriter5 *iface, const WCHAR *url,
+     const GUID *language, const GUID *languageVendor, const GUID *documentType,
+     ISymUnmanagedDocumentWriter** pRetVal)
+ {
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
+     SymDocumentWriter *result;
++    DWORD i;
+ 
+-    FIXME("(%p,%s,%s,%s,%s,%p)\n", iface, debugstr_w(url), debugstr_guid(language),
++    TRACE("(%p,%s,%s,%s,%s,%p)\n", iface, debugstr_w(url), debugstr_guid(language),
+         debugstr_guid(languageVendor), debugstr_guid(documentType), pRetVal);
+ 
+     if (!pRetVal)
+         return E_POINTER;
+ 
+-    result = malloc(sizeof(*result));
++    if (!url)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&This->lock);
++
++    /* defining a document twice returns the first one */
++    for (i = 0; i < This->docs_count; i++)
++    {
++        if (!wcsicmp(This->docs[i]->url, url))
++        {
++            ISymUnmanagedDocumentWriter_AddRef(&This->docs[i]->iface);
++            *pRetVal = &This->docs[i]->iface;
++            LeaveCriticalSection(&This->lock);
++            return S_OK;
++        }
++    }
++
++    result = calloc(1, sizeof(*result));
+     if (!result)
++    {
++        LeaveCriticalSection(&This->lock);
+         return E_OUTOFMEMORY;
++    }
+ 
+     result->iface.lpVtbl = &SymDocumentWriter_Vtbl;
+-    result->ref = 1;
++    result->ref = 2; /* one for the writer, one for the caller */
++    result->url = dup_wstr(url);
++    if (language) result->language = *language;
++    if (languageVendor) result->vendor = *languageVendor;
++    if (documentType) result->type = *documentType;
++
++    if (!result->url || !array_add((void **)&This->docs, &This->docs_count, &This->docs_cap, sizeof(*This->docs)))
++    {
++        free(result->url);
++        free(result);
++        LeaveCriticalSection(&This->lock);
++        return E_OUTOFMEMORY;
++    }
++    This->docs[This->docs_count - 1] = result;
++
++    LeaveCriticalSection(&This->lock);
+     *pRetVal = &result->iface;
+ 
+     return S_OK;
+@@ -217,40 +448,194 @@
+ 
+ static HRESULT WINAPI SymWriter_SetUserEntryPoint(ISymUnmanagedWriter5 *iface, mdMethodDef entryMethod)
+ {
+-    FIXME("(%p,0x%x)\n", iface, entryMethod);
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++
++    TRACE("(%p,0x%x)\n", iface, entryMethod);
++
++    EnterCriticalSection(&This->lock);
++    This->entry_point = entryMethod;
++    LeaveCriticalSection(&This->lock);
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI SymWriter_OpenMethod(ISymUnmanagedWriter5 *iface, mdMethodDef method)
++static HRESULT open_method(SymWriter *This, mdMethodDef method, BOOL has_pos, ULONG32 isect, ULONG32 offset)
+ {
+-    FIXME("(%p,0x%x)\n", iface, method);
++    struct sw_method *m;
++
++    if (This->cur_method >= 0)
++        return E_UNEXPECTED;
++
++    m = array_add((void **)&This->methods, &This->methods_count, &This->methods_cap, sizeof(*This->methods));
++    if (!m)
++        return E_OUTOFMEMORY;
++
++    m->token = method;
++    if (has_pos)
++    {
++        m->section = isect;
++        m->offset = offset;
++    }
++    This->cur_method = This->methods_count - 1;
++    This->cur_scope = -1;
+     return S_OK;
+ }
+ 
++static HRESULT WINAPI SymWriter_OpenMethod(ISymUnmanagedWriter5 *iface, mdMethodDef method)
++{
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr;
++
++    TRACE("(%p,0x%x)\n", iface, method);
++
++    EnterCriticalSection(&This->lock);
++    hr = open_method(This, method, FALSE, 0, 0);
++    LeaveCriticalSection(&This->lock);
++    return hr;
++}
++
+ static HRESULT WINAPI SymWriter_CloseMethod(ISymUnmanagedWriter5 *iface)
+ {
+-    FIXME("(%p)\n", iface);
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    struct sw_method *m;
++
++    TRACE("(%p)\n", iface);
++
++    EnterCriticalSection(&This->lock);
++    m = cur_method(This);
++    if (!m)
++    {
++        LeaveCriticalSection(&This->lock);
++        return E_UNEXPECTED;
++    }
++
++    /* scopes still open are closed where their last child ended */
++    while (This->cur_scope >= 0)
++    {
++        struct sw_scope *s = &m->scopes[This->cur_scope];
++        s->closed = TRUE;
++        This->cur_scope = s->parent;
++    }
++    This->cur_method = -1;
++    LeaveCriticalSection(&This->lock);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI SymWriter_OpenScope(ISymUnmanagedWriter5 *iface, ULONG32 startOffset,
+     ULONG32 *pRetVal)
+ {
+-    FIXME("(%p,%u,%p)\n", iface, startOffset, pRetVal);
+-    *pRetVal = 0xdeadbeef;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    struct sw_method *m;
++    struct sw_scope *s;
++
++    TRACE("(%p,%lu,%p)\n", iface, (ULONG)startOffset, pRetVal);
++
++    if (!pRetVal)
++        return E_POINTER;
++
++    EnterCriticalSection(&This->lock);
++    m = cur_method(This);
++    if (!m)
++    {
++        LeaveCriticalSection(&This->lock);
++        return E_UNEXPECTED;
++    }
++
++    s = array_add((void **)&m->scopes, &m->scopes_count, &m->scopes_cap, sizeof(*m->scopes));
++    if (!s)
++    {
++        LeaveCriticalSection(&This->lock);
++        return E_OUTOFMEMORY;
++    }
++    s->parent = This->cur_scope;
++    s->start = startOffset;
++    s->end = startOffset;
++    This->cur_scope = m->scopes_count - 1;
++    *pRetVal = This->cur_scope;
++    LeaveCriticalSection(&This->lock);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI SymWriter_CloseScope(ISymUnmanagedWriter5 *iface, ULONG32 endOffset)
+ {
+-    FIXME("(%p,%u)\n", iface, endOffset);
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    struct sw_method *m;
++    struct sw_scope *s;
++
++    TRACE("(%p,%lu)\n", iface, (ULONG)endOffset);
++
++    EnterCriticalSection(&This->lock);
++    m = cur_method(This);
++    if (!m || This->cur_scope < 0)
++    {
++        LeaveCriticalSection(&This->lock);
++        return E_UNEXPECTED;
++    }
++    s = &m->scopes[This->cur_scope];
++    s->end = endOffset;
++    s->closed = TRUE;
++    This->cur_scope = s->parent;
++    LeaveCriticalSection(&This->lock);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI SymWriter_SetScopeRange(ISymUnmanagedWriter5 *iface, ULONG32 scopeID, ULONG32 startOffset,
+     ULONG32 endOffset)
+ {
+-    FIXME("(%p,%u,%u,%u)\n", iface, scopeID, startOffset, endOffset);
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    struct sw_method *m;
++
++    TRACE("(%p,%lu,%lu,%lu)\n", iface, (ULONG)scopeID, (ULONG)startOffset, (ULONG)endOffset);
++
++    EnterCriticalSection(&This->lock);
++    m = cur_method(This);
++    if (!m)
++    {
++        LeaveCriticalSection(&This->lock);
++        return E_UNEXPECTED;
++    }
++    if (scopeID >= m->scopes_count)
++    {
++        LeaveCriticalSection(&This->lock);
++        return E_INVALIDARG;
++    }
++    m->scopes[scopeID].start = startOffset;
++    m->scopes[scopeID].end = endOffset;
++    LeaveCriticalSection(&This->lock);
++    return S_OK;
++}
++
++static HRESULT add_var(SymWriter *This, const WCHAR *name, ULONG32 attributes, ULONG32 sig_token,
++    ULONG32 addr_kind, ULONG32 addr1, ULONG32 addr2, ULONG32 addr3, ULONG32 start, ULONG32 end,
++    BOOL param, ULONG32 sequence)
++{
++    struct sw_method *m = cur_method(This);
++    struct sw_var *v;
++
++    if (!name)
++        return E_INVALIDARG;
++    if (!m)
++        return E_UNEXPECTED;
++
++    v = array_add((void **)&m->vars, &m->vars_count, &m->vars_cap, sizeof(*m->vars));
++    if (!v)
++        return E_OUTOFMEMORY;
++    v->name = dup_wstr(name);
++    if (!v->name)
++    {
++        m->vars_count--;
++        return E_OUTOFMEMORY;
++    }
++    v->attributes = attributes;
++    v->sig_token = sig_token;
++    v->addr_kind = addr_kind;
++    v->addr1 = addr1;
++    v->addr2 = addr2;
++    v->addr3 = addr3;
++    v->start = start;
++    v->end = end;
++    v->scope = This->cur_scope;
++    v->param = param;
++    v->sequence = sequence;
+     return S_OK;
+ }
+ 
+@@ -258,23 +643,40 @@
+     ULONG32 attributes, ULONG32 cSig, unsigned char signature[], ULONG32 addrKind,
+     ULONG32 addr1, ULONG32 addr2, ULONG32 addr3, ULONG32 startOffset, ULONG32 endOffset)
+ {
+-    FIXME("(%p,%s,0x%x,%u,%u)\n", iface, debugstr_w(name), attributes, cSig, addrKind);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr;
++
++    TRACE("(%p,%s,0x%lx,%lu,%lu)\n", iface, debugstr_w(name), (ULONG)attributes, (ULONG)cSig, (ULONG)addrKind);
++
++    if (cSig && !signature)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&This->lock);
++    hr = add_var(This, name, attributes, 0, addrKind, addr1, addr2, addr3, startOffset, endOffset, FALSE, 0);
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_DefineParameter(ISymUnmanagedWriter5 *iface, const WCHAR *name,
+     ULONG32 attributes, ULONG32 sequence, ULONG32 addrKind,
+     ULONG32 addr1, ULONG32 addr2, ULONG32 addr3)
+ {
+-    FIXME("(%p,%s,0x%x,%u,%u)\n", iface, debugstr_w(name), attributes, sequence, addrKind);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr;
++
++    TRACE("(%p,%s,0x%lx,%lu,%lu)\n", iface, debugstr_w(name), (ULONG)attributes, (ULONG)sequence, (ULONG)addrKind);
++
++    EnterCriticalSection(&This->lock);
++    hr = add_var(This, name, attributes, 0, addrKind, addr1, addr2, addr3, 0, 0, TRUE, sequence);
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_DefineField(ISymUnmanagedWriter5 *iface, mdTypeDef parent,
+     const WCHAR *name, ULONG32 attributes, ULONG32 cSig, unsigned char signature[], ULONG32 addrKind,
+     ULONG32 addr1, ULONG32 addr2, ULONG32 addr3)
+ {
+-    FIXME("(%p,0x%x,%s,0x%x,%u,%u)\n", iface, parent, debugstr_w(name), attributes, cSig, addrKind);
++    FIXME("(%p,0x%x,%s,0x%x,%u,%u) stub\n", iface, parent, debugstr_w(name), attributes, cSig, addrKind);
+     return S_OK;
+ }
+ 
+@@ -282,62 +684,741 @@
+     ULONG32 attributes, ULONG32 cSig, unsigned char signature[], ULONG32 addrKind,
+     ULONG32 addr1, ULONG32 addr2, ULONG32 addr3)
+ {
+-    FIXME("(%p,%s,0x%x,%u,%u)\n", iface, debugstr_w(name), attributes, cSig, addrKind);
++    FIXME("(%p,%s,0x%x,%u,%u) stub\n", iface, debugstr_w(name), attributes, cSig, addrKind);
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI SymWriter_Close(ISymUnmanagedWriter5 *iface)
++/* ---- building the PDB file ---- */
++
++/* the token a method is stored under after RemapToken calls */
++static DWORD remapped_token(const SymWriter *This, DWORD token)
++{
++    DWORD i;
++
++    for (i = 0; i < This->remaps_count; i++)
++        if (This->remaps[i].old_token == token) return This->remaps[i].new_token;
++    return token;
++}
++
++static DWORD method_code_length(const struct sw_method *m)
++{
++    DWORD len = 0, i, j;
++
++    for (i = 0; i < m->scopes_count; i++) len = max(len, m->scopes[i].end);
++    for (i = 0; i < m->lines_count; i++)
++        for (j = 0; j < m->lines[i].count; j++) len = max(len, m->lines[i].points[j].offset + 1);
++    return len;
++}
++
++static DWORD rec_begin(struct buf *b, WORD kind)
++{
++    DWORD pos = b->size;
++    buf_u16(b, 0);
++    buf_u16(b, kind);
++    return pos;
++}
++
++static void rec_end(struct buf *b, DWORD pos)
++{
++    WORD len;
++
++    buf_align4(b);
++    len = b->size - pos - 2;
++    if (!b->fail) memcpy(b->data + pos, &len, 2);
++}
++
++static void emit_cstr_w(struct buf *b, const WCHAR *name)
+ {
+-    FIXME("(%p)\n", iface);
++    char *s = wide_to_utf8(name);
++
++    if (!s) { b->fail = TRUE; return; }
++    buf_cstr(b, s);
++    free(s);
++}
++
++/* Encode a constant value as a numeric leaf. */
++static HRESULT encode_leaf(const VARIANT *v, struct buf *b)
++{
++    INT64 sv = 0;
++    UINT64 uv = 0;
++    BOOL is_unsigned = FALSE;
++
++    switch (V_VT(v))
++    {
++    case VT_EMPTY: case VT_NULL: break;
++    case VT_I1: sv = V_I1(v); break;
++    case VT_UI1: uv = V_UI1(v); is_unsigned = TRUE; break;
++    case VT_I2: sv = V_I2(v); break;
++    case VT_BOOL: sv = V_BOOL(v) ? 1 : 0; break;
++    case VT_UI2: uv = V_UI2(v); is_unsigned = TRUE; break;
++    case VT_I4: sv = V_I4(v); break;
++    case VT_INT: sv = V_INT(v); break;
++    case VT_UI4: uv = V_UI4(v); is_unsigned = TRUE; break;
++    case VT_UINT: uv = V_UINT(v); is_unsigned = TRUE; break;
++    case VT_I8: sv = V_I8(v); break;
++    case VT_UI8: uv = V_UI8(v); is_unsigned = TRUE; break;
++    case VT_R4:
++        buf_u16(b, SW_LF_REAL32);
++        buf_put(b, &V_R4(v), 4);
++        return S_OK;
++    case VT_R8:
++        buf_u16(b, SW_LF_REAL64);
++        buf_put(b, &V_R8(v), 8);
++        return S_OK;
++    case VT_BSTR:
++    {
++        char *s = wide_to_utf8(V_BSTR(v) ? V_BSTR(v) : L"");
++        size_t len;
++
++        if (!s) return E_OUTOFMEMORY;
++        len = strlen(s);
++        if (len > 0xffff) { free(s); return E_INVALIDARG; }
++        buf_u16(b, SW_LF_VARSTRING);
++        buf_u16(b, len);
++        buf_put(b, s, len);
++        free(s);
++        return S_OK;
++    }
++    default:
++        return E_INVALIDARG;
++    }
++
++    if (is_unsigned)
++    {
++        if (uv < 0x8000) buf_u16(b, uv);
++        else if (uv <= 0xffff) { buf_u16(b, SW_LF_USHORT); buf_u16(b, uv); }
++        else if (uv <= 0xffffffff) { buf_u16(b, SW_LF_ULONG); buf_u32(b, uv); }
++        else { buf_u16(b, SW_LF_UQUADWORD); buf_u64(b, uv); }
++    }
++    else
++    {
++        if (sv >= 0 && sv < 0x8000) buf_u16(b, sv);
++        else if (sv >= -128 && sv < 128) { buf_u16(b, SW_LF_CHAR); buf_u8(b, (BYTE)sv); }
++        else if (sv >= -32768 && sv < 32768) { buf_u16(b, SW_LF_SHORT); buf_u16(b, (WORD)sv); }
++        else if (sv >= -2147483647 - 1 && sv <= 2147483647) { buf_u16(b, SW_LF_LONG); buf_u32(b, (DWORD)sv); }
++        else { buf_u16(b, SW_LF_QUADWORD); buf_u64(b, (UINT64)sv); }
++    }
+     return S_OK;
+ }
+ 
++static void emit_scope_contents(struct buf *ms, const struct sw_method *m, LONG scope, DWORD proc_pos);
++
++static void emit_scope_children(struct buf *ms, const struct sw_method *m, LONG parent, DWORD parent_pos)
++{
++    DWORD i;
++
++    for (i = 0; i < m->scopes_count; i++)
++    {
++        const struct sw_scope *s = &m->scopes[i];
++        DWORD pos, end_pos;
++
++        if (s->parent != parent) continue;
++        pos = ms->size;
++        rec_begin(ms, SW_S_BLOCK32);
++        buf_u32(ms, parent_pos);
++        buf_u32(ms, 0);                              /* end, patched below */
++        buf_u32(ms, s->end > s->start ? s->end - s->start : 0);
++        buf_u32(ms, m->offset + s->start);
++        buf_u16(ms, m->section);
++        buf_cstr(ms, "");
++        rec_end(ms, pos);
++        emit_scope_contents(ms, m, i, pos);
++        end_pos = ms->size;
++        rec_begin(ms, SW_S_END);
++        rec_end(ms, end_pos);
++        buf_patch32(ms, pos + 8, end_pos);
++    }
++}
++
++static void emit_scope_contents(struct buf *ms, const struct sw_method *m, LONG scope, DWORD proc_pos)
++{
++    DWORD i;
++
++    for (i = 0; i < m->usings_count; i++)
++    {
++        DWORD pos;
++        if (m->usings[i].scope != scope) continue;
++        pos = rec_begin(ms, SW_S_UNAMESPACE);
++        emit_cstr_w(ms, m->usings[i].name);
++        rec_end(ms, pos);
++    }
++    for (i = 0; i < m->vars_count; i++)
++    {
++        const struct sw_var *v = &m->vars[i];
++        DWORD pos;
++
++        if (v->scope != scope) continue;
++        pos = rec_begin(ms, SW_S_MANSLOT);
++        buf_u32(ms, v->param ? v->sequence : v->addr1);
++        buf_u32(ms, v->sig_token);
++        buf_u32(ms, v->start);
++        buf_u16(ms, 0);
++        buf_u16(ms, (v->param ? 1 : 0) | ((v->attributes & 0x7fff) << 1));
++        emit_cstr_w(ms, v->name);
++        rec_end(ms, pos);
++    }
++    for (i = 0; i < m->consts_count; i++)
++    {
++        const struct sw_const *c = &m->consts[i];
++        DWORD pos;
++
++        if (c->scope != scope) continue;
++        pos = rec_begin(ms, SW_S_MANCONSTANT);
++        buf_u32(ms, c->sig_token);
++        buf_put(ms, c->leaf, c->leaf_size);
++        emit_cstr_w(ms, c->name);
++        rec_end(ms, pos);
++    }
++    emit_scope_children(ms, m, scope, proc_pos);
++}
++
++static void emit_method(struct buf *ms, const SymWriter *This, const struct sw_method *m)
++{
++    DWORD pos = ms->size, end_pos, len = method_code_length(m);
++
++    rec_begin(ms, SW_S_GMANPROC);
++    buf_u32(ms, 0);        /* parent */
++    buf_u32(ms, 0);        /* end, patched below */
++    buf_u32(ms, 0);        /* next */
++    buf_u32(ms, len);
++    buf_u32(ms, 0);        /* debug start */
++    buf_u32(ms, len);      /* debug end */
++    buf_u32(ms, remapped_token(This, m->token));
++    buf_u32(ms, m->offset);
++    buf_u16(ms, m->section);
++    buf_u8(ms, 0);         /* flags */
++    buf_u16(ms, 0);        /* return register */
++    buf_cstr(ms, "");      /* methods are named by their metadata token */
++    rec_end(ms, pos);
++    emit_scope_contents(ms, m, -1, pos);
++    end_pos = ms->size;
++    rec_begin(ms, SW_S_END);
++    rec_end(ms, end_pos);
++    buf_patch32(ms, pos + 8, end_pos);
++}
++
++static int checksum_kind(const SymDocumentWriter *doc)
++{
++    if (!doc->checksum_size) return 0;
++    if (IsEqualGUID(&doc->algorithm, &guid_md5)) return 1;
++    if (IsEqualGUID(&doc->algorithm, &guid_sha1)) return 2;
++    if (IsEqualGUID(&doc->algorithm, &guid_sha256)) return 3;
++    return 0;
++}
++
++static DWORD doc_index(const SymWriter *This, const SymDocumentWriter *doc)
++{
++    DWORD i;
++    for (i = 0; i < This->docs_count; i++) if (This->docs[i] == doc) return i;
++    return 0;
++}
++
++static HRESULT build_pdb(SymWriter *This, struct buf *file)
++{
++    DWORD nsrc = 0, nstreams, i, j, k, sym_size, c13_size, named_count = 0, src_idx;
++    BOOL has_attrs = This->attrs_count > 0;
++    struct buf *streams = NULL, chk = {0}, lines = {0}, srcnames = {0}, modinfo = {0}, srcinfo = {0},
++               sc = {0}, ec = {0};
++    struct names_table names;
++    struct named_stream *named = NULL;
++    char **named_names = NULL;
++    DWORD *chk_offsets = NULL, *name_offsets = NULL;
++    char *modname = NULL;
++    HRESULT hr = S_OK;
++    struct buf *ms;
++    char *tmp_name;
++
++    names_init(&names);
++
++    for (i = 0; i < This->docs_count; i++)
++        if (This->docs[i]->source_size) nsrc++;
++    nstreams = 10 + nsrc + (has_attrs ? 1 : 0);
++    streams = calloc(nstreams, sizeof(*streams));
++    named = calloc(2 + nsrc, sizeof(*named));
++    named_names = calloc(2 + nsrc, sizeof(*named_names));
++    chk_offsets = calloc(max(This->docs_count, 1), sizeof(*chk_offsets));
++    name_offsets = calloc(max(This->docs_count, 1), sizeof(*name_offsets));
++    if (!streams || !named || !named_names || !chk_offsets || !name_offsets) { hr = E_OUTOFMEMORY; goto done; }
++
++    /* file checksums + names */
++    for (i = 0; i < This->docs_count; i++)
++    {
++        SymDocumentWriter *doc = This->docs[i];
++        char *url = wide_to_utf8(doc->url);
++        int kind = checksum_kind(doc);
++
++        if (!url) { hr = E_OUTOFMEMORY; goto done; }
++        chk_offsets[i] = chk.size;
++        buf_u32(&chk, names_add(&names, url));
++        buf_u8(&chk, kind ? doc->checksum_size : 0);
++        buf_u8(&chk, kind);
++        if (kind) buf_put(&chk, doc->checksum, doc->checksum_size);
++        buf_align4(&chk);
++        name_offsets[i] = srcnames.size;
++        buf_cstr(&srcnames, url);
++        free(url);
++    }
++
++    /* module stream: symbols, then line info and file checksums */
++    ms = &streams[9];
++    buf_u32(ms, 4);   /* C13 signature */
++    for (i = 0; i < This->global_usings_count; i++)
++    {
++        DWORD pos = rec_begin(ms, SW_S_UNAMESPACE);
++        emit_cstr_w(ms, This->global_usings[i]);
++        rec_end(ms, pos);
++    }
++    for (i = 0; i < This->methods_count; i++) emit_method(ms, This, &This->methods[i]);
++    sym_size = ms->size;
++
++    for (i = 0; i < This->methods_count; i++)
++    {
++        const struct sw_method *m = &This->methods[i];
++        DWORD start, ntotal = 0;
++
++        for (j = 0; j < m->lines_count; j++) ntotal += m->lines[j].count;
++        if (!ntotal) continue;
++
++        buf_u32(&lines, SW_DEBUG_S_LINES);
++        start = lines.size;
++        buf_u32(&lines, 0);                       /* length, patched below */
++        buf_u32(&lines, m->offset);
++        buf_u16(&lines, m->section);
++        buf_u16(&lines, 1);                       /* CV_LINES_HAVE_COLUMNS */
++        buf_u32(&lines, method_code_length(m));
++        for (j = 0; j < m->lines_count; j++)
++        {
++            const struct sw_lines *l = &m->lines[j];
++
++            if (!l->count) continue;
++            buf_u32(&lines, chk_offsets[doc_index(This, l->doc)]);
++            buf_u32(&lines, l->count);
++            buf_u32(&lines, 12 + l->count * 12);
++            for (k = 0; k < l->count; k++)
++            {
++                const struct sw_point *p = &l->points[k];
++                DWORD delta = p->end_line >= p->line && p->end_line - p->line < 128 ? p->end_line - p->line : 0;
++                DWORD stmt = p->line == 0xfeefee ? 0 : 1;
++
++                buf_u32(&lines, p->offset);
++                buf_u32(&lines, (p->line & 0xffffff) | (delta << 24) | (stmt << 31));
++            }
++            for (k = 0; k < l->count; k++)
++            {
++                buf_u16(&lines, l->points[k].column);
++                buf_u16(&lines, l->points[k].end_column);
++            }
++        }
++        buf_patch32(&lines, start, lines.size - start - 4);
++    }
++    buf_put(ms, lines.data, lines.size);
++    c13_size = lines.size;
++    if (chk.size)
++    {
++        buf_u32(ms, SW_DEBUG_S_FILECHKSMS);
++        buf_u32(ms, chk.size);
++        buf_put(ms, chk.data, chk.size);
++        c13_size += 8 + chk.size;
++    }
++    buf_u32(ms, 0);   /* global references */
++
++    /* /names */
++    names_serialize(&names, &streams[8]);
++    named_names[0] = _strdup("/names");
++    if (!named_names[0]) { hr = E_OUTOFMEMORY; goto done; }
++    named[0].name = named_names[0];
++    named[0].index = 8;
++    named_count = 1;
++
++    /* embedded sources */
++    src_idx = 10;
++    for (i = 0; i < This->docs_count; i++)
++    {
++        SymDocumentWriter *doc = This->docs[i];
++        char *url;
++
++        if (!doc->source_size) continue;
++        url = wide_to_utf8(doc->url);
++        tmp_name = url ? malloc(strlen(url) + 12) : NULL;
++        if (!tmp_name) { free(url); hr = E_OUTOFMEMORY; goto done; }
++        strcpy(tmp_name, "/src/files/");
++        strcat(tmp_name, url);
++        free(url);
++        named_names[named_count] = tmp_name;
++        named[named_count].name = tmp_name;
++        named[named_count].index = src_idx;
++        named_count++;
++        buf_put(&streams[src_idx], doc->source, doc->source_size);
++        src_idx++;
++    }
++
++    /* implementation-specific stream with the symbol attributes */
++    if (has_attrs)
++    {
++        struct buf *a = &streams[src_idx];
++
++        named_names[named_count] = _strdup("/sg/attributes");
++        if (!named_names[named_count]) { hr = E_OUTOFMEMORY; goto done; }
++        named[named_count].name = named_names[named_count];
++        named[named_count].index = src_idx;
++        named_count++;
++        buf_u32(a, This->attrs_count);
++        for (i = 0; i < This->attrs_count; i++)
++        {
++            char *n = wide_to_utf8(This->attrs[i].name);
++            if (!n) { hr = E_OUTOFMEMORY; goto done; }
++            buf_u32(a, remapped_token(This, This->attrs[i].parent));
++            buf_u32(a, strlen(n));
++            buf_put(a, n, strlen(n));
++            buf_u32(a, This->attrs[i].size);
++            buf_put(a, This->attrs[i].data, This->attrs[i].size);
++            free(n);
++        }
++    }
++
++    /* PDB info */
++    pdb_build_info(&streams[1], This->pdb_timestamp, This->pdb_age, &This->pdb_guid, named, named_count);
++
++    /* TPI (2) and IPI (4): empty type streams */
++    for (i = 2; i <= 4; i += 2)
++    {
++        buf_u32(&streams[i], 20040203);
++        buf_u32(&streams[i], 56);
++        buf_u32(&streams[i], 0x1000);
++        buf_u32(&streams[i], 0x1000);
++        buf_u32(&streams[i], 0);
++        buf_u16(&streams[i], 0xffff);
++        buf_u16(&streams[i], 0xffff);
++        buf_u32(&streams[i], 4);
++        buf_u32(&streams[i], 0x3ffff);
++        for (j = 0; j < 6; j++) buf_u32(&streams[i], 0);
++    }
++
++    /* global and public symbol hash streams (no records) */
++    buf_u32(&streams[5], 0xffffffff);
++    buf_u32(&streams[5], 0xeffe0000 + 19990810);
++    buf_u32(&streams[5], 0);
++    buf_u32(&streams[5], 0);
++    buf_u32(&streams[6], 16);       /* symbol hash size */
++    buf_u32(&streams[6], 0);        /* address map size */
++    buf_u32(&streams[6], 0);        /* thunks */
++    buf_u32(&streams[6], 0);
++    buf_u16(&streams[6], 0);
++    buf_u16(&streams[6], 0);
++    buf_u32(&streams[6], 0);
++    buf_u32(&streams[6], 0);
++    buf_u32(&streams[6], 0xffffffff);
++    buf_u32(&streams[6], 0xeffe0000 + 19990810);
++    buf_u32(&streams[6], 0);
++    buf_u32(&streams[6], 0);
++    /* stream 7: the (empty) symbol record stream */
++
++    /* debug information stream */
++    {
++        struct buf *d = &streams[3];
++        const char *base;
++        WCHAR *p;
++        const WCHAR *mod = This->module_name[0] ? This->module_name : This->pdb_filename;
++
++        p = wcsrchr(mod, '\\');
++        if (!p) p = wcsrchr(mod, '/');
++        modname = wide_to_utf8(p ? p + 1 : mod);
++        if (!modname) { hr = E_OUTOFMEMORY; goto done; }
++        base = modname;
++
++        buf_u32(&modinfo, 0);
++        buf_put(&modinfo, NULL, 28);           /* section contribution */
++        buf_u16(&modinfo, 0);                  /* flags */
++        buf_u16(&modinfo, 9);                  /* module symbol stream */
++        buf_u32(&modinfo, sym_size);
++        buf_u32(&modinfo, 0);                  /* C11 line bytes */
++        buf_u32(&modinfo, c13_size);
++        buf_u16(&modinfo, This->docs_count);
++        buf_u16(&modinfo, 0);
++        buf_u32(&modinfo, 0);
++        buf_u32(&modinfo, 0);
++        buf_u32(&modinfo, 0);
++        buf_cstr(&modinfo, base);
++        buf_cstr(&modinfo, base);
++        buf_align4(&modinfo);
++
++        buf_u32(&sc, 0xeffe0000 + 19970605);   /* section contributions, none */
++
++        buf_u16(&srcinfo, 1);                  /* modules */
++        buf_u16(&srcinfo, This->docs_count);
++        buf_u16(&srcinfo, 0);                  /* first file of module 0 */
++        buf_u16(&srcinfo, This->docs_count);
++        for (i = 0; i < This->docs_count; i++) buf_u32(&srcinfo, name_offsets[i]);
++        buf_put(&srcinfo, srcnames.data, srcnames.size);
++        buf_align4(&srcinfo);
++
++        {
++            struct names_table empty;
++            names_init(&empty);
++            names_serialize(&empty, &ec);
++            names_free(&empty);
++        }
++
++        buf_u32(d, 0xffffffff);                /* version signature */
++        buf_u32(d, 19990903);                  /* V70 */
++        buf_u32(d, This->pdb_age);
++        buf_u16(d, 5);                         /* global symbol stream */
++        buf_u16(d, 0x8e0b);                    /* build number */
++        buf_u16(d, 6);                         /* public symbol stream */
++        buf_u16(d, 0);
++        buf_u16(d, 7);                         /* symbol record stream */
++        buf_u16(d, 0);
++        buf_u32(d, modinfo.size);
++        buf_u32(d, sc.size);
++        buf_u32(d, 4);                         /* section map */
++        buf_u32(d, srcinfo.size);
++        buf_u32(d, 0);                         /* type server map */
++        buf_u32(d, 0);                         /* MFC type server */
++        buf_u32(d, 0);                         /* optional debug header */
++        buf_u32(d, ec.size);
++        buf_u16(d, 0);                         /* flags */
++        buf_u16(d, 0x14c);                     /* machine */
++        buf_u32(d, 0);
++        buf_put(d, modinfo.data, modinfo.size);
++        buf_put(d, sc.data, sc.size);
++        buf_u16(d, 0);
++        buf_u16(d, 0);
++        buf_put(d, srcinfo.data, srcinfo.size);
++        buf_put(d, ec.data, ec.size);
++    }
++
++    hr = msf_build(streams, nstreams, file);
++
++done:
++    if (streams)
++        for (i = 0; i < nstreams; i++) buf_free(&streams[i]);
++    free(streams);
++    if (named_names)
++        for (i = 0; i < 2 + nsrc; i++) free(named_names[i]);
++    free(named_names);
++    free(named);
++    free(chk_offsets);
++    free(name_offsets);
++    free(modname);
++    names_free(&names);
++    buf_free(&chk);
++    buf_free(&lines);
++    buf_free(&srcnames);
++    buf_free(&modinfo);
++    buf_free(&srcinfo);
++    buf_free(&sc);
++    buf_free(&ec);
++    return hr;
++}
++
++/* Write the PDB to the stream or file given at initialization. */
++static HRESULT write_pdb(SymWriter *This)
++{
++    struct buf file = {0};
++    HRESULT hr;
++
++    if (!This->initialized)
++        return E_UNEXPECTED;
++
++    hr = build_pdb(This, &file);
++    if (FAILED(hr))
++    {
++        buf_free(&file);
++        return hr;
++    }
++
++    if (This->stream)
++    {
++        LARGE_INTEGER zero = {{0}};
++        ULARGE_INTEGER size;
++        ULONG written;
++
++        hr = IStream_Seek(This->stream, zero, STREAM_SEEK_SET, NULL);
++        if (SUCCEEDED(hr)) hr = IStream_Write(This->stream, file.data, file.size, &written);
++        if (SUCCEEDED(hr) && written != file.size) hr = E_FAIL;
++        if (SUCCEEDED(hr))
++        {
++            size.QuadPart = file.size;
++            hr = IStream_SetSize(This->stream, size);
++        }
++    }
++    else if (This->write_filename[0])
++    {
++        HANDLE h = CreateFileW(This->write_filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
++                               FILE_ATTRIBUTE_NORMAL, NULL);
++        DWORD written;
++
++        if (h == INVALID_HANDLE_VALUE)
++            hr = HRESULT_FROM_WIN32(GetLastError());
++        else
++        {
++            if (!WriteFile(h, file.data, file.size, &written, NULL) || written != file.size)
++                hr = HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_WRITE_FAULT);
++            CloseHandle(h);
++        }
++    }
++    else
++        hr = E_UNEXPECTED;
++
++    buf_free(&file);
++    return hr;
++}
++
++static HRESULT WINAPI SymWriter_Close(ISymUnmanagedWriter5 *iface)
++{
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("(%p)\n", iface);
++
++    EnterCriticalSection(&This->lock);
++    if (This->initialized && !This->closed && !This->aborted)
++        hr = write_pdb(This);
++    This->closed = TRUE;
++    LeaveCriticalSection(&This->lock);
++    return hr;
++}
++
+ static HRESULT WINAPI SymWriter_SetSymAttributes(ISymUnmanagedWriter5 *iface, mdToken parent,
+     const WCHAR *name, ULONG32 cData, unsigned char data[])
+ {
+-    FIXME("(%p,0x%x,%s,%u)\n", iface, parent, debugstr_w(name), cData);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    struct sw_attr *a;
++
++    TRACE("(%p,0x%x,%s,%lu)\n", iface, parent, debugstr_w(name), (ULONG)cData);
++
++    if (!name || (cData && !data))
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&This->lock);
++    a = array_add((void **)&This->attrs, &This->attrs_count, &This->attrs_cap, sizeof(*This->attrs));
++    if (a)
++    {
++        a->parent = parent;
++        a->name = dup_wstr(name);
++        a->data = cData ? malloc(cData) : NULL;
++        a->size = cData;
++        if (!a->name || (cData && !a->data))
++        {
++            free(a->name);
++            free(a->data);
++            This->attrs_count--;
++            a = NULL;
++        }
++        else if (cData)
++            memcpy(a->data, data, cData);
++    }
++    LeaveCriticalSection(&This->lock);
++    return a ? S_OK : E_OUTOFMEMORY;
+ }
+ 
+ static HRESULT WINAPI SymWriter_OpenNamespace(ISymUnmanagedWriter5 *iface, const WCHAR *name)
+ {
+-    FIXME("(%p,%s)\n", iface, debugstr_w(name));
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    WCHAR **slot;
++
++    TRACE("(%p,%s)\n", iface, debugstr_w(name));
++
++    if (!name)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&This->lock);
++    slot = array_add((void **)&This->namespaces, &This->namespaces_count, &This->namespaces_cap,
++                     sizeof(*This->namespaces));
++    if (slot && !(*slot = dup_wstr(name)))
++    {
++        This->namespaces_count--;
++        slot = NULL;
++    }
++    LeaveCriticalSection(&This->lock);
++    return slot ? S_OK : E_OUTOFMEMORY;
+ }
+ 
+ static HRESULT WINAPI SymWriter_CloseNamespace(ISymUnmanagedWriter5 *iface)
+ {
+-    FIXME("(%p)\n", iface);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("(%p)\n", iface);
++
++    EnterCriticalSection(&This->lock);
++    if (!This->namespaces_count)
++        hr = E_UNEXPECTED;
++    else
++        free(This->namespaces[--This->namespaces_count]);
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_UsingNamespace(ISymUnmanagedWriter5 *iface, const WCHAR *fullName)
+ {
+-    FIXME("(%p,%s)\n", iface, debugstr_w(fullName));
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    struct sw_method *m;
++    WCHAR *copy;
++    HRESULT hr = S_OK;
++
++    TRACE("(%p,%s)\n", iface, debugstr_w(fullName));
++
++    if (!fullName)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&This->lock);
++    copy = dup_wstr(fullName);
++    m = cur_method(This);
++    if (!copy)
++        hr = E_OUTOFMEMORY;
++    else if (m)
++    {
++        struct sw_using *u = array_add((void **)&m->usings, &m->usings_count, &m->usings_cap, sizeof(*m->usings));
++        if (u) { u->name = copy; u->scope = This->cur_scope; }
++        else { free(copy); hr = E_OUTOFMEMORY; }
++    }
++    else
++    {
++        WCHAR **slot = array_add((void **)&This->global_usings, &This->global_usings_count,
++                                 &This->global_usings_cap, sizeof(*This->global_usings));
++        if (slot) *slot = copy;
++        else { free(copy); hr = E_OUTOFMEMORY; }
++    }
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_SetMethodSourceRange(ISymUnmanagedWriter5 *iface, ISymUnmanagedDocumentWriter *startDoc,
+     ULONG32 startLine, ULONG32 startColumn, ISymUnmanagedDocumentWriter *endDoc, ULONG32 endLine, ULONG32 endColumn)
+ {
+-    FIXME("(%p,%p,%u,%u,%p,%u,%u)\n", iface, startDoc, startLine, startColumn, endDoc, endLine, endColumn);
++    FIXME("(%p,%p,%u,%u,%p,%u,%u) stub\n", iface, startDoc, startLine, startColumn, endDoc, endLine, endColumn);
+     return S_OK;
+ }
+ 
++static void set_paths(SymWriter *This, const WCHAR *final_name, const WCHAR *write_name, IStream *stream)
++{
++    This->pdb_filename[0] = 0;
++    This->write_filename[0] = 0;
++    if (final_name)
++        wcsncpy_s(This->pdb_filename, MAX_PATH, final_name, _TRUNCATE);
++    if (write_name)
++        wcsncpy_s(This->write_filename, MAX_PATH, write_name, _TRUNCATE);
++    if (This->stream) IStream_Release(This->stream);
++    This->stream = stream;
++    if (stream) IStream_AddRef(stream);
++    This->pdb_timestamp = _time32(NULL);
++    This->initialized = TRUE;
++    This->closed = This->aborted = FALSE;
++}
++
+ static HRESULT WINAPI SymWriter_Initialize(ISymUnmanagedWriter5 *iface, IUnknown *emitter, const WCHAR *filename,
+     IStream *pIStream, BOOL fFullBuild)
+ {
+     SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
+ 
+-    FIXME("(%p,%p,%s,%p,%u)\n", iface, emitter, debugstr_w(filename), pIStream, fFullBuild);
++    TRACE("(%p,%p,%s,%p,%u)\n", iface, emitter, debugstr_w(filename), pIStream, fFullBuild);
+ 
+-    EnterCriticalSection(&This->lock);
+-
+-    if (filename)
+-        wcsncpy_s(This->pdb_filename, MAX_PATH, filename, _TRUNCATE);
+-
+-    This->pdb_timestamp = _time32(NULL);
++    if (!filename && !pIStream)
++        return E_INVALIDARG;
+ 
++    EnterCriticalSection(&This->lock);
++    set_paths(This, filename, filename, pIStream);
+     LeaveCriticalSection(&This->lock);
+ 
+     return S_OK;
+@@ -362,10 +1443,13 @@
+     if (pIDD)
+     {
+         pIDD->Characteristics = 0;
++        pIDD->TimeDateStamp = This->pdb_timestamp;
+         pIDD->MajorVersion = 0;
+         pIDD->MinorVersion = 0;
+         pIDD->Type = IMAGE_DEBUG_TYPE_CODEVIEW;
+         pIDD->SizeOfData = data_size;
++        pIDD->AddressOfRawData = 0;
++        pIDD->PointerToRawData = 0;
+     }
+ 
+     if (data)
+@@ -390,33 +1474,146 @@
+ static HRESULT WINAPI SymWriter_DefineSequencePoints(ISymUnmanagedWriter5 *iface, ISymUnmanagedDocumentWriter *document,
+     ULONG32 spCount, ULONG32 offsets[], ULONG32 lines[], ULONG32 columns[], ULONG32 endLines[], ULONG32 endColumns[])
+ {
+-    FIXME("(%p,%p,%u)\n", iface, document, spCount);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    SymDocumentWriter *doc;
++    struct sw_method *m;
++    struct sw_lines *group = NULL;
++    DWORD i;
++    HRESULT hr = S_OK;
++
++    TRACE("(%p,%p,%lu)\n", iface, document, (ULONG)spCount);
++
++    if (!document || (spCount && (!offsets || !lines || !columns || !endLines || !endColumns)))
++        return E_INVALIDARG;
++    if (document->lpVtbl != &SymDocumentWriter_Vtbl)
++        return E_INVALIDARG;
++    doc = impl_from_ISymUnmanagedDocumentWriter(document);
++
++    EnterCriticalSection(&This->lock);
++    m = cur_method(This);
++    if (!m)
++    {
++        LeaveCriticalSection(&This->lock);
++        return E_UNEXPECTED;
++    }
++
++    for (i = 0; i < m->lines_count; i++)
++        if (m->lines[i].doc == doc) { group = &m->lines[i]; break; }
++    if (!group)
++    {
++        group = array_add((void **)&m->lines, &m->lines_count, &m->lines_cap, sizeof(*m->lines));
++        if (!group)
++            hr = E_OUTOFMEMORY;
++        else
++        {
++            group->doc = doc;
++            ISymUnmanagedDocumentWriter_AddRef(&doc->iface);
++        }
++    }
++
++    for (i = 0; SUCCEEDED(hr) && i < spCount; i++)
++    {
++        struct sw_point *p = array_add((void **)&group->points, &group->count, &group->cap, sizeof(*group->points));
++
++        if (!p) { hr = E_OUTOFMEMORY; break; }
++        p->offset = offsets[i];
++        p->line = lines[i];
++        p->column = columns[i];
++        p->end_line = endLines[i];
++        p->end_column = endColumns[i];
++    }
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_RemapToken(ISymUnmanagedWriter5 *iface, mdToken oldToken, mdToken newToken)
+ {
+-    FIXME("(%p,0x%x,0x%x)\n", iface, oldToken, newToken);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    struct sw_remap *r;
++
++    TRACE("(%p,0x%x,0x%x)\n", iface, oldToken, newToken);
++
++    EnterCriticalSection(&This->lock);
++    r = array_add((void **)&This->remaps, &This->remaps_count, &This->remaps_cap, sizeof(*This->remaps));
++    if (r)
++    {
++        r->old_token = oldToken;
++        r->new_token = newToken;
++    }
++    LeaveCriticalSection(&This->lock);
++    return r ? S_OK : E_OUTOFMEMORY;
+ }
+ 
+ static HRESULT WINAPI SymWriter_Initialize2(ISymUnmanagedWriter5 *iface, IUnknown *emitter, const WCHAR *tempFilename,
+     IStream *pIStream, BOOL fFullBuild, const WCHAR *finalFilename)
+ {
+-    FIXME("(%p,%p,%s,%p,%u,%s)\n", iface, emitter, debugstr_w(tempFilename), pIStream, fFullBuild, debugstr_w(finalFilename));
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++
++    TRACE("(%p,%p,%s,%p,%u,%s)\n", iface, emitter, debugstr_w(tempFilename), pIStream, fFullBuild, debugstr_w(finalFilename));
++
++    if (!tempFilename && !pIStream)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&This->lock);
++    set_paths(This, finalFilename ? finalFilename : tempFilename, tempFilename, pIStream);
++    LeaveCriticalSection(&This->lock);
++
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI SymWriter_DefineConstant(ISymUnmanagedWriter5 *iface, const WCHAR *name, VARIANT value, ULONG32 cSig,
+     unsigned char signature[])
+ {
+-    FIXME("(%p,%s,%s,%u,%p)\n", iface, debugstr_w(name), debugstr_variant(&value), cSig, signature);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    struct sw_method *m;
++    struct sw_const *c;
++    struct buf leaf = {0};
++    HRESULT hr;
++
++    TRACE("(%p,%s,%s,%lu,%p)\n", iface, debugstr_w(name), debugstr_variant(&value), (ULONG)cSig, signature);
++
++    if (!name)
++        return E_INVALIDARG;
++
++    hr = encode_leaf(&value, &leaf);
++    if (FAILED(hr) || leaf.fail)
++    {
++        buf_free(&leaf);
++        return FAILED(hr) ? hr : E_OUTOFMEMORY;
++    }
++
++    EnterCriticalSection(&This->lock);
++    m = cur_method(This);
++    if (!m)
++        hr = E_UNEXPECTED;
++    else if (!(c = array_add((void **)&m->consts, &m->consts_count, &m->consts_cap, sizeof(*m->consts))))
++        hr = E_OUTOFMEMORY;
++    else if (!(c->name = dup_wstr(name)))
++    {
++        m->consts_count--;
++        hr = E_OUTOFMEMORY;
++    }
++    else
++    {
++        c->leaf = leaf.data;
++        c->leaf_size = leaf.size;
++        c->scope = This->cur_scope;
++        leaf.data = NULL;
++    }
++    LeaveCriticalSection(&This->lock);
++    buf_free(&leaf);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_Abort(ISymUnmanagedWriter5 *iface)
+ {
+-    FIXME("(%p)\n", iface);
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++
++    TRACE("(%p)\n", iface);
++
++    EnterCriticalSection(&This->lock);
++    This->aborted = TRUE;
++    LeaveCriticalSection(&This->lock);
+     return S_OK;
+ }
+ 
+@@ -424,61 +1621,121 @@
+     mdSignature sigToken, ULONG32 addrKind, ULONG32 addr1, ULONG32 addr2, ULONG32 addr3,
+     ULONG32 startOffset, ULONG32 endOffset)
+ {
+-    FIXME("(%p,%s,0x%x,0x%x,%u)\n", iface, debugstr_w(name), attributes, sigToken, addrKind);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr;
++
++    TRACE("(%p,%s,0x%lx,0x%x,%lu)\n", iface, debugstr_w(name), (ULONG)attributes, sigToken, (ULONG)addrKind);
++
++    EnterCriticalSection(&This->lock);
++    hr = add_var(This, name, attributes, sigToken, addrKind, addr1, addr2, addr3, startOffset, endOffset, FALSE, 0);
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_DefineGlobalVariable2(ISymUnmanagedWriter5 *iface, const WCHAR *name, ULONG32 attributes,
+     mdSignature sigToken, ULONG32 addrKind, ULONG32 addr1, ULONG32 addr2, ULONG32 addr3)
+ {
+-    FIXME("(%p,%s,0x%x,0x%x,%u)\n", iface, debugstr_w(name), attributes, sigToken, addrKind);
++    FIXME("(%p,%s,0x%x,0x%x,%u) stub\n", iface, debugstr_w(name), attributes, sigToken, addrKind);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI SymWriter_DefineConstant2(ISymUnmanagedWriter5 *iface, const WCHAR *name, VARIANT value, mdSignature sigToken)
+ {
+-    FIXME("(%p,%s,%s,0x%x)\n", iface, debugstr_w(name), debugstr_variant(&value), sigToken);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr;
++
++    TRACE("(%p,%s,%s,0x%x)\n", iface, debugstr_w(name), debugstr_variant(&value), sigToken);
++
++    hr = SymWriter_DefineConstant(iface, name, value, 0, NULL);
++    if (SUCCEEDED(hr))
++    {
++        struct sw_method *m;
++
++        EnterCriticalSection(&This->lock);
++        m = cur_method(This);
++        if (m && m->consts_count) m->consts[m->consts_count - 1].sig_token = sigToken;
++        LeaveCriticalSection(&This->lock);
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_OpenMethod2(ISymUnmanagedWriter5 *iface, mdMethodDef method, ULONG32 isect, ULONG32 offset)
+ {
+-    FIXME("(%p,0x%x,%u,%u)\n", iface, method, isect, offset);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr;
++
++    TRACE("(%p,0x%x,%lu,%lu)\n", iface, method, (ULONG)isect, (ULONG)offset);
++
++    EnterCriticalSection(&This->lock);
++    hr = open_method(This, method, TRUE, isect, offset);
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_Commit(ISymUnmanagedWriter5 *iface)
+ {
+-    FIXME("(%p)\n", iface);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("(%p)\n", iface);
++
++    EnterCriticalSection(&This->lock);
++    if (This->initialized && !This->closed && !This->aborted)
++        hr = write_pdb(This);
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_GetDebugInfoWithPadding(ISymUnmanagedWriter5 *iface, IMAGE_DEBUG_DIRECTORY *pIDD, DWORD cbData,
+     DWORD* pcData, BYTE data[])
+ {
+-    FIXME("(%p,%p,%lu,%p,%p)\n", iface, pIDD, cbData, pcData, data);
+-    return E_NOTIMPL;
++    TRACE("(%p,%p,%lu,%p,%p)\n", iface, pIDD, cbData, pcData, data);
++
++    /* The record has the same layout; the padding only keeps room for a longer path. */
++    return SymWriter_GetDebugInfo(iface, pIDD, cbData, pcData, data);
+ }
+ 
+ static HRESULT WINAPI SymWriter_OpenMapTokensToSourceSpans(ISymUnmanagedWriter5 *iface)
+ {
+-    FIXME("(%p)\n", iface);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("(%p)\n", iface);
++
++    EnterCriticalSection(&This->lock);
++    if (This->map_spans_open) hr = E_UNEXPECTED;
++    This->map_spans_open = TRUE;
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_CloseMapTokensToSourceSpans(ISymUnmanagedWriter5 *iface)
+ {
+-    FIXME("(%p)\n", iface);
+-    return S_OK;
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("(%p)\n", iface);
++
++    EnterCriticalSection(&This->lock);
++    if (!This->map_spans_open) hr = E_UNEXPECTED;
++    This->map_spans_open = FALSE;
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_MapTokenToSourceSpan(ISymUnmanagedWriter5 *iface, mdToken token, ISymUnmanagedDocumentWriter* document,
+                                  ULONG32 line, ULONG32 column, ULONG32 endLine, ULONG32 endColumn)
+ {
+-    FIXME("(%p,%x,%p,%u,%u,%u,%u)\n", iface, token, document, line, column, endLine, endColumn);
+-    return S_OK;
+-}
++    SymWriter *This = impl_from_ISymUnmanagedWriter5(iface);
++    BOOL open;
+ 
++    FIXME("(%p,%x,%p,%u,%u,%u,%u) stub\n", iface, token, document, line, column, endLine, endColumn);
++
++    EnterCriticalSection(&This->lock);
++    open = This->map_spans_open;
++    LeaveCriticalSection(&This->lock);
++    return open ? S_OK : E_UNEXPECTED;
++}
+ 
+ static const ISymUnmanagedWriter5Vtbl SymWriter_Vtbl = {
+     SymWriter_QueryInterface,
+@@ -539,26 +1796,61 @@
+ 
+ static HRESULT WINAPI SymWriter_SetPath(IPdbWriter *iface, const WCHAR *fullpath, IStream *stream, BOOL fullbuild)
+ {
+-    FIXME("(%p,%s,%p,%u)\n", iface, debugstr_w(fullpath), stream, fullbuild);
+-    return E_NOTIMPL;
++    SymWriter *This = impl_from_IPdbWriter(iface);
++
++    TRACE("(%p,%s,%p,%u)\n", iface, debugstr_w(fullpath), stream, fullbuild);
++
++    if (!fullpath && !stream)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&This->lock);
++    set_paths(This, fullpath, fullpath, stream);
++    LeaveCriticalSection(&This->lock);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI SymWriter_OpenMod(IPdbWriter *iface, const WCHAR *modulename, const WCHAR *fullpath)
+ {
+-    FIXME("(%p,%s,%s)\n", iface, debugstr_w(modulename), debugstr_w(fullpath));
+-    return E_NOTIMPL;
++    SymWriter *This = impl_from_IPdbWriter(iface);
++
++    TRACE("(%p,%s,%s)\n", iface, debugstr_w(modulename), debugstr_w(fullpath));
++
++    if (!modulename)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&This->lock);
++    wcsncpy_s(This->module_name, MAX_PATH, fullpath ? fullpath : modulename, _TRUNCATE);
++    LeaveCriticalSection(&This->lock);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI SymWriter_CloseMod(IPdbWriter *iface)
+ {
+-    FIXME("(%p)\n", iface);
++    TRACE("(%p)\n", iface);
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI SymWriter_GetPath(IPdbWriter *iface, DWORD ccData, DWORD *pccData, WCHAR *path)
+ {
+-    FIXME("(%p,%lu,%p,%p)\n", iface, ccData, pccData, path);
+-    return E_NOTIMPL;
++    SymWriter *This = impl_from_IPdbWriter(iface);
++    DWORD len;
++    HRESULT hr = S_OK;
++
++    TRACE("(%p,%lu,%p,%p)\n", iface, ccData, pccData, path);
++
++    EnterCriticalSection(&This->lock);
++    len = wcslen(This->pdb_filename) + 1;
++    if (pccData)
++        *pccData = len;
++    if (path)
++    {
++        if (ccData < len)
++            hr = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++        else
++            memcpy(path, This->pdb_filename, len * sizeof(WCHAR));
++    }
++    LeaveCriticalSection(&This->lock);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI SymWriter_GetSignatureAge(IPdbWriter *iface, DWORD *timestamp, DWORD *age)
+@@ -595,7 +1887,7 @@
+     SymWriter *This;
+     HRESULT hr;
+ 
+-    This = malloc(sizeof(*This));
++    This = calloc(1, sizeof(*This));
+     if (!This)
+         return E_OUTOFMEMORY;
+ 
+@@ -606,7 +1898,8 @@
+     This->lock.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": SymWriter.lock");
+     UuidCreate(&This->pdb_guid);
+     This->pdb_age = 1;
+-    This->pdb_filename[0] = 0;
++    This->cur_method = -1;
++    This->cur_scope = -1;
+ 
+     hr = IUnknown_QueryInterface(&This->iface, iid, ppv);
+ 
