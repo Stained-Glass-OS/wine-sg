@@ -32,3 +32,25 @@ and /var/tmp/stubs-agent do not exist there. Use these instead:
 6. Everything else in RULES.md applies unchanged: patch numbers 2800-2999,
    branch stubs-5, no pushes to main, no release.sh, no email, scratch HOME
    for every Wine run, no VMs.
+
+## Update 2026-10-12 (round 2 for drafter 5)
+- Everything you pushed through 2996 is merged on main (10.0-410..416). Fetch
+  and rebase stubs-5 on origin/main first; never edit a merged patch (a fix to
+  one is a NEW patch).
+- NEW QUEUE: docs/stubs/audit5-drafter5.json (your group's remaining 724
+  items, 595 real gaps, highest score first; from an audit of current main,
+  docs/stubs/audit5.md). The old audit3-drafter5.json is out of date.
+  Biggest: winegstreamer, qcap, dsdmo, dxva2, dmime, mf, dmusic, dmstyle,
+  quartz, mmdevapi, dmsynth, evr, amstream, windows.gaming.*, devenum.
+- NEW PATCH RANGE: 4000-4499 (2800-2999 is used up).
+- WORK IN FAST MODE (RULES.md "FAST MODE"): your DLLs are long-tail, so write
+  a whole DLL's remaining items, compile only that DLL as you go, then run its
+  conformance tests and the regression comparison against stock wine at the
+  end, one patch per DLL, push once per group of DLLs. Keep the hard safety
+  rules (scratch HOME/WINEPREFIX for every Wine run).
+- Lint: every test script that runs Wine must have
+  `. "$(dirname "$0")/scratch-home.sh"` as line 2 (your
+  dinput-hidusage-gate.sh missed it and failed CI); helper scripts sourced by
+  gates must not be named *-gate.sh.
+- Never turn a FIXME into a quiet TRACE unless the function now really does
+  what Windows does.

@@ -72,6 +72,37 @@ behaves. An Opus "integrator" merges your branch into main; you never push to ma
   series to name the culprit patch; a culprit outside your group goes to
   ESCALATE.md. (Drafter 2 found a spurious file-change notification this way.)
 
+## Hard safety rules (2026-10-10, after two incidents)
+- Never run any wine/wineserver/wineboot binary bare, not even a quick one-off:
+  always a scratch HOME and WINEPREFIX under /var/tmp and
+  WINEDLLOVERRIDES=winemenubuilder.exe=d. A bare run touched David's real
+  ~/.wine. David's real HOME (Desktop, Documents, ~/.wine) must never be read
+  or written by a test.
+- Never delete anything outside your own /var/tmp/drafter-N or a temp directory
+  your own running command created. No rm with globs over shared /var/tmp names:
+  other agents' gates use them while running.
+
+## FAST MODE (long-tail DLLs only; David 2026-10-12)
+For DLLs listed as fast-mode in your prompt (never core, Office-facing, browser,
+security or installer DLLs), the per-batch rules above are replaced by:
+1. Write ALL the remaining stubs/todo items of one DLL in one go (ranked list
+   first, then everything else that has documentation or Wine test ground truth).
+2. After each file or two, compile ONLY that DLL (and its tests):
+   `buildslot.sh make -j3 dlls/NAME dlls/NAME/tests` -- seconds to minutes. Fix
+   compile errors and warnings immediately. No full builds, no hand-written gate
+   per batch, no mutants, no push, no CI while writing.
+3. When the DLL is done: run Wine's own conformance tests for it (64- and 32-bit)
+   and the regression comparison against stock wine; fix everything that passes
+   on stock but fails on ours, remove todo_wine marks that now pass. Write ONE
+   patch for the DLL (or a few by area), with a notes file listing what was
+   implemented and what is unverified. A small smoke gate per DLL is enough
+   (load the DLL, call a handful of the new functions) -- it must source
+   scratch-home.sh on line 2.
+4. Push once per group of DLLs (every few hours), not per batch; the integrator
+   does the full build, the broad gates and the Office/browser checks.
+Hard safety rules, scratch HOME, build slots and "fixes to merged patches are new
+patches" still apply in fast mode.
+
 ## Your branch
 - A worktree of wine-sg on your own branch: `git -C /home/david/Stained-Glass-OS/wine-sg
   worktree add /var/tmp/drafter-N/wsg -b stubs-N origin/main` (first time), then push
