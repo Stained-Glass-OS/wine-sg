@@ -99,4 +99,9 @@ run 'tasklist /fi "modules eq shell32.dll" /nh /fo csv'
 check "processes with shell32" "$(grep -q '^"cmd.exe"' "$T/o"; echo $?)"
 run "net user $me"
 check "net user shows local group memberships" "$(grep -q 'Local Group Memberships .*\*Users' "$T/o"; echo $?)"
+echo "== robocopy /maxage /minage"
+run 'mkdir c:\rs & echo a> c:\rs\new.txt & echo b> c:\rs\old.txt & robocopy c:\rs c:\rd /maxage:1800 /njh /njs /ndl & dir /b c:\rd'
+check "files younger than the limit are copied" "$(grep -q '^new.txt' "$T/o"; echo $?)"
+run 'robocopy c:\rs c:\rd2 /minage:1800 /njh /njs /ndl & dir /b c:\rd2'
+check "nothing is old enough" "$(! grep -q 'new.txt' "$T/o"; echo $?)"
 exit $RC
