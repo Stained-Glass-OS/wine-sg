@@ -124,7 +124,8 @@ int main(void)
             if (found) IUIAutomationElement_Release(found);
             hr = IUIAutomationElement9_FindFirstWithOptions(root9, TreeScope_Children, cond,
                     TreeTraversalOptions_PostOrder, NULL, &found);
-            check(hr == E_NOTIMPL, "post-order traversal is reported as unsupported");
+            check(SUCCEEDED(hr), "post-order traversal works");
+            if (found) IUIAutomationElement_Release(found);
             IUIAutomationElement9_Release(root9);
         }
     }
