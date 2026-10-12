@@ -670,16 +670,38 @@ static void test_avifil32(void)
                   "info changed: %ls %#x %lu", info.szName, info.wLanguage, info.dwEditCount);
             hr = stream->lpVtbl->SetInfo(stream, &info, sizeof(info) - 1);
             check(hr == AVIERR_BADSIZE, "SetInfo(short): %#lx", hr);
+            if (info.dwLength == 4)
+            {
+                /* a frame added to the existing file goes after its frames */
+                BYTE frame[768];
+
+                memset(frame, 0x77, sizeof(frame));
+                hr = AVIStreamWrite(stream, 4, 1, frame, sizeof(frame), AVIIF_KEYFRAME, NULL, NULL);
+                check(hr == AVIERR_OK, "AVIStreamWrite(frame 4): %#lx", hr);
+            }
             AVIStreamRelease(stream);
         }
         AVIFileRelease(file);
     }
     hr = AVIFileOpenW(&file, L"smoke.avi", OF_READ, NULL);
+    check(hr == AVIERR_OK, "reopen after saving: %#lx", hr);
     if (hr == AVIERR_OK)
     {
         if (AVIFileGetStream(file, &stream, streamtypeVIDEO, 0) == AVIERR_OK)
         {
+            BYTE frame[768];
+            LONG bytes = 0, samples = 0;
+
             AVIStreamInfoW(stream, &info, sizeof(info));
+            /* the longer header moved the frames (the generated file has no header room) */
+            check(!wcscmp(info.szName, L"smoke video") && info.dwLength >= 5, "saved info: %ls, %lu frames",
+                  info.szName, info.dwLength);
+            memset(frame, 0, sizeof(frame));
+            hr = AVIStreamRead(stream, 3, 1, frame, sizeof(frame), &bytes, &samples);
+            check(hr == AVIERR_OK && bytes == sizeof(frame) && frame[0] == 0x40 && frame[1] == 0x80 && frame[767] == 0xc0,
+                  "frame 3 after the move: %#lx %ld %02x%02x", hr, bytes, frame[0], frame[1]);
+            hr = AVIStreamRead(stream, 4, 1, frame, sizeof(frame), &bytes, &samples);
+            check(hr == AVIERR_OK && frame[0] == 0x77 && frame[767] == 0x77, "added frame 4: %#lx %02x", hr, frame[0]);
             hr = stream->lpVtbl->SetInfo(stream, &info, sizeof(info));
             check(hr == AVIERR_READONLY, "SetInfo on a read-only file: %#lx", hr);
             AVIStreamRelease(stream);
