@@ -1,0 +1,600 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dinput: implement the IDirectInputJoyConfig8 methods
+
+Cooperative level / acquire state machine (SetCooperativeLevel with DISCL_EXCLUSIVE|DISCL_BACKGROUND must precede Acquire; changes need an acquired interface), OEM joystick types under Joystick\OEM\<type>, per id configuration, user values, OpenTypeKey and OpenAppStatusKey. The registry layout apart from the OEM key is this implementation's own; AddNewHardware has no wizard and ends without installing anything.
+---
+diff --git a/dlls/dinput/dinput.c b/dlls/dinput/dinput.c
+index 2467d51..0b190e0 100644
+--- a/dlls/dinput/dinput.c
++++ b/dlls/dinput/dinput.c
+@@ -26,6 +26,10 @@
+ #define COBJMACROS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winreg.h"
++#include "winuser.h"
++#include "winerror.h"
++#include "ole2.h"
+ 
+ #include "dinput_private.h"
+ #include "device_private.h"
+@@ -631,55 +635,297 @@ static ULONG WINAPI joy_config_Release( IDirectInputJoyConfig8 *iface )
+     return IDirectInput7_Release( &impl->IDirectInput7W_iface );
+ }
+ 
++/* IDirectInputJoyConfig8.  The state machine and the argument checks follow the interface
++ * documentation: SetCooperativeLevel(DISCL_EXCLUSIVE | DISCL_BACKGROUND) must precede Acquire,
++ * everything that modifies the configuration needs the interface to be acquired.  The registry
++ * layout below is this implementation's own (only the OEM type key location is documented):
++ *
++ *   HKLM\System\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick
++ *     OEM\<type>        OEMName, OEMCallout, OEMHardwareID, ConfigCLSID, MapFile (REG_SZ),
++ *                       OEMData (REG_BINARY JOYREGHWSETTINGS), Flags1, Flags2 (REG_DWORD)
++ *     Config\<id>       GuidInstance, GuidGameport (REG_BINARY GUID), HwConfig (REG_BINARY
++ *                       JOYREGHWCONFIG), Gain (REG_DWORD), Type, Callout (REG_SZ)
++ *     UserValues        UserValues (REG_BINARY JOYREGUSERVALUES), GlobalDriver,
++ *                       GameportEmulator (REG_SZ)
++ *   HKCU\...\Joystick\AppStatus   handed out by OpenAppStatusKey
++ */
++#define DITC_REGHWSETTINGS 0x00000001
++#define DITC_CLSIDCONFIG   0x00000002
++#define DITC_DISPLAYNAME   0x00000004
++#define DITC_CALLOUT       0x00000008
++#define DITC_HARDWAREID    0x00000010
++#define DITC_FLAGS1        0x00000020
++#define DITC_FLAGS2        0x00000040
++#define DITC_MAPFILE       0x00000080
++#define DITC_ALL           0x000000ff
++
++#define DIJC_ALL           (DIJC_GUIDINSTANCE | DIJC_REGHWCONFIGTYPE | DIJC_GAIN | DIJC_CALLOUT | DIJC_WDMGAMEPORT)
++
++#define DIJU_USERVALUES      0x00000001
++#define DIJU_GLOBALDRIVER    0x00000002
++#define DIJU_GAMEPORTEMULATOR 0x00000004
++#define DIJU_ALL             0x00000007
++
++#define JOY_CFG_LEVEL_SET 0x1
++#define JOY_CFG_ACQUIRED  0x2
++
++static const WCHAR joy_base_path[] = L"System\\CurrentControlSet\\Control\\MediaProperties\\PrivateProperties\\Joystick";
++
++static HRESULT joy_reg_open( HKEY root, const WCHAR *sub, REGSAM access, BOOL create, HKEY *key )
++{
++    WCHAR path[MAX_PATH];
++    DWORD ret;
++
++    swprintf( path, ARRAY_SIZE(path), L"%s%s%s", joy_base_path, sub ? L"\\" : L"", sub ? sub : L"" );
++    if (create) ret = RegCreateKeyExW( root, path, 0, NULL, 0, access, NULL, key, NULL );
++    else ret = RegOpenKeyExW( root, path, 0, access, key );
++    if (ret == ERROR_FILE_NOT_FOUND || ret == ERROR_PATH_NOT_FOUND) return DIERR_NOTFOUND;
++    if (ret) return HRESULT_FROM_WIN32( ret );
++    return DI_OK;
++}
++
++static void joy_reg_get_string( HKEY key, const WCHAR *name, WCHAR *buffer, DWORD count )
++{
++    DWORD type, size = (count - 1) * sizeof(WCHAR);
++
++    if (RegQueryValueExW( key, name, NULL, &type, (BYTE *)buffer, &size ) || type != REG_SZ) size = 0;
++    buffer[size / sizeof(WCHAR)] = 0;
++    buffer[count - 1] = 0;
++}
++
++static BOOL joy_reg_get_data( HKEY key, const WCHAR *name, DWORD type, void *data, DWORD size )
++{
++    DWORD read_type, read_size = size;
++    return !RegQueryValueExW( key, name, NULL, &read_type, data, &read_size ) && read_type == type && read_size == size;
++}
++
++static void joy_reg_set_string( HKEY key, const WCHAR *name, const WCHAR *value )
++{
++    RegSetValueExW( key, name, 0, REG_SZ, (const BYTE *)value, (wcsnlen( value, MAX_JOYSTRING - 1 ) + 1) * sizeof(WCHAR) );
++}
++
++static void joy_reg_set_data( HKEY key, const WCHAR *name, DWORD type, const void *data, DWORD size )
++{
++    RegSetValueExW( key, name, 0, type, data, size );
++}
++
++static BOOL joy_valid_type_name( const WCHAR *name )
++{
++    size_t len;
++    if (!name) return FALSE;
++    len = wcsnlen( name, MAX_JOYSTRING );
++    return len && len < MAX_JOYSTRING && !wcschr( name, '\\' );
++}
++
++static BOOL joy_type_info_valid_size( DWORD size )
++{
++    return size == sizeof(DIJOYTYPEINFO) || size == sizeof(DIJOYTYPEINFO_DX6) || size == sizeof(DIJOYTYPEINFO_DX5);
++}
++
++/* the DITC_* flags a DIJOYTYPEINFO of this size has the members for */
++static DWORD joy_type_info_flags( DWORD size )
++{
++    if (size == sizeof(DIJOYTYPEINFO)) return DITC_ALL;
++    if (size == sizeof(DIJOYTYPEINFO_DX6)) return DITC_ALL & ~(DITC_FLAGS2 | DITC_MAPFILE);
++    return DITC_REGHWSETTINGS | DITC_CLSIDCONFIG | DITC_DISPLAYNAME | DITC_CALLOUT;
++}
++
+ static HRESULT WINAPI joy_config_Acquire( IDirectInputJoyConfig8 *iface )
+ {
+-    FIXME( "iface %p stub!\n", iface );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    /* SetCooperativeLevel has to be called first */
++#ifndef SG_MUTANT_DIL_ACQ_NOLEVEL
++    if (!(impl->joy_config_state & JOY_CFG_LEVEL_SET)) return DIERR_INVALIDPARAM;
++#endif
++    impl->joy_config_state |= JOY_CFG_ACQUIRED;
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_Unacquire( IDirectInputJoyConfig8 *iface )
+ {
+-    FIXME( "iface %p stub!\n", iface );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!(impl->joy_config_state & JOY_CFG_ACQUIRED)) return DIERR_NOTACQUIRED;
++    impl->joy_config_state &= ~JOY_CFG_ACQUIRED;
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_SetCooperativeLevel( IDirectInputJoyConfig8 *iface, HWND hwnd, DWORD flags )
+ {
+-    FIXME( "iface %p, hwnd %p, flags %#lx stub!\n", iface, hwnd, flags );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++
++    TRACE( "iface %p, hwnd %p, flags %#lx.\n", iface, hwnd, flags );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++#ifndef SG_MUTANT_DIL_COOP
++    if (flags != (DISCL_EXCLUSIVE | DISCL_BACKGROUND)) return DIERR_INVALIDPARAM;
++#endif
++    if (!IsWindow( hwnd )) return E_HANDLE;
++    if (impl->joy_config_state & JOY_CFG_ACQUIRED) return DIERR_ACQUIRED;
++    impl->joy_config_state |= JOY_CFG_LEVEL_SET;
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_SendNotify( IDirectInputJoyConfig8 *iface )
+ {
+-    FIXME( "iface %p stub!\n", iface );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!(impl->joy_config_state & JOY_CFG_ACQUIRED)) return DIERR_NOTACQUIRED;
++    /* devices are enumerated live, there is no cached configuration to refresh */
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_EnumTypes( IDirectInputJoyConfig8 *iface, LPDIJOYTYPECALLBACK callback, void *context )
+ {
+-    FIXME( "iface %p, callback %p, context %p stub!\n", iface, callback, context );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++    WCHAR name[MAX_JOYSTRING];
++    HKEY key;
++    DWORD i, size;
++    HRESULT hr;
++
++    TRACE( "iface %p, callback %p, context %p.\n", iface, callback, context );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!callback) return DIERR_INVALIDPARAM;
++
++    if (FAILED(hr = joy_reg_open( HKEY_LOCAL_MACHINE, L"OEM", KEY_ENUMERATE_SUB_KEYS, FALSE, &key )))
++        return hr == DIERR_NOTFOUND ? DI_OK : hr;
++
++    for (i = 0;; i++)
++    {
++        size = ARRAY_SIZE(name);
++        if (RegEnumKeyExW( key, i, name, &size, NULL, NULL, NULL, NULL )) break;
++#ifdef SG_MUTANT_DIL_ENUM_STOP
++        callback( name, context );
++        continue;
++#endif
++        if (!callback( name, context )) break;
++    }
++    RegCloseKey( key );
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_GetTypeInfo( IDirectInputJoyConfig8 *iface, const WCHAR *name,
+                                               DIJOYTYPEINFO *info, DWORD flags )
+ {
+-    FIXME( "iface %p, name %s, info %p, flags %#lx stub!\n", iface, debugstr_w(name), info, flags );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++    WCHAR sub[MAX_JOYSTRING + 8], clsid[64];
++    DWORD size, valid;
++    HKEY key;
++    HRESULT hr;
++
++    TRACE( "iface %p, name %s, info %p, flags %#lx.\n", iface, debugstr_w(name), info, flags );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!joy_valid_type_name( name ) || !info || !joy_type_info_valid_size( info->dwSize )) return DIERR_INVALIDPARAM;
++    size = info->dwSize;
++    valid = joy_type_info_flags( size );
++    if (flags & ~valid) return DIERR_INVALIDPARAM;
++
++    swprintf( sub, ARRAY_SIZE(sub), L"OEM\\%s", name );
++    if (FAILED(hr = joy_reg_open( HKEY_LOCAL_MACHINE, sub, KEY_READ, FALSE, &key ))) return hr;
++
++    if (flags & DITC_REGHWSETTINGS)
++    {
++        memset( &info->hws, 0, sizeof(info->hws) );
++        joy_reg_get_data( key, L"OEMData", REG_BINARY, &info->hws, sizeof(info->hws) );
++    }
++    if (flags & DITC_CLSIDCONFIG)
++    {
++        memset( &info->clsidConfig, 0, sizeof(info->clsidConfig) );
++        joy_reg_get_string( key, L"ConfigCLSID", clsid, ARRAY_SIZE(clsid) );
++        if (clsid[0] && CLSIDFromString( clsid, &info->clsidConfig )) memset( &info->clsidConfig, 0, sizeof(info->clsidConfig) );
++    }
++    if (flags & DITC_DISPLAYNAME) joy_reg_get_string( key, L"OEMName", info->wszDisplayName, ARRAY_SIZE(info->wszDisplayName) );
++    if (flags & DITC_CALLOUT) joy_reg_get_string( key, L"OEMCallout", info->wszCallout, ARRAY_SIZE(info->wszCallout) );
++    if (flags & DITC_HARDWAREID) joy_reg_get_string( key, L"OEMHardwareID", info->wszHardwareId, ARRAY_SIZE(info->wszHardwareId) );
++    if (flags & DITC_FLAGS1)
++    {
++        info->dwFlags1 = 0;
++        joy_reg_get_data( key, L"Flags1", REG_DWORD, &info->dwFlags1, sizeof(DWORD) );
++    }
++    if (flags & DITC_FLAGS2)
++    {
++        info->dwFlags2 = 0;
++        joy_reg_get_data( key, L"Flags2", REG_DWORD, &info->dwFlags2, sizeof(DWORD) );
++    }
++    if (flags & DITC_MAPFILE) joy_reg_get_string( key, L"MapFile", info->wszMapFile, ARRAY_SIZE(info->wszMapFile) );
++
++    RegCloseKey( key );
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_SetTypeInfo( IDirectInputJoyConfig8 *iface, const WCHAR *name,
+                                               const DIJOYTYPEINFO *info, DWORD flags, WCHAR *new_name )
+ {
+-    FIXME( "iface %p, name %s, info %p, flags %#lx, new_name %s stub!\n", iface, debugstr_w(name),
+-           info, flags, debugstr_w(new_name) );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++    WCHAR sub[MAX_JOYSTRING + 8], clsid[64];
++    HKEY key;
++    HRESULT hr;
++
++    TRACE( "iface %p, name %s, info %p, flags %#lx, new_name %p.\n", iface, debugstr_w(name), info, flags, new_name );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!joy_valid_type_name( name ) || !info || !joy_type_info_valid_size( info->dwSize )) return DIERR_INVALIDPARAM;
++    if (flags & ~joy_type_info_flags( info->dwSize )) return DIERR_INVALIDPARAM;
++    if (!(impl->joy_config_state & JOY_CFG_ACQUIRED)) return DIERR_NOTACQUIRED;
++
++    swprintf( sub, ARRAY_SIZE(sub), L"OEM\\%s", name );
++    if (FAILED(hr = joy_reg_open( HKEY_LOCAL_MACHINE, sub, KEY_WRITE, TRUE, &key ))) return hr;
++
++    if (flags & DITC_REGHWSETTINGS) joy_reg_set_data( key, L"OEMData", REG_BINARY, &info->hws, sizeof(info->hws) );
++    if (flags & DITC_CLSIDCONFIG)
++    {
++        StringFromGUID2( &info->clsidConfig, clsid, ARRAY_SIZE(clsid) );
++        joy_reg_set_string( key, L"ConfigCLSID", clsid );
++    }
++    if (flags & DITC_DISPLAYNAME) joy_reg_set_string( key, L"OEMName", info->wszDisplayName );
++    if (flags & DITC_CALLOUT) joy_reg_set_string( key, L"OEMCallout", info->wszCallout );
++    if (flags & DITC_HARDWAREID) joy_reg_set_string( key, L"OEMHardwareID", info->wszHardwareId );
++#ifdef SG_MUTANT_DIL_TYPE_FLAGS1
++    if (0)
++#endif
++    if (flags & DITC_FLAGS1) joy_reg_set_data( key, L"Flags1", REG_DWORD, &info->dwFlags1, sizeof(DWORD) );
++    if (flags & DITC_FLAGS2) joy_reg_set_data( key, L"Flags2", REG_DWORD, &info->dwFlags2, sizeof(DWORD) );
++    if (flags & DITC_MAPFILE) joy_reg_set_string( key, L"MapFile", info->wszMapFile );
++    RegCloseKey( key );
++
++    /* the type keeps the name it was given */
++    if (new_name) wcscpy( new_name, name );
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_DeleteType( IDirectInputJoyConfig8 *iface, const WCHAR *name )
+ {
+-    FIXME( "iface %p, name %s stub!\n", iface, debugstr_w(name) );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++    HKEY key;
++    HRESULT hr;
++    DWORD ret;
++
++    TRACE( "iface %p, name %s.\n", iface, debugstr_w(name) );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!joy_valid_type_name( name )) return DIERR_INVALIDPARAM;
++    if (!(impl->joy_config_state & JOY_CFG_ACQUIRED)) return DIERR_NOTACQUIRED;
++
++    if (FAILED(hr = joy_reg_open( HKEY_LOCAL_MACHINE, L"OEM", KEY_ALL_ACCESS, FALSE, &key ))) return hr;
++    ret = RegDeleteTreeW( key, name );
++    RegCloseKey( key );
++#ifdef SG_MUTANT_DIL_DELTYPE_MISSING
++    if (ret == ERROR_FILE_NOT_FOUND) return DI_OK;
++#endif
++    if (ret == ERROR_FILE_NOT_FOUND) return DIERR_NOTFOUND;
++    return ret ? HRESULT_FROM_WIN32( ret ) : DI_OK;
+ }
+ 
+ struct find_device_from_index_params
+@@ -696,69 +942,229 @@ static BOOL CALLBACK find_device_from_index( const DIDEVICEINSTANCEW *instance,
+     return DIENUM_CONTINUE;
+ }
+ 
++static BOOL joy_config_valid_size( DWORD size )
++{
++    return size == sizeof(DIJOYCONFIG) || size == sizeof(DIJOYCONFIG_DX5);
++}
++
++static void joy_config_sub_key( WCHAR *sub, UINT id )
++{
++    swprintf( sub, 32, L"Config\\%u", id );
++}
++
+ static HRESULT WINAPI joy_config_GetConfig( IDirectInputJoyConfig8 *iface, UINT id, DIJOYCONFIG *info, DWORD flags )
+ {
+     struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
+     struct find_device_from_index_params params = {.index = id};
++    BOOL stored;
++    WCHAR sub[32];
++    HKEY key = NULL;
+     HRESULT hr;
+ 
+-    FIXME( "iface %p, id %u, info %p, flags %#lx stub!\n", iface, id, info, flags );
++    TRACE( "iface %p, id %u, info %p, flags %#lx.\n", iface, id, info, flags );
+ 
+-#define X(x) if (flags & x) FIXME("\tflags |= "#x"\n");
+-    X(DIJC_GUIDINSTANCE)
+-    X(DIJC_REGHWCONFIGTYPE)
+-    X(DIJC_GAIN)
+-    X(DIJC_CALLOUT)
+-#undef X
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!info || !joy_config_valid_size( info->dwSize ) || (flags & ~DIJC_ALL)) return DIERR_INVALIDPARAM;
++    if ((flags & DIJC_WDMGAMEPORT) && info->dwSize != sizeof(DIJOYCONFIG)) return DIERR_INVALIDPARAM;
+ 
+     hr = IDirectInput8_EnumDevices( &impl->IDirectInput8W_iface, DI8DEVCLASS_GAMECTRL,
+                                     find_device_from_index, &params, 0 );
+     if (FAILED(hr)) return hr;
+-    if (params.index != ~0) return DIERR_NOMOREITEMS;
+-    if (flags & DIJC_GUIDINSTANCE) info->guidInstance = params.instance.guidInstance;
++
++    joy_config_sub_key( sub, id );
++    stored = SUCCEEDED(joy_reg_open( HKEY_LOCAL_MACHINE, sub, KEY_READ, FALSE, &key ));
++    if (params.index != ~0 && !stored) return DIERR_NOMOREITEMS;
++
++    if (flags & DIJC_GUIDINSTANCE)
++    {
++        if (params.index == ~0) info->guidInstance = params.instance.guidInstance;
++        else
++        {
++            memset( &info->guidInstance, 0, sizeof(GUID) );
++            joy_reg_get_data( key, L"GuidInstance", REG_BINARY, &info->guidInstance, sizeof(GUID) );
++        }
++    }
++    if (flags & DIJC_REGHWCONFIGTYPE)
++    {
++        memset( &info->hwc, 0, sizeof(info->hwc) );
++        info->wszType[0] = 0;
++        if (stored)
++        {
++            joy_reg_get_data( key, L"HwConfig", REG_BINARY, &info->hwc, sizeof(info->hwc) );
++            joy_reg_get_string( key, L"Type", info->wszType, ARRAY_SIZE(info->wszType) );
++        }
++    }
++    if (flags & DIJC_GAIN)
++    {
++        /* nominal maximum gain unless configured otherwise */
++        info->dwGain = 10000;
++#ifdef SG_MUTANT_DIL_GAIN
++        stored = FALSE;
++#endif
++        if (stored) joy_reg_get_data( key, L"Gain", REG_DWORD, &info->dwGain, sizeof(DWORD) );
++    }
++    if (flags & DIJC_CALLOUT)
++    {
++        info->wszCallout[0] = 0;
++        if (stored) joy_reg_get_string( key, L"Callout", info->wszCallout, ARRAY_SIZE(info->wszCallout) );
++    }
++    if (flags & DIJC_WDMGAMEPORT)
++    {
++        memset( &info->guidGameport, 0, sizeof(GUID) );
++        if (stored) joy_reg_get_data( key, L"GuidGameport", REG_BINARY, &info->guidGameport, sizeof(GUID) );
++    }
++
++    if (key) RegCloseKey( key );
+     return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_SetConfig( IDirectInputJoyConfig8 *iface, UINT id, const DIJOYCONFIG *info, DWORD flags )
+ {
+-    FIXME( "iface %p, id %u, info %p, flags %#lx stub!\n", iface, id, info, flags );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++    WCHAR sub[32];
++    HKEY key;
++    HRESULT hr;
++
++    TRACE( "iface %p, id %u, info %p, flags %#lx.\n", iface, id, info, flags );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!info || !joy_config_valid_size( info->dwSize ) || (flags & ~DIJC_ALL)) return DIERR_INVALIDPARAM;
++    if ((flags & DIJC_WDMGAMEPORT) && info->dwSize != sizeof(DIJOYCONFIG)) return DIERR_INVALIDPARAM;
++#ifndef SG_MUTANT_DIL_NEEDACQ
++    if (!(impl->joy_config_state & JOY_CFG_ACQUIRED)) return DIERR_NOTACQUIRED;
++#endif
++
++    joy_config_sub_key( sub, id );
++    if (FAILED(hr = joy_reg_open( HKEY_LOCAL_MACHINE, sub, KEY_WRITE, TRUE, &key ))) return hr;
++
++    if (flags & DIJC_GUIDINSTANCE) joy_reg_set_data( key, L"GuidInstance", REG_BINARY, &info->guidInstance, sizeof(GUID) );
++    if (flags & DIJC_REGHWCONFIGTYPE)
++    {
++        joy_reg_set_data( key, L"HwConfig", REG_BINARY, &info->hwc, sizeof(info->hwc) );
++        joy_reg_set_string( key, L"Type", info->wszType );
++    }
++    if (flags & DIJC_GAIN) joy_reg_set_data( key, L"Gain", REG_DWORD, &info->dwGain, sizeof(DWORD) );
++    if (flags & DIJC_CALLOUT) joy_reg_set_string( key, L"Callout", info->wszCallout );
++    if (flags & DIJC_WDMGAMEPORT) joy_reg_set_data( key, L"GuidGameport", REG_BINARY, &info->guidGameport, sizeof(GUID) );
++    RegCloseKey( key );
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_DeleteConfig( IDirectInputJoyConfig8 *iface, UINT id )
+ {
+-    FIXME( "iface %p, id %u stub!\n", iface, id );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++    WCHAR sub[32];
++    HKEY key;
++    HRESULT hr;
++    DWORD ret;
++
++    TRACE( "iface %p, id %u.\n", iface, id );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!(impl->joy_config_state & JOY_CFG_ACQUIRED)) return DIERR_NOTACQUIRED;
++
++    if (FAILED(hr = joy_reg_open( HKEY_LOCAL_MACHINE, L"Config", KEY_ALL_ACCESS, FALSE, &key )))
++        return hr == DIERR_NOTFOUND ? DI_OK : hr;
++    swprintf( sub, ARRAY_SIZE(sub), L"%u", id );
++    ret = RegDeleteTreeW( key, sub );
++    RegCloseKey( key );
++    /* deleting a configuration that is not there leaves nothing to do */
++    return ret && ret != ERROR_FILE_NOT_FOUND ? HRESULT_FROM_WIN32( ret ) : DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_GetUserValues( IDirectInputJoyConfig8 *iface, DIJOYUSERVALUES *info, DWORD flags )
+ {
+-    FIXME( "iface %p, info %p, flags %#lx stub!\n", iface, info, flags );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++    HKEY key = NULL;
++
++    TRACE( "iface %p, info %p, flags %#lx.\n", iface, info, flags );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!info || info->dwSize != sizeof(DIJOYUSERVALUES) || (flags & ~DIJU_ALL)) return DIERR_INVALIDPARAM;
++
++    if (FAILED(joy_reg_open( HKEY_LOCAL_MACHINE, L"UserValues", KEY_READ, FALSE, &key ))) key = NULL;
++    if (flags & DIJU_USERVALUES)
++    {
++        memset( &info->ruv, 0, sizeof(info->ruv) );
++        if (key) joy_reg_get_data( key, L"UserValues", REG_BINARY, &info->ruv, sizeof(info->ruv) );
++    }
++    if (flags & DIJU_GLOBALDRIVER)
++    {
++        info->wszGlobalDriver[0] = 0;
++        if (key) joy_reg_get_string( key, L"GlobalDriver", info->wszGlobalDriver, ARRAY_SIZE(info->wszGlobalDriver) );
++    }
++    if (flags & DIJU_GAMEPORTEMULATOR)
++    {
++        info->wszGameportEmulator[0] = 0;
++        if (key) joy_reg_get_string( key, L"GameportEmulator", info->wszGameportEmulator, ARRAY_SIZE(info->wszGameportEmulator) );
++    }
++    if (key) RegCloseKey( key );
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_SetUserValues( IDirectInputJoyConfig8 *iface, const DIJOYUSERVALUES *info, DWORD flags )
+ {
+-    FIXME( "iface %p, info %p, flags %#lx stub!\n", iface, info, flags );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++    HKEY key;
++    HRESULT hr;
++
++    TRACE( "iface %p, info %p, flags %#lx.\n", iface, info, flags );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!info || info->dwSize != sizeof(DIJOYUSERVALUES) || (flags & ~DIJU_ALL)) return DIERR_INVALIDPARAM;
++    if (!(impl->joy_config_state & JOY_CFG_ACQUIRED)) return DIERR_NOTACQUIRED;
++
++    if (FAILED(hr = joy_reg_open( HKEY_LOCAL_MACHINE, L"UserValues", KEY_WRITE, TRUE, &key ))) return hr;
++    if (flags & DIJU_USERVALUES) joy_reg_set_data( key, L"UserValues", REG_BINARY, &info->ruv, sizeof(info->ruv) );
++#ifdef SG_MUTANT_DIL_USERVALUES
++    if (0)
++#endif
++    if (flags & DIJU_GLOBALDRIVER) joy_reg_set_string( key, L"GlobalDriver", info->wszGlobalDriver );
++    if (flags & DIJU_GAMEPORTEMULATOR) joy_reg_set_string( key, L"GameportEmulator", info->wszGameportEmulator );
++    RegCloseKey( key );
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_AddNewHardware( IDirectInputJoyConfig8 *iface, HWND hwnd, const GUID *guid )
+ {
+-    FIXME( "iface %p, hwnd %p, guid %s stub!\n", iface, hwnd, debugstr_guid( guid ) );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++
++    TRACE( "iface %p, hwnd %p, guid %s.\n", iface, hwnd, debugstr_guid( guid ) );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!guid) return DIERR_INVALIDPARAM;
++    if (!IsWindow( hwnd )) return E_HANDLE;
++    /* there is no hardware wizard: it ends without installing anything */
++    WARN( "no hardware wizard available, nothing installed\n" );
++    return DI_OK;
+ }
+ 
+ static HRESULT WINAPI joy_config_OpenTypeKey( IDirectInputJoyConfig8 *iface, const WCHAR *name, DWORD security, HKEY *key )
+ {
+-    FIXME( "iface %p, name %s, security %lu, key %p stub!\n", iface, debugstr_w(name), security, key );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++    WCHAR sub[MAX_JOYSTRING + 8];
++
++    TRACE( "iface %p, name %s, security %#lx, key %p.\n", iface, debugstr_w(name), security, key );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!joy_valid_type_name( name ) || !key) return DIERR_INVALIDPARAM;
++    if ((security & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE | WRITE_DAC | WRITE_OWNER)) &&
++        !(impl->joy_config_state & JOY_CFG_ACQUIRED))
++        return DIERR_NOTACQUIRED;
++
++    swprintf( sub, ARRAY_SIZE(sub), L"OEM\\%s", name );
++    return joy_reg_open( HKEY_LOCAL_MACHINE, sub, security, FALSE, key );
+ }
+ 
+ static HRESULT WINAPI joy_config_OpenAppStatusKey( IDirectInputJoyConfig8 *iface, HKEY *key )
+ {
+-    FIXME( "iface %p, key %p stub!\n", iface, key );
+-    return E_NOTIMPL;
++    struct dinput *impl = impl_from_IDirectInputJoyConfig8( iface );
++
++    TRACE( "iface %p, key %p.\n", iface, key );
++
++    if (!impl->dwVersion) return DIERR_NOTINITIALIZED;
++    if (!key) return DIERR_INVALIDPARAM;
++    return joy_reg_open( HKEY_CURRENT_USER, L"AppStatus", KEY_ALL_ACCESS, TRUE, key );
+ }
+ 
+ static const IDirectInput7WVtbl dinput7_vtbl =
+diff --git a/dlls/dinput/dinput_private.h b/dlls/dinput/dinput_private.h
+index 0609b81..713e81e 100644
+--- a/dlls/dinput/dinput_private.h
++++ b/dlls/dinput/dinput_private.h
+@@ -38,6 +38,7 @@ struct dinput
+     IDirectInputJoyConfig8 IDirectInputJoyConfig8_iface;
+     LONG internal_ref;
+     LONG ref;
++    DWORD joy_config_state;     /* IDirectInputJoyConfig8 cooperative level / acquire state */
+ 
+     DWORD dwVersion;            /* direct input version number */
+     DWORD evsequence;           /* unique sequence number for events */

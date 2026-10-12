@@ -1,0 +1,287 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dmime: Stop at a time, GetResolvedTime marker / segment end
+
+IDirectMusicPerformance::Stop with a time or resolution flags, and the
+DMUS_TIME_RESOLVE_MARKER / DMUS_TIME_RESOLVE_SEGMENTEND resolutions of
+GetResolvedTime (and so of PlaySegmentEx and Stop).
+
+- GetResolvedTime / PlaySegmentEx: DMUS_TIME_RESOLVE_MARKER moves the time
+  to the next play marker (GUID_Play_Marker of the marker track) of the
+  primary segment, DMUS_TIME_RESOLVE_SEGMENTEND to the end of the primary
+  segment state. When the primary segment has no marker after the time
+  the next flag is tried, when nothing applies the time is not changed.
+  A marker or segment end wins over the grid / beat / measure flags.
+- Stop: the time is a music time (a reference time with DMUS_SEGF_REFTIME;
+  StopEx converts its 64 bit time first), moved by the resolution flags
+  (after prepare / queue / latency time, grid, beat, measure, marker,
+  segment end, DMUS_SEGF_DEFAULT = default resolution of the segment).
+  A time which is not in the future stops at once as before; a future time
+  queues an internal stop message per segment state (the state itself, the
+  states of the segment, or all of them) which stops the state when the
+  time is reached unless it ended on its own before. A later immediate Stop
+  flushes the queued stop messages of the state.
+---
+diff --git a/dlls/dmime/dmime_private.h b/dlls/dmime/dmime_private.h
+index 6806681..cf5d8c2 100644
+--- a/dlls/dmime/dmime_private.h
++++ b/dlls/dmime/dmime_private.h
+@@ -88,6 +88,8 @@ extern HRESULT segment_state_create(IDirectMusicSegment *segment, MUSIC_TIME sta
+         IDirectMusicSegmentState **ret_iface);
+ extern BOOL segment_state_has_audio_path(IDirectMusicSegmentState *iface, IDirectMusicAudioPath *path);
+ extern void segment_state_get_times(IDirectMusicSegmentState *iface, MUSIC_TIME *start, MUSIC_TIME *end);
++extern HRESULT segment_state_get_segment(IDirectMusicSegmentState *iface, IDirectMusicSegment **segment,
++        MUSIC_TIME *offset);
+ extern HRESULT segment_state_get_track(IDirectMusicSegmentState *iface, DWORD track_id,
+         MUSIC_TIME *time_offset, IDirectMusicTrack **ret_track);
+ extern BOOL segment_state_will_invalidate(IDirectMusicSegmentState *iface, MUSIC_TIME time);
+diff --git a/dlls/dmime/performance.c b/dlls/dmime/performance.c
+index 3740723..e09df84 100644
+--- a/dlls/dmime/performance.c
++++ b/dlls/dmime/performance.c
+@@ -30,6 +30,7 @@ enum dmus_internal_message_type
+     DMUS_PMSGT_INTERNAL_FIRST = 0x10,
+     DMUS_PMSGT_INTERNAL_SEGMENT_END = DMUS_PMSGT_INTERNAL_FIRST,
+     DMUS_PMSGT_INTERNAL_SEGMENT_TICK,
++    DMUS_PMSGT_INTERNAL_SEGMENT_STOP,
+ };
+ 
+ struct channel
+@@ -674,6 +675,7 @@ static BOOL message_needs_flushing(struct message *message, IDirectMusicSegmentS
+ 
+     case DMUS_PMSGT_INTERNAL_SEGMENT_TICK:
+     case DMUS_PMSGT_INTERNAL_SEGMENT_END:
++    case DMUS_PMSGT_INTERNAL_SEGMENT_STOP:
+         if ((IDirectMusicSegmentState *)message->msg.punkUser != state) return FALSE;
+         break;
+ 
+@@ -714,6 +716,53 @@ static void performance_flush_messages(struct performance *This, IDirectMusicSeg
+     }
+ }
+ 
++/* the primary segment state which plays at music time (the last one which started before it otherwise) */
++static IDirectMusicSegmentState *performance_get_primary_state(struct performance *This, MUSIC_TIME time)
++{
++    IDirectMusicSegmentState *found = NULL;
++    struct list states = LIST_INIT(states);
++    struct state_entry *entry, *next;
++    MUSIC_TIME found_start = 0;
++
++    EnterCriticalSection(&This->safe);
++    if (This->primary_segment) enum_segment_states(This, This->primary_segment, &states);
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &states, struct state_entry, entry)
++    {
++        MUSIC_TIME start, end;
++
++        segment_state_get_times(entry->state, &start, &end);
++        if (start <= time && (!found || start >= found_start))
++        {
++            if (found) IDirectMusicSegmentState_Release(found);
++            if ((found = entry->state)) IDirectMusicSegmentState_AddRef(found);
++            found_start = start;
++        }
++        state_entry_destroy(entry);
++    }
++    LeaveCriticalSection(&This->safe);
++    return found;
++}
++
++static BOOL performance_state_is_active(struct performance *This, IDirectMusicSegmentState *state)
++{
++    struct list states = LIST_INIT(states);
++    struct state_entry *entry, *next;
++    BOOL active = FALSE;
++
++    EnterCriticalSection(&This->safe);
++    enum_segment_states(This, NULL, &states);
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &states, struct state_entry, entry)
++    {
++        if (entry->state == state) active = TRUE;
++        state_entry_destroy(entry);
++    }
++    LeaveCriticalSection(&This->safe);
++    return active;
++}
++
++static HRESULT performance_resolve_time(struct performance *This, REFERENCE_TIME time, DWORD flags,
++        REFERENCE_TIME *ret_time);
++
+ static HRESULT WINAPI performance_Stop(IDirectMusicPerformance8 *iface, IDirectMusicSegment *segment,
+         IDirectMusicSegmentState *state, MUSIC_TIME music_time, DWORD flags)
+ {
+@@ -725,9 +774,59 @@ static HRESULT WINAPI performance_Stop(IDirectMusicPerformance8 *iface, IDirectM
+ 
+     TRACE("(%p, %p, %p, %ld, %#lx)\n", This, segment, state, music_time, flags);
+ 
+-    if (music_time) FIXME("time parameter %lu not implemented\n", music_time);
+-    if (flags & ~(DMUS_SEGF_DEFAULT | DMUS_SEGF_REFTIME)) FIXME("flags parameter %#lx not implemented\n", flags);
++    /* The time is in music time, or reference time with DMUS_SEGF_REFTIME, zero is now. It is moved to the
++     * boundary which the flags ask for (the segment's default resolution for DMUS_SEGF_DEFAULT) and the
++     * segment states stop when it is reached. */
++    {
++        static const DWORD resolve_flags = DMUS_SEGF_AFTERPREPARETIME | DMUS_SEGF_AFTERQUEUETIME
++                | DMUS_SEGF_AFTERLATENCYTIME | DMUS_SEGF_GRID | DMUS_SEGF_BEAT | DMUS_SEGF_MEASURE
++                | DMUS_SEGF_MARKER | DMUS_SEGF_SEGMENTEND;
++        DWORD resolve = flags & resolve_flags;
++        REFERENCE_TIME rt = 0;
++        MUSIC_TIME now;
++
++        if ((flags & DMUS_SEGF_DEFAULT) && segment)
++        {
++            DWORD resolution = 0;
++            IDirectMusicSegment_GetDefaultResolution(segment, &resolution);
++            resolve |= resolution & resolve_flags;
++        }
+ 
++        if (!music_time && !resolve) goto immediate;
++        if (FAILED(hr = IDirectMusicPerformance8_GetTime(iface, NULL, &now))) return hr;
++
++        if (flags & DMUS_SEGF_REFTIME) rt = music_time;
++        else if (music_time && FAILED(hr = IDirectMusicPerformance8_MusicToReferenceTime(iface, music_time, &rt)))
++            return hr;
++        if (resolve && FAILED(hr = performance_resolve_time(This, rt, resolve, &rt))) return hr;
++        if (FAILED(hr = IDirectMusicPerformance8_ReferenceToMusicTime(iface, rt, &music_time))) return hr;
++
++#ifdef SG_MUTANT_STOP_FUTURE
++        music_time = now;
++#endif
++        if (music_time > now)
++        {
++            EnterCriticalSection(&This->safe);
++            if (!state) enum_segment_states(This, segment, &states);
++            else if ((entry = malloc(sizeof(*entry))))
++            {
++                entry->state = state;
++                IDirectMusicSegmentState_AddRef(entry->state);
++                list_add_tail(&states, &entry->entry);
++            }
++            LIST_FOR_EACH_ENTRY_SAFE(entry, next, &states, struct state_entry, entry)
++            {
++                if (FAILED(hr = performance_send_pmsg(This, music_time, DMUS_PMSGF_TOOL_ATTIME,
++                        DMUS_PMSGT_INTERNAL_SEGMENT_STOP, (IUnknown *)entry->state)))
++                    ERR("Failed to schedule the stop of segment state %p, hr %#lx\n", entry->state, hr);
++                state_entry_destroy(entry);
++            }
++            LeaveCriticalSection(&This->safe);
++            return S_OK;
++        }
++    }
++
++immediate:
+     if (!music_time && FAILED(hr = IDirectMusicPerformance8_GetTime(iface, NULL, &music_time)))
+         return hr;
+ 
+@@ -1721,6 +1820,48 @@ static HRESULT performance_resolve_time(struct performance *This, REFERENCE_TIME
+         time = max(time, other);
+     }
+ 
++    /* the next marker of the primary segment, or the end of it */
++    if (flags & (DMUS_TIME_RESOLVE_MARKER | DMUS_TIME_RESOLVE_SEGMENTEND))
++    {
++        IDirectMusicSegmentState *state;
++        MUSIC_TIME music_time;
++
++        if (FAILED(hr = IDirectMusicPerformance8_ReferenceToMusicTime(iface, time, &music_time))) return hr;
++        if ((state = performance_get_primary_state(This, music_time)))
++        {
++            MUSIC_TIME start, end, offset, resolved = 0;
++            IDirectMusicSegment *segment;
++
++            segment_state_get_times(state, &start, &end);
++            if (SUCCEEDED(segment_state_get_segment(state, &segment, &offset)))
++            {
++                DMUS_PLAY_MARKER_PARAM marker;
++
++                BOOL want_marker = !!(flags & DMUS_TIME_RESOLVE_MARKER);
++
++#ifdef SG_MUTANT_RESOLVE_MARKER
++                want_marker = FALSE;
++#endif
++                if (want_marker && IDirectMusicSegment_GetParam(segment,
++                        &GUID_Play_Marker, -1, DMUS_SEG_ANYTRACK, music_time - offset, NULL, &marker) == S_OK)
++                    resolved = music_time + marker.mtTime;
++                IDirectMusicSegment_Release(segment);
++            }
++            IDirectMusicSegmentState_Release(state);
++
++#ifdef SG_MUTANT_RESOLVE_END
++            end = 0;
++#endif
++            if (!resolved && (flags & DMUS_TIME_RESOLVE_SEGMENTEND) && end > music_time) resolved = end;
++            if (resolved)
++            {
++                if (FAILED(hr = IDirectMusicPerformance8_MusicToReferenceTime(iface, resolved, &other))) return hr;
++                *ret_time = max(time, other);
++                return S_OK;
++            }
++        }
++    }
++
+ #ifdef SG_MUTANT_RESOLVE
+     flags = 0;
+ #endif
+@@ -1767,9 +1908,6 @@ static HRESULT WINAPI performance_GetResolvedTime(IDirectMusicPerformance8 *ifac
+ 
+     if (!resolved) return E_POINTER;
+ 
+-    if (flags & (DMUS_TIME_RESOLVE_MARKER | DMUS_TIME_RESOLVE_SEGMENTEND))
+-        FIXME("flags %#lx not implemented\n", flags & (DMUS_TIME_RESOLVE_MARKER | DMUS_TIME_RESOLVE_SEGMENTEND));
+-
+     return performance_resolve_time(This, time, flags, resolved);
+ }
+ 
+@@ -2225,7 +2363,7 @@ static HRESULT WINAPI performance_StopEx(IDirectMusicPerformance8 *iface, IUnkno
+ #ifdef SG_MUTANT_STOPEX
+     state = NULL;
+ #endif
+-    if (!path) hr = IDirectMusicPerformance8_Stop(iface, segment, state, music_time, flags);
++    if (!path) hr = IDirectMusicPerformance8_Stop(iface, segment, state, music_time, flags & ~DMUS_SEGF_REFTIME);
+     else
+     {
+         /* everything that plays on the audio path stops */
+@@ -2244,7 +2382,7 @@ static HRESULT WINAPI performance_StopEx(IDirectMusicPerformance8 *iface, IUnkno
+             if (segment_state_has_audio_path(entry->state, path)
+                     || (path == default_path && segment_state_has_audio_path(entry->state, NULL)))
+ #endif
+-                IDirectMusicPerformance8_Stop(iface, NULL, entry->state, music_time, flags);
++                IDirectMusicPerformance8_Stop(iface, NULL, entry->state, music_time, flags & ~DMUS_SEGF_REFTIME);
+             state_entry_destroy(entry);
+         }
+         LeaveCriticalSection(&This->safe);
+@@ -2940,6 +3078,14 @@ static HRESULT WINAPI performance_tool_ProcessPMsg(IDirectMusicTool *iface,
+ 
+         return S_OK;
+ 
++    case DMUS_PMSGT_INTERNAL_SEGMENT_STOP:
++        /* a stop which was asked for at a time, unless the segment state ended on its own before */
++        if (performance_state_is_active(This, (IDirectMusicSegmentState *)msg->punkUser)
++                && FAILED(hr = IDirectMusicPerformance_Stop(performance, NULL,
++                (IDirectMusicSegmentState *)msg->punkUser, 0, 0)))
++            ERR("Failed to stop segment state %p, hr %#lx\n", msg->punkUser, hr);
++        break;
++
+     case DMUS_PMSGT_INTERNAL_SEGMENT_END:
+         if (FAILED(hr = segment_state_end_play((IDirectMusicSegmentState *)msg->punkUser,
+                 (IDirectMusicPerformance8 *)performance)))
+diff --git a/dlls/dmime/segmentstate.c b/dlls/dmime/segmentstate.c
+index 24bca9e..1fc263d 100644
+--- a/dlls/dmime/segmentstate.c
++++ b/dlls/dmime/segmentstate.c
+@@ -636,6 +636,18 @@ void segment_state_get_times(IDirectMusicSegmentState *iface, MUSIC_TIME *start,
+     *end = This->start_time + (This->end_point - This->start_point) * (1 + This->actual_repeats);
+ }
+ 
++/* the segment of the state, and the performance time at which the segment's time zero is (or would be) */
++HRESULT segment_state_get_segment(IDirectMusicSegmentState *iface, IDirectMusicSegment **segment,
++        MUSIC_TIME *offset)
++{
++    struct segment_state *This = impl_from_IDirectMusicSegmentState8((IDirectMusicSegmentState8 *)iface);
++
++    *segment = This->segment;
++    IDirectMusicSegment_AddRef(This->segment);
++    *offset = This->start_time - This->start_point;
++    return S_OK;
++}
++
+ HRESULT segment_state_get_track(IDirectMusicSegmentState *iface, DWORD track_id, MUSIC_TIME *time_offset,
+         IDirectMusicTrack **ret_track)
+ {

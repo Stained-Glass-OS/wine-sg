@@ -99,8 +99,14 @@ struct msg
     BYTE midi[3];
     DWORD len;
     DWORD flags;
+    /* notes and curves */
+    MUSIC_TIME duration, reset_duration;
+    WORD music, measure;
+    short offset, start_value, end_value, reset_value;
+    BYTE midi_value, velocity, note_flags, play_mode, sub_level, beat, grid, time_range, dur_range, vel_range;
+    BYTE curve_type, shape, cc, curve_flags;
 };
-static struct msg msgs[64];
+static struct msg msgs[128];
 static int msg_count;
 
 static HRESULT WINAPI tool_QueryInterface(IDirectMusicTool *iface, REFIID riid, void **out)
@@ -150,6 +156,24 @@ static HRESULT WINAPI tool_ProcessPMsg(IDirectMusicTool *iface, IDirectMusicPerf
         m->midi[1] = ((DMUS_MIDI_PMSG *)pmsg)->bByte1;
         m->midi[2] = ((DMUS_MIDI_PMSG *)pmsg)->bByte2;
         break;
+    case DMUS_PMSGT_NOTE:
+    {
+        DMUS_NOTE_PMSG *n = (DMUS_NOTE_PMSG *)pmsg;
+        m->duration = n->mtDuration; m->music = n->wMusicValue; m->measure = n->wMeasure; m->offset = n->nOffset;
+        m->beat = n->bBeat; m->grid = n->bGrid; m->velocity = n->bVelocity; m->note_flags = n->bFlags;
+        m->time_range = n->bTimeRange; m->dur_range = n->bDurRange; m->vel_range = n->bVelRange;
+        m->play_mode = n->bPlayModeFlags; m->sub_level = n->bSubChordLevel; m->midi_value = n->bMidiValue;
+        break;
+    }
+    case DMUS_PMSGT_CURVE:
+    {
+        DMUS_CURVE_PMSG *c = (DMUS_CURVE_PMSG *)pmsg;
+        m->duration = c->mtDuration; m->reset_duration = c->mtResetDuration; m->start_value = c->nStartValue;
+        m->end_value = c->nEndValue; m->reset_value = c->nResetValue; m->measure = c->wMeasure; m->offset = c->nOffset;
+        m->beat = c->bBeat; m->grid = c->bGrid; m->curve_type = c->bType; m->shape = c->bCurveShape;
+        m->cc = c->bCCData; m->curve_flags = c->bFlags;
+        break;
+    }
     case DMUS_PMSGT_PATCH:
         m->midi[0] = ((DMUS_PATCH_PMSG *)pmsg)->byInstrument;
         m->midi[1] = ((DMUS_PATCH_PMSG *)pmsg)->byMSB;

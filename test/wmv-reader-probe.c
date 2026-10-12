@@ -420,7 +420,8 @@ static void test_start_at(IWMReader *reader, IWMReaderAdvanced6 *adv, struct cal
     HRESULT hr;
 
     hr = IWMReaderAdvanced6_StartAtPosition(adv, 0, &start, &duration, WMT_OFFSET_FORMAT_FRAME_NUMBERS, 1.0f, NULL);
-    CHECKF(hr == E_NOTIMPL, "StartAtPosition in frame numbers is not supported (%08lx)", hr);
+    CHECKF(hr == S_OK, "StartAtPosition in frame numbers is accepted, the range is checked on start (%08lx)", hr);
+    IWMReader_Stop(reader);
     hr = IWMReaderAdvanced6_StartAtPosition(adv, 0, NULL, NULL, WMT_OFFSET_FORMAT_100NS, 1.0f, NULL);
     CHECKF(hr == E_INVALIDARG, "StartAtPosition(NULL start) = E_INVALIDARG (%08lx)", hr);
     hr = IWMReaderAdvanced6_StartAtPosition(adv, 0, &start, &duration, (WMT_OFFSET_FORMAT)77, 1.0f, NULL);
@@ -430,7 +431,14 @@ static void test_start_at(IWMReader *reader, IWMReaderAdvanced6 *adv, struct cal
     cb->started_count = 0;
     hr = IWMReaderAdvanced6_StartAtPosition(adv, 0, &start, &duration, WMT_OFFSET_FORMAT_100NS, 1.0f, (void *)0xf00d);
     CHECKF(hr == S_OK, "StartAtPosition(100 ns) (%08lx)", hr);
-    CHECKF(WaitForSingleObject(cb->started, 5000) == WAIT_OBJECT_0 && cb->started_context == (void *)0xf00d,
+    /* the frame-number start above sends its own WMT_STARTED (context NULL)
+     * from the callback thread, possibly after the ResetEvent: wait for ours */
+    {
+        DWORD end = GetTickCount() + 5000;
+        while (cb->started_context != (void *)0xf00d && (int)(end - GetTickCount()) > 0)
+            WaitForSingleObject(cb->started, 100);
+    }
+    CHECKF(cb->started_context == (void *)0xf00d,
            "the reader started with the context (%p)", cb->started_context);
     hr = IWMReader_Stop(reader);
     CHECKF(hr == S_OK, "Stop (%08lx)", hr);
