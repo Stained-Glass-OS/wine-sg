@@ -88,3 +88,8 @@ Old note:
 - qdvd GetDiscID: ACCEPTED as is. A stable non-zero id is what callers use it for (caching per disc); E_NOTIMPL broke them. Equality with Windows' value stays unverified (notes/4016.txt).
 - winmm:mci hang: ACCEPTED (not attributable to 4021). Load A/B, 3 parallel runs each: base 0 hangs, 4021 0 hangs; both sides fail differently depending on which run gets the one ALSA device (base: open MCIERR_INTERNAL / record DEVICE_OPEN; 4021: play fails at once, then pause NONAPPLICABLE). Quiet runs with 4021: 6/6 pass. 4021 only changes Save (copy instead of rename) and adds a flag; the earlier hangs were all in the auto-open/play part under load. Keep watching winmm:mci in integration.
 - "Not done" list: ACCEPTED as escalations; none is a small gap (dialogs, engines, undocumented signatures).
+
+## 2026-10-12 evening (round 3)
+- msvcp140 conformance: the std::filesystem tests fail 12 (x64) / 16 (x86) on this host with or without round 3 (wine_test_dir not removable after the symlink checks, CreateSymbolicLinkW failing in 32-bit). Likely our series' symlink support or the /var/tmp filesystem; not investigated.
+- My test runner ran Wine tests with the shell's working directory, which is the person's project folder (/var/lib/stained-glass/.../Stained-Glass-OS) in this session; tests that create files in the current directory (winmm mci tempfile.wav, msvcp filesystem) may have created and removed files there during round 2 (folder mtime 13:36, nothing left behind). Fixed: tests now run in a scratch work directory. Gates were not affected (they cd into their own temp dir).
+- __GetPlatformExceptionInfo returns no WinRT information for C++/CX exceptions (layout undocumented); 4501 FIXMEs then.
