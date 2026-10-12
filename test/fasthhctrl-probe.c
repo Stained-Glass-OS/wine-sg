@@ -15,6 +15,7 @@ typedef HWND (WINAPI *HtmlHelpA_t)(HWND, const char *, UINT, DWORD_PTR);
 
 #define HH_GET_WIN_HANDLE 0x06
 #define HH_KEYWORD_LOOKUP 0x0D
+#define HH_PRETRANSLATEMESSAGE 0x20
 #define HH_INITIALIZE 0x1C
 #define HH_UNINITIALIZE 0x1D
 
@@ -44,6 +45,13 @@ int main(void)
     pHtmlHelpA(NULL, NULL, HH_UNINITIALIZE, cookie);
 
     CHECK(pHtmlHelpA(NULL, NULL, HH_GET_WIN_HANDLE, (DWORD_PTR)"NoSuchWindow") == NULL);
+
+    /* no help window exists: nothing translates the message */
+    {
+        MSG msg = { 0 };
+        CHECK(pHtmlHelpA(NULL, NULL, HH_PRETRANSLATEMESSAGE, (DWORD_PTR)&msg) == NULL);
+        CHECK(pHtmlHelpA(NULL, NULL, HH_PRETRANSLATEMESSAGE, 0) == NULL);
+    }
 
     link.pszKeywords = "nothing";
     CHECK(pHtmlHelpA(NULL, "C:\\no\\such\\file.chm", HH_KEYWORD_LOOKUP, (DWORD_PTR)&link) == NULL);
