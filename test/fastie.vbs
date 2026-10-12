@@ -11,6 +11,7 @@ Sub Check(ok, what)
 End Sub
 
 Set ie = CreateObject("InternetExplorer.Application")
+Set fso0 = CreateObject("Scripting.FileSystemObject")
 ie.Visible = False
 
 ie.Left = 10
@@ -94,6 +95,25 @@ Check v, "RegisterAsBrowser"
 ie.TheaterMode = True
 v = (ie.TheaterMode = True)
 Check v, "TheaterMode"
+
+' ShellUIHelper (window.external of the document)
+Set shl = CreateObject("WScript.Shell")
+fav = shl.SpecialFolders("Favorites") & "\fastie favorite.url"
+If fso0.FileExists(fav) Then fso0.DeleteFile fav
+Set ext = ie.Document.parentWindow.external
+ext.AddFavorite "http://www.winehq.org/fastie", "fastie favorite"
+v = fso0.FileExists(fav)
+Check v, "AddFavorite creates the .url file"
+If fso0.FileExists(fav) Then
+    Set ts = fso0.OpenTextFile(fav, 1)
+    txt = ts.ReadAll
+    ts.Close
+    v = (InStr(txt, "http://www.winehq.org/fastie") > 0)
+    Check v, "the .url file holds the address"
+    fso0.DeleteFile fav
+End If
+v = (ext.IsSubscribed("http://www.winehq.org/") = False)
+Check v, "IsSubscribed is false"
 
 ie.Quit
 If fails = 0 Then WScript.Echo "RESULT: PASS" Else WScript.Echo "RESULT: FAIL (" & fails & ")"
