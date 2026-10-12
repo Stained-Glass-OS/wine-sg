@@ -218,6 +218,169 @@ int main(void)
         }
         ReleaseDC(NULL, hdc);
     }
+
+    {
+        static const GUID matrix_guid = {0x718f2615, 0x7933, 0x40e3, {0xa5, 0x11, 0x5f, 0x68, 0xfe, 0x14, 0xdd, 0x74}};
+        static const GUID lut_guid = {0xa7ce72a9, 0x0f7f, 0x40d7, {0xb3, 0xcc, 0xd0, 0xc0, 0x2d, 0x5c, 0x32, 0x12}};
+        static const GUID blur_guid = {0x633c80a4, 0x1843, 0x482b, {0x9e, 0xf2, 0xbe, 0x28, 0x34, 0xc5, 0xfd, 0xd4}};
+        static const GUID bc_guid = {0xd3a1dbe1, 0x8ec4, 0x4c17, {0x9f, 0x4c, 0xea, 0x97, 0xad, 0x1c, 0x34, 0x3d}};
+        static const GUID red_guid = {0x74d29d05, 0x69a4, 0x4266, {0x95, 0x49, 0x3c, 0xc5, 0x28, 0x36, 0xb6, 0x32}};
+        HMODULE gp = GetModuleHandleA("gdiplus.dll");
+        GpStatus (WINAPI *create)(GUID, void **) = (void *)GetProcAddress(gp, "GdipCreateEffect");
+        GpStatus (WINAPI *delete)(void *) = (void *)GetProcAddress(gp, "GdipDeleteEffect");
+        GpStatus (WINAPI *set)(void *, const void *, UINT) = (void *)GetProcAddress(gp, "GdipSetEffectParameters");
+        GpStatus (WINAPI *get)(void *, UINT *, void *) = (void *)GetProcAddress(gp, "GdipGetEffectParameters");
+        GpStatus (WINAPI *apply)(GpBitmap *, void *, RECT *, BOOL, void **, INT *) = (void *)GetProcAddress(gp, "GdipBitmapApplyEffect");
+        GpStatus (WINAPI *create_apply)(GpBitmap **, INT, void *, RECT *, RECT *, GpBitmap **, BOOL, void **, INT *) =
+                (void *)GetProcAddress(gp, "GdipBitmapCreateApplyEffect");
+        GpStatus (WINAPI *draw_fx)(GpGraphics *, GpImage *, GpRectF *, GpMatrix *, void *, GpImageAttributes *, GpUnit) =
+                (void *)GetProcAddress(gp, "GdipDrawImageFX");
+        void *fx = NULL;
+        GpBitmap *bm = NULL, *out = NULL;
+        ARGB px = 0;
+        ColorMatrix cm;
+        UINT size = 4;
+        BYTE lut[1024];
+        struct { int b, c; } bcp = { 50, 0 };
+        struct { float r; BOOL e; } blp = { 4.0f, FALSE };
+        RECT roi = { 0, 0, 2, 2 };
+        int i, j;
+
+        check(create && delete && set && get && apply && create_apply && draw_fx, "effect functions are exported");
+        st = create(matrix_guid, &fx);
+        check(st == Ok && fx, "create a colour matrix effect");
+        memset(&cm, 0, sizeof(cm));
+        for (i = 0; i < 5; i++) cm.m[i][i] = 1.0f;
+        cm.m[0][0] = 0.0f; cm.m[0][2] = 1.0f;  /* red goes into blue */
+        cm.m[2][2] = 0.0f; cm.m[2][0] = 1.0f;  /* blue goes into red */
+        st = set(fx, &cm, sizeof(cm));
+        check(st == Ok, "set the matrix");
+        st = set(fx, &cm, sizeof(cm) - 4);
+        check(st == InvalidParameter, "wrong parameter size");
+        size = sizeof(cm); memset(&cm, 0, sizeof(cm));
+        st = get(fx, &size, &cm);
+        check(st == Ok && size == sizeof(cm) && cm.m[0][2] == 1.0f, "the parameters are kept");
+        size = 4;
+        st = get(fx, &size, &cm);
+        check(st == InvalidParameter, "buffer too small");
+
+        GdipCreateBitmapFromScan0(4, 4, 0, PixelFormat32bppARGB, NULL, &bm);
+        GdipBitmapSetPixel(bm, 0, 0, 0xffff2010);
+        GdipBitmapSetPixel(bm, 3, 3, 0xffff2010);
+        st = apply(bm, fx, NULL, FALSE, NULL, NULL);
+        check(st == Ok, "ApplyEffect with a colour matrix");
+        GdipBitmapGetPixel(bm, 0, 0, &px);
+        check(px == 0xff1020ff, "red and blue swapped");
+        delete(fx);
+
+        /* a region only */
+        GdipBitmapSetPixel(bm, 0, 0, 0xffff2010);
+        create(matrix_guid, &fx);
+        cm.m[0][0] = 0.0f;
+        memset(&cm, 0, sizeof(cm));
+        for (i = 0; i < 5; i++) cm.m[i][i] = 1.0f;
+        cm.m[0][0] = 0.0f; cm.m[0][2] = 1.0f; cm.m[2][2] = 0.0f; cm.m[2][0] = 1.0f;
+        set(fx, &cm, sizeof(cm));
+        GdipBitmapSetPixel(bm, 3, 3, 0xffff2010);
+        st = apply(bm, fx, &roi, FALSE, NULL, NULL);
+        GdipBitmapGetPixel(bm, 0, 0, &px);
+        check(st == Ok && px == 0xff1020ff, "inside the region it applies");
+        GdipBitmapGetPixel(bm, 3, 3, &px);
+        check(px == 0xffff2010, "outside the region it does not");
+
+        st = create_apply(&bm, 1, fx, &roi, NULL, &out, FALSE, NULL, NULL);
+        check(st == Ok && out, "CreateApplyEffect");
+        if (out)
+        {
+            UINT w = 0;
+            GdipGetImageWidth((GpImage *)out, &w);
+            check(w == 2, "the output is the region");
+            GdipDisposeImage((GpImage *)out);
+        }
+        delete(fx);
+
+        create(lut_guid, &fx);
+        for (i = 0; i < 4; i++) for (j = 0; j < 256; j++) lut[i * 256 + j] = i == 1 ? 255 - j : j; /* G inverted */
+        st = set(fx, lut, sizeof(lut));
+        GdipBitmapSetPixel(bm, 1, 1, 0xff0a2030);
+        apply(bm, fx, NULL, FALSE, NULL, NULL);
+        GdipBitmapGetPixel(bm, 1, 1, &px);
+        check(st == Ok && px == 0xff0adf30, "a lookup table inverts green");
+        delete(fx);
+
+        create(bc_guid, &fx);
+        st = set(fx, &bcp, sizeof(bcp));
+        check(st == Ok, "brightness and contrast set");
+        bcp.b = 300;
+        st = set(fx, &bcp, sizeof(bcp));
+        check(st == InvalidParameter, "brightness out of range");
+        bcp.b = 50;
+        set(fx, &bcp, sizeof(bcp));
+        GdipBitmapSetPixel(bm, 1, 1, 0xff102030);
+        apply(bm, fx, NULL, FALSE, NULL, NULL);
+        GdipBitmapGetPixel(bm, 1, 1, &px);
+        check(px == 0xff425262, "brightness +50 adds 50 at neutral contrast");
+        delete(fx);
+
+        create(blur_guid, &fx);
+        set(fx, &blp, sizeof(blp));
+        {
+            GpBitmap *b2 = NULL;
+            ARGB centre = 0, near_px = 0;
+            GdipCreateBitmapFromScan0(9, 9, 0, PixelFormat32bppARGB, NULL, &b2);
+            for (i = 0; i < 9; i++) for (j = 0; j < 9; j++) GdipBitmapSetPixel(b2, i, j, 0xff000000);
+            GdipBitmapSetPixel(b2, 4, 4, 0xffffffff);
+            st = apply(b2, fx, NULL, FALSE, NULL, NULL);
+            GdipBitmapGetPixel(b2, 4, 4, &centre);
+            GdipBitmapGetPixel(b2, 5, 4, &near_px);
+            check(st == Ok && (centre & 0xff) < 0xff && (near_px & 0xff) > 0, "blur spreads a bright pixel");
+            GdipDisposeImage((GpImage *)b2);
+        }
+        delete(fx);
+
+        create(red_guid, &fx);
+        {
+            RECT area = { 0, 0, 1, 1 };
+            struct { UINT n; RECT *a; } rp = { 1, &area };
+            UINT sz = sizeof(rp);
+            struct { UINT n; RECT *a; } back = {0};
+
+            st = set(fx, &rp, sizeof(rp));
+            check(st == Ok, "red eye areas set");
+            area.right = 99; /* the effect keeps its own copy */
+            st = get(fx, &sz, &back);
+            check(st == Ok && back.n == 1 && back.a && back.a[0].right == 1, "red eye areas are copied");
+            free(back.a);
+            GdipBitmapSetPixel(bm, 0, 0, 0xffe02020);
+            apply(bm, fx, NULL, FALSE, NULL, NULL);
+            GdipBitmapGetPixel(bm, 0, 0, &px);
+            check(((px >> 16) & 0xff) <= 0x30, "red eye reduced");
+        }
+        delete(fx);
+
+        {
+            GpBitmap *dst = NULL;
+            GpGraphics *g = NULL;
+
+            create(matrix_guid, &fx);
+            set(fx, &cm, sizeof(cm));
+            GdipBitmapSetPixel(bm, 2, 2, 0xffff2010);
+            GdipCreateBitmapFromScan0(4, 4, 0, PixelFormat32bppARGB, NULL, &dst);
+            GdipGetImageGraphicsContext((GpImage *)dst, &g);
+            GdipSetInterpolationMode(g, InterpolationModeNearestNeighbor);
+            GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+            st = draw_fx(g, (GpImage *)bm, NULL, NULL, fx, NULL, UnitPixel);
+            check(st == Ok, "DrawImageFX with an effect");
+            GdipBitmapGetPixel(dst, 2, 2, &px);
+            check(px == 0xff1020ff, "the drawn image went through the effect");
+            GdipBitmapGetPixel(bm, 2, 2, &px);
+            check(px == 0xffff2010, "and the source is unchanged");
+            GdipDeleteGraphics(g);
+            GdipDisposeImage((GpImage *)dst);
+            delete(fx);
+        }
+        GdipDisposeImage((GpImage *)bm);
+    }
     printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
     return failures != 0;
 }
