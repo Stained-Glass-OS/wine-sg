@@ -85,3 +85,8 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4502 msvcp: std::locale operator=/==/!= were FIXME stubs (operator= returned NULL). Gate + mutant.
 - 4503 msvcp140: codecvt<char16_t>/<char32_t> (UTF-8 <-> UTF-16/32), every member was a FIXME stub. Careful: gate (43 checks) + mutant.
 - Before push: the conformance suites of all 23 runtime DLLs with tests (concrt140, msvcirt, msvcp60/90/100/110/120/140/140_1/140_2/140_atomic_wait, msvcr70/71/80/90/100/110/120, msvcrt, msvcrtd, ucrtbase, vcomp, vcomp110), 64/32: 0 failures except msvcp140's filesystem tests (12 x64 / 16 x86), identical with the round-2 sources (escalated).
+- 4504 msvcp60..90: collate::transform (sort keys; unset string before), num_get::_Hexdig, num_put::_Putgrouped, num_get<unsigned short> do_get, _Clocptr_func. Gate + mutant.
+- 4505 msvcrt family: FMA3 flags, __clean_type_info_names_internal, __security_error_handler default report. Gate + mutant.
+- 4506 concrt140/msvcp: concurrent_queue _Internal_swap, _IsNonBlockingThread, _ExceptionHolder::ReportUnhandledError. Gate + 2 mutants.
+- 4507 msvcp100..140: error_category default_error_condition/equivalent (were stubs: every error_code == errc comparison was false; msvcp140 system errors now map to generic conditions). Gate (categories inside thrown system_error objects) + mutant.
+- Runtime suites before this push: same as before (only msvcp140 filesystem, pre-existing).
