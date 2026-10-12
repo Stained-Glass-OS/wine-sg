@@ -54,3 +54,46 @@ and /var/tmp/stubs-agent do not exist there. Use these instead:
   gates must not be named *-gate.sh.
 - Never turn a FIXME into a quiet TRACE unless the function now really does
   what Windows does.
+
+## Update 2026-10-12 evening (round 3 for drafter 5)
+- Your round 2 (4000-4032, PR #3) is waiting for the next integration; David
+  wants more written before that runs. Keep stubs-5 rebased on origin/main and
+  keep pushing to the same draft PR.
+- NEW GROUP: the C and C++ runtimes. NEW QUEUE: docs/stubs/audit5-drafter5b.json,
+  3714 unique exports (10,445 audit items, about 28% of the whole audit),
+  already ranked: items apps were seen to need first, then real gaps
+  (FIXME / E_NOTIMPL), then the exports present in the most DLL versions.
+  Each entry: export, dlls (every runtime version that lacks it), kinds,
+  apps, where (file:line of the stub when it is not a spec stub), careful.
+  DLLs: msvcp60..msvcp140(_1/_2/_atomic_wait/_app), msvcp_win, msvcr70..120
+  (+_app), msvcrt, msvcrtd, ucrtbase, vcruntime140(_1), concrt140, msvcm80/90,
+  vcomp*, msvcirt.
+- NEW PATCH RANGE: 4500-4999.
+- How these DLLs are built: most versions are built from ONE source through
+  PARENTSRC (dlls/msvcp90 is the parent of most msvcp*, dlls/msvcrt of the
+  msvcr*/ucrtbase family), and the version differences are #if _MSVCP_VER /
+  _MSVCR_VER blocks and the .spec files. So implement an export ONCE in the
+  parent source, guarded for the versions that export it, and change each
+  version's .spec line from a stub to the real entry. Build every child DLL
+  from the clean tree (RULES.md "Sibling DLLs"): a missed child breaks CI.
+- Mangled C++ names: the export's demangled signature and the class layout
+  are in Wine's existing implementation of the neighbouring members and in
+  the MSVC STL's public headers' documented behaviour; never disassemble or
+  copy Microsoft binaries. msvcp's tests (dlls/msvcp*/tests) are the ground
+  truth for behaviour; run msvcp90, msvcp120, msvcp140, msvcr*, ucrtbase and
+  msvcrt tests 64- and 32-bit.
+- CAREFUL MODE where entry "careful" is true (ucrtbase, msvcrt,
+  vcruntime140, msvcp140*, msvcp_win, concrt140): every Windows program
+  loads these, so a mistake breaks everything. For those: small batches (one
+  area per patch), a table-driven gate per patch with a mutant shown caught,
+  and the full conformance suites of every runtime DLL before each push.
+  FAST MODE for the rest (the old versions msvcp60-120, msvcr70-120, msvcm*,
+  vcomp*): whole areas at once, compile-only while writing, conformance at
+  the end.
+- Order: (1) the 3 entries with apps; (2) the ~100 real FIXME/E_NOTIMPL
+  entries (msvcp90, msvcrt, msvcm80, concrt140); (3) spec stubs by area
+  (iostreams, locale facets, filesystem (tr2/std::filesystem), threads and
+  synchronization, concurrency runtime, CRT math/string/time), most-versions
+  first. One patch per area per family.
+- Same safety rules as before: scratch HOME/WINEPREFIX for every Wine run,
+  no pushes to main, no release.sh, no email, no VMs.
