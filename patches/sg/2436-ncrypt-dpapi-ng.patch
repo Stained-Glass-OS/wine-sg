@@ -1,0 +1,647 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ncrypt: protection descriptors, NCryptProtectSecret and NCryptUnprotectSecret, streams
+
+NCryptCreateProtectionDescriptor parses a descriptor string (LOCAL=user,
+LOCAL=machine, LOCAL=logon and SID=... rules joined by AND or OR, not mixed;
+a bad string, a mixed one or an unknown flag is NTE_INVALID_PARAMETER,
+SDDL=, CERTIFICATE= and WEBCREDENTIALS= rules are refused) into a handle that
+NCryptCloseProtectionDescriptor closes and NCryptGetProtectionDescriptorInfo
+reads back (caller's allocator or LocalAlloc). NCryptProtectSecret protects
+the data with DPAPI, for the user or, without a user rule, the machine, with
+the descriptor as entropy, and puts the descriptor in the blob;
+NCryptUnprotectSecret checks the rules against the caller's token (SID rules
+by membership, AND needs all, OR any: NTE_PERM otherwise), unprotects, and
+can hand back a descriptor handle. NCryptStreamOpenToProtect,
+OpenToUnprotect(Ex), Update and Close collect the pieces and give the result
+to the output callback with the last one. These were stubs.
+---
+--- a/dlls/ncrypt/Makefile.in
++++ b/dlls/ncrypt/Makefile.in
+@@ -1,9 +1,10 @@
+ IMPORTLIB = ncrypt
+ MODULE    = ncrypt.dll
+-IMPORTS   = bcrypt
++IMPORTS   = bcrypt advapi32
+ DELAYIMPORTS = crypt32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
+-	main.c
++	main.c \
++	protect.c
+--- a/dlls/ncrypt/ncrypt.spec
++++ b/dlls/ncrypt/ncrypt.spec
+@@ -58,10 +58,10 @@
+ @ stub GetKeyStorageInterface
+ @ stub GetSChannelInterface
+ @ stub NCryptCloseKeyProtector
+-@ stub NCryptCloseProtectionDescriptor
++@ stdcall NCryptCloseProtectionDescriptor(long)
+ @ stub NCryptCreateClaim
+ @ stdcall NCryptCreatePersistedKey(long ptr wstr wstr long long)
+-@ stub NCryptCreateProtectionDescriptor
++@ stdcall NCryptCreateProtectionDescriptor(wstr long ptr)
+ @ stdcall NCryptDecrypt(long ptr long ptr ptr long ptr long)
+ @ stdcall NCryptDeleteKey(long long)
+ @ stdcall NCryptDeriveKey(long wstr ptr ptr long ptr long)
+@@ -75,7 +75,7 @@
+ @ stdcall NCryptFreeBuffer(ptr)
+ @ stdcall NCryptFreeObject(long)
+ @ stdcall NCryptGetProperty(ptr wstr ptr long ptr long)
+-@ stub NCryptGetProtectionDescriptorInfo
++@ stdcall NCryptGetProtectionDescriptorInfo(long ptr long ptr)
+ @ stdcall NCryptImportKey(long long wstr ptr ptr ptr long long)
+ @ stdcall NCryptIsAlgSupported(long wstr long)
+ @ stdcall NCryptIsKeyHandle(long)
+@@ -85,21 +85,21 @@
+ @ stub NCryptOpenKeyProtector
+ @ stdcall NCryptOpenStorageProvider(ptr wstr long)
+ @ stub NCryptProtectKey
+-@ stub NCryptProtectSecret
++@ stdcall NCryptProtectSecret(long long ptr long ptr ptr ptr ptr)
+ @ stub NCryptQueryProtectionDescriptorName
+ @ stub NCryptRegisterProtectionDescriptorName
+ @ stdcall NCryptSecretAgreement(long long ptr long)
+ @ stub NCryptSetAuditingInterface
+ @ stdcall NCryptSetProperty(ptr wstr ptr long long)
+ @ stdcall NCryptSignHash(long ptr ptr long ptr long ptr long)
+-@ stub NCryptStreamClose
+-@ stub NCryptStreamOpenToProtect
+-@ stub NCryptStreamOpenToUnprotect
+-@ stub NCryptStreamOpenToUnprotectEx
+-@ stub NCryptStreamUpdate
++@ stdcall NCryptStreamClose(long)
++@ stdcall NCryptStreamOpenToProtect(long long ptr ptr ptr)
++@ stdcall NCryptStreamOpenToUnprotect(ptr long ptr ptr)
++@ stdcall NCryptStreamOpenToUnprotectEx(ptr long ptr ptr)
++@ stdcall NCryptStreamUpdate(long ptr long long)
+ @ stub NCryptTranslateHandle
+ @ stub NCryptUnprotectKey
+-@ stub NCryptUnprotectSecret
++@ stdcall NCryptUnprotectSecret(ptr long ptr long ptr ptr ptr ptr)
+ @ stub NCryptVerifyClaim
+ @ stdcall NCryptVerifySignature(ptr ptr ptr long ptr long long)
+ @ stub SslChangeNotify
+new file mode 100644
+--- /dev/null
++++ b/dlls/ncrypt/protect.c
+@@ -0,0 +1,558 @@
++/*
++ * CNG DPAPI (protection descriptors and secrets)
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * A protection descriptor is a string of rules ("LOCAL=user", "LOCAL=machine",
++ * "SID=S-1-5-...") joined by AND or OR (not mixed). A secret is protected
++ * with DPAPI for the user (LOCAL=user, or a descriptor without a LOCAL rule
++ * that names the user's SID) or the machine, and the blob carries the
++ * descriptor; unprotecting checks the rules against the caller's token: a SID
++ * rule is met by membership, LOCAL=user by the same user's DPAPI key, and
++ * LOCAL=machine by the machine. The blob format is our own. The protection
++ * is the one of DPAPI plus the membership checks, not a key that only the
++ * members can derive: any process that could call CryptUnprotectData with
++ * the machine scope can read a SID-protected blob. SDDL, CERTIFICATE and
++ * WEBCREDENTIALS rules are refused (NTE_NOT_SUPPORTED).
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winerror.h"
++#include "wincrypt.h"
++#include "sddl.h"
++#include "ncrypt.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(ncrypt);
++
++typedef void *(WINAPI *PFN_NCRYPT_ALLOC)(SIZE_T);
++typedef void (WINAPI *PFN_NCRYPT_FREE)(void *);
++
++typedef struct
++{
++    DWORD cbSize;
++    PFN_NCRYPT_ALLOC pfnAlloc;
++    PFN_NCRYPT_FREE pfnFree;
++} NCRYPT_ALLOC_PARA;
++
++typedef HRESULT (WINAPI *PFNCryptStreamOutputCallback)(void *ctx, const BYTE *data, SIZE_T size, BOOL final);
++
++typedef struct
++{
++    PFNCryptStreamOutputCallback pfnStreamOutput;
++    void *pvCallbackCtxt;
++} NCRYPT_PROTECT_STREAM_INFO;
++
++#define NCRYPT_NAMED_DESCRIPTOR_FLAG 0x00000001
++#define NCRYPT_PROTECTION_INFO_TYPE_DESCRIPTOR_STRING 0x00000001
++
++enum rule_type { RULE_LOCAL_USER, RULE_LOCAL_MACHINE, RULE_LOCAL_LOGON, RULE_SID };
++
++struct rule
++{
++    enum rule_type type;
++    PSID sid;
++};
++
++struct descriptor
++{
++    struct descriptor *next;
++    WCHAR *string;
++    BOOL any;           /* the rules are joined by OR */
++    struct rule *rules;
++    unsigned int count;
++};
++
++static CRITICAL_SECTION descriptors_cs;
++static CRITICAL_SECTION_DEBUG descriptors_cs_debug =
++{
++    0, 0, &descriptors_cs,
++    { &descriptors_cs_debug.ProcessLocksList, &descriptors_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": descriptors_cs") }
++};
++static CRITICAL_SECTION descriptors_cs = { &descriptors_cs_debug, -1, 0, 0, 0, 0 };
++static struct descriptor *live_descriptors;
++
++static void free_descriptor(struct descriptor *d)
++{
++    unsigned int i;
++
++    for (i = 0; i < d->count; i++)
++        LocalFree(d->rules[i].sid);
++    free(d->rules);
++    free(d->string);
++    free(d);
++}
++
++static BOOL is_space(WCHAR c) { return c == ' ' || c == '\t'; }
++
++/* next token of a descriptor: the text up to the next " AND " / " OR " (as words) */
++static BOOL parse_descriptor(const WCHAR *text, struct descriptor *d)
++{
++    const WCHAR *p = text;
++    BOOL have_and = FALSE, have_or = FALSE;
++
++    for (;;)
++    {
++        const WCHAR *start, *end, *eq;
++        WCHAR *value;
++        struct rule *rules;
++        struct rule rule = {0};
++        SIZE_T name_len, value_len;
++
++        while (is_space(*p)) p++;
++        start = p;
++        while (*p && !is_space(*p)) p++;
++        end = p;
++        if (end == start) return FALSE;
++
++        for (eq = start; eq < end && *eq != '='; eq++) ;
++        if (eq == end || eq == start || eq + 1 == end) return FALSE;
++        name_len = eq - start;
++        value_len = end - eq - 1;
++
++        if (name_len == 5 && !wcsnicmp(start, L"LOCAL", 5))
++        {
++            if (value_len == 4 && !wcsnicmp(eq + 1, L"user", 4)) rule.type = RULE_LOCAL_USER;
++            else if (value_len == 7 && !wcsnicmp(eq + 1, L"machine", 7)) rule.type = RULE_LOCAL_MACHINE;
++            else if (value_len == 5 && !wcsnicmp(eq + 1, L"logon", 5)) rule.type = RULE_LOCAL_LOGON;
++            else return FALSE;
++        }
++        else if (name_len == 3 && !wcsnicmp(start, L"SID", 3))
++        {
++            if (!(value = malloc((value_len + 1) * sizeof(WCHAR)))) return FALSE;
++            memcpy(value, eq + 1, value_len * sizeof(WCHAR));
++            value[value_len] = 0;
++            rule.type = RULE_SID;
++            if (!ConvertStringSidToSidW(value, &rule.sid))
++            {
++                free(value);
++                return FALSE;
++            }
++            free(value);
++        }
++        else
++            return FALSE;
++
++        if (!(rules = realloc(d->rules, (d->count + 1) * sizeof(*rules))))
++        {
++            LocalFree(rule.sid);
++            return FALSE;
++        }
++        d->rules = rules;
++        d->rules[d->count++] = rule;
++
++        while (is_space(*p)) p++;
++        if (!*p) break;
++        if (!wcsnicmp(p, L"AND", 3) && (is_space(p[3]))) { have_and = TRUE; p += 3; }
++        else if (!wcsnicmp(p, L"OR", 2) && (is_space(p[2]))) { have_or = TRUE; p += 2; }
++        else return FALSE;
++        while (is_space(*p)) p++;
++        if (!*p) return FALSE;
++    }
++    if (have_and && have_or) return FALSE;
++    d->any = have_or;
++    return TRUE;
++}
++
++static struct descriptor *get_descriptor(NCRYPT_HANDLE handle)
++{
++    struct descriptor *d;
++
++    if (!handle) return NULL;
++    EnterCriticalSection(&descriptors_cs);
++    for (d = live_descriptors; d; d = d->next)
++        if (d == (struct descriptor *)handle) break;
++    LeaveCriticalSection(&descriptors_cs);
++    return d;
++}
++
++SECURITY_STATUS WINAPI NCryptCreateProtectionDescriptor(const WCHAR *string, DWORD flags, NCRYPT_HANDLE *handle)
++{
++    struct descriptor *d;
++
++    TRACE("%s, %#lx, %p\n", debugstr_w(string), flags, handle);
++
++    if (!string || !handle) return NTE_INVALID_PARAMETER;
++    if (flags & ~NCRYPT_NAMED_DESCRIPTOR_FLAG) return NTE_INVALID_PARAMETER;
++    *handle = 0;
++    if (flags & NCRYPT_NAMED_DESCRIPTOR_FLAG)
++    {
++        FIXME("named descriptors are not registered anywhere\n");
++        return NTE_NOT_FOUND;
++    }
++
++    if (!(d = calloc(1, sizeof(*d)))) return NTE_NO_MEMORY;
++    if (!(d->string = wcsdup(string)))
++    {
++        free(d);
++        return NTE_NO_MEMORY;
++    }
++    if (!parse_descriptor(string, d))
++    {
++        WARN("invalid descriptor %s\n", debugstr_w(string));
++        free_descriptor(d);
++        return NTE_INVALID_PARAMETER;
++    }
++    EnterCriticalSection(&descriptors_cs);
++    d->next = live_descriptors;
++    live_descriptors = d;
++    LeaveCriticalSection(&descriptors_cs);
++    *handle = (NCRYPT_HANDLE)d;
++    return ERROR_SUCCESS;
++}
++
++SECURITY_STATUS WINAPI NCryptCloseProtectionDescriptor(NCRYPT_HANDLE handle)
++{
++    struct descriptor **p, *d;
++
++    TRACE("%#Ix\n", handle);
++
++    EnterCriticalSection(&descriptors_cs);
++    for (p = &live_descriptors; *p; p = &(*p)->next)
++        if (*p == (struct descriptor *)handle) break;
++    if (!(d = *p))
++    {
++        LeaveCriticalSection(&descriptors_cs);
++        return NTE_INVALID_HANDLE;
++    }
++    *p = d->next;
++    LeaveCriticalSection(&descriptors_cs);
++    free_descriptor(d);
++    return ERROR_SUCCESS;
++}
++
++static void *alloc_out(const NCRYPT_ALLOC_PARA *para, SIZE_T size)
++{
++    return para && para->pfnAlloc ? para->pfnAlloc(size) : LocalAlloc(LMEM_FIXED, size);
++}
++
++SECURITY_STATUS WINAPI NCryptGetProtectionDescriptorInfo(NCRYPT_HANDLE handle, const NCRYPT_ALLOC_PARA *para,
++        DWORD type, void **info)
++{
++    struct descriptor *d = get_descriptor(handle);
++    SIZE_T size;
++    WCHAR *ret;
++
++    TRACE("%#Ix, %p, %lu, %p\n", handle, para, type, info);
++
++    if (!d) return NTE_INVALID_HANDLE;
++    if (!info || type != NCRYPT_PROTECTION_INFO_TYPE_DESCRIPTOR_STRING) return NTE_INVALID_PARAMETER;
++    if (para && para->cbSize < sizeof(*para)) return NTE_INVALID_PARAMETER;
++
++    size = (lstrlenW(d->string) + 1) * sizeof(WCHAR);
++    if (!(ret = alloc_out(para, size))) return NTE_NO_MEMORY;
++    memcpy(ret, d->string, size);
++    *info = ret;
++    return ERROR_SUCCESS;
++}
++
++/* blob: "SGPN", version 1, size of the descriptor string in bytes, the string, then the DPAPI blob */
++#define BLOB_MAGIC 0x4e504753
++#define BLOB_VERSION 1
++
++struct blob_header
++{
++    DWORD magic;
++    DWORD version;
++    DWORD machine;     /* DPAPI scope */
++    DWORD string_size; /* bytes, with the terminator */
++};
++
++static BOOL uses_machine_scope(const struct descriptor *d)
++{
++    unsigned int i;
++
++    for (i = 0; i < d->count; i++)
++        if (d->rules[i].type == RULE_LOCAL_USER || d->rules[i].type == RULE_LOCAL_LOGON) return FALSE;
++    return TRUE;
++}
++
++SECURITY_STATUS WINAPI NCryptProtectSecret(NCRYPT_HANDLE handle, DWORD flags, const BYTE *data, ULONG size,
++        const NCRYPT_ALLOC_PARA *para, HWND hwnd, BYTE **blob_out, ULONG *blob_size)
++{
++    struct descriptor *d = get_descriptor(handle);
++    DATA_BLOB in, entropy, out;
++    struct blob_header *header;
++    SIZE_T string_size;
++    BYTE *blob;
++    BOOL machine;
++
++    TRACE("%#Ix, %#lx, %p, %lu, %p, %p, %p, %p\n", handle, flags, data, size, para, hwnd, blob_out, blob_size);
++
++    if (!d) return NTE_INVALID_HANDLE;
++    if (!data || !size || !blob_out || !blob_size) return NTE_INVALID_PARAMETER;
++    if (para && para->cbSize < sizeof(*para)) return NTE_INVALID_PARAMETER;
++    *blob_out = NULL;
++    *blob_size = 0;
++
++    machine = uses_machine_scope(d);
++    string_size = (lstrlenW(d->string) + 1) * sizeof(WCHAR);
++    in.pbData = (BYTE *)data;
++    in.cbData = size;
++    entropy.pbData = (BYTE *)d->string;
++    entropy.cbData = string_size;
++#ifdef SG_MUTANT_DPAPING_NO_ENTROPY
++    entropy.cbData = 0;
++#endif
++    if (!CryptProtectData(&in, NULL, &entropy, NULL, NULL,
++            CRYPTPROTECT_UI_FORBIDDEN | (machine ? CRYPTPROTECT_LOCAL_MACHINE : 0), &out))
++        return HRESULT_FROM_WIN32(GetLastError());
++
++    if (!(blob = alloc_out(para, sizeof(*header) + string_size + out.cbData)))
++    {
++        LocalFree(out.pbData);
++        return NTE_NO_MEMORY;
++    }
++    header = (struct blob_header *)blob;
++    header->magic = BLOB_MAGIC;
++    header->version = BLOB_VERSION;
++    header->machine = machine;
++    header->string_size = string_size;
++    memcpy(blob + sizeof(*header), d->string, string_size);
++    memcpy(blob + sizeof(*header) + string_size, out.pbData, out.cbData);
++    *blob_out = blob;
++    *blob_size = sizeof(*header) + string_size + out.cbData;
++    LocalFree(out.pbData);
++    return ERROR_SUCCESS;
++}
++
++static BOOL rule_met(const struct rule *rule)
++{
++    BOOL member = FALSE;
++
++    switch (rule->type)
++    {
++    case RULE_SID:
++        return CheckTokenMembership(NULL, rule->sid, &member) && member;
++    default:
++        /* the DPAPI scope the blob was made with is the check */
++        return TRUE;
++    }
++}
++
++SECURITY_STATUS WINAPI NCryptUnprotectSecret(NCRYPT_HANDLE *handle, DWORD flags, const BYTE *blob, ULONG blob_size,
++        const NCRYPT_ALLOC_PARA *para, HWND hwnd, BYTE **data_out, ULONG *data_size)
++{
++    const struct blob_header *header = (const struct blob_header *)blob;
++    DATA_BLOB in, entropy, out;
++    struct descriptor *d;
++    WCHAR *string;
++    BYTE *data;
++    SECURITY_STATUS ret = ERROR_SUCCESS;
++    unsigned int i;
++    BOOL met;
++
++    TRACE("%p, %#lx, %p, %lu, %p, %p, %p, %p\n", handle, flags, blob, blob_size, para, hwnd, data_out, data_size);
++
++    if (!blob || !data_out || !data_size) return NTE_INVALID_PARAMETER;
++    if (para && para->cbSize < sizeof(*para)) return NTE_INVALID_PARAMETER;
++    *data_out = NULL;
++    *data_size = 0;
++    if (handle) *handle = 0;
++
++    if (blob_size < sizeof(*header) || header->magic != BLOB_MAGIC || header->version != BLOB_VERSION ||
++            header->string_size < sizeof(WCHAR) || header->string_size & 1 ||
++            blob_size - sizeof(*header) < header->string_size)
++        return NTE_BAD_DATA;
++    string = (WCHAR *)(blob + sizeof(*header));
++    if (string[header->string_size / sizeof(WCHAR) - 1]) return NTE_BAD_DATA;
++
++    if (!(d = calloc(1, sizeof(*d)))) return NTE_NO_MEMORY;
++    if (!(d->string = wcsdup(string)) || !parse_descriptor(string, d))
++    {
++        free_descriptor(d);
++        return NTE_BAD_DATA;
++    }
++
++    /* the rules: all (AND) or any one (OR) must be met by the caller */
++    met = !d->any;
++    for (i = 0; i < d->count; i++)
++    {
++        BOOL ok = rule_met(&d->rules[i]);
++        if (d->any) met |= ok; else met &= ok;
++    }
++#ifndef SG_MUTANT_DPAPING_NO_RULE_CHECK
++    if (!met)
++    {
++        free_descriptor(d);
++        return NTE_PERM;
++    }
++#endif
++
++    in.pbData = (BYTE *)blob + sizeof(*header) + header->string_size;
++    in.cbData = blob_size - sizeof(*header) - header->string_size;
++    entropy.pbData = (BYTE *)string;
++    entropy.cbData = header->string_size;
++    if (!CryptUnprotectData(&in, NULL, &entropy, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN, &out))
++    {
++        DWORD err = GetLastError();
++        free_descriptor(d);
++        return err == ERROR_INVALID_DATA ? NTE_BAD_DATA : HRESULT_FROM_WIN32(err);
++    }
++
++    if (!(data = alloc_out(para, out.cbData)))
++        ret = NTE_NO_MEMORY;
++    else
++    {
++        memcpy(data, out.pbData, out.cbData);
++        *data_out = data;
++        *data_size = out.cbData;
++    }
++    LocalFree(out.pbData);
++
++    if (ret == ERROR_SUCCESS && handle)
++    {
++        EnterCriticalSection(&descriptors_cs);
++        d->next = live_descriptors;
++        live_descriptors = d;
++        LeaveCriticalSection(&descriptors_cs);
++        *handle = (NCRYPT_HANDLE)d;
++    }
++    else
++        free_descriptor(d);
++    return ret;
++}
++
++/* ---- streams: the data is collected and protected when the last piece arrives ---- */
++
++struct stream
++{
++    struct stream *next;
++    BOOL protect;
++    struct descriptor *descriptor;   /* a handle of ours, closed with the stream */
++    NCRYPT_PROTECT_STREAM_INFO info;
++    BYTE *data;
++    SIZE_T size;
++    BOOL finished;
++};
++
++static struct stream *live_streams;
++
++static struct stream *get_stream(NCRYPT_HANDLE handle)
++{
++    struct stream *s;
++
++    EnterCriticalSection(&descriptors_cs);
++    for (s = live_streams; s; s = s->next)
++        if (s == (struct stream *)handle) break;
++    LeaveCriticalSection(&descriptors_cs);
++    return s;
++}
++
++static SECURITY_STATUS open_stream(BOOL protect, NCRYPT_HANDLE descriptor, const NCRYPT_PROTECT_STREAM_INFO *info,
++        NCRYPT_HANDLE *handle)
++{
++    struct stream *s;
++
++    if (!info || !info->pfnStreamOutput || !handle) return NTE_INVALID_PARAMETER;
++    *handle = 0;
++    if (protect && !get_descriptor(descriptor)) return NTE_INVALID_HANDLE;
++    if (!(s = calloc(1, sizeof(*s)))) return NTE_NO_MEMORY;
++    s->protect = protect;
++    s->descriptor = (struct descriptor *)descriptor;
++    s->info = *info;
++    EnterCriticalSection(&descriptors_cs);
++    s->next = live_streams;
++    live_streams = s;
++    LeaveCriticalSection(&descriptors_cs);
++    *handle = (NCRYPT_HANDLE)s;
++    return ERROR_SUCCESS;
++}
++
++SECURITY_STATUS WINAPI NCryptStreamOpenToProtect(NCRYPT_HANDLE descriptor, DWORD flags, HWND hwnd,
++        NCRYPT_PROTECT_STREAM_INFO *info, NCRYPT_HANDLE *handle)
++{
++    TRACE("%#Ix, %#lx, %p, %p, %p\n", descriptor, flags, hwnd, info, handle);
++    return open_stream(TRUE, descriptor, info, handle);
++}
++
++SECURITY_STATUS WINAPI NCryptStreamOpenToUnprotect(NCRYPT_PROTECT_STREAM_INFO *info, DWORD flags, HWND hwnd,
++        NCRYPT_HANDLE *handle)
++{
++    TRACE("%p, %#lx, %p, %p\n", info, flags, hwnd, handle);
++    return open_stream(FALSE, 0, info, handle);
++}
++
++SECURITY_STATUS WINAPI NCryptStreamOpenToUnprotectEx(NCRYPT_PROTECT_STREAM_INFO *info, DWORD flags, HWND hwnd,
++        NCRYPT_HANDLE *handle)
++{
++    TRACE("%p, %#lx, %p, %p\n", info, flags, hwnd, handle);
++    return open_stream(FALSE, 0, info, handle);
++}
++
++SECURITY_STATUS WINAPI NCryptStreamUpdate(NCRYPT_HANDLE handle, const BYTE *data, SIZE_T size, BOOL final)
++{
++    struct stream *s = get_stream(handle);
++    BYTE *grown, *out = NULL;
++    ULONG out_size = 0;
++    SECURITY_STATUS ret;
++    HRESULT hr;
++
++    TRACE("%#Ix, %p, %Iu, %d\n", handle, data, size, final);
++
++    if (!s) return NTE_INVALID_HANDLE;
++    if (s->finished) return NTE_INVALID_PARAMETER;
++    if (size && !data) return NTE_INVALID_PARAMETER;
++    if (size)
++    {
++        if (!(grown = realloc(s->data, s->size + size))) return NTE_NO_MEMORY;
++        s->data = grown;
++        memcpy(s->data + s->size, data, size);
++        s->size += size;
++    }
++    if (!final) return ERROR_SUCCESS;
++    s->finished = TRUE;
++
++    if (s->protect)
++        ret = NCryptProtectSecret((NCRYPT_HANDLE)s->descriptor, 0, s->data, s->size, NULL, NULL, &out, &out_size);
++    else
++        ret = NCryptUnprotectSecret(NULL, 0, s->data, s->size, NULL, NULL, &out, &out_size);
++    if (ret != ERROR_SUCCESS) return ret;
++
++    hr = s->info.pfnStreamOutput(s->info.pvCallbackCtxt, out, out_size, TRUE);
++    LocalFree(out);
++    return hr;
++}
++
++SECURITY_STATUS WINAPI NCryptStreamClose(NCRYPT_HANDLE handle)
++{
++    struct stream **p, *s;
++
++    TRACE("%#Ix\n", handle);
++
++    EnterCriticalSection(&descriptors_cs);
++    for (p = &live_streams; *p; p = &(*p)->next)
++        if (*p == (struct stream *)handle) break;
++    if (!(s = *p))
++    {
++        LeaveCriticalSection(&descriptors_cs);
++        return NTE_INVALID_HANDLE;
++    }
++    *p = s->next;
++    LeaveCriticalSection(&descriptors_cs);
++    free(s->data);
++    free(s);
++    return ERROR_SUCCESS;
++}
