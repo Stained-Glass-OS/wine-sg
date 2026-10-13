@@ -140,3 +140,11 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4546 msvcr100..120, concrt140: 14 Concurrency Runtime exception classes, scheduler_worker_creation_error, _ReentrantLock and _ReaderWriterLock members. Gate + 2 mutants.
 - 4547 msvcrt, msvcrtd, msvcr70..120: i386 _inp/_inpw/_inpd/_outp/_outpw/_outpd (privileged instruction exception as on Windows), __p__fileinfo/_fileinfo, __p__mbcasemap in the older CRTs. Gate (vectored handler checks instruction, port, data) + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
+- 4548 (fast) msvcp60..90, msvcp120: complex<float/double/long double> stream operators on wchar_t and unsigned short streams (msvcp60: char readers), msvcp120's unsigned short number reader and time_get::get with a format. Smoke gate (every such export, through string streams) + mutant.
+- 4549 msvcp140, msvcp_win: _WStod/_WStodx/_WStof/_WStofx/_WStold/_WStoldx, __Wcrtomb_lk. Gate + 2 mutants.
+- 4550 msvcp140, msvcp_win: __ExceptionPtrSwap. Gate + mutant.
+- 4551 msvcp110..140, msvcp_win: GetNextAsyncId, CaptureCallstack, __set_stl_sync_api_mode. Gate + 2 mutants.
+- 4552 (fast) msvcr100..120: exception::_Copy_str/_Tidy, _Interruption_exception, _SetUnobservedExceptionHandler, msvcr120 CaptureCallstack. Smoke gate + 2 mutants.
+- 4553 msvcp100..140, msvcp_win: public ctype<char>::classic_table, _Locinfo::_W_Gettnames. Gate + mutant.
+- 4554 msvcp140, msvcp_win: basic_istream<unsigned short>::operator>>(unsigned short &). Gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
