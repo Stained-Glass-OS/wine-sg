@@ -16,9 +16,9 @@ T=$(mktemp -d /var/tmp/sg-fastb-mscoree.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="winemenubuilder.exe=d" WINESERVER
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
-TMPDIR=/var/tmp x86_64-w64-mingw32-gcc -O1 -o "$T/probe64.exe" "$HERE/fastb-mscoree-probe.c" || { echo "FAIL  probe did not build"; exit 1; }
+TMPDIR=/var/tmp x86_64-w64-mingw32-gcc -O1 -Wno-format -o "$T/probe64.exe" "$HERE/fastb-mscoree-probe.c" -lole32 || { echo "FAIL  probe did not build"; exit 1; }
 if command -v i686-w64-mingw32-gcc >/dev/null; then
-  TMPDIR=/var/tmp i686-w64-mingw32-gcc -O1 -o "$T/probe32.exe" "$HERE/fastb-mscoree-probe.c" || rm -f "$T/probe32.exe"
+  TMPDIR=/var/tmp i686-w64-mingw32-gcc -O1 -Wno-format -o "$T/probe32.exe" "$HERE/fastb-mscoree-probe.c" -lole32 || rm -f "$T/probe32.exe"
 fi
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1

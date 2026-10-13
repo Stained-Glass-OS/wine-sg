@@ -46,6 +46,68 @@ static int count_enum(Obj *en)
     return n;
 }
 
+
+static void test_config_stream(HMODULE mscoree)
+{
+    HRESULT (WINAPI *pCreateConfigStream)(const WCHAR*, Obj**) = (void *)GetProcAddress(mscoree, "CreateConfigStream");
+    WCHAR path[MAX_PATH];
+    Obj *st = NULL, *mem = NULL;
+    LARGE_INTEGER mv;
+    ULARGE_INTEGER np, rd, wr, sz;
+    STATSTG stat;
+    char data[16];
+    ULONG got;
+    HRESULT hr;
+    HANDLE f;
+    HGLOBAL hg;
+    char *p;
+
+    if (!pCreateConfigStream) return;
+    GetTempPathW(MAX_PATH, path);
+    lstrcatW(path, L"sgcfgstream.config");
+    f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    WriteFile(f, "0123456789abcdefghij", 20, &got, NULL);
+    CloseHandle(f);
+
+    hr = pCreateConfigStream(path, &st);
+    CHECK(hr == S_OK && st, "CreateConfigStream %lx", hr);
+    if (!st) { DeleteFileW(path); return; }
+    mv.QuadPart = 5; np.QuadPart = 99;
+    hr = CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_SET, &np);
+    CHECK(hr == S_OK && np.QuadPart == 5, "Seek set %lx %I64u", hr, np.QuadPart);
+    got = 0;
+    hr = CALL(st, 3, HRESULT, void*, ULONG, ULONG*)(st, data, 4, &got);
+    CHECK(hr == S_OK && got == 4 && !memcmp(data, "5678", 4), "Read after seek");
+    mv.QuadPart = 2;
+    hr = CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_CUR, &np);
+    CHECK(hr == S_OK && np.QuadPart == 11, "Seek cur %lx %I64u", hr, np.QuadPart);
+    mv.QuadPart = -3;
+    hr = CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_END, &np);
+    CHECK(hr == S_OK && np.QuadPart == 17, "Seek end %lx %I64u", hr, np.QuadPart);
+    hr = CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, 7, &np);
+    CHECK(hr == 0x80030001, "Seek bad origin %lx", hr);
+    memset(&stat, 0xcc, sizeof(stat));
+    hr = CALL(st, 12, HRESULT, STATSTG*, DWORD)(st, &stat, STATFLAG_NONAME);
+    CHECK(hr == S_OK && stat.type == STGTY_STREAM && stat.cbSize.QuadPart == 20, "Stat %lx type=%lu size=%I64u", hr, stat.type, stat.cbSize.QuadPart);
+    mv.QuadPart = 10;
+    CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_SET, &np);
+    hg = GlobalAlloc(GMEM_MOVEABLE, 0);
+    CreateStreamOnHGlobal(hg, TRUE, (IStream **)&mem);
+    sz.QuadPart = 6;
+    hr = CALL(st, 7, HRESULT, void*, ULARGE_INTEGER, ULARGE_INTEGER*, ULARGE_INTEGER*)(st, mem, sz, &rd, &wr);
+    CHECK(hr == S_OK && rd.QuadPart == 6 && wr.QuadPart == 6, "CopyTo %lx %I64u %I64u", hr, rd.QuadPart, wr.QuadPart);
+    p = GlobalLock(hg);
+    CHECK(p && !memcmp(p, "abcdef", 6), "CopyTo data");
+    GlobalUnlock(hg);
+    sz.QuadPart = 100;
+    hr = CALL(st, 7, HRESULT, void*, ULARGE_INTEGER, ULARGE_INTEGER*, ULARGE_INTEGER*)(st, mem, sz, &rd, &wr);
+    CHECK(hr == S_OK && rd.QuadPart == 4, "CopyTo to end read=%I64u", rd.QuadPart);
+    CHECK(CALL(st, 8, HRESULT, DWORD)(st, 0) == S_OK, "Commit");
+    CALL(mem, 2, ULONG)(mem);
+    CALL(st, 2, ULONG)(st);
+    DeleteFileW(path);
+}
+
 int main(void)
 {
     HMODULE mscoree = LoadLibraryA("mscoree.dll");
@@ -61,6 +123,7 @@ int main(void)
     if (!mscoree) { printf("SKIP mscoree not loadable\nRESULT: PASS\n"); return 0; }
     pCLRCreateInstance = (void *)GetProcAddress(mscoree, "CLRCreateInstance");
     pGetVersionFromProcess = (void *)GetProcAddress(mscoree, "GetVersionFromProcess");
+    test_config_stream(mscoree);
     hr = pCLRCreateInstance(&CLSID_MetaHost, &IID_MetaHost, (void **)&host);
     CHECK(hr == S_OK, "CLRCreateInstance %lx", hr);
     hr = CALL(host, 3, HRESULT, const WCHAR*, const GUID*, void**)(host, L"v4.0.30319", &IID_RTInfo, (void **)&v4);
