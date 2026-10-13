@@ -185,3 +185,7 @@ Every real item ends in exactly one of these states:
    - escalate: needs a design or security decision; also put it in ESCALATE.md.
 The audit will count TRIAGED windows-matches/not-applicable items as closed.
 Never triage an item as windows-matches without evidence.
+- NO BULK TRIAGE: every triage line is one item you actually examined.
+  "no-ground-truth" is only for undocumented AND untested items; a documented
+  member that is still a stub is open work (implement it from the docs).
+  "Provisional" lines are not allowed (2026-10-13).

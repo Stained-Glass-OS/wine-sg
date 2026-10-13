@@ -113,3 +113,8 @@ and /var/tmp/stubs-agent do not exist there. Use these instead:
   triage windows-matches without evidence (a Wine test line or a Microsoft
   docs URL).
 - Your escalate-5.md items count too: give each a verdict in triage-5.tsv.
+- Round 4 addendum (2026-10-13): fix the msvcp "C" locale collation bug you
+  found (string comparison must follow byte order, plain strcmp, as Windows
+  does) as a new patch in your range, with a gate and mutant. The ntdll
+  symlink bug goes to drafter 6 (core). Your escalate-5.md items each get a
+  verdict line in triage-5.tsv.
