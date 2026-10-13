@@ -123,3 +123,7 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4534 msvcp140: nine __crt* kernel32 wrappers. Gate + mutant.
 - 4535 msvcp100..140, msvcp_win: iostream move constructors/assignments and basic_ios::move (char, wchar_t, unsigned short). Gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
+- 4536 (fast) msvcp60..90: _Ctraits math members, plain _Cosh/_Sinh/_FCosh/_FSinh, data-less class assignments, _UShinit, _Mtx*/_Once for msvcp80/90. Smoke gate + mutant.
+- 4537 (fast) msvcp60..90: the messages facet (no catalogs). Smoke gate + mutant.
+- 4538 (fast) msvcp60..90: the money facets (money_base, _Mpunct, moneypunct, money_get, money_put for char/wchar_t/unsigned short). Smoke gate (put/get through string streams) + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); msvcp60/msvcp90 rerun with 4538.
