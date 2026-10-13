@@ -63,3 +63,16 @@ are gated with a probe kernel driver (test/sg-driver.h, sg-driver-host.h; 64-bit
 - Decided while drafting (recorded in triage-6.tsv): 1163 MmCopyVirtualMemory and 1098 KeQueryPriorityThread
   escalate (no kernel/user split; Wine keeps relative priorities); 1146/1147 ProbeForRead/Write escalate (needs SEH
   in a driver to gate); 1164 ExSetTimerResolution windows-matches (fixed 1 ms).
+
+## 2026-10-13, batch 4: patches 5057-5063 (39 items; 182 implemented so far)
+Same method; suites cryptowinrt windows.security.authentication.onlineid combase ole32 (64 and 32) compared with the
+base: no new failures (web.core has no conformance tests; its gates cover it).
+- 5057 cryptowinrt, 5059 onlineid, 5060 web.core: IInspectable on the factories, statics, objects and async operations
+  (GetIids lists the interfaces, a factory or statics object answers GetRuntimeClassName with E_ILLEGAL_METHOD_CALL as
+  documented, operations are named IAsyncOperation`1<result class> as Windows names them in cryptowinrt's and
+  userconsentverifier's tests; BaseTrust). 5060 also IAsyncInfo::get_Id. (1000-1005, 1012-1014, 722-739, 911-916,
+  741-745, 757-759, 920.) The boolean operation's class name no longer counts the terminating null in its length.
+- 5058 CryptographicBuffer ConvertStringToBinary / ConvertBinaryToString (1016, 1017).
+- 5061 StringMap IMap::GetView, a snapshot (747).
+- 5062 combase IComThreadingInfo::SetCurrentLogicalThreadId (166); 5063 IContext properties on the thread object
+  context (832-835).
