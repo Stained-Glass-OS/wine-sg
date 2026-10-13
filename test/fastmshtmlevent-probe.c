@@ -28,6 +28,13 @@ L"function $(i){return document.getElementById(i);}"
 L"function T(n,f){try{f();}catch(e){r.push(n+'=ERR '+(e.number&0xffff)+' '+e.message);}}"
 L"T('MEV',function(){var e=document.createEvent('MouseEvent'); e.initMouseEvent('click',true,true,window,0,1,2,3,4,false,false,true,false,0,null);"
 L" t('MEV0',e.getModifierState('Shift')+' '+e.getModifierState('Control')+' '+e.shiftKey);});"
+L"T('KEV',function(){var e=document.createEvent('KeyboardEvent'); e.initKeyboardEvent('keydown',true,true,window,'a',1,'Control Shift',true,'en-US');"
+L" t('KEV0',e.getModifierState('Control')+' '+e.getModifierState('Alt')+' '+e.shiftKey+' '+e.key+' '+e.location+' '+e.repeat+' '+e.locale+' '+e.charCode);});"
+L"T('SEV',function(){var e=document.createEvent('StorageEvent'); e.initStorageEvent('storage',false,false,'k','o','n','http://x/',window.sessionStorage);"
+L" t('SEV0',e.key+' '+e.oldValue+' '+e.newValue+' '+e.url+' '+(e.storageArea===window.sessionStorage));});"
+L"T('OFF',function(){var d=$('d1'),got; d.addEventListener('click',function(e){got=e;}); var e=document.createEvent('MouseEvent');"
+L" e.initMouseEvent('click',true,true,window,0,0,0,50,40,false,false,false,false,0,null); d.dispatchEvent(e);"
+L" var r=d.getBoundingClientRect(); t('OFF0',got.offsetX==50-r.left-d.clientLeft && got.offsetY==40-r.top-d.clientTop);});"
 L"t('MODE',document.documentMode);"
 L"document.title=r.join('|');";
 

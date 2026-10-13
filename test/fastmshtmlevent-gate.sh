@@ -49,5 +49,8 @@ grep -q "^DONE" "$T/o" || { fail "the probe did not finish"; head -30 "$T/o"; ec
 [ "$(w OVERFLOW)" = "00000000 0" ] && [ "$(w IME)" = "00000000 0 00000000 0 00000000 0" ] && [ "$(w BEHAVIOR)" = "00000000 00000000 0 0" ] && [ "$(w WHEEL)" = "00000000 0" ] \
     && [ "$(w EV6)" = "00000000 00000000 1 0" ] && [ "$(w DATATRANSFER)" = "00000000 1" ] && pass "contentOverflow, IME, behavior, wheelDelta, actionURL, buttonID, dataTransfer answer instead of E_NOTIMPL" || fail "defaults: $(grep -E '^(OVERFLOW|IME|BEHAV|WHEEL|EV6|DATATR)' "$T/o" | tr '\n' ';')"
 [ "$(v MEV0)" = "true false true" ] && pass "MouseEvent.getModifierState follows initMouseEvent" || fail "getModifierState: $(v MEV0)"
+[ "$(v KEV0)" = "true false true a 1 true en-US 0" ] && pass "initKeyboardEvent sets modifiers, key, location, repeat and locale" || fail "keyboard: $(v KEV0)"
+[ "$(v SEV0)" = "k o n http://x/ true" ] && pass "initStorageEvent keeps its arguments, storageArea included" || fail "storage: $(v SEV0)"
+[ "$(v OFF0)" = true ] && pass "a mouse event's offsetX/Y are relative to the target's padding edge" || fail "offset: $(v OFF0)"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
