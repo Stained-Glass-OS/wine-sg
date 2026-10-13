@@ -154,3 +154,34 @@ patches" still apply in fast mode.
 - Every ~5 batches send a short progress message to "main" with SendMessage:
   patches done (numbers, DLLs, function counts), CI state, escalations. Keep
   working after reporting; stop only when your group's items are exhausted.
+- Sibling DLLs: many DLLs build from another's sources (grep PARENTSRC in
+  dlls/*/Makefile.in, e.g. d3dx11_42 from d3dx11_43, d3dx9_24..43, msvcr*).
+  When you add exports or source files to a parent, build every child from the
+  clean tree too (CI failed on d3dx11_42 after 3540, 2026-10-12).
+- No 16-bit (Win16) work: wine-sg is a new-style WoW64 build, which cannot run
+  16-bit programs at all, so *.dll16 / *.exe16 / krnl386 code never executes
+  for our users (2026-10-12). Skip those audit items.
+- Clean room for metadata too: never use a Microsoft SDK .winmd, .lib, .pdb
+  or header file as the source of GUIDs, vtable order or signatures. Use
+  Wine's include/*.idl, Microsoft's published API documentation pages, or
+  freely licensed open-source headers (mingw-w64). (2026-10-12: a drafter
+  dumped interfaces from an SDK .winmd; don't.)
+
+## Closing the real gap (David 2026-10-13: "close the real gap first")
+The goal is now the audit's REAL gaps (fixme-stub, notimpl, fake-success in
+/var/tmp/audit7/audit7-items.json, scanned on main + all drafter branches).
+Every real item ends in exactly one of these states:
+1. IMPLEMENTED as Windows does (a patch, careful or fast as your prompt says).
+2. TRIAGED, written to /var/tmp/stubs-common/triage/<you>.tsv, one line per
+   item, tab-separated: dll, func, kind, file:line, verdict, evidence.
+   Verdicts:
+   - windows-matches: Windows really behaves this way (E_NOTIMPL, a failure
+     code, a no-op). Evidence = a Wine test line that runs on Windows, or a
+     Microsoft docs URL. Then also turn a FIXME into a WARN/TRACE ONLY IF the
+     behaviour is complete, never to hide a gap.
+   - no-ground-truth: undocumented and untested; say what is missing.
+   - not-applicable: 16-bit (WoW64 has no Win16), ARM-only, or a Wine-
+     internal debug message that is not a gap.
+   - escalate: needs a design or security decision; also put it in ESCALATE.md.
+The audit will count TRIAGED windows-matches/not-applicable items as closed.
+Never triage an item as windows-matches without evidence.

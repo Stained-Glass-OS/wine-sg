@@ -97,3 +97,19 @@ and /var/tmp/stubs-agent do not exist there. Use these instead:
   first. One patch per area per family.
 - Same safety rules as before: scratch HOME/WINEPREFIX for every Wine run,
   no pushes to main, no release.sh, no email, no VMs.
+
+## Update 2026-10-13 (round 4 for drafter 5): close the real gap
+- David: "Let's close the real gap first" -- no integration until the audit's
+  REAL gaps (fixme-stub, notimpl, fake-success) are closed. Read the new last
+  section of docs/stubs/RULES.md, "Closing the real gap".
+- YOUR QUEUE: docs/stubs/gap-D5.json -- the 522 real items left in your groups
+  (media: winegstreamer, dmime, dmusic, dmstyle, quartz, mf*, rtworkq, dpvoice
+  and the rest; and the C/C++ runtimes' remaining real items), from an audit
+  of main + all three drafter branches, sorted by score.
+- Each item ends IMPLEMENTED (a patch, range 4573-4999, same branch and PR #3)
+  or TRIAGED: append a line to docs/stubs/triage-5.tsv IN YOUR BRANCH
+  (tab-separated: dll, func, kind, file:line, verdict, evidence; verdicts
+  windows-matches / no-ground-truth / not-applicable / escalate). Never
+  triage windows-matches without evidence (a Wine test line or a Microsoft
+  docs URL).
+- Your escalate-5.md items count too: give each a verdict in triage-5.tsv.
