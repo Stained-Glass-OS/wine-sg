@@ -112,3 +112,9 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4525 __report_gsfailure (fail-fast), set_terminate(int)/set_unexpected(int), ucrtbase/vcruntime140 unexpected and _is_exception_typeof. Gate + mutant.
 - 4526 vcruntime140: __vcrt_GetModuleFileNameW/GetModuleHandleW/LoadLibraryExW. Gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
+- 4527 msvcp140_2: the 21 C++17 special math functions, double/float (84 exports). Gate (313+188 mpmath table cases) + 2 mutants; drafter's 1205-point comparison in notes.
+- 4528 msvcr100..120, concrt140: Concurrency runtime helpers (processor/node counts, OS version, ids, Log2, shared timer queue, _UnderlyingYield, tracing, _SpinWait assignment, _SpinLock). Gate + mutant.
+- 4529 msvcp100..120, concrt140: concurrent_queue iterator base, NFS allocator. Gate + mutant.
+- 4530 msvcp100..140, msvcp_win: _Yarn<wchar_t/unsigned short>, _Facet_base, _UShinit, empty-class assignments. Gate + mutant.
+- 4531 msvcp90..140, msvcp_win: <random> _MP_* helpers, _Rng_abort. Gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
