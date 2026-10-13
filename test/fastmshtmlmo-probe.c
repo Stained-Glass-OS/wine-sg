@@ -39,7 +39,13 @@ L"var taken=o4.takeRecords(); t('TAKE0',taken.length+' '+taken[0].type+' '+taken
 L"o4.observe($('d'),{childList:true}); $('d').appendChild(document.createElement('u')); o4.disconnect();"
 /* innerHTML gives one record with several nodes */
 L"var o5=new MutationObserver(function(recs){t('O5_N',recs.length); for(var i=0;i<recs.length;i++) t('O5_'+i,d(recs[i]));});"
-L"o5.observe($('d'),{childList:true}); $('d').innerHTML='<s></s><s></s>';"
+L"o5.observe($('d'),{childList:true}); $('d').innerHTML='<s id=n1></s><s id=n2></s>';"
+L"var o6=new MutationObserver(function(recs){t('O6_N',recs.length); for(var i=0;i<recs.length;i++) t('O6_'+i,d(recs[i])+':'+recs[i].removedNodes[0].tagName+(recs[i].removedNodes[1]?recs[i].removedNodes[1].tagName:'-')+':'+(recs[i].addedNodes[0].id||recs[i].addedNodes[0].nodeValue)+':'+(recs[i].previousSibling===null)+(recs[i].nextSibling===null));});"
+L"$('c').innerHTML='<a id=c1></a><b id=c2></b><i id=c3></i>';"
+L"o6.observe($('c'),{childList:true}); $('c').innerHTML='<u id=x1></u><i></i>'; $('c').innerText='plain';"
+L"var o7=new MutationObserver(function(recs){t('O7_N',recs.length); var r=recs[0]; t('O7_0',d(r)+':'+r.removedNodes[0].id+':'+r.addedNodes[0].id+':'+r.previousSibling.id+':'+r.nextSibling.id);});"
+L"$('b').innerHTML='<s id=r1></s><s id=r2></s><s id=r3></s>';"
+L"o7.observe($('b'),{childList:true}); var nn=document.createElement('em'); nn.id='r9'; $('b').replaceChild(nn,$('r2'));"
 L"t('SYNC',calls);";
 static const WCHAR script2[] =
 L"t('ASYNC',calls); document.title=r.join('|');";
