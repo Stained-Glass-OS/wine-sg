@@ -118,3 +118,8 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4530 msvcp100..140, msvcp_win: _Yarn<wchar_t/unsigned short>, _Facet_base, _UShinit, empty-class assignments. Gate + mutant.
 - 4531 msvcp90..140, msvcp_win: <random> _MP_* helpers, _Rng_abort. Gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
+- 4532 msvcp100..140, msvcp_win: C threads layer (_Mtxinit family, _Mtx_timedlock, _Thrd_exit/_Thrd_abort, _Tss_*, _Once). Gate + 2 mutants.
+- 4533 msvcp100..140, msvcp_win: _Xoverflow_error with a std::overflow_error class, _Future_error_map, get_new_handler. Gate + mutant.
+- 4534 msvcp140: nine __crt* kernel32 wrappers. Gate + mutant.
+- 4535 msvcp100..140, msvcp_win: iostream move constructors/assignments and basic_ios::move (char, wchar_t, unsigned short). Gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
