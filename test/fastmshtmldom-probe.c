@@ -17,8 +17,11 @@ L"<div id=rp><span id=r1>x</span></div>"
 L"<div id=ib><u>0</u></div>"
 L"<div id=tx>text</div>"
 L"<div id=e1 class=k><b>x</b></div><div id=e2 class=k><b>x</b></div>"
-L"<div id=at foo=1></div>"
+L"<div id=at title=1></div>"
 L"<p id=kids><a>1</a><a>2</a><a>3</a></p>"
+L"<style id=st1 title=\"Sty\" media=\"screen\">p.a { color: red } div.b { color: blue }</style>"
+L"<a id=an href=\"http://www.example.com:8080/p/q?x=1#h\">x</a><map name=m><area id=ar href=\"http://a.example:81/x/y\"></map>"
+L"<input id=inp type=text><img id=im src=\"about:blank\"><link id=lk><form id=fm><input name=fa><input name=fb></form><select id=sel><option>a<option>b</select>"
 L"<fieldset disabled id=fs><div id=inner><span id=deep>d</span></div></fieldset><br id=br>"
 L"</body></html>";
 
@@ -39,10 +42,11 @@ L"T('IB',function(){var nu=document.createElement('s'); $('ib').insertBefore(nu,
 /* nodeValue of a non-string */
 L"T('NV',function(){var tn=$('tx').firstChild; tn.nodeValue=42; t('NV',tn.nodeValue);});"
 /* Node3 */
-L"T('EQ',function(){t('EQ',$('e1').isEqualNode($('e2'))+' '+$('e1').isEqualNode($('s2')));});"
+L"T('EQ',function(){t('EQ',$('e1').isEqualNode($('e1').cloneNode(true))+' '+$('e1').isEqualNode($('e2'))+' '+$('e1').isEqualNode($('s2')));});"
 L"T('SAME',function(){t('SAME',$('e1').isSameNode($('e1'))+' '+$('e1').isSameNode($('e2')));});"
 L"T('LOCAL',function(){t('LOCAL',$('e1').localName+' '+$('e1').prefix);});"
-L"T('NSLOOKUP',function(){t('NSLOOKUP',$('e1').lookupNamespaceURI(null)+' '+$('e1').isDefaultNamespace('http://www.w3.org/1999/xhtml'));});"
+L"T('NSLOOKUP',function(){t('NSLOOKUP',typeof $('e1').lookupNamespaceURI(null)+' '+typeof $('e1').isDefaultNamespace(null)+' '+typeof $('e1').lookupPrefix(null));});"
+L"T('SAN',function(){var at=$('at'); var a2=document.createAttribute('q'); a2.value='v'; at.setAttributeNode(a2); t('SAN',at.getAttribute('q'));});"
 /* hasAttributes / normalize */
 L"T('HASATTR',function(){t('HASATTR',$('e1').hasAttributes()+' '+document.createElement('p').hasAttributes());});"
 L"T('NORM',function(){var n=document.createElement('div'); n.appendChild(document.createTextNode('a')); n.appendChild(document.createTextNode('b'));"
@@ -53,8 +57,17 @@ L" cd.replaceData(0,1,'J'); t('CD2',cd.data+' '+cd.length+' '+cd.substringData(1
 /* attribute collection / nodes */
 L"T('SNI',function(){var at=$('at'); var a=document.createAttribute('bar'); a.value='baz'; at.attributes.setNamedItem(a); t('SNI',at.getAttribute('bar'));"
 L" var rem=at.attributes.removeNamedItem('bar'); t('RNI',rem.value+' '+at.getAttribute('bar'));"
-L" var rem2=at.removeAttributeNode(at.getAttributeNode('foo')); t('RAN',rem2.name+'='+rem2.value+' '+at.hasAttribute('foo'));"
+L" var rem2=at.removeAttributeNode(at.attributes.item(0)); t('RAN',rem2.name+'='+rem2.value+' '+at.hasAttribute(rem2.name));"
 L" t('ATTR',a.nodeType+' '+a.previousSibling+' '+a.nextSibling+' '+(a.ownerDocument==document));});"
+L"T('SS',function(){var ss=document.styleSheets[0]; t('SS0',ss.title+' '+ss.type+' '+ss.disabled+' '+ss.media+' '+ss.ownerNode.id+' '+ss.rules.length);"
+L" t('SS1',ss.rules[0].selectorText+' '+ss.rules[1].selectorText); ss.disabled=true; t('SS2',ss.disabled); ss.disabled=false;"
+L" ss.deleteRule(0); t('SS3',ss.rules.length+' '+ss.rules[0].selectorText); ss.removeRule(0); t('SS4',ss.rules.length);});"
+L"T('STY',function(){var s=$('e2').style; s.pixelRight=12; s.pixelBottom=7; t('STY0',s.right+' '+s.bottom+' '+s.pixelRight+' '+s.pixelBottom);"
+L" s.posRight=2.5; t('STY1',s.posRight+' '+s.pixelRight); s.setProperty('color','red','important');"
+L" t('STY2',s.length+' '+s.item(0)+' '+s.getPropertyPriority('color')+','+s.getPropertyPriority('right'));});"
+L"T('ANC',function(){var a=$('an'); a.hostname='b.example'; t('ANC0',a.href); a.port='99'; t('ANC1',a.href); a.pathname='/z'; t('ANC2',a.href);"
+L" a.protocol='https:'; t('ANC3',a.href); a.hash='#k'; t('ANC4',a.href);});"
+L"T('ARE',function(){var a=$('ar'); t('ARE0',a.hostname+' '+a.port+' '+a.protocol+' '+a.pathname); a.hostname='c.example'; a.hash='#q'; t('ARE1',a.host+' '+a.hash);});"
 L"t('MODE',document.documentMode);"
 L"document.title=r.join('|');";
 
@@ -176,6 +189,66 @@ int main(void)
             IEnumVARIANT_Release(en); IUnknown_Release(unk); IHTMLAttributeCollection_Release(ac); IDispatch_Release(attrs);
         }
         IHTMLDOMNode_Release(node); IHTMLElement_Release(el);
+    }
+    /* a style sheet by the id of its element, and the clone of its enumerator */
+    {
+        IHTMLStyleSheetsCollection *sheets = NULL; VARIANT idv, res; IDispatch *d; IHTMLStyleSheet *ss; IUnknown *unk; IEnumVARIANT *en, *en2;
+        BSTR id = NULL;
+        IHTMLDocument2_get_styleSheets(doc, &sheets);
+        V_VT(&idv) = VT_BSTR; V_BSTR(&idv) = SysAllocString(L"st1"); VariantInit(&res);
+        hr = IHTMLStyleSheetsCollection_item(sheets, &idv, &res);
+        P("SSID %08lx %d", hr, V_VT(&res));
+        if (V_VT(&res) == VT_DISPATCH) {
+            d = V_DISPATCH(&res);
+            IDispatch_QueryInterface(d, &IID_IHTMLStyleSheet, (void**)&ss);
+            IHTMLStyleSheet_get_id(ss, &id); P(" %ls", id ? id : L"(null)"); SysFreeString(id);
+            IHTMLStyleSheet_Release(ss);
+        }
+        P("\n");
+        VariantClear(&res); SysFreeString(V_BSTR(&idv));
+        IHTMLStyleSheetsCollection_get__newEnum(sheets, &unk);
+        IUnknown_QueryInterface(unk, &IID_IEnumVARIANT, (void**)&en);
+        hr = IEnumVARIANT_Clone(en, &en2); P("CLONE_SHEETS %08lx\n", hr);
+        if (en2) IEnumVARIANT_Release(en2);
+        IEnumVARIANT_Release(en); IUnknown_Release(unk); IHTMLStyleSheetsCollection_Release(sheets);
+    }
+    /* event properties and ready states of elements */
+    {
+        IHTMLElement *el; IHTMLInputElement *inp; IHTMLImgElement *img; IHTMLLinkElement *lnk; void *dummy = NULL;
+        VARIANT v, got; BSTR rs = NULL;
+        (void)dummy;
+        el = byid(doc3, L"inp");
+        IHTMLElement_QueryInterface(el, &IID_IHTMLInputElement, (void**)&inp);
+        V_VT(&v) = VT_DISPATCH; V_DISPATCH(&v) = NULL;
+        hr = IHTMLInputElement_put_onselect(inp, v); VariantInit(&got);
+        { HRESULT hr2 = IHTMLInputElement_get_onselect(inp, &got); P("INSEL %08lx %08lx\n", hr, hr2); }
+        hr = IHTMLInputElement_get_readyState(inp, &rs); P("INRS %08lx %ls\n", hr, rs ? rs : L"(null)"); SysFreeString(rs); rs = NULL;
+        IHTMLInputElement_Release(inp); IHTMLElement_Release(el);
+        el = byid(doc3, L"im");
+        IHTMLElement_QueryInterface(el, &IID_IHTMLImgElement, (void**)&img);
+        hr = IHTMLImgElement_get_readyState(img, &rs); P("IMGRS %08lx %ls\n", hr, rs ? rs : L"(null)"); SysFreeString(rs); rs = NULL;
+        IHTMLImgElement_Release(img); IHTMLElement_Release(el);
+        el = byid(doc3, L"lk");
+        IHTMLElement_QueryInterface(el, &IID_IHTMLLinkElement, (void**)&lnk);
+        hr = IHTMLLinkElement_get_readyState(lnk, &rs); P("LNKRS %08lx %ls\n", hr, rs ? rs : L"(null)"); SysFreeString(rs);
+        IHTMLLinkElement_Release(lnk); IHTMLElement_Release(el);
+    }
+    {
+        IHTMLElement *el; IHTMLFormElement *form; IHTMLSelectElement *sel; IUnknown *unk; IEnumVARIANT *en, *en2; VARIANT v[3]; ULONG got;
+        el = byid(doc3, L"fm");
+        IHTMLElement_QueryInterface(el, &IID_IHTMLFormElement, (void**)&form);
+        IHTMLFormElement_get__newEnum(form, &unk); IUnknown_QueryInterface(unk, &IID_IEnumVARIANT, (void**)&en);
+        got = 0; IEnumVARIANT_Next(en, 1, v, &got); VariantClear(&v[0]);
+        hr = IEnumVARIANT_Clone(en, &en2); P("CLONE_FORM %08lx", hr);
+        got = 0; IEnumVARIANT_Next(en2, 3, v, &got); P(" %lu\n", got); { ULONG i; for (i = 0; i < got; i++) VariantClear(&v[i]); }
+        IEnumVARIANT_Release(en2); IEnumVARIANT_Release(en); IUnknown_Release(unk); IHTMLFormElement_Release(form); IHTMLElement_Release(el);
+        el = byid(doc3, L"sel");
+        IHTMLElement_QueryInterface(el, &IID_IHTMLSelectElement, (void**)&sel);
+        IHTMLSelectElement_get__newEnum(sel, &unk); IUnknown_QueryInterface(unk, &IID_IEnumVARIANT, (void**)&en);
+        got = 0; IEnumVARIANT_Next(en, 1, v, &got); VariantClear(&v[0]);
+        hr = IEnumVARIANT_Clone(en, &en2); P("CLONE_SELECT %08lx", hr);
+        got = 0; IEnumVARIANT_Next(en2, 3, v, &got); P(" %lu\n", got); { ULONG i; for (i = 0; i < got; i++) VariantClear(&v[i]); }
+        IEnumVARIANT_Release(en2); IEnumVARIANT_Release(en); IUnknown_Release(unk); IHTMLSelectElement_Release(sel); IHTMLElement_Release(el);
     }
     P("DONE\n");
     return 0;
