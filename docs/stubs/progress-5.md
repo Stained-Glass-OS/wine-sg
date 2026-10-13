@@ -191,3 +191,8 @@ Every item is either implemented (patches from 4573) or triaged in docs/stubs/tr
 - 4585 (fast) mfplat: a memory 2D buffer's GetService is E_NOTIMPL again (merged 2830 had changed it; evr.c:1942, a Windows-run test, failed). 2830's gate updated. Mutant.
 - 4586 (fast) msacm32: ACM_METRIC_MAX_SIZE_FILTER, DRV_CONFIGURE to an open driver, acmDriverAdd(ACM_DRIVERADDF_NAME) returned an error for a driver it had registered. Gate (the probe is its own ACM driver) + 3 mutants.
 - Media suites of each touched DLL before this push: 0 failures (evr was 1 before 4585; mfplat 1 environment-dependent todo-succeeded, notes/4583.txt).
+- 4587 (fast) winegstreamer (WM reader): IWMReaderPlaylistBurn checks the files and sends WMT_INIT_PLAYLIST_BURN. Gate + mutant.
+- 4588 (fast) quartz: VMR-9 AllocateSurfaceHelper takes the documented flag combinations. Gate + mutant.
+- 4589 (fast) avifil32: ReadFormat applies palette changes. Gate (fails on the old code) + mutant.
+- 4590 (fast) dmsynth: DLS level 1 articulation (DMUS_ARTICPARAMS) of instrument downloads. Gate (renders and compares the note's start) + mutant.
+- gap-D5 queue: all 473 items resolved - 31 implemented (4574-4590), 442 triaged in triage-5.tsv (windows-matches, escalate, no-ground-truth, not-applicable; each with its evidence).
