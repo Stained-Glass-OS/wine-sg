@@ -27,6 +27,7 @@ DEFINE_GUID(IID_Dev1, 0xc37ea93a,0xe7aa,0x450d,0xb1,0x6f,0x97,0x46,0xcb,0x04,0x0
 
 typedef HRESULT (WINAPI *create_t)(IUnknown *, REFIID, void **);
 
+#define COMPOSITIONOBJECT_ALL_ACCESS 0x0003
 int main(void)
 {
     HMODULE dc = LoadLibraryA("dcomp.dll");
@@ -73,6 +74,40 @@ int main(void)
         hr = CALL1(dd, 23, &anim);
         CHECK(hr == S_OK && anim);
         if (anim) CALL0(anim, 2, ULONG);
+        {
+            typedef HRESULT (WINAPI *csh_t)(DWORD, SECURITY_ATTRIBUTES *, HANDLE *);
+            typedef HRESULT (WINAPI *fromh_t)(void *, HANDLE, void **);
+            csh_t create_handle = (csh_t)GetProcAddress(dc, "DCompositionCreateSurfaceHandle");
+            HANDLE h = NULL;
+            void *surf = NULL;
+            HWND w;
+
+            CHECK(create_handle);
+            hr = create_handle(0, NULL, NULL);
+            CHECK(hr == E_INVALIDARG);
+            hr = create_handle(COMPOSITIONOBJECT_ALL_ACCESS, NULL, &h);
+            CHECK(hr == S_OK && h);
+            hr = ((fromh_t)SLOT(dd, 25))(dd, h, &surf);
+            CHECK(hr == S_OK && surf);
+            if (surf) CALL0(surf, 2, ULONG);
+            hr = ((fromh_t)SLOT(dd, 25))(dd, GetCurrentProcess(), &surf);
+            CHECK(hr == E_INVALIDARG);
+            hr = ((fromh_t)SLOT(dd, 25))(dd, NULL, &surf);
+            CHECK(hr == E_INVALIDARG);
+            if (h) CloseHandle(h);
+            h = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096, NULL);
+            hr = ((fromh_t)SLOT(dd, 25))(dd, h, &surf);
+            CHECK(hr == E_INVALIDARG);
+            CloseHandle(h);
+            w = CreateWindowA("static", "x", WS_POPUP, 0, 0, 40, 30, NULL, NULL, NULL, NULL);
+            surf = NULL;
+            hr = ((fromh_t)SLOT(dd, 26))(dd, (HANDLE)w, &surf);
+            CHECK(hr == S_OK && surf);
+            if (surf) CALL0(surf, 2, ULONG);
+            hr = ((fromh_t)SLOT(dd, 26))(dd, (HANDLE)0xdeadbeef, &surf);
+            CHECK(hr == E_INVALIDARG);
+            DestroyWindow(w);
+        }
         hr = ((HRESULT (WINAPI *)(void *, void *, void **))SLOT(dd, 7))(dd, NULL, &fac);
         CHECK(hr == S_OK && fac);
         if (fac)
