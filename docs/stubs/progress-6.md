@@ -25,3 +25,19 @@ The series applied to the tarball reproduces the build tree.
 - 5013 crypt32 CryptBinaryToStringA CRYPT_STRING_HEX (49).
 - 5014 bcrypt unknown algorithm -> STATUS_NOT_FOUND (9); 5015 BCryptImportKeyPair hImportKey (45); 5016
   BCryptDecrypt flags (18); 5017 AES key wrap export/import, RFC 3394 vectors (36, 814).
+
+## 2026-10-13, batch 2: patches 5018-5032 (53 items; 91 implemented so far)
+Same method as batch 1; suites rpcrt4 combase ole32 oleaut32 gdi32 user32 ntdll kernel32 kernelbase bcrypt crypt32
+(64 and 32) compared with the base: no new failures (kernel32 loader/profile flakes as in batch 1).
+- 5018 rpcrt4 NdrClearOutParameters (26): frees and clears [out] parameters after a failed proxy call, only once the
+  proxy is unmarshalling, never the caller's own variable.
+- 5019 combase CoGetDefaultContext for the current apartment (30); the other apartments' default contexts stay a FIXME.
+- 5020 user32 DdeDisconnect from the server side, XTYP_DISCONNECT to the client (43).
+- 5021 gdi32 EMR_SMALLTEXTOUT playback (40; the escape and colour records stay unplayed, see the notes).
+- 5022 ntdll RtlZombifyActivationContext (389, three todo_wine removed); 5023 ThreadIsIoPending access check (23);
+  5024 RtlDeleteTimerQueueEx returns at once with an event (384); 5025 FileCompressionInformation (12).
+- 5026 bcrypt STATUS_NOT_SUPPORTED for unknown properties and modes (802-811).
+- 5027 crypt32 CERT_RDN_UNIVERSAL_STRING encode/decode/text (170, 171, 208, 209); 5028 invalid add disposition
+  E_INVALIDARG for CRLs/CTLs (180, 205); 5029 CERT_CLOSE_STORE_CHECK_FLAG for collection/provider stores (178, 192, 213).
+- 5030-5032 ole32 call_as proxy/stub wrappers: LockServer, bind options, IsRunning, BindToObject (468-477);
+  FLAG_STGMEDIUM and IDataObject::SetData (464-467, 478, 479); IViewObject and ResizeBorder (480-489).
