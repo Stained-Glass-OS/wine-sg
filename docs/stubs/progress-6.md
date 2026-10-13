@@ -88,3 +88,15 @@ Same method; suites ntdll kernel32 kernelbase advapi32 shlwapi (64 and 32) compa
 - 5069 ntdll FileFsObjectIdInformation is the file system's UUID (46).
 - 5070 the registry quota used is the registry's size, the same in GetSystemRegistryQuota and ntdll (974).
 - 5071 GetNumberOfConsoleMouseButtons asks conhost (SM_CMOUSEBUTTONS) through a new condrv ioctl (334).
+
+## 2026-10-13, batch 6: patches 5072-5078 (17 items; 207 implemented so far)
+Same method; suites ntoskrnl.exe ole32 (64 and 32) compared with the base: no new failures, three todo_wine removed.
+- 5072 ntoskrnl callback objects: ExCreateCallback (named; the system's \Callback objects open), ExRegisterCallback,
+  ExUnregisterCallback (also from inside the routine), ExNotifyCallback (1090-1093).
+- 5073 IoInitializeTimer / IoStartTimer / IoStopTimer, a routine called once a second (1075-1077).
+- 5074 driver Reinitialize routines run after DriverEntry with Count (1084, 1085).
+- 5075 a DPC queue: KeInsertQueueDpc, KeRemoveQueueDpc, KeFlushQueuedDpcs, KeSetTargetProcessorDpc(Ex) (1097, 1160,
+  1130, 1131).
+- 5076 RtlIsNtDdiVersionAvailable against the running version (1165).
+- 5077 ole32 IPropertyStorage::SetTimes on a simple set (890); 5078 the data cache's IViewObject::Freeze/Unfreeze
+  (510, 511).
