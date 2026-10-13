@@ -313,9 +313,14 @@ static void test_copy2d(void)
     hr = IMFMediaBuffer_QueryInterface(src, &IID_IMFGetService, (void **)&gs);
     if (hr == S_OK)
     {
+        static const GUID mr_buffer_service = {0xa562248c,0x9ac6,0x4ffc,{0x9f,0xba,0x3a,0xf8,0xf8,0xad,0x1a,0x4d}};
         void *obj = (void *)1;
+        /* a buffer in memory has no surface: E_NOTIMPL, as Windows answers in
+         * dlls/evr/tests/evr.c (patch 4585; 2830 had MF_E_UNSUPPORTED_SERVICE) */
+        hr = IMFGetService_GetService(gs, &mr_buffer_service, &IID_IUnknown, &obj);
+        CHECKF(hr == E_NOTIMPL, "GetService(MR_BUFFER_SERVICE) of a memory buffer is E_NOTIMPL (%#lx)", hr);
         hr = IMFGetService_GetService(gs, &IID_IUnknown /* any non-service GUID */, &IID_IUnknown, &obj);
-        CHECKF(hr == MF_E_UNSUPPORTED_SERVICE, "GetService of an unknown service is MF_E_UNSUPPORTED_SERVICE (%#lx)", hr);
+        CHECKF(hr == E_NOTIMPL, "GetService of an unknown service is E_NOTIMPL (%#lx)", hr);
         IMFGetService_Release(gs);
     }
     else check(1, "(a 2D memory buffer without IMFGetService: skipped)");

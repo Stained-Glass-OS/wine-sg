@@ -9,7 +9,8 @@
 #   WINE=/opt/wine-sg/bin/wine test/mfplat-buffers-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
 # Mutants (mfplat, -DSG_MUTANT_x): MFBUF_FP16_NO_ROUND (truncates), MFBUF_WRAP_OFFSET
-# (the wrapper ignores its offset), MFBUF_WRAP_NO_BOUNDS, MFBUF_COPY2D_NOOP, MFBUF_BMP_SIZE.
+# (the wrapper ignores its offset), MFBUF_WRAP_NO_BOUNDS, MFBUF_COPY2D_NOOP, MFBUF_BMP_SIZE;
+# MEM2D_SERVICE_UNSUPPORTED (4585: a memory 2D buffer's GetService is E_NOTIMPL).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
