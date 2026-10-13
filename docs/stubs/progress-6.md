@@ -76,3 +76,15 @@ base: no new failures (web.core has no conformance tests; its gates cover it).
 - 5061 StringMap IMap::GetView, a snapshot (747).
 - 5062 combase IComThreadingInfo::SetCurrentLogicalThreadId (166); 5063 IContext properties on the thread object
   context (832-835).
+
+## 2026-10-13, batch 5: patches 5064-5071 (8 items; 190 implemented so far)
+Same method; suites ntdll kernel32 kernelbase advapi32 shlwapi (64 and 32) compared with the base: no new failures
+(kernel32 profile.c:1560 fails on the base's 64-bit run too; loader as in the earlier batches).
+- 5064 kernelbase SetProcessAffinityUpdateMode keeps the mode, QueryProcessAffinityUpdateMode (311).
+- 5065 kernel32 Wow64GetThreadSelectorEntry (260).
+- 5066 kernelbase UrlFixupW reproduces the documented corrections (352).
+- 5067 advapi32 GetCurrentHwProfileW/A from the registry, keeping Wine's old GUID as the default (98).
+- 5068 ntdll NtQueryDirectoryFile with an event, APC or completion port (62).
+- 5069 ntdll FileFsObjectIdInformation is the file system's UUID (46).
+- 5070 the registry quota used is the registry's size, the same in GetSystemRegistryQuota and ntdll (974).
+- 5071 GetNumberOfConsoleMouseButtons asks conhost (SM_CMOUSEBUTTONS) through a new condrv ioctl (334).
