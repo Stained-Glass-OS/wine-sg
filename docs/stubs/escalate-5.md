@@ -101,3 +101,11 @@ Old note:
 - msvcp60: its wide complex operators stay stubs (Wine's msvcp60 has no wide streams); msvcp70's private basic_string/num_put/money_put helpers stay stubs (internal signatures of the VC7.0 library, no source names to map to).
 - Dinkumware math internals (_Dint, _Dnorm, _Dtento, _Dunscale, _Poly, _LExp, the _Xp_* extended precision family, _Stoflt/_Stopfx/_Stoxflt) stay stubs in msvcp1x0 and ucrtbase: their return codes and rounding are only described in third-party books; the documented C functions cover what programs call.
 - msvcp collate<char> in the classic ("C") locale does not compare in byte order in Wine: "A" and "Z" collate after "a" (found with 4569's gate); the "C" locale's strcoll on Windows is strcmp. Pre-existing (collate_char_compare/_Strcoll), not changed in round 3.
+
+## Round 4 (2026-10-13)
+- The msvcp "C" locale collation bug (last item above): FIXED by 4573. Fixing it exposed that Wine's msvcrt setlocale("C") rebuilt a category that was "C" already; msvcp90's collate test (which runs on Windows) shows Windows keeps it, so 4573 does too.
+- 4538's money_wcsdup_mb passed a NULL _Mbstatet to _Mbrtowc (a crash for moneypunct<wchar_t> in the "C" locale, never reached until _Make*loc built that facet); fixed inside 4576, 4538 itself unchanged.
+- quartz: BasicVideo2_GetPreferredAspectRatio recursed into itself (Wine 10.0); fixed in 4578.
+- msvcp100 and later have no messages, money_get, money_put or moneypunct facets at all; _Make*loc keeps its FIXME there (triage-5.tsv: escalate).
+- num_get::_Getffldx: the only source of its behaviour is microsoft/STL's xlocnum (Apache-2.0 WITH LLVM-exception); reimplementing it from that source in LGPL-2.1 Wine is a licensing decision for the integrator.
+- _heapmin fails because ntdll's RtlCompactHeap is a stub returning 0; the fix belongs to the core DLLs (drafter 6, gap-CORE).

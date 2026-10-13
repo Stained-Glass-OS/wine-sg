@@ -171,3 +171,15 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4572 (fast) msvcr100: details::task_canceled. Smoke gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
 - Queue status (audit5-drafter5b.json): 683 of 3714 still stubbed somewhere (90 of them ARM-only names), from 899 at the last count. The rest is the escalated set (escalate-5.md): C++ EH internals, private stream/locale helpers and static data, Dinkumware math internals, the ConcRT agent/task collection/cancellation token/location classes and debug hooks (their object layouts come from headers not openly available), vcomp's ordered/copyprivate protocol, msvcm managed helpers (policy), and a few with unknown signatures or messages (msvcp80 __Stodx, tr1 throwers, _GetLocaleForCP, _Locinfo::_Getno/_Getyes, VC 6 codecvt::length).
+
+## Round 4 (2026-10-13): close the real gap (docs/stubs/gap-D5.json, 473 items)
+Every item is either implemented (patches from 4573) or triaged in docs/stubs/triage-5.tsv (dll, func, kind, file:line, verdict, evidence). Each item was examined; the media groups' evidence (Wine test lines that run on Windows, or Microsoft docs pages that were fetched) was machine-checked: every cited test line exists, is an ok() check, and is not a todo_wine for the case cited.
+- 4573 msvcp60..140 (+ msvcrt..msvcr100 setlocale): the "C" locale collates by code unit (_Strcoll/_Wcscoll/_Strxfrm/_Wcsxfrm); setlocale keeps a category that is "C" already (msvcp90 misc test). Gate + 3 mutants.
+- 4574 msvcr100..120, concrt140: Context::Yield, Context::Oversubscribe (invalid_oversubscribe_operation), the context's Alloc/Free. Gate + 3 mutants.
+- 4575 (fast) msvcp60: per-class _Doraise throwing the object as its own class. Gate + mutant.
+- 4576 msvcp80..140: _Makexloc/_Makewloc/_Makeushloc add messages/money_get/money_put/moneypunct (msvcp80/90) and time_get<unsigned short>; fixes a NULL _Mbstatet in 4538's money_wcsdup_mb. Gate + mutant.
+- 4577 (fast) mp3dmod: Get*CurrentType, Allocate/FreeStreamingResources, GetInputStatus, Lock. Gate + 3 mutants.
+- 4578 (fast) quartz: the graph's interface cache holds all four forwarded interfaces; GetPreferredAspectRatio recursed into itself; Step returns VFW_E_FRAME_STEP_UNSUPPORTED. Gate + 2 mutants.
+- 4579 (fast) quartz: DirectSound renderer IAMDirectSound::Set/GetFocusWindow. Gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); quartz and mp3dmod suites clean.
+- Queue status: 15 implemented, 437 triaged (windows-matches 258, escalate 84, no-ground-truth 50, not-applicable 45), 21 still open (being implemented: amstream sample allocation, dpvoice class factory, wmp GetMoniker, avifil32 palette changes, msacm32 filter metrics/driver message, rtworkq platform events, evr GetFullscreen, winegstreamer h264 profiles/WMA lossless/playlist burn, dmsynth DLS1 articulation, dmstyle chord maps, VMR9 surface flags).
