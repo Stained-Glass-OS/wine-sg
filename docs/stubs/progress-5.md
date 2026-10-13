@@ -103,3 +103,12 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4517 ucrtbase: mbrtoc16, mbrtoc32, c16rtomb, c32rtomb (UTF-8). Gate (138 checks) + mutant.
 - 4518 msvcr110/120: 20 __crt* kernel32 wrappers. Gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
+- 4519 msvcp140_atomic_wait: indirect waits/notifications, deadlines, api level, atomic mutexes, cmpxchg128, execution byte wait (11). Gate + mutant.
+- 4520 crtdll, msvcrt family, ucrtbase: _getsystime, _setsystime. Gate + mutant.
+- 4521 msvcr80..120, ucrtbase: _iswcsym_l, _iswcsymf_l, _o___pwctype_func, _o__ismbclower. Gate + mutant.
+- 4522 msvcr120, ucrtbase: norm, normf, norml. Gate + mutant.
+- 4523 (fast) vcomp family: _vcomp_for_dynamic_init_i8/_next_i8, omp_get_wtick. Gate + mutant; ordered/copyprivate/master_barrier escalated.
+- 4524 msvcrtd: 12 debug heap functions (no debug block headers in Wine; limits escalated). Gate + mutant.
+- 4525 __report_gsfailure (fail-fast), set_terminate(int)/set_unexpected(int), ucrtbase/vcruntime140 unexpected and _is_exception_typeof. Gate + mutant.
+- 4526 vcruntime140: __vcrt_GetModuleFileNameW/GetModuleHandleW/LoadLibraryExW. Gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
