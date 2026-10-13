@@ -47,6 +47,10 @@ L"T('SAME',function(){t('SAME',$('e1').isSameNode($('e1'))+' '+$('e1').isSameNod
 L"T('LOCAL',function(){t('LOCAL',$('e1').localName+' '+$('e1').prefix);});"
 L"T('NSLOOKUP',function(){t('NSLOOKUP',typeof $('e1').lookupNamespaceURI(null)+' '+typeof $('e1').isDefaultNamespace(null)+' '+typeof $('e1').lookupPrefix(null));});"
 L"T('SAN',function(){var at=$('at'); var a2=document.createAttribute('q'); a2.value='v'; at.setAttributeNode(a2); t('SAN',at.getAttribute('q'));});"
+L"T('SAN2',function(){var at=$('at'); var a2=document.createAttribute('q2'); a2.value=5; at.setAttributeNode(a2); t('SAN2',at.getAttribute('q2')+' '+typeof at.getAttribute('q2'));"
+L" a2.value='later'; t('SAN3',at.getAttribute('q2')+' '+at.attributes.getNamedItem('q2').value);"
+L" at.setAttribute('q3','one'); var a3=document.createAttribute('q3'); a3.value='two'; var old=at.setAttributeNode(a3);"
+L" t('SAN4',old.value+' '+at.getAttribute('q3')+' '+at.attributes.length);});"
 /* hasAttributes / normalize */
 L"T('HASATTR',function(){t('HASATTR',$('e1').hasAttributes()+' '+document.createElement('p').hasAttributes());});"
 L"T('NORM',function(){var n=document.createElement('div'); n.appendChild(document.createTextNode('a')); n.appendChild(document.createTextNode('b'));"

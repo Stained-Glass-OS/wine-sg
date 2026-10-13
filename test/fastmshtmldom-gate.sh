@@ -2,7 +2,7 @@
 . "$(dirname "$0")/scratch-home.sh"
 # mshtml: DOM nodes and collections (removeNode/swapNode/replaceNode, Node3, CharacterData, attributes).
 #
-#   WINE=/opt/wine-sg/bin/wine test/fastmshtmldom-gate.sh   (mutant SG_MUTANT_MSHTML_DOM_NOSWAP)
+#   WINE=/opt/wine-sg/bin/wine test/fastmshtmldom-gate.sh   (mutants SG_MUTANT_MSHTML_DOM_NOSWAP, SG_MUTANT_ATTRMIRROR)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -41,6 +41,8 @@ grep -q "^DONE" "$T/o" || { fail "the probe did not finish"; head -30 "$T/o"; ec
 [ "$(v LOCAL)" = "div null" ] && [ "$(v NSLOOKUP)" = "object boolean object" ] && pass "localName, prefix, lookupNamespaceURI/lookupPrefix/isDefaultNamespace answer" || fail "node3: $(v LOCAL) $(v NSLOOKUP)"
 [ "$(v HASATTR)" = "true false" ] && [ "$(v NORM0)" = 2 ] && [ "$(v NORM1)" = "1 ab" ] && pass "hasAttributes; normalize merges text nodes" || fail "hasAttributes/normalize: $(v HASATTR) $(v NORM0) $(v NORM1)"
 [ "$(v CD0)" = heXXllo ] && [ "$(v CD1)" = hXllo ] && [ "$(v CD2)" = "JXllo 5 Xl" ] && [ "$(v CD3)" = "JXllo!" ] && pass "CharacterData insertData, deleteData, replaceData, substringData, length" || fail "chardata: $(grep '^CD' "$T/o" | tr '\n' ' ')"
+[ "$(v SAN)" = v ] && [ "$(v SAN2)" = "5 string" ] && [ "$(v SAN3)" = "later later" ] && [ "$(v SNI)" = baz ] && pass "document mode 11: setAttributeNode and setNamedItem make getAttribute return the value, also after the node's value changes" || fail "setAttributeNode: $(grep '^SAN\|^SNI' "$T/o" | tr '\n' ' ')"
+[ "$(v SAN4 | cut -d' ' -f1-2)" = "one two" ] && pass "setAttributeNode over an attribute made by setAttribute returns that attribute" || fail "replace: $(v SAN4)"
 [ "$(v RNI)" = "baz null" ] && [ "$(v RAN)" = "parentElement= false" ] && pass "attributes.removeNamedItem and removeAttributeNode return the detached attribute" || fail "remove attr: $(v RNI) $(v RAN)"
 [ "$(v ATTR)" = "2 null null false" ] && pass "an attribute node: nodeType 2, no siblings" || fail "attr: $(v ATTR)"
 [ "$(w ISDIS_DEEP)" = "00000000 -1" ] && [ "$(w ISDIS_E1)" = "00000000 0" ] && [ "$(w DIS_DEEP)" = 0 ] && pass "isDisabled looks at the ancestors, disabled does not" || fail "isDisabled: $(grep ISDIS "$T/o" | tr '\n' ' ')"
