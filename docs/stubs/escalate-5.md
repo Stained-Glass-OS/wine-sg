@@ -109,3 +109,6 @@ Old note:
 - msvcp100 and later have no messages, money_get, money_put or moneypunct facets at all; _Make*loc keeps its FIXME there (triage-5.tsv: escalate).
 - num_get::_Getffldx: the only source of its behaviour is microsoft/STL's xlocnum (Apache-2.0 WITH LLVM-exception); reimplementing it from that source in LGPL-2.1 Wine is a licensing decision for the integrator.
 - _heapmin fails because ntdll's RtlCompactHeap is a stub returning 0; the fix belongs to the core DLLs (drafter 6, gap-CORE).
+- 2830 (merged) made a memory 2D buffer's GetService return MF_E_UNSUPPORTED_SERVICE; dlls/evr/tests/evr.c:1942 (Windows) expects E_NOTIMPL. Fixed by 4585 as a new patch; 2830's gate now checks E_NOTIMPL. Lesson recorded: the media suites of DLLs a patch's callers test (evr tests mfplat buffers) need running too.
+- msacm32: acmDriverAdd(ACM_DRIVERADDF_NAME) always failed (Wine 10.0); fixed in 4586.
+- mfplat suite: mfplat.c:11222 todo_wine succeeds on this host (D3D11 allocator with both sharing flags fails with E_INVALIDARG on our wined3d); environment-dependent, mark left alone.

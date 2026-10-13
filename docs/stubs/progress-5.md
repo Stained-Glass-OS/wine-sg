@@ -183,3 +183,11 @@ Every item is either implemented (patches from 4573) or triaged in docs/stubs/tr
 - 4579 (fast) quartz: DirectSound renderer IAMDirectSound::Set/GetFocusWindow. Gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); quartz and mp3dmod suites clean.
 - Queue status: 15 implemented, 437 triaged (windows-matches 258, escalate 84, no-ground-truth 50, not-applicable 45), 21 still open (being implemented: amstream sample allocation, dpvoice class factory, wmp GetMoniker, avifil32 palette changes, msacm32 filter metrics/driver message, rtworkq platform events, evr GetFullscreen, winegstreamer h264 profiles/WMA lossless/playlist burn, dmsynth DLS1 articulation, dmstyle chord maps, VMR9 surface flags).
+- 4580 (fast) amstream: AllocateSample/CreateSharedSample of the DirectDraw and audio streams. Gate + 2 mutants.
+- 4581 (fast) dpvoice: class factory QueryInterface, LockServer TRACE, DirectPlayVoiceCreate takes three arguments; two stale todo_wine in the dpvoice test removed (dpnet's server works since 2980). Gate + mutant + the old spec by hand.
+- 4582 (fast) wmp: IOleObject::GetMoniker (the documented default implementation). Gate + mutant.
+- 4583 (fast) rtworkq: RtwqRegisterPlatformEvents/RtwqUnregisterPlatformEvents. Gate + 2 mutants.
+- 4584 (fast) evr: the presenter's GetFullscreen reports windowed mode. Gate + mutant.
+- 4585 (fast) mfplat: a memory 2D buffer's GetService is E_NOTIMPL again (merged 2830 had changed it; evr.c:1942, a Windows-run test, failed). 2830's gate updated. Mutant.
+- 4586 (fast) msacm32: ACM_METRIC_MAX_SIZE_FILTER, DRV_CONFIGURE to an open driver, acmDriverAdd(ACM_DRIVERADDF_NAME) returned an error for a driver it had registered. Gate (the probe is its own ACM driver) + 3 mutants.
+- Media suites of each touched DLL before this push: 0 failures (evr was 1 before 4585; mfplat 1 environment-dependent todo-succeeded, notes/4583.txt).
