@@ -1,10 +1,10 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # Concurrency platform helpers (patches/sg/4551), 64- and 32-bit:
-# # GetNextAsyncId (msvcp110 .. msvcp140, msvcp_win; one more each call,
-# # unique on four threads), CaptureCallstack against a table of skip and
-# # count values, __set_stl_sync_api_mode: test/msvcp-platform-probe.c.
-# # All were spec stubs.
+# Concurrency platform helpers (patches/sg/4551), 64- and 32-bit:
+# GetNextAsyncId (msvcp110 .. msvcp140, msvcp_win; one more each call,
+# unique on four threads), CaptureCallstack against a table of skip and
+# count values, __set_stl_sync_api_mode: test/msvcp-platform-probe.c.
+# All were spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-platform-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

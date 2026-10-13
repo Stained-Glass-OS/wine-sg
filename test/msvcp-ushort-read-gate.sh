@@ -1,9 +1,9 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # unsigned short stream number reader (patches/sg/4554), 64- and 32-bit:
-# # basic_istream<unsigned short>::operator>>(unsigned short &) of msvcp140
-# # and msvcp_win against a table, through string streams:
-# # test/msvcp-ushort-read-probe.c. It was a spec stub.
+# unsigned short stream number reader (patches/sg/4554), 64- and 32-bit:
+# basic_istream<unsigned short>::operator>>(unsigned short &) of msvcp140
+# and msvcp_win against a table, through string streams:
+# test/msvcp-ushort-read-probe.c. It was a spec stub.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-ushort-read-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

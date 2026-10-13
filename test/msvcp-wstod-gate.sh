@@ -1,9 +1,9 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # Wide string conversions (patches/sg/4549), 64- and 32-bit: _WStod,
-# # _WStodx, _WStof, _WStofx, _WStold, _WStoldx against a table and the
-# # narrow _Stod, and __Wcrtomb_lk against _Wcrtomb, in msvcp140 and
-# # msvcp_win: test/msvcp-wstod-probe.c. All were spec stubs.
+# Wide string conversions (patches/sg/4549), 64- and 32-bit: _WStod,
+# _WStodx, _WStof, _WStofx, _WStold, _WStoldx against a table and the
+# narrow _Stod, and __Wcrtomb_lk against _Wcrtomb, in msvcp140 and
+# msvcp_win: test/msvcp-wstod-probe.c. All were spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-wstod-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

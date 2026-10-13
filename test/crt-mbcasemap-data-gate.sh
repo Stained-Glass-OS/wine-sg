@@ -1,8 +1,8 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # _mbcasemap data (patches/sg/4561), 64- and 32-bit: ucrtbase's exported
-# # case map against __p__mbcasemap at start and after _setmbcp to a table
-# # of code pages: test/crt-mbcasemap-data-probe.c. It was a spec stub.
+# _mbcasemap data (patches/sg/4561), 64- and 32-bit: ucrtbase's exported
+# case map against __p__mbcasemap at start and after _setmbcp to a table
+# of code pages: test/crt-mbcasemap-data-probe.c. It was a spec stub.
 #
 #   WINE=/opt/wine-sg/bin/wine test/crt-mbcasemap-data-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

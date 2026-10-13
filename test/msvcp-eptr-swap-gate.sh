@@ -1,8 +1,8 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # exception_ptr swap (patches/sg/4550), 64- and 32-bit: __ExceptionPtrSwap
-# # in msvcp140 and msvcp_win against a table, __ExceptionPtrCompare and the
-# # reference counts: test/msvcp-eptr-swap-probe.c. It was a spec stub.
+# exception_ptr swap (patches/sg/4550), 64- and 32-bit: __ExceptionPtrSwap
+# in msvcp140 and msvcp_win against a table, __ExceptionPtrCompare and the
+# reference counts: test/msvcp-eptr-swap-probe.c. It was a spec stub.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-eptr-swap-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

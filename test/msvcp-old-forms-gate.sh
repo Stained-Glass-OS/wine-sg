@@ -1,9 +1,9 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # Older export forms (patches/sg/4557, fast mode), 64- and 32-bit: numpunct
-# # constructors and _Init without the default-names flag, time_get::_Getcat
-# # without a locale, basic_ostream<wchar_t>(_Uninitialized), in msvcp60 ..
-# # msvcp80: test/msvcp-old-forms-probe.c. All were spec stubs.
+# Older export forms (patches/sg/4557, fast mode), 64- and 32-bit: numpunct
+# constructors and _Init without the default-names flag, time_get::_Getcat
+# without a locale, basic_ostream<wchar_t>(_Uninitialized), in msvcp60 ..
+# msvcp80: test/msvcp-old-forms-probe.c. All were spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-old-forms-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

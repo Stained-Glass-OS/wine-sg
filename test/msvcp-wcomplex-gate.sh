@@ -1,10 +1,10 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # Wide complex stream I/O (patches/sg/4548, fast mode), 64- and 32-bit:
-# # every operator<< and operator>> of complex<float/double/long double> on
-# # wchar_t and unsigned short streams that msvcp60 .. msvcp90 export, through
-# # basic_ostringstream/basic_istringstream: test/msvcp-wcomplex-probe.c.
-# # All were spec stubs.
+# Wide complex stream I/O (patches/sg/4548, fast mode), 64- and 32-bit:
+# every operator<< and operator>> of complex<float/double/long double> on
+# wchar_t and unsigned short streams that msvcp60 .. msvcp90 export, through
+# basic_ostringstream/basic_istringstream: test/msvcp-wcomplex-probe.c.
+# All were spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-wcomplex-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

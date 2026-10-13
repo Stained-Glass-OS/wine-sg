@@ -157,3 +157,12 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4561 ucrtbase: the _mbcasemap data export. Gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); concrt140 rerun after 4560.
 - Queue status (audit5-drafter5b.json): 899 of 3714 still stubbed somewhere (180 of them ARM-only names), from 1277 at the last count. What is left is mostly internal or undocumented (EH internals, private stream/locale helpers, Dinkumware math internals), the ConcRT agent/task-collection/cancellation-token classes, and msvcm managed helpers (policy); see escalate-5.md.
+- 4562 (fast) msvcr70/71: __set_buffer_overrun_handler, __buffer_overrun; msvcr80 fastcall @_calloc_crt@8/@_realloc_crt@8. Smoke gate + 2 mutants.
+- 4563 (fast) msvcp60/70/71: exports differing only in member access (msvcp70 basic_string helpers, msvcp60 time_get destructors, ios_base::_Addstd). Smoke gate.
+- 4564 (fast) msvcp60: overflow_error members, underflow_error, domain_error. Smoke gate + mutant.
+- 4565 (fast) msvcp60: _Lockit and locale::id assignment. Smoke gate + mutant.
+- 4566 (fast) msvcp60: char_traits::assign with a count (character by reference). Smoke gate + mutant.
+- 4567 (fast) msvcp60: short-mode pubseekpos, unsigned short getloc. Smoke gate + mutant.
+- 4568 (fast) msvcp60: std::bad_typeid, std::__non_rtti_object, std::bad_exception, ios_base::exceptions(short). Smoke gate + 2 mutants.
+- 4569 (fast) msvcp60: locale::operator()(string, string). Smoke gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); msvcp60 rerun after 4568/4569.

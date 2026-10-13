@@ -1,9 +1,9 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # Filesystem helpers (patches/sg/4555), 64- and 32-bit: _Hard_links,
-# # _Statvfs, _Chmod and _Symlink_get of msvcp140 and msvcp_win against
-# # tables and the kernel32 functions: test/msvcp-fs-misc-probe.c. All were
-# # spec stubs.
+# Filesystem helpers (patches/sg/4555), 64- and 32-bit: _Hard_links,
+# _Statvfs, _Chmod and _Symlink_get of msvcp140 and msvcp_win against
+# tables and the kernel32 functions: test/msvcp-fs-misc-probe.c. All were
+# spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-fs-misc-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

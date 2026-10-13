@@ -1,10 +1,10 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # Exception internals and task helpers (patches/sg/4552, fast mode), 64-
-# # and 32-bit: exception::_Copy_str/_Tidy (msvcr100 .. msvcr120),
-# # _Interruption_exception, _SetUnobservedExceptionHandler with
-# # _ReportUnobservedException (msvcr110, msvcr120), CaptureCallstack
-# # (msvcr120): test/crt-exc-misc-probe.c. All were spec stubs.
+# Exception internals and task helpers (patches/sg/4552, fast mode), 64-
+# and 32-bit: exception::_Copy_str/_Tidy (msvcr100 .. msvcr120),
+# _Interruption_exception, _SetUnobservedExceptionHandler with
+# _ReportUnobservedException (msvcr110, msvcr120), CaptureCallstack
+# (msvcr120): test/crt-exc-misc-probe.c. All were spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/crt-exc-misc-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

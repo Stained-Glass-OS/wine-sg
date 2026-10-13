@@ -1,8 +1,8 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # msvcp60 date order (patches/sg/4556, fast mode), 64- and 32-bit:
-# # time_get<char/unsigned short>::date_order and do_date_order in the "C"
-# # locale: test/msvcp60-dateorder-probe.c. They were spec stubs.
+# msvcp60 date order (patches/sg/4556, fast mode), 64- and 32-bit:
+# time_get<char/unsigned short>::date_order and do_date_order in the "C"
+# locale: test/msvcp60-dateorder-probe.c. They were spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp60-dateorder-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

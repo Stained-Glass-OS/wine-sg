@@ -1,10 +1,10 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # _Context and the inline depth (patches/sg/4560), 64- and 32-bit:
-# # details::_Context's constructor (a table of pointers) and default
-# # constructor closure, _Oversubscribe, _StackGuard::_GetCurrentInlineDepth
-# # per thread, in msvcr110, msvcr120 and concrt140:
-# # test/concrt-context-probe.c. All were spec stubs.
+# _Context and the inline depth (patches/sg/4560), 64- and 32-bit:
+# details::_Context's constructor (a table of pointers) and default
+# constructor closure, _Oversubscribe, _StackGuard::_GetCurrentInlineDepth
+# per thread, in msvcr110, msvcr120 and concrt140:
+# test/concrt-context-probe.c. All were spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/concrt-context-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

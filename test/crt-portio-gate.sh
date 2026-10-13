@@ -1,11 +1,11 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # Port I/O, file info and case map (patches/sg/4547), 64- and 32-bit:
-# # _inp/_inpw/_inpd/_outp/_outpw/_outpd raise a privileged instruction
-# # exception with the right instruction, port and data (i386 only),
-# # __p__fileinfo/_fileinfo (msvcrt, msvcrtd, msvcr70, msvcr71) and
-# # __p__mbcasemap in code page 1252: test/crt-portio-probe.c. All were spec
-# # stubs.
+# Port I/O, file info and case map (patches/sg/4547), 64- and 32-bit:
+# _inp/_inpw/_inpd/_outp/_outpw/_outpd raise a privileged instruction
+# exception with the right instruction, port and data (i386 only),
+# __p__fileinfo/_fileinfo (msvcrt, msvcrtd, msvcr70, msvcr71) and
+# __p__mbcasemap in code page 1252: test/crt-portio-probe.c. All were spec
+# stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/crt-portio-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

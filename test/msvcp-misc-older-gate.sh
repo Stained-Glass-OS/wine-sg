@@ -1,8 +1,8 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # __Wcrtomb_lk in msvcp60 .. msvcp120 and msvcp110's _Add_vtordisp members
-# # and _GetCurrentThreadId (patches/sg/4559, fast mode), 64- and 32-bit:
-# # test/msvcp-misc-older-probe.c. All were spec stubs.
+# __Wcrtomb_lk in msvcp60 .. msvcp120 and msvcp110's _Add_vtordisp members
+# and _GetCurrentThreadId (patches/sg/4559, fast mode), 64- and 32-bit:
+# test/msvcp-misc-older-probe.c. All were spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-misc-older-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

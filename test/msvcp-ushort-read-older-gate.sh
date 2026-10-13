@@ -1,9 +1,9 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # unsigned short stream number reader in msvcp90 and msvcp110 (patches/sg/
-# # 4558, fast mode), 64- and 32-bit, with the probe of 4554:
-# # test/msvcp-ushort-read-probe.c. It was a spec stub. 4558 also maps
-# # msvcp110's unsigned short time_get::get with a format (not run here).
+# unsigned short stream number reader in msvcp90 and msvcp110 (patches/sg/
+# 4558, fast mode), 64- and 32-bit, with the probe of 4554:
+# test/msvcp-ushort-read-probe.c. It was a spec stub. 4558 also maps
+# msvcp110's unsigned short time_get::get with a format (not run here).
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-ushort-read-older-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

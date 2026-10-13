@@ -1,10 +1,10 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# # classic_table and _W_Gettnames (patches/sg/4553), 64- and 32-bit:
-# # ctype<char>::classic_table's character classes against a table (msvcp100
-# # .. msvcp140, msvcp_win), _Locinfo::_W_Gettnames's wide and narrow names
-# # of the "C" locale (msvcp110 and later): test/msvcp-locinfo-probe.c.
-# # Both were spec stubs.
+# classic_table and _W_Gettnames (patches/sg/4553), 64- and 32-bit:
+# ctype<char>::classic_table's character classes against a table (msvcp100
+# .. msvcp140, msvcp_win), _Locinfo::_W_Gettnames's wide and narrow names
+# of the "C" locale (msvcp110 and later): test/msvcp-locinfo-probe.c.
+# Both were spec stubs.
 #
 #   WINE=/opt/wine-sg/bin/wine test/msvcp-locinfo-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
