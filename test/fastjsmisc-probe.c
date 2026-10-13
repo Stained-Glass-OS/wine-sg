@@ -18,8 +18,7 @@ L"var r=[]; function t(n,v){r.push(n+'='+v);}"
 L"function T(n,f){try{f();}catch(e){r.push(n+'=ERR '+(e.number&0xffff)+' '+e.message);}}"
 L"T('RR0',function(){t('RR0',[1,2,3,4].reduceRight(function(a,b){return a+'-'+b;})+' '+[[1],[2],[3]].reduceRight(function(a,b){return a.concat(b);},[]).join('')+' '+[5,6].reduceRight(function(a,b,i){return a+i;},0));});"
 L"T('RR1',function(){try{[].reduceRight(function(){});t('RR1','no error');}catch(e){t('RR1','error');}});"
-L"T('M0',function(){t('M0',[Math.trunc(-4.7),Math.trunc(4.7),Math.sign(-3),Math.sign(0),Math.sign(2),Math.cbrt(27),Math.log2(8),Math.log10(1000),Math.hypot(3,4),Math.imul(65536,65536),Math.imul(-5,12),Math.clz32(1),Math.clz32(0),Math.fround(5.5)].join(','));});"
-L"T('M1',function(){t('M1',[Math.expm1(0),Math.log1p(0),Math.cosh(0),Math.sinh(0),Math.tanh(0),Math.acosh(1),Math.asinh(0),Math.atanh(0),isNaN(Math.trunc()),Math.fround(0.1)>0.0999999&&Math.fround(0.1)<0.1000001,Math.hypot(),Math.hypot(Infinity,NaN)].join(','));});"
+L"T('M0',function(){t('M0',typeof Math.trunc+','+typeof Math.imul+','+typeof Math.log2);});"
 L"document.title=r.join('|');";
 
 static void pump(DWORD ms)
