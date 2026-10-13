@@ -2671,3 +2671,8 @@ test-wicico:
 
 test-wicidxpal:
 	WINE=$(PREFIX)/bin/wine test/wicidxpal-gate.sh
+
+# DWM thumbnails (5500): the destination's pixels show the source window
+# (64- and 32-bit probe under Xvfb in the shell desktop).
+test-dwmthumb:
+	WINE=$(PREFIX)/bin/wine test/dwmthumb-gate.sh

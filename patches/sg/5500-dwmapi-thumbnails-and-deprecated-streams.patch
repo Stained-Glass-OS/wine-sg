@@ -1,0 +1,716 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dwmapi: thumbnails really draw; the deprecated MIL/stream entry points answer as documented
+
+DwmRegisterThumbnail, DwmUpdateThumbnailProperties, DwmUnregisterThumbnail and
+(new, was a spec stub) DwmQueryThumbnailSourceSize follow Microsoft's
+documentation: the registration is per process (a handle is unique to it and
+only it can update or remove it; null, unknown and other processes' handles
+are E_INVALIDARG), only top-level windows can be a destination (or the
+desktop window) or a source (E_INVALIDARG), the destination must belong to the
+caller (E_ACCESSDENIED), nothing is drawn until the first update, and only the
+fields named by the update flags change. There is no compositor, so a thread
+of the process copies each visible source (PrintWindow, so another process's or
+a covered/cloaked window works) into the destination: source rectangle, client
+area only, scaled into rcDestination, with the opacity blended over the
+destination's own pixels. It draws again only when the source or the
+destination changed, and it clears what it drew when the thumbnail is hidden,
+moved or unregistered.
+
+DwmAttachMilContent, DwmDetachMilContent, DwmGetGraphicsStreamClient and
+DwmGetGraphicsStreamTransformHint return DWM_E_COMPOSITIONDISABLED: Microsoft
+documents them as "deprecated and only returns DWM_E_COMPOSITIONDISABLED in
+Windows 7 and later" (they returned E_NOTIMPL). DwmSetPresentParameters
+"always returns S_OK" and keeps doing so, without the FIXME.
+---
+--- a/dlls/dwmapi/dwmapi.spec
++++ b/dlls/dwmapi/dwmapi.spec
+@@ -76,7 +76,7 @@
+ @ stdcall DwmInvalidateIconicBitmaps(ptr)
+ @ stdcall DwmIsCompositionEnabled(ptr)
+ @ stub DwmModifyPreviousDxFrameDuration
+-@ stub DwmQueryThumbnailSourceSize
++@ stdcall DwmQueryThumbnailSourceSize(long ptr)
+ @ stdcall DwmRegisterThumbnail(long long ptr)
+ # @ stub DwmRenderGesture
+ @ stub DwmSetDxFrameDuration
+--- a/dlls/dwmapi/dwmapi_main.c
++++ b/dlls/dwmapi/dwmapi_main.c
+@@ -31,11 +31,365 @@
+ #include "dwmapi.h"
+ #include "ntuser.h"
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dwmapi);
+ 
+ static int get_display_frequency(void);
+ 
++/* Thumbnail relationships (DwmRegisterThumbnail). They are per process, as
++ * documented: a handle is unique to the process that registered it and only
++ * that process can update or remove it. There is no compositor to draw them,
++ * so a thread of the process copies each visible source window into its
++ * destination window every few tens of milliseconds. */
++struct thumbnail
++{
++    struct list entry;
++    HTHUMBNAIL id;
++    HWND dest, src;
++    DWM_THUMBNAIL_PROPERTIES props;
++};
++
++static struct list thumbnails = LIST_INIT( thumbnails );
++static CRITICAL_SECTION thumbnail_cs;
++static CRITICAL_SECTION_DEBUG thumbnail_cs_debug =
++{
++    0, 0, &thumbnail_cs,
++    { &thumbnail_cs_debug.ProcessLocksList, &thumbnail_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": thumbnail_cs") }
++};
++static CRITICAL_SECTION thumbnail_cs = { &thumbnail_cs_debug, -1, 0, 0, 0, 0 };
++static ULONG_PTR next_thumbnail_id = 1;
++static BOOL thumbnail_thread_running;
++
++#define THUMBNAIL_INTERVAL 40
++
++static struct thumbnail *find_thumbnail( HTHUMBNAIL id )
++{
++    struct thumbnail *thumbnail;
++
++    LIST_FOR_EACH_ENTRY( thumbnail, &thumbnails, struct thumbnail, entry )
++        if (thumbnail->id == id) return thumbnail;
++    return NULL;
++}
++
++static BOOL is_top_level( HWND hwnd )
++{
++    return IsWindow( hwnd ) && GetAncestor( hwnd, GA_PARENT ) == GetDesktopWindow();
++}
++
++/* the source rectangle of a thumbnail, in the source window's own coordinates */
++static BOOL get_thumbnail_source_area( const struct thumbnail *thumbnail, RECT *area )
++{
++    RECT window, client;
++    POINT origin = { 0, 0 };
++
++    if (!GetWindowRect( thumbnail->src, &window )) return FALSE;
++    OffsetRect( &window, -window.left, -window.top );
++    *area = window;
++    if ((thumbnail->props.dwFlags & DWM_TNP_SOURCECLIENTAREAONLY) && thumbnail->props.fSourceClientAreaOnly)
++    {
++        RECT outer;
++
++        if (!GetClientRect( thumbnail->src, &client ) || !ClientToScreen( thumbnail->src, &origin )) return FALSE;
++        GetWindowRect( thumbnail->src, &outer );
++        OffsetRect( &client, origin.x - outer.left, origin.y - outer.top );
++        *area = client;
++    }
++    return TRUE;
++}
++
++/* What the render thread remembers about one thumbnail between two passes:
++ * the destination pixels under it before it was drawn, and what it drew. A
++ * thumbnail with an opacity is blended over the background, never over its own
++ * last picture (that would drift to opaque), and nothing is drawn again while
++ * neither the source nor the destination has changed. */
++struct render
++{
++    struct list entry;
++    HTHUMBNAIL id;
++    HWND dest;
++    RECT rect;
++    BYTE opacity;
++    DWORD *background, *picture, *source;  /* width * height pixels, or NULL */
++};
++
++static struct render *find_render( struct list *renders, HTHUMBNAIL id )
++{
++    struct render *render;
++
++    LIST_FOR_EACH_ENTRY( render, renders, struct render, entry )
++        if (render->id == id) return render;
++    if (!(render = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*render) ))) return NULL;
++    render->id = id;
++    list_add_tail( renders, &render->entry );
++    return render;
++}
++
++static void free_render( struct render *render )
++{
++    list_remove( &render->entry );
++    HeapFree( GetProcessHeap(), 0, render->background );
++    HeapFree( GetProcessHeap(), 0, render->picture );
++    HeapFree( GetProcessHeap(), 0, render->source );
++    HeapFree( GetProcessHeap(), 0, render );
++}
++
++/* ask the destination to paint over what the thumbnail drew; only the render
++ * thread draws, so nothing can draw again after this */
++static void erase_render( struct render *render, BOOL now )
++{
++    UINT flags = RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN;
++
++    HeapFree( GetProcessHeap(), 0, render->picture );
++    HeapFree( GetProcessHeap(), 0, render->source );
++    render->picture = render->source = NULL;
++#ifdef SG_MUTANT_NO_ERASE
++    return;
++#endif
++    if (!IsWindow( render->dest )) return;
++    if (now) flags |= RDW_UPDATENOW;
++    RedrawWindow( render->dest, &render->rect, NULL, flags );
++}
++
++static HBITMAP create_dib( HDC dc, int width, int height, DWORD **bits )
++{
++    BITMAPINFO info = {{ sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB }};
++
++    return CreateDIBSection( dc, &info, DIB_RGB_COLORS, (void **)bits, NULL, 0 );
++}
++
++static DWORD *copy_pixels( const DWORD *pixels, size_t count )
++{
++    DWORD *copy = HeapAlloc( GetProcessHeap(), 0, count * sizeof(DWORD) );
++
++    if (copy) memcpy( copy, pixels, count * sizeof(DWORD) );
++    return copy;
++}
++
++static void clear_alpha( DWORD *pixels, size_t count )
++{
++    while (count--) *pixels++ &= 0x00ffffff;
++}
++
++static DWORD blend_pixel( DWORD src, DWORD base, unsigned int alpha )
++{
++    DWORD out = 0;
++    int shift;
++
++    for (shift = 0; shift < 24; shift += 8)
++    {
++        unsigned int s = (src >> shift) & 0xff, d = (base >> shift) & 0xff;
++        out |= ((s * alpha + d * (255 - alpha) + 127) / 255) << shift;
++    }
++    return out;
++}
++
++static void draw_thumbnail( const struct thumbnail *thumbnail, struct render *render )
++{
++    RECT window, area, source, dest, client;
++    HDC screen_dc, src_dc = NULL, scaled_dc = NULL, dest_dc = NULL;
++    HBITMAP src_bitmap = NULL, scaled_bitmap = NULL, old_src = NULL, old_scaled = NULL;
++    DWORD *scaled_bits, *base, *work;
++    BYTE opacity = 255;
++    int width, height, i;
++    size_t count;
++
++    if (!is_top_level( thumbnail->src ) || !IsWindow( thumbnail->dest )) return;
++    if (!get_thumbnail_source_area( thumbnail, &area ) || IsRectEmpty( &area )) return;
++    if (!GetWindowRect( thumbnail->src, &window )) return;
++
++    source = area;
++    if (thumbnail->props.dwFlags & DWM_TNP_RECTSOURCE)
++    {
++        /* the rectangle is relative to the area being shown */
++        RECT wanted = thumbnail->props.rcSource;
++
++        OffsetRect( &wanted, area.left, area.top );
++        if (!IntersectRect( &source, &area, &wanted )) return;
++    }
++
++    GetClientRect( thumbnail->dest, &client );
++    if (thumbnail->props.dwFlags & DWM_TNP_RECTDESTINATION) dest = thumbnail->props.rcDestination;
++    else dest = client;
++    if (IsRectEmpty( &dest )) return;
++    if (thumbnail->props.dwFlags & DWM_TNP_OPACITY) opacity = thumbnail->props.opacity;
++
++    /* only what lies inside the destination window can be drawn */
++    if (!IntersectRect( &dest, &dest, &client )) return;
++
++    /* moved or resized: the old place must show the window's own content again,
++     * before what is under the new one is taken as the background */
++    if (render->picture && !EqualRect( &render->rect, &dest )) erase_render( render, TRUE );
++    render->dest = thumbnail->dest;
++    width = dest.right - dest.left;
++    height = dest.bottom - dest.top;
++    count = (size_t)width * height;
++
++    screen_dc = GetDC( NULL );
++    src_dc = CreateCompatibleDC( screen_dc );
++    scaled_dc = CreateCompatibleDC( screen_dc );
++    src_bitmap = CreateCompatibleBitmap( screen_dc, window.right - window.left, window.bottom - window.top );
++    scaled_bitmap = create_dib( screen_dc, width, height, &scaled_bits );
++    ReleaseDC( NULL, screen_dc );
++    if (!src_dc || !scaled_dc || !src_bitmap || !scaled_bitmap) goto done;
++    old_src = SelectObject( src_dc, src_bitmap );
++    old_scaled = SelectObject( scaled_dc, scaled_bitmap );
++
++    /* PW_RENDERFULLCONTENT: a cloaked or covered window still has its pixels */
++    if (!PrintWindow( thumbnail->src, src_dc, PW_RENDERFULLCONTENT )) goto done;
++    SetStretchBltMode( scaled_dc, HALFTONE );
++    SetBrushOrgEx( scaled_dc, 0, 0, NULL );
++    if (!StretchBlt( scaled_dc, 0, 0, width, height, src_dc, source.left, source.top,
++                     source.right - source.left, source.bottom - source.top, SRCCOPY ))
++        goto done;
++    GdiFlush();
++    clear_alpha( scaled_bits, count );
++
++#ifdef SG_MUTANT_NO_RENDER
++    goto done;
++#endif
++    if (!(dest_dc = GetDC( thumbnail->dest ))) goto done;
++
++    /* the destination as it is now */
++    {
++        DWORD *cur_bits;
++        HBITMAP cur_bitmap = create_dib( dest_dc, width, height, &cur_bits ), old;
++        HDC cur_dc = CreateCompatibleDC( dest_dc );
++
++        if (!cur_bitmap || !cur_dc)
++        {
++            if (cur_bitmap) DeleteObject( cur_bitmap );
++            if (cur_dc) DeleteDC( cur_dc );
++            goto done;
++        }
++        old = SelectObject( cur_dc, cur_bitmap );
++        BitBlt( cur_dc, 0, 0, width, height, dest_dc, dest.left, dest.top, SRCCOPY );
++        GdiFlush();
++        clear_alpha( cur_bits, count );
++        SelectObject( cur_dc, old );
++        DeleteDC( cur_dc );
++
++        if (render->picture && EqualRect( &render->rect, &dest ) &&
++            !memcmp( cur_bits, render->picture, count * sizeof(DWORD) ))
++        {
++            /* our picture is still there: only a new source or opacity redraws */
++            if (render->opacity == opacity && !memcmp( scaled_bits, render->source, count * sizeof(DWORD) ))
++            {
++                DeleteObject( cur_bitmap );
++                goto done;
++            }
++            base = render->background;
++        }
++        else
++        {
++            /* the destination was painted over (or this is the first pass):
++             * what it shows now is the new background */
++            HeapFree( GetProcessHeap(), 0, render->background );
++            render->background = copy_pixels( cur_bits, count );
++            base = render->background;
++            render->rect = dest;
++        }
++        DeleteObject( cur_bitmap );
++    }
++    if (!base) goto done;
++
++    work = HeapAlloc( GetProcessHeap(), 0, count * sizeof(DWORD) );
++    if (!work) goto done;
++    for (i = 0; i < count; i++)
++#ifdef SG_MUTANT_NO_OPACITY
++        work[i] = scaled_bits[i];
++#else
++        work[i] = opacity == 255 ? scaled_bits[i] : blend_pixel( scaled_bits[i], base[i], opacity );
++#endif
++
++    {
++        BITMAPINFO info = {{ sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB }};
++
++        SetDIBitsToDevice( dest_dc, dest.left, dest.top, width, height, 0, 0, 0, height, work, &info, DIB_RGB_COLORS );
++    }
++    HeapFree( GetProcessHeap(), 0, render->picture );
++    HeapFree( GetProcessHeap(), 0, render->source );
++    render->picture = work;
++    render->source = copy_pixels( scaled_bits, count );
++    render->opacity = opacity;
++
++done:
++    if (dest_dc) ReleaseDC( thumbnail->dest, dest_dc );
++    if (src_dc) { SelectObject( src_dc, old_src ); DeleteDC( src_dc ); }
++    if (scaled_dc) { SelectObject( scaled_dc, old_scaled ); DeleteDC( scaled_dc ); }
++    if (src_bitmap) DeleteObject( src_bitmap );
++    if (scaled_bitmap) DeleteObject( scaled_bitmap );
++}
++
++static DWORD WINAPI thumbnail_thread( void *arg )
++{
++    struct list renders = LIST_INIT( renders );
++    struct render *render, *next_render;
++    HMODULE module = arg;
++
++    for (;;)
++    {
++        struct thumbnail *thumbnail, *copy;
++        unsigned int count = 0, i;
++
++        Sleep( THUMBNAIL_INTERVAL );
++
++        /* draw from copies, outside the lock: the source's thread may be
++         * the one waiting to unregister, and PrintWindow sends it a message */
++        EnterCriticalSection( &thumbnail_cs );
++        if (list_empty( &thumbnails ) && list_empty( &renders ))
++        {
++            thumbnail_thread_running = FALSE;
++            LeaveCriticalSection( &thumbnail_cs );
++            break;
++        }
++        copy = HeapAlloc( GetProcessHeap(), 0, list_count( &thumbnails ) * sizeof(*copy) );
++        if (copy)
++        {
++            LIST_FOR_EACH_ENTRY( thumbnail, &thumbnails, struct thumbnail, entry )
++                if ((thumbnail->props.dwFlags & DWM_TNP_VISIBLE) && thumbnail->props.fVisible)
++                    copy[count++] = *thumbnail;
++        }
++        LeaveCriticalSection( &thumbnail_cs );
++
++        /* forget what was kept for thumbnails that are gone or hidden */
++        LIST_FOR_EACH_ENTRY_SAFE( render, next_render, &renders, struct render, entry )
++        {
++            for (i = 0; i < count; i++) if (copy[i].id == render->id) break;
++            if (i != count) continue;
++            /* hidden, moved away or unregistered: take its picture back */
++            if (render->picture) erase_render( render, FALSE );
++            free_render( render );
++        }
++        for (i = 0; i < count; i++)
++        {
++            if ((render = find_render( &renders, copy[i].id ))) draw_thumbnail( &copy[i], render );
++        }
++        HeapFree( GetProcessHeap(), 0, copy );
++    }
++
++    LIST_FOR_EACH_ENTRY_SAFE( render, next_render, &renders, struct render, entry ) free_render( render );
++    FreeLibraryAndExitThread( module, 0 );
++}
++
++static void start_thumbnail_thread(void)
++{
++    HMODULE module;
++    HANDLE thread;
++
++    /* called with the lock held */
++    if (thumbnail_thread_running) return;
++    if (!GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (const WCHAR *)start_thumbnail_thread, &module ))
++        return;
++    if (!(thread = CreateThread( NULL, 0, thumbnail_thread, module, 0, NULL )))
++    {
++        FreeLibrary( module );
++        return;
++    }
++    CloseHandle( thread );
++    thumbnail_thread_running = TRUE;
++}
+ 
+ /**********************************************************************
+  *           DwmIsCompositionEnabled         (DWMAPI.@)
+@@ -346,9 +700,10 @@ HRESULT WINAPI DwmSetWindowAttribute(HWND hwnd, DWORD attributenum, LPCVOID attr
+  */
+ HRESULT WINAPI DwmGetGraphicsStreamClient(UINT uIndex, UUID *pClientUuid)
+ {
+-    FIXME("(%d, %p) stub\n", uIndex, pClientUuid);
++    /* deprecated: "only returns DWM_E_COMPOSITIONDISABLED in Windows 7 and later" */
++    TRACE("(%d, %p)\n", uIndex, pClientUuid);
+ 
+-    return E_NOTIMPL;
++    return DWM_E_COMPOSITIONDISABLED;
+ }
+ 
+ /**********************************************************************
+@@ -369,11 +724,26 @@ HRESULT WINAPI DwmGetTransportAttributes(BOOL *pfIsRemoting, BOOL *pfIsConnected
+ /**********************************************************************
+  *           DwmUnregisterThumbnail         (DWMAPI.@)
+  */
+-HRESULT WINAPI DwmUnregisterThumbnail(HTHUMBNAIL thumbnail)
++HRESULT WINAPI DwmUnregisterThumbnail(HTHUMBNAIL id)
+ {
+-    FIXME("(%p) stub\n", thumbnail);
++    struct thumbnail *thumbnail;
+ 
+-    return E_NOTIMPL;
++    TRACE("(%p)\n", id);
++
++    /* null and unknown handles, and other processes' (which are not in this
++     * process's list), are E_INVALIDARG */
++    EnterCriticalSection( &thumbnail_cs );
++    if (!id || !(thumbnail = find_thumbnail( id )))
++    {
++        LeaveCriticalSection( &thumbnail_cs );
++        return E_INVALIDARG;
++    }
++    list_remove( &thumbnail->entry );
++    HeapFree( GetProcessHeap(), 0, thumbnail );
++    LeaveCriticalSection( &thumbnail_cs );
++
++    /* the render thread sees it gone and clears what it drew */
++    return S_OK;
+ }
+ 
+ /**********************************************************************
+@@ -392,9 +762,10 @@ HRESULT WINAPI DwmEnableMMCSS(BOOL enableMMCSS)
+  */
+ HRESULT WINAPI DwmGetGraphicsStreamTransformHint(UINT uIndex, MilMatrix3x2D *pTransform)
+ {
+-    FIXME("(%d, %p) stub\n", uIndex, pTransform);
++    /* deprecated: "only returns DWM_E_COMPOSITIONDISABLED in Windows 7 and later" */
++    TRACE("(%d, %p)\n", uIndex, pTransform);
+ 
+-    return E_NOTIMPL;
++    return DWM_E_COMPOSITIONDISABLED;
+ }
+ 
+ /**********************************************************************
+@@ -555,9 +926,72 @@ HRESULT WINAPI DwmGetWindowAttribute(HWND hwnd, DWORD attribute, PVOID pv_attrib
+  */
+ HRESULT WINAPI DwmRegisterThumbnail(HWND dest, HWND src, PHTHUMBNAIL thumbnail_id)
+ {
+-    FIXME("(%p %p %p) stub\n", dest, src, thumbnail_id);
++    struct thumbnail *thumbnail;
++    DWORD pid;
+ 
+-    return E_NOTIMPL;
++    TRACE("(%p %p %p)\n", dest, src, thumbnail_id);
++
++    if (!thumbnail_id) return E_INVALIDARG;
++    *thumbnail_id = NULL;
++
++    /* "anything other than a top-level window" is E_INVALIDARG; the destination
++     * may also be the desktop window itself */
++    if (!IsWindow( dest ) || !IsWindow( src )) return E_INVALIDARG;
++    if (dest != GetDesktopWindow() && !is_top_level( dest )) return E_INVALIDARG;
++    if (!is_top_level( src )) return E_INVALIDARG;
++
++    /* the destination must be the desktop or belong to the caller: nothing
++     * may change what another program's window shows */
++#ifndef SG_MUTANT_NO_OWNER_CHECK
++    if (dest != GetDesktopWindow())
++    {
++        GetWindowThreadProcessId( dest, &pid );
++        if (pid != GetCurrentProcessId()) return E_ACCESSDENIED;
++    }
++#endif
++
++    if (!(thumbnail = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*thumbnail) ))) return E_OUTOFMEMORY;
++    thumbnail->dest = dest;
++    thumbnail->src = src;
++    thumbnail->props.opacity = 255;
++
++    EnterCriticalSection( &thumbnail_cs );
++    thumbnail->id = (HTHUMBNAIL)next_thumbnail_id++;
++    list_add_tail( &thumbnails, &thumbnail->entry );
++    *thumbnail_id = thumbnail->id;
++    start_thumbnail_thread();
++    LeaveCriticalSection( &thumbnail_cs );
++    return S_OK;
++}
++
++/**********************************************************************
++ *           DwmQueryThumbnailSourceSize         (DWMAPI.@)
++ */
++HRESULT WINAPI DwmQueryThumbnailSourceSize(HTHUMBNAIL id, SIZE *size)
++{
++    struct thumbnail *thumbnail, copy;
++    RECT window;
++
++    TRACE("(%p %p)\n", id, size);
++
++    if (!size) return E_INVALIDARG;
++
++    EnterCriticalSection( &thumbnail_cs );
++    if (!id || !(thumbnail = find_thumbnail( id )))
++    {
++        LeaveCriticalSection( &thumbnail_cs );
++        return E_INVALIDARG;
++    }
++    copy = *thumbnail;
++    LeaveCriticalSection( &thumbnail_cs );
++
++    /* the whole source window, not what rcSource selects of it */
++    copy.props.dwFlags = 0;
++    if (!IsWindow( copy.src ) || !get_thumbnail_source_area( &copy, &window ))
++        return DWM_E_COMPOSITIONDISABLED;
++    size->cx = window.right - window.left;
++    size->cy = window.bottom - window.top;
++    return S_OK;
+ }
+ 
+ static int get_display_frequency(void)
+@@ -635,8 +1069,9 @@ HRESULT WINAPI DwmGetCompositionTimingInfo(HWND hwnd, DWM_TIMING_INFO *info)
+  */
+ HRESULT WINAPI DwmAttachMilContent(HWND hwnd)
+ {
+-    FIXME("(%p) stub\n", hwnd);
+-    return E_NOTIMPL;
++    /* deprecated: "only returns DWM_E_COMPOSITIONDISABLED in Windows 7 and later" */
++    TRACE("(%p)\n", hwnd);
++    return DWM_E_COMPOSITIONDISABLED;
+ }
+ 
+ /**********************************************************************
+@@ -644,17 +1079,44 @@ HRESULT WINAPI DwmAttachMilContent(HWND hwnd)
+  */
+ HRESULT WINAPI DwmDetachMilContent(HWND hwnd)
+ {
+-    FIXME("(%p) stub\n", hwnd);
+-    return E_NOTIMPL;
++    /* deprecated: "only returns DWM_E_COMPOSITIONDISABLED in Windows 7 and later" */
++    TRACE("(%p)\n", hwnd);
++    return DWM_E_COMPOSITIONDISABLED;
+ }
+ 
+ /**********************************************************************
+  *           DwmUpdateThumbnailProperties         (DWMAPI.@)
+  */
+-HRESULT WINAPI DwmUpdateThumbnailProperties(HTHUMBNAIL thumbnail, const DWM_THUMBNAIL_PROPERTIES *props)
++HRESULT WINAPI DwmUpdateThumbnailProperties(HTHUMBNAIL id, const DWM_THUMBNAIL_PROPERTIES *props)
+ {
+-    FIXME("(%p, %p) stub\n", thumbnail, props);
+-    return E_NOTIMPL;
++    struct thumbnail *thumbnail;
++    DWORD flags;
++
++    TRACE("(%p, %p)\n", id, props);
++
++    /* null or invalid thumbnails, and other processes', are E_INVALIDARG */
++    if (!props) return E_INVALIDARG;
++    flags = props->dwFlags;
++
++    EnterCriticalSection( &thumbnail_cs );
++    if (!id || !(thumbnail = find_thumbnail( id )))
++    {
++        LeaveCriticalSection( &thumbnail_cs );
++        return E_INVALIDARG;
++    }
++
++    /* only the fields named by the flags change; the others keep their value */
++    if (flags & DWM_TNP_RECTDESTINATION) thumbnail->props.rcDestination = props->rcDestination;
++    if (flags & DWM_TNP_RECTSOURCE) thumbnail->props.rcSource = props->rcSource;
++    if (flags & DWM_TNP_OPACITY) thumbnail->props.opacity = props->opacity;
++    if (flags & DWM_TNP_VISIBLE) thumbnail->props.fVisible = props->fVisible;
++    if (flags & DWM_TNP_SOURCECLIENTAREAONLY) thumbnail->props.fSourceClientAreaOnly = props->fSourceClientAreaOnly;
++    thumbnail->props.dwFlags |= flags & (DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_OPACITY |
++                                         DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY);
++    LeaveCriticalSection( &thumbnail_cs );
++
++    /* hiding or moving: the render thread clears what it drew */
++    return S_OK;
+ }
+ 
+ /**********************************************************************
+@@ -662,7 +1124,9 @@ HRESULT WINAPI DwmUpdateThumbnailProperties(HTHUMBNAIL thumbnail, const DWM_THUM
+  */
+ HRESULT WINAPI DwmSetPresentParameters(HWND hwnd, DWM_PRESENT_PARAMETERS *params)
+ {
+-    FIXME("(%p %p) stub\n", hwnd, params);
++    /* "This function always returns S_OK": the frame parameters are a hint
++     * for a compositor that is not there */
++    TRACE("(%p %p)\n", hwnd, params);
+     return S_OK;
+ };
+ 
+--- a/dlls/dwmapi/tests/dwmapi.c
++++ b/dlls/dwmapi/tests/dwmapi.c
+@@ -140,9 +140,96 @@ cleanup:
+     DestroyWindow(hwnd);
+ }
+ 
++static void test_thumbnails(void)
++{
++    DWM_THUMBNAIL_PROPERTIES props;
++    HTHUMBNAIL thumbnail, thumbnail2;
++    HWND dest, src, child;
++    BOOL enabled = FALSE;
++    SIZE size;
++    HRESULT hr;
++
++    DwmIsCompositionEnabled(&enabled);
++    if (!enabled)
++    {
++        skip("DWM is disabled.\n");
++        return;
++    }
++
++    dest = CreateWindowW(L"static", L"dest", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 10, 10, 200, 200, NULL, NULL, NULL, NULL);
++    src = CreateWindowW(L"static", L"src", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 300, 10, 160, 120, NULL, NULL, NULL, NULL);
++    child = CreateWindowW(L"static", L"child", WS_CHILD | WS_VISIBLE, 0, 0, 50, 50, dest, NULL, NULL, NULL);
++    ok(!!dest && !!src && !!child, "Failed to create windows.\n");
++
++    /* null and unknown thumbnails */
++    memset(&props, 0, sizeof(props));
++    props.dwFlags = DWM_TNP_VISIBLE;
++    props.fVisible = TRUE;
++    hr = DwmUnregisterThumbnail(NULL);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    hr = DwmUnregisterThumbnail((HTHUMBNAIL)0x1234abcd);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    hr = DwmUpdateThumbnailProperties(NULL, &props);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    hr = DwmUpdateThumbnailProperties((HTHUMBNAIL)0x1234abcd, &props);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++
++    /* only top-level windows can be a destination or a source */
++    thumbnail = NULL;
++    hr = DwmRegisterThumbnail(child, src, &thumbnail);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    hr = DwmRegisterThumbnail(dest, child, &thumbnail);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++
++    hr = DwmRegisterThumbnail(dest, src, &thumbnail);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(!!thumbnail, "Got a null thumbnail.\n");
++    hr = DwmRegisterThumbnail(dest, src, &thumbnail2);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(thumbnail2 != thumbnail, "Got the same thumbnail twice.\n");
++
++    memset(&size, 0, sizeof(size));
++    hr = DwmQueryThumbnailSourceSize(thumbnail, &size);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(size.cx > 0 && size.cy > 0, "Got source size %ldx%ld.\n", size.cx, size.cy);
++
++    props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
++    SetRect(&props.rcDestination, 0, 50, 100, 150);
++    props.fVisible = TRUE;
++    props.opacity = 178;
++    props.fSourceClientAreaOnly = FALSE;
++    hr = DwmUpdateThumbnailProperties(thumbnail, &props);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = DwmUpdateThumbnailProperties(thumbnail, NULL);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++
++    hr = DwmUnregisterThumbnail(thumbnail);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = DwmUnregisterThumbnail(thumbnail);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    hr = DwmUpdateThumbnailProperties(thumbnail, &props);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    hr = DwmQueryThumbnailSourceSize(thumbnail, &size);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    hr = DwmUnregisterThumbnail(thumbnail2);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    /* the deprecated entry points: "only returns DWM_E_COMPOSITIONDISABLED
++     * in Windows 7 and later" */
++    hr = DwmAttachMilContent(dest);
++    ok(hr == DWM_E_COMPOSITIONDISABLED, "Got hr %#lx.\n", hr);
++    hr = DwmDetachMilContent(dest);
++    ok(hr == DWM_E_COMPOSITIONDISABLED, "Got hr %#lx.\n", hr);
++
++    DestroyWindow(child);
++    DestroyWindow(src);
++    DestroyWindow(dest);
++}
++
+ START_TEST(dwmapi)
+ {
+     test_DwmIsCompositionEnabled();
+     test_DwmGetCompositionTimingInfo();
+     test_DWMWA_EXTENDED_FRAME_BOUNDS();
++    test_thumbnails();
+ }
+--- a/include/dwmapi.h
++++ b/include/dwmapi.h
+@@ -218,6 +218,7 @@ DWMAPI DwmGetTransportAttributes(BOOL*, BOOL*, DWORD*);
+ DWMAPI DwmGetWindowAttribute(HWND, DWORD, PVOID, DWORD);
+ DWMAPI DwmInvalidateIconicBitmaps(HWND);
+ DWMAPI DwmIsCompositionEnabled(BOOL*);
++DWMAPI DwmQueryThumbnailSourceSize(HTHUMBNAIL, PSIZE);
+ DWMAPI DwmRegisterThumbnail(HWND, HWND, PHTHUMBNAIL);
+ DWMAPI DwmSetIconicLivePreviewBitmap(HWND, HBITMAP, POINT*, DWORD);
+ DWMAPI DwmSetIconicThumbnail(HWND, HBITMAP, DWORD);
