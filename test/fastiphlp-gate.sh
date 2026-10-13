@@ -77,5 +77,6 @@ runw "sg-netctl says invalid: ERROR_INVALID_PARAMETER" "invalid" "$T/netctl" "$R
 runw "sg-netctl says failed: ERROR_GEN_FAILURE" "failed" "$T/netctl" "$REPLY_LOG" reply 31
 runw "sg-netctl does not know the request: ERROR_NOT_SUPPORTED" "unsupported" "$T/netctl" "$REPLY_LOG" reply 50
 runw "no sg-netctl at all: ERROR_NOT_SUPPORTED" "" "/nonexistent/sg-netctl" "" reply 50
+runw "ParseNetworkString networks, no-scope forms, named addresses" "" "$T/netctl" "" parse
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"

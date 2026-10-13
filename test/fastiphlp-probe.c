@@ -110,11 +110,66 @@ static void sequence(int admin)
     }
     expect(SetPerTcpConnectionEStats(&tcp, TcpConnectionEstatsSynOpts, rw, 0, sizeof(rw), 0),
            admin ? ERROR_NOT_SUPPORTED : ERROR_ACCESS_DENIED, "SetPerTcpConnectionEStats");
+    expect(GetPerTcpConnectionEStats(&tcp, TcpConnectionEstatsSynOpts, NULL, 0, 0, NULL, 0, 0, NULL, 0, 0),
+           admin ? ERROR_NOT_SUPPORTED : ERROR_ACCESS_DENIED, "GetPerTcpConnectionEStats");
     expect(SetPerTcpConnectionEStats(&tcp, 99, rw, 0, sizeof(rw), 0), ERROR_INVALID_PARAMETER, "SetPerTcpConnectionEStats bad type");
 
     expect(CreateProxyArpEntry(inet_addr("10.9.8.20"), inet_addr("255.255.255.0"), 1), ok, "CreateProxyArpEntry");
     expect(DeleteProxyArpEntry(inet_addr("10.9.8.20"), inet_addr("255.255.255.0"), 1), ok, "DeleteProxyArpEntry");
     expect(CreateProxyArpEntry(0, 0, 1), ERROR_INVALID_PARAMETER, "CreateProxyArpEntry(0)");
+}
+
+#include <ws2ipdef.h>
+typedef struct { int Format; union { struct { WCHAR Address[256]; WCHAR Port[6]; } n; SOCKADDR_IN v4; SOCKADDR_IN6 v6; } u; } NET_ADDRESS_INFO;
+#ifndef NET_STRING_IPV4_NETWORK
+#define NET_STRING_IPV4_NETWORK 4
+#define NET_STRING_IPV6_NETWORK 0x80
+#define NET_STRING_IPV6_ADDRESS_NO_SCOPE 0x10
+#define NET_STRING_NAMED_ADDRESS 0x100
+#define NET_STRING_NAMED_SERVICE 0x200
+#endif
+#define NET_ADDRESS_IPV4 2
+#define NET_ADDRESS_IPV6 3
+#define NET_ADDRESS_DNS_NAME 1
+static void parse(void)
+{
+    typedef DWORD (WINAPI *parse_t)(const WCHAR *, DWORD, NET_ADDRESS_INFO *, USHORT *, BYTE *);
+    parse_t pParse = (parse_t)GetProcAddress(LoadLibraryA("iphlpapi.dll"), "ParseNetworkString");
+    NET_ADDRESS_INFO info;
+    USHORT port = 99;
+    BYTE plen = 0;
+    static const struct { const WCHAR *s; DWORD type; DWORD ret; int format; int port; int plen; } t[] = {
+        { L"10.1.0.0/16", NET_STRING_IPV4_NETWORK, 0, NET_ADDRESS_IPV4, 0, 16 },
+        { L"10.1.0.0/33", NET_STRING_IPV4_NETWORK, ERROR_INVALID_PARAMETER, 0, 0, 0 },
+        { L"10.1.0.0",    NET_STRING_IPV4_NETWORK, ERROR_INVALID_PARAMETER, 0, 0, 0 },
+        { L"fe80::/10",   NET_STRING_IPV6_NETWORK, 0, NET_ADDRESS_IPV6, 0, 10 },
+        { L"fe80::/129",  NET_STRING_IPV6_NETWORK, ERROR_INVALID_PARAMETER, 0, 0, 0 },
+        { L"::1",         NET_STRING_IPV6_ADDRESS_NO_SCOPE, 0, NET_ADDRESS_IPV6, 0, 255 },
+        { L"fe80::1%3",   NET_STRING_IPV6_ADDRESS_NO_SCOPE, ERROR_INVALID_PARAMETER, 0, 0, 0 },
+        { L"winehq.org",  NET_STRING_NAMED_ADDRESS, 0, NET_ADDRESS_DNS_NAME, 0, 255 },
+        { L"winehq.org:443", NET_STRING_NAMED_SERVICE, 0, NET_ADDRESS_DNS_NAME, 443, 255 },
+        { L"winehq.org:443", NET_STRING_NAMED_ADDRESS, ERROR_INVALID_PARAMETER, 0, 0, 0 },
+        { L"winehq.org",  NET_STRING_NAMED_SERVICE, ERROR_INVALID_PARAMETER, 0, 0, 0 },
+        { L"bad name",    NET_STRING_NAMED_ADDRESS, ERROR_INVALID_PARAMETER, 0, 0, 0 },
+        { L"a..b",        NET_STRING_NAMED_ADDRESS, ERROR_INVALID_PARAMETER, 0, 0, 0 },
+        { L"host:70000",  NET_STRING_NAMED_SERVICE, ERROR_INVALID_PARAMETER, 0, 0, 0 },
+    };
+    unsigned i;
+    for (i = 0; i < ARRAYSIZE(t); i++)
+    {
+        char msg[100];
+        DWORD ret;
+        memset(&info, 0, sizeof(info)); port = 99; plen = 0;
+        ret = pParse(t[i].s, t[i].type, &info, &port, &plen);
+        sprintf(msg, "ParseNetworkString %ls type %lx", t[i].s, t[i].type);
+        expect(ret, t[i].ret, msg);
+        if (!t[i].ret)
+        {
+            expect(info.Format, t[i].format, "format");
+            expect(port, t[i].port, "port");
+            expect(plen, t[i].plen, "prefix length");
+        }
+    }
 }
 
 int main(int argc, char **argv)
@@ -128,6 +183,7 @@ int main(int argc, char **argv)
         expect(imp && SetThreadToken(NULL, imp), 1, "a thread without the Administrators group");
         sequence(0);
     }
+    else if (argc > 1 && !strcmp(argv[1], "parse")) parse();
     else if (argc > 2 && !strcmp(argv[1], "reply")) expect(SetIpTTL(64), atoi(argv[2]), "SetIpTTL answered by sg-netctl");
     else return 2;
     printf(failures ? "RESULT: FAIL\n" : "RESULT: PASS\n");
