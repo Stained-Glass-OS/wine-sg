@@ -136,3 +136,7 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4543 ucrtbase: _dscale/_dexp/_dunscale/_dpoly/_dlog/_dsin (+_fd/_ld/_o_). Gate + mutant.
 - 4544 msvcrt, msvcr80..120, ucrtbase: _dosmaperr, app type, osplatform/winver, TLS/FLS helpers, _getdcwd_nolock, _Validate*, type_info statics, int overloads, debug placement delete, __ExceptionPtrSwap. Gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
+- 4545 msvcr80..120, ucrtbase: x64 _SetImageBase/_GetImageBase/_SetThrowImageBase/_GetThrowImageBase (per thread), __p__mbcasemap. Gate + mutant.
+- 4546 msvcr100..120, concrt140: 14 Concurrency Runtime exception classes, scheduler_worker_creation_error, _ReentrantLock and _ReaderWriterLock members. Gate + 2 mutants.
+- 4547 msvcrt, msvcrtd, msvcr70..120: i386 _inp/_inpw/_inpd/_outp/_outpw/_outpd (privileged instruction exception as on Windows), __p__fileinfo/_fileinfo, __p__mbcasemap in the older CRTs. Gate (vectored handler checks instruction, port, data) + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
