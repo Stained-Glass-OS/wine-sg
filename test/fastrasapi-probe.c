@@ -54,6 +54,36 @@ int main(void)
     CHECK(r == ERROR_BUFFER_TOO_SMALL && count == 99 && size == sizeof(di), "RasEnumDevicesW zero buffer %lu", r);
     di.dwSize = 3;
     CHECK(devs(&di, &size, &count) == ERROR_INVALID_SIZE, "bad size");
+    {
+        DWORD (WINAPI *devsa)(RASDEVINFOA *, DWORD *, DWORD *) = (void *)GetProcAddress(m, "RasEnumDevicesA");
+        DWORD (WINAPI *entw)(const WCHAR *, const WCHAR *, RASENTRYNAMEW *, DWORD *, DWORD *) = (void *)GetProcAddress(m, "RasEnumEntriesW");
+        DWORD (WINAPI *enta)(const char *, const char *, RASENTRYNAMEA *, DWORD *, DWORD *) = (void *)GetProcAddress(m, "RasEnumEntriesA");
+        RASDEVINFOA dia;
+        RASENTRYNAMEA ena;
+        RASENTRYNAMEW enw;
+
+        memset(&dia, 0, sizeof(dia)); dia.dwSize = sizeof(dia);
+        size = sizeof(dia); count = 0;
+        r = devsa(&dia, &size, &count);
+        CHECK(r == 0 && count == 1 && dia.szDeviceName[0] && dia.szDeviceType[0], "RasEnumDevicesA %lu", r);
+        size = 0; count = 99;
+        r = devsa(&dia, &size, &count);
+        CHECK(r == ERROR_BUFFER_TOO_SMALL && count == 99 && size == sizeof(dia), "RasEnumDevicesA zero buffer %lu", r);
+        dia.dwSize = 3;
+        CHECK(devsa(&dia, &size, &count) == ERROR_INVALID_SIZE, "RasEnumDevicesA bad size");
+        CHECK(devsa(NULL, &size, NULL) == ERROR_INVALID_PARAMETER, "RasEnumDevicesA NULL count");
+
+        ena.dwSize = sizeof(ena); enw.dwSize = sizeof(enw);
+        size = sizeof(ena); count = 99;
+        r = enta(NULL, NULL, &ena, &size, &count);
+        CHECK(r == 0 && count == 0, "RasEnumEntriesA none %lu count %lu", r, count);
+        size = sizeof(enw); count = 99;
+        r = entw(NULL, NULL, &enw, &size, &count);
+        CHECK(r == 0 && count == 0, "RasEnumEntriesW none %lu", r);
+        ena.dwSize = 2;
+        CHECK(enta(NULL, NULL, &ena, &size, &count) == ERROR_INVALID_SIZE, "RasEnumEntriesA bad dwSize");
+        CHECK(enta(NULL, NULL, NULL, NULL, &count) == ERROR_INVALID_PARAMETER, "RasEnumEntriesA NULL lpcb");
+    }
 
     memset(&dp, 0, sizeof(dp)); dp.dwSize = sizeof(dp);
     wcscpy(dp.szEntryName, L"no such entry");
