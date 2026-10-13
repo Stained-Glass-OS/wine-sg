@@ -155,6 +155,38 @@ int main(void)
         SetupCloseFileQueue(q);
     }
 
+    /* custom directory ids belong to the INF they were set for */
+    {
+        char p1[MAX_PATH], p2[MAX_PATH], text[256];
+        HINF a, b;
+        DWORD n;
+        sprintf(p1, "%s\\a.inf", dir); sprintf(p2, "%s\\b.inf", dir);
+        write_file(p1, "[Version]\nSignature=\"$Chicago$\"\n[S]\nKey=%41000%\\app\nG=%41001%\\g\n");
+        write_file(p2, "[Version]\nSignature=\"$Chicago$\"\n[S]\nKey=%41000%\\app\nG=%41001%\\g\n");
+        a = SetupOpenInfFileA(p1, NULL, INF_STYLE_WIN4, NULL);
+        b = SetupOpenInfFileA(p2, NULL, INF_STYLE_WIN4, NULL);
+        CHECK(a != INVALID_HANDLE_VALUE && b != INVALID_HANDLE_VALUE, "open infs");
+        CHECK(SetupSetDirectoryIdA(a, 41000, "C:\\OnlyA"), "set for a");
+        CHECK(SetupSetDirectoryIdA(NULL, 41001, "C:\\Everyone"), "set for all");
+        text[0] = 0;
+        SetupGetLineTextA(NULL, a, "S", "Key", text, sizeof(text), &n);
+        CHECK(!strcmp(text, "C:\\OnlyA\\app"), "a sees its id: '%s'", text);
+        text[0] = 0;
+        SetupGetLineTextA(NULL, b, "S", "Key", text, sizeof(text), &n);
+        CHECK(!strcmp(text, "%41000%\\app"), "b does not: '%s'", text);
+        text[0] = 0;
+        SetupGetLineTextA(NULL, b, "S", "G", text, sizeof(text), &n);
+        CHECK(!strcmp(text, "C:\\Everyone\\g"), "everybody's id: '%s'", text);
+        SetupCloseInfFile(a);
+        a = SetupOpenInfFileA(p1, NULL, INF_STYLE_WIN4, NULL);
+        text[0] = 0;
+        SetupGetLineTextA(NULL, a, "S", "Key", text, sizeof(text), &n);
+        CHECK(!strcmp(text, "%41000%\\app"), "a reopened has none: '%s'", text);
+        SetupCloseInfFile(a);
+        SetupCloseInfFile(b);
+        SetupSetDirectoryIdA(NULL, 0, NULL);
+    }
+
     printf("checks %d fails %d\n", checks, fails);
     printf(fails ? "RESULT: FAIL\n" : "RESULT: PASS\n");
     return fails != 0;
