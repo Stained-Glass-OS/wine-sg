@@ -246,6 +246,47 @@ int main(void)
             IUrlHistoryStg2_Release(hist);
         }
     }
+
+    /* IEGetWriteableHKCU, internet shortcut commands */
+    {
+        typedef HRESULT (WINAPI *get_hkcu_t)(HKEY *);
+        HMODULE ie = LoadLibraryW(L"ieframe.dll");
+        get_hkcu_t get_hkcu = ie ? (get_hkcu_t)GetProcAddress(ie, "IEGetWriteableHKCU") : NULL;
+        HKEY key = NULL; DWORD val = 7, rd = 0, sz = sizeof(rd);
+        CHK(get_hkcu != NULL);
+        if (get_hkcu) {
+            CHK(get_hkcu(NULL) == E_INVALIDARG);
+            CHK(get_hkcu(&key) == S_OK && key);
+            if (key) {
+                CHK(RegSetValueExW(key, L"SgProbe", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) == ERROR_SUCCESS);
+                CHK(RegQueryValueExW(key, L"SgProbe", NULL, NULL, (BYTE*)&rd, &sz) == ERROR_SUCCESS && rd == 7);
+                RegDeleteValueW(key, L"SgProbe"); RegCloseKey(key);
+            }
+        }
+        {
+            static const GUID clsid_is = {0xfbf23b40,0xe3f0,0x101b,{0x84,0x88,0x00,0xaa,0x00,0x3e,0x56,0xf8}};
+            static const GUID iid_urlw = {0xcabb0da0,0xda57,0x11cf,{0x99,0x74,0x00,0x20,0xaf,0xd7,0x97,0x62}};
+            IUnknown *unk = NULL; IPersistFile *pf = NULL;
+            hr = CoCreateInstance(&clsid_is, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void**)&unk);
+            CHK(hr == S_OK);
+            if (unk) {
+                void *urlw = NULL;
+                hr = IUnknown_QueryInterface(unk, &IID_IPersistFile, (void**)&pf); CHK(hr == S_OK);
+                if (pf) { CHK(IPersistFile_SaveCompleted(pf, NULL) == S_OK); IPersistFile_Release(pf); }
+                hr = IUnknown_QueryInterface(unk, &iid_urlw, &urlw); CHK(hr == S_OK);
+                if (urlw) {
+                    struct { DWORD cb; DWORD flags; HWND hwnd; LPCWSTR verb; } ci = { sizeof(ci), 0x80, NULL, L"open" };
+                    typedef HRESULT (WINAPI *inv_t)(void *, void *);
+                    inv_t inv = (inv_t)(*(void***)urlw)[5]; /* IUnknown(0-2), SetURL, GetURL, InvokeCommand */
+                    CHK(inv(urlw, &ci) == E_INVALIDARG);
+                    ci.flags = 0; ci.verb = NULL;
+                    CHK(inv(urlw, &ci) == E_INVALIDARG);
+                    IUnknown_Release((IUnknown*)urlw);
+                }
+                IUnknown_Release(unk);
+            }
+        }
+    }
     P("checks %d fails %d\nRESULT: %s\n", checks, fails, fails ? "FAIL" : "PASS");
     return fails != 0;
 }
