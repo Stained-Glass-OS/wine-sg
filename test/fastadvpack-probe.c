@@ -10,6 +10,8 @@ static HRESULT (WINAPI *pRegRestoreAllA)(HWND, LPSTR, HKEY);
 static HRESULT (WINAPI *pRegSaveRestoreOnINFA)(HWND, LPCSTR, LPCSTR, LPCSTR, HKEY, HKEY, DWORD);
 static HRESULT (WINAPI *pFileSaveRestoreA)(HWND, LPSTR, LPSTR, LPSTR, DWORD);
 static HRESULT (WINAPI *pFileSaveRestoreOnINFA)(HWND, LPCSTR, LPCSTR, LPCSTR, LPCSTR, LPCSTR, DWORD);
+typedef struct { CHAR szGUID[59], szDispName[128], szLocale[10], szStub[MAX_PATH * 4], szVersion[32], szCompID[128]; DWORD dwIsInstalled; BOOL bRollback; } PERUSER;
+static HRESULT (WINAPI *pSetPerUserSecValuesA)(PERUSER *);
 static DWORD (WINAPI *pNeedRebootInit)(void);
 static BOOL (WINAPI *pNeedReboot)(DWORD);
 static HRESULT (WINAPI *pRebootCheckOnInstallA)(HWND, LPCSTR, LPCSTR, DWORD);
@@ -161,6 +163,42 @@ int main(void)
     CloseHandle(lock);
     hr = pRebootCheckOnInstallA(NULL, inf, "DefaultInstall", 0);
     CHECK(hr == S_FALSE, "released: %08lx", hr);
+
+    /* a per-user component installed again with rollback keeps the old stub and runs the new one through the wrapper */
+    pSetPerUserSecValuesA = (void *)GetProcAddress(adv, "SetPerUserSecValues");
+    CHECK(pSetPerUserSecValuesA != NULL, "no SetPerUserSecValues");
+    if (pSetPerUserSecValuesA)
+    {
+        static const char *guid = "{FA571A5B-0000-4000-8000-0000000A0001}";
+        PERUSER pu;
+        HKEY comp;
+        char path[200], v[260];
+        DWORD vs;
+
+        memset(&pu, 0, sizeof(pu));
+        strcpy(pu.szGUID, guid); strcpy(pu.szDispName, "First"); strcpy(pu.szStub, "first.exe"); strcpy(pu.szVersion, "1,0");
+        hr = pSetPerUserSecValuesA(&pu);
+        CHECK(hr == S_OK, "per-user first: %08lx", hr);
+        strcpy(pu.szDispName, "Second"); strcpy(pu.szStub, "second.exe"); pu.bRollback = TRUE;
+        hr = pSetPerUserSecValuesA(&pu);
+        CHECK(hr == S_OK, "per-user second: %08lx", hr);
+        sprintf(path, "Software\\Microsoft\\Active Setup\\Installed Components\\%s", guid);
+        if (!RegOpenKeyExA(HKEY_LOCAL_MACHINE, path, 0, KEY_ALL_ACCESS, &comp))
+        {
+            vs = sizeof(v); v[0] = 0;
+            RegQueryValueExA(comp, "OldStubPath", NULL, NULL, (BYTE *)v, &vs);
+            CHECK(!strcmp(v, "first.exe"), "OldStubPath '%s'", v);
+            vs = sizeof(v); v[0] = 0;
+            RegQueryValueExA(comp, "RealStubPath", NULL, NULL, (BYTE *)v, &vs);
+            CHECK(!strcmp(v, "second.exe"), "RealStubPath '%s'", v);
+            vs = sizeof(v); v[0] = 0;
+            RegQueryValueExA(comp, "StubPath", NULL, NULL, (BYTE *)v, &vs);
+            CHECK(strstr(v, "UserInstStubWrapper") != NULL, "StubPath '%s'", v);
+            RegCloseKey(comp);
+            RegDeleteKeyA(HKEY_LOCAL_MACHINE, path);
+        }
+        else CHECK(0, "component key missing");
+    }
 
     printf("checks %d fails %d\n", checks, fails);
     printf(fails ? "RESULT: FAIL\n" : "RESULT: PASS\n");
