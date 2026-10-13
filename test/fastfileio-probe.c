@@ -24,6 +24,7 @@ G(IID_IIterable_HSTRING_, 0xe2fcc7c1, 0x3bfc, 0x5a0b, 0xb2,0xb0,0x72,0xe7,0x69,0
 G(IID_IStreamedFileDataRequest_, 0x1673fcce, 0xdabd, 0x4d50, 0xbe,0xee,0x18,0x0b,0x8a,0x81,0x91,0xb6);
 G(IID_IOutputStream_, 0x905a0fe6, 0xbc53, 0x11df, 0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda);
 G(IID_IClosable_, 0x30d5a829, 0x7fa4, 0x4026, 0x83,0xbb,0xd7,0x5b,0xae,0x4e,0xa9,0x9e);
+G(IID_IUriRuntimeClassFactory_, 0x44a9796f, 0x723e, 0x4fdf, 0xa2,0x18,0x03,0x3e,0x75,0xb0,0xc0,0x84);
 G(IID_IBufferFactory_, 0x71af914d, 0xc10f, 0x484b, 0xbc,0x50,0x14,0xbc,0x62,0x3b,0x3a,0x27);
 G(IID_IBufferByteAccess_, 0x905a0fef, 0xbc53, 0x11df, 0x8c,0x49,0x00,0x1e,0x4f,0xc6,0x86,0xda);
 
@@ -89,10 +90,13 @@ static DWORD WINAPI late_close(void *request)
     return 0;
 }
 
+static LONG calls;
 static HRESULT WINAPI h_invoke(void *This, void *request)
 {
     struct handler *h = This;
     void *closable = NULL;
+
+    InterlockedIncrement(&calls);
 
     if (h->mode == 2)
         return CALL(request, 6, HRESULT, 1 /* CurrentlyUnavailable */);
@@ -126,7 +130,7 @@ static BYTE *slurp(const WCHAR *path, DWORD *size)
     return data;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     HMODULE combase = LoadLibraryA("combase.dll");
     RGAF get_factory = (RGAF)GetProcAddress(combase, "RoGetActivationFactory");
@@ -264,45 +268,64 @@ int main(void)
         CHECK(hr == E_INVALIDARG, "FileIO null file %lx", hr);
     }
 
-    /* streamed files: StorageFile statics slots 8 (create) and 9 (replace) */
+    /* streamed files: StorageFile statics slots 8 (create), 9 (replace), 10 (from uri); the data is made on first open */
     {
         struct handler h = { handler_vtbl, 1, 0 };
         void *f2 = NULL, *item = NULL;
-        HS name = NULL;
+        HS name = NULL, text = NULL;
+        LONG before;
         int mode;
 
         for (mode = 0; mode < 4; mode++)
         {
             const GUID *iid_item = &IID_IStorageItem_;
+            const char *want = mode == 3 ? "late data" : "streamed data";
+            WCHAR wide[32];
             h.mode = mode;
+            before = calls;
             hr = CALL(file_statics, 8, HRESULT, mk(L"streamed.txt"), &h, NULL, &op);
             CHECK(hr == S_OK, "CreateStreamedFileAsync mode %d: %lx", mode, hr);
             f2 = NULL;
             hr = done(op, &f2);
-            if (mode == 2)
-            {
-                CHECK(hr == HRESULT_FROM_WIN32(ERROR_NOT_READY), "unavailable file result %lx", hr);
-                continue;
-            }
             CHECK(hr == S_OK && f2, "streamed file mode %d result %lx", mode, hr);
             if (!f2) continue;
+            CHECK(calls == before, "handler ran at creation (mode %d)", mode);
             CALL(f2, 0, HRESULT, iid_item, &item);
             name = NULL; CALL(item, 11, HRESULT, &name);
             CHECK(!wcscmp(str(name), L"streamed.txt"), "streamed name %ls", str(name));
             name = NULL; CALL(item, 12, HRESULT, &name);
             data = slurp(str(name), &size);
-            CHECK(data && size == strlen(mode == 3 ? "late data" : "streamed data") &&
-                  !memcmp(data, mode == 3 ? "late data" : "streamed data", size), "streamed data mode %d (size %lu)", mode, size);
+            CHECK(data && size == 0, "streamed data present before open (size %lu)", size);
             free(data);
+            hr = CALL(fio, 6, HRESULT, f2, &op);                 /* ReadTextAsync: first open */
+            text = NULL;
+            hr = done_str(op, &text);
+            if (mode == 2)
+            {
+                CHECK(hr == HRESULT_FROM_WIN32(ERROR_NOT_READY), "unavailable file result %lx", hr);
+                CHECK(calls == before + 1, "handler calls %ld", calls - before);
+                continue;
+            }
+            CHECK(hr == S_OK, "read streamed file mode %d: %lx", mode, hr);
+            swprintf(wide, 32, L"%hs", want);
+            CHECK(!wcscmp(str(text), wide), "streamed text mode %d: %ls", mode, str(text));
+            CHECK(calls == before + 1, "handler calls %ld (mode %d)", calls - before, mode);
+            hr = CALL(fio, 6, HRESULT, f2, &op);
+            text = NULL; done_str(op, &text);
+            CHECK(calls == before + 1, "handler ran twice (mode %d)", mode);
         }
         hr = CALL(file_statics, 8, HRESULT, mk(L"bad/name.txt"), &h, NULL, &op);
         CHECK(hr == E_INVALIDARG, "invalid streamed name %lx", hr);
-        /* replace: the old data stays when the handler fails, changes when it succeeds */
+        /* replace: the old data stays until the first open, and when the handler fails */
         swprintf(path, MAX_PATH, L"%ls\\t.txt", dir);
         h.mode = 2;
+        before = calls;
         hr = CALL(file_statics, 9, HRESULT, file, &h, NULL, &op);
         CHECK(hr == S_OK, "ReplaceWithStreamedFileAsync call %lx", hr);
         hr = done(op, &f2);
+        CHECK(hr == S_OK && calls == before, "replace ran the handler early (%lx)", hr);
+        hr = CALL(fio, 6, HRESULT, f2, &op);
+        text = NULL; hr = done_str(op, &text);
         CHECK(hr == HRESULT_FROM_WIN32(ERROR_NOT_READY), "failed replace %lx", hr);
         data = slurp(path, &size);
         CHECK(size == 8 && !memcmp(data, "via file", 8), "old data kept (size %lu, err %lu)", size, GetLastError());
@@ -312,8 +335,47 @@ int main(void)
         hr = done(op, &f2);
         CHECK(hr == S_OK, "replace %lx", hr);
         data = slurp(path, &size);
+        CHECK(size == 8 && !memcmp(data, "via file", 8), "replace changed data early (size %lu)", size);
+        free(data);
+        hr = CALL(fio, 6, HRESULT, f2, &op);
+        text = NULL; hr = done_str(op, &text);
+        CHECK(hr == S_OK && !wcscmp(str(text), L"streamed data"), "replaced text %lx %ls", hr, str(text));
+        data = slurp(path, &size);
         CHECK(size == 13 && !memcmp(data, "streamed data", 13), "replaced data (size %lu)", size);
         free(data);
+
+        /* http(s): downloaded on the first open (argv[1] is a served file, argv[2] a missing one) */
+        if (argc > 2)
+        {
+            void *uri_factory = NULL, *uri = NULL;
+            WCHAR url[256];
+            int k;
+
+            printf("http tests run\n");
+            hr = get_factory(mk(L"Windows.Foundation.Uri"), &IID_IUriRuntimeClassFactory_, &uri_factory);
+            CHECK(hr == S_OK && uri_factory, "Uri factory %lx", hr);
+            for (k = 1; k <= 2 && uri_factory; k++)
+            {
+                swprintf(url, 256, L"%hs", argv[k]);
+                uri = NULL;
+                hr = CALL(uri_factory, 6, HRESULT, mk(url), &uri);
+                CHECK(hr == S_OK && uri, "CreateUri %lx", hr);
+                hr = CALL(file_statics, 10, HRESULT, mk(L"web.txt"), uri, NULL, &op);
+                CHECK(hr == S_OK, "CreateStreamedFileFromUriAsync %lx", hr);
+                f2 = NULL; hr = done(op, &f2);
+                CHECK(hr == S_OK && f2, "from uri result %lx", hr);
+                if (!f2) continue;
+                CALL(f2, 0, HRESULT, &IID_IStorageItem_, &item);
+                name = NULL; CALL(item, 12, HRESULT, &name);
+                data = slurp(str(name), &size);
+                CHECK(size == 0, "download before open (size %lu)", size);
+                free(data);
+                hr = CALL(fio, 6, HRESULT, f2, &op);
+                text = NULL; hr = done_str(op, &text);
+                if (k == 1) CHECK(hr == S_OK && !wcscmp(str(text), L"from the web"), "downloaded text %lx %ls", hr, str(text));
+                else CHECK(hr == (HRESULT)0x80190194, "404 result %lx", hr);
+            }
+        }
     }
 
     printf("RESULT: %s\n", fails ? "FAIL" : "PASS");

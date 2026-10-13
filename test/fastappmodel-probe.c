@@ -62,7 +62,7 @@ static HRESULT WINAPI h_invoke(void *This, void *sender, void *args)
 }
 static void *handler_vtbl[] = { h_qi, h_addref, h_release, h_invoke };
 
-int main(void)
+int main(int argc, char **argv)
 {
     HMODULE combase = LoadLibraryA("combase.dll");
     HRESULT (WINAPI *ro_init)(int) = (void *)GetProcAddress(combase, "RoInitialize");
@@ -215,23 +215,29 @@ int main(void)
         hr = get_factory(mk(L"Windows.ApplicationModel.Package"), &IID_IPackageStatics_, &factory);
         CHECK(hr == S_OK && factory, "Package statics %lx", hr);
         hr = CALL(factory, 6, HRESULT, &package);
+        if (argc < 2)
+        {
+            /* no package identity outside an installed package */
+            CHECK(hr == HRESULT_FROM_WIN32(15700) && !package, "Package.Current unpackaged %lx", hr);
+            goto no_package;
+        }
         CHECK(hr == S_OK && package, "Package.Current %lx", hr);
         hr = CALL(package, 6, HRESULT, &pid);
         CHECK(hr == S_OK && pid, "Package.Id %lx", hr);
         {
-            WCHAR exe[MAX_PATH], *name, *dot;
-            GetModuleFileNameW(NULL, exe, MAX_PATH);
-            name = wcsrchr(exe, '\\') + 1;
-            if ((dot = wcsrchr(name, '.'))) *dot = 0;
             s = NULL; CALL(pid, 6, HRESULT, &s);
-            CHECK(!wcscmp(str(s), name), "Id.Name %ls vs %ls", str(s), name);
+            CHECK(!wcscmp(str(s), L"Fabrikam.Test"), "Id.Name %ls", str(s));
             s = NULL; CALL(pid, 13, HRESULT, &s);
-            CHECK(wcsstr(str(s), name) == str(s) && wcschr(str(s), '_'), "FamilyName %ls", str(s));
+            CHECK(!wcscmp(str(s), L"Fabrikam.Test_8wekyb3d8bbwe"), "FamilyName %ls", str(s));
             s = NULL; CALL(pid, 12, HRESULT, &s);
-            CHECK(wcsstr(str(s), L"_1.0.0.0_x64__"), "FullName %ls", str(s));
+            CHECK(!wcscmp(str(s), L"Fabrikam.Test_1.2.3.4_x64__8wekyb3d8bbwe"), "FullName %ls", str(s));
+            s = NULL; CALL(pid, 11, HRESULT, &s);
+            CHECK(!wcscmp(str(s), L"8wekyb3d8bbwe"), "PublisherId %ls", str(s));
+            s = NULL; CALL(pid, 9, HRESULT, &s);
+            CHECK(!wcscmp(str(s), L""), "ResourceId %ls", str(s));
         }
         { int arch = -1; CALL(pid, 8, HRESULT, &arch); CHECK(arch == 9, "Architecture %d", arch); }
-        { UINT16 ver[4] = {9, 9, 9, 9}; CALL(pid, 7, HRESULT, ver); CHECK(ver[0] == 1 && !ver[1] && !ver[2] && !ver[3], "Version"); }
+        { UINT16 ver[4] = {9, 9, 9, 9}; CALL(pid, 7, HRESULT, ver); CHECK(ver[0] == 1 && ver[1] == 2 && ver[2] == 3 && ver[3] == 4, "Version %d.%d.%d.%d", ver[0], ver[1], ver[2], ver[3]); }
         CALL(pid, 2, ULONG);
 
         b = TRUE;
@@ -249,13 +255,13 @@ int main(void)
         CHECK(hr == S_OK && folder, "InstalledLocation %lx", hr);
         if (folder)
         {
-            WCHAR exe[MAX_PATH], *sep;
-            GetModuleFileNameW(NULL, exe, MAX_PATH);
-            sep = wcsrchr(exe, 0x5c); if (sep == exe + 2) sep[1] = 0; else *sep = 0;
             CALL(folder, 0, HRESULT, &IID_IStorageItem_, &item);
             CHECK(item != NULL, "folder is an IStorageItem");
             if (item)
             {
+                WCHAR exe[MAX_PATH], *sep;
+                GetModuleFileNameW(NULL, exe, MAX_PATH);
+                sep = wcsrchr(exe, 0x5c); *sep = 0;
                 s = NULL; CALL(item, 12, HRESULT, &s);
                 CHECK(!wcsicmp(str(s), exe), "Path %ls vs %ls", str(s), exe);
                 CALL(item, 2, ULONG);
@@ -263,6 +269,7 @@ int main(void)
             CALL(folder, 2, ULONG);
         }
         CALL(package, 2, ULONG);
+no_package:
 
         /* CoreApplication.GetCurrentView */
         hr = CALL(app, 12, HRESULT, &cview);
