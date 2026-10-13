@@ -22,6 +22,25 @@ Check "getResource", o.res() = "Hello <world>"
 Check "createComponent", o.comp() = 1
 Check "object element", o.fsoName() = "b"
 
+Dim hits : hits = 0
+Sub EV_onx()
+  hits = hits + 1
+End Sub
+Set e1 = WScript.CreateObject("Sg.ScrobjTest", "EV_")
+Check "a component made with a prefix", Err.Number = 0 And Not e1 Is Nothing
+Dim r : r = e1.fire()
+Check "fireEvent reaches the handler once", r = 1 And hits = 1
+Set e2 = CreateObject("Sg.ScrobjTest")
+WScript.ConnectObject e2, "EV_"
+Check "ConnectObject", Err.Number = 0
+r = e2.fire()
+Check "a second component's event", hits = 2
+WScript.DisconnectObject e2
+r = e2.fire()
+Check "after DisconnectObject nothing is heard", hits = 2
+r = o.fire()
+Check "an unconnected component fires into nothing", r = 1 And hits = 2
+
 Set g = CreateObject("Scriptlet.TypeLib")
 Check "typelib defaults", g.Name = "" And g.Path = ""
 g.AddURL "C:\fastscrobj.wsc"

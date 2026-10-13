@@ -24,7 +24,7 @@ int main(void)
     CHECK(hr == S_OK, "LoadTypeLibEx %lx", hr);
     if (!lib) return 1;
     count = ITypeLib_GetTypeInfoCount(lib);
-    CHECK(count == 2, "type info count %u", count);
+    CHECK(count == 3, "type info count %u", count);
     hr = ITypeLib_GetLibAttr(lib, &tla);
     CHECK(hr == S_OK && tla->wMajorVerNum == 2 && tla->wMinorVerNum == 3, "version");
     CHECK(IsEqualGUID(&tla->guid, &libid), "libid");
@@ -33,13 +33,13 @@ int main(void)
     CHECK(hr == S_OK && !wcscmp(name, L"SgScrobj") && doc && !wcscmp(doc, L"SG scrobj typelib"), "lib doc %ls / %ls", name, doc);
     SysFreeString(name); SysFreeString(doc);
 
-    /* the interface: add, res, comp, fsoName, plain get+put, ro get = 7 functions after the 7 of IDispatch */
+    /* the interface: add, res, comp, fsoName, fire, plain get+put, ro get = 8 functions after the 7 of IDispatch */
     hr = ITypeLib_GetTypeInfo(lib, 0, &ti);
     CHECK(hr == S_OK, "GetTypeInfo(0)");
     if (ti)
     {
         ITypeInfo_GetTypeAttr(ti, &attr);
-        CHECK(attr->typekind == TKIND_DISPATCH && attr->cFuncs == 14, "interface kind %d funcs %u", attr->typekind, attr->cFuncs);
+        CHECK(attr->typekind == TKIND_DISPATCH && attr->cFuncs == 15, "interface kind %d funcs %u", attr->typekind, attr->cFuncs);
         ITypeInfo_ReleaseTypeAttr(ti, attr);
         name = NULL;
         ITypeInfo_GetDocumentation(ti, MEMBERID_NIL, &name, NULL, NULL, NULL);
@@ -47,13 +47,49 @@ int main(void)
         SysFreeString(name);
         ITypeInfo_Release(ti);
     }
-    hr = ITypeLib_GetTypeInfo(lib, 1, &ti);
+    /* the events: a dispinterface with one method, onx */
+    {
+        UINT i, found = 0;
+        for (i = 0; i < count; i++)
+        {
+            ITypeInfo *e = NULL;
+            if (FAILED(ITypeLib_GetTypeInfo(lib, i, &e)) || !e) continue;
+            if (SUCCEEDED(ITypeInfo_GetTypeAttr(e, &attr)))
+            {
+                if (attr->typekind == TKIND_DISPATCH && attr->cFuncs == 8)    /* the 7 of IDispatch and onx */
+                {
+                    UINT k;
+                    for (k = 0; k < attr->cFuncs && !found; k++)
+                    {
+                        FUNCDESC *fd;
+                        if (SUCCEEDED(ITypeInfo_GetFuncDesc(e, k, &fd)))
+                        {
+                            BSTR fname = NULL; UINT n = 0;
+                            ITypeInfo_GetNames(e, fd->memid, &fname, 1, &n);
+                            found = fname && !wcscmp(fname, L"onx") && fd->memid == 1;
+                            SysFreeString(fname);
+                            ITypeInfo_ReleaseFuncDesc(e, fd);
+                        }
+                    }
+                }
+                ITypeInfo_ReleaseTypeAttr(e, attr);
+            }
+            ITypeInfo_Release(e);
+        }
+        CHECK(found, "events dispinterface with onx");
+    }
+    ti = NULL;
+    hr = ITypeLib_GetTypeInfoOfGuid(lib, &clsid, &ti);
     if (ti)
     {
+        INT flags = 0;
         ITypeInfo_GetTypeAttr(ti, &attr);
-        CHECK(attr->typekind == TKIND_COCLASS && attr->cImplTypes == 1, "coclass kind %d impl %u", attr->typekind, attr->cImplTypes);
+        CHECK(attr->typekind == TKIND_COCLASS && attr->cImplTypes == 2, "coclass kind %d impl %u", attr->typekind, attr->cImplTypes);
         CHECK(IsEqualGUID(&attr->guid, &clsid), "coclass guid");
         ITypeInfo_ReleaseTypeAttr(ti, attr);
+        /* the component's <event> is a source interface */
+        hr = ITypeInfo_GetImplTypeFlags(ti, 1, &flags);
+        CHECK(hr == S_OK && (flags & IMPLTYPEFLAG_FSOURCE), "event interface is a source: %lx flags %x", hr, flags);
         ITypeInfo_Release(ti);
     }
     ITypeLib_Release(lib);
