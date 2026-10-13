@@ -95,3 +95,11 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4510 msvcrt family, crtdll, ucrtbase: _ismbbkalnum/_ismbbkana/_ismbbkprint/_ismbbkpunct/_ismbbalnum/_ismbbalpha/_ismbbgraph/_ismbbprint/_ismbbpunct/_ismbbblank (+_l) and _ismbcblank (+_l). Gate (cp 932 and 1252 tables) + mutant.
 - 4511 msvcrt family, ucrtbase: _strset_s, __wcsncnt, _strerror_s, _umask_s, _lsearch_s, _mbsncoll/_mbsnicoll (+_l), _mbsninc_l, _mbsstr_l, _mbstrnlen (+_l), _mbsset_s, _mbsnset_s, _mbsnbset_s, _mbsncat_s (+_l). Gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
+- 4512 msvcr80..120, ucrtbase: the _p/_s/_l printf variants (stdout and console forms, 32 functions) and ucrtbase __conio_common_vc(w)printf_p/_s. Gate (console cases under a headless pseudo console) + mutant.
+- 4513 msvcr80..120, ucrtbase: _findfirst32i64/_findnext32i64 (+ wide). Gate (sparse 5 GiB file) + mutant.
+- 4514 msvcr80..120, ucrtbase: _aligned_recalloc, _aligned_offset_recalloc, _recalloc_crt, _freea(_s), _set_malloc_crt_max_wait, _get/_set_amblksiz. Gate + mutant.
+- 4515 msvcr120 va_list scanf forms (10), _getws_s (msvcr80+, ucrtbase). Gate + mutant.
+- 4516 _cgets_s, _cgetws, _cgetws_s, ucrtbase __conio_common_vc(w)scanf. Gate (typed into a pseudo console) + mutant.
+- 4517 ucrtbase: mbrtoc16, mbrtoc32, c16rtomb, c32rtomb (UTF-8). Gate (138 checks) + mutant.
+- 4518 msvcr110/120: 20 __crt* kernel32 wrappers. Gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
