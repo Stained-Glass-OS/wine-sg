@@ -133,3 +133,6 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4542 (fast) msvcp60: argument-less facet _Getcat. Smoke gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); msvcp60/90 rerun after 4542.
 - Queue status (audit5-drafter5b.json): 1277 of 3714 still stubbed somewhere (244 of them ARM-only names), from 3047 at the start of round 3's count.
+- 4543 ucrtbase: _dscale/_dexp/_dunscale/_dpoly/_dlog/_dsin (+_fd/_ld/_o_). Gate + mutant.
+- 4544 msvcrt, msvcr80..120, ucrtbase: _dosmaperr, app type, osplatform/winver, TLS/FLS helpers, _getdcwd_nolock, _Validate*, type_info statics, int overloads, debug placement delete, __ExceptionPtrSwap. Gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
