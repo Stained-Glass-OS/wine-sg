@@ -67,7 +67,7 @@ static void html(const char *name, int mode)
     IPersistStreamInit_Release(psi); IStream_Release(stream);
     pump(1000);
     IHTMLDocument2_get_parentWindow(doc, &win);
-    b = SysAllocString(L"document.title=typeof ArrayBuffer+','+typeof Int8Array+','+typeof Float64Array+','+typeof DataView+','+typeof Math.trunc;");
+    b = SysAllocString(L"document.title=typeof ArrayBuffer+','+typeof Int8Array+','+typeof Float64Array+','+typeof DataView+','+typeof Math.trunc+','+typeof Object.setPrototypeOf;");
     lang = SysAllocString(L"jscript"); VariantInit(&res);
     IHTMLWindow2_execScript(win, b, lang, &res);
     pump(100);
@@ -88,6 +88,9 @@ int main(void)
     engine("E_ES6", 0x503, t);
     engine("E_ES6_MATH", 0x503, mt);
     engine("E_NEXT_MATH", 0x504, m);
+    engine("E_SETPROTO6", 0x503, L"typeof Object.setPrototypeOf");
+    engine("E_SETPROTO5", 0x502, L"typeof Object.setPrototypeOf");
+    engine("E_SETPROTO_USE", 0x503, L"var p={a:1}; var o={}; var r=Object.setPrototypeOf(o,p); var e1='no'; try{Object.setPrototypeOf(undefined,p);}catch(x){e1='thrown';} var e2='no'; try{Object.setPrototypeOf(o,5);}catch(x){e2='thrown';} (r===o)+','+o.a+','+(Object.getPrototypeOf(o)===p)+','+(Object.setPrototypeOf(5,null)===5)+','+e1+','+e2");
     html("H9", 9); html("H10", 10); html("H11", 11);
     P("DONE\n");
     return 0;
