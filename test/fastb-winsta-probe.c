@@ -36,6 +36,23 @@ int main(void)
     TOKEN_USER *tu;
     HWND hwnd;
 
+    {
+        BOOLEAN (WINAPI *query)(HANDLE, ULONG, ULONG, void *, ULONG, ULONG *) = (void *)GetProcAddress(m, "WinStationQueryInformationW");
+        ULONG v = 7, rl = 0;
+        SESSIONIDW_ *qi; ULONG qc;
+
+        CHECK(query != NULL, "WinStationQueryInformationW export");
+        if (query && enumerate(NULL, &qi, &qc) && qc)
+        {
+            ULONG sid = qi[0].id;
+            CHECK(query(NULL, sid, 30, &v, 4, &rl) && v == 0 && rl == 4, "idle time %lu", v);
+            CHECK(query(NULL, sid, 31, &v, 4, &rl) && v == 0, "last reconnect type");
+            CHECK(query(NULL, sid, 37, &v, 4, &rl) && v == ~0u, "reconnected-from id %lx", v);
+            CHECK(!query(NULL, sid, 30, &v, 3, &rl) && GetLastError() == ERROR_INSUFFICIENT_BUFFER && rl == 4, "small buffer %lu", GetLastError());
+            CHECK(!query(NULL, 0x7fff, 30, &v, 4, &rl) && GetLastError() == ERROR_CTX_WINSTATION_NOT_FOUND, "unknown session %lu", GetLastError());
+            CHECK(!query(NULL, sid, 30, &v, 4, NULL) && GetLastError() == ERROR_INVALID_PARAMETER, "no length pointer");
+        }
+    }
     CHECK(m && enumerate && free_mem && name_w && name_a && id_w && id_a && help && get_sid && reg && unreg, "exports");
     if (!m) goto end;
 
