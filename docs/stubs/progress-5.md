@@ -166,3 +166,8 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4568 (fast) msvcp60: std::bad_typeid, std::__non_rtti_object, std::bad_exception, ios_base::exceptions(short). Smoke gate + 2 mutants.
 - 4569 (fast) msvcp60: locale::operator()(string, string). Smoke gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); msvcp60 rerun after 4568/4569.
+- 4570 (fast) msvcp100: tr1::_Xfunc, _Mutex(_Uninitialized), _GetCurrentThreadId, unsigned short reader and time_get::get with a format. Smoke gates.
+- 4571 (fast) msvcp80/90: _Xfsopen; msvcp90 tr1::_Xinvalid. Smoke gate + mutant.
+- 4572 (fast) msvcr100: details::task_canceled. Smoke gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
+- Queue status (audit5-drafter5b.json): 683 of 3714 still stubbed somewhere (90 of them ARM-only names), from 899 at the last count. The rest is the escalated set (escalate-5.md): C++ EH internals, private stream/locale helpers and static data, Dinkumware math internals, the ConcRT agent/task collection/cancellation token/location classes and debug hooks (their object layouts come from headers not openly available), vcomp's ordered/copyprivate protocol, msvcm managed helpers (policy), and a few with unknown signatures or messages (msvcp80 __Stodx, tr1 throwers, _GetLocaleForCP, _Locinfo::_Getno/_Getyes, VC 6 codecvt::length).

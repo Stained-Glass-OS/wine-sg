@@ -28,7 +28,7 @@ timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 RC=0
 for p in p64 p32; do
-    for dll in msvcp90 msvcp110; do
+    for dll in msvcp90 msvcp100 msvcp110; do
         out=$(cd "$T" && timeout -s KILL 120 "$WINE" "$T/$p.exe" $dll 2>/dev/null </dev/null | tr -d '\r')
         if printf '%s\n' "$out" | grep '^RESULT: ' | tail -n1 | grep -qx 'RESULT: PASS'; then
             echo "ok   $p $dll ($(printf '%s\n' "$out" | grep -c '^ok') checks)"
