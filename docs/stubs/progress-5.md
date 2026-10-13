@@ -127,3 +127,9 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4537 (fast) msvcp60..90: the messages facet (no catalogs). Smoke gate + mutant.
 - 4538 (fast) msvcp60..90: the money facets (money_base, _Mpunct, moneypunct, money_get, money_put for char/wchar_t/unsigned short). Smoke gate (put/get through string streams) + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); msvcp60/msvcp90 rerun with 4538.
+- 4539 (fast) msvcp60: time_get<unsigned short>/time_base exports mapped to functions it already builds. Smoke gate.
+- 4540 (fast) msvcp60: ~375 complex/_Complex_base/_Ctr exports matched to msvcp90's by demangled signature, plus template compound-assignment wrappers. Smoke gate + mutant.
+- 4541 (fast) msvcp60/70/71/80: ~200 more entries matched by demangled signature (mostly msvcp70 complex). Smoke gate.
+- 4542 (fast) msvcp60: argument-less facet _Getcat. Smoke gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); msvcp60/90 rerun after 4542.
+- Queue status (audit5-drafter5b.json): 1277 of 3714 still stubbed somewhere (244 of them ARM-only names), from 3047 at the start of round 3's count.
