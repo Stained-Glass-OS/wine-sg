@@ -196,3 +196,11 @@ Every item is either implemented (patches from 4573) or triaged in docs/stubs/tr
 - 4589 (fast) avifil32: ReadFormat applies palette changes. Gate (fails on the old code) + mutant.
 - 4590 (fast) dmsynth: DLS level 1 articulation (DMUS_ARTICPARAMS) of instrument downloads. Gate (renders and compares the note's start) + mutant.
 - gap-D5 queue: all 473 items resolved - 31 implemented (4574-4590), 442 triaged in triage-5.tsv (windows-matches, escalate, no-ground-truth, not-applicable; each with its evidence).
+
+## 2026-10-13, round 4 media sweep
+The media suites (devenum dinput dmime dmusic dplayx mf mfmediaengine mmdevapi winmm wmvcore mfplat) were rerun
+quietly on the series-applied base and on stubs-5. Only mf differed for the worse: x86_64 hung at mf.c:6476
+(117 failures until the timeout, deterministic). Bisected to 4010's seek-from-pause flush in the media session;
+4591 removes it (gate test/mf-seekpause-gate.sh, mutant caught; mf and mfmediaengine now equal or better than
+base). dinput hotplug, dplayx and mfmediaengine x86_64 had fewer failures than base; devenum/dinput failures in
+the earlier loaded run are pre-existing.
