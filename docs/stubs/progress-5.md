@@ -148,3 +148,12 @@ Group 1: patches 4000-4030, one per DLL, gates test/*-smoke-gate.sh sourcing tes
 - 4553 msvcp100..140, msvcp_win: public ctype<char>::classic_table, _Locinfo::_W_Gettnames. Gate + mutant.
 - 4554 msvcp140, msvcp_win: basic_istream<unsigned short>::operator>>(unsigned short &). Gate + mutant.
 - Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing).
+- 4555 (fast) msvcp60: time_get::date_order/do_date_order. Smoke gate.
+- 4556 msvcp140, msvcp_win: _Hard_links, _Statvfs, _Chmod, _Symlink_get (contracts from the public <experimental/filesystem> header). Gate + 3 mutants.
+- 4557 (fast) msvcp60..80: the older numpunct constructor/_Init, time_get::_Getcat and basic_ostream<wchar_t>(_Uninitialized) forms. Smoke gate + mutant.
+- 4558 (fast) msvcp90, msvcp110: unsigned short stream number reader, msvcp110 unsigned short time_get::get with a format. Smoke gate.
+- 4559 (fast) msvcp60..120: __Wcrtomb_lk everywhere, msvcp110 _Add_vtordisp members and _GetCurrentThreadId. Smoke gate + mutant.
+- 4560 msvcr110, msvcr120, concrt140: details::_Context constructors, _Oversubscribe (FIXME kept), _StackGuard::_GetCurrentInlineDepth. Gate + 2 mutants.
+- 4561 ucrtbase: the _mbcasemap data export. Gate + mutant.
+- Runtime suites before this push: 0 failures except msvcp140 filesystem (pre-existing); concrt140 rerun after 4560.
+- Queue status (audit5-drafter5b.json): 899 of 3714 still stubbed somewhere (180 of them ARM-only names), from 1277 at the last count. What is left is mostly internal or undocumented (EH internals, private stream/locale helpers, Dinkumware math internals), the ConcRT agent/task-collection/cancellation-token classes, and msvcm managed helpers (policy); see escalate-5.md.
