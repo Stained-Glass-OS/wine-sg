@@ -39,10 +39,10 @@ static char *slurp(const char *path)
     return p;
 }
 
-int main(void)
+static HRESULT (WINAPI *create)(LPDIRECTXFILE *);
+
+static void run(DXFILEFORMAT fmt, const char *fname)
 {
-    HMODULE m = LoadLibraryA("d3dxof.dll");
-    HRESULT (WINAPI *create)(LPDIRECTXFILE *) = (void *)GetProcAddress(m, "DirectXFileCreate");
     LPDIRECTXFILE dx = NULL, dx2 = NULL;
     LPDIRECTXFILESAVEOBJECT save = NULL, save2 = NULL;
     LPDIRECTXFILEDATA other = NULL, thing = NULL, mark = NULL, d = NULL;
@@ -61,17 +61,18 @@ int main(void)
     IDirectXFileData *dd;
 
     GetCurrentDirectoryA(MAX_PATH, path);
-    strcat(path, "\\out.x");
+    strcat(path, "\\");
+    strcat(path, fname);
     DeleteFileA(path);
 
     CHECK(create && create(&dx) == DXFILE_OK);
     CHECK(IDirectXFile_RegisterTemplates(dx, (void *)templates, sizeof(templates) - 1) == DXFILE_OK);
 
-    hr = IDirectXFile_CreateSaveObject(dx, path, DXFILEFORMAT_BINARY, &save2);
-    CHECK(hr == DXFILEERR_NOTDONEYET);
+    hr = IDirectXFile_CreateSaveObject(dx, path, 4, &save2);
+    CHECK(hr == DXFILEERR_BADVALUE);
     hr = IDirectXFile_CreateSaveObject(dx, "Z:\\nonexistent-dir\\x.x", DXFILEFORMAT_TEXT, &save2);
     CHECK(FAILED(hr));
-    hr = IDirectXFile_CreateSaveObject(dx, path, DXFILEFORMAT_TEXT, &save);
+    hr = IDirectXFile_CreateSaveObject(dx, path, fmt, &save);
     CHECK(hr == DXFILE_OK && save);
     if (!save) goto end;
 
@@ -123,7 +124,25 @@ int main(void)
 
     text = slurp(path);
     CHECK(text != NULL);
-    if (text)
+    if (text && fmt == DXFILEFORMAT_BINARY)
+    {
+        CHECK(!strncmp(text, "xof 0303bin 0032", 16));
+        CHECK(text[16] == 31 && text[17] == 0);             /* TOKEN_TEMPLATE first */
+        CHECK(!memcmp(text + 18, "\1\0\4\0\0\0Vec3", 10));  /* then its name token */
+        CHECK(!contains(text + 16, "template"));
+    }
+    else if (text && fmt == (DXFILEFORMAT_BINARY | DXFILEFORMAT_COMPRESSED))
+    {
+        CHECK(!strncmp(text, "xof 0303bzip0032", 16));
+        CHECK(text[24] == 'C' && text[25] == 'K');           /* the MSZIP signature of the first chunk */
+        CHECK(*(WORD *)(text + 20) > 16 && *(DWORD *)(text + 16) >= 16 + *(WORD *)(text + 20));
+    }
+    else if (text && fmt == (DXFILEFORMAT_TEXT | DXFILEFORMAT_COMPRESSED))
+    {
+        CHECK(!strncmp(text, "xof 0303tzip0032", 16));
+        CHECK(text[24] == 'C' && text[25] == 'K');
+    }
+    else if (text)
     {
         CHECK(!strncmp(text, "xof 0303txt 0032", 16));
         CHECK(contains(text, "template Thing {"));
@@ -202,6 +221,81 @@ int main(void)
 end:
     if (dx2) IDirectXFile_Release(dx2);
     IDirectXFile_Release(dx);
+}
+
+/* a body larger than one 32 KB MSZIP chunk, and a template with the other integer types */
+static void run_big(DXFILEFORMAT fmt, const char *fname)
+{
+    LPDIRECTXFILE dx = NULL, dx2 = NULL;
+    LPDIRECTXFILESAVEOBJECT save = NULL;
+    LPDIRECTXFILEDATA obj = NULL, d = NULL;
+    LPDIRECTXFILEENUMOBJECT en = NULL;
+    const GUID *tpl_list[2] = { &g_vec, &g_thing };
+    DWORD n = 8000, i, size, bytes = 4 + 4 + n * 12 + 2 + 4;
+    BYTE *buf = calloc(1, bytes), *p;
+    struct thing *got;
+    char path[MAX_PATH];
+    HRESULT hr;
+
+    GetCurrentDirectoryA(MAX_PATH, path);
+    strcat(path, "\\");
+    strcat(path, fname);
+    DeleteFileA(path);
+
+    /* Thing = { STRING label; DWORD n; array Vec3 pts[n]; WORD w } with the string pointer first */
+    p = buf;
+    *(char **)p = "big"; p += sizeof(char *);
+    *(DWORD *)p = n; p += 4;
+    for (i = 0; i < n * 3; i++) { *(float *)p = (float)i; p += 4; }
+    *(WORD *)p = 9; p += 2;
+
+    CHECK(create(&dx) == DXFILE_OK);
+    CHECK(IDirectXFile_RegisterTemplates(dx, (void *)templates, sizeof(templates) - 1) == DXFILE_OK);
+    CHECK(IDirectXFile_CreateSaveObject(dx, path, fmt, &save) == DXFILE_OK);
+    CHECK(IDirectXFileSaveObject_SaveTemplates(save, 2, tpl_list) == DXFILE_OK);
+    hr = IDirectXFileSaveObject_CreateDataObject(save, &g_thing, "bigone", NULL, p - buf, buf, &obj);
+    CHECK(hr == DXFILE_OK && obj);
+    if (obj) CHECK(IDirectXFileSaveObject_SaveData(save, obj) == DXFILE_OK);
+    if (obj) IDirectXFileData_Release(obj);
+    IDirectXFileSaveObject_Release(save);
+    IDirectXFile_Release(dx);
+
+    CHECK(create(&dx2) == DXFILE_OK);
+    hr = IDirectXFile_CreateEnumObject(dx2, path, DXFILELOAD_FROMFILE, &en);
+    CHECK(hr == DXFILE_OK && en);
+    if (en)
+    {
+        hr = IDirectXFileEnumObject_GetNextDataObject(en, &d);
+        CHECK(hr == DXFILE_OK && d);
+        if (d)
+        {
+            hr = IDirectXFileData_GetData(d, NULL, &size, (void **)&got);
+            CHECK(hr == DXFILE_OK && size == p - buf);
+            if (hr == DXFILE_OK && size == p - buf)
+            {
+                CHECK(!strcmp(got->label, "big") && got->n == n);
+                CHECK(got->pts[0] == 0 && got->pts[5] == 5 && *(float *)((BYTE *)got->pts + (n * 3 - 1) * 4) == n * 3 - 1);
+            }
+            IDirectXFileData_Release(d);
+        }
+        IDirectXFileEnumObject_Release(en);
+    }
+    IDirectXFile_Release(dx2);
+    free(buf);
+}
+
+int main(void)
+{
+    HMODULE m = LoadLibraryA("d3dxof.dll");
+
+    create = (void *)GetProcAddress(m, "DirectXFileCreate");
+    run(DXFILEFORMAT_TEXT, "out-txt.x");
+    run(DXFILEFORMAT_BINARY, "out-bin.x");
+    run(DXFILEFORMAT_TEXT | DXFILEFORMAT_COMPRESSED, "out-tzip.x");
+    run(DXFILEFORMAT_BINARY | DXFILEFORMAT_COMPRESSED, "out-bzip.x");
+    run_big(DXFILEFORMAT_BINARY, "big-bin.x");
+    run_big(DXFILEFORMAT_BINARY | DXFILEFORMAT_COMPRESSED, "big-bzip.x");
+    run_big(DXFILEFORMAT_TEXT | DXFILEFORMAT_COMPRESSED, "big-tzip.x");
     printf("%d checks, %d failures\nRESULT: %s\n", checks, fails, fails ? "FAIL" : "PASS");
     return fails != 0;
 }
