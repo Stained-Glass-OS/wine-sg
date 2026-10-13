@@ -115,5 +115,37 @@ End If
 v = (ext.IsSubscribed("http://www.winehq.org/") = False)
 Check v, "IsSubscribed is false"
 
+' first-run state (patch 3175): IShellUIHelper2 over HKCU\Software\Microsoft\Internet Explorer\Main
+Const RUNKEY = "HKCU\Software\Microsoft\Internet Explorer\Main\"
+ext.ResetFirstBootMode
+v = (ext.RunOnceHasShown = False)
+Check v, "RunOnceHasShown false after ResetFirstBootMode"
+ext.RunOnceShown
+v = (ext.RunOnceHasShown = True)
+Check v, "RunOnceShown sets the flag"
+v = (shl.RegRead(RUNKEY & "RunOnceHasShown") = 1)
+Check v, "the flag is in the registry"
+ext.ResetFirstBootMode
+v = (ext.RunOnceHasShown = False)
+Check v, "ResetFirstBootMode clears it"
+ext.RunOnceRequiredSettingsComplete True
+v = (shl.RegRead(RUNKEY & "RunOnceComplete") = 1)
+Check v, "RunOnceRequiredSettingsComplete(True)"
+ext.RunOnceRequiredSettingsComplete False
+v = (shl.RegRead(RUNKEY & "RunOnceComplete") = 0)
+Check v, "RunOnceRequiredSettingsComplete(False)"
+ext.SkipRunOnce
+v = (ext.RunOnceHasShown = True And shl.RegRead(RUNKEY & "RunOnceComplete") = 1)
+Check v, "SkipRunOnce marks both"
+v = (ext.IsSearchMigrated = True)
+Check v, "IsSearchMigrated"
+ext.ResetSafeMode
+ext.RefreshOfflineDesktop
+ext.ResetFirstBootMode
+
+ie.Stop
+v = True
+Check v, "Stop succeeds"
+
 ie.Quit
 If fails = 0 Then WScript.Echo "RESULT: PASS" Else WScript.Echo "RESULT: FAIL (" & fails & ")"
