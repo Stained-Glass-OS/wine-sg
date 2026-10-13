@@ -52,6 +52,12 @@ grep -q '^DONE' "$T/o" || fail "the probe did not finish: $(tail -2 "$T/o" | tr 
 reqs=$(for f in "$T"/spool/requests/*.req; do [ -f "$f" ] && { tr '\n' ' ' < "$f"; echo; }; done)
 printf '%s\n' "$reqs" | grep -qx 'firewall reset ' && printf '%s\n' "$reqs" | grep -q '^firewall profile public off $' && printf '%s\n' "$reqs" | grep -q '^firewall profile private off $' \
     && pass "the firewall is asked through sg-admind: reset, and profile off for private and public" || fail "requests: $reqs"
+if [ -n "${DUMP:-}" ]; then printf '%s\n' "$reqs"; fi
+printf '%s\n' "$reqs" | grep -qx 'firewall registry-push setting:public:DoNotAllowExceptions 1 ' \
+    && printf '%s\n' "$reqs" | grep -qx 'firewall registry-push setting:domain:DoNotAllowExceptions 1 ' \
+    && pass "a changed setting is pushed to the firewall at once (setting:PROFILE:NAME VALUE; Standard = private)" || fail "setting push: $reqs"
+printf '%s\n' "$reqs" | grep -qx 'firewall registry-push setting:public:DoNotAllowExceptions ' \
+    && pass "a setting removed by RestoreLocalFirewallDefaults is pushed with no value" || fail "setting delete push: $reqs"
 [ "$(v MGR_RESTORE)" = 00000000 ] && pass "INetFwMgr::RestoreDefaults" || fail "mgr restore: $(v MGR_RESTORE)"
 [ "$(v LA_COUNT0)" = 0 ] && [ "$(v LA_SCOPE0)" = 0 ] && [ "$(v LA_REMOTE)" = LocalSubnet ] && [ "$(v LA_ADD)" = 00000000 ] && [ "$(v LA_COUNT1)" = 1 ] \
     && pass "authorized applications: Add, Count, scope and remote addresses" || fail "apps add: $(grep '^LA_' "$T/o" | head -6 | tr '\n' ' ')"
