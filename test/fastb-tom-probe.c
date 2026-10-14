@@ -118,6 +118,42 @@ int main(void)
     ITextRange_Release(r);
     SetWindowTextW(hwnd, L"Hello big world.\rSecond  para here\rThird");
 
+    /* indexes */
+    r = range(20, 20);
+    hr = ITextRange_GetIndex(r, tomParagraph, &d);
+    CHECK(hr == S_OK && d == 2, "GetIndex paragraph %#lx %ld", hr, d);
+    ITextRange_GetIndex(r, tomWord, &d);
+    CHECK(d == 6, "GetIndex word %ld", d);
+    ITextRange_GetIndex(r, tomCharacter, &d);
+    CHECK(d == 21, "GetIndex character %ld", d);
+    ITextRange_GetIndex(r, tomStory, &d);
+    CHECK(d == 1, "GetIndex story %ld", d);
+    hr = ITextRange_SetIndex(r, tomParagraph, 2, 0);
+    CHECK(hr == S_OK, "SetIndex paragraph %#lx", hr); expect(r, 17, 35, "SetIndex paragraph 2");
+    hr = ITextRange_SetIndex(r, tomWord, 3, 0); expect(r, 10, 15, "SetIndex word 3");
+    hr = ITextRange_SetIndex(r, tomParagraph, -1, 0);
+    { LONG a; ITextRange_GetStart(r, &a); CHECK(a == 35, "last paragraph at %ld", a); }
+    hr = ITextRange_SetIndex(r, tomParagraph, 9, 0);
+    CHECK(hr == S_FALSE, "SetIndex out of range %#lx", hr);
+    ITextRange_Release(r);
+
+    /* SetPara copies paragraph formatting */
+    {
+        ITextRange *r1 = range(2, 2), *r2 = range(20, 20);
+        ITextPara *p1 = NULL, *p2 = NULL;
+        LONG al = -1;
+
+        ITextRange_GetPara(r1, &p1);
+        ITextPara_SetAlignment(p1, tomAlignCenter);
+        hr = ITextRange_SetPara(r2, p1);
+        CHECK(hr == S_OK, "SetPara %#lx", hr);
+        ITextRange_GetPara(r2, &p2);
+        ITextPara_GetAlignment(p2, &al);
+        CHECK(al == tomAlignCenter, "second paragraph alignment %ld", al);
+        ITextPara_Release(p1); ITextPara_Release(p2);
+        ITextRange_Release(r1); ITextRange_Release(r2);
+    }
+
     /* the selection takes the same */
     {
         ITextSelection *sel = NULL;
