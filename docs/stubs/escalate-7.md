@@ -101,3 +101,12 @@ else's hive is the real risk); keep the self case open. Needs a decision.
   HKLM) and have the event log service pick sources up from there.
 - kernelbase `AccessCheckByType` (and the other `AccessCheckByType*`) are stubs that always fail; not in this
   queue, but authz and anything doing object-type access checks need them.
+
+## dxgi: CoreWindow and Direct3D 12 composition swap chains
+
+- `CreateSwapChainForCoreWindow` needs `Windows.UI.Core.CoreWindow` (UWP). Proposal: only if the UWP surface
+  is wanted at all; a CoreWindow backed by a top-level HWND (as the composition work in 0229-0234 did for
+  `DesktopWindowTarget`) with `ICoreWindowInterop::get_WindowHandle`, then the swap chain is `CreateSwapChainForHwnd`.
+- `CreateSwapChainForComposition` with a D3D12 command queue: `dxgi_composition_swapchain_create` only knows
+  d3d11 devices. The back buffer of a d3d12 swap chain would have to be copied to the composition surface at
+  Present (the same GDI draw as 0190).
