@@ -1,0 +1,2334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 11:25:50 -0700
+Subject: [PATCH] mapi32: advise sinks of a thread, utility init, property
+ object copies, names, streams, compressed RTF (3230)
+
+HrThisThreadAdviseSink with a queue per thread, HrDispatchNotifications,
+ScInitMapiUtil/DeinitMapiUtil counting, IPropData CopyTo/CopyProps,
+GetIDsFromNames/GetNamesFromIDs, OpenProperty as a stream, HrAddObjProps,
+and WrapCompressedRTFStream (LZFu and MELA).
+
+diff --git a/dlls/mapi32/Makefile.in b/dlls/mapi32/Makefile.in
+index 9231594..440c26e 100644
+--- a/dlls/mapi32/Makefile.in
++++ b/dlls/mapi32/Makefile.in
+@@ -1,11 +1,13 @@
+ MODULE    = mapi32.dll
+ IMPORTLIB = mapi32
+-IMPORTS   = uuid shlwapi shell32 user32 advapi32
++IMPORTS   = uuid ole32 shlwapi shell32 user32 advapi32
+ 
+ SOURCES = \
+ 	imalloc.c \
+ 	mapi32.rc \
+ 	mapi32_main.c \
++	notify.c \
+ 	prop.c \
++	rtfcomp.c \
+ 	sendmail.c \
+ 	util.c
+diff --git a/dlls/mapi32/notify.c b/dlls/mapi32/notify.c
+new file mode 100644
+index 0000000..4ffaa5c
+--- /dev/null
++++ b/dlls/mapi32/notify.c
+@@ -0,0 +1,529 @@
++/*
++ * MAPI notification engine: advise sinks bound to a thread
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define COBJMACROS
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winuser.h"
++#include "winerror.h"
++#include "objbase.h"
++#include "mapival.h"
++#include "mapiutil.h"
++#include "wine/list.h"
++#include "wine/debug.h"
++#include "util.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(mapi);
++
++/* The utility functions are in use between ScInitMapiUtil and DeinitMapiUtil. */
++static LONG util_init_count;
++
++/* A packet: the notifications sent to a sink from another thread, waiting for the thread of the sink */
++struct packet
++{
++    struct list entry;
++    IMAPIAdviseSink *sink;
++    ULONG count;
++    NOTIFICATION *notifs;   /* one MAPI allocation, with all it points to */
++};
++
++/* The queue of a thread, with the window that wakes the thread up */
++struct thread_queue
++{
++    struct list entry;
++    DWORD tid;
++    HWND hwnd;
++    struct list packets;
++};
++
++static CRITICAL_SECTION notify_cs;
++static CRITICAL_SECTION_DEBUG notify_cs_debug =
++{
++    0, 0, &notify_cs,
++    { &notify_cs_debug.ProcessLocksList, &notify_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": notify_cs") }
++};
++static CRITICAL_SECTION notify_cs = { &notify_cs_debug, -1, 0, 0, 0, 0 };
++static struct list queues = LIST_INIT(queues);
++
++#define WM_MAPI_NOTIFY (WM_USER + 0x4d4e)
++
++/* NOTIFICATION copy: the allocations are linked to the first, so MAPIFreeBuffer frees them all */
++static HRESULT copy_bytes(void *orig, const void *src, ULONG size, void **dst)
++{
++    HRESULT hr;
++
++    *dst = NULL;
++    if (!src) return S_OK;
++    if (FAILED(hr = MAPIAllocateMore(size ? size : 1, orig, dst))) return hr;
++    memcpy(*dst, src, size);
++    return S_OK;
++}
++
++static HRESULT copy_proptags(void *orig, const SPropTagArray *src, SPropTagArray **dst)
++{
++    return copy_bytes(orig, src, src ? CbNewSPropTagArray(src->cValues) : 0, (void **)dst);
++}
++
++static HRESULT copy_props(void *orig, const SPropValue *src, ULONG count, SPropValue **dst)
++{
++    HRESULT hr;
++    ULONG i;
++
++    *dst = NULL;
++    if (!src) return S_OK;
++    if (FAILED(hr = MAPIAllocateMore(count * sizeof(SPropValue), orig, (void **)dst))) return hr;
++    for (i = 0; i < count; i++)
++        if (FAILED(hr = PropCopyMore(&(*dst)[i], (SPropValue *)&src[i], MAPIAllocateMore, orig))) return hr;
++    return S_OK;
++}
++
++static HRESULT copy_notification(void *orig, NOTIFICATION *dst, const NOTIFICATION *src)
++{
++    HRESULT hr = S_OK;
++
++    *dst = *src;
++    switch (src->ulEventType)
++    {
++    case fnevCriticalError:
++#ifndef SG_MUTANT_MAPI_CPERR
++        if (FAILED(hr = copy_bytes(orig, src->info.err.lpEntryID, src->info.err.cbEntryID,
++                                   (void **)&dst->info.err.lpEntryID))) break;
++#endif
++        if (src->info.err.lpMAPIError)
++        {
++            const MAPIERROR *e = src->info.err.lpMAPIError;
++            MAPIERROR *copy;
++            BOOL unicode = (src->info.err.ulFlags & MAPI_UNICODE) != 0;
++
++            if (FAILED(hr = copy_bytes(orig, e, sizeof(*e), (void **)&copy))) break;
++            if (FAILED(hr = copy_bytes(orig, e->lpszError, e->lpszError ? (unicode ? (lstrlenW((WCHAR *)e->lpszError) + 1) * 2 :
++                                       strlen((char *)e->lpszError) + 1) : 0, (void **)&copy->lpszError))) break;
++            if (FAILED(hr = copy_bytes(orig, e->lpszComponent, e->lpszComponent ? (unicode ?
++                                       (lstrlenW((WCHAR *)e->lpszComponent) + 1) * 2 : strlen((char *)e->lpszComponent) + 1) : 0,
++                                       (void **)&copy->lpszComponent))) break;
++            dst->info.err.lpMAPIError = copy;
++        }
++        break;
++
++    case fnevNewMail:
++#ifndef SG_MUTANT_MAPI_CPMAIL
++        if (FAILED(hr = copy_bytes(orig, src->info.newmail.lpEntryID, src->info.newmail.cbEntryID,
++                                   (void **)&dst->info.newmail.lpEntryID))) break;
++#endif
++        if (FAILED(hr = copy_bytes(orig, src->info.newmail.lpParentID, src->info.newmail.cbParentID,
++                                   (void **)&dst->info.newmail.lpParentID))) break;
++        /* the class name is an ASCII or a Unicode string; the flags say which */
++        if (src->info.newmail.lpszMessageClass)
++        {
++            BOOL unicode = (src->info.newmail.ulFlags & MAPI_UNICODE) != 0;
++            ULONG len = unicode ? (lstrlenW((WCHAR *)src->info.newmail.lpszMessageClass) + 1) * 2 :
++                                  strlen((char *)src->info.newmail.lpszMessageClass) + 1;
++            hr = copy_bytes(orig, src->info.newmail.lpszMessageClass, len, (void **)&dst->info.newmail.lpszMessageClass);
++        }
++        break;
++
++    case fnevObjectCreated:
++    case fnevObjectDeleted:
++    case fnevObjectModified:
++    case fnevObjectMoved:
++    case fnevObjectCopied:
++    case fnevSearchComplete:
++        if (FAILED(hr = copy_bytes(orig, src->info.obj.lpEntryID, src->info.obj.cbEntryID,
++                                   (void **)&dst->info.obj.lpEntryID))) break;
++        if (FAILED(hr = copy_bytes(orig, src->info.obj.lpParentID, src->info.obj.cbParentID,
++                                   (void **)&dst->info.obj.lpParentID))) break;
++        if (FAILED(hr = copy_bytes(orig, src->info.obj.lpOldID, src->info.obj.cbOldID,
++                                   (void **)&dst->info.obj.lpOldID))) break;
++        if (FAILED(hr = copy_bytes(orig, src->info.obj.lpOldParentID, src->info.obj.cbOldParentID,
++                                   (void **)&dst->info.obj.lpOldParentID))) break;
++#ifndef SG_MUTANT_MAPI_CPOBJ
++        hr = copy_proptags(orig, src->info.obj.lpPropTagArray, &dst->info.obj.lpPropTagArray);
++#endif
++        break;
++
++    case fnevTableModified:
++        if (src->info.tab.propIndex.ulPropTag &&
++            FAILED(hr = PropCopyMore(&dst->info.tab.propIndex, (SPropValue *)&src->info.tab.propIndex,
++                                     MAPIAllocateMore, orig))) break;
++        if (src->info.tab.propPrior.ulPropTag &&
++            FAILED(hr = PropCopyMore(&dst->info.tab.propPrior, (SPropValue *)&src->info.tab.propPrior,
++                                     MAPIAllocateMore, orig))) break;
++#ifndef SG_MUTANT_MAPI_CPTAB
++        hr = copy_props(orig, src->info.tab.row.lpProps, src->info.tab.row.cValues, &dst->info.tab.row.lpProps);
++#endif
++        break;
++
++    case fnevStatusObjectModified:
++        if (FAILED(hr = copy_bytes(orig, src->info.statobj.lpEntryID, src->info.statobj.cbEntryID,
++                                   (void **)&dst->info.statobj.lpEntryID))) break;
++#ifndef SG_MUTANT_MAPI_CPSTAT
++        hr = copy_props(orig, src->info.statobj.lpPropVals, src->info.statobj.cValues, &dst->info.statobj.lpPropVals);
++#endif
++        break;
++
++    case fnevExtended:
++#ifndef SG_MUTANT_MAPI_CPEXT
++        hr = copy_bytes(orig, src->info.ext.pbEventParameters, src->info.ext.cb,
++                        (void **)&dst->info.ext.pbEventParameters);
++#endif
++        break;
++
++    default:
++        break;
++    }
++    return hr;
++}
++
++static struct thread_queue *find_queue(DWORD tid)
++{
++    struct thread_queue *q;
++
++    LIST_FOR_EACH_ENTRY(q, &queues, struct thread_queue, entry)
++        if (q->tid == tid) return q;
++    return NULL;
++}
++
++/* deliver what is queued for the thread, on the thread */
++static void dispatch_queue(void)
++{
++    struct thread_queue *q;
++
++    for (;;)
++    {
++        struct packet *packet = NULL;
++
++        EnterCriticalSection(&notify_cs);
++        if ((q = find_queue(GetCurrentThreadId())) && !list_empty(&q->packets))
++        {
++            packet = LIST_ENTRY(list_head(&q->packets), struct packet, entry);
++            list_remove(&packet->entry);
++        }
++        LeaveCriticalSection(&notify_cs);
++        if (!packet) return;
++
++        IMAPIAdviseSink_OnNotify(packet->sink, packet->count, packet->notifs);
++        IMAPIAdviseSink_Release(packet->sink);
++        MAPIFreeBuffer(packet->notifs);
++        free(packet);
++    }
++}
++
++static LRESULT CALLBACK notify_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
++{
++    if (msg == WM_MAPI_NOTIFY)
++    {
++        dispatch_queue();
++        return 0;
++    }
++    return DefWindowProcW(hwnd, msg, wp, lp);
++}
++
++static const WCHAR notify_class[] = L"WineMapiNotifyWindow";
++
++static ATOM register_notify_class(void)
++{
++    WNDCLASSW wc = {0};
++
++    wc.lpfnWndProc = notify_wndproc;
++    wc.hInstance = GetModuleHandleW(L"mapi32.dll");
++    wc.lpszClassName = notify_class;
++    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 0;
++    return 1;
++}
++
++/* the queue of the calling thread, made if there is none */
++static struct thread_queue *get_queue(void)
++{
++    struct thread_queue *q;
++
++    EnterCriticalSection(&notify_cs);
++    if (!(q = find_queue(GetCurrentThreadId())))
++    {
++        if (register_notify_class() && (q = calloc(1, sizeof(*q))))
++        {
++            q->tid = GetCurrentThreadId();
++            list_init(&q->packets);
++            q->hwnd = CreateWindowExW(0, notify_class, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL,
++                                      GetModuleHandleW(L"mapi32.dll"), NULL);
++            if (!q->hwnd)
++            {
++                free(q);
++                q = NULL;
++            }
++            else list_add_tail(&queues, &q->entry);
++        }
++    }
++    LeaveCriticalSection(&notify_cs);
++    return q;
++}
++
++/* The sink that goes to the other threads */
++struct thread_sink
++{
++    IMAPIAdviseSink IMAPIAdviseSink_iface;
++    LONG ref;
++    IMAPIAdviseSink *inner;
++    DWORD tid;
++};
++
++static struct thread_sink *impl_from_sink(IMAPIAdviseSink *iface)
++{
++    return CONTAINING_RECORD(iface, struct thread_sink, IMAPIAdviseSink_iface);
++}
++
++static HRESULT WINAPI sink_QueryInterface(IMAPIAdviseSink *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IMAPIAdviseSink))
++    {
++        *obj = iface;
++        IMAPIAdviseSink_AddRef(iface);
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI sink_AddRef(IMAPIAdviseSink *iface)
++{
++    return InterlockedIncrement(&impl_from_sink(iface)->ref);
++}
++
++static ULONG WINAPI sink_Release(IMAPIAdviseSink *iface)
++{
++    struct thread_sink *sink = impl_from_sink(iface);
++    ULONG ref = InterlockedDecrement(&sink->ref);
++
++    if (!ref)
++    {
++        IMAPIAdviseSink_Release(sink->inner);
++        free(sink);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI sink_OnNotify(IMAPIAdviseSink *iface, ULONG count, LPNOTIFICATION notifs)
++{
++    struct thread_sink *sink = impl_from_sink(iface);
++    struct packet *packet;
++    struct thread_queue *q;
++    NOTIFICATION *copy;
++    ULONG i;
++
++    TRACE("(%p, %lu, %p)\n", iface, count, notifs);
++
++    /* on the thread of the sink the notification goes straight through */
++#ifdef SG_MUTANT_MAPI_ALWAYSDIRECT
++    if (TRUE)
++#else
++    if (GetCurrentThreadId() == sink->tid)
++#endif
++        return IMAPIAdviseSink_OnNotify(sink->inner, count, notifs);
++
++    if (!count || !notifs) return 0;
++    if (FAILED(MAPIAllocateBuffer(count * sizeof(NOTIFICATION), (void **)&copy))) return 0;
++    for (i = 0; i < count; i++)
++        if (FAILED(copy_notification(copy, &copy[i], &notifs[i])))
++        {
++            MAPIFreeBuffer(copy);
++            return 0;
++        }
++    if (!(packet = calloc(1, sizeof(*packet))))
++    {
++        MAPIFreeBuffer(copy);
++        return 0;
++    }
++    packet->sink = sink->inner;
++    IMAPIAdviseSink_AddRef(packet->sink);
++    packet->count = count;
++    packet->notifs = copy;
++
++    EnterCriticalSection(&notify_cs);
++    q = find_queue(sink->tid);
++    if (q) list_add_tail(&q->packets, &packet->entry);
++    LeaveCriticalSection(&notify_cs);
++    if (!q)
++    {
++        /* the thread has no window any more */
++        IMAPIAdviseSink_Release(packet->sink);
++        MAPIFreeBuffer(copy);
++        free(packet);
++        return 0;
++    }
++#ifndef SG_MUTANT_MAPI_NOWAKE
++    PostMessageW(q->hwnd, WM_MAPI_NOTIFY, 0, 0);
++#endif
++    return 0;
++}
++
++static const IMAPIAdviseSinkVtbl sink_vtbl =
++{
++    sink_QueryInterface,
++    sink_AddRef,
++    sink_Release,
++    sink_OnNotify
++};
++
++/*************************************************************************
++ * HrThisThreadAdviseSink@8 (MAPI32.42)
++ *
++ * Ensure that an advise sink is only notified in its originating thread.
++ *
++ * PARAMS
++ *  lpSink     [I] IMAPIAdviseSink interface to be protected
++ *  lppNewSink [I] Destination for wrapper IMAPIAdviseSink interface
++ *
++ * RETURNS
++ * Success: S_OK. *lppNewSink contains a new sink to use in place of lpSink.
++ * Failure: E_INVALIDARG, if any parameter is invalid.
++ *
++ * NOTES
++ *  A notification sent to the new sink on another thread is copied and queued
++ *  for the thread that made the sink; the thread gets it when it handles its
++ *  messages, or when it calls HrDispatchNotifications().
++ */
++HRESULT WINAPI HrThisThreadAdviseSink(LPMAPIADVISESINK lpSink, LPMAPIADVISESINK* lppNewSink)
++{
++    struct thread_sink *sink;
++
++    if (mapiFunctions.HrThisThreadAdviseSink)
++        return mapiFunctions.HrThisThreadAdviseSink(lpSink, lppNewSink);
++
++    TRACE("(%p,%p)\n", lpSink, lppNewSink);
++
++    if (!lpSink || !lppNewSink)
++        return E_INVALIDARG;
++
++    /* the queue and its window are made for this thread now */
++    if (!get_queue()) return MAPI_E_NOT_ENOUGH_MEMORY;
++    if (!(sink = calloc(1, sizeof(*sink)))) return MAPI_E_NOT_ENOUGH_MEMORY;
++    sink->IMAPIAdviseSink_iface.lpVtbl = &sink_vtbl;
++    sink->ref = 1;
++    sink->inner = lpSink;
++    IMAPIAdviseSink_AddRef(lpSink);
++    sink->tid = GetCurrentThreadId();
++    *lppNewSink = &sink->IMAPIAdviseSink_iface;
++    return S_OK;
++}
++
++/*************************************************************************
++ * HrDispatchNotifications@4 (MAPI32.239)
++ *
++ * Deliver the notifications queued for the calling thread.
++ *
++ * PARAMS
++ *  flags [I] Reserved, 0
++ *
++ * RETURNS
++ *  S_OK: the notifications have been delivered.
++ *  MAPI_E_USER_CANCEL: the thread has a WM_QUIT or an end session message.
++ *  MAPI_E_NOT_INITIALIZED: MAPI is not initialized.
++ *  MAPI_E_INVALID_PARAMETER: flags is not 0.
++ */
++HRESULT WINAPI HrDispatchNotifications(ULONG flags)
++{
++    MSG msg;
++
++    TRACE("(%08lx)\n", flags);
++
++#ifndef SG_MUTANT_MAPI_DISPFLAGS
++    if (flags) return MAPI_E_INVALID_PARAMETER;
++#endif
++#ifndef SG_MUTANT_MAPI_NOINIT
++    if (util_init_count <= 0 && !mapiFunctions.MAPIInitialize) return MAPI_E_NOT_INITIALIZED;
++#endif
++
++    dispatch_queue();
++
++    if (PeekMessageW(&msg, NULL, WM_QUIT, WM_QUIT, PM_NOREMOVE) ||
++        PeekMessageW(&msg, NULL, WM_QUERYENDSESSION, WM_QUERYENDSESSION, PM_NOREMOVE) ||
++        PeekMessageW(&msg, NULL, WM_ENDSESSION, WM_ENDSESSION, PM_NOREMOVE))
++    {
++#ifndef SG_MUTANT_MAPI_QUIT
++        return MAPI_E_USER_CANCEL;
++#endif
++    }
++    return S_OK;
++}
++
++/**************************************************************************
++ *  ScInitMapiUtil (MAPI32.33)
++ *
++ * Initialise Mapi utility functions.
++ *
++ * PARAMS
++ *  ulReserved [I] Reserved, pass 0.
++ *
++ * RETURNS
++ *  Success: S_OK. Mapi utility functions may be called.
++ *  Failure: MAPI_E_INVALID_PARAMETER, if ulReserved is not 0.
++ *
++ * NOTES
++ *  Your application does not need to call this function unless it does not
++ *  call MAPIInitialize()/MAPIUninitialize().
++ */
++SCODE WINAPI ScInitMapiUtil(ULONG ulReserved)
++{
++    if (mapiFunctions.ScInitMapiUtil)
++        return mapiFunctions.ScInitMapiUtil(ulReserved);
++
++    TRACE("(0x%08lx)\n", ulReserved);
++#ifndef SG_MUTANT_MAPI_INITRES
++    if (ulReserved)
++        return MAPI_E_INVALID_PARAMETER;
++#endif
++    InterlockedIncrement(&util_init_count);
++    return S_OK;
++}
++
++/**************************************************************************
++ *  DeinitMapiUtil (MAPI32.34)
++ *
++ * Uninitialise Mapi utility functions.
++ *
++ * PARAMS
++ *  None.
++ *
++ * RETURNS
++ *  Nothing.
++ *
++ * NOTES
++ *  Your application does not need to call this function unless it does not
++ *  call MAPIInitialize()/MAPIUninitialize().
++ */
++VOID WINAPI DeinitMapiUtil(void)
++{
++    if (mapiFunctions.DeinitMapiUtil)
++        mapiFunctions.DeinitMapiUtil();
++    else
++    {
++        TRACE("()\n");
++        /* calls that were not matched by an initialization are ignored */
++#ifdef SG_MUTANT_MAPI_DEINIT
++        InterlockedExchange(&util_init_count, 0);
++#else
++        if (InterlockedDecrement(&util_init_count) < 0) InterlockedExchange(&util_init_count, 0);
++#endif
++    }
++}
+diff --git a/dlls/mapi32/prop.c b/dlls/mapi32/prop.c
+index 65ac44b..2894f92 100644
+--- a/dlls/mapi32/prop.c
++++ b/dlls/mapi32/prop.c
+@@ -18,6 +18,8 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#define COBJMACROS
++
+ #include <stdarg.h>
+ 
+ #include "windef.h"
+@@ -1397,6 +1399,16 @@ ULONG WINAPI FBadColumnSet(LPSPropTagArray lpCols)
+  * METHODS
+  */
+ 
++/* A name given an identifier of the 0x8000 range */
++struct prop_name
++{
++    ULONG id;
++    GUID guid;
++    ULONG kind;   /* MNID_ID or MNID_STRING */
++    LONG lid;
++    WCHAR *name;
++};
++
+ /* A single property in a property data collection */
+ typedef struct
+ {
+@@ -1417,6 +1429,8 @@ typedef struct
+     ULONG            ulNumValues; /* Number of items in values list */
+     struct list      values;      /* List of property values */
+     CRITICAL_SECTION cs;          /* Lock for thread safety */
++    struct prop_name *names;      /* Named properties: name to identifier mapping */
++    ULONG            num_names;
+ } IPropDataImpl;
+ 
+ static inline IPropDataImpl *impl_from_IPropData(IPropData *iface)
+@@ -1611,6 +1625,11 @@ static ULONG WINAPI IPropData_fnRelease(LPPROPDATA iface)
+             This->lpFree(current->value);
+             This->lpFree(current);
+         }
++        {
++            ULONG n;
++            for (n = 0; n < This->num_names; n++) free(This->names[n].name);
++            free(This->names);
++        }
+         This->cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&This->cs);
+         This->lpFree(This);
+@@ -1803,20 +1822,314 @@ static HRESULT WINAPI IPropData_fnGetPropList(LPPROPDATA iface, ULONG ulFlags,
+     return hRet;
+ }
+ 
++/* A stream over the value of a binary or string property: the data is read
++ * when it is opened, and written back to the property when it is committed or
++ * released after a change */
++typedef struct
++{
++    IStream IStream_iface;
++    LONG ref;
++    IPropDataImpl *data;
++    ULONG tag;
++    IStream *mem;
++    BOOL modify, dirty;
++} PropStream;
++
++static inline PropStream *impl_from_PropStream(IStream *iface)
++{
++    return CONTAINING_RECORD(iface, PropStream, IStream_iface);
++}
++
++static HRESULT PropStream_Store(PropStream *s)
++{
++    HRESULT hr;
++    HGLOBAL global;
++    SPropValue value;
++    STATSTG stat;
++    SIZE_T size;
++    BYTE *bytes, *copy;
++    LPSPropProblemArray probs = NULL;
++
++#ifdef SG_MUTANT_MAPI_NOSTORE
++    return S_OK;
++#endif
++    if (!s->dirty) return S_OK;
++    if (FAILED(hr = IStream_Stat(s->mem, &stat, STATFLAG_NONAME))) return hr;
++    size = stat.cbSize.LowPart;
++    if (FAILED(hr = GetHGlobalFromStream(s->mem, &global))) return hr;
++    if (!(bytes = GlobalLock(global))) return E_FAIL;
++
++    memset(&value, 0, sizeof(value));
++    value.ulPropTag = s->tag;
++    switch (PROP_TYPE(s->tag))
++    {
++    case PT_BINARY:
++        if (FAILED(hr = MAPIAllocateBuffer(size ? size : 1, (void **)&copy))) break;
++        memcpy(copy, bytes, size);
++        value.Value.bin.cb = size;
++        value.Value.bin.lpb = copy;
++        break;
++    case PT_STRING8:
++        if (FAILED(hr = MAPIAllocateBuffer(size + 1, (void **)&copy))) break;
++        memcpy(copy, bytes, size);
++        copy[size] = 0;
++        value.Value.lpszA = (char *)copy;
++        break;
++    default: /* PT_UNICODE */
++        if (FAILED(hr = MAPIAllocateBuffer(size + sizeof(WCHAR), (void **)&copy))) break;
++        memcpy(copy, bytes, size);
++        *(WCHAR *)(copy + (size & ~1)) = 0;
++        value.Value.lpszW = (WCHAR *)copy;
++        break;
++    }
++    GlobalUnlock(global);
++    if (FAILED(hr)) return hr;
++
++    hr = IPropData_SetProps(&s->data->IPropData_iface, 1, &value, &probs);
++    MAPIFreeBuffer(copy);
++    if (probs) MAPIFreeBuffer(probs);
++    if (SUCCEEDED(hr)) s->dirty = FALSE;
++    return hr;
++}
++
++static HRESULT WINAPI PropStream_QueryInterface(IStream *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_ISequentialStream) || IsEqualIID(riid, &IID_IStream))
++    {
++        *obj = iface;
++        IStream_AddRef(iface);
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI PropStream_AddRef(IStream *iface)
++{
++    return InterlockedIncrement(&impl_from_PropStream(iface)->ref);
++}
++
++static ULONG WINAPI PropStream_Release(IStream *iface)
++{
++    PropStream *s = impl_from_PropStream(iface);
++    ULONG ref = InterlockedDecrement(&s->ref);
++
++    if (!ref)
++    {
++        PropStream_Store(s);
++        IStream_Release(s->mem);
++        IPropData_Release(&s->data->IPropData_iface);
++        free(s);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI PropStream_Read(IStream *iface, void *buf, ULONG cb, ULONG *read)
++{
++    return IStream_Read(impl_from_PropStream(iface)->mem, buf, cb, read);
++}
++
++static HRESULT WINAPI PropStream_Write(IStream *iface, const void *buf, ULONG cb, ULONG *written)
++{
++    PropStream *s = impl_from_PropStream(iface);
++
++#ifndef SG_MUTANT_MAPI_STREAMRO
++    if (!s->modify) return STG_E_ACCESSDENIED;
++#endif
++    s->dirty = TRUE;
++    return IStream_Write(s->mem, buf, cb, written);
++}
++
++static HRESULT WINAPI PropStream_Seek(IStream *iface, LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *pos)
++{
++    return IStream_Seek(impl_from_PropStream(iface)->mem, move, origin, pos);
++}
++
++static HRESULT WINAPI PropStream_SetSize(IStream *iface, ULARGE_INTEGER size)
++{
++    PropStream *s = impl_from_PropStream(iface);
++
++    if (!s->modify) return STG_E_ACCESSDENIED;
++    s->dirty = TRUE;
++    return IStream_SetSize(s->mem, size);
++}
++
++static HRESULT WINAPI PropStream_CopyTo(IStream *iface, IStream *dest, ULARGE_INTEGER cb, ULARGE_INTEGER *read,
++                                        ULARGE_INTEGER *written)
++{
++    return IStream_CopyTo(impl_from_PropStream(iface)->mem, dest, cb, read, written);
++}
++
++static HRESULT WINAPI PropStream_Commit(IStream *iface, DWORD flags)
++{
++    return PropStream_Store(impl_from_PropStream(iface));
++}
++
++static HRESULT WINAPI PropStream_Revert(IStream *iface)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI PropStream_LockRegion(IStream *iface, ULARGE_INTEGER off, ULARGE_INTEGER cb, DWORD type)
++{
++    return STG_E_INVALIDFUNCTION;
++}
++
++static HRESULT WINAPI PropStream_UnlockRegion(IStream *iface, ULARGE_INTEGER off, ULARGE_INTEGER cb, DWORD type)
++{
++    return STG_E_INVALIDFUNCTION;
++}
++
++static HRESULT WINAPI PropStream_Stat(IStream *iface, STATSTG *stat, DWORD flags)
++{
++    return IStream_Stat(impl_from_PropStream(iface)->mem, stat, flags);
++}
++
++static HRESULT WINAPI PropStream_Clone(IStream *iface, IStream **clone)
++{
++    *clone = NULL;
++    return E_NOTIMPL;
++}
++
++static const IStreamVtbl PropStream_vtbl =
++{
++    PropStream_QueryInterface,
++    PropStream_AddRef,
++    PropStream_Release,
++    PropStream_Read,
++    PropStream_Write,
++    PropStream_Seek,
++    PropStream_SetSize,
++    PropStream_CopyTo,
++    PropStream_Commit,
++    PropStream_Revert,
++    PropStream_LockRegion,
++    PropStream_UnlockRegion,
++    PropStream_Stat,
++    PropStream_Clone
++};
++
+ /**************************************************************************
+  *  IPropData_OpenProperty {MAPI32}
+  *
+- * Not documented at this time.
++ * Open a property through an interface: a stream for the binary and string
++ * properties.
++ *
++ * PARAMS
++ *  iface    [I] IMAPIProp object to open the property of
++ *  ulPropTag[I] Tag of the property, the type is the type to use
++ *  iid      [I] Interface to open it with: IID_IStream
++ *  ulOpts   [I] Options of the interface, none for a stream
++ *  ulFlags  [I] MAPI_CREATE, MAPI_MODIFY, MAPI_DEFERRED_ERRORS
++ *  lpUnk    [O] The interface
+  *
+  * RETURNS
+- *  An HRESULT success/failure code.
++ *  Success: S_OK.
++ *  Failure: MAPI_E_INVALID_PARAMETER, MAPI_E_INTERFACE_NOT_SUPPORTED,
++ *           MAPI_E_NO_SUPPORT, MAPI_E_NOT_FOUND, MAPI_E_NO_ACCESS.
+  */
+ static HRESULT WINAPI IPropData_fnOpenProperty(LPPROPDATA iface, ULONG ulPropTag, LPCIID iid,
+                                                ULONG ulOpts, ULONG ulFlags, LPUNKNOWN *lpUnk)
+ {
+-    FIXME("(%p,%lu,%s,%lu,0x%08lx,%p) stub\n", iface, ulPropTag,
+-          debugstr_guid(iid), ulOpts, ulFlags, lpUnk);
+-    return MAPI_E_NO_SUPPORT;
++    IPropDataImpl *This = impl_from_IPropData(iface);
++    LPIPropDataItem item;
++    PropStream *stream;
++    ULONG type = PROP_TYPE(ulPropTag);
++    HRESULT hr;
++    SPropValue empty;
++    BOOL modify = (ulFlags & (MAPI_MODIFY | MAPI_CREATE)) != 0;
++
++    TRACE("(%p,%#lx,%s,%lu,0x%08lx,%p)\n", iface, ulPropTag, debugstr_guid(iid), ulOpts, ulFlags, lpUnk);
++
++    if (!iface || !iid || !lpUnk || type == PT_UNSPECIFIED) return MAPI_E_INVALID_PARAMETER;
++    *lpUnk = NULL;
++    if (ulFlags & ~(MAPI_CREATE | MAPI_MODIFY | MAPI_DEFERRED_ERRORS)) return MAPI_E_INVALID_PARAMETER;
++#ifndef SG_MUTANT_MAPI_OPENIID
++    if (!IsEqualIID(iid, &IID_IStream)) return MAPI_E_INTERFACE_NOT_SUPPORTED;
++#endif
++    /* the property has to be one that has data to stream */
++    if (type != PT_BINARY && type != PT_STRING8 && type != PT_UNICODE) return MAPI_E_NO_SUPPORT;
++
++    IMAPIPROP_Lock(This);
++    item = IMAPIPROP_GetValue(This, ulPropTag);
++    if (!item)
++    {
++        if (!(ulFlags & MAPI_CREATE))
++        {
++            IMAPIPROP_Unlock(This);
++            return MAPI_E_NOT_FOUND;
++        }
++        if (This->ulObjAccess != IPROP_READWRITE)
++        {
++            IMAPIPROP_Unlock(This);
++            return MAPI_E_NO_ACCESS;
++        }
++        /* a new, empty property */
++        memset(&empty, 0, sizeof(empty));
++        empty.ulPropTag = ulPropTag;
++        if (type == PT_BINARY) { empty.Value.bin.cb = 0; empty.Value.bin.lpb = (BYTE *)""; }
++        else if (type == PT_STRING8) empty.Value.lpszA = (char *)"";
++        else empty.Value.lpszW = (WCHAR *)L"";
++        item = IMAPIPROP_AddValue(This, &empty);
++        if (!item)
++        {
++            IMAPIPROP_Unlock(This);
++            return MAPI_E_NOT_ENOUGH_MEMORY;
++        }
++    }
++#ifdef SG_MUTANT_MAPI_OPENACCESS
++    else if (FALSE)
++#else
++    else if (modify && (This->ulObjAccess != IPROP_READWRITE || !(item->ulAccess & IPROP_READWRITE)))
++#endif
++    {
++        IMAPIPROP_Unlock(This);
++        return MAPI_E_NO_ACCESS;
++    }
++    else if ((ulFlags & MAPI_CREATE))
++    {
++        /* the property that exists is discarded */
++        empty.ulPropTag = item->value->ulPropTag;
++    }
++
++    stream = calloc(1, sizeof(*stream));
++    hr = stream ? CreateStreamOnHGlobal(NULL, TRUE, &stream->mem) : E_OUTOFMEMORY;
++    if (SUCCEEDED(hr) && !(ulFlags & MAPI_CREATE))
++    {
++        /* the data of the value, as a stream holds it: no terminator for a string */
++        const void *data = NULL;
++        ULONG size = 0, written;
++
++        switch (PROP_TYPE(item->value->ulPropTag))
++        {
++        case PT_BINARY: data = item->value->Value.bin.lpb; size = item->value->Value.bin.cb; break;
++        case PT_STRING8: data = item->value->Value.lpszA; size = data ? strlen(data) : 0; break;
++        case PT_UNICODE: data = item->value->Value.lpszW; size = data ? lstrlenW(data) * sizeof(WCHAR) : 0; break;
++        }
++        if (size) hr = IStream_Write(stream->mem, data, size, &written);
++        if (SUCCEEDED(hr))
++        {
++            LARGE_INTEGER zero = {{0}};
++            hr = IStream_Seek(stream->mem, zero, STREAM_SEEK_SET, NULL);
++        }
++    }
++    IMAPIPROP_Unlock(This);
++    if (FAILED(hr))
++    {
++        if (stream) { if (stream->mem) IStream_Release(stream->mem); free(stream); }
++        return hr == E_OUTOFMEMORY ? MAPI_E_NOT_ENOUGH_MEMORY : hr;
++    }
++
++    stream->IStream_iface.lpVtbl = &PropStream_vtbl;
++    stream->ref = 1;
++    stream->data = This;
++    IPropData_AddRef(iface);
++    stream->tag = ulPropTag;
++    stream->modify = modify;
++    stream->dirty = (ulFlags & MAPI_CREATE) != 0;
++    /* a property that was just created or emptied is empty when the stream is */
++    *lpUnk = (LPUNKNOWN)&stream->IStream_iface;
++    return S_OK;
+ }
+ 
+ 
+@@ -1869,8 +2182,9 @@ static HRESULT WINAPI IPropData_fnSetProps(LPPROPDATA iface, ULONG ulValues, LPS
+             LPVOID lpMem = NULL;
+ 
+             /* Found, so update the existing value */
++            /* a property takes the type of the value it is set to (IMAPIProp::SetProps documentation) */
+             if (item->value->ulPropTag != lpProps[i].ulPropTag)
+-                FIXME("semi-stub, overwriting type (not coercing)\n");
++                TRACE("property %#lx changes type to %#lx\n", item->value->ulPropTag, lpProps[i].ulPropTag);
+ 
+             hRetTmp = This->lpAlloc(sizeof(SPropValue), &lpMem);
+             if (SUCCEEDED(hRetTmp))
+@@ -1997,13 +2311,182 @@ static HRESULT WINAPI IPropData_fnDeleteProps(LPPROPDATA iface, LPSPropTagArray
+ }
+ 
+ 
++/* Internal - the properties of the object to copy: those of the include list, or
++ * all but those of the exclude list. A problem is added to the array when a
++ * property cannot go. */
++static HRESULT IPropData_CopyInternal(IPropDataImpl *This, LPSPropTagArray lpIncl, LPSPropTagArray lpExcl,
++                                      LPCIID lpIface, LPVOID lpDstObj, ULONG ulFlags,
++                                      LPSPropProblemArray *lppProbs)
++{
++    IUnknown *dst_unk = NULL, *src_unk = NULL;
++    IMAPIProp *dst = NULL;
++    struct list *cursor;
++    LPSPropProblemArray probs = NULL;
++    ULONG count = 0, i, max;
++    HRESULT hr;
++
++    if (lppProbs) *lppProbs = NULL;
++    if (!lpIface || !lpDstObj) return MAPI_E_INVALID_PARAMETER;
++
++    /* the destination, asked for the interface the caller named */
++#ifdef SG_MUTANT_MAPI_IFACE
++    dst_unk = (IUnknown *)lpDstObj; IUnknown_AddRef(dst_unk);
++#else
++    if (FAILED(IUnknown_QueryInterface((IUnknown *)lpDstObj, lpIface, (void **)&dst_unk)))
++        return MAPI_E_INTERFACE_NOT_SUPPORTED;
++#endif
++    if (FAILED(IUnknown_QueryInterface(dst_unk, &IID_IMAPIProp, (void **)&dst)))
++    {
++        IUnknown_Release(dst_unk);
++        return MAPI_E_INTERFACE_NOT_SUPPORTED;
++    }
++    IUnknown_Release(dst_unk);
++    /* an object is not copied onto itself */
++    IPropData_QueryInterface(&This->IPropData_iface, &IID_IUnknown, (void **)&src_unk);
++    IUnknown_QueryInterface((IUnknown *)dst, &IID_IUnknown, (void **)&dst_unk);
++#ifdef SG_MUTANT_MAPI_SELF
++    hr = S_OK;
++#else
++    hr = (src_unk == dst_unk) ? MAPI_E_NO_ACCESS : S_OK;
++#endif
++    IUnknown_Release(src_unk);
++    IUnknown_Release(dst_unk);
++    if (FAILED(hr))
++    {
++        IMAPIProp_Release(dst);
++        return hr;
++    }
++
++    IMAPIPROP_Lock(This);
++    max = This->ulNumValues;
++    if (lppProbs && max && FAILED(MAPIAllocateBuffer(CbNewSPropProblemArray(max), (void **)&probs))) probs = NULL;
++
++    LIST_FOR_EACH(cursor, &This->values)
++    {
++        LPIPropDataItem item = LIST_ENTRY(cursor, IPropDataItem, entry);
++        LPSPropValue value = item->value;
++        ULONG id = PROP_ID(value->ulPropTag);
++        BOOL wanted = TRUE;
++        HRESULT sc = S_OK;
++
++        /* the objects held as properties are not copied */
++        if (PROP_TYPE(value->ulPropTag) == PT_OBJECT) continue;
++        if (lpIncl)
++        {
++            wanted = FALSE;
++            for (i = 0; i < lpIncl->cValues; i++)
++                if (PROP_ID(lpIncl->aulPropTag[i]) == id) wanted = TRUE;
++        }
++#ifndef SG_MUTANT_MAPI_EXCL
++        if (lpExcl)
++            for (i = 0; i < lpExcl->cValues; i++)
++                if (PROP_ID(lpExcl->aulPropTag[i]) == id) wanted = FALSE;
++#endif
++        if (!wanted) continue;
++
++#ifdef SG_MUTANT_MAPI_NOREPLACE
++        if (FALSE)
++#else
++        if (ulFlags & MAPI_NOREPLACE)
++#endif
++        {
++            SPropTagArray one = { 1, { value->ulPropTag } };
++            ULONG got = 0;
++            LPSPropValue existing = NULL;
++
++            if (SUCCEEDED(IMAPIProp_GetProps(dst, &one, 0, &got, &existing)) && existing)
++            {
++                BOOL there = PROP_TYPE(existing[0].ulPropTag) != PT_ERROR;
++                MAPIFreeBuffer(existing);
++                if (there) continue;
++            }
++        }
++
++        {
++            LPSPropProblemArray dprobs = NULL;
++            SPropValue copy = *value;
++
++            sc = IMAPIProp_SetProps(dst, 1, &copy, &dprobs);
++            if (SUCCEEDED(sc) && dprobs && dprobs->cProblem) sc = dprobs->aProblem[0].scode;
++            if (dprobs) MAPIFreeBuffer(dprobs);
++        }
++        if (FAILED(sc))
++        {
++            if (probs && count < max)
++            {
++                probs->aProblem[count].ulIndex = count;
++                probs->aProblem[count].ulPropTag = value->ulPropTag;
++                probs->aProblem[count].scode = sc;
++                count++;
++            }
++        }
++#ifndef SG_MUTANT_MAPI_NOMOVE
++        else if (ulFlags & MAPI_MOVE)
++            item->ulAccess |= 0x80000000;
++#endif   /* to be removed once the loop is done */
++    }
++
++    /* a move removes what was copied */
++    if (ulFlags & MAPI_MOVE)
++    {
++        struct list *next;
++
++        LIST_FOR_EACH_SAFE(cursor, next, &This->values)
++        {
++            LPIPropDataItem item = LIST_ENTRY(cursor, IPropDataItem, entry);
++
++            if (!(item->ulAccess & 0x80000000)) continue;
++#ifdef SG_MUTANT_MAPI_MOVERO
++            if (TRUE)
++#else
++            if (This->ulObjAccess == IPROP_READWRITE && (item->ulAccess & IPROP_READWRITE))
++#endif
++            {
++                list_remove(&item->entry);
++                This->lpFree(item->value);
++                This->lpFree(item);
++                This->ulNumValues--;
++            }
++            else item->ulAccess &= ~0x80000000;
++        }
++    }
++    IMAPIPROP_Unlock(This);
++    IMAPIProp_Release(dst);
++
++    if (probs)
++    {
++        if (count)
++        {
++            probs->cProblem = count;
++            *lppProbs = probs;
++        }
++        else MAPIFreeBuffer(probs);
++    }
++    return S_OK;
++}
++
+ /**************************************************************************
+  *  IPropData_CopyTo {MAPI32}
+  *
+- * Not documented at this time.
++ * Copy or move the properties of an object, but those excluded, to another
++ * object.
++ *
++ * PARAMS
++ *  iface        [I] Source object
++ *  niids        [I] Number of interfaces in lpiidExcl
++ *  lpiidExcl    [I] Interfaces not to copy supplemental data of
++ *  lpPropsExcl  [I] Properties not to copy, or NULL for all (cValues not 0)
++ *  ulParam      [I] Window of the progress display
++ *  lpIProgress  [I] Progress object, or NULL
++ *  lpIfaceIid   [I] Interface of the destination object
++ *  lpDstObj     [I] Destination object
++ *  ulFlags      [I] MAPI_MOVE, MAPI_NOREPLACE, MAPI_DECLINE_OK, MAPI_DIALOG
++ *  lppProbs     [O] Properties that could not be copied, or NULL
+  *
+  * RETURNS
+- *  An HRESULT success/failure code.
++ *  Success: S_OK.
++ *  Failure: MAPI_E_INVALID_PARAMETER, MAPI_E_INTERFACE_NOT_SUPPORTED, or
++ *           MAPI_E_NO_ACCESS if the destination is the source.
+  */
+ static HRESULT WINAPI IPropData_fnCopyTo(LPPROPDATA iface, ULONG niids, LPCIID lpiidExcl,
+                                          LPSPropTagArray lpPropsExcl, ULONG ulParam,
+@@ -2011,29 +2494,56 @@ static HRESULT WINAPI IPropData_fnCopyTo(LPPROPDATA iface, ULONG niids, LPCIID l
+                                          LPVOID lpDstObj, ULONG ulFlags,
+                                          LPSPropProblemArray *lppProbs)
+ {
+-    FIXME("(%p,%lu,%p,%p,%lx,%p,%s,%p,0x%08lX,%p) stub\n", iface, niids,
++    TRACE("(%p,%lu,%p,%p,%lx,%p,%s,%p,0x%08lX,%p)\n", iface, niids,
+           lpiidExcl, lpPropsExcl, ulParam, lpIProgress,
+           debugstr_guid(lpIfaceIid), lpDstObj, ulFlags, lppProbs);
+-    return MAPI_E_NO_SUPPORT;
++
++#ifdef SG_MUTANT_MAPI_EXCLEMPTY
++    if (!iface)
++#else
++    if (!iface || (lpPropsExcl && !lpPropsExcl->cValues) || (niids && !lpiidExcl))
++#endif
++        return MAPI_E_INVALID_PARAMETER;
++    return IPropData_CopyInternal(impl_from_IPropData(iface), NULL, lpPropsExcl, lpIfaceIid, lpDstObj,
++                                  ulFlags, lppProbs);
+ }
+ 
+ /**************************************************************************
+  *  IPropData_CopyProps {MAPI32}
+  *
+- * Not documented at this time.
++ * Copy or move some of the properties of an object to another object.
++ *
++ * PARAMS
++ *  iface       [I] Source object
++ *  lpInclProps [I] Properties to copy (not NULL, not empty)
++ *  ulParam     [I] Window of the progress display
++ *  lpIProgress [I] Progress object, or NULL
++ *  lpIface     [I] Interface of the destination object
++ *  lpDstObj    [I] Destination object
++ *  ulFlags     [I] MAPI_MOVE, MAPI_NOREPLACE, MAPI_DECLINE_OK, MAPI_DIALOG
++ *  lppProbs    [O] Properties that could not be copied, or NULL
+  *
+  * RETURNS
+- *  An HRESULT success/failure code.
++ *  Success: S_OK.
++ *  Failure: MAPI_E_INVALID_PARAMETER, MAPI_E_INTERFACE_NOT_SUPPORTED, or
++ *           MAPI_E_NO_ACCESS if the destination is the source.
+  */
+ static HRESULT WINAPI IPropData_fnCopyProps(LPPROPDATA iface, LPSPropTagArray lpInclProps,
+                                             ULONG ulParam, LPMAPIPROGRESS lpIProgress,
+                                             LPCIID lpIface, LPVOID lpDstObj, ULONG ulFlags,
+                                             LPSPropProblemArray *lppProbs)
+ {
+-    FIXME("(%p,%p,%lx,%p,%s,%p,0x%08lX,%p) stub\n", iface, lpInclProps,
++    ULONG i;
++
++    TRACE("(%p,%p,%lx,%p,%s,%p,0x%08lX,%p)\n", iface, lpInclProps,
+           ulParam, lpIProgress, debugstr_guid(lpIface), lpDstObj, ulFlags,
+           lppProbs);
+-    return MAPI_E_NO_SUPPORT;
++
++    if (!iface || !lpInclProps || !lpInclProps->cValues) return MAPI_E_INVALID_PARAMETER;
++    for (i = 0; i < lpInclProps->cValues; i++)
++        if (lpInclProps->aulPropTag[i] == PR_NULL) return MAPI_E_INVALID_PARAMETER;
++    return IPropData_CopyInternal(impl_from_IPropData(iface), lpInclProps, NULL, lpIface, lpDstObj,
++                                  ulFlags, lppProbs);
+ }
+ 
+ /**************************************************************************
+@@ -2063,9 +2573,144 @@ static HRESULT WINAPI IPropData_fnGetNamesFromIDs(LPPROPDATA iface, LPSPropTagAr
+                                                   LPGUID iid, ULONG ulFlags, ULONG *lpCount,
+                                                   LPMAPINAMEID **lpppNames)
+ {
+-    FIXME("(%p,%p,%s,0x%08lX,%p,%p) stub\n", iface, lppPropTags,
++    IPropDataImpl *This = impl_from_IPropData(iface);
++    LPSPropTagArray tags;
++    LPMAPINAMEID *names = NULL;
++    ULONG i, n, count = 0;
++    HRESULT hr = S_OK;
++
++    TRACE("(%p,%p,%s,0x%08lX,%p,%p)\n", iface, lppPropTags,
+           debugstr_guid(iid), ulFlags, lpCount, lpppNames);
+-    return MAPI_E_NO_SUPPORT;
++
++    if (!iface || !lpCount || !lpppNames || (ulFlags & ~(MAPI_NO_IDS | MAPI_NO_STRINGS)))
++        return MAPI_E_INVALID_PARAMETER;
++    *lpCount = 0;
++    *lpppNames = NULL;
++    if (lppPropTags && *lppPropTags && !(*lppPropTags)->cValues) return MAPI_E_INVALID_PARAMETER;
++
++    IMAPIPROP_Lock(This);
++
++    if (lppPropTags && *lppPropTags)
++    {
++        /* the names of the identifiers given, whichever set they are in */
++        tags = *lppPropTags;
++        if (FAILED(hr = MAPIAllocateBuffer(tags->cValues * sizeof(*names), (void **)&names))) goto done;
++        for (i = 0; i < tags->cValues; i++)
++        {
++            ULONG id = PROP_ID(tags->aulPropTag[i]);
++            struct prop_name *pn = NULL;
++            LPMAPINAMEID mn;
++
++            names[i] = NULL;
++            for (n = 0; n < This->num_names; n++)
++                if (This->names[n].id == id) pn = &This->names[n];
++#ifndef SG_MUTANT_MAPI_NAMEFLAGS
++            if (pn && (((ulFlags & MAPI_NO_IDS) && pn->kind == MNID_ID) ||
++                       ((ulFlags & MAPI_NO_STRINGS) && pn->kind == MNID_STRING)))
++                pn = NULL;
++#endif
++            if (!pn)
++            {
++                tags->aulPropTag[i] = CHANGE_PROP_TYPE(tags->aulPropTag[i], PT_ERROR);
++                hr = MAPI_W_ERRORS_RETURNED;
++                continue;
++            }
++            if (FAILED(MAPIAllocateMore(sizeof(MAPINAMEID), names, (void **)&mn)) ||
++                FAILED(MAPIAllocateMore(sizeof(GUID), names, (void **)&mn->lpguid)))
++            {
++                hr = MAPI_E_NOT_ENOUGH_MEMORY;
++                MAPIFreeBuffer(names);
++                goto done;
++            }
++            *mn->lpguid = pn->guid;
++            mn->ulKind = pn->kind;
++            if (pn->kind == MNID_ID) mn->Kind.lID = pn->lid;
++            else
++            {
++                SIZE_T size = (lstrlenW(pn->name) + 1) * sizeof(WCHAR);
++                if (FAILED(MAPIAllocateMore(size, names, (void **)&mn->Kind.lpwstrName)))
++                {
++                    hr = MAPI_E_NOT_ENOUGH_MEMORY;
++                    MAPIFreeBuffer(names);
++                    goto done;
++                }
++                memcpy(mn->Kind.lpwstrName, pn->name, size);
++            }
++            names[i] = mn;
++        }
++        *lpCount = tags->cValues;
++        *lpppNames = names;
++    }
++    else
++    {
++        /* all the names, of the set if one is given */
++        for (n = 0; n < This->num_names; n++)
++        {
++            struct prop_name *pn = &This->names[n];
++
++#ifndef SG_MUTANT_MAPI_NAMESET
++            if (iid && !IsEqualGUID(iid, &pn->guid)) continue;
++#endif
++            if (((ulFlags & MAPI_NO_IDS) && pn->kind == MNID_ID) || ((ulFlags & MAPI_NO_STRINGS) && pn->kind == MNID_STRING))
++                continue;
++            count++;
++        }
++        if (FAILED(hr = MAPIAllocateBuffer(CbNewSPropTagArray(count), (void **)&tags))) goto done;
++        tags->cValues = count;
++        if (count)
++        {
++            if (FAILED(hr = MAPIAllocateBuffer(count * sizeof(*names), (void **)&names)))
++            {
++                MAPIFreeBuffer(tags);
++                goto done;
++            }
++            i = 0;
++            for (n = 0; n < This->num_names; n++)
++            {
++                struct prop_name *pn = &This->names[n];
++                LPMAPINAMEID mn;
++
++                if (iid && !IsEqualGUID(iid, &pn->guid)) continue;
++                if (((ulFlags & MAPI_NO_IDS) && pn->kind == MNID_ID) ||
++                    ((ulFlags & MAPI_NO_STRINGS) && pn->kind == MNID_STRING))
++                    continue;
++                if (FAILED(MAPIAllocateMore(sizeof(MAPINAMEID), names, (void **)&mn)) ||
++                    FAILED(MAPIAllocateMore(sizeof(GUID), names, (void **)&mn->lpguid)))
++                {
++                    hr = MAPI_E_NOT_ENOUGH_MEMORY;
++                    MAPIFreeBuffer(names);
++                    MAPIFreeBuffer(tags);
++                    goto done;
++                }
++                *mn->lpguid = pn->guid;
++                mn->ulKind = pn->kind;
++                if (pn->kind == MNID_ID) mn->Kind.lID = pn->lid;
++                else
++                {
++                    SIZE_T size = (lstrlenW(pn->name) + 1) * sizeof(WCHAR);
++                    if (FAILED(MAPIAllocateMore(size, names, (void **)&mn->Kind.lpwstrName)))
++                    {
++                        hr = MAPI_E_NOT_ENOUGH_MEMORY;
++                        MAPIFreeBuffer(names);
++                        MAPIFreeBuffer(tags);
++                        goto done;
++                    }
++                    memcpy(mn->Kind.lpwstrName, pn->name, size);
++                }
++                names[i] = mn;
++                tags->aulPropTag[i] = PROP_TAG(PT_UNSPECIFIED, pn->id);
++                i++;
++            }
++        }
++        if (lppPropTags) *lppPropTags = tags;
++        else MAPIFreeBuffer(tags);
++        *lpCount = count;
++        *lpppNames = names;
++        hr = S_OK;
++    }
++done:
++    IMAPIPROP_Unlock(This);
++    return hr;
+ }
+ 
+ /**************************************************************************
+@@ -2093,9 +2738,104 @@ static HRESULT WINAPI IPropData_fnGetIDsFromNames(LPPROPDATA iface, ULONG ulName
+                                                   LPMAPINAMEID *lppNames, ULONG ulFlags,
+                                                   LPSPropTagArray *lppPropTags)
+ {
+-    FIXME("(%p,%ld,%p,0x%08lX,%p) stub\n",
+-          iface, ulNames, lppNames, ulFlags, lppPropTags);
+-    return MAPI_E_NO_SUPPORT;
++    IPropDataImpl *This = impl_from_IPropData(iface);
++    LPSPropTagArray tags;
++    ULONG i, n, count;
++    HRESULT hr = S_OK;
++
++    TRACE("(%p,%ld,%p,0x%08lX,%p)\n", iface, ulNames, lppNames, ulFlags, lppPropTags);
++
++    if (!iface || !lppPropTags || (ulFlags & ~MAPI_CREATE)) return MAPI_E_INVALID_PARAMETER;
++    *lppPropTags = NULL;
++    if (!lppNames && (ulNames || (ulFlags & MAPI_CREATE))) return MAPI_E_INVALID_PARAMETER;
++
++    IMAPIPROP_Lock(This);
++
++    if (!lppNames)
++    {
++        /* every name there is */
++        count = This->num_names;
++        if (FAILED(hr = MAPIAllocateBuffer(CbNewSPropTagArray(count), (void **)&tags))) goto done;
++        tags->cValues = count;
++        for (n = 0; n < count; n++) tags->aulPropTag[n] = PROP_TAG(PT_UNSPECIFIED, This->names[n].id);
++        *lppPropTags = tags;
++        goto done;
++    }
++
++    if (FAILED(hr = MAPIAllocateBuffer(CbNewSPropTagArray(ulNames), (void **)&tags))) goto done;
++    tags->cValues = ulNames;
++    for (i = 0; i < ulNames; i++)
++    {
++        LPMAPINAMEID name = lppNames[i];
++        struct prop_name *pn = NULL;
++
++        tags->aulPropTag[i] = PROP_TAG(PT_ERROR, 0);
++        if (!name || !name->lpguid || (name->ulKind != MNID_ID && name->ulKind != MNID_STRING) ||
++            (name->ulKind == MNID_STRING && !name->Kind.lpwstrName))
++        {
++            hr = MAPI_W_ERRORS_RETURNED;
++            continue;
++        }
++        for (n = 0; n < This->num_names; n++)
++        {
++            struct prop_name *c = &This->names[n];
++
++            if (c->kind != name->ulKind || !IsEqualGUID(&c->guid, name->lpguid)) continue;
++            if (c->kind == MNID_ID ? c->lid == name->Kind.lID : !wcsicmp(c->name, name->Kind.lpwstrName))
++            {
++                pn = c;
++                break;
++            }
++        }
++#ifdef SG_MUTANT_MAPI_NAMEDUP
++        pn = NULL;
++#endif
++        if (!pn && (ulFlags & MAPI_CREATE))
++        {
++            struct prop_name *grown;
++#ifdef SG_MUTANT_MAPI_NAMEID
++            ULONG next = 0x7000 + This->num_names;
++#else
++            ULONG next = 0x8000 + This->num_names;
++#endif
++
++            /* the identifiers are of the range 0x8000 to 0xfffe */
++            if (next > 0xfffe)
++            {
++                MAPIFreeBuffer(tags);
++                hr = MAPI_E_TOO_BIG;
++                goto done;
++            }
++            grown = realloc(This->names, (This->num_names + 1) * sizeof(*grown));
++            if (!grown)
++            {
++                MAPIFreeBuffer(tags);
++                hr = MAPI_E_NOT_ENOUGH_MEMORY;
++                goto done;
++            }
++            This->names = grown;
++            pn = &This->names[This->num_names];
++            pn->id = next;
++            pn->guid = *name->lpguid;
++            pn->kind = name->ulKind;
++            pn->lid = 0;
++            pn->name = NULL;
++            if (name->ulKind == MNID_ID) pn->lid = name->Kind.lID;
++            else if (!(pn->name = wcsdup(name->Kind.lpwstrName)))
++            {
++                MAPIFreeBuffer(tags);
++                hr = MAPI_E_NOT_ENOUGH_MEMORY;
++                goto done;
++            }
++            This->num_names++;
++        }
++        if (pn) tags->aulPropTag[i] = PROP_TAG(PT_UNSPECIFIED, pn->id);
++        else hr = MAPI_W_ERRORS_RETURNED;
++    }
++    *lppPropTags = tags;
++done:
++    IMAPIPROP_Unlock(This);
++    return hr;
+ }
+ 
+ /**************************************************************************
+@@ -2269,47 +3009,83 @@ IPropData_fnHrGetPropAccess(LPPROPDATA iface, LPSPropTagArray *lppTags,
+ /**************************************************************************
+  *  IPropData_HrAddObjProps {MAPI32}
+  *
+- * Not documented at this time.
++ * Add object properties to an IPropData object.
++ *
++ * PARAMS
++ *  iface   [I] IPropData object to add to
++ *  lpTags  [I] Tags of the properties, all of type PT_OBJECT
++ *  lppProbs[O] The properties that could not be added, or NULL
+  *
+  * RETURNS
+- *  An HRESULT success/failure code.
++ *  Success: S_OK.
++ *  Failure: MAPI_E_INVALID_TYPE, if a tag is not of type PT_OBJECT,
++ *           MAPI_E_NO_ACCESS, if the object is read only,
++ *           MAPI_W_PARTIAL_COMPLETION, if some were not added.
+  */
+ static HRESULT WINAPI
+ IPropData_fnHrAddObjProps(LPPROPDATA iface, LPSPropTagArray lpTags,
+                           LPSPropProblemArray *lppProbs)
+ {
+-#if 0
+-    ULONG i;
+-    HRESULT hRet;
+-    LPSPropValue lpValues;
+-#endif
++    IPropDataImpl *This = impl_from_IPropData(iface);
++    LPSPropProblemArray probs = NULL;
++    ULONG i, count = 0;
++    HRESULT hr = S_OK;
+ 
+-    FIXME("(%p,%p,%p) stub\n", iface, lpTags, lppProbs);
++    TRACE("(%p,%p,%p)\n", iface, lpTags, lppProbs);
+ 
+-    if (!iface || !lpTags)
+-        return MAPI_E_INVALID_PARAMETER;
++    if (!iface || !lpTags) return MAPI_E_INVALID_PARAMETER;
++    if (lppProbs) *lppProbs = NULL;
+ 
+-    /* FIXME: Below is the obvious implementation, adding all the properties
+-     *        in lpTags to the object. However, it doesn't appear that this
+-     *        is what this function does.
+-     */
+-    return S_OK;
+-#if 0
+-    if (!lpTags->cValues)
+-        return S_OK;
++    /* only object properties can be added this way */
++    for (i = 0; i < lpTags->cValues; i++)
++#ifndef SG_MUTANT_MAPI_OBJTYPE
++        if (PROP_TYPE(lpTags->aulPropTag[i]) != PT_OBJECT) return MAPI_E_INVALID_TYPE;
++#endif
+ 
+-    lpValues = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+-                         lpTags->cValues * sizeof(SPropValue));
+-    if (!lpValues)
+-        return MAPI_E_NOT_ENOUGH_MEMORY;
++    IMAPIPROP_Lock(This);
++#ifndef SG_MUTANT_MAPI_OBJACCESS
++    if (This->ulObjAccess != IPROP_READWRITE)
++    {
++        IMAPIPROP_Unlock(This);
++        return MAPI_E_NO_ACCESS;
++    }
++#endif
++    if (lppProbs && lpTags->cValues &&
++        FAILED(MAPIAllocateBuffer(CbNewSPropProblemArray(lpTags->cValues), (void **)&probs)))
++        probs = NULL;
+ 
+     for (i = 0; i < lpTags->cValues; i++)
+-        lpValues[i].ulPropTag = lpTags->aulPropTag[i];
++    {
++        SPropValue value;
+ 
+-    hRet = IPropData_SetProps(iface, lpTags->cValues, lpValues, lppProbs);
+-    HeapFree(GetProcessHeap(), 0, lpValues);
+-    return hRet;
+-#endif
++        memset(&value, 0, sizeof(value));
++        value.ulPropTag = lpTags->aulPropTag[i];
++        /* one that is there is left as it is */
++        if (IMAPIPROP_GetValue(This, value.ulPropTag)) continue;
++        if (!IMAPIPROP_AddValue(This, &value))
++        {
++            hr = MAPI_W_PARTIAL_COMPLETION;
++            if (probs)
++            {
++                probs->aProblem[count].ulIndex = i;
++                probs->aProblem[count].ulPropTag = value.ulPropTag;
++                probs->aProblem[count].scode = MAPI_E_NOT_ENOUGH_MEMORY;
++                count++;
++            }
++        }
++    }
++    IMAPIPROP_Unlock(This);
++
++    if (probs)
++    {
++        if (count)
++        {
++            probs->cProblem = count;
++            *lppProbs = probs;
++        }
++        else MAPIFreeBuffer(probs);
++    }
++    return hr;
+ }
+ 
+ static const IPropDataVtbl IPropDataImpl_vtbl =
+@@ -2382,6 +3158,8 @@ SCODE WINAPI CreateIProp(LPCIID iid, ALLOCATEBUFFER *lpAlloc,
+         lpPropData->lpFree = lpFree;
+         lpPropData->ulObjAccess = IPROP_READWRITE;
+         lpPropData->ulNumValues = 0;
++        lpPropData->names = NULL;
++        lpPropData->num_names = 0;
+         list_init(&lpPropData->values);
+         InitializeCriticalSectionEx(&lpPropData->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+         lpPropData->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": IPropDataImpl.cs");
+diff --git a/dlls/mapi32/rtfcomp.c b/dlls/mapi32/rtfcomp.c
+new file mode 100644
+index 0000000..073b5ae
+--- /dev/null
++++ b/dlls/mapi32/rtfcomp.c
+@@ -0,0 +1,607 @@
++/*
++ * Compressed RTF streams (PR_RTF_COMPRESSED)
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * The format is the one documented in MS-OXRTFCP: a header of the compressed
++ * size, the raw size, the type ("LZFu" compressed, "MELA" not) and a CRC, then
++ * the data. The compressed data is made of tokens in groups of eight, after a
++ * byte of flags: a literal byte, or a reference of 12 bits of position and 4
++ * bits of length into a dictionary of 4096 bytes that starts with a fixed text.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define COBJMACROS
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winerror.h"
++#include "objbase.h"
++#include "mapival.h"
++#include "mapiutil.h"
++#include "wine/debug.h"
++#include "util.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(mapi);
++
++#define RTF_HEADER_SIZE 16
++#define RTF_DICT_SIZE   4096
++
++static const char rtf_prebuf[] =
++    "{\\rtf1\\ansi\\mac\\deff0\\deftab720{\\fonttbl;}{\\f0\\fnil \\froman \\fswiss \\fmodern \\fscript \\fdecor "
++    "MS Sans SerifSymbolArialTimes New RomanCourier{\\colortbl\\red0\\green0\\blue0\r\n\\par \\pard\\plain\\f0"
++    "\\fs20\\b\\i\\u\\tab\\tx";
++#define RTF_PREBUF_SIZE (sizeof(rtf_prebuf) - 1)
++
++static DWORD read_dword(const BYTE *p)
++{
++    return p[0] | (p[1] << 8) | (p[2] << 16) | ((DWORD)p[3] << 24);
++}
++
++static void write_dword(BYTE *p, DWORD v)
++{
++    p[0] = v;
++    p[1] = v >> 8;
++    p[2] = v >> 16;
++    p[3] = v >> 24;
++}
++
++static DWORD rtf_crc32(const BYTE *data, SIZE_T size)
++{
++    static DWORD table[256];
++    static BOOL init;
++    DWORD crc = 0;
++    SIZE_T i;
++
++    if (!init)
++    {
++        DWORD n, k, c;
++        for (n = 0; n < 256; n++)
++        {
++            c = n;
++            for (k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320 ^ (c >> 1) : c >> 1;
++            table[n] = c;
++        }
++        init = TRUE;
++    }
++    for (i = 0; i < size; i++) crc = table[(crc ^ data[i]) & 0xff] ^ (crc >> 8);
++    return crc;
++}
++
++/* The raw text of the compressed data. *OUT is allocated. */
++static HRESULT rtf_decompress(const BYTE *in, SIZE_T in_size, BYTE **out, SIZE_T *out_size)
++{
++    BYTE dict[RTF_DICT_SIZE];
++    DWORD comp_size, raw_size, type;
++    SIZE_T pos, end, n = 0;
++    unsigned int wp;
++    BOOL done = FALSE;
++    BYTE *buf;
++
++    *out = NULL;
++    *out_size = 0;
++    if (in_size < RTF_HEADER_SIZE) return MAPI_E_CORRUPT_DATA;
++    comp_size = read_dword(in);
++    raw_size = read_dword(in + 4);
++    type = read_dword(in + 8);
++    /* the size counts what follows its own field */
++    if (comp_size < 12 || comp_size > in_size - 4) comp_size = in_size - 4;
++
++    if (type == 0x414c454d)   /* "MELA": the text is not compressed */
++    {
++        SIZE_T have = comp_size - 12;
++
++        if (raw_size > have) return MAPI_E_CORRUPT_DATA;
++        if (!(buf = malloc(raw_size ? raw_size : 1))) return MAPI_E_NOT_ENOUGH_MEMORY;
++        memcpy(buf, in + RTF_HEADER_SIZE, raw_size);
++        *out = buf;
++        *out_size = raw_size;
++        return S_OK;
++    }
++#ifndef SG_MUTANT_MAPI_BADTYPE
++    if (type != 0x75465a4c) return MAPI_E_CORRUPT_DATA;   /* "LZFu" */
++#endif
++    if (raw_size > 0x40000000) return MAPI_E_CORRUPT_DATA;
++
++    if (!(buf = malloc(raw_size ? raw_size : 1))) return MAPI_E_NOT_ENOUGH_MEMORY;
++#ifdef SG_MUTANT_MAPI_PREBUF
++    memset(dict, ' ', RTF_PREBUF_SIZE);
++#else
++    memcpy(dict, rtf_prebuf, RTF_PREBUF_SIZE);
++#endif
++    memset(dict + RTF_PREBUF_SIZE, 0, RTF_DICT_SIZE - RTF_PREBUF_SIZE);
++    wp = RTF_PREBUF_SIZE;
++
++    end = comp_size + 4;
++    pos = RTF_HEADER_SIZE;
++    while (pos < end && !done)
++    {
++        BYTE flags = in[pos++];
++        int bit;
++
++        for (bit = 0; bit < 8 && pos < end; bit++, flags >>= 1)
++        {
++            if (!(flags & 1))
++            {
++                BYTE c = in[pos++];
++
++                if (n < raw_size) buf[n++] = c;
++                dict[wp] = c;
++                wp = (wp + 1) & (RTF_DICT_SIZE - 1);
++            }
++            else
++            {
++                unsigned int off, len, i;
++
++                if (pos + 2 > end)
++                {
++                    pos = end;
++                    break;
++                }
++                off = (in[pos] << 4) | (in[pos + 1] >> 4);
++                len = (in[pos + 1] & 0xf) + 2;
++                pos += 2;
++                /* a reference to the write position is the end */
++                if (off == wp)
++                {
++                    done = TRUE;
++                    break;
++                }
++                for (i = 0; i < len; i++)
++                {
++                    BYTE c = dict[off];
++
++                    if (n < raw_size) buf[n++] = c;
++                    dict[wp] = c;
++                    wp = (wp + 1) & (RTF_DICT_SIZE - 1);
++                    off = (off + 1) & (RTF_DICT_SIZE - 1);
++                }
++            }
++        }
++    }
++#ifdef SG_MUTANT_MAPI_SIZECHECK
++    if (FALSE)
++#else
++    if (n != raw_size)
++#endif
++    {
++        free(buf);
++        return MAPI_E_CORRUPT_DATA;
++    }
++    *out = buf;
++    *out_size = n;
++    return S_OK;
++}
++
++/* The compressed form of the text, with the header; or the text as it is, with a header of
++ * the other type. *OUT is allocated. */
++static HRESULT rtf_compress(const BYTE *raw, SIZE_T raw_size, BOOL store_raw, BYTE **out, SIZE_T *out_size)
++{
++    BYTE *buf, *p, *flags_at;
++    BYTE *lin;             /* the dictionary text followed by the raw data: positions are in it */
++    int *head, *prev;
++    SIZE_T i, lin_size = RTF_PREBUF_SIZE + raw_size, max;
++    int flag_bit = 0;
++
++    *out = NULL;
++    *out_size = 0;
++
++    if (store_raw)
++    {
++        if (!(buf = malloc(RTF_HEADER_SIZE + raw_size))) return MAPI_E_NOT_ENOUGH_MEMORY;
++        write_dword(buf, raw_size + 12);
++        write_dword(buf + 4, raw_size);
++#ifdef SG_MUTANT_MAPI_MELA
++        write_dword(buf + 8, 0x75465a4c);
++#else
++        write_dword(buf + 8, 0x414c454d);
++#endif
++        write_dword(buf + 12, 0);
++        memcpy(buf + RTF_HEADER_SIZE, raw, raw_size);
++        *out = buf;
++        *out_size = RTF_HEADER_SIZE + raw_size;
++        return S_OK;
++    }
++
++    /* the worst case is a flag byte for every 8 literals, and the end token */
++    max = RTF_HEADER_SIZE + raw_size + raw_size / 8 + 8;
++    if (!(buf = malloc(max)) || !(lin = malloc(lin_size ? lin_size : 1)) ||
++        !(head = malloc(65536 * sizeof(int))) || !(prev = malloc((lin_size ? lin_size : 1) * sizeof(int))))
++    {
++        free(buf);
++        return MAPI_E_NOT_ENOUGH_MEMORY;
++    }
++    memcpy(lin, rtf_prebuf, RTF_PREBUF_SIZE);
++    memcpy(lin + RTF_PREBUF_SIZE, raw, raw_size);
++    for (i = 0; i < 65536; i++) head[i] = -1;
++
++    /* chains of the positions that start with the same three bytes */
++#define HASH3(q) ((((q)[0] << 8) ^ ((q)[1] << 4) ^ (q)[2]) & 0xffff)
++    for (i = 0; i + 2 < RTF_PREBUF_SIZE; i++)
++    {
++        unsigned int h = HASH3(lin + i);
++        prev[i] = head[h];
++        head[h] = i;
++    }
++
++    p = buf + RTF_HEADER_SIZE;
++    flags_at = p++;
++    *flags_at = 0;
++    for (i = RTF_PREBUF_SIZE; i < lin_size;)
++    {
++        int best_len = 0, best_pos = 0, cand, tries = 0;
++
++        if (i + 2 < lin_size)
++        {
++            for (cand = head[HASH3(lin + i)]; cand >= 0 && tries < 64; cand = prev[cand], tries++)
++            {
++                int len = 0;
++
++                if (i - cand >= RTF_DICT_SIZE - 1) break;
++                while (len < 17 && i + len < lin_size && lin[cand + len] == lin[i + len]) len++;
++                if (len > best_len)
++                {
++                    best_len = len;
++                    best_pos = cand;
++                    if (len == 17) break;
++                }
++            }
++        }
++        if (flag_bit == 8)
++        {
++            flags_at = p++;
++            *flags_at = 0;
++            flag_bit = 0;
++        }
++        if (best_len >= 3)
++        {
++            unsigned int off = best_pos & (RTF_DICT_SIZE - 1), k;
++
++            *flags_at |= 1 << flag_bit;
++            *p++ = off >> 4;
++            *p++ = ((off & 0xf) << 4) | (best_len - 2);
++            for (k = 0; k < best_len; k++, i++)
++                if (i + 2 < lin_size)
++                {
++                    unsigned int h = HASH3(lin + i);
++                    prev[i] = head[h];
++                    head[h] = i;
++                }
++        }
++        else
++        {
++            *p++ = lin[i];
++            if (i + 2 < lin_size)
++            {
++                unsigned int h = HASH3(lin + i);
++                prev[i] = head[h];
++                head[h] = i;
++            }
++            i++;
++        }
++        flag_bit++;
++    }
++    /* the end: a reference to the position that is written next */
++    if (flag_bit == 8)
++    {
++        flags_at = p++;
++        *flags_at = 0;
++        flag_bit = 0;
++    }
++    {
++        unsigned int off = lin_size & (RTF_DICT_SIZE - 1);
++
++        *flags_at |= 1 << flag_bit;
++        *p++ = off >> 4;
++#ifdef SG_MUTANT_MAPI_ENDMARK
++        *p++ = ((off + 1) & 0xf) << 4;
++#else
++        *p++ = (off & 0xf) << 4;
++#endif
++    }
++
++    *out_size = p - buf;
++#ifdef SG_MUTANT_MAPI_COMPSIZE
++    write_dword(buf, *out_size);
++#else
++    write_dword(buf, *out_size - 4);
++#endif
++    write_dword(buf + 4, raw_size);
++    write_dword(buf + 8, 0x75465a4c);
++#ifdef SG_MUTANT_MAPI_CRC
++    write_dword(buf + 12, 0);
++#else
++    write_dword(buf + 12, rtf_crc32(buf + RTF_HEADER_SIZE, *out_size - RTF_HEADER_SIZE));
++#endif
++    free(lin);
++    free(head);
++    free(prev);
++    *out = buf;
++    return S_OK;
++}
++
++/* the stream of the text */
++struct rtf_stream
++{
++    IStream IStream_iface;
++    LONG ref;
++    IStream *compressed;
++    BOOL modify, uncompressed, dirty;
++    BYTE *data;
++    SIZE_T size, cap, pos;
++};
++
++static struct rtf_stream *impl_from_rtf(IStream *iface)
++{
++    return CONTAINING_RECORD(iface, struct rtf_stream, IStream_iface);
++}
++
++/* put the text back in the stream of the property, in the compressed form */
++static HRESULT rtf_flush(struct rtf_stream *s)
++{
++    BYTE *out;
++    SIZE_T out_size;
++    ULARGE_INTEGER size;
++    LARGE_INTEGER zero = {{0}};
++    ULONG written;
++    HRESULT hr;
++
++    if (!s->modify || !s->dirty) return S_OK;
++    if (FAILED(hr = rtf_compress(s->data, s->size, s->uncompressed, &out, &out_size))) return hr;
++    size.QuadPart = 0;
++    if (SUCCEEDED(hr = IStream_Seek(s->compressed, zero, STREAM_SEEK_SET, NULL)) &&
++        SUCCEEDED(hr = IStream_SetSize(s->compressed, size)))
++        hr = IStream_Write(s->compressed, out, out_size, &written);
++    if (SUCCEEDED(hr) && written != out_size) hr = STG_E_MEDIUMFULL;
++    free(out);
++    if (SUCCEEDED(hr)) s->dirty = FALSE;
++    return hr;
++}
++
++static HRESULT WINAPI rtf_QueryInterface(IStream *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_ISequentialStream) || IsEqualIID(riid, &IID_IStream))
++    {
++        *obj = iface;
++        IStream_AddRef(iface);
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI rtf_AddRef(IStream *iface)
++{
++    return InterlockedIncrement(&impl_from_rtf(iface)->ref);
++}
++
++static ULONG WINAPI rtf_Release(IStream *iface)
++{
++    struct rtf_stream *s = impl_from_rtf(iface);
++    ULONG ref = InterlockedDecrement(&s->ref);
++
++    if (!ref)
++    {
++        rtf_flush(s);
++        IStream_Release(s->compressed);
++        free(s->data);
++        free(s);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI rtf_Read(IStream *iface, void *buf, ULONG cb, ULONG *read)
++{
++    struct rtf_stream *s = impl_from_rtf(iface);
++    SIZE_T n;
++
++    if (s->modify) return STG_E_ACCESSDENIED;
++    n = s->pos < s->size ? s->size - s->pos : 0;
++    if (n > cb) n = cb;
++    memcpy(buf, s->data + s->pos, n);
++    s->pos += n;
++    if (read) *read = n;
++    return n == cb ? S_OK : S_FALSE;
++}
++
++static HRESULT WINAPI rtf_Write(IStream *iface, const void *buf, ULONG cb, ULONG *written)
++{
++    struct rtf_stream *s = impl_from_rtf(iface);
++
++#ifndef SG_MUTANT_MAPI_RTFRO
++    if (!s->modify) return STG_E_ACCESSDENIED;
++#endif
++    if (s->pos + cb > s->cap)
++    {
++        SIZE_T cap = max(s->cap * 2, s->pos + cb + 4096);
++        BYTE *data = realloc(s->data, cap);
++
++        if (!data) return STG_E_MEDIUMFULL;
++        s->data = data;
++        s->cap = cap;
++    }
++    memcpy(s->data + s->pos, buf, cb);
++    s->pos += cb;
++    if (s->pos > s->size) s->size = s->pos;
++    s->dirty = TRUE;
++    if (written) *written = cb;
++    return S_OK;
++}
++
++static HRESULT WINAPI rtf_Seek(IStream *iface, LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *pos)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtf_SetSize(IStream *iface, ULARGE_INTEGER size)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtf_CopyTo(IStream *iface, IStream *dest, ULARGE_INTEGER cb, ULARGE_INTEGER *read,
++                                 ULARGE_INTEGER *written)
++{
++    struct rtf_stream *s = impl_from_rtf(iface);
++    SIZE_T n;
++    ULONG put = 0;
++    HRESULT hr;
++
++    if (s->modify) return STG_E_ACCESSDENIED;
++    n = s->pos < s->size ? s->size - s->pos : 0;
++    if (n > cb.QuadPart) n = cb.QuadPart;
++    hr = n ? IStream_Write(dest, s->data + s->pos, n, &put) : S_OK;
++    s->pos += n;
++    if (read) read->QuadPart = n;
++    if (written) written->QuadPart = put;
++    return hr;
++}
++
++static HRESULT WINAPI rtf_Commit(IStream *iface, DWORD flags)
++{
++    return rtf_flush(impl_from_rtf(iface));
++}
++
++static HRESULT WINAPI rtf_Revert(IStream *iface)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtf_LockRegion(IStream *iface, ULARGE_INTEGER off, ULARGE_INTEGER cb, DWORD type)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtf_UnlockRegion(IStream *iface, ULARGE_INTEGER off, ULARGE_INTEGER cb, DWORD type)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtf_Stat(IStream *iface, STATSTG *stat, DWORD flags)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI rtf_Clone(IStream *iface, IStream **clone)
++{
++    return E_NOTIMPL;
++}
++
++static const IStreamVtbl rtf_vtbl =
++{
++    rtf_QueryInterface,
++    rtf_AddRef,
++    rtf_Release,
++    rtf_Read,
++    rtf_Write,
++    rtf_Seek,
++    rtf_SetSize,
++    rtf_CopyTo,
++    rtf_Commit,
++    rtf_Revert,
++    rtf_LockRegion,
++    rtf_UnlockRegion,
++    rtf_Stat,
++    rtf_Clone
++};
++
++/**************************************************************************
++ *  WrapCompressedRTFStream   (MAPI32.186)
++ *
++ * Wrap the stream of PR_RTF_COMPRESSED in a stream of the RTF text.
++ *
++ * PARAMS
++ *  compressed   [I] The stream of the compressed text, at its start
++ *  flags        [I] MAPI_MODIFY: the new text is written to the stream returned,
++ *                   STORE_UNCOMPRESSED_RTF: and kept as it is
++ *  uncompressed [O] The stream of the text
++ *
++ * RETURNS
++ *  Success: S_OK.
++ *  Failure: MAPI_E_INVALID_PARAMETER, MAPI_E_CORRUPT_DATA (the compressed data is not valid),
++ *           MAPI_E_NOT_ENOUGH_MEMORY.
++ *
++ * NOTES
++ *  The returned stream can be read, or written when MAPI_MODIFY is set, and not
++ *  both. It does not support Seek, SetSize, Stat, Clone, Revert and the locks.
++ */
++HRESULT WINAPI WrapCompressedRTFStream(LPSTREAM compressed, ULONG flags, LPSTREAM *uncompressed)
++{
++    struct rtf_stream *s;
++    BYTE *raw = NULL, *comp = NULL;
++    SIZE_T raw_size = 0, comp_size = 0, cap = 0;
++    HRESULT hr = S_OK;
++
++    if (mapiFunctions.WrapCompressedRTFStream)
++        return mapiFunctions.WrapCompressedRTFStream(compressed, flags, uncompressed);
++
++    TRACE("(%p, 0x%08lx, %p)\n", compressed, flags, uncompressed);
++
++    if (!compressed || !uncompressed || (flags & ~(MAPI_MODIFY | STORE_UNCOMPRESSED_RTF)))
++        return MAPI_E_INVALID_PARAMETER;
++    *uncompressed = NULL;
++
++    if (!(s = calloc(1, sizeof(*s)))) return MAPI_E_NOT_ENOUGH_MEMORY;
++    s->modify = (flags & MAPI_MODIFY) != 0;
++    s->uncompressed = (flags & STORE_UNCOMPRESSED_RTF) != 0;
++
++    if (!s->modify)
++    {
++        /* the whole stream is read and expanded */
++        for (;;)
++        {
++            ULONG got = 0;
++
++            if (comp_size + 4096 > cap)
++            {
++                BYTE *grown = realloc(comp, cap = max(cap * 2, comp_size + 8192));
++
++                if (!grown)
++                {
++                    hr = MAPI_E_NOT_ENOUGH_MEMORY;
++                    break;
++                }
++                comp = grown;
++            }
++            hr = IStream_Read(compressed, comp + comp_size, 4096, &got);
++            if (FAILED(hr)) break;
++            comp_size += got;
++            if (got < 4096)
++            {
++                hr = S_OK;
++                break;
++            }
++        }
++        if (SUCCEEDED(hr)) hr = rtf_decompress(comp, comp_size, &raw, &raw_size);
++        free(comp);
++        if (FAILED(hr))
++        {
++            free(s);
++            return hr;
++        }
++        s->data = raw;
++        s->size = s->cap = raw_size;
++    }
++
++    s->IStream_iface.lpVtbl = &rtf_vtbl;
++    s->ref = 1;
++    s->compressed = compressed;
++    IStream_AddRef(compressed);
++    *uncompressed = &s->IStream_iface;
++    return S_OK;
++}
+diff --git a/dlls/mapi32/util.c b/dlls/mapi32/util.c
+index 88ab392..42eaed8 100644
+--- a/dlls/mapi32/util.c
++++ b/dlls/mapi32/util.c
+@@ -48,56 +48,6 @@ static const BYTE digitsToHex[] = {
+ 
+ MAPI_FUNCTIONS mapiFunctions;
+ 
+-/**************************************************************************
+- *  ScInitMapiUtil (MAPI32.33)
+- *
+- * Initialise Mapi utility functions.
+- *
+- * PARAMS
+- *  ulReserved [I] Reserved, pass 0.
+- *
+- * RETURNS
+- *  Success: S_OK. Mapi utility functions may be called.
+- *  Failure: MAPI_E_INVALID_PARAMETER, if ulReserved is not 0.
+- *
+- * NOTES
+- *  Your application does not need to call this function unless it does not
+- *  call MAPIInitialize()/MAPIUninitialize().
+- */
+-SCODE WINAPI ScInitMapiUtil(ULONG ulReserved)
+-{
+-    if (mapiFunctions.ScInitMapiUtil)
+-        return mapiFunctions.ScInitMapiUtil(ulReserved);
+-
+-    FIXME("(0x%08lx)stub!\n", ulReserved);
+-    if (ulReserved)
+-        return MAPI_E_INVALID_PARAMETER;
+-    return S_OK;
+-}
+-
+-/**************************************************************************
+- *  DeinitMapiUtil (MAPI32.34)
+- *
+- * Uninitialise Mapi utility functions.
+- *
+- * PARAMS
+- *  None.
+- *
+- * RETURNS
+- *  Nothing.
+- *
+- * NOTES
+- *  Your application does not need to call this function unless it does not
+- *  call MAPIInitialize()/MAPIUninitialize().
+- */
+-VOID WINAPI DeinitMapiUtil(void)
+-{
+-    if (mapiFunctions.DeinitMapiUtil)
+-        mapiFunctions.DeinitMapiUtil();
+-    else
+-        FIXME("()stub!\n");
+-}
+-
+ typedef LPVOID *LPMAPIALLOCBUFFER;
+ 
+ /**************************************************************************
+@@ -237,44 +187,6 @@ HRESULT WINAPI WrapProgress(PVOID unk1, PVOID unk2, PVOID unk3, PVOID unk4, PVOI
+     return MAPI_E_NO_SUPPORT;
+ }
+ 
+-/*************************************************************************
+- * HrDispatchNotifications@4 (MAPI32.239)
+- */
+-HRESULT WINAPI HrDispatchNotifications(ULONG flags)
+-{
+-    FIXME("(%08lx)\n", flags);
+-    return S_OK;
+-}
+-
+-/*************************************************************************
+- * HrThisThreadAdviseSink@8 (MAPI32.42)
+- *
+- * Ensure that an advise sink is only notified in its originating thread.
+- *
+- * PARAMS
+- *  lpSink     [I] IMAPIAdviseSink interface to be protected
+- *  lppNewSink [I] Destination for wrapper IMAPIAdviseSink interface
+- *
+- * RETURNS
+- * Success: S_OK. *lppNewSink contains a new sink to use in place of lpSink.
+- * Failure: E_INVALIDARG, if any parameter is invalid.
+- */
+-HRESULT WINAPI HrThisThreadAdviseSink(LPMAPIADVISESINK lpSink, LPMAPIADVISESINK* lppNewSink)
+-{
+-    if (mapiFunctions.HrThisThreadAdviseSink)
+-        return mapiFunctions.HrThisThreadAdviseSink(lpSink, lppNewSink);
+-
+-    FIXME("(%p,%p)semi-stub\n", lpSink, lppNewSink);
+-
+-    if (!lpSink || !lppNewSink)
+-        return E_INVALIDARG;
+-
+-    /* Don't wrap the sink for now, just copy it */
+-    *lppNewSink = lpSink;
+-    IMAPIAdviseSink_AddRef(lpSink);
+-    return S_OK;
+-}
+-
+ /*************************************************************************
+  * FBinFromHex (MAPI32.44)
+  *
+@@ -997,18 +909,6 @@ failed:
+     return hr;
+ }
+ 
+-/**************************************************************************
+- *  WrapCompressedRTFStream   (MAPI32.186)
+- */
+-HRESULT WINAPI WrapCompressedRTFStream(LPSTREAM compressed, ULONG flags, LPSTREAM *uncompressed)
+-{
+-    if (mapiFunctions.WrapCompressedRTFStream)
+-        return mapiFunctions.WrapCompressedRTFStream(compressed, flags, uncompressed);
+-
+-    FIXME("(%p, 0x%08lx, %p): stub\n", compressed, flags, uncompressed);
+-    return MAPI_E_NO_SUPPORT;
+-}
+-
+ static HMODULE mapi_provider;
+ static HMODULE mapi_ex_provider;
+ 
+diff --git a/include/mapidefs.h b/include/mapidefs.h
+index e3e2bd4..1fd8877 100644
+--- a/include/mapidefs.h
++++ b/include/mapidefs.h
+@@ -148,6 +148,21 @@ typedef struct _MAPIUID
+ #define MAPI_USE_DEFAULT              0x00000040U
+ #define MAPI_UNICODE                  0x80000000U /* Strings in this call are Unicode */
+ 
++/* IMAPIProp::CopyTo/CopyProps flags */
++#define MAPI_MOVE                     0x00000001U
++#define MAPI_NOREPLACE                0x00000002U
++#define MAPI_DECLINE_OK               0x00000004U
++
++/* IMAPIProp::GetNamesFromIDs flags */
++#define MAPI_NO_STRINGS               0x00000001U
++#define MAPI_NO_IDS                   0x00000002U
++
++/* PR_STORE_SUPPORT_MASK: the store takes RTF that is not compressed */
++#define STORE_UNCOMPRESSED_RTF        0x00008000U
++
++/* IMAPIProp::OpenProperty flags */
++#define MAPI_DEFERRED_ERRORS          0x00000008U
++
+ #if defined (UNICODE) || defined (__WINESRC__)
+ #define fMapiUnicode MAPI_UNICODE
+ #else
