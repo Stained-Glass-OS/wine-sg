@@ -1,0 +1,396 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] amsi: providers and IAmsiStream (3723)
+
+amsi: load registered providers and scan through IAmsiStream
+
+AmsiInitialize/OpenSession/ScanBuffer/ScanString were fake successes.
+Details in notes/3723.txt.
+---
+diff --git a/dlls/amsi/Makefile.in b/dlls/amsi/Makefile.in
+index 0347585..be2d53f 100644
+--- a/dlls/amsi/Makefile.in
++++ b/dlls/amsi/Makefile.in
+@@ -1,4 +1,5 @@
+ MODULE    = amsi.dll
++IMPORTS   = uuid ole32 advapi32
+ 
+ SOURCES = \
+ 	main.c
+diff --git a/dlls/amsi/main.c b/dlls/amsi/main.c
+index 2c1db4c..7ab3707 100644
+--- a/dlls/amsi/main.c
++++ b/dlls/amsi/main.c
+@@ -17,49 +17,359 @@
+  */
+ 
+ #include <stdarg.h>
++#define COBJMACROS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winreg.h"
++#include "objbase.h"
+ #include "amsi.h"
++#include "wine/list.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(amsi);
+ 
++/* The interfaces an AMSI provider implements and is given (IIDs and vtable
++ * layouts: Microsoft's amsi.h documentation, windows-rs 0.58.0 data). */
++static const GUID IID_IAntimalwareProvider = {0xb2cabfe3, 0xfe04, 0x42b1, {0xa5, 0xdf, 0x08, 0xd4, 0x83, 0xd4, 0xd1, 0x25}};
++static const GUID IID_IAmsiStream = {0x3e47f2e5, 0x81d4, 0x4d3b, {0x89, 0x7f, 0x54, 0x50, 0x96, 0x77, 0x03, 0x73}};
++
++enum { ATTR_APP_NAME, ATTR_CONTENT_NAME, ATTR_CONTENT_SIZE, ATTR_CONTENT_ADDRESS, ATTR_SESSION };
++
++struct provider_vtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void *, REFIID, void **);
++    ULONG (STDMETHODCALLTYPE *AddRef)(void *);
++    ULONG (STDMETHODCALLTYPE *Release)(void *);
++    HRESULT (STDMETHODCALLTYPE *Scan)(void *, void *stream, AMSI_RESULT *result);
++    void (STDMETHODCALLTYPE *CloseSession)(void *, ULONGLONG session);
++    HRESULT (STDMETHODCALLTYPE *DisplayName)(void *, WCHAR **name);
++};
++struct provider_obj { const struct provider_vtbl *lpVtbl; };
++
++#define CONTEXT_MAGIC 0x49534d41
++#define SESSION_MAGIC 0x53534d41
++
++static CRITICAL_SECTION objects_cs;
++static CRITICAL_SECTION_DEBUG objects_cs_debug =
++{
++    0, 0, &objects_cs, { &objects_cs_debug.ProcessLocksList, &objects_cs_debug.ProcessLocksList },
++    0, 0, { (DWORD_PTR)(__FILE__ ": objects_cs") }
++};
++static CRITICAL_SECTION objects_cs = { &objects_cs_debug, -1, 0, 0, 0, 0 };
++static struct list contexts = LIST_INIT(contexts);
++static struct list sessions = LIST_INIT(sessions);
++
++struct context
++{
++    struct list entry;
++    DWORD magic;
++    WCHAR *app_name;
++    struct provider_obj **providers;
++    unsigned int count;
++    LONG next_session;
++};
++
++struct session
++{
++    struct list entry;
++    DWORD magic;
++    ULONGLONG id;
++};
++
++/* the IAmsiStream handed to the providers: the buffer being scanned */
++struct stream
++{
++    const struct stream_vtbl *lpVtbl;
++    LONG ref;
++    struct context *context;
++    const WCHAR *content_name;
++    const BYTE *buffer;
++    ULONG length;
++    struct session *session;
++};
++
++struct stream_vtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(struct stream *, REFIID, void **);
++    ULONG (STDMETHODCALLTYPE *AddRef)(struct stream *);
++    ULONG (STDMETHODCALLTYPE *Release)(struct stream *);
++    HRESULT (STDMETHODCALLTYPE *GetAttribute)(struct stream *, int attr, ULONG size, BYTE *data, ULONG *ret_size);
++    HRESULT (STDMETHODCALLTYPE *Read)(struct stream *, ULONGLONG pos, ULONG size, BYTE *data, ULONG *ret_size);
++};
++
++static HRESULT STDMETHODCALLTYPE stream_QueryInterface(struct stream *s, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IAmsiStream))
++    {
++        InterlockedIncrement(&s->ref);
++        *out = s;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE stream_AddRef(struct stream *s) { return InterlockedIncrement(&s->ref); }
++static ULONG STDMETHODCALLTYPE stream_Release(struct stream *s) { return InterlockedDecrement(&s->ref); }
++
++static HRESULT copy_attribute(const void *src, ULONG len, ULONG size, BYTE *data, ULONG *ret_size)
++{
++    if (!ret_size) return E_INVALIDARG;
++    *ret_size = len;
++    if (size < len) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++    if (!data) return E_INVALIDARG;
++    memcpy(data, src, len);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE stream_GetAttribute(struct stream *s, int attr, ULONG size, BYTE *data, ULONG *ret_size)
++{
++    TRACE("%p, %d, %lu, %p, %p\n", s, attr, size, data, ret_size);
++
++    switch (attr)
++    {
++    case ATTR_APP_NAME:
++        return copy_attribute(s->context->app_name, (lstrlenW(s->context->app_name) + 1) * sizeof(WCHAR), size, data, ret_size);
++    case ATTR_CONTENT_NAME:
++        if (!s->content_name) return E_NOTIMPL;   /* GUESS: no name was given */
++        return copy_attribute(s->content_name, (lstrlenW(s->content_name) + 1) * sizeof(WCHAR), size, data, ret_size);
++    case ATTR_CONTENT_SIZE:
++    {
++        ULONGLONG len = s->length;
++        return copy_attribute(&len, sizeof(len), size, data, ret_size);
++    }
++    case ATTR_CONTENT_ADDRESS:
++    {
++        const BYTE *addr = s->buffer;
++        return copy_attribute(&addr, sizeof(addr), size, data, ret_size);
++    }
++    case ATTR_SESSION:
++    {
++#ifdef SG_MUTANT_AMSI_NOSESSION
++        return E_NOTIMPL;
++#endif
++        return copy_attribute(&s->session, sizeof(s->session), size, data, ret_size);
++    }
++    default:
++        FIXME("attribute %d is not supported\n", attr);
++        return E_NOTIMPL;
++    }
++}
++
++static HRESULT STDMETHODCALLTYPE stream_Read(struct stream *s, ULONGLONG pos, ULONG size, BYTE *data, ULONG *ret_size)
++{
++    ULONG n;
++
++    TRACE("%p, %s, %lu, %p, %p\n", s, wine_dbgstr_longlong(pos), size, data, ret_size);
++
++    if (!data || !ret_size) return E_INVALIDARG;
++    *ret_size = 0;
++    if (pos >= s->length) return S_OK;   /* GUESS: nothing left to read */
++    n = min(size, (ULONG)(s->length - pos));
++    memcpy(data, s->buffer + pos, n);
++    *ret_size = n;
++    return S_OK;
++}
++
++static const struct stream_vtbl stream_vtbl =
++{
++    stream_QueryInterface, stream_AddRef, stream_Release, stream_GetAttribute, stream_Read
++};
++
++/* handles are checked against the live objects: a program may pass anything */
++static struct context *get_context(HAMSICONTEXT handle)
++{
++    struct context *c, *ret = NULL;
++
++    EnterCriticalSection(&objects_cs);
++    LIST_FOR_EACH_ENTRY(c, &contexts, struct context, entry)
++        if (c == (struct context *)handle) { ret = c; break; }
++    LeaveCriticalSection(&objects_cs);
++    return ret;
++}
++
++static struct session *get_session(HAMSISESSION handle)
++{
++    struct session *s, *ret = NULL;
++
++    EnterCriticalSection(&objects_cs);
++    LIST_FOR_EACH_ENTRY(s, &sessions, struct session, entry)
++        if (s == (struct session *)handle) { ret = s; break; }
++    LeaveCriticalSection(&objects_cs);
++    return ret;
++}
++
++static void load_providers(struct context *c)
++{
++    HKEY key;
++    DWORD i, len;
++    WCHAR name[64];
++    HRESULT init;
++
++#ifdef SG_MUTANT_AMSI_NOPROV
++    return;
++#endif
++    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\AMSI\\Providers", 0, KEY_READ, &key)) return;
++    init = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    for (i = 0; ; i++)
++    {
++        CLSID clsid;
++        struct provider_obj **p, *obj;
++
++        len = ARRAY_SIZE(name);
++        if (RegEnumKeyExW(key, i, name, &len, NULL, NULL, NULL, NULL)) break;
++        if (FAILED(CLSIDFromString(name, &clsid)))
++        {
++            WARN("provider key %s is not a CLSID\n", debugstr_w(name));
++            continue;
++        }
++        if (FAILED(CoCreateInstance(&clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IAntimalwareProvider, (void **)&obj)))
++        {
++            WARN("could not create the provider %s\n", debugstr_w(name));
++            continue;
++        }
++        if (!(p = realloc(c->providers, (c->count + 1) * sizeof(*p))))
++        {
++            obj->lpVtbl->Release(obj);
++            break;
++        }
++        c->providers = p;
++        c->providers[c->count++] = obj;
++    }
++    RegCloseKey(key);
++    if (SUCCEEDED(init)) CoUninitialize();
++}
++
+ HRESULT WINAPI AmsiInitialize( const WCHAR *appname, HAMSICONTEXT *context )
+ {
+-    FIXME( "%s, %p\n", debugstr_w(appname), context );
+-    *context = (HAMSICONTEXT)0xdeadbeef;
++    struct context *c;
++
++    TRACE( "%s, %p\n", debugstr_w(appname), context );
++
++    if (!appname || !context) return E_INVALIDARG;
++    if (!(c = calloc( 1, sizeof(*c) ))) return E_OUTOFMEMORY;
++    c->magic = CONTEXT_MAGIC;
++    if (!(c->app_name = wcsdup( appname )))
++    {
++        free( c );
++        return E_OUTOFMEMORY;
++    }
++    load_providers( c );
++    EnterCriticalSection(&objects_cs);
++    list_add_tail( &contexts, &c->entry );
++    LeaveCriticalSection(&objects_cs);
++    *context = (HAMSICONTEXT)c;
+     return S_OK;
+ }
+ 
++void WINAPI AmsiUninitialize( HAMSICONTEXT context )
++{
++    struct context *c = get_context( context );
++    unsigned int i;
++
++    TRACE( "%p\n", context );
++
++    if (!c) return;
++    EnterCriticalSection(&objects_cs);
++    list_remove( &c->entry );
++    LeaveCriticalSection(&objects_cs);
++    c->magic = 0;
++    for (i = 0; i < c->count; i++) c->providers[i]->lpVtbl->Release( c->providers[i] );
++    free( c->providers );
++    free( c->app_name );
++    free( c );
++}
++
+ HRESULT WINAPI AmsiOpenSession( HAMSICONTEXT context, HAMSISESSION *session )
+ {
+-    FIXME( "%p, %p\n", context, session );
+-    *session = (HAMSISESSION)0xdeadbeef;
++    struct context *c = get_context( context );
++    struct session *s;
++
++    TRACE( "%p, %p\n", context, session );
++
++    if (!c || !session) return E_INVALIDARG;
++    if (!(s = calloc( 1, sizeof(*s) ))) return E_OUTOFMEMORY;
++    s->magic = SESSION_MAGIC;
++    s->id = InterlockedIncrement( &c->next_session );
++    EnterCriticalSection(&objects_cs);
++    list_add_tail( &sessions, &s->entry );
++    LeaveCriticalSection(&objects_cs);
++    *session = (HAMSISESSION)s;
+     return S_OK;
+ }
+ 
+ void WINAPI AmsiCloseSession( HAMSICONTEXT context, HAMSISESSION session )
+ {
+-    FIXME( "%p, %p\n", context, session );
++    struct context *c = get_context( context );
++    struct session *s = get_session( session );
++    unsigned int i;
++
++    TRACE( "%p, %p\n", context, session );
++
++    if (!c || !s) return;
++    EnterCriticalSection(&objects_cs);
++    list_remove( &s->entry );
++    LeaveCriticalSection(&objects_cs);
++    s->magic = 0;
++#ifndef SG_MUTANT_AMSI_NOCLOSE
++    for (i = 0; i < c->count; i++) c->providers[i]->lpVtbl->CloseSession( c->providers[i], s->id );
++#endif
++    free( s );
+ }
+ 
+ HRESULT WINAPI AmsiScanBuffer( HAMSICONTEXT context, void *buffer, ULONG length, const WCHAR *name,
+                                HAMSISESSION session, AMSI_RESULT *result )
+ {
+-    FIXME( "%p, %p, %lu, %s, %p, %p\n", context, buffer, length, debugstr_w(name), session, result );
+-    *result = AMSI_RESULT_NOT_DETECTED;
++    struct context *c = get_context( context );
++    struct session *s = session ? get_session( session ) : NULL;
++    struct stream stream;
++    AMSI_RESULT best = c && c->count ? AMSI_RESULT_CLEAN : AMSI_RESULT_NOT_DETECTED;
++    unsigned int i;
++    HRESULT init;
++
++    TRACE( "%p, %p, %lu, %s, %p, %p\n", context, buffer, length, debugstr_w(name), session, result );
++
++#ifndef SG_MUTANT_AMSI_ARGS
++    if (!result) return E_INVALIDARG;
++    *result = AMSI_RESULT_CLEAN;
++    if (!c || !buffer || !length) return E_INVALIDARG;
++    if (session && !s) return E_INVALIDARG;
++#endif
++
++    stream.lpVtbl = &stream_vtbl;
++    stream.ref = 1;
++    stream.context = c;
++    stream.content_name = name;
++    stream.buffer = buffer;
++    stream.length = length;
++    stream.session = s;
++
++    init = CoInitializeEx( NULL, COINIT_MULTITHREADED );
++    for (i = 0; i < c->count; i++)
++    {
++        AMSI_RESULT r = AMSI_RESULT_NOT_DETECTED;
++
++        if (FAILED(c->providers[i]->lpVtbl->Scan( c->providers[i], &stream, &r )))
++        {
++            WARN( "provider %u failed to scan\n", i );
++            continue;
++        }
++#ifdef SG_MUTANT_AMSI_MIN
++        if (r < best || i == 0) best = r;
++#else
++        if (r > best) best = r;
++#endif
++    }
++    if (SUCCEEDED(init)) CoUninitialize();
++    *result = best;
+     return S_OK;
+ }
+ 
+ HRESULT WINAPI AmsiScanString( HAMSICONTEXT context, const WCHAR *string, const WCHAR *name,
+                                HAMSISESSION session, AMSI_RESULT *result )
+ {
+-    FIXME( "%p, %s, %s, %p, %p\n", context, debugstr_w(string), debugstr_w(name), session, result );
+-    *result = AMSI_RESULT_NOT_DETECTED;
+-    return S_OK;
+-}
++    TRACE( "%p, %s, %s, %p, %p\n", context, debugstr_w(string), debugstr_w(name), session, result );
+ 
+-void WINAPI AmsiUninitialize( HAMSICONTEXT context )
+-{
+-    FIXME( "%p\n", context );
++    if (!string) return E_INVALIDARG;
++    return AmsiScanBuffer( context, (void *)string, lstrlenW( string ) * sizeof(WCHAR), name, session, result );
+ }
