@@ -2726,3 +2726,7 @@ test-pnputil:
 # wscript/cscript (5524): GetObject, reporting of script errors.
 test-wscript:
 	WINE=$(PREFIX)/bin/wine test/wscript-gate.sh
+
+# olepro32, dpnhpast (5527): DllGetClassObject for DLLs without classes.
+test-dllclass:
+	WINE=$(PREFIX)/bin/wine test/dllclass-gate.sh
