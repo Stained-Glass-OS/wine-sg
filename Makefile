@@ -2743,3 +2743,6 @@ test-epmap:
 
 test-loadperf:
 	WINE=$(PREFIX)/bin/wine test/loadperf-gate.sh
+
+test-fontsub:
+	WINE=$(PREFIX)/bin/wine test/fontsub-gate.sh
