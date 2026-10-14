@@ -73,60 +73,45 @@ static void test_config_stream(HMODULE mscoree)
     hr = pCreateConfigStream(path, &st);
     CHECK(hr == S_OK && st, "CreateConfigStream %lx", hr);
     if (!st) { DeleteFileW(path); return; }
+    /* the stream cannot be repositioned, resized, committed, reverted or cloned (the Wine test in
+     * tests/mscoree.c checks the same, on Windows too) */
     mv.QuadPart = 5; np.QuadPart = 99;
     hr = CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_SET, &np);
-    CHECK(hr == S_OK && np.QuadPart == 5, "Seek set %lx %I64u", hr, np.QuadPart);
+    CHECK(hr == E_NOTIMPL, "Seek %lx", hr);
+    sz.QuadPart = 0;
+    CHECK(CALL(st, 6, HRESULT, ULARGE_INTEGER)(st, sz) == E_NOTIMPL, "SetSize");
+    CHECK(CALL(st, 8, HRESULT, DWORD)(st, 0) == E_NOTIMPL, "Commit");
+    CHECK(CALL(st, 9, HRESULT)(st) == E_NOTIMPL, "Revert");
+    {
+        Obj *clone = (Obj *)0x1;
+        hr = CALL(st, 13, HRESULT, Obj**)(st, &clone);
+        CHECK(hr == E_NOTIMPL, "Clone %lx", hr);
+    }
+    got = 0;
+    hr = CALL(st, 3, HRESULT, void*, ULONG, ULONG*)(st, data, 5, &got);
+    CHECK(hr == S_OK && got == 5 && !memcmp(data, "01234", 5), "Read 5");
     got = 0;
     hr = CALL(st, 3, HRESULT, void*, ULONG, ULONG*)(st, data, 4, &got);
-    CHECK(hr == S_OK && got == 4 && !memcmp(data, "5678", 4), "Read after seek");
-    mv.QuadPart = 2;
-    hr = CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_CUR, &np);
-    CHECK(hr == S_OK && np.QuadPart == 11, "Seek cur %lx %I64u", hr, np.QuadPart);
-    mv.QuadPart = -3;
-    hr = CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_END, &np);
-    CHECK(hr == S_OK && np.QuadPart == 17, "Seek end %lx %I64u", hr, np.QuadPart);
-    hr = CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, 7, &np);
-    CHECK(hr == 0x80030001, "Seek bad origin %lx", hr);
+    CHECK(hr == S_OK && got == 4 && !memcmp(data, "5678", 4), "Read 4");
     memset(&stat, 0xcc, sizeof(stat));
     hr = CALL(st, 12, HRESULT, STATSTG*, DWORD)(st, &stat, STATFLAG_NONAME);
     CHECK(hr == S_OK && stat.type == STGTY_STREAM && stat.cbSize.QuadPart == 20, "Stat %lx type=%lu size=%I64u", hr, stat.type, stat.cbSize.QuadPart);
-    mv.QuadPart = 10;
-    CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_SET, &np);
     hg = GlobalAlloc(GMEM_MOVEABLE, 0);
     CreateStreamOnHGlobal(hg, TRUE, (IStream **)&mem);
     sz.QuadPart = 6;
     hr = CALL(st, 7, HRESULT, void*, ULARGE_INTEGER, ULARGE_INTEGER*, ULARGE_INTEGER*)(st, mem, sz, &rd, &wr);
     CHECK(hr == S_OK && rd.QuadPart == 6 && wr.QuadPart == 6, "CopyTo %lx %I64u %I64u", hr, rd.QuadPart, wr.QuadPart);
     p = GlobalLock(hg);
-    CHECK(p && !memcmp(p, "abcdef", 6), "CopyTo data");
+    CHECK(p && !memcmp(p, "9abcde", 6), "CopyTo data");
     GlobalUnlock(hg);
     sz.QuadPart = 100;
     hr = CALL(st, 7, HRESULT, void*, ULARGE_INTEGER, ULARGE_INTEGER*, ULARGE_INTEGER*)(st, mem, sz, &rd, &wr);
-    CHECK(hr == S_OK && rd.QuadPart == 4, "CopyTo to end read=%I64u", rd.QuadPart);
-    CHECK(CALL(st, 8, HRESULT, DWORD)(st, 0) == S_OK, "Commit");
+    CHECK(hr == S_OK && rd.QuadPart == 5, "CopyTo to end read=%I64u", rd.QuadPart);
     {
         ULARGE_INTEGER z = {{0}}, one = {{1}};
-        Obj *clone = NULL;
-        char b1[2], b2[2];
-        ULONG g1 = 0, g2 = 0;
 
-        CHECK(CALL(st, 6, HRESULT, ULARGE_INTEGER)(st, z) == 0x80030005, "SetSize read-only");
-        CHECK(CALL(st, 9, HRESULT)(st) == S_OK, "Revert");
         CHECK(CALL(st, 10, HRESULT, ULARGE_INTEGER, ULARGE_INTEGER, DWORD)(st, z, one, 1) == 0x80030001, "LockRegion");
         CHECK(CALL(st, 11, HRESULT, ULARGE_INTEGER, ULARGE_INTEGER, DWORD)(st, z, one, 1) == 0x80030001, "UnlockRegion");
-        mv.QuadPart = 3;
-        CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_SET, &np);
-        hr = CALL(st, 13, HRESULT, Obj**)(st, &clone);
-        CHECK(hr == S_OK && clone, "Clone %lx", hr);
-        if (clone)
-        {
-            /* independent seek pointers, both starting at 3 */
-            CALL(clone, 3, HRESULT, void*, ULONG, ULONG*)(clone, b1, 2, &g1);
-            CALL(clone, 3, HRESULT, void*, ULONG, ULONG*)(clone, b1, 2, &g1);
-            CALL(st, 3, HRESULT, void*, ULONG, ULONG*)(st, b2, 2, &g2);
-            CHECK(g1 == 2 && g2 == 2 && !memcmp(b2, "34", 2) && !memcmp(b1, "56", 2), "Clone reads %.2s %.2s", b1, b2);
-            CALL(clone, 2, ULONG)(clone);
-        }
     }
     CALL(mem, 2, ULONG)(mem);
     CALL(st, 2, ULONG)(st);
