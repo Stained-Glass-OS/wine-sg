@@ -118,3 +118,15 @@ The routine is documented (callback with make/break scan codes, modifier state s
 ## ncrypt: NCryptExportKey with NCryptBufferDesc (batch 5518)
 
 Encrypted PKCS #8 export needs PBES2/PBKDF2 and DER writing around the key blob. Decision needed: whether to build that on bcrypt's PBKDF2 and an ASN.1 writer in ncrypt, or leave NTE_NOT_SUPPORTED.
+
+## sensapi: IsDestinationReachable (batch 5519)
+
+Needs a decision on whether a reachability answer may probe the network (resolve + connect) or follows the link state like IsNetworkAlive.
+
+## virtdisk: OpenVirtualDisk (batch 5519)
+
+VHD/VHDX/ISO images mapped as block devices need image parsing and a privileged helper (loop device); a design decision, with sg-session.
+
+## websocket: the protocol component (batch 5519)
+
+WebSocketCreateClientHandle, AbortHandle and DeleteHandle belong to a state machine of which ten other exports are still stubs; implementing the handle alone would be a handle that does nothing. A patch series of its own.
