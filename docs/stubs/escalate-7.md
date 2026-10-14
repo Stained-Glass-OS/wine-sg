@@ -19,3 +19,19 @@
 - **What:** ten of appxpackaging's eleven audit items return E_NOTIMPL or log a FIXME because the interface they return or implement is not defined: IAppxPackageWriter, IAppxBundleWriter, IAppxBlockMapReader / IAppxBlockMapFile / IAppxBlockMapBlock (+ enumerators), IAppxManifestDeviceCapabilitiesEnumerator, and the newer IAppxFactory2-4 (all documented under learn.microsoft.com/en-us/windows/win32/api/appxpackaging/). Wine's include/appxpackaging.idl only forward-declares most of them. Microsoft's pages give method names alphabetically, no IIDs and not the vtable order; mingw-w64 in this container has no appxpackaging.h. (The eleventh, CreateBundleManifestReader, only needed an interface Wine had: done in 5505.)
 - **Why it matters:** package tools (MSIX Packaging Tool, makeappx-like programs, Visual Studio's packager) cannot create a package or bundle; code that reads a package's block map or asks for its device capabilities fails. The reader side of the work exists (zip.c, the block-map parser, the manifest parser).
 - **Proposal (decision needed):** patch 0063 took the interface IIDs from the MIT-licensed `windows` crate's published metadata; RULES.md (2026-10-12) now says not to use an SDK .winmd. Please rule whether the `windows` crate's generated source (MIT, an independent open-source artifact) is an allowed source for IIDs and vtable order. If yes: define the interfaces in appxpackaging.idl and implement, in one batch, the block-map reader (reusing package.c's parser; CreateValidatedBlockMapReader checks the AXBM digest against AppxSignature.p7x with the 0037 code), GetBlockMap on both readers, GetDeviceCapabilities, the package writer (a ZIP writer with stored or deflated parts, the block map with SHA-256 per 64 KiB, [Content_Types].xml, the manifest last) and the bundle writer, with a gate that writes a package with the writer and reads it back with the reader and makepri-free tools (test/mkappx.py as the oracle).
+
+## winebus.sys: sdl_bus_init / sdl_bus_wait / sdl_bus_stop
+
+These are the stubs compiled when libsdl2 is absent (`SONAME_LIBSDL2` unset). They are the intended
+'bus not built' answer, not a gap. Making them real means building with libsdl2-dev, a new build
+dependency the owner has to approve; and the code path cannot be exercised here without an SDL
+joystick. No patch proposed.
+
+## Found while working winebus (not in the queue)
+
+At wineboot shutdown winedevice can fault: hidclass's read thread (`hid_device_thread`) leaves its
+IOCTL_HID_READ_REPORT IRP pending in winebus when `halt_event` fires and exits, freeing the stack
+IO_STATUS_BLOCK; `IRP_MN_REMOVE_DEVICE` then reaches winebus `remove_pending_irps`, which completes the
+IRP (ntoskrnl.c:2093 writes `*irp->UserIosb`) into that dead stack. Fix sketch: winebus sets a cancel
+routine on the parked read IRP; hidclass calls IoCancelIrp and waits for the IRP event before leaving the
+thread. Touches upstream-owned paths in two drivers, so left for a decision.
