@@ -95,6 +95,18 @@ int main(void)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     OleInitialize(NULL);
+    /* the bin lives under XDG_DATA_HOME/Trash: never anywhere but a scratch home */
+    {
+        WCHAR xdg[MAX_PATH] = L"";
+
+        GetEnvironmentVariableW(L"XDG_DATA_HOME", xdg, MAX_PATH);
+        printf("trash under: %ls\n", xdg);
+        if (wcsncmp(xdg, L"\\??\\unix/var/tmp/", 19) && wcsncmp(xdg, L"/var/tmp/", 9))
+        {
+            printf("REFUSING: XDG_DATA_HOME is not under /var/tmp\nRESULT: FAIL (unsafe)\n");
+            return 2;
+        }
+    }
     test_icon();
 
     GetTempPathW(MAX_PATH, dir);
