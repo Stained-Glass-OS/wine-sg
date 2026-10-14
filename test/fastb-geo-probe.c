@@ -27,6 +27,7 @@ static const GUID IID_IGeopoint_ = {0x6bfa00eb,0xe56e,0x49bb,{0x9c,0xaf,0xcb,0xa
 static const GUID IID_IGeopointFactory_ = {0xdb6b8d33,0x76bd,0x4e30,{0x8a,0xf7,0xa8,0x44,0xdc,0x37,0xb7,0xa0}};
 static const GUID IID_IGeolocatorWithScalarAccuracy_ = {0x96f5d3c1,0xb80f,0x460a,{0x99,0x4d,0xa9,0x6c,0x47,0xa5,0x1a,0xa4}};
 static const GUID IID_IGeolocatorStatics2_ = {0x993011a2,0xfa1c,0x4631,{0xa7,0x1d,0x0d,0xbe,0xb1,0x25,0x0d,0x9c}};
+static const GUID IID_IGeolocator2_ = {0xd1b42e6d,0x8891,0x43b4,{0xad,0x36,0x27,0xc6,0xfe,0x9a,0x97,0xb1}};
 static const GUID IID_IAsyncInfo_ = {0x00000036,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
 
 enum { G_DesiredAccuracy = 6, G_put_DesiredAccuracy, G_MovementThreshold, G_put_MovementThreshold, G_ReportInterval,
@@ -434,6 +435,45 @@ int main(int argc, char **argv)
         else if (!strcmp(phase, "deny-hkcu")) set_consent(HKEY_CURRENT_USER, NULL, L"Allow");
         else set_consent(HKEY_CURRENT_USER, L"NonPackaged", L"Allow");
         CHECK(status_of(geo) != 3, "status not Disabled after Allow: %d", status_of(geo));
+    }
+    else if (!strcmp(phase, "fallback"))
+    {
+        /* AllowFallbackToConsentlessPositions: the app's own consent is overridden by a city-level fix,
+         * but never when the user's switch or the device switch is off */
+        OBJ g2 = NULL, coord = NULL, wd = NULL;
+        int src = -1;
+
+        set_consent(HKEY_CURRENT_USER, L"NonPackaged", L"Deny");
+        pos = get_position(geo, &err, &ops, &rhr);
+        CHECK(ops == 3 && err == E_ACCESSDENIED && !pos, "denied before the fallback: ops=%d err=%08lx", ops, err);
+        hr = CALL(geo, 0, HRESULT, &IID_IGeolocator2_, &g2);
+        CHECK(hr == S_OK && g2, "QI IGeolocator2 %08lx", hr);
+        if (!g2) goto end;
+        hr = CALL(g2, 6, HRESULT);
+        CHECK(hr == S_OK, "AllowFallbackToConsentlessPositions %08lx", hr);
+        pos = get_position(geo, &err, &ops, &rhr);
+        CHECK(ops == 1 && rhr == S_OK && pos, "fallback position: ops=%d results=%08lx", ops, rhr);
+        if (pos)
+        {
+            CALL(pos, 6, HRESULT, &coord);
+            if (coord)
+            {
+                CALL(coord, 0, HRESULT, &IID_IGeocoordinateWithPositionData_, &wd);
+                if (wd) { CALL(wd, 6, HRESULT, &src); CHECK(src == 3, "fallback PositionSource IPAddress: %d", src); CALL(wd, 2, ULONG); }
+                CALL(coord, 2, ULONG);
+            }
+            CALL(pos, 2, ULONG);
+        }
+        set_consent(HKEY_CURRENT_USER, NULL, L"Deny");
+        pos = get_position(geo, &err, &ops, &rhr);
+        CHECK(ops == 3 && err == E_ACCESSDENIED && !pos, "user switch off: ops=%d err=%08lx", ops, err);
+        set_consent(HKEY_CURRENT_USER, NULL, L"Allow");
+        set_consent(HKEY_LOCAL_MACHINE, NULL, L"Deny");
+        pos = get_position(geo, &err, &ops, &rhr);
+        CHECK(ops == 3 && err == E_ACCESSDENIED && !pos, "device switch off: ops=%d err=%08lx", ops, err);
+        set_consent(HKEY_LOCAL_MACHINE, NULL, L"Allow");
+        set_consent(HKEY_CURRENT_USER, L"NonPackaged", L"Allow");
+        CALL(g2, 2, ULONG);
     }
     else if (!strcmp(phase, "absent"))
     {

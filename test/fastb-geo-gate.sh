@@ -92,6 +92,12 @@ phase scalar
 expect "scalar: 50 m then 5000 m ask for the exact then the default level" "$(grep -- 'Set RequestedAccuracyLevel' "$T/log" | sed 's/.*=//' | tr '\n' ' ')" "8 5 "
 stop_fake
 
+# AllowFallbackToConsentlessPositions: one city-level (4) request, none while a switch is off
+start_fake ""
+phase fallback
+expect "fallback: GeoClue asked once, for the city level only" "$(grep -- 'Set RequestedAccuracyLevel' "$T/log" | sed 's/.*=//' | tr '\n' ' ')" "4 "
+stop_fake
+
 for p in deny-hklm deny-hkcu deny-np; do
     start_fake ""
     phase $p
