@@ -1,0 +1,544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 13:16:47 -0700
+Subject: [PATCH] winemapi: Simple MAPI mailbox for
+ SaveMail/FindNext/ReadMail/DeleteMail (3242)
+
+The provider keeps the messages saved with MAPISaveMail in the process
+(identifiers are only valid for the session, as the documentation says):
+MAPIFindNext walks them by message type from a seed (MAPI_UNREAD_ONLY),
+MAPIReadMail returns a MapiMessage freeable with one MAPIFreeBuffer
+(MAPI_ENVELOPE_ONLY, MAPI_SUPPRESS_ATTACH, MAPI_BODY_AS_FILE, MAPI_PEEK,
+attachments copied to temporary files), MAPIDeleteMail removes. Error codes
+follow the documented tables (invalid session / message, no messages).
+The declaration of MAPIReadMail's last parameter is now lpMapiMessage*.
+
+diff --git a/dlls/mapi32/mapi32_main.c b/dlls/mapi32/mapi32_main.c
+index 2eadad4..20b2d77 100644
+--- a/dlls/mapi32/mapi32_main.c
++++ b/dlls/mapi32/mapi32_main.c
+@@ -250,7 +250,7 @@ ULONG WINAPI MAPIFindNext(LHANDLE session, ULONG_PTR uiparam, LPSTR msg_type,
+ }
+ 
+ ULONG WINAPI MAPIReadMail(LHANDLE session, ULONG_PTR uiparam, LPSTR msg_id,
+-    FLAGS flags, ULONG reserved, lpMapiMessage msg)
++    FLAGS flags, ULONG reserved, lpMapiMessage *msg)
+ {
+     if (mapiFunctions.MAPIReadMail)
+         return mapiFunctions.MAPIReadMail(session, uiparam, msg_id, flags, reserved, msg);
+diff --git a/dlls/winemapi/main.c b/dlls/winemapi/main.c
+index e8407f8..c6cf4ec 100644
+--- a/dlls/winemapi/main.c
++++ b/dlls/winemapi/main.c
+@@ -19,6 +19,9 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -28,34 +31,453 @@
+ #include "mapi.h"
+ #include "mapix.h"
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winemapi);
+ 
++/* A mailbox of the current process: Simple MAPI message identifiers are
++ * only valid for the session that created them, and this provider keeps
++ * its messages for as long as the process runs. */
+ 
+-ULONG WINAPI MAPIAddress(LHANDLE session, ULONG_PTR uiparam, LPSTR caption,
+-    ULONG editfields, LPSTR labels, ULONG nRecips, lpMapiRecipDesc lpRecips,
+-    FLAGS flags, ULONG reserved, LPULONG newRecips, lpMapiRecipDesc * lppNewRecips)
++#define MAPI_UNREAD_ONLY      0x00000020
++#define MAPI_GUARANTEE_FIFO   0x00000100
++#define MAPI_LONG_MSGID       0x00004000
++#define MAPI_PEEK             0x00000080
++#define MAPI_SUPPRESS_ATTACH  0x00000800
++#define MAPI_ENVELOPE_ONLY    0x00000040
++#define MAPI_BODY_AS_FILE     0x00000200
++#define MAPI_MSG_UNREAD       0x00000001
++
++struct stored_file
+ {
+-    FIXME("(stub)\n");
+-    return MAPI_E_NOT_SUPPORTED;
++    ULONG flags, position;
++    char *path;      /* private copy of the attached file */
++    char *name;
++};
++
++struct stored_recip
++{
++    ULONG class;
++    char *name, *address;
++};
++
++struct stored_msg
++{
++    struct list entry;
++    ULONG id;
++    char *subject, *text, *type, *date, *conversation;
++    FLAGS flags;
++    BOOL has_originator;
++    struct stored_recip originator;
++    ULONG recip_count, file_count;
++    struct stored_recip *recips;
++    struct stored_file *files;
++};
++
++static struct list store = LIST_INIT(store);
++static ULONG next_id = 1;
++static CRITICAL_SECTION store_cs;
++static CRITICAL_SECTION_DEBUG store_cs_debug =
++{
++    0, 0, &store_cs,
++    { &store_cs_debug.ProcessLocksList, &store_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": store_cs") }
++};
++static CRITICAL_SECTION store_cs = { &store_cs_debug, -1, 0, 0, 0, 0 };
++
++static char *dup_str(const char *s)
++{
++    char *r;
++    if (!s) return NULL;
++    if ((r = malloc(strlen(s) + 1))) strcpy(r, s);
++    return r;
++}
++
++static void free_recip(struct stored_recip *r)
++{
++    free(r->name);
++    free(r->address);
++}
++
++static void free_msg(struct stored_msg *m)
++{
++    ULONG i;
++
++    for (i = 0; i < m->recip_count; i++) free_recip(&m->recips[i]);
++    for (i = 0; i < m->file_count; i++)
++    {
++        if (m->files[i].path) DeleteFileA(m->files[i].path);
++        free(m->files[i].path);
++        free(m->files[i].name);
++    }
++    if (m->has_originator) free_recip(&m->originator);
++    free(m->recips);
++    free(m->files);
++    free(m->subject);
++    free(m->text);
++    free(m->type);
++    free(m->date);
++    free(m->conversation);
++    free(m);
++}
++
++static BOOL copy_recip(struct stored_recip *dst, const MapiRecipDesc *src)
++{
++    dst->class = src->ulRecipClass;
++    dst->name = dup_str(src->lpszName);
++    dst->address = dup_str(src->lpszAddress);
++    return (!src->lpszName || dst->name) && (!src->lpszAddress || dst->address);
++}
++
++static BOOL is_message_class(const char *type)
++{
++    /* an empty message type means interpersonal messages */
++    return !type || !*type || !strcmp(type, "IPM");
++}
++
++static struct stored_msg *find_msg(const char *id)
++{
++    struct stored_msg *m;
++    char *end;
++    ULONG n;
++
++    if (!id || !*id) return NULL;
++    n = strtoul(id, &end, 16);
++    if (*end) return NULL;
++    LIST_FOR_EACH_ENTRY(m, &store, struct stored_msg, entry)
++        if (m->id == n) return m;
++    return NULL;
++}
++
++static BOOL copy_file_to_temp(const char *src, char **out, ULONG *error)
++{
++    char dir[MAX_PATH], tmp[MAX_PATH];
++
++    *out = NULL;
++    if (!GetTempPathA(sizeof(dir), dir) || !GetTempFileNameA(dir, "mpi", 0, tmp))
++    {
++        *error = MAPI_E_ATTACHMENT_WRITE_FAILURE;
++        return FALSE;
++    }
++    if (!CopyFileA(src, tmp, FALSE))
++    {
++        DWORD err = GetLastError();
++        DeleteFileA(tmp);
++        *error = (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) ? MAPI_E_ATTACHMENT_NOT_FOUND :
++                 err == ERROR_DISK_FULL ? MAPI_E_DISK_FULL : MAPI_E_ATTACHMENT_OPEN_FAILURE;
++        return FALSE;
++    }
++    *out = dup_str(tmp);
++    if (!*out) { DeleteFileA(tmp); *error = MAPI_E_INSUFFICIENT_MEMORY; return FALSE; }
++    return TRUE;
++}
++
++ULONG WINAPI MAPISaveMail(LHANDLE session, ULONG_PTR uiparam, lpMapiMessage msg,
++    FLAGS flags, ULONG reserved, LPSTR msg_id)
++{
++    struct stored_msg *m, *old = NULL;
++    ULONG i, ret = MAPI_E_INSUFFICIENT_MEMORY;
++
++    TRACE("(0x%08Ix 0x%08Ix %p 0x%08lx 0x%08lx %p)\n", session, uiparam, msg, flags, reserved, msg_id);
++
++    if (!session) return MAPI_E_INVALID_SESSION;
++    if (!msg || !msg_id) return MAPI_E_FAILURE;
++
++    EnterCriticalSection(&store_cs);
++    if (*msg_id && !(old = find_msg(msg_id)))
++    {
++        LeaveCriticalSection(&store_cs);
++        return MAPI_E_INVALID_MESSAGE;
++    }
++
++    if (!(m = calloc(1, sizeof(*m)))) goto done_nomem;
++    m->subject = dup_str(msg->lpszSubject);
++    m->text = dup_str(msg->lpszNoteText);
++    m->type = dup_str(msg->lpszMessageType);
++    m->date = dup_str(msg->lpszDateReceived);
++    m->conversation = dup_str(msg->lpszConversationID);
++    m->flags = msg->flFlags;
++    if (msg->lpOriginator)
++    {
++        m->has_originator = TRUE;
++        if (!copy_recip(&m->originator, msg->lpOriginator)) goto fail;
++    }
++    if (msg->nRecipCount && msg->lpRecips)
++    {
++        if (!(m->recips = calloc(msg->nRecipCount, sizeof(*m->recips)))) goto fail;
++        m->recip_count = msg->nRecipCount;
++        for (i = 0; i < m->recip_count; i++)
++            if (!copy_recip(&m->recips[i], &msg->lpRecips[i])) goto fail;
++    }
++    if (msg->nFileCount && msg->lpFiles)
++    {
++        if (!(m->files = calloc(msg->nFileCount, sizeof(*m->files)))) goto fail;
++        m->file_count = msg->nFileCount;
++        for (i = 0; i < m->file_count; i++)
++        {
++            const MapiFileDesc *f = &msg->lpFiles[i];
++            m->files[i].flags = f->flFlags;
++            m->files[i].position = f->nPosition;
++            m->files[i].name = dup_str(f->lpszFileName);
++            if (!f->lpszPathName) { ret = MAPI_E_ATTACHMENT_NOT_FOUND; goto fail; }
++#ifdef SG_MUTANT_MAPI_NOCOPY
++            m->files[i].path = dup_str(f->lpszPathName);
++#else
++            if (!copy_file_to_temp(f->lpszPathName, &m->files[i].path, &ret)) goto fail;
++#endif
++        }
++    }
++
++    if (old)
++    {
++        m->id = old->id;
++        list_add_before(&old->entry, &m->entry);
++        list_remove(&old->entry);
++        free_msg(old);
++    }
++    else
++    {
++        m->id = next_id++;
++        list_add_tail(&store, &m->entry);
++        sprintf(msg_id, "%08lX", m->id);
++    }
++    LeaveCriticalSection(&store_cs);
++    return SUCCESS_SUCCESS;
++
++fail:
++    free_msg(m);
++done_nomem:
++    LeaveCriticalSection(&store_cs);
++    return ret;
+ }
+ 
+ ULONG WINAPI MAPIDeleteMail(LHANDLE session, ULONG_PTR uiparam, LPSTR msg_id,
+     FLAGS flags, ULONG reserved)
+ {
+-    FIXME("(stub)\n");
+-    return MAPI_E_NOT_SUPPORTED;
++    struct stored_msg *m;
++
++    TRACE("(0x%08Ix 0x%08Ix %s 0x%08lx 0x%08lx)\n", session, uiparam, debugstr_a(msg_id), flags, reserved);
++
++    if (!session) return MAPI_E_INVALID_SESSION;
++    EnterCriticalSection(&store_cs);
++    if (!(m = find_msg(msg_id)))
++    {
++        LeaveCriticalSection(&store_cs);
++        return MAPI_E_INVALID_MESSAGE;
++    }
++    list_remove(&m->entry);
++    free_msg(m);
++    LeaveCriticalSection(&store_cs);
++    return SUCCESS_SUCCESS;
+ }
+ 
+-ULONG WINAPI MAPIDetails(LHANDLE session, ULONG_PTR uiparam, lpMapiRecipDesc recip,
+-    FLAGS flags, ULONG reserved)
++ULONG WINAPI MAPIFindNext(LHANDLE session, ULONG_PTR uiparam, LPSTR msg_type,
++    LPSTR seed_msg_id, FLAGS flags, ULONG reserved, LPSTR msg_id)
++{
++    struct stored_msg *m, *seed = NULL;
++    BOOL seen = FALSE;
++
++    TRACE("(0x%08Ix 0x%08Ix %s %s 0x%08lx 0x%08lx %p)\n", session, uiparam, debugstr_a(msg_type),
++          debugstr_a(seed_msg_id), flags, reserved, msg_id);
++
++    if (!session) return MAPI_E_INVALID_SESSION;
++    if (!msg_id) return MAPI_E_FAILURE;
++
++    EnterCriticalSection(&store_cs);
++    if (seed_msg_id && *seed_msg_id && !(seed = find_msg(seed_msg_id)))
++    {
++        LeaveCriticalSection(&store_cs);
++        return MAPI_E_INVALID_MESSAGE;
++    }
++#ifdef SG_MUTANT_MAPI_NOSEED
++    seed = NULL;
++#endif
++    seen = !seed;
++    LIST_FOR_EACH_ENTRY(m, &store, struct stored_msg, entry)
++    {
++        if (!seen)
++        {
++            seen = (m == seed);
++            continue;
++        }
++        if (is_message_class(msg_type) != is_message_class(m->type)) continue;
++        if (!is_message_class(msg_type) && strcmp(m->type, msg_type)) continue;
++        if ((flags & MAPI_UNREAD_ONLY) && !(m->flags & MAPI_MSG_UNREAD)) continue;
++        sprintf(msg_id, "%08lX", m->id);
++        LeaveCriticalSection(&store_cs);
++        return SUCCESS_SUCCESS;
++    }
++    LeaveCriticalSection(&store_cs);
++    return MAPI_E_NO_MESSAGES;
++}
++
++static ULONG fill_recip(MapiRecipDesc *dst, const struct stored_recip *src, void *root)
++{
++    memset(dst, 0, sizeof(*dst));
++    dst->ulRecipClass = src->class;
++    if (src->name)
++    {
++        if (MAPIAllocateMore(strlen(src->name) + 1, root, (void **)&dst->lpszName)) return MAPI_E_INSUFFICIENT_MEMORY;
++        strcpy(dst->lpszName, src->name);
++    }
++    if (src->address)
++    {
++        if (MAPIAllocateMore(strlen(src->address) + 1, root, (void **)&dst->lpszAddress)) return MAPI_E_INSUFFICIENT_MEMORY;
++        strcpy(dst->lpszAddress, src->address);
++    }
++    return SUCCESS_SUCCESS;
++}
++
++static ULONG more_str(const char *s, void *root, char **out)
++{
++    *out = NULL;
++    if (!s) return SUCCESS_SUCCESS;
++    if (MAPIAllocateMore(strlen(s) + 1, root, (void **)out)) return MAPI_E_INSUFFICIENT_MEMORY;
++    strcpy(*out, s);
++    return SUCCESS_SUCCESS;
++}
++
++ULONG WINAPI MAPIReadMail(LHANDLE session, ULONG_PTR uiparam, LPSTR msg_id,
++    FLAGS flags, ULONG reserved, lpMapiMessage *out)
++{
++    struct stored_msg *m;
++    lpMapiMessage r = NULL;
++    ULONG i, ret, nfiles = 0, first = 0;
++    char *body_path = NULL;
++#ifdef SG_MUTANT_MAPI_NOENV
++    BOOL envelope = FALSE,
++#else
++    BOOL envelope = flags & MAPI_ENVELOPE_ONLY,
++#endif
++          attach = !envelope && !(flags & MAPI_SUPPRESS_ATTACH);
++
++    TRACE("(0x%08Ix 0x%08Ix %s 0x%08lx 0x%08lx %p)\n", session, uiparam, debugstr_a(msg_id), flags, reserved, out);
++
++    if (!session) return MAPI_E_INVALID_SESSION;
++    if (!out) return MAPI_E_FAILURE;
++    *out = NULL;
++
++    EnterCriticalSection(&store_cs);
++    if (!(m = find_msg(msg_id)))
++    {
++        LeaveCriticalSection(&store_cs);
++        return MAPI_E_INVALID_MESSAGE;
++    }
++
++    ret = MAPI_E_INSUFFICIENT_MEMORY;
++    if (MAPIAllocateBuffer(sizeof(*r), (void **)&r)) goto error;
++    memset(r, 0, sizeof(*r));
++    if (more_str(m->subject, r, &r->lpszSubject)) goto error;
++    if (more_str(m->type, r, &r->lpszMessageType)) goto error;
++    if (more_str(m->date, r, &r->lpszDateReceived)) goto error;
++    if (more_str(m->conversation, r, &r->lpszConversationID)) goto error;
++    r->flFlags = m->flags;
++    if (!envelope && !(flags & MAPI_BODY_AS_FILE) && more_str(m->text, r, &r->lpszNoteText)) goto error;
++
++    if (m->has_originator)
++    {
++        if (MAPIAllocateMore(sizeof(*r->lpOriginator), r, (void **)&r->lpOriginator)) goto error;
++        if (fill_recip(r->lpOriginator, &m->originator, r)) goto error;
++    }
++    if (m->recip_count)
++    {
++        if (MAPIAllocateMore(m->recip_count * sizeof(*r->lpRecips), r, (void **)&r->lpRecips)) goto error;
++        r->nRecipCount = m->recip_count;
++        for (i = 0; i < m->recip_count; i++)
++            if (fill_recip(&r->lpRecips[i], &m->recips[i], r)) goto error;
++    }
++
++    if (attach || (!envelope && (flags & MAPI_BODY_AS_FILE)))
++    {
++        BOOL body_file = !envelope && (flags & MAPI_BODY_AS_FILE);
++
++        nfiles = (attach ? m->file_count : 0) + (body_file ? 1 : 0);
++        if (nfiles)
++        {
++            if (MAPIAllocateMore(nfiles * sizeof(*r->lpFiles), r, (void **)&r->lpFiles)) goto error;
++            memset(r->lpFiles, 0, nfiles * sizeof(*r->lpFiles));
++        }
++        if (body_file)
++        {
++            char dir[MAX_PATH], tmp[MAX_PATH];
++            DWORD written, len = m->text ? strlen(m->text) : 0;
++            HANDLE h;
++
++            ret = MAPI_E_ATTACHMENT_WRITE_FAILURE;
++            if (!GetTempPathA(sizeof(dir), dir) || !GetTempFileNameA(dir, "mpb", 0, tmp)) goto error;
++            h = CreateFileA(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++            if (h == INVALID_HANDLE_VALUE) goto error;
++            if (!WriteFile(h, m->text ? m->text : "", len, &written, NULL) || written != len)
++            {
++                ret = GetLastError() == ERROR_DISK_FULL ? MAPI_E_DISK_FULL : MAPI_E_ATTACHMENT_WRITE_FAILURE;
++                CloseHandle(h);
++                DeleteFileA(tmp);
++                goto error;
++            }
++            CloseHandle(h);
++            body_path = dup_str(tmp);
++            ret = MAPI_E_INSUFFICIENT_MEMORY;
++            if (!body_path || more_str(tmp, r, &r->lpFiles[0].lpszPathName)) goto error;
++            r->lpFiles[0].nPosition = (ULONG)-1;
++            first = 1;
++            r->nFileCount = 1;
++        }
++        if (attach)
++        {
++            for (i = 0; i < m->file_count; i++)
++            {
++                char *copy;
++
++                if (!copy_file_to_temp(m->files[i].path, &copy, &ret)) goto error;
++                r->lpFiles[first + i].flFlags = m->files[i].flags;
++                r->lpFiles[first + i].nPosition = m->files[i].position;
++                ret = MAPI_E_INSUFFICIENT_MEMORY;
++                if (more_str(copy, r, &r->lpFiles[first + i].lpszPathName) ||
++                    more_str(m->files[i].name, r, &r->lpFiles[first + i].lpszFileName))
++                {
++                    DeleteFileA(copy);
++                    free(copy);
++                    goto error;
++                }
++                free(copy);
++                r->nFileCount = first + i + 1;
++            }
++        }
++    }
++
++#ifdef SG_MUTANT_MAPI_NOPEEK
++    m->flags &= ~MAPI_MSG_UNREAD;
++#else
++    if (!(flags & MAPI_PEEK)) m->flags &= ~MAPI_MSG_UNREAD;
++#endif
++    LeaveCriticalSection(&store_cs);
++    free(body_path);
++    *out = r;
++    return SUCCESS_SUCCESS;
++
++error:
++    if (r)
++    {
++        for (i = 0; i < r->nFileCount; i++)
++            if (r->lpFiles[i].lpszPathName) DeleteFileA(r->lpFiles[i].lpszPathName);
++        MAPIFreeBuffer(r);
++    }
++    LeaveCriticalSection(&store_cs);
++    free(body_path);
++    return ret;
++}
++
++
++ULONG WINAPI MAPIAddress(LHANDLE session, ULONG_PTR uiparam, LPSTR caption,
++    ULONG editfields, LPSTR labels, ULONG nRecips, lpMapiRecipDesc lpRecips,
++    FLAGS flags, ULONG reserved, LPULONG newRecips, lpMapiRecipDesc * lppNewRecips)
+ {
+     FIXME("(stub)\n");
+     return MAPI_E_NOT_SUPPORTED;
+ }
+ 
+-ULONG WINAPI MAPIFindNext(LHANDLE session, ULONG_PTR uiparam, LPSTR msg_type,
+-    LPSTR seed_msg_id, FLAGS flags, ULONG reserved, LPSTR msg_id)
++ULONG WINAPI MAPIDetails(LHANDLE session, ULONG_PTR uiparam, lpMapiRecipDesc recip,
++    FLAGS flags, ULONG reserved)
+ {
+     FIXME("(stub)\n");
+     return MAPI_E_NOT_SUPPORTED;
+@@ -82,13 +504,6 @@ ULONG WINAPI MAPILogoff(LHANDLE session, ULONG_PTR uiparam, FLAGS flags,
+     return SUCCESS_SUCCESS;
+ }
+ 
+-ULONG WINAPI MAPIReadMail(LHANDLE session, ULONG_PTR uiparam, LPSTR msg_id,
+-    FLAGS flags, ULONG reserved, lpMapiMessage msg)
+-{
+-    FIXME("(stub)\n");
+-    return MAPI_E_NOT_SUPPORTED;
+-}
+-
+ ULONG WINAPI MAPIResolveName(LHANDLE session, ULONG_PTR uiparam, LPSTR name,
+     FLAGS flags, ULONG reserved, lpMapiRecipDesc *recip)
+ {
+@@ -119,9 +534,3 @@ ULONG WINAPI MAPIResolveName(LHANDLE session, ULONG_PTR uiparam, LPSTR name,
+     return SUCCESS_SUCCESS;
+ }
+ 
+-ULONG WINAPI MAPISaveMail(LHANDLE session, ULONG_PTR uiparam, lpMapiMessage msg,
+-    FLAGS flags, ULONG reserved, LPSTR msg_id)
+-{
+-    FIXME("(stub)\n");
+-    return MAPI_E_NOT_SUPPORTED;
+-}
+diff --git a/include/mapi.h b/include/mapi.h
+index c8475a1..b887526 100644
+--- a/include/mapi.h
++++ b/include/mapi.h
+@@ -214,7 +214,7 @@ typedef ULONG (WINAPI MAPILOGON)(ULONG_PTR,LPSTR,LPSTR,FLAGS,ULONG,LPLHANDLE);
+ typedef MAPILOGON *LPMAPILOGON;
+ MAPILOGON MAPILogon;
+ 
+-typedef ULONG (WINAPI MAPIREADMAIL)(LHANDLE,ULONG_PTR,LPSTR,FLAGS,ULONG,lpMapiMessage);
++typedef ULONG (WINAPI MAPIREADMAIL)(LHANDLE,ULONG_PTR,LPSTR,FLAGS,ULONG,lpMapiMessage*);
+ typedef MAPIREADMAIL *LPMAPIREADMAIL;
+ MAPIREADMAIL MAPIReadMail;
+ 
