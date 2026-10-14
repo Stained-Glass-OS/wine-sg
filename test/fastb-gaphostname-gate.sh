@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# HostName statics Compare and IStringable (patches 3665): runs windows.networking.hostname_test.exe from the build tree
+# HostName statics, IStringable and EndpointPair (patches 3665-3667): runs windows.networking.hostname_test.exe from the build tree
 #
 #   WINE=/path/to/build/wine test/fastb-gaphostname-gate.sh      (needs dlls/windows.networking.hostname/tests built beside it)
 #   SG_XVFB_N=260 to name the display
