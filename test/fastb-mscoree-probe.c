@@ -9,6 +9,7 @@ static int fails, checks;
 #define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 typedef struct { void **vtbl; } Obj;
+static const GUID IID_Unk = {0, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
 #define SLOT(o, i) ((o)->vtbl[i])
 #define CALL(o, i, ret, ...) ((ret (__stdcall *)(Obj*, ##__VA_ARGS__))SLOT(o, i))
 
@@ -148,6 +149,33 @@ int main(void)
     pCLRCreateInstance = (void *)GetProcAddress(mscoree, "CLRCreateInstance");
     pGetVersionFromProcess = (void *)GetProcAddress(mscoree, "GetVersionFromProcess");
     test_config_stream(mscoree);
+    {
+        /* an app config asking for useLegacyV2RuntimeActivationPolicy binds legacy activation to the selected runtime */
+        HRESULT (WINAPI *pGetRequestedRuntimeInfo)(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, DWORD, LPWSTR, DWORD, DWORD*,
+                LPWSTR, DWORD, DWORD*) = (void *)GetProcAddress(mscoree, "GetRequestedRuntimeInfo");
+        static const char cfg[] = "<configuration><startup useLegacyV2RuntimeActivationPolicy=\"true\">"
+                "<supportedRuntime version=\"v2.0.50727\"/></startup></configuration>";
+        WCHAR cfgpath[MAX_PATH], dir[MAX_PATH], ver[64];
+        DWORD dl = 0, vl = 0, wr;
+        HANDLE cf;
+        Obj *h = NULL, *r4 = NULL;
+
+        GetTempPathW(MAX_PATH, cfgpath);
+        lstrcatW(cfgpath, L"sgpolicy.config");
+        cf = CreateFileW(cfgpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        WriteFile(cf, cfg, sizeof(cfg) - 1, &wr, NULL);
+        CloseHandle(cf);
+        if (pGetRequestedRuntimeInfo)
+        {
+            hr = pGetRequestedRuntimeInfo(NULL, NULL, cfgpath, 0, 0, dir, MAX_PATH, &dl, ver, 64, &vl);
+            CHECK(hr == S_OK && !lstrcmpW(ver, L"v2.0.50727"), "GetRequestedRuntimeInfo %lx %ls", hr, ver);
+            pCLRCreateInstance(&CLSID_MetaHost, &IID_MetaHost, (void **)&h);
+            CALL(h, 3, HRESULT, const WCHAR*, const GUID*, void**)(h, L"v4.0.30319", &IID_RTInfo, (void **)&r4);
+            hr = CALL(r4, 13, HRESULT)(r4);
+            CHECK(hr == E_SHIM_ALREADYBOUND, "policy config bound v2: bind v4 gives %lx", hr);
+        }
+        DeleteFileW(cfgpath);
+    }
     hr = pCLRCreateInstance(&CLSID_MetaHost, &IID_MetaHost, (void **)&host);
     CHECK(hr == S_OK, "CLRCreateInstance %lx", hr);
     hr = CALL(host, 3, HRESULT, const WCHAR*, const GUID*, void**)(host, L"v4.0.30319", &IID_RTInfo, (void **)&v4);
@@ -277,6 +305,22 @@ int main(void)
         CHECK(n >= 1, "domains %d", n);
         CHECK(CALL(cor, 16, HRESULT, void*)(cor, henum) == S_OK, "CloseEnum");
         CHECK(CALL(cor, 16, HRESULT, void*)(cor, NULL) == E_POINTER, "CloseEnum NULL");
+        {
+            Obj *cfg = NULL, *cfg2 = NULL, *u = NULL;
+            hr = CALL(cor, 9, HRESULT, Obj**)(cor, &cfg);
+            CHECK(hr == S_OK && cfg, "GetConfiguration %lx", hr);
+            CHECK(CALL(cor, 9, HRESULT, Obj**)(cor, NULL) == E_POINTER, "GetConfiguration NULL");
+            if (cfg)
+            {
+                CHECK(CALL(cor, 9, HRESULT, Obj**)(cor, &cfg2) == S_OK && cfg2 == cfg, "GetConfiguration same object");
+                hr = CALL(cfg, 0, HRESULT, const GUID*, void**)(cfg, &IID_Unk, (void **)&u);
+                CHECK(hr == S_OK && u, "ICorConfiguration QI IUnknown %lx", hr);
+                CHECK(CALL(cfg, 6, HRESULT, DWORD)(cfg, 1234) == S_OK, "AddDebuggerSpecialThread");
+                CHECK(CALL(cfg, 3, HRESULT, void*)(cfg, NULL) == E_INVALIDARG, "SetGCThreadControl NULL");
+                CHECK(CALL(cfg, 4, HRESULT, void*)(cfg, NULL) == E_INVALIDARG, "SetGCHostControl NULL");
+                CHECK(CALL(cfg, 5, HRESULT, void*)(cfg, NULL) == E_INVALIDARG, "SetDebuggerThreadControl NULL");
+            }
+        }
         CHECK(CALL(cor, 11, HRESULT)(cor) == S_OK, "ICorRuntimeHost::Stop");
     }
     CHECK(CALL(clr, 4, HRESULT)(clr) == S_OK, "ICLRRuntimeHost::Stop");
