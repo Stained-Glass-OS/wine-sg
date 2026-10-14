@@ -132,6 +132,34 @@ int main(void)
         }
         ITextSelection_Release(sel);
     }
+    /* the clipboard data object of the control */
+    {
+        IDataObject *obj = NULL;
+        CHARRANGE cr = { 0, 5 };
+        FORMATETC f = { CF_UNICODETEXT, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM m = { TYMED_HGLOBAL };
+        DWORD conn = 3;
+
+        hr = ole->lpVtbl->GetClipboardData(ole, &cr, 0, &obj);
+        CHECK(hr == S_OK && obj, "GetClipboardData %#lx", hr);
+        if (obj)
+        {
+            m.hGlobal = GlobalAlloc(GMEM_MOVEABLE, 64);
+            hr = IDataObject_GetDataHere(obj, &f, &m);
+            CHECK(hr == S_OK, "GetDataHere %#lx", hr);
+            if (hr == S_OK) CHECK(!wcsncmp(GlobalLock(m.hGlobal), L"Hello", 5), "data here");
+            GlobalFree(m.hGlobal);
+            m.hGlobal = GlobalAlloc(GMEM_MOVEABLE, 2);
+            hr = IDataObject_GetDataHere(obj, &f, &m);
+            CHECK(hr == STG_E_MEDIUMFULL, "GetDataHere small block %#lx", hr);
+            GlobalFree(m.hGlobal);
+            hr = IDataObject_DAdvise(obj, &f, 0, NULL, &conn);
+            CHECK(hr == OLE_E_ADVISENOTSUPPORTED, "DAdvise %#lx", hr);
+            hr = IDataObject_DUnadvise(obj, 1);
+            CHECK(hr == OLE_E_ADVISENOTSUPPORTED, "DUnadvise %#lx", hr);
+            IDataObject_Release(obj);
+        }
+    }
     ITextDocument_Release(doc);
     ole->lpVtbl->Release(ole);
     DestroyWindow(hwnd);
