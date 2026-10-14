@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# tdh (patch 3587): decoding handles and provider enumeration.
+# tdh (3675): TdhLoadManifest/TdhUnloadManifest/TdhGetEventInformation from an instrumentation manifest
 #
 #   WINE=/opt/wine-sg/bin/wine test/fastb-tdh-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
@@ -18,7 +18,7 @@ T=$(mktemp -d /var/tmp/sg-fastb-tdh.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
-TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/fastb-tdh-probe.c" -ladvapi32 \
+TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/fastb-tdh-probe.c" -ltdh -ladvapi32 \
     || { echo "FAIL  probe did not build"; exit 1; }
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
