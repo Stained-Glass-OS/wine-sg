@@ -2690,3 +2690,8 @@ test-apphelp:
 # a fresh prefix (no display needed).
 test-newdev:
 	WINE=$(PREFIX)/bin/wine test/newdev-gate.sh
+
+# difxapi (5504): DriverPackage* against a test device and packages, under a
+# fresh prefix (no display needed).
+test-difxapi:
+	WINE=$(PREFIX)/bin/wine test/difxapi-gate.sh
