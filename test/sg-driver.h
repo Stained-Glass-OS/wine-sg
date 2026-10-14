@@ -88,5 +88,9 @@ NTSTATUS NTAPI DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *registry)
     RtlInitUnicodeString(&name, L"\\Device\\SgProbe");
     RtlInitUnicodeString(&link, L"\\DosDevices\\SgProbe");
     if ((status = IoCreateDevice(driver, 0, &name, FILE_DEVICE_UNKNOWN, 0, FALSE, &sg_device))) return status;
-    return IoCreateSymbolicLink(&link, &name);
+    status = IoCreateSymbolicLink(&link, &name);
+#ifdef SG_DRIVER_ENTRY_AFTER_HOOK
+    if (!status) SG_DRIVER_ENTRY_AFTER_HOOK(driver);
+#endif
+    return status;
 }

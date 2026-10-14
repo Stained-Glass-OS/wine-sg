@@ -73,6 +73,9 @@ int main(void)
         fputs(results, stdout);
     }
     if (dev != INVALID_HANDLE_VALUE) CloseHandle(dev);
+#ifdef SG_HOST_AFTER_IOCTL
+    SG_HOST_AFTER_IOCTL();
+#endif
     ControlService(service, SERVICE_CONTROL_STOP, &status);
     DeleteService(service);
     CloseServiceHandle(service);
