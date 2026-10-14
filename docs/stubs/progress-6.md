@@ -100,3 +100,18 @@ Same method; suites ntoskrnl.exe ole32 (64 and 32) compared with the base: no ne
 - 5076 RtlIsNtDdiVersionAvailable against the running version (1165).
 - 5077 ole32 IPropertyStorage::SetTimes on a simple set (890); 5078 the data cache's IViewObject::Freeze/Unfreeze
   (510, 511).
+
+## 2026-10-14, batch 7 (Fast A, successor): patches 5079-5095 (ntoskrnl.exe, netio.sys)
+Same method, build tree with X; suites ntoskrnl.exe (64 and 32) and ole32 (64 and 32) equal the base (ntoskrnl 64-bit shows
+the 4 catalog-signing failures the base build has too). Drafter 6's 5072-5078 gates pass; the series applies on a fresh tarball.
+Scope change from the coordinator: crypt32/bcrypt/wintrust/cryptowinrt/onlineid/web.core go to drafter 7 (branch stubs-6b,
+5300-5499), gdi32/user32/win32u to Fast B (stubs-6c, 5200-5299).
+- 5079 MDL lock/map/protect (1104 1109 1111 1112 1126); 5080 READ/WRITE_REGISTER_* (1134); 5081 SeLocateProcessImageName,
+  IoGetRelatedDeviceObject (1159 1082); 5082 StartIo/device queue (1142); 5083 cancel-safe IRP queues (1145);
+  5084 KQUEUE (1096); 5085 load-image notify flags (1137); 5086 shutdown notification (1086 1087); 5087 error log (1078);
+  5088 IoReportResourceForDetection (1088); 5089 IoCreateFile options (1151 1152); 5090 IoGetConfigurationInformation (1083);
+  5091 PoSetPowerState/PoRequestPowerIrp (1068 1069); 5092 IoGetDeviceInterfaces (1080); 5093 PlugPlay notification
+  (1143 1144); 5094 IoGetDeviceProperty (1179); 5095 netio.sys WskGetLocalAddress/WskGetRemoteAddress + error map (1059 1060 1174).
+- ntoskrnl.exe candidates now all closed (1184/1185 triaged no-ground-truth). Open next: netio.sys 1061 1062 1064 1067 1175 1176 1178;
+  ntdll 1 11 55 360 361 362 367 395 405 439 443 444 446 981; ole32 460 461 493 494 499 505 506 509 517 519 869 985-989;
+  rpcrt4 554-597 (23); combase 61 159 160 162 927; advapi32 123; oleaut32 547. Details in /var/tmp/fast-a/s6-STATE.md.
