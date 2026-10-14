@@ -29,7 +29,7 @@ T=$(mktemp -d /var/tmp/sg-sppc.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 # sppc's exports, as the probe links them (mingw has no import library for it)
-printf 'LIBRARY sppc.dll\nEXPORTS\nSLOpen\nSLClose\nSLInstallLicense\nSLUninstallLicense\nSLInstallProofOfPurchase\nSLUninstallProofOfPurchase\nSLGetLicensingStatusInformation\nSLGetLicenseFileId\nSLGetLicense\nSLGetPKeyId\nSLLoadApplicationPolicies\nSLGetApplicationPolicy\nSLUnloadApplicationPolicies\nSLGetPolicyInformationDWORD\nSLConsumeRight\nSLSetAuthenticationData\nSLGetAuthenticationResult\nSLRegisterEvent\nSLUnregisterEvent\nSLIsGenuineLocalEx\nSLGetProductSkuInformation\n' > "$T/sppc.def"
+printf 'LIBRARY sppc.dll\nEXPORTS\nSLOpen\nSLClose\nSLInstallLicense\nSLUninstallLicense\nSLInstallProofOfPurchase\nSLUninstallProofOfPurchase\nSLGetLicensingStatusInformation\nSLGetLicenseFileId\nSLGetLicense\nSLGetPKeyId\nSLLoadApplicationPolicies\nSLGetApplicationPolicy\nSLUnloadApplicationPolicies\nSLGetPolicyInformationDWORD\nSLConsumeRight\nSLSetAuthenticationData\nSLGetAuthenticationResult\nSLRegisterEvent\nSLUnregisterEvent\nSLIsGenuineLocalEx\nSLGetProductSkuInformation\nSLGetSLIDList\n' > "$T/sppc.def"
 "${DLLTOOL:-x86_64-w64-mingw32-dlltool}" -d "$T/sppc.def" -l "$T/libsppc.a" || { fail "no import library"; exit 1; }
 "$MINGW" -O2 -o "$T/probe.exe" "$HERE/sppc-probe.c" "$T/libsppc.a" || { fail "probe did not build"; exit 1; }
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
@@ -72,6 +72,19 @@ case "$(v key)" in "00000000 {"*) pass "SLInstallProofOfPurchase keeps a product
     && pass "SLGetProductSkuInformation reads the license's items (Name is productName); a missing one: not found (0505)" || fail "sku info: $(v skuinfo) / $(v skuname) / $(v skumissing)"
 [ "$(v consume-nokey)" = c004f014 ] && [ "$(v consume-key)" = c004f013 ] \
     && pass "no right is granted: for want of a product key, or (with one) not granted" || fail "consume reasons: $(v consume-nokey) / $(v consume-key)"
+[ "$(v slid-apps)" = "00000000 1 1" ] && [ "$(v slid-skus)" = "00000000 1 1" ] && [ "$(v slid-app-sku)" = "00000000 1 1" ] \
+    && [ "$(v slid-sku-app)" = "00000000 1 1" ] && [ "$(v slid-sku-file)" = "00000000 1 1" ] \
+    && pass "SLGetSLIDList lists applications, SKUs, a SKU of an application, the application and the license file of a SKU (5518)" \
+    || fail "slid: $(v slid-apps) / $(v slid-skus) / $(v slid-app-sku) / $(v slid-sku-app) / $(v slid-sku-file)"
+[ "$(v slid-unknown-app)" = "c004f012 0" ] && [ "$(v slid-no-query)" = 80070057 ] && [ "$(v slid-sku-pkey)" = c004f012 ] \
+    && [ "$(v slid-unlisted)" = c004f016 ] && [ "$(v slid-after-uninstall)" = "c004f012 0" ] \
+    && pass "SLGetSLIDList: nothing found, a missing query, an unlisted combination (SL_E_NOT_SUPPORTED), none left after uninstalling (5518)" \
+    || fail "slid errors: $(v slid-unknown-app) / $(v slid-no-query) / $(v slid-sku-pkey) / $(v slid-unlisted) / $(v slid-after-uninstall)"
+[ "$(v distinct)" = 1 ] && [ "$(v close)" = 00000000 ] && [ "$(v close-other)" = 00000000 ] \
+    && pass "SLOpen gives each caller its own context; SLClose closes it (5518)" || fail "contexts: $(v distinct) / $(v close) / $(v close-other)"
+[ "$(v close-again)" = 80070057 ] && [ "$(v use-closed)" = 80070057 ] && [ "$(v close-invented)" = 80070057 ] \
+    && [ "$(v close-null)" = 80070057 ] && [ "$(v use-other)" = c004f011 ] \
+    && pass "a closed, invented or NULL context is E_INVALIDARG (5518); an open one still works" || fail "stale handles: $(v close-again) / $(v use-closed) / $(v close-invented) / $(v close-null) / $(v use-other)"
 [ "$(wc -l < "$T/files")" = 0 ] && pass "the store is empty again after uninstalling" || fail "store: $(cat "$T/files")"
 
 echo

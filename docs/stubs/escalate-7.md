@@ -110,3 +110,11 @@ else's hive is the real risk); keep the self case open. Needs a decision.
 - `CreateSwapChainForComposition` with a D3D12 command queue: `dxgi_composition_swapchain_create` only knows
   d3d11 devices. The back buffer of a d3d12 swap chain would have to be copied to the composition surface at
   Present (the same GDI draw as 0190).
+
+## hid: HidP_TranslateUsagesToI8042ScanCodes (batch 5518)
+
+The routine is documented (callback with make/break scan codes, modifier state structure, HIDP_STATUS_I8042_TRANS_UNKNOWN) but the table that maps a keyboard usage to its set-1 scan code, with the E0/E1 prefixed codes and the Pause sequence, is in a separate specification. Decision needed: which public table is the source (the USB HID to PS/2 scan code translation Microsoft publishes), then it is a small patch with an insert-callback test in dlls/hid/tests.
+
+## ncrypt: NCryptExportKey with NCryptBufferDesc (batch 5518)
+
+Encrypted PKCS #8 export needs PBES2/PBKDF2 and DER writing around the key blob. Decision needed: whether to build that on bcrypt's PBKDF2 and an ASN.1 writer in ncrypt, or leave NTE_NOT_SUPPORTED.
