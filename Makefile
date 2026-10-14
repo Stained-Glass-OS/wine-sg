@@ -2730,3 +2730,7 @@ test-wscript:
 # olepro32, dpnhpast (5527): DllGetClassObject for DLLs without classes.
 test-dllclass:
 	WINE=$(PREFIX)/bin/wine test/dllclass-gate.sh
+
+# schedsvc monthly triggers (5528).
+test-taskmonth:
+	WINE=$(PREFIX)/bin/wine test/taskmonth-gate.sh
