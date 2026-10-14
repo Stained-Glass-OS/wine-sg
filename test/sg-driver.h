@@ -14,6 +14,7 @@ static char sg_out[16384];
 static size_t sg_pos;
 static int failures;
 static DEVICE_OBJECT *sg_device;
+static FILE_OBJECT *sg_file; /* the file object the probe's IOCTL arrived on */
 
 static void sg_printf(const char *fmt, ...)
 {
@@ -49,6 +50,7 @@ static NTSTATUS NTAPI sg_ioctl(DEVICE_OBJECT *device, IRP *irp)
     irp->IoStatus.Information = 0;
     if (stack->Parameters.DeviceIoControl.IoControlCode == SG_PROBE_IOCTL)
     {
+        sg_file = stack->FileObject;
         run_probe(device->DriverObject);
         sg_printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
         if (len > sg_pos) len = sg_pos;
