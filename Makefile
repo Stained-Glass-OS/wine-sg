@@ -2722,3 +2722,7 @@ test-msiexec-repair:
 # pnputil (5522): driver packages.
 test-pnputil:
 	WINE=$(PREFIX)/bin/wine test/pnputil-gate.sh
+
+# wscript/cscript (5524): GetObject, reporting of script errors.
+test-wscript:
+	WINE=$(PREFIX)/bin/wine test/wscript-gate.sh
