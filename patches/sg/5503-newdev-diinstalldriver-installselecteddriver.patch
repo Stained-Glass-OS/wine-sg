@@ -1,0 +1,404 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] newdev: DiInstallDriver and InstallSelectedDriver install drivers
+
+DiInstallDriver and InstallSelectedDriver returned TRUE and did nothing. Now,
+as Microsoft documents them:
+
+DiInstallDriver stages the driver package in the driver store (the INF copy in
+the system INF directory; a package that is already there is the same package,
+so nothing is added twice), then installs it on the devices present that it
+matches -- only where it is a better match than the driver the device has
+(setupapi's ranking decides: the package must be the best of all the INFs for
+the device), or on every device it matches with DIIRFLAG_FORCE_INF -- and
+reports whether a restart is needed. A package that matches no device is still
+a success. DIIRFLAG_INSTALL_AS_SET stages every INF of a directory and
+installs none. Errors: ERROR_IN_WOW64 for a 32-bit caller (the page: "not
+allowed"), ERROR_INVALID_FLAGS, ERROR_ACCESS_DENIED for a caller who is not an
+administrator, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER.
+
+InstallSelectedDriver installs the driver selected for the selected device of a
+device information set (no backup is kept; ERROR_IN_WOW64 for a 32-bit caller,
+Reserved must be NULL) and reports DI_NEEDREBOOT.
+
+newdev now imports advapi32. A Wine-private export, SgInstallDriverOnDevices,
+gives DIFxAPI the match counts that DriverPackageInstall's errors need.
+---
+--- a/dlls/newdev/Makefile.in
++++ b/dlls/newdev/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = newdev.dll
+ IMPORTLIB = newdev
+-IMPORTS   = setupapi
++IMPORTS   = setupapi advapi32
+ 
+ SOURCES = \
+ 	main.c
+--- a/dlls/newdev/main.c
++++ b/dlls/newdev/main.c
+@@ -28,11 +28,208 @@
+ #include "winreg.h"
+ #include "cfgmgr32.h"
+ #include "newdev.h"
++#include "winnt.h"
+ 
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(setupapi);
+ 
++
++static const DWORD dif_list[] =
++{
++    DIF_SELECTBESTCOMPATDRV,
++    DIF_ALLOW_INSTALL,
++    DIF_INSTALLDEVICEFILES,
++    DIF_REGISTER_COINSTALLERS,
++    DIF_INSTALLINTERFACES,
++    DIF_INSTALLDEVICE,
++    DIF_NEWDEVICEWIZARD_FINISHINSTALL,
++};
++
++static BOOL is_administrator(void)
++{
++    SID_IDENTIFIER_AUTHORITY authority = { SECURITY_NT_AUTHORITY };
++    BOOL member = FALSE;
++    PSID sid;
++
++    if (!AllocateAndInitializeSid(&authority, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
++                                  0, 0, 0, 0, 0, 0, &sid))
++        return FALSE;
++    if (!CheckTokenMembership(NULL, sid, &member)) member = FALSE;
++    FreeSid(sid);
++#ifdef SG_MUTANT_NO_ADMIN_CHECK
++    return TRUE;
++#endif
++    return member;
++}
++
++/* "ERROR_IN_WOW64: The calling application is a 32-bit application that is
++ * attempting to execute in a 64-bit environment, which is not allowed." */
++static BOOL is_wow64(void)
++{
++    BOOL wow64 = FALSE;
++
++    IsWow64Process(GetCurrentProcess(), &wow64);
++#ifdef SG_MUTANT_NO_WOW64_CHECK
++    return FALSE;
++#endif
++    return wow64;
++}
++
++/* the driver list of one device made from one INF only (or none: FALSE) */
++static BOOL build_single_inf_list(HDEVINFO set, SP_DEVINFO_DATA *device, const WCHAR *inf_path)
++{
++    SP_DEVINSTALL_PARAMS_W params = {sizeof(params)};
++
++    if (!SetupDiGetDeviceInstallParamsW(set, device, &params)) return FALSE;
++    lstrcpyW(params.DriverPath, inf_path);
++    params.Flags |= DI_ENUMSINGLEINF;
++    if (!SetupDiSetDeviceInstallParamsW(set, device, &params)) return FALSE;
++    SetupDiDestroyDriverInfoList(set, device, SPDIT_COMPATDRIVER);
++    return SetupDiBuildDriverInfoList(set, device, SPDIT_COMPATDRIVER);
++}
++
++static void end_single_inf_list(HDEVINFO set, SP_DEVINFO_DATA *device)
++{
++    SP_DEVINSTALL_PARAMS_W params = {sizeof(params)};
++
++    SetupDiDestroyDriverInfoList(set, device, SPDIT_COMPATDRIVER);
++    if (!SetupDiGetDeviceInstallParamsW(set, device, &params)) return;
++    params.Flags &= ~DI_ENUMSINGLEINF;
++    params.DriverPath[0] = 0;
++    SetupDiSetDeviceInstallParamsW(set, device, &params);
++}
++
++/* the staged INFs all live in one directory (setupapi spells it with a slash
++ * after the drive in some places): compare the file names */
++static BOOL same_inf_file(const WCHAR *a, const WCHAR *b)
++{
++    const WCHAR *p;
++
++    for (p = a; *p; p++) if (*p == '\\' || *p == '/') a = p + 1;
++    for (p = b; *p; p++) if (*p == '\\' || *p == '/') b = p + 1;
++    return !lstrcmpiW(a, b);
++}
++
++/* Is the staged package (its INF copy, new_inf) the best driver of the device
++ * among all the INFs installed? setupapi chooses by rank, as Windows does, so
++ * this is "a better match for the device than the driver that is currently
++ * installed" (the current driver is one of the INFs). */
++static BOOL package_is_best_for_device(HDEVINFO set, SP_DEVINFO_DATA *device, const WCHAR *new_inf)
++{
++    SP_DEVINSTALL_PARAMS_W params = {sizeof(params)};
++    SP_DRVINFO_DATA_W drv = {sizeof(drv)};
++    SP_DRVINFO_DETAIL_DATA_W *detail;
++    DWORD size = sizeof(*detail) + MAX_PATH * sizeof(WCHAR);
++    BOOL best = FALSE;
++
++    if (!SetupDiGetDeviceInstallParamsW(set, device, &params)) return FALSE;
++    params.Flags &= ~DI_ENUMSINGLEINF;
++    params.DriverPath[0] = 0;
++    if (!SetupDiSetDeviceInstallParamsW(set, device, &params)) return FALSE;
++    SetupDiDestroyDriverInfoList(set, device, SPDIT_COMPATDRIVER);
++    if (!SetupDiBuildDriverInfoList(set, device, SPDIT_COMPATDRIVER)) return FALSE;
++
++    if (SetupDiCallClassInstaller(DIF_SELECTBESTCOMPATDRV, set, device) || GetLastError() == ERROR_DI_DO_DEFAULT)
++    {
++        if (SetupDiGetSelectedDriverW(set, device, &drv) && (detail = calloc(1, size)))
++        {
++            detail->cbSize = sizeof(*detail);
++            if (SetupDiGetDriverInfoDetailW(set, device, &drv, detail, size, NULL))
++                best = same_inf_file(detail->InfFileName, new_inf);
++            free(detail);
++        }
++    }
++    SetupDiDestroyDriverInfoList(set, device, SPDIT_COMPATDRIVER);
++    return best;
++}
++
++/* Installs the driver package whose INF is inf_path on the devices present
++ * that it matches; unless force, only on a device where it is a better match
++ * than the driver the device has. matched counts the devices the package
++ * matches, installed those it was installed on. */
++static BOOL install_on_devices(const WCHAR *inf_path, BOOL force, BOOL *reboot, DWORD *matched, DWORD *installed)
++{
++    SP_DEVINFO_DATA device = {sizeof(device)};
++    SP_DRVINFO_DATA_W drv = {sizeof(drv)};
++    HDEVINFO set;
++    DWORD i, j;
++
++    *matched = *installed = 0;
++    if ((set = SetupDiGetClassDevsW(NULL, NULL, 0, DIGCF_ALLCLASSES | DIGCF_PRESENT)) == INVALID_HANDLE_VALUE)
++        return FALSE;
++
++    for (i = 0; SetupDiEnumDeviceInfo(set, i, &device); ++i)
++    {
++        BOOL match;
++
++        /* does the package have a driver for this device at all? */
++        match = build_single_inf_list(set, &device, inf_path)
++                && SetupDiEnumDriverInfoW(set, &device, SPDIT_COMPATDRIVER, 0, &drv);
++        end_single_inf_list(set, &device);
++        if (!match) continue;
++        ++*matched;
++
++#ifdef SG_MUTANT_NO_BETTER_MATCH
++        if (0)
++#else
++        if (!force && !package_is_best_for_device(set, &device, inf_path))
++#endif
++        {
++            end_single_inf_list(set, &device);
++            continue;
++        }
++
++        if (!build_single_inf_list(set, &device, inf_path)) { end_single_inf_list(set, &device); continue; }
++        for (j = 0; j < ARRAY_SIZE(dif_list); ++j)
++        {
++            if (!SetupDiCallClassInstaller(dif_list[j], set, &device) && GetLastError() != ERROR_DI_DO_DEFAULT)
++                break;
++        }
++        if (j == ARRAY_SIZE(dif_list))
++        {
++            SP_DEVINSTALL_PARAMS_W params = {sizeof(params)};
++
++            ++*installed;
++            if (SetupDiGetDeviceInstallParamsW(set, &device, &params)
++                    && (params.Flags & (DI_NEEDREBOOT | DI_NEEDRESTART)) && reboot)
++                *reboot = TRUE;
++        }
++        end_single_inf_list(set, &device);
++    }
++
++    SetupDiDestroyDeviceInfoList(set);
++    return TRUE;
++}
++
++/* Wine private: the part of DiInstallDriver that DIFxAPI needs the counts of */
++BOOL WINAPI SgInstallDriverOnDevices(const WCHAR *inf_path, BOOL force, BOOL *reboot, DWORD *matched, DWORD *installed)
++{
++    return install_on_devices(inf_path, force, reboot, matched, installed);
++}
++
++/* The package in the driver store, its INF copy in the system INF directory
++ * (oem_path). The store knows a package by its name and content, so a package
++ * that is already there is the same package: with replace it is "removed and
++ * added again", which leaves what it was, and without it the caller is told. */
++static DWORD stage_package(const WCHAR *inf_path, BOOL replace, WCHAR *oem_path, DWORD size, BOOL *existed)
++{
++    DWORD err;
++
++    *existed = FALSE;
++#ifdef SG_MUTANT_NO_STAGE
++    lstrcpyW(oem_path, inf_path);
++    return ERROR_SUCCESS;
++#endif
++    if (SetupCopyOEMInfW(inf_path, NULL, SPOST_PATH, SP_COPY_NOOVERWRITE, oem_path, size, NULL, NULL))
++        return ERROR_SUCCESS;
++    err = GetLastError();
++    if (err != ERROR_FILE_EXISTS) return err;
++
++    *existed = TRUE;
++    return replace ? ERROR_SUCCESS : ERROR_ALREADY_EXISTS;
++}
++
+ /***********************************************************************
+  *           InstallNewDevice (NEWDEV.@)
+  */
+@@ -47,7 +244,36 @@ BOOL WINAPI InstallNewDevice(HWND hwndParent, LPGUID ClassGuid, PDWORD pReboot)
+  */
+ BOOL WINAPI InstallSelectedDriver(HWND parent, HDEVINFO info, const WCHAR *reserved, BOOL backup, DWORD *reboot)
+ {
+-    FIXME("Stub! %p %p %s %u %p\n", parent, info, debugstr_w(reserved), backup, reboot);
++    SP_DEVINSTALL_PARAMS_W params = {sizeof(params)};
++    SP_DEVINFO_DATA device = {sizeof(device)};
++    DWORD i;
++
++    TRACE("parent %p, info %p, reserved %s, backup %d, reboot %p.\n", parent, info, debugstr_w(reserved), backup, reboot);
++
++    if (reboot) *reboot = 0;
++    if (is_wow64())
++    {
++        SetLastError(ERROR_IN_WOW64);
++        return FALSE;
++    }
++    if (reserved)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    /* "a device information element that represents a selected device and a
++     * selected driver for the device" */
++    if (!SetupDiGetSelectedDevice(info, &device)) return FALSE;
++
++    /* no rollback store is kept: the previous driver is not backed up */
++    for (i = 1; i < ARRAY_SIZE(dif_list); ++i)
++    {
++        if (!SetupDiCallClassInstaller(dif_list[i], info, &device) && GetLastError() != ERROR_DI_DO_DEFAULT)
++            return FALSE;
++    }
++    if (reboot && SetupDiGetDeviceInstallParamsW(info, &device, &params))
++        *reboot = params.Flags & (DI_NEEDREBOOT | DI_NEEDRESTART) ? DI_NEEDREBOOT : 0;
++    SetLastError(ERROR_SUCCESS);
+     return TRUE;
+ }
+ 
+@@ -89,17 +315,6 @@ BOOL WINAPI UpdateDriverForPlugAndPlayDevicesW(HWND parent, const WCHAR *hardwar
+     DWORD size = 0, i, j;
+     HDEVINFO set;
+ 
+-    static const DWORD dif_list[] =
+-    {
+-        DIF_SELECTBESTCOMPATDRV,
+-        DIF_ALLOW_INSTALL,
+-        DIF_INSTALLDEVICEFILES,
+-        DIF_REGISTER_COINSTALLERS,
+-        DIF_INSTALLINTERFACES,
+-        DIF_INSTALLDEVICE,
+-        DIF_NEWDEVICEWIZARD_FINISHINSTALL,
+-    };
+-
+     TRACE("parent %p, hardware_id %s, inf_path %s, flags %#lx, reboot %p.\n",
+             parent, debugstr_w(hardware_id), debugstr_w(inf_path), flags, reboot);
+ 
+@@ -153,8 +368,42 @@ BOOL WINAPI UpdateDriverForPlugAndPlayDevicesW(HWND parent, const WCHAR *hardwar
+  */
+ BOOL WINAPI DiInstallDriverA(HWND parent, const char *inf_path, DWORD flags, BOOL *reboot)
+ {
+-    FIXME("parent %p, inf_path %s, flags %#lx, reboot %p, stub!\n", parent, debugstr_a(inf_path), flags, reboot);
+-    return TRUE;
++    WCHAR inf_pathW[MAX_PATH];
++
++    TRACE("parent %p, inf_path %s, flags %#lx, reboot %p.\n", parent, debugstr_a(inf_path), flags, reboot);
++
++    if (!inf_path)
++    {
++        if (reboot) *reboot = FALSE;
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    if (!MultiByteToWideChar(CP_ACP, 0, inf_path, -1, inf_pathW, ARRAY_SIZE(inf_pathW)))
++    {
++        if (reboot) *reboot = FALSE;
++        SetLastError(ERROR_FILENAME_EXCED_RANGE);
++        return FALSE;
++    }
++    return DiInstallDriverW(parent, inf_pathW, flags, reboot);
++}
++
++static DWORD stage_inf_set(const WCHAR *dir)
++{
++    WIN32_FIND_DATAW find;
++    WCHAR pattern[MAX_PATH], inf[MAX_PATH], oem[MAX_PATH];
++    HANDLE handle;
++    BOOL existed;
++    DWORD err = ERROR_SUCCESS;
++
++    swprintf(pattern, ARRAY_SIZE(pattern), L"%s\\*.inf", dir);
++    if ((handle = FindFirstFileW(pattern, &find)) == INVALID_HANDLE_VALUE) return GetLastError();
++    do
++    {
++        swprintf(inf, ARRAY_SIZE(inf), L"%s\\%s", dir, find.cFileName);
++        if ((err = stage_package(inf, TRUE, oem, ARRAY_SIZE(oem), &existed))) break;
++    } while (FindNextFileW(handle, &find));
++    FindClose(handle);
++    return err;
+ }
+ 
+ /***********************************************************************
+@@ -162,6 +411,48 @@ BOOL WINAPI DiInstallDriverA(HWND parent, const char *inf_path, DWORD flags, BOO
+  */
+ BOOL WINAPI DiInstallDriverW(HWND parent, const WCHAR *inf_path, DWORD flags, BOOL *reboot)
+ {
+-    FIXME("parent %p, inf_path %s, flags %#lx, reboot %p, stub!\n", parent, debugstr_w(inf_path), flags, reboot);
++    DWORD err, matched, installed, attrs;
++    WCHAR oem[MAX_PATH];
++    BOOL existed;
++
++    TRACE("parent %p, inf_path %s, flags %#lx, reboot %p.\n", parent, debugstr_w(inf_path), flags, reboot);
++
++    if (reboot) *reboot = FALSE;
++    if (is_wow64()) { SetLastError(ERROR_IN_WOW64); return FALSE; }
++    if (!inf_path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
++    /* "The value specified for Flags is not equal to zero or DIIRFLAG_FORCE_INF"
++     * (and DIIRFLAG_INSTALL_AS_SET, which the page also describes) */
++    if (flags & ~(DIIRFLAG_FORCE_INF | DIIRFLAG_INSTALL_AS_SET)) { SetLastError(ERROR_INVALID_FLAGS); return FALSE; }
++    if (!is_administrator()) { SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
++    if ((attrs = GetFileAttributesW(inf_path)) == INVALID_FILE_ATTRIBUTES)
++    {
++        SetLastError(ERROR_FILE_NOT_FOUND);
++        return FALSE;
++    }
++
++    if (flags & DIIRFLAG_INSTALL_AS_SET)
++    {
++        /* a directory of INF files: all of them staged, none installed on a
++         * device yet */
++        if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) { SetLastError(ERROR_DIRECTORY); return FALSE; }
++        if ((err = stage_inf_set(inf_path))) { SetLastError(err); return FALSE; }
++        SetLastError(ERROR_SUCCESS);
++        return TRUE;
++    }
++
++    /* "If there is an instance of the same driver package already preinstalled
++     * in the driver store, DiInstallDriver first removes that instance and then
++     * adds the new instance" -- the same package is the one already there */
++    if ((err = stage_package(inf_path, TRUE, oem, ARRAY_SIZE(oem), &existed)))
++    {
++        SetLastError(err);
++        return FALSE;
++    }
++
++    /* then the devices that are present; a package that matches none is still
++     * a success: "TRUE if the function successfully preinstalled the specified
++     * driver package in the driver store" */
++    install_on_devices(oem, !!(flags & DIIRFLAG_FORCE_INF), reboot, &matched, &installed);
++    SetLastError(ERROR_SUCCESS);
+     return TRUE;
+ }
+--- a/dlls/newdev/newdev.spec
++++ b/dlls/newdev/newdev.spec
+@@ -16,3 +16,4 @@
+ @ stub pDiDoDeviceInstallAsAdmin
+ @ stub pDiDoFinishInstallAsAdmin
+ @ stub pDiDoNullDriverInstall
++@ stdcall -private SgInstallDriverOnDevices(wstr long ptr ptr ptr)

@@ -2685,3 +2685,8 @@ test-nsi:
 # apphelp (5502): ShimFlushCache needs an administrator, SdbGetAppPatchDir.
 test-apphelp:
 	WINE=$(PREFIX)/bin/wine test/apphelp-gate.sh
+
+# newdev (5503): DiInstallDriver / InstallSelectedDriver on a test device, under
+# a fresh prefix (no display needed).
+test-newdev:
+	WINE=$(PREFIX)/bin/wine test/newdev-gate.sh
