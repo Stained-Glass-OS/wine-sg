@@ -927,6 +927,10 @@ static void make_advertise_package(const char *file, const char *productcode)
     run(db, "INSERT INTO `Feature` (`Feature`, `Title`, `Level`, `Directory_`, `Attributes`) VALUES ('feat', 'Feature', 1, 'TARGETDIR', 0)");
     run(db, "CREATE TABLE `FeatureComponents` (`Feature_` CHAR(38) NOT NULL, `Component_` CHAR(72) NOT NULL PRIMARY KEY `Feature_`, `Component_`)");
     run(db, "INSERT INTO `FeatureComponents` (`Feature_`, `Component_`) VALUES ('feat', 'comp')");
+    /* a feature above the default install level: only ADVERTISE=ALL (the default of the ADVERTISE action) selects it */
+    run(db, "INSERT INTO `Component` (`Component`, `ComponentId`, `Directory_`, `Attributes`) VALUES ('comp2', '{A1B2C3D4-0000-4000-8000-000000000002}', 'TARGETDIR', 4)");
+    run(db, "INSERT INTO `Feature` (`Feature`, `Title`, `Level`, `Directory_`, `Attributes`) VALUES ('feat2', 'High level feature', 100, 'TARGETDIR', 0)");
+    run(db, "INSERT INTO `FeatureComponents` (`Feature_`, `Component_`) VALUES ('feat2', 'comp2')");
     run(db, "CREATE TABLE `File` (`File` CHAR(72) NOT NULL, `Component_` CHAR(72) NOT NULL, `FileName` CHAR(255) NOT NULL, `FileSize` LONG NOT NULL, `Version` CHAR(72), `Language` CHAR(20), `Attributes` SHORT, `Sequence` SHORT NOT NULL PRIMARY KEY `File`)");
     run(db, "CREATE TABLE `Media` (`DiskId` SHORT NOT NULL, `LastSequence` SHORT NOT NULL, `DiskPrompt` CHAR(64), `Cabinet` CHAR(255), `VolumeLabel` CHAR(32), `Source` CHAR(32) PRIMARY KEY `DiskId`)");
     run(db, "CREATE TABLE `AdvtExecuteSequence` (`Action` CHAR(72) NOT NULL, `Condition` CHAR(255), `Sequence` SHORT PRIMARY KEY `Action`)");
@@ -987,6 +991,7 @@ static void test_advertise(void)
     OK(r == ERROR_SUCCESS, "MsiAdvertiseScript: %u", r);
     OK(MsiQueryProductStateA(pc) == INSTALLSTATE_ADVERTISED, "product advertised: %d", MsiQueryProductStateA(pc));
     OK(MsiQueryFeatureStateA(pc, "feat") == INSTALLSTATE_ADVERTISED, "feature advertised: %d", MsiQueryFeatureStateA(pc, "feat"));
+    OK(MsiQueryFeatureStateA(pc, "feat2") == INSTALLSTATE_ADVERTISED, "feature above the install level advertised (ADVERTISE=ALL): %d", MsiQueryFeatureStateA(pc, "feat2"));
     sz = sizeof(buf);
     r = MsiGetProductInfoA(pc, INSTALLPROPERTY_PRODUCTNAME, buf, &sz);
     OK(r == ERROR_SUCCESS && !strcmp(buf, "SG Advertise Test"), "advertised product name: %u '%s'", r, buf);
@@ -998,12 +1003,515 @@ static void test_advertise(void)
     r = MsiAdvertiseProductExA(path, (const char *)(ULONG_PTR)ADVERTISEFLAGS_MACHINEASSIGN, NULL, 0, 0, 0);
     OK(r == ERROR_SUCCESS, "MsiAdvertiseProductEx machine: %u", r);
     OK(MsiQueryProductStateA(pc) == INSTALLSTATE_ADVERTISED, "directly advertised: %d", MsiQueryProductStateA(pc));
+    OK(MsiQueryFeatureStateA(pc, "feat2") == INSTALLSTATE_ADVERTISED, "directly advertised, high level feature: %d", MsiQueryFeatureStateA(pc, "feat2"));
     r = MsiConfigureProductExA(pc, 0, INSTALLSTATE_ABSENT, NULL);
     OK(r == ERROR_SUCCESS, "uninstall the advertisement: %u", r);
     OK(MsiQueryProductStateA(pc) == INSTALLSTATE_UNKNOWN, "gone after uninstall: %d", MsiQueryProductStateA(pc));
 
     DeleteFileA(script);
     DeleteFileA(path);
+}
+
+
+/* ---------------------------------------------------------------- silent install safety
+ * No window may appear when the UI level is NONE or BASIC, whatever the package contains: a file in use,
+ * a SpawnWaitDialog row, a Cancel button, FilesInUse / MsiRMFilesInUse messages.  A watcher thread polls
+ * the top-level windows of the desktop (every 5 ms) and records each visible window that was not there
+ * before the test; the gate also samples the X server of its own Xvfb (C:\phase.txt names the phase).
+ * FULL is the positive control: the same package must show its dialogs there (and the watcher clicks
+ * them away), otherwise "no window" would prove nothing. */
+
+#include <stdlib.h>
+
+static HWND base_wnds[512];
+static int nbase;
+static volatile LONG w_stop, w_mode;     /* mode 0: observe (and close anything after 6 s), 1: click through the dialogs */
+static volatile LONG nseen, w_wait_seen, w_main_seen, w_cancel_state = -1, w_clicks;
+static char seen_names[32][128];
+static HANDLE w_thread;
+static DWORD w_phase_start;
+
+static BOOL CALLBACK base_cb(HWND h, LPARAM l)
+{
+    if (nbase < 512) base_wnds[nbase++] = h;
+    return TRUE;
+}
+
+static BOOL in_base(HWND h)
+{
+    int i;
+    for (i = 0; i < nbase; i++) if (base_wnds[i] == h) return TRUE;
+    return FALSE;
+}
+
+struct find_btn { const char *text; HWND found; };
+
+static BOOL CALLBACK child_cb(HWND h, LPARAM l)
+{
+    struct find_btn *f = (struct find_btn *)l;
+    char buf[64];
+    if (!f->found && GetWindowTextA(h, buf, sizeof(buf)) && !strcmp(buf, f->text)) f->found = h;
+    return TRUE;
+}
+
+static HWND find_button(HWND top, const char *text)
+{
+    struct find_btn f = { text, NULL };
+    EnumChildWindows(top, child_cb, (LPARAM)&f);
+    return f.found;
+}
+
+static struct { HWND main, wait, track_main, track_wait; DWORD first_main, first_wait; int clicked_wait, clicked_close, clicked_done; } wst;
+
+static BOOL CALLBACK watch_cb(HWND h, LPARAM l)
+{
+    char cls[64], title[64];
+    int i, n;
+
+    if (!IsWindowVisible(h) || in_base(h)) return TRUE;
+    cls[0] = title[0] = 0;
+    GetClassNameA(h, cls, sizeof(cls));
+    GetWindowTextA(h, title, sizeof(title));
+    n = nseen;
+    {
+        char key[128];
+        sprintf(key, "%s|%s", cls, title);
+        for (i = 0; i < n && i < 32; i++) if (!strcmp(seen_names[i], key)) break;
+        if (i == n && n < 32) { strcpy(seen_names[n], key); InterlockedIncrement(&nseen); }
+    }
+    if (w_mode == 1)
+    {
+        if (find_button(h, "Done")) { wst.main = h; if (h != wst.track_main) { wst.track_main = h; wst.first_main = GetTickCount(); } }
+        if (find_button(h, "Close")) { wst.wait = h; if (h != wst.track_wait) { wst.track_wait = h; wst.first_wait = GetTickCount(); } }
+    }
+    else if (GetTickCount() - w_phase_start > 6000)
+        PostMessageA(h, WM_CLOSE, 0, 0);   /* a dialog nobody expected: do not hang the run */
+    if (w_mode == 1 && GetTickCount() - w_phase_start > 12000)
+        PostMessageA(h, WM_CLOSE, 0, 0);   /* the dialogs did not take the clicks: end them */
+    return TRUE;
+}
+
+static BOOL CALLBACK dump_child(HWND h, LPARAM l)
+{
+    char cls[64], t[64];
+    GetClassNameA(h, cls, sizeof(cls)); GetWindowTextA(h, t, sizeof(t));
+    printf("#    child %p %s '%s' vis=%d\n", h, cls, t, IsWindowVisible(h));
+    return TRUE;
+}
+
+static BOOL CALLBACK dump_top(HWND h, LPARAM l)
+{
+    char cls[64], t[64];
+    GetClassNameA(h, cls, sizeof(cls)); GetWindowTextA(h, t, sizeof(t));
+    printf("#  top %p %s '%s' vis=%d base=%d\n", h, cls, t, IsWindowVisible(h), in_base(h));
+    EnumChildWindows(h, dump_child, 0);
+    return TRUE;
+}
+
+static DWORD WINAPI watcher(void *arg)
+{
+    int dumped = 0;
+    while (!w_stop)
+    {
+        HWND b;
+        wst.main = wst.wait = NULL;
+        EnumWindows(watch_cb, 0);
+        if (getenv("SG_DBG") && !dumped && nseen && GetTickCount() - w_phase_start > 2000) { dumped = 1; EnumWindows(dump_top, 0); }
+        if (w_mode == 1)
+        {
+            DWORD now = GetTickCount();
+            if (wst.main && !w_main_seen) { w_main_seen = 1; }
+            if (wst.wait) w_wait_seen = 1;
+            if (wst.wait && !wst.clicked_close && now - wst.first_wait > 150)
+            {
+                if ((b = find_button(wst.wait, "Close"))) { PostMessageA(b, BM_CLICK, 0, 0); wst.clicked_close = 1; w_clicks++; if (getenv("SG_DBG")) printf("# click Close\n"); }
+            }
+            else if (wst.main && !wst.wait && !wst.clicked_wait && now - wst.first_main > 150)
+            {
+                if ((b = find_button(wst.main, "Cancel"))) w_cancel_state = IsWindowEnabled(b) ? 1 : 0;
+                if ((b = find_button(wst.main, "Wait"))) { PostMessageA(b, BM_CLICK, 0, 0); wst.clicked_wait = 1; w_clicks++; if (getenv("SG_DBG")) printf("# click Wait\n"); }
+                else { if ((b = find_button(wst.main, "Done"))) { PostMessageA(b, BM_CLICK, 0, 0); wst.clicked_done = 1; w_clicks++; } }
+            }
+            else if (wst.main && !wst.wait && wst.clicked_wait && wst.clicked_close && !wst.clicked_done)
+            {
+                if ((b = find_button(wst.main, "Done"))) { PostMessageA(b, BM_CLICK, 0, 0); wst.clicked_done = 1; w_clicks++; }
+            }
+            else if (wst.main && !wst.wait && !wst.clicked_wait && now - w_phase_start > 8000) {}
+        }
+        Sleep(5);
+    }
+    return 0;
+}
+
+static void phase_begin(const char *name, int mode)
+{
+    FILE *f;
+    nseen = 0; w_wait_seen = w_main_seen = 0; w_cancel_state = -1; w_clicks = 0;
+    memset(seen_names, 0, sizeof(seen_names));
+    memset(&wst, 0, sizeof(wst));
+    w_mode = mode;
+    w_phase_start = GetTickCount();
+    printf("# phase %s\n", name);
+    if ((f = fopen("C:\\phase.txt", "w"))) { fputs(name, f); fclose(f); }
+}
+
+static void phase_end(void)
+{
+    FILE *f;
+    if ((f = fopen("C:\\phase.txt", "w"))) { fputs("idle", f); fclose(f); }
+}
+
+static void start_watcher(void)
+{
+    EnumWindows(base_cb, 0);
+    w_thread = CreateThread(NULL, 0, watcher, NULL, 0, NULL);
+    phase_end();
+}
+
+static void stop_watcher(void)
+{
+    w_stop = 1;
+    WaitForSingleObject(w_thread, 5000);
+}
+
+static const char *seen_list(void)
+{
+    static char buf[1024];
+    int i;
+    buf[0] = 0;
+    for (i = 0; i < nseen && i < 32; i++) { if (i) strcat(buf, ", "); strncat(buf, seen_names[i], 100); }
+    return buf;
+}
+
+/* ---- the test package ---- */
+
+static volatile LONG ui_counts[32];    /* messages seen by the external UI handler, by type >> 24 */
+
+static int WINAPI count_ui(void *ctx, UINT type, const char *msg)
+{
+    InterlockedIncrement(&ui_counts[(type >> 24) & 31]);
+    return 0;   /* let the internal UI see it as well */
+}
+
+#define MSG_FILESINUSE (INSTALLMESSAGE_FILESINUSE >> 24)
+#define MSG_RMFILESINUSE (INSTALLMESSAGE_RMFILESINUSE >> 24)
+#define MSG_SHOWDIALOG (INSTALLMESSAGE_SHOWDIALOG >> 24)
+#define MSG_COMMONDATA (INSTALLMESSAGE_COMMONDATA >> 24)
+
+static const char *silent_pc = "{5E3C0A55-7B1D-4D1E-9A00-3215000000A1}";
+
+static void run_ok(MSIHANDLE db, const char *fmt)
+{
+    UINT r = run(db, "%s", fmt);
+    OK(r == ERROR_SUCCESS, "setup query failed (%u): %.60s", r, fmt);
+}
+
+static void make_silent_package(const char *file)
+{
+    MSIHANDLE db = 0;
+    UINT r = MsiOpenDatabaseA(file, MSIDBOPEN_CREATE, &db);
+    MSIHANDLE si;
+    OK(!r, "create silent package: %u", r);
+    MsiGetSummaryInformationA(db, NULL, 7, &si);
+    MsiSummaryInfoSetPropertyA(si, 2, VT_LPSTR, 0, NULL, "Installation Database");
+    MsiSummaryInfoSetPropertyA(si, 3, VT_LPSTR, 0, NULL, "Silent install test");
+    MsiSummaryInfoSetPropertyA(si, 4, VT_LPSTR, 0, NULL, "Wine Hackers");
+    MsiSummaryInfoSetPropertyA(si, 7, VT_LPSTR, 0, NULL, ";1033");
+    MsiSummaryInfoSetPropertyA(si, 9, VT_LPSTR, 0, NULL, "{913B8D18-FBB6-4CAC-A239-C74C11E3FA75}");
+    MsiSummaryInfoSetPropertyA(si, 14, VT_I4, 100, NULL, NULL);
+    MsiSummaryInfoSetPropertyA(si, 15, VT_I4, 0, NULL, NULL);
+    MsiSummaryInfoPersist(si);
+    MsiCloseHandle(si);
+    run(db, "CREATE TABLE `Property` (`Property` CHAR(72) NOT NULL, `Value` LONGCHAR NOT NULL PRIMARY KEY `Property`)");
+    run(db, "INSERT INTO `Property` (`Property`, `Value`) VALUES ('ProductCode', '%s')", silent_pc);
+    run(db, "INSERT INTO `Property` (`Property`, `Value`) VALUES ('ProductName', 'SG Silent Test')");
+    run(db, "INSERT INTO `Property` (`Property`, `Value`) VALUES ('ProductVersion', '1.0.0')");
+    run(db, "INSERT INTO `Property` (`Property`, `Value`) VALUES ('ProductLanguage', '1033')");
+    run(db, "INSERT INTO `Property` (`Property`, `Value`) VALUES ('Manufacturer', 'Wine')");
+    run(db, "INSERT INTO `Property` (`Property`, `Value`) VALUES ('ALLUSERS', '1')");
+    run(db, "CREATE TABLE `Directory` (`Directory` CHAR(255) NOT NULL, `Directory_Parent` CHAR(255), `DefaultDir` CHAR(255) NOT NULL PRIMARY KEY `Directory`)");
+    run(db, "INSERT INTO `Directory` (`Directory`, `DefaultDir`) VALUES ('TARGETDIR', 'SourceDir')");
+    run(db, "INSERT INTO `Directory` (`Directory`, `Directory_Parent`, `DefaultDir`) VALUES ('INSTALLDIR', 'TARGETDIR', 'sgtarget:.')");
+    run(db, "CREATE TABLE `Component` (`Component` CHAR(72) NOT NULL, `ComponentId` CHAR(38), `Directory_` CHAR(72) NOT NULL, `Attributes` SHORT NOT NULL, `Condition` CHAR(255), `KeyPath` CHAR(72) PRIMARY KEY `Component`)");
+    run(db, "INSERT INTO `Component` (`Component`, `ComponentId`, `Directory_`, `Attributes`, `KeyPath`) VALUES ('comp', '{A1B2C3D4-0000-4000-8000-000000000032}', 'INSTALLDIR', 0, 'file.txt')");
+    run(db, "CREATE TABLE `Feature` (`Feature` CHAR(38) NOT NULL, `Feature_Parent` CHAR(38), `Title` CHAR(64), `Description` CHAR(255), `Display` SHORT, `Level` SHORT NOT NULL, `Directory_` CHAR(72), `Attributes` SHORT NOT NULL PRIMARY KEY `Feature`)");
+    run(db, "INSERT INTO `Feature` (`Feature`, `Title`, `Level`, `Directory_`, `Attributes`) VALUES ('feat', 'Feature', 1, 'INSTALLDIR', 0)");
+    run(db, "CREATE TABLE `FeatureComponents` (`Feature_` CHAR(38) NOT NULL, `Component_` CHAR(72) NOT NULL PRIMARY KEY `Feature_`, `Component_`)");
+    run(db, "INSERT INTO `FeatureComponents` (`Feature_`, `Component_`) VALUES ('feat', 'comp')");
+    run(db, "CREATE TABLE `File` (`File` CHAR(72) NOT NULL, `Component_` CHAR(72) NOT NULL, `FileName` CHAR(255) NOT NULL, `FileSize` LONG NOT NULL, `Version` CHAR(72), `Language` CHAR(20), `Attributes` SHORT, `Sequence` SHORT NOT NULL PRIMARY KEY `File`)");
+    run(db, "INSERT INTO `File` (`File`, `Component_`, `FileName`, `FileSize`, `Attributes`, `Sequence`) VALUES ('file.txt', 'comp', 'file.txt', 11, 0, 1)");
+    run(db, "CREATE TABLE `Media` (`DiskId` SHORT NOT NULL, `LastSequence` SHORT NOT NULL, `DiskPrompt` CHAR(64), `Cabinet` CHAR(255), `VolumeLabel` CHAR(32), `Source` CHAR(32) PRIMARY KEY `DiskId`)");
+    run(db, "INSERT INTO `Media` (`DiskId`, `LastSequence`) VALUES (1, 1)");
+    run(db, "CREATE TABLE `InstallExecuteSequence` (`Action` CHAR(72) NOT NULL, `Condition` CHAR(255), `Sequence` SHORT PRIMARY KEY `Action`)");
+    {
+        static const struct { const char *a; int n; } seq[] = {
+            { "CostInitialize", 800 }, { "FileCost", 900 }, { "CostFinalize", 1000 }, { "InstallValidate", 1400 },
+            { "InstallInitialize", 1500 }, { "ProcessComponents", 1600 }, { "InstallFiles", 4000 }, { "RemoveFiles", 3500 },
+            { "RegisterProduct", 6100 }, { "PublishFeatures", 6300 }, { "PublishProduct", 6400 }, { "InstallFinalize", 6600 } };
+        unsigned i;
+        for (i = 0; i < sizeof(seq) / sizeof(seq[0]); i++)
+            run(db, "INSERT INTO `InstallExecuteSequence` (`Action`, `Sequence`) VALUES ('%s', %d)", seq[i].a, seq[i].n);
+    }
+    /* the authored UI: a Main dialog with a button that spawns a wait dialog (SpawnWaitDialog until WAITDONE),
+     * a Done button and a Cancel button; the wait dialog has a Close button; FilesInUse / MsiRMFilesInUse */
+    run(db, "CREATE TABLE `InstallUISequence` (`Action` CHAR(72) NOT NULL, `Condition` CHAR(255), `Sequence` SHORT PRIMARY KEY `Action`)");
+    run(db, "INSERT INTO `InstallUISequence` (`Action`, `Sequence`) VALUES ('CostInitialize', 800)");
+    run(db, "INSERT INTO `InstallUISequence` (`Action`, `Sequence`) VALUES ('FileCost', 900)");
+    run(db, "INSERT INTO `InstallUISequence` (`Action`, `Sequence`) VALUES ('CostFinalize', 1000)");
+    run(db, "INSERT INTO `InstallUISequence` (`Action`, `Sequence`) VALUES ('Main', 1250)");
+    run(db, "INSERT INTO `InstallUISequence` (`Action`, `Sequence`) VALUES ('ExecuteAction', 1300)");
+    run(db, "CREATE TABLE `Dialog` (`Dialog` CHAR(72) NOT NULL, `HCentering` SHORT NOT NULL, `VCentering` SHORT NOT NULL, `Width` SHORT NOT NULL, `Height` SHORT NOT NULL, `Attributes` LONG, `Title` CHAR(128) LOCALIZABLE, `Control_First` CHAR(50) NOT NULL, `Control_Default` CHAR(50), `Control_Cancel` CHAR(50) PRIMARY KEY `Dialog`)");
+    run_ok(db, "INSERT INTO `Dialog` (`Dialog`, `HCentering`, `VCentering`, `Width`, `Height`, `Attributes`, `Title`, `Control_First`, `Control_Default`, `Control_Cancel`) VALUES ('Main', 50, 50, 200, 100, 3, 'Main', 'Wait', 'Done', 'Cancel')");
+    run_ok(db, "INSERT INTO `Dialog` (`Dialog`, `HCentering`, `VCentering`, `Width`, `Height`, `Attributes`, `Title`, `Control_First`, `Control_Default`, `Control_Cancel`) VALUES ('Wait', 50, 50, 150, 60, 3, 'Wait', 'Close', 'Close', 'Close')");
+    run_ok(db, "INSERT INTO `Dialog` (`Dialog`, `HCentering`, `VCentering`, `Width`, `Height`, `Attributes`, `Title`, `Control_First`, `Control_Default`, `Control_Cancel`) VALUES ('FilesInUse', 50, 50, 150, 60, 3, 'FilesInUse', 'Close', 'Close', 'Close')");
+    run_ok(db, "INSERT INTO `Dialog` (`Dialog`, `HCentering`, `VCentering`, `Width`, `Height`, `Attributes`, `Title`, `Control_First`, `Control_Default`, `Control_Cancel`) VALUES ('MsiRMFilesInUse', 50, 50, 150, 60, 3, 'MsiRMFilesInUse', 'Close', 'Close', 'Close')");
+    run(db, "CREATE TABLE `Control` (`Dialog_` CHAR(72) NOT NULL, `Control` CHAR(50) NOT NULL, `Type` CHAR(20) NOT NULL, `X` SHORT NOT NULL, `Y` SHORT NOT NULL, `Width` SHORT NOT NULL, `Height` SHORT NOT NULL, `Attributes` LONG, `Property` CHAR(50), `Text` CHAR(0) LOCALIZABLE, `Control_Next` CHAR(50), `Help` CHAR(50) LOCALIZABLE PRIMARY KEY `Dialog_`, `Control`)");
+    run_ok(db, "INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES ('Main', 'Wait', 'PushButton', 10, 10, 50, 15, 3, NULL, 'Wait', 'Done', NULL)");
+    run_ok(db, "INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES ('Main', 'Done', 'PushButton', 70, 10, 50, 15, 3, NULL, 'Done', 'Cancel', NULL)");
+    run_ok(db, "INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES ('Main', 'Cancel', 'PushButton', 130, 10, 50, 15, 3, NULL, 'Cancel', 'Wait', NULL)");
+    run_ok(db, "INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES ('Wait', 'Close', 'PushButton', 10, 10, 50, 15, 3, NULL, 'Close', 'Close', NULL)");
+    run_ok(db, "INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES ('FilesInUse', 'Close', 'PushButton', 10, 10, 50, 15, 3, NULL, 'Close', 'Close', NULL)");
+    run_ok(db, "INSERT INTO `Control` (`Dialog_`, `Control`, `Type`, `X`, `Y`, `Width`, `Height`, `Attributes`, `Property`, `Text`, `Control_Next`, `Help`) VALUES ('MsiRMFilesInUse', 'Close', 'PushButton', 10, 10, 50, 15, 3, NULL, 'Close', 'Close', NULL)");
+    run(db, "CREATE TABLE `ControlEvent` (`Dialog_` CHAR(72) NOT NULL, `Control_` CHAR(50) NOT NULL, `Event` CHAR(50) NOT NULL, `Argument` CHAR(255) NOT NULL, `Condition` CHAR(255), `Ordering` SHORT PRIMARY KEY `Dialog_`, `Control_`, `Event`, `Argument`, `Condition`)");
+    run_ok(db, "INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Condition`, `Ordering`) VALUES ('Main', 'Wait', 'SpawnWaitDialog', 'Wait', 'WAITDONE', 1)");
+    run_ok(db, "INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Condition`, `Ordering`) VALUES ('Main', 'Done', 'EndDialog', 'Return', '1', 1)");
+    run_ok(db, "INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Condition`, `Ordering`) VALUES ('Main', 'Cancel', 'EndDialog', 'Exit', '1', 1)");
+    run_ok(db, "INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Condition`, `Ordering`) VALUES ('Wait', 'Close', 'EndDialog', 'Return', '1', 1)");
+    run_ok(db, "INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Condition`, `Ordering`) VALUES ('FilesInUse', 'Close', 'EndDialog', 'Return', '1', 1)");
+    run_ok(db, "INSERT INTO `ControlEvent` (`Dialog_`, `Control_`, `Event`, `Argument`, `Condition`, `Ordering`) VALUES ('MsiRMFilesInUse', 'Close', 'EndDialog', 'Return', '1', 1)");
+    MsiDatabaseCommit(db);
+    MsiCloseHandle(db);
+}
+
+static void put_file(const char *path, const char *content)
+{
+    FILE *f = fopen(path, "wb");
+    if (f) { fputs(content, f); fclose(f); }
+}
+
+static int read_file(const char *path, char *buf, int size)
+{
+    FILE *f = fopen(path, "rb");
+    int n;
+    if (!f) return -1;
+    n = fread(buf, 1, size - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    return n;
+}
+
+static const char *lvl_name(int l)
+{
+    return l == INSTALLUILEVEL_NONE ? "NONE" : l == INSTALLUILEVEL_BASIC ? "BASIC" : l == INSTALLUILEVEL_REDUCED ? "REDUCED" : "FULL";
+}
+
+static UINT remove_product(int silent, const char *lv)
+{
+    char name[64];
+    UINT r;
+
+    sprintf(name, "remove-%s", lv);
+    phase_begin(name, silent ? 0 : 1);
+    r = MsiConfigureProductExA(silent_pc, 0, INSTALLSTATE_ABSENT, "REBOOT=ReallySuppress");
+    phase_end();
+    if (silent) OK(nseen == 0, "[%s] a window appeared during the uninstall: %s", lv, seen_list());
+    return r;
+}
+
+static BOOL pending_rename_has(const char *needle)
+{
+    char buf[4096];
+    DWORD sz = sizeof(buf) - 1, type, i;
+    HKEY key;
+    BOOL ret = FALSE;
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager", 0, KEY_READ, &key)) return FALSE;
+    if (!RegQueryValueExA(key, "PendingFileRenameOperations", NULL, &type, (BYTE *)buf, &sz) && type == REG_MULTI_SZ)
+    {
+        for (i = 0; i < sz; i++) if (!buf[i]) buf[i] = '|';
+        buf[sz] = 0;
+        ret = strstr(buf, needle) != NULL;
+    }
+    RegCloseKey(key);
+    return ret;
+}
+
+static void clear_pending_renames(void)
+{
+    HKEY key;
+    if (!RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager", 0, KEY_WRITE, &key))
+    {
+        RegDeleteValueA(key, "PendingFileRenameOperations");
+        RegCloseKey(key);
+    }
+}
+
+static void test_silent_level(int level, const char *pkg)
+{
+    char name[64], cmd[512], buf[64];
+    MSIHANDLE db = 0, hpkg = 0, rec;
+    HANDLE hold;
+    FILETIME ft;
+    UINT r;
+    int silent = level == INSTALLUILEVEL_NONE || level == INSTALLUILEVEL_BASIC;
+    int i;
+    const char *lv = lvl_name(level);
+
+    sprintf(cmd, "TARGETDIR=C:\\sgdir ALLUSERS=1 REBOOT=ReallySuppress");
+    MsiSetInternalUI(level, NULL);
+    MsiSetExternalUIA(count_ui, INSTALLLOGMODE_FILESINUSE | INSTALLLOGMODE_RMFILESINUSE | INSTALLLOGMODE_SHOWDIALOG |
+                      INSTALLLOGMODE_COMMONDATA, NULL);
+
+    /* 1. an ordinary install, the package carries a UI sequence with the Main / Wait dialogs */
+    memset((void *)ui_counts, 0, sizeof(ui_counts));
+    sprintf(name, "install-%s", lv);
+    phase_begin(name, silent ? 0 : 1);
+    DeleteFileA("C:\\sgdir\\sgtarget\\file.txt");
+    r = MsiInstallProductA(pkg, cmd);
+    phase_end();
+    OK(r == ERROR_SUCCESS, "[%s] install: %u", lv, r);
+    r = read_file("C:\\sgdir\\sgtarget\\file.txt", buf, sizeof(buf));
+    OK(r == 11 && !strcmp(buf, "hello world"), "[%s] file installed: %d '%s'", lv, (int)r, buf);
+    OK(MsiQueryProductStateA(silent_pc) == INSTALLSTATE_DEFAULT, "[%s] product installed: %d", lv, MsiQueryProductStateA(silent_pc));
+    if (silent)
+    {
+        OK(nseen == 0, "[%s] a window appeared during the install: %s", lv, seen_list());
+        OK(ui_counts[MSG_SHOWDIALOG] == 0, "[%s] SHOWDIALOG sent %ld times: the UI sequence must not run", lv, ui_counts[MSG_SHOWDIALOG]);
+    }
+    else
+    {
+        OK(w_main_seen && w_wait_seen, "[%s] positive control: Main dialog %ld, SpawnWaitDialog wait dialog %ld; windows: %s", lv, w_main_seen, w_wait_seen, seen_list());
+        OK(w_clicks == 3, "[%s] positive control: %ld clicks", lv, w_clicks);
+        OK(ui_counts[MSG_SHOWDIALOG] >= 1, "[%s] SHOWDIALOG sent %ld times", lv, ui_counts[MSG_SHOWDIALOG]);
+    }
+    r = remove_product(silent, lv);
+    OK(r == ERROR_SUCCESS, "[%s] uninstall: %u", lv, r);
+
+    /* 2. a file in use: the target is open without sharing while the package is installed */
+    MsiSetInternalUI(level, NULL);
+    CreateDirectoryA("C:\\sgdir\\sgtarget", NULL);
+    put_file("C:\\sgdir\\sgtarget\\file.txt", "old content");
+    hold = CreateFileA("C:\\sgdir\\sgtarget\\file.txt", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    OK(hold != INVALID_HANDLE_VALUE, "[%s] hold the target: %lu", lv, GetLastError());
+    memset(&ft, 0, sizeof(ft));
+    ft.dwHighDateTime = 0x01b00000;   /* long ago: the package file is newer, so the install wants to replace it */
+    SetFileTime(hold, &ft, &ft, &ft);
+    memset((void *)ui_counts, 0, sizeof(ui_counts));
+    sprintf(name, "inuse-%s", lv);
+    phase_begin(name, silent ? 0 : 1);
+    r = MsiInstallProductA(pkg, cmd);
+    phase_end();
+    OK(r == ERROR_SUCCESS_REBOOT_REQUIRED, "[%s] install with the file in use: %u (documented: ERROR_SUCCESS_REBOOT_REQUIRED, the replacement waits for a restart)", lv, r);
+    OK(pending_rename_has("sgtarget\\file.txt"), "[%s] the replacement of the file in use is queued in PendingFileRenameOperations", lv);
+    clear_pending_renames();
+    if (silent)
+        OK(nseen == 0, "[%s] a window appeared although a file was in use: %s", lv, seen_list());
+    else
+        OK(w_main_seen, "[%s] positive control: the authored dialogs show", lv);
+    CloseHandle(hold);
+    remove_product(silent, lv);
+    DeleteFileA("C:\\sgdir\\sgtarget\\file.txt");
+
+    /* 3. messages sent to the internal UI: FilesInUse, MsiRMFilesInUse, Cancel button, SHOWDIALOG, CommonData */
+    MsiSetInternalUI(level, NULL);
+    r = MsiOpenDatabaseA(pkg, MSIDBOPEN_READONLY, &db);
+    OK(!r, "[%s] open the package database: %u", lv, r);
+    sprintf(name, "#%lu", (unsigned long)db);
+    r = MsiOpenPackageA(name, &hpkg);
+    OK(!r, "[%s] open package: %u", lv, r);
+    if (hpkg)
+    {
+        for (i = 0; i < 4; i++)
+        {
+            static const struct { INSTALLMESSAGE type; const char *name; } msg[] = {
+                { INSTALLMESSAGE_FILESINUSE, "FILESINUSE" }, { INSTALLMESSAGE_RMFILESINUSE, "RMFILESINUSE" },
+                { INSTALLMESSAGE_COMMONDATA, "COMMONDATA cancel" }, { INSTALLMESSAGE_RESOLVESOURCE, "RESOLVESOURCE" } };
+            int res;
+
+            rec = MsiCreateRecord(3);
+            if (i == 2) { MsiRecordSetInteger(rec, 1, 2); MsiRecordSetInteger(rec, 2, 0); }
+            else { MsiRecordSetStringA(rec, 1, "C:\\sgdir\\sgtarget\\file.txt"); MsiRecordSetStringA(rec, 2, "sg.exe"); }
+            sprintf(name, "msg%d-%s", i, lv);
+            phase_begin(name, silent ? 0 : 1);
+            res = MsiProcessMessage(hpkg, msg[i].type, rec);
+            phase_end();
+            OK(res == 0, "[%s] %s: result %d", lv, msg[i].name, res);
+            if (silent)
+                OK(nseen == 0, "[%s] %s showed a window: %s", lv, msg[i].name, seen_list());
+            else if (i < 2)
+                OK(w_wait_seen, "[%s] %s shows the package's own dialog", lv, msg[i].name);
+            else
+                OK(nseen == 0, "[%s] %s must not show a window: %s", lv, msg[i].name, seen_list());
+            MsiCloseHandle(rec);
+        }
+
+        /* a plain USER message: no message box at NONE (BASIC does show errors, as Windows does) */
+        if (level == INSTALLUILEVEL_NONE)
+        {
+            rec = MsiCreateRecord(1);
+            MsiRecordSetStringA(rec, 0, "this message must not be shown");
+            phase_begin("usermsg-NONE", 0);
+            r = MsiProcessMessage(hpkg, INSTALLMESSAGE_USER | MB_OK, rec);
+            phase_end();
+            OK(nseen == 0, "[NONE] a USER message opened a window: %s", seen_list());
+            OK(r == 0, "[NONE] USER message result %d", (int)r);
+            MsiCloseHandle(rec);
+        }
+
+        /* SHOWDIALOG for an authored dialog: nothing at NONE, and nothing at BASIC (no authored dialogs there) */
+        if (silent)
+        {
+            rec = MsiCreateRecord(1);
+            MsiRecordSetStringA(rec, 0, "Main");
+            sprintf(name, "showdialog-%s", lv);
+            phase_begin(name, 0);
+            r = MsiProcessMessage(hpkg, INSTALLMESSAGE_SHOWDIALOG, rec);
+            phase_end();
+            OK(nseen == 0, "[%s] SHOWDIALOG showed a window: %s", lv, seen_list());
+            OK(r == 0, "[%s] SHOWDIALOG result %d", lv, (int)r);
+            MsiCloseHandle(rec);
+        }
+        else
+        {
+            /* positive control for the Cancel button: COMMONDATA disables it for the dialogs that follow */
+            rec = MsiCreateRecord(2);
+            MsiRecordSetInteger(rec, 1, 2);
+            MsiRecordSetInteger(rec, 2, 0);
+            MsiProcessMessage(hpkg, INSTALLMESSAGE_COMMONDATA, rec);
+            MsiCloseHandle(rec);
+            rec = MsiCreateRecord(1);
+            MsiRecordSetStringA(rec, 0, "Main");
+            phase_begin("showdialog-FULL", 1);
+            r = MsiProcessMessage(hpkg, INSTALLMESSAGE_SHOWDIALOG, rec);
+            phase_end();
+            OK(w_main_seen, "[%s] SHOWDIALOG shows the authored dialog", lv);
+            OK(w_cancel_state == 0, "[%s] COMMONDATA 2 disabled the Cancel button of the next dialog: %ld", lv, w_cancel_state);
+            MsiCloseHandle(rec);
+        }
+        MsiCloseHandle(hpkg);
+    }
+    if (db) MsiCloseHandle(db);
+    MsiSetExternalUIA(NULL, 0, NULL);
+}
+
+static void test_silent(void)
+{
+    char pkg[MAX_PATH];
+
+    CreateDirectoryA("C:\\sgsrc", NULL);
+    CreateDirectoryA("C:\\sgdir", NULL);
+    put_file("C:\\sgsrc\\file.txt", "hello world");
+    strcpy(pkg, "C:\\sgsrc\\fastmsib1-silent.msi");
+    DeleteFileA(pkg);
+    make_silent_package(pkg);
+
+    start_watcher();
+    test_silent_level(INSTALLUILEVEL_NONE, pkg);
+    test_silent_level(INSTALLUILEVEL_BASIC, pkg);
+    test_silent_level(INSTALLUILEVEL_FULL, pkg);
+    stop_watcher();
+    MsiSetInternalUI(INSTALLUILEVEL_NONE, NULL);
+    DeleteFileA(pkg);
 }
 
 int main(void)
@@ -1018,6 +1526,7 @@ int main(void)
     test_streams();
     test_storages();
     test_advertise();
+    test_silent();
     printf("checks %d, failures %d\n", checks, fails);
     printf("RESULT: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
