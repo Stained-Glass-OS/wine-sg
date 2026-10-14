@@ -2706,3 +2706,11 @@ test-difxapi:
 # tbs (5517): argument checks before TBS_E_TPM_NOT_FOUND.
 test-tbs:
 	WINE=$(PREFIX)/bin/wine test/tbs-gate.sh
+
+# setx (5520): command line and registry modes.
+test-setx:
+	WINE=$(PREFIX)/bin/wine test/setx-gate.sh
+
+# arp (5520): the ARP table, -s and -d.
+test-arp:
+	WINE=$(PREFIX)/bin/wine test/arp-gate.sh

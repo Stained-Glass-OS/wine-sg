@@ -130,3 +130,7 @@ VHD/VHDX/ISO images mapped as block devices need image parsing and a privileged 
 ## websocket: the protocol component (batch 5519)
 
 WebSocketCreateClientHandle, AbortHandle and DeleteHandle belong to a state machine of which ten other exports are still stubs; implementing the handle alone would be a handle that does nothing. A patch series of its own.
+
+## subst (batch 5520)
+
+Drive mappings made with DefineDosDevice are not followed by ntdll's file name resolution (nt_to_unix_file_name uses the prefix's dosdevices directory only), so a subst that only defines the link does nothing for file access. Decision needed: resolve \DosDevices symbolic link objects in ntdll (Windows' semantic, a change in every file open's path) or have subst write a dosdevices symlink (persistent across sessions, not possible for a non-owner of a shared prefix).
