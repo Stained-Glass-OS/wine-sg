@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# NetworkInformation: GetProxyConfigurationAsync and GetSortedEndpointPairs (patches 3668): runs windows.networking.connectivity_test.exe from the build tree
+# NetworkInformation: proxy configuration, endpoint pair sorting, FindConnectionProfilesAsync (patches 3668-3669): runs windows.networking.connectivity_test.exe from the build tree
 #
 #   WINE=/path/to/build/wine test/fastb-gapconnectivity-gate.sh      (needs dlls/windows.networking.connectivity/tests built beside it)
 #   SG_XVFB_N=260 to name the display
