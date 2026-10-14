@@ -6,7 +6,7 @@
 # ntoskrnl.exe_test.exe from a build tree and fails on any failure in driver_pnp.c.
 #
 #   WINE=/path/to/build/wine test/ntoskrnl-pnptest-gate.sh   (SKIP without the built test)
-# Mutants: SG_MUTANT_POWER_REQUEST, SG_MUTANT_POWER_PREVIOUS (pnp.c); the later PnP patches list theirs here.
+# Mutants: SG_MUTANT_POWER_REQUEST, SG_MUTANT_POWER_PREVIOUS, SG_MUTANT_IFACES_EMPTY, SG_MUTANT_IFACES_ALL (pnp.c); the later PnP patches list theirs here.
 # SG_MUTANT_NOTIFY_NONE, SG_MUTANT_NOTIFY_NO_EXISTING (pnp.c); SG_MUTANT_DEVPROP_DRIVERKEY (pnp.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
