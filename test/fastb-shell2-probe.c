@@ -218,6 +218,49 @@ static void test_assoc(void)
     SHDeleteValueW(HKEY_LOCAL_MACHINE, L"Software\\RegisteredApplications", L"SGQOther");
 }
 
+
+static void test_getstring(void)
+{
+    IQueryAssociations *qa = NULL;
+    WCHAR buf[256];
+    DWORD n;
+    HRESULT hr;
+    BYTE data[16];
+
+    RegSetKeyValueW(HKEY_CLASSES_ROOT, L".sgq9", NULL, REG_SZ, L"SGQ9.File", 20);
+    setreg(HKEY_CLASSES_ROOT, L"SGQ9.File\\shell\\open\\command", NULL, L"\"C:\\windows\\notepad.exe\" \"%1\"");
+    setreg(HKEY_CLASSES_ROOT, L"SGQ9.File\\shell\\open\\ddeexec", NULL, L"[open(\"%1\")]");
+    setreg(HKEY_CLASSES_ROOT, L"SGQ9.File\\shell\\open\\ddeexec\\application", NULL, L"SGApp");
+    setreg(HKEY_CLASSES_ROOT, L"SGQ9.File\\shell\\open\\ddeexec\\topic", NULL, L"System");
+    setreg(HKEY_CLASSES_ROOT, L"SGQ9.File\\shell\\open\\DropTarget", L"CLSID", L"{11111111-2222-3333-4444-555555555555}");
+    setreg(HKEY_CLASSES_ROOT, L"SGQ9.File", L"InfoTip", L"my tip");
+    RegSetKeyValueW(HKEY_CLASSES_ROOT, L"SGQ9.File", L"EditFlags", REG_DWORD, "\x01\0\0\0", 4);
+    hr = CoCreateInstance(&CLSID_QueryAssociations, NULL, CLSCTX_INPROC_SERVER, &IID_IQueryAssociations, (void **)&qa);
+    CHECK(hr == S_OK, "QA %#lx", hr);
+    if (!qa) return;
+    hr = qa->lpVtbl->Init(qa, 0, L".sgq9", NULL, NULL);
+    CHECK(hr == S_OK, "Init %#lx", hr);
+#define GS(id, expect) do { n = 256; buf[0] = 0; hr = qa->lpVtbl->GetString(qa, 0, id, NULL, buf, &n); \
+    CHECK(hr == S_OK && !lstrcmpW(buf, expect), "GetString %d: %#lx %ls", id, hr, buf); } while (0)
+    GS(7, L"[open(\"%1\")]");
+    GS(9, L"SGApp");
+    GS(10, L"System");
+    GS(11, L"my tip");
+    GS(17, L"{11111111-2222-3333-4444-555555555555}");
+    n = 256; hr = qa->lpVtbl->GetString(qa, 0, 8, NULL, buf, &n);
+    CHECK(FAILED(hr), "no ifexec: %#lx", hr);
+    n = 256; hr = qa->lpVtbl->GetString(qa, 0, 12, NULL, buf, &n);
+    CHECK(FAILED(hr), "no quicktip: %#lx", hr);
+    n = 16;
+    hr = qa->lpVtbl->GetData(qa, 0, 6, L"EditFlags", data, &n);
+    CHECK(hr == S_OK && n == 4 && data[0] == 1, "ASSOCDATA_VALUE %#lx n=%lu", hr, n);
+    n = 16;
+    hr = qa->lpVtbl->GetData(qa, 0, 6, L"NoSuchValue", data, &n);
+    CHECK(FAILED(hr), "missing value %#lx", hr);
+    qa->lpVtbl->Release(qa);
+    SHDeleteKeyW(HKEY_CLASSES_ROOT, L"SGQ9.File"); SHDeleteKeyW(HKEY_CLASSES_ROOT, L".sgq9");
+}
+
 static void test_dataobject(void)
 {
     ITEMIDLIST *folder = NULL, *item = NULL, *full = NULL;
@@ -490,6 +533,7 @@ int main(void)
 {
     CoInitialize(NULL);
     test_assoc();
+    test_getstring();
     test_dataobject();
     test_descid();
     test_enum_clone();

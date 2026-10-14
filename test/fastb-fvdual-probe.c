@@ -209,6 +209,21 @@ int main(void)
             }
             SysFreeString(cols);
         }
+        {
+            IFolderView2 *fv2 = NULL;
+            int cols = 0;
+            hr = IShellView_QueryInterface(view, &IID_IFolderView2, (void **)&fv2);
+            if (fv2)
+            {
+                hr = IFolderView2_GetSortColumnCount(fv2, &cols);
+                CHECK(hr == S_OK && cols == 1, "GetSortColumnCount %#lx %d", hr, cols);
+                hr = IFolderView2_DoRename(fv2);
+                CHECK(hr == S_OK, "DoRename %#lx", hr);
+                CHECK(FindWindowExW(list, NULL, L"Edit", NULL) != NULL || FindWindowExW(GetWindow(list, GW_CHILD), NULL, L"Edit", NULL) != NULL
+                      || FindWindowW(L"Edit", NULL) != NULL, "label edit control");
+                IFolderView2_Release(fv2);
+            }
+        }
         if (second) FolderItem_Release(second);
         if (all) FolderItems_Release(all);
         if (f) Folder_Release(f);
