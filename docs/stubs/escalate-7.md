@@ -70,3 +70,13 @@ assembly (the dispositions STILL_IN_USE, HAS_INSTALL_REFERENCES, REFERENCE_NOT_F
 `References` list in the assembly's directory next to its manifest, written by InstallAssembly when a
 reference is given; CreateAssemblyCacheItem then becomes a wrapper that stages streams in a temp
 directory and calls the existing install path on Commit. Both change what lands in the shared WinSxS.
+
+## ws2_32: UDP connection reset and socket reuse (server work)
+
+- `SIO_UDP_CONNRESET`: Windows reports an ICMP port-unreachable for a UDP socket as `WSAECONNRESET` on the next
+  receive unless the ioctl turned it off. Wine's afd never produces it (Linux needs `IP_RECVERR`/`IPV6_RECVERR`
+  and reading the error queue). Proposal: the server enables RECVERR on UDP sockets, maps `ECONNREFUSED` from
+  `MSG_ERRQUEUE` to a per-socket pending `STATUS_CONNECTION_RESET`, and honours the ioctl's flag (default on,
+  as on Windows). It changes what UDP programs see by default, so it wants a broad network-program test run.
+- `DisconnectEx` with `TF_REUSE_SOCKET`: the afd socket object needs a "reset" request that replaces the Linux
+  fd with a fresh one of the same type and returns the object to the unconnected state.
