@@ -2740,3 +2740,6 @@ test-dllhost:
 
 test-epmap:
 	@echo "run the rpcrt4 rpc test (test_endpoint_inquiry): make -C build/obj dlls/rpcrt4/tests/rpc.ok"
+
+test-loadperf:
+	WINE=$(PREFIX)/bin/wine test/loadperf-gate.sh
