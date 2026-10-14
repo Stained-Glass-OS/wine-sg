@@ -53,6 +53,33 @@ static void pump(DWORD ms, HWND hwnd, int *min_r, int *max_r, int *min_b, int *m
     }
 }
 
+/* run the message loop and count the thread timer messages (the animation timer) */
+static int count_timers(DWORD ms)
+{
+    DWORD end = GetTickCount() + ms;
+    MSG msg;
+    int n = 0;
+
+    while (GetTickCount() < end)
+    {
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE))
+        {
+            if (msg.message == WM_TIMER && !msg.hwnd) n++;
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        Sleep(5);
+    }
+    return n;
+}
+
+static ULONGLONG cpu_ms(void)
+{
+    FILETIME c, e, k, u;
+    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    return (((ULONGLONG)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((ULONGLONG)u.dwHighDateTime << 32 | u.dwLowDateTime)) / 10000;
+}
+
 static COLORREF pixel(HWND hwnd, int x, int y)
 {
     HDC dc = GetDC(hwnd);
@@ -176,6 +203,63 @@ int main(void)
         CHECK(!BufferedPaintRenderAnimation(hwnd, dc), "render after stopping");
     }
     ReleaseDC(hwnd, dc);
+
+    /* the window goes away while its animation runs: the timer must end with it
+     * (a leak was 15 ms timer messages for ever), and the idle process stays idle */
+    {
+        HWND h2 = CreateWindowA("SgUxAnim", "gone", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 200, 200, NULL, NULL, wc.hInstance, NULL);
+        HDC dc2 = GetDC(h2);
+        RECT r2 = { 0, 0, 50, 50 };
+        int ticks;
+        ULONGLONG cpu;
+
+        count_timers(100);
+        ap.dwDuration = 60000;
+        anim = BeginBufferedAnimation(h2, dc2, &r2, BPBF_COMPATIBLEBITMAP, NULL, &ap, &from, &to);
+        CHECK(anim != NULL, "begin on the doomed window");
+        if (anim)
+        {
+            fill(from, &r2, RGB(255, 0, 0));
+            fill(to, &r2, RGB(0, 0, 255));
+            EndBufferedAnimation(anim, TRUE);
+            ticks = count_timers(200);
+            CHECK(ticks >= 3, "the animation timer runs while the window lives: %d", ticks);
+            ReleaseDC(h2, dc2);
+            DestroyWindow(h2);
+            count_timers(100);
+            cpu = cpu_ms();
+            ticks = count_timers(1500);
+            CHECK(ticks <= 2, "animation timer still ticking after the window was destroyed: %d messages in 1.5 s", ticks);
+            cpu = cpu_ms() - cpu;
+            CHECK(cpu < 150, "busy after the window was destroyed: %I64u ms of CPU in 1.5 s", cpu);
+        }
+        else { ReleaseDC(h2, dc2); DestroyWindow(h2); }
+    }
+
+    /* BufferedPaintUnInit ends the thread's animations */
+    {
+        HDC dc3 = GetDC(hwnd);
+        int ticks;
+
+        BufferedPaintInit();
+        ap.dwDuration = 60000;
+        anim = BeginBufferedAnimation(hwnd, dc3, &rc, BPBF_COMPATIBLEBITMAP, NULL, &ap, &from, &to);
+        CHECK(anim != NULL, "begin before UnInit");
+        if (anim)
+        {
+            fill(from, &rc, RGB(255, 0, 0));
+            fill(to, &rc, RGB(0, 0, 255));
+            EndBufferedAnimation(anim, TRUE);
+            ticks = count_timers(150);
+            CHECK(ticks >= 3, "timer runs before UnInit: %d", ticks);
+            CHECK(BufferedPaintUnInit() == S_OK, "UnInit");
+            count_timers(100);
+            ticks = count_timers(500);
+            CHECK(ticks <= 1, "animation timer still ticking after BufferedPaintUnInit: %d", ticks);
+            CHECK(EndBufferedAnimation(anim, TRUE) == E_INVALIDARG, "animation handle survived UnInit");
+        }
+        ReleaseDC(hwnd, dc3);
+    }
 
     /* hit testing */
     theme = OpenThemeData(hwnd, L"Window");
