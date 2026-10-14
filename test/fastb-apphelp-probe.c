@@ -91,6 +91,37 @@ int main(void)
         wcscpy(buf, L"junk"); pDir(NULL, buf, 256); CHECK(!wcscmp(buf, want), "AppPatch dir '%ls'", buf);
         wcscpy(buf, L"junk"); pDir(NULL, buf, 4); CHECK(!buf[0], "too small a buffer gives an empty string");
     }
+    {
+        /* ShimFlushCache: "the caller must be an administrator" */
+        BOOL (WINAPI *pFlush)(HWND, HINSTANCE, const char *, int) = (void *)GetProcAddress(m, "ShimFlushCache");
+        BYTE sidbuf[SECURITY_MAX_SID_SIZE]; DWORD sl = sizeof(sidbuf); SID_AND_ATTRIBUTES dis;
+        HANDLE tok = NULL, restricted = NULL, imp = NULL; BOOL admin = FALSE;
+
+        CHECK(pFlush != NULL, "no ShimFlushCache");
+        CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, sidbuf, &sl);
+        CheckTokenMembership(NULL, sidbuf, &admin);
+        CHECK(admin, "this test runs as an administrator");
+        SetLastError(0xdeadbeef);
+        if (pFlush) { ret = pFlush(NULL, NULL, NULL, 0); CHECK(ret, "administrator: ShimFlushCache %d %lu", ret, GetLastError()); }
+        dis.Sid = sidbuf; dis.Attributes = 0;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &tok) &&
+            CreateRestrictedToken(tok, 0, 1, &dis, 0, NULL, 0, NULL, &restricted) &&
+            DuplicateTokenEx(restricted, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenImpersonation, &imp) &&
+            SetThreadToken(NULL, imp))
+        {
+            BOOL still = TRUE;
+            CheckTokenMembership(NULL, sidbuf, &still);
+            CHECK(!still, "the restricted token is no administrator");
+            if (pFlush)
+            {
+                SetLastError(0xdeadbeef);
+                ret = pFlush(NULL, NULL, NULL, 0);
+                CHECK(!ret && GetLastError() == ERROR_ACCESS_DENIED, "non administrator: ShimFlushCache %d %lu", ret, GetLastError());
+            }
+            SetThreadToken(NULL, NULL);
+        }
+        else CHECK(0, "no restricted token: %lu", GetLastError());
+    }
     printf("%s\n", f ? "RESULT: FAIL" : "RESULT: PASS");
     return f != 0;
 }
