@@ -1,0 +1,1673 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 08:49:32 -0700
+Subject: [PATCH] 3224 imm32: user dictionary, conversion and candidates,
+ WM_IME_CONTROL and hot keys of the built-in IME (CORE review)
+
+The built-in IME answered most of its entry points with a FIXME and
+ERROR_CALL_NOT_IMPLEMENTED.  It now has what the documentation describes:
+
+ - a user dictionary in HKCU\Software\Wine\IME\UserDictionary: ImeRegisterWord,
+   ImeUnregisterWord, ImeEnumRegisterWord (NULL / 0 as wildcards, the last
+   callback value is returned), ImeGetRegisterWordStyle (the EUDC style and
+   one user style) and ImeConversionList (GCL_CONVERSION, GCL_REVERSECONVERSION,
+   GCL_REVERSE_LENGTH); ImeConfigure shows a small dialog to register, list
+   and remove words; ImeEscape answers IME_ESC_QUERY_SUPPORT, IME_ESC_IME_NAME
+   and the EUDC dictionary path; ImeGetImeMenuItems reports no items.
+ - the IME window answers the ten WM_IME_CONTROL commands (candidate,
+   composition and status positions, composition font, open/close status
+   window) through the input context.
+ - ImeSetCompositionString takes the reading string and handles
+   SCS_CHANGEATTR and SCS_CHANGECLAUSE; NotifyIME handles CPS_CONVERT
+   (the dictionary converts the reading, an unknown reading converts to
+   itself), CPS_REVERT and the candidate list actions (NI_OPENCANDIDATE,
+   NI_CLOSECANDIDATE, NI_SELECTCANDIDATESTR, NI_CHANGECANDIDATELIST and the
+   page actions) with the IMN_ notifications.
+ - ImmSimulateHotKey performs the documented hot keys on the input context.
+
+A layout that is not an IME layout has none of this, as on Windows: the
+Imm calls for the dictionary, conversion lists, escapes and configuration
+answer 0 and leave the last error alone for it (the todo_wine marks on that
+in the conformance test are removed).
+
+Also: ImmGetCandidateWindow read past the candidate forms for an index
+over 3, and ImmUnlockIMCC answered TRUE for a destroyed IMCC since
+GlobalUnlock changed (the conformance test imm32 passes on stock wine).
+
+diff --git a/dlls/imm32/ime.c b/dlls/imm32/ime.c
+index 24270e8..54f6e4f 100644
+--- a/dlls/imm32/ime.c
++++ b/dlls/imm32/ime.c
+@@ -91,55 +91,460 @@ static WCHAR *input_context_get_comp_str( INPUTCONTEXT *ctx, BOOL result, UINT *
+     return text;
+ }
+ 
+-static void input_context_set_comp_str( INPUTCONTEXT *ctx, const WCHAR *str, UINT len )
++/* The user dictionary of the IME: words registered with ImmRegisterWord, that the IME offers as
++ * the conversion of their reading.  It is kept in the registry of the user, one value per word:
++ * the name of the value is the style as 8 hex digits, a \001, the reading, a \001 and the word. */
++
++#define IME_KEY_NAME     L"Software\\Wine\\IME"
++#define IME_DICT_KEY     L"Software\\Wine\\IME\\UserDictionary"
++#define IME_EUDC_VALUE   L"EudcDictionary"
++#define IME_NAME         L"Wine IME"
++#define IME_DICT_SEP     L'\001'
++#define IME_DICT_NAME_MAX 16383
++#define IME_EUDC_PATH_MAX 80
++
++struct dict_word
++{
++    DWORD style;
++    WCHAR *reading;
++    WCHAR *string;
++};
++
++static WCHAR *dict_strdup( const WCHAR *str )
++{
++    UINT size = (wcslen( str ) + 1) * sizeof(WCHAR);
++    WCHAR *ret = malloc( size );
++    if (ret) memcpy( ret, str, size );
++    return ret;
++}
++
++static void dict_free( struct dict_word *words, UINT count )
++{
++    UINT i;
++    for (i = 0; i < count; i++)
++    {
++        free( words[i].reading );
++        free( words[i].string );
++    }
++    free( words );
++}
++
++static BOOL dict_valid_style( DWORD style )
++{
++#ifdef SG_MUTANT_IMM_STYLE
++    return TRUE;
++#endif
++    return style == IME_REGWORD_STYLE_EUDC || style >= IME_REGWORD_STYLE_USER_FIRST;
++}
++
++static BOOL dict_valid_text( const WCHAR *text )
++{
++    return text && *text && !wcschr( text, IME_DICT_SEP );
++}
++
++static WCHAR *dict_value_name( DWORD style, const WCHAR *reading, const WCHAR *string )
++{
++    UINT len = 8 + 1 + wcslen( reading ) + 1 + wcslen( string ) + 1, i;
++    WCHAR *name, *ptr;
++
++    if (len - 1 > IME_DICT_NAME_MAX || !(name = malloc( len * sizeof(WCHAR) ))) return NULL;
++    for (i = 0; i < 8; i++) name[i] = L"0123456789ABCDEF"[(style >> (28 - 4 * i)) & 0xf];
++    ptr = name + 8;
++    *ptr++ = IME_DICT_SEP;
++    wcscpy( ptr, reading );
++    ptr += wcslen( reading );
++    *ptr++ = IME_DICT_SEP;
++    wcscpy( ptr, string );
++    return name;
++}
++
++static UINT dict_load( struct dict_word **ret )
++{
++    struct dict_word *words = NULL;
++    UINT count = 0, capacity = 0, index;
++    WCHAR *name;
++    HKEY key;
++
++    *ret = NULL;
++    if (RegOpenKeyExW( HKEY_CURRENT_USER, IME_DICT_KEY, 0, KEY_READ, &key )) return 0;
++    if (!(name = malloc( (IME_DICT_NAME_MAX + 1) * sizeof(WCHAR) )))
++    {
++        RegCloseKey( key );
++        return 0;
++    }
++
++    for (index = 0;; index++)
++    {
++        DWORD len = IME_DICT_NAME_MAX + 1, style;
++        WCHAR *end, *reading, *string;
++        struct dict_word *tmp;
++
++        if (RegEnumValueW( key, index, name, &len, NULL, NULL, NULL, NULL )) break;
++        style = wcstoul( name, &end, 16 );
++        if (end != name + 8 || *end != IME_DICT_SEP) continue;
++        reading = end + 1;
++        if (!(string = wcschr( reading, IME_DICT_SEP ))) continue;
++        *string++ = 0;
++        if (!*reading || !*string) continue;
++
++        if (count == capacity)
++        {
++            capacity = capacity ? capacity * 2 : 16;
++            if (!(tmp = realloc( words, capacity * sizeof(*words) ))) break;
++            words = tmp;
++        }
++        words[count].style = style;
++        words[count].reading = dict_strdup( reading );
++        words[count].string = dict_strdup( string );
++        if (!words[count].reading || !words[count].string)
++        {
++            free( words[count].reading );
++            free( words[count].string );
++            break;
++        }
++        count++;
++    }
++
++    free( name );
++    RegCloseKey( key );
++    *ret = words;
++    return count;
++}
++
++static BOOL dict_register( DWORD style, const WCHAR *reading, const WCHAR *string )
++{
++    WCHAR *name;
++    HKEY key;
++    LSTATUS ret;
++
++    if (!dict_valid_text( reading ) || !dict_valid_text( string ) || !dict_valid_style( style ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(name = dict_value_name( style, reading, string )))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(ret = RegCreateKeyExW( HKEY_CURRENT_USER, IME_DICT_KEY, 0, NULL, 0, KEY_WRITE, NULL, &key, NULL )))
++    {
++        ret = RegSetValueExW( key, name, 0, REG_SZ, (const BYTE *)L"", sizeof(WCHAR) );
++        RegCloseKey( key );
++    }
++    free( name );
++    if (ret) SetLastError( ret );
++    return !ret;
++}
++
++static BOOL dict_unregister( DWORD style, const WCHAR *reading, const WCHAR *string )
++{
++    WCHAR *name;
++    HKEY key;
++    LSTATUS ret;
++
++    if (!dict_valid_text( reading ) || !dict_valid_text( string ) || !dict_valid_style( style ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(name = dict_value_name( style, reading, string )))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(ret = RegOpenKeyExW( HKEY_CURRENT_USER, IME_DICT_KEY, 0, KEY_WRITE, &key )))
++    {
++        ret = RegDeleteValueW( key, name );
++        RegCloseKey( key );
++    }
++    free( name );
++    if (ret) SetLastError( ret );
++    return !ret;
++}
++
++/* the candidates for a reading (or for a word, for the reverse conversion) */
++static CANDIDATELIST *dict_candidates( const WCHAR *source, BOOL reverse, UINT *ret_size )
++{
++    struct dict_word *words;
++    CANDIDATELIST *list = NULL;
++    UINT i, count, found = 0, size;
++    WCHAR *dst;
++
++    if (!source || !*source || !(count = dict_load( &words ))) return NULL;
++
++    size = offsetof( CANDIDATELIST, dwOffset );
++    for (i = 0; i < count; i++)
++    {
++        const WCHAR *key = reverse ? words[i].string : words[i].reading;
++        const WCHAR *val = reverse ? words[i].reading : words[i].string;
++        if (wcscmp( key, source )) continue;
++        size += sizeof(DWORD) + (wcslen( val ) + 1) * sizeof(WCHAR);
++        found++;
++    }
++
++    if (found && (list = calloc( 1, size )))
++    {
++        DWORD *offset = list->dwOffset;
++
++        list->dwSize = size;
++        list->dwStyle = IME_CAND_UNKNOWN;
++        list->dwCount = found;
++        list->dwPageSize = 9;
++        dst = (WCHAR *)((BYTE *)list + offsetof( CANDIDATELIST, dwOffset ) + found * sizeof(DWORD));
++        for (i = 0; i < count; i++)
++        {
++            const WCHAR *key = reverse ? words[i].string : words[i].reading;
++            const WCHAR *val = reverse ? words[i].reading : words[i].string;
++            if (wcscmp( key, source )) continue;
++            *offset++ = (BYTE *)dst - (BYTE *)list;
++            wcscpy( dst, val );
++            dst += wcslen( val ) + 1;
++        }
++        *ret_size = size;
++    }
++
++    dict_free( words, count );
++    return list;
++}
++
++static const WCHAR *candidate_string( const CANDIDATELIST *list, UINT index )
++{
++    return (const WCHAR *)((const BYTE *)list + list->dwOffset[index]);
++}
++
++/* The composition string of the input context, in parts: the characters, their attributes and
++ * clauses, and the reading string with its own attributes and clauses. */
++struct comp_data
++{
++    const WCHAR *str;
++    UINT len;                  /* characters */
++    const BYTE *attr;
++    UINT attr_len;             /* bytes */
++    const DWORD *clause;
++    UINT clause_len;           /* bytes */
++    const WCHAR *read;
++    UINT read_len;             /* characters */
++    const BYTE *read_attr;
++    UINT read_attr_len;        /* bytes */
++    const DWORD *read_clause;
++    UINT read_clause_len;      /* bytes */
++    void *blob;                /* the memory the pointers above point into, when it was read */
++};
++
++static void comp_data_free( struct comp_data *data )
++{
++    free( data->blob );
++    memset( data, 0, sizeof(*data) );
++}
++
++static BOOL input_context_get_comp_data( INPUTCONTEXT *ctx, struct comp_data *data )
+ {
+     COMPOSITIONSTRING *compstr;
+-    HIMCC himcc;
++    BYTE *blob, *dst;
+     UINT size;
++
++    memset( data, 0, sizeof(*data) );
++    if (!(compstr = ImmLockIMCC( ctx->hCompStr ))) return FALSE;
++
++    size = compstr->dwCompStrLen * sizeof(WCHAR) + compstr->dwCompAttrLen + compstr->dwCompClauseLen +
++           compstr->dwCompReadStrLen * sizeof(WCHAR) + compstr->dwCompReadAttrLen + compstr->dwCompReadClauseLen + 16;
++    if (!(blob = calloc( 1, size )))
++    {
++        ImmUnlockIMCC( ctx->hCompStr );
++        return FALSE;
++    }
++    data->blob = dst = blob;
++
++#define COPY_PART( off, len, unit, ptr, count ) \
++    if (compstr->len && compstr->off) \
++    { \
++        memcpy( dst, (BYTE *)compstr + compstr->off, compstr->len * (unit) ); \
++        data->ptr = (void *)dst; \
++        data->count = compstr->len * ((unit) == sizeof(WCHAR) ? 1 : (unit)); \
++        dst += compstr->len * (unit); \
++    }
++    COPY_PART( dwCompStrOffset, dwCompStrLen, sizeof(WCHAR), str, len )
++    COPY_PART( dwCompAttrOffset, dwCompAttrLen, 1, attr, attr_len )
++    COPY_PART( dwCompClauseOffset, dwCompClauseLen, 1, clause, clause_len )
++    COPY_PART( dwCompReadStrOffset, dwCompReadStrLen, sizeof(WCHAR), read, read_len )
++    COPY_PART( dwCompReadAttrOffset, dwCompReadAttrLen, 1, read_attr, read_attr_len )
++    COPY_PART( dwCompReadClauseOffset, dwCompReadClauseLen, 1, read_clause, read_clause_len )
++#undef COPY_PART
++
++    ImmUnlockIMCC( ctx->hCompStr );
++    return TRUE;
++}
++
++/* the layout is the one input_context_set_comp_str always had (string, clauses, attributes),
++ * followed by the reading string with its clauses and attributes */
++static BOOL input_context_set_comp_data( INPUTCONTEXT *ctx, const struct comp_data *data )
++{
++    COMPOSITIONSTRING *compstr;
++    UINT size, clause_len = data->clause_len, attr_len = data->attr_len;
++    UINT read_clause_len = data->read_clause_len, read_attr_len = data->read_attr_len;
++    HIMCC himcc;
+     BYTE *dst;
+ 
+-    TRACE( "ctx %p, str %s\n", ctx, debugstr_wn( str, len ) );
++    if (data->len && !clause_len) clause_len = 2 * sizeof(DWORD);
++    if (data->len && !attr_len) attr_len = data->len;
++    if (data->read_len && !read_clause_len) read_clause_len = 2 * sizeof(DWORD);
++    if (data->read_len && !read_attr_len) read_attr_len = data->read_len;
+ 
+-    size = sizeof(*compstr);
+-    size += len * sizeof(WCHAR); /* GCS_COMPSTR */
+-    size += len; /* GCS_COMPSTRATTR */
+-    size += 2 * sizeof(DWORD); /* GCS_COMPSTRCLAUSE */
++    size = sizeof(*compstr) + data->len * sizeof(WCHAR) + clause_len + attr_len +
++           data->read_len * sizeof(WCHAR) + read_clause_len + read_attr_len;
+ 
+     if (!(himcc = ImmReSizeIMCC( ctx->hCompStr, size )))
++    {
+         WARN( "Failed to resize input context composition string\n" );
+-    else if (!(compstr = ImmLockIMCC( (ctx->hCompStr = himcc) )))
++        return FALSE;
++    }
++    if (!(compstr = ImmLockIMCC( (ctx->hCompStr = himcc) )))
++    {
+         WARN( "Failed to lock input context composition string\n" );
+-    else
++        return FALSE;
++    }
++
++    memset( compstr, 0, sizeof(*compstr) );
++    compstr->dwSize = sizeof(*compstr);
++
++    if (data->len)
+     {
+-        memset( compstr, 0, sizeof(*compstr) );
+-        compstr->dwSize = sizeof(*compstr);
++        compstr->dwCursorPos = data->len;
++
++        compstr->dwCompStrLen = data->len;
++        compstr->dwCompStrOffset = compstr->dwSize;
++        dst = (BYTE *)compstr + compstr->dwCompStrOffset;
++        memcpy( dst, data->str, data->len * sizeof(WCHAR) );
++        compstr->dwSize += data->len * sizeof(WCHAR);
++
++        compstr->dwCompClauseLen = clause_len;
++        compstr->dwCompClauseOffset = compstr->dwSize;
++        dst = (BYTE *)compstr + compstr->dwCompClauseOffset;
++        if (data->clause_len) memcpy( dst, data->clause, clause_len );
++        else
++        {
++            *((DWORD *)dst + 0) = 0;
++            *((DWORD *)dst + 1) = data->len;
++        }
++        compstr->dwSize += clause_len;
++
++        compstr->dwCompAttrLen = attr_len;
++        compstr->dwCompAttrOffset = compstr->dwSize;
++        dst = (BYTE *)compstr + compstr->dwCompAttrOffset;
++        if (data->attr_len) memcpy( dst, data->attr, attr_len );
++        else memset( dst, ATTR_INPUT, attr_len );
++        compstr->dwSize += attr_len;
++    }
+ 
+-        if (len)
++    if (data->read_len)
++    {
++        compstr->dwCompReadStrLen = data->read_len;
++        compstr->dwCompReadStrOffset = compstr->dwSize;
++        dst = (BYTE *)compstr + compstr->dwCompReadStrOffset;
++        memcpy( dst, data->read, data->read_len * sizeof(WCHAR) );
++        compstr->dwSize += data->read_len * sizeof(WCHAR);
++
++        compstr->dwCompReadClauseLen = read_clause_len;
++        compstr->dwCompReadClauseOffset = compstr->dwSize;
++        dst = (BYTE *)compstr + compstr->dwCompReadClauseOffset;
++        if (data->read_clause_len) memcpy( dst, data->read_clause, read_clause_len );
++        else
+         {
+-            compstr->dwCursorPos = len;
++            *((DWORD *)dst + 0) = 0;
++            *((DWORD *)dst + 1) = data->read_len;
++        }
++        compstr->dwSize += read_clause_len;
++
++        compstr->dwCompReadAttrLen = read_attr_len;
++        compstr->dwCompReadAttrOffset = compstr->dwSize;
++        dst = (BYTE *)compstr + compstr->dwCompReadAttrOffset;
++        if (data->read_attr_len) memcpy( dst, data->read_attr, read_attr_len );
++        else memset( dst, ATTR_INPUT, read_attr_len );
++        compstr->dwSize += read_attr_len;
++    }
+ 
+-            compstr->dwCompStrLen = len;
+-            compstr->dwCompStrOffset = compstr->dwSize;
+-            dst = (BYTE *)compstr + compstr->dwCompStrOffset;
+-            memcpy( dst, str, compstr->dwCompStrLen * sizeof(WCHAR) );
+-            compstr->dwSize += compstr->dwCompStrLen * sizeof(WCHAR);
++    ImmUnlockIMCC( ctx->hCompStr );
++    return TRUE;
++}
+ 
+-            compstr->dwCompClauseLen = 2 * sizeof(DWORD);
+-            compstr->dwCompClauseOffset = compstr->dwSize;
+-            dst = (BYTE *)compstr + compstr->dwCompClauseOffset;
+-            *((DWORD *)dst + 0) = 0;
+-            *((DWORD *)dst + 1) = compstr->dwCompStrLen;
+-            compstr->dwSize += compstr->dwCompClauseLen;
++/* The candidate lists of the input context: CANDIDATEINFO is followed by the lists, at the
++ * offsets it holds.  A NULL list closes the list at the index. */
++static BOOL input_context_set_candidates( INPUTCONTEXT *ctx, UINT index, const CANDIDATELIST *list )
++{
++    CANDIDATEINFO *old, *info;
++    const CANDIDATELIST *lists[ARRAY_SIZE(info->dwOffset)] = {0};
++    UINT i, count = 0, size = sizeof(*info);
++    HIMCC himcc;
++    BYTE *dst;
+ 
+-            compstr->dwCompAttrLen = compstr->dwCompStrLen;
+-            compstr->dwCompAttrOffset = compstr->dwSize;
+-            dst = (BYTE *)compstr + compstr->dwCompAttrOffset;
+-            memset( dst, ATTR_INPUT, compstr->dwCompAttrLen );
+-            compstr->dwSize += compstr->dwCompAttrLen;
++    if (index >= ARRAY_SIZE(info->dwOffset)) return FALSE;
++    if (!(old = ImmLockIMCC( ctx->hCandInfo ))) return FALSE;
++    for (i = 0; i < old->dwCount && i < ARRAY_SIZE(lists); i++)
++    {
++        const CANDIDATELIST *cand = (const CANDIDATELIST *)((BYTE *)old + old->dwOffset[i]);
++        if (old->dwOffset[i] && cand->dwSize) lists[i] = cand;
++    }
++    lists[index] = list;
++    for (i = 0; i < ARRAY_SIZE(lists); i++)
++    {
++        if (!lists[i]) continue;
++        size += lists[i]->dwSize;
++        count = i + 1;
++    }
++
++    /* the old lists are copied before the old memory goes away */
++    {
++        BYTE *copy = malloc( size );
++        if (!copy)
++        {
++            ImmUnlockIMCC( ctx->hCandInfo );
++            return FALSE;
++        }
++        info = (CANDIDATEINFO *)copy;
++        memset( info, 0, sizeof(*info) );
++        info->dwSize = size;
++        info->dwCount = count;
++        dst = copy + sizeof(*info);
++        for (i = 0; i < count; i++)
++        {
++            if (!lists[i]) continue;
++            info->dwOffset[i] = dst - copy;
++            memcpy( dst, lists[i], lists[i]->dwSize );
++            dst += lists[i]->dwSize;
+         }
++        ImmUnlockIMCC( ctx->hCandInfo );
+ 
+-        ImmUnlockIMCC( ctx->hCompStr );
++        if (!(himcc = ImmReSizeIMCC( ctx->hCandInfo, size ))) { free( copy ); return FALSE; }
++        if (!(old = ImmLockIMCC( (ctx->hCandInfo = himcc) ))) { free( copy ); return FALSE; }
++        memcpy( old, copy, size );
++        ImmUnlockIMCC( ctx->hCandInfo );
++        free( copy );
+     }
++    return TRUE;
++}
++
++static CANDIDATELIST *input_context_get_candidates( INPUTCONTEXT *ctx, UINT index )
++{
++    CANDIDATEINFO *info;
++    CANDIDATELIST *list = NULL;
++
++    if (index >= ARRAY_SIZE(info->dwOffset) || !(info = ImmLockIMCC( ctx->hCandInfo ))) return NULL;
++    if (index < info->dwCount && info->dwOffset[index])
++    {
++        CANDIDATELIST *src = (CANDIDATELIST *)((BYTE *)info + info->dwOffset[index]);
++        if (src->dwSize && (list = malloc( src->dwSize ))) memcpy( list, src, src->dwSize );
++    }
++    ImmUnlockIMCC( ctx->hCandInfo );
++    return list;
++}
++
++static void input_context_set_comp_str( INPUTCONTEXT *ctx, const WCHAR *str, UINT len )
++{
++    struct comp_data data = {.str = str, .len = len};
++
++    TRACE( "ctx %p, str %s\n", ctx, debugstr_wn( str, len ) );
++    input_context_set_comp_data( ctx, &data );
+ }
+ 
+ static HFONT input_context_select_ui_font( INPUTCONTEXT *ctx, HDC hdc )
+@@ -386,6 +791,237 @@ static UINT ime_set_comp_string( HIMC himc, LPARAM lparam )
+     return count;
+ }
+ 
++BOOL WINAPI ImeRegisterWord( const WCHAR *reading, DWORD style, const WCHAR *string );
++BOOL WINAPI ImeUnregisterWord( const WCHAR *reading, DWORD style, const WCHAR *string );
++
++/* WM_IME_CONTROL: the commands an application sends to the IME window */
++static LRESULT ime_ui_control( HIMC himc, WPARAM wparam, LPARAM lparam )
++{
++    POINT pt;
++
++    switch (wparam)
++    {
++    case IMC_GETCANDIDATEPOS:
++    {
++        CANDIDATEFORM *form = (CANDIDATEFORM *)lparam;
++#ifdef SG_MUTANT_IMM_CTLCAND
++        return 1;
++#endif
++        if (!himc || !form) return 1;
++        return !ImmGetCandidateWindow( himc, form->dwIndex, form );
++    }
++    case IMC_SETCANDIDATEPOS:
++        if (!himc || !lparam) return 1;
++        return !ImmSetCandidateWindow( himc, (CANDIDATEFORM *)lparam );
++    case IMC_GETCOMPOSITIONFONT:
++        if (!himc || !lparam) return 1;
++        return !ImmGetCompositionFontW( himc, (LOGFONTW *)lparam );
++    case IMC_SETCOMPOSITIONFONT:
++#ifdef SG_MUTANT_IMM_CTLFONT
++        return 0;
++#endif
++        if (!himc || !lparam) return 1;
++        return !ImmSetCompositionFontW( himc, (LOGFONTW *)lparam );
++    case IMC_GETCOMPOSITIONWINDOW:
++        if (!himc || !lparam) return 1;
++        return !ImmGetCompositionWindow( himc, (COMPOSITIONFORM *)lparam );
++    case IMC_SETCOMPOSITIONWINDOW:
++        if (!himc || !lparam) return 1;
++        return !ImmSetCompositionWindow( himc, (COMPOSITIONFORM *)lparam );
++    case IMC_GETSTATUSWINDOWPOS:
++        if (!himc || !ImmGetStatusWindowPos( himc, &pt )) return 0;
++#ifdef SG_MUTANT_IMM_CTLSTATUS
++        return MAKELONG( pt.y, pt.x );
++#endif
++        return MAKELONG( pt.x, pt.y );
++    case IMC_SETSTATUSWINDOWPOS:
++    {
++        POINTS *pos = (POINTS *)lparam;
++        if (!himc || !pos) return 1;
++        pt.x = pos->x;
++        pt.y = pos->y;
++        return !ImmSetStatusWindowPos( himc, &pt );
++    }
++    case IMC_OPENSTATUSWINDOW:
++    case IMC_CLOSESTATUSWINDOW:
++        /* the IME has no status window, there is nothing to show or to hide */
++        return 0;
++    default:
++        FIXME( "himc %p, command %s, lparam %#Ix not implemented\n", himc, debugstr_imc( wparam ), lparam );
++        return 1;
++    }
++}
++
++/* The dictionary dialog.  It registers words, lists the registered ones and removes them. */
++
++#define IDC_DICT_READING  101
++#define IDC_DICT_WORD     102
++#define IDC_DICT_REGISTER 103
++#define IDC_DICT_LIST     104
++#define IDC_DICT_REMOVE   105
++#define IME_DICT_DIALOG_TITLE L"Wine IME User Dictionary"
++
++struct dict_dialog
++{
++    struct dict_word *words;
++    UINT count;
++};
++
++static void dict_dialog_fill( HWND hwnd, struct dict_dialog *dlg )
++{
++    HWND list = GetDlgItem( hwnd, IDC_DICT_LIST );
++    UINT i;
++
++    dict_free( dlg->words, dlg->count );
++    dlg->count = dict_load( &dlg->words );
++    SendMessageW( list, LB_RESETCONTENT, 0, 0 );
++    for (i = 0; i < dlg->count; i++)
++    {
++        WCHAR *text = malloc( (wcslen( dlg->words[i].reading ) + wcslen( dlg->words[i].string ) + 4) * sizeof(WCHAR) );
++        if (!text) continue;
++        wcscpy( text, dlg->words[i].reading );
++        wcscat( text, L" = " );
++        wcscat( text, dlg->words[i].string );
++        SendMessageW( list, LB_SETITEMDATA, SendMessageW( list, LB_ADDSTRING, 0, (LPARAM)text ), i );
++        free( text );
++    }
++}
++
++static INT_PTR CALLBACK dict_dialog_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    struct dict_dialog *dlg = (struct dict_dialog *)GetWindowLongPtrW( hwnd, DWLP_USER );
++
++    switch (msg)
++    {
++    case WM_INITDIALOG:
++    {
++        REGISTERWORDW *word = (REGISTERWORDW *)lparam;
++        if (!(dlg = calloc( 1, sizeof(*dlg) )))
++        {
++            EndDialog( hwnd, 0 );
++            return TRUE;
++        }
++        SetWindowLongPtrW( hwnd, DWLP_USER, (LONG_PTR)dlg );
++#ifdef SG_MUTANT_IMM_DIALOGPRESET
++        if (0)
++#else
++        if (word)
++#endif
++        {
++            if (word->lpReading) SetDlgItemTextW( hwnd, IDC_DICT_READING, word->lpReading );
++            if (word->lpWord) SetDlgItemTextW( hwnd, IDC_DICT_WORD, word->lpWord );
++        }
++        dict_dialog_fill( hwnd, dlg );
++        return TRUE;
++    }
++    case WM_DESTROY:
++        if (dlg)
++        {
++            dict_free( dlg->words, dlg->count );
++            free( dlg );
++            SetWindowLongPtrW( hwnd, DWLP_USER, 0 );
++        }
++        return TRUE;
++    case WM_COMMAND:
++        switch (LOWORD( wparam ))
++        {
++        case IDC_DICT_REGISTER:
++        {
++            WCHAR reading[128], word[128];
++            GetDlgItemTextW( hwnd, IDC_DICT_READING, reading, ARRAY_SIZE(reading) );
++            GetDlgItemTextW( hwnd, IDC_DICT_WORD, word, ARRAY_SIZE(word) );
++            if (!ImeRegisterWord( reading, IME_REGWORD_STYLE_USER_FIRST, word )) MessageBeep( MB_ICONEXCLAMATION );
++            else
++            {
++                SetDlgItemTextW( hwnd, IDC_DICT_READING, L"" );
++                SetDlgItemTextW( hwnd, IDC_DICT_WORD, L"" );
++                dict_dialog_fill( hwnd, dlg );
++            }
++            return TRUE;
++        }
++        case IDC_DICT_REMOVE:
++        {
++            HWND list = GetDlgItem( hwnd, IDC_DICT_LIST );
++            LRESULT sel = SendMessageW( list, LB_GETCURSEL, 0, 0 ), idx;
++            if (sel == LB_ERR || (idx = SendMessageW( list, LB_GETITEMDATA, sel, 0 )) == LB_ERR || idx >= dlg->count) return TRUE;
++#ifndef SG_MUTANT_IMM_DIALOGREMOVE
++            ImeUnregisterWord( dlg->words[idx].reading, dlg->words[idx].style, dlg->words[idx].string );
++#endif
++            dict_dialog_fill( hwnd, dlg );
++            return TRUE;
++        }
++        case IDOK:
++        case IDCANCEL:
++            EndDialog( hwnd, 1 );
++            return TRUE;
++        }
++        break;
++    }
++    return FALSE;
++}
++
++static WORD *dialog_align( WORD *ptr )
++{
++    return (WORD *)(((ULONG_PTR)ptr + 3) & ~(ULONG_PTR)3);
++}
++
++static WORD *dialog_add_item( WORD *ptr, DWORD style, short x, short y, short cx, short cy, WORD id, WORD class,
++                              const WCHAR *text )
++{
++    DLGITEMTEMPLATE *item;
++
++    item = (DLGITEMTEMPLATE *)dialog_align( ptr );
++    item->style = style | WS_CHILD | WS_VISIBLE;
++    item->dwExtendedStyle = 0;
++    item->x = x;
++    item->y = y;
++    item->cx = cx;
++    item->cy = cy;
++    item->id = id;
++    ptr = (WORD *)(item + 1);
++    *ptr++ = 0xffff;
++    *ptr++ = class;
++    wcscpy( (WCHAR *)ptr, text );
++    ptr += wcslen( text ) + 1;
++    *ptr++ = 0;
++    return ptr;
++}
++
++static BOOL ime_show_dictionary( HWND owner, REGISTERWORDW *word )
++{
++    static const WCHAR font[] = L"MS Shell Dlg";
++    WORD buffer[512], *ptr = buffer;
++    DLGTEMPLATE *tmpl = (DLGTEMPLATE *)buffer;
++    INT_PTR ret;
++
++    memset( buffer, 0, sizeof(buffer) );
++    tmpl->style = DS_MODALFRAME | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU;
++    tmpl->cdit = 9;
++    tmpl->cx = 220;
++    tmpl->cy = 150;
++    ptr = (WORD *)(tmpl + 1);
++    *ptr++ = 0; /* no menu */
++    *ptr++ = 0; /* default class */
++    wcscpy( (WCHAR *)ptr, IME_DICT_DIALOG_TITLE );
++    ptr += wcslen( IME_DICT_DIALOG_TITLE ) + 1;
++    *ptr++ = 8;
++    wcscpy( (WCHAR *)ptr, font );
++    ptr += wcslen( font ) + 1;
++
++    ptr = dialog_add_item( ptr, SS_LEFT, 7, 9, 40, 10, -1, 0x0082, L"Reading:" );
++    ptr = dialog_add_item( ptr, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 50, 7, 100, 12, IDC_DICT_READING, 0x0081, L"" );
++    ptr = dialog_add_item( ptr, SS_LEFT, 7, 25, 40, 10, -1, 0x0082, L"Word:" );
++    ptr = dialog_add_item( ptr, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 50, 23, 100, 12, IDC_DICT_WORD, 0x0081, L"" );
++    ptr = dialog_add_item( ptr, WS_TABSTOP | BS_PUSHBUTTON, 157, 7, 56, 14, IDC_DICT_REGISTER, 0x0080, L"Register" );
++    ptr = dialog_add_item( ptr, SS_LEFT, 7, 42, 100, 10, -1, 0x0082, L"Registered words:" );
++    ptr = dialog_add_item( ptr, WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY, 7, 53, 143, 90, IDC_DICT_LIST, 0x0083, L"" );
++    ptr = dialog_add_item( ptr, WS_TABSTOP | BS_PUSHBUTTON, 157, 53, 56, 14, IDC_DICT_REMOVE, 0x0080, L"Remove" );
++    ptr = dialog_add_item( ptr, WS_TABSTOP | BS_DEFPUSHBUTTON, 157, 129, 56, 14, IDOK, 0x0080, L"Close" );
++
++    ret = DialogBoxIndirectParamW( imm32_module, tmpl, owner, dict_dialog_proc, (LPARAM)word );
++    return ret > 0;
++}
++
+ static LRESULT ime_ui_notify( HIMC himc, HWND hwnd, WPARAM wparam, LPARAM lparam )
+ {
+     TRACE( "himc %p, hwnd %p, wparam %s, lparam %#Ix\n", hwnd, himc, debugstr_imn(wparam), lparam );
+@@ -431,9 +1067,7 @@ static LRESULT WINAPI ime_ui_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LP
+     case WM_IME_NOTIFY:
+         return ime_ui_notify( himc, hwnd, wparam, lparam );
+     case WM_IME_CONTROL:
+-        FIXME( "hwnd %p, himc %p, msg %s, wparam %s, lparam %#Ix stub!\n", hwnd, himc,
+-               debugstr_wm_ime(msg), debugstr_imc(wparam), lparam );
+-        return 1;
++        return ime_ui_control( himc, wparam, lparam );
+     }
+ 
+     return DefWindowProcW( hwnd, msg, wparam, lparam );
+@@ -588,54 +1222,361 @@ done:
+ 
+ BOOL WINAPI ImeConfigure( HKL hkl, HWND hwnd, DWORD mode, void *data )
+ {
+-    FIXME( "hkl %p, hwnd %p, mode %lu, data %p stub!\n", hkl, hwnd, mode, data );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    TRACE( "hkl %p, hwnd %p, mode %lu, data %p\n", hkl, hwnd, mode, data );
++
++    switch (mode)
++    {
++    case IME_CONFIG_REGISTERWORD:
++        return ime_show_dictionary( hwnd, data );
++    case IME_CONFIG_GENERAL:
++    case IME_CONFIG_SELECTDICTIONARY:
++        /* the user dictionary is the one dictionary and the one setting of the IME */
++        return ime_show_dictionary( hwnd, NULL );
++    default:
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
+ }
+ 
+ DWORD WINAPI ImeConversionList( HIMC himc, const WCHAR *source, CANDIDATELIST *dest, DWORD dest_len, UINT flag )
+ {
+-    FIXME( "himc %p, source %s, dest %p, dest_len %lu, flag %#x stub!\n",
+-           himc, debugstr_w(source), dest, dest_len, flag );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return 0;
++    CANDIDATELIST *list;
++    UINT size, ret;
++
++    TRACE( "himc %p, source %s, dest %p, dest_len %lu, flag %#x\n", himc, debugstr_w(source), dest, dest_len, flag );
++
++    if (flag != GCL_CONVERSION && flag != GCL_REVERSECONVERSION && flag != GCL_REVERSE_LENGTH)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return 0;
++    }
++
++    /* the words of the user dictionary that have the source as reading (or as word, for the reverse) */
++#ifdef SG_MUTANT_IMM_REVERSE
++    if (!(list = dict_candidates( source, FALSE, &size ))) return 0;
++#else
++    if (!(list = dict_candidates( source, flag != GCL_CONVERSION, &size ))) return 0;
++#endif
++
++#ifdef SG_MUTANT_IMM_REVLEN
++    if (flag == GCL_REVERSE_LENGTH) ret = wcslen( candidate_string( list, 0 ) ) * sizeof(WCHAR);
++#else
++    if (flag == GCL_REVERSE_LENGTH) ret = (wcslen( candidate_string( list, 0 ) ) + 1) * sizeof(WCHAR);
++#endif
++    else if (!dest_len) ret = size;
++    else if (!dest || dest_len < size) ret = 0;
++    else
++    {
++        memcpy( dest, list, size );
++        ret = size;
++    }
++
++    free( list );
++    return ret;
+ }
+ 
+ BOOL WINAPI ImeSetCompositionString( HIMC himc, DWORD index, const void *comp, DWORD comp_len,
+                                      const void *read, DWORD read_len )
+ {
++    struct comp_data data;
+     INPUTCONTEXT *ctx;
++    UINT msg, i, flags;
++    BOOL ret = FALSE;
+ 
+-    FIXME( "himc %p, index %lu, comp %p, comp_len %lu, read %p, read_len %lu semi-stub!\n",
+-            himc, index, comp, comp_len, read, read_len );
+-    if (read && read_len) FIXME( "Read string unimplemented\n" );
++    TRACE( "himc %p, index %lu, comp %p, comp_len %lu, read %p, read_len %lu\n",
++           himc, index, comp, comp_len, read, read_len );
+     if (index != SCS_SETSTR && index != SCS_CHANGECLAUSE && index != SCS_CHANGEATTR) return FALSE;
+ 
+     if (!(ctx = ImmLockIMC( himc ))) return FALSE;
+ 
+-    if (index != SCS_SETSTR)
+-        FIXME( "index %#lx not implemented\n", index );
+-    else
++    switch (index)
++    {
++    case SCS_SETSTR:
+     {
+-        UINT msg, flags = GCS_COMPSTR | GCS_COMPCLAUSE | GCS_COMPATTR | GCS_DELTASTART | GCS_CURSORPOS;
+         WCHAR wparam = comp && comp_len >= sizeof(WCHAR) ? *(WCHAR *)comp : 0;
+-        input_context_set_comp_str( ctx, comp, comp_len / sizeof(WCHAR) );
++
++        memset( &data, 0, sizeof(data) );
++        data.str = comp;
++        data.len = comp ? comp_len / sizeof(WCHAR) : 0;
++        flags = GCS_COMPSTR | GCS_COMPCLAUSE | GCS_COMPATTR | GCS_DELTASTART | GCS_CURSORPOS;
++        if (read && read_len >= sizeof(WCHAR))
++        {
++            data.read = read;
++            data.read_len = read_len / sizeof(WCHAR);
++            flags |= GCS_COMPREADSTR | GCS_COMPREADCLAUSE | GCS_COMPREADATTR;
++#ifdef SG_MUTANT_IMM_SCSREAD
++            data.read_len = 0;
++#endif
++        }
++        if (!input_context_set_comp_data( ctx, &data )) break;
+         if ((msg = ime_set_composition_status( himc, TRUE ))) ime_send_message( himc, msg, 0, 0 );
+         ime_send_message( himc, WM_IME_COMPOSITION, wparam, flags );
++        ret = TRUE;
++        break;
++    }
++
++    case SCS_CHANGEATTR:
++        /* one attribute for each character of the composition string, and of the reading string */
++        if (!input_context_get_comp_data( ctx, &data )) break;
++#ifdef SG_MUTANT_IMM_ATTRCHECK
++        if (comp && data.len)
++#else
++        if (comp && data.len && comp_len == data.len)
++#endif
++        {
++            data.attr = comp;
++            data.attr_len = comp_len;
++            flags = GCS_COMPATTR;
++            if (read && data.read_len && read_len == data.read_len)
++            {
++                data.read_attr = read;
++                data.read_attr_len = read_len;
++                flags |= GCS_COMPREADATTR;
++            }
++            if (input_context_set_comp_data( ctx, &data ))
++            {
++                ime_send_message( himc, WM_IME_COMPOSITION, data.str[0], flags );
++                ret = TRUE;
++            }
++        }
++        comp_data_free( &data );
++        break;
++
++    case SCS_CHANGECLAUSE:
++        /* the clauses start at 0, grow and end at the length of the string */
++        if (!input_context_get_comp_data( ctx, &data )) break;
++        if (comp && data.len && comp_len >= 2 * sizeof(DWORD) && !(comp_len % sizeof(DWORD)))
++        {
++            const DWORD *clause = comp;
++            UINT count = comp_len / sizeof(DWORD);
++
++#ifdef SG_MUTANT_IMM_CLAUSECHECK
++            ret = TRUE;
++#else
++            ret = clause[0] == 0 && clause[count - 1] == data.len;
++#endif
++            for (i = 1; ret && i < count; i++) ret = clause[i] > clause[i - 1];
++            if (ret)
++            {
++                data.clause = clause;
++                data.clause_len = comp_len;
++                flags = GCS_COMPCLAUSE;
++                if (read && data.read_len && read_len >= 2 * sizeof(DWORD) && !(read_len % sizeof(DWORD)))
++                {
++                    const DWORD *read_clause = read;
++                    UINT read_count = read_len / sizeof(DWORD);
++
++                    ret = read_clause[0] == 0 && read_clause[read_count - 1] == data.read_len;
++                    for (i = 1; ret && i < read_count; i++) ret = read_clause[i] > read_clause[i - 1];
++                    data.read_clause = read_clause;
++                    data.read_clause_len = read_len;
++                    flags |= GCS_COMPREADCLAUSE;
++                }
++                if (ret && input_context_set_comp_data( ctx, &data ))
++                    ime_send_message( himc, WM_IME_COMPOSITION, data.str[0], flags );
++                else ret = FALSE;
++            }
++        }
++        comp_data_free( &data );
++        break;
+     }
+ 
+     ImmUnlockIMC( himc );
+ 
+-    return TRUE;
++    return ret;
++}
++
++/* NI_COMPOSITIONSTR with CPS_CONVERT or CPS_REVERT: the user dictionary converts the reading,
++ * and the reading comes back with the revert */
++static BOOL ime_convert_composition( HIMC himc, INPUTCONTEXT *ctx, BOOL revert )
++{
++    struct comp_data data, new = {0};
++    CANDIDATELIST *list = NULL;
++    WCHAR *reading = NULL;
++    BYTE *attr = NULL;
++    UINT size, flags;
++    BOOL ret = FALSE;
++
++    if (!input_context_get_comp_data( ctx, &data )) return FALSE;
++    if (!data.len) goto done;
++
++    if (revert)
++    {
++        if (!data.read_len)
++        {
++            ret = TRUE; /* nothing was converted */
++            goto done;
++        }
++        new.str = data.read;
++        new.len = data.read_len;
++#ifdef SG_MUTANT_IMM_REVERTKEEP
++        new.read = data.read;
++        new.read_len = data.read_len;
++#endif
++    }
++    else
++    {
++        const WCHAR *src = data.read_len ? data.read : data.str;
++        UINT src_len = data.read_len ? data.read_len : data.len;
++
++        if (!(reading = malloc( (src_len + 1) * sizeof(WCHAR) ))) goto done;
++        memcpy( reading, src, src_len * sizeof(WCHAR) );
++        reading[src_len] = 0;
++
++        if ((list = dict_candidates( reading, FALSE, &size )))
++        {
++            new.str = candidate_string( list, 0 );
++            new.len = wcslen( new.str );
++        }
++        else
++        {
++            new.str = data.str; /* a reading without a word converts to itself */
++            new.len = data.len;
++        }
++        if (!(attr = malloc( new.len ))) goto done;
++#ifdef SG_MUTANT_IMM_CONVATTR
++        memset( attr, ATTR_INPUT, new.len );
++#else
++        memset( attr, ATTR_CONVERTED, new.len );
++#endif
++        new.attr = attr;
++        new.attr_len = new.len;
++        new.read = reading;
++        new.read_len = src_len;
++    }
++
++    if (!input_context_set_comp_data( ctx, &new )) goto done;
++    flags = GCS_COMPSTR | GCS_COMPATTR | GCS_COMPCLAUSE | GCS_CURSORPOS | GCS_DELTASTART |
++            GCS_COMPREADSTR | GCS_COMPREADATTR | GCS_COMPREADCLAUSE;
++    ime_send_message( himc, WM_IME_COMPOSITION, new.str[0], flags );
++    ret = TRUE;
++
++done:
++    free( attr );
++    free( list );
++    free( reading );
++    comp_data_free( &data );
++    return ret;
++}
++
++static BOOL ime_open_candidates( HIMC himc, INPUTCONTEXT *ctx, UINT index )
++{
++    struct comp_data data;
++    CANDIDATELIST *list;
++    WCHAR *reading;
++    UINT size;
++    BOOL ret = FALSE;
++
++    if (!input_context_get_comp_data( ctx, &data )) return FALSE;
++    if (data.len)
++    {
++        const WCHAR *src = data.read_len ? data.read : data.str;
++        UINT src_len = data.read_len ? data.read_len : data.len;
++
++        if ((reading = malloc( (src_len + 1) * sizeof(WCHAR) )))
++        {
++            memcpy( reading, src, src_len * sizeof(WCHAR) );
++            reading[src_len] = 0;
++            if ((list = dict_candidates( reading, FALSE, &size )))
++            {
++                if ((ret = input_context_set_candidates( ctx, index, list )))
++#ifdef SG_MUTANT_IMM_OPENMSG
++                    (void)0;
++#else
++                    ime_send_message( himc, WM_IME_NOTIFY, IMN_OPENCANDIDATE, 1 << index );
++#endif
++                free( list );
++            }
++            free( reading );
++        }
++    }
++    comp_data_free( &data );
++    return ret;
++}
++
++static BOOL ime_candidates_action( HIMC himc, INPUTCONTEXT *ctx, DWORD action, DWORD index, DWORD value )
++{
++    CANDIDATELIST *list;
++    BOOL ret = FALSE;
++
++    if (action == NI_OPENCANDIDATE) return ime_open_candidates( himc, ctx, index );
++    if (!(list = input_context_get_candidates( ctx, index ))) return FALSE;
++
++    switch (action)
++    {
++    case NI_CLOSECANDIDATE:
++        if ((ret = input_context_set_candidates( ctx, index, NULL )))
++            ime_send_message( himc, WM_IME_NOTIFY, IMN_CLOSECANDIDATE, 1 << index );
++        break;
++
++    case NI_SELECTCANDIDATESTR:
++    case NI_CHANGECANDIDATELIST:
++        if (action == NI_SELECTCANDIDATESTR)
++        {
++            struct comp_data data;
++            const WCHAR *text;
++
++#ifndef SG_MUTANT_IMM_SELECTRANGE
++            if (value >= list->dwCount) break;
++#endif
++            list->dwSelection = value;
++            if (!input_context_set_candidates( ctx, index, list )) break;
++
++            /* the selected candidate is the composition string, converted from the reading */
++            text = candidate_string( list, value );
++            if (input_context_get_comp_data( ctx, &data ))
++            {
++                struct comp_data new = {.str = text, .len = wcslen( text ), .read = data.read, .read_len = data.read_len};
++                BYTE *attr = malloc( new.len );
++
++                if (attr)
++                {
++                    memset( attr, ATTR_CONVERTED, new.len );
++                    new.attr = attr;
++                    new.attr_len = new.len;
++                    if (input_context_set_comp_data( ctx, &new ))
++                        ime_send_message( himc, WM_IME_COMPOSITION, text[0],
++                                          GCS_COMPSTR | GCS_COMPATTR | GCS_COMPCLAUSE | GCS_CURSORPOS | GCS_DELTASTART );
++                    free( attr );
++                }
++                comp_data_free( &data );
++            }
++        }
++        ime_send_message( himc, WM_IME_NOTIFY, IMN_CHANGECANDIDATE, 1 << index );
++        ret = TRUE;
++        break;
++
++    case NI_SETCANDIDATE_PAGESTART:
++        if (index > 3 || value >= list->dwCount) break;
++        list->dwPageStart = value;
++        if ((ret = input_context_set_candidates( ctx, index, list )))
++            ime_send_message( himc, WM_IME_NOTIFY, IMN_CHANGECANDIDATE, 1 << index );
++        break;
++
++    case NI_SETCANDIDATE_PAGESIZE:
++#ifdef SG_MUTANT_IMM_PAGESIZE
++        if (!value) break;
++#else
++        if (index > 3 || !value) break;
++#endif
++        list->dwPageSize = value;
++        if ((ret = input_context_set_candidates( ctx, index, list )))
++            ime_send_message( himc, WM_IME_NOTIFY, IMN_CHANGECANDIDATE, 1 << index );
++        break;
++    }
++
++    free( list );
++    return ret;
+ }
+ 
+ BOOL WINAPI NotifyIME( HIMC himc, DWORD action, DWORD index, DWORD value )
+ {
+     struct ime_private *priv;
+     INPUTCONTEXT *ctx;
++    BOOL ret = TRUE;
+     UINT msg;
+ 
+-    TRACE( "himc %p, action %#lx, index %#lx, value %#lx stub!\n", himc, action, index, value );
++    TRACE( "himc %p, action %#lx, index %#lx, value %#lx\n", himc, action, index, value );
+ 
+     if (!(ctx = ImmLockIMC( himc ))) return FALSE;
+ 
+@@ -694,63 +1635,180 @@ BOOL WINAPI NotifyIME( HIMC himc, DWORD action, DWORD index, DWORD value )
+             if ((msg = ime_set_composition_status( himc, FALSE )))
+                 ime_send_message( himc, msg, 0, 0 );
+             break;
++        case CPS_CONVERT:
++            ret = ime_convert_composition( himc, ctx, FALSE );
++            break;
++        case CPS_REVERT:
++            ret = ime_convert_composition( himc, ctx, TRUE );
++            break;
+         default:
+-            FIXME( "himc %p, action %#lx, index %#lx, value %#lx stub!\n", himc, action, index, value );
++            WARN( "himc %p, action %#lx, index %#lx, value %#lx unknown\n", himc, action, index, value );
+             break;
+         }
+         break;
+ 
++    case NI_OPENCANDIDATE:
++    case NI_CLOSECANDIDATE:
++    case NI_SELECTCANDIDATESTR:
++    case NI_CHANGECANDIDATELIST:
++    case NI_SETCANDIDATE_PAGESTART:
++    case NI_SETCANDIDATE_PAGESIZE:
++        ret = ime_candidates_action( himc, ctx, action, index, value );
++        break;
++
++    case NI_IMEMENUSELECTED:
++        ret = FALSE; /* the IME has no menu, see ImeGetImeMenuItems */
++        break;
++
+     default:
+-        FIXME( "himc %p, action %#lx, index %#lx, value %#lx stub!\n", himc, action, index, value );
++        TRACE( "himc %p, action %#lx, index %#lx, value %#lx not handled\n", himc, action, index, value );
+         break;
+     }
+ 
+     ImmUnlockIMC( himc );
+-    return TRUE;
++    return ret;
+ }
+ 
+ LRESULT WINAPI ImeEscape( HIMC himc, UINT escape, void *data )
+ {
+-    FIXME( "himc %p, escape %#x, data %p stub!\n", himc, escape, data );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return 0;
++    HKEY key;
++    LSTATUS status;
++
++    TRACE( "himc %p, escape %#x, data %p\n", himc, escape, data );
++
++    switch (escape)
++    {
++    case IME_ESC_QUERY_SUPPORT:
++        if (!data) return 0;
++        switch (*(UINT *)data)
++        {
++        case IME_ESC_QUERY_SUPPORT:
++        case IME_ESC_IME_NAME:
++        case IME_ESC_GET_EUDC_DICTIONARY:
++        case IME_ESC_SET_EUDC_DICTIONARY:
++#ifdef SG_MUTANT_IMM_ESCQUERY
++            return 0;
++#endif
++            return 1;
++        default:
++            return 0;
++        }
++
++    case IME_ESC_IME_NAME:
++        if (!data) return 0;
++        wcscpy( data, IME_NAME );
++        return 1;
++
++    case IME_ESC_GET_EUDC_DICTIONARY:
++    {
++        WCHAR *path = data;
++        DWORD size = IME_EUDC_PATH_MAX * sizeof(WCHAR), type;
++
++        if (!path) return 0;
++        path[0] = 0;
++        if (!RegOpenKeyExW( HKEY_CURRENT_USER, IME_KEY_NAME, 0, KEY_READ, &key ))
++        {
++            status = RegQueryValueExW( key, IME_EUDC_VALUE, NULL, &type, (BYTE *)path, &size );
++            RegCloseKey( key );
++            if (status || type != REG_SZ) path[0] = 0;
++        }
++        path[IME_EUDC_PATH_MAX - 1] = 0;
++        return 1;
++    }
++
++    case IME_ESC_SET_EUDC_DICTIONARY:
++    {
++        const WCHAR *path = data;
++
++#ifdef SG_MUTANT_IMM_EUDCLEN
++        if (!path) return 0;
++#else
++        if (!path || wcslen( path ) >= IME_EUDC_PATH_MAX) return 0;
++#endif
++        if (RegCreateKeyExW( HKEY_CURRENT_USER, IME_KEY_NAME, 0, NULL, 0, KEY_WRITE, NULL, &key, NULL )) return 0;
++        status = RegSetValueExW( key, IME_EUDC_VALUE, 0, REG_SZ, (const BYTE *)path, (wcslen( path ) + 1) * sizeof(WCHAR) );
++        RegCloseKey( key );
++        return !status;
++    }
++
++    default:
++        /* the escapes of the Chinese and Korean editors, and the help file, need a dictionary and a
++         * help file the IME does not have */
++        return 0;
++    }
+ }
+ 
+ DWORD WINAPI ImeGetImeMenuItems( HIMC himc, DWORD flags, DWORD type, IMEMENUITEMINFOW *parent,
+                                  IMEMENUITEMINFOW *menu, DWORD size )
+ {
+-    FIXME( "himc %p, flags %#lx, type %lu, parent %p, menu %p, size %#lx stub!\n",
+-           himc, flags, type, parent, menu, size );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
++    TRACE( "himc %p, flags %#lx, type %lu, parent %p, menu %p, size %#lx\n", himc, flags, type, parent, menu, size );
++
++    /* the IME has no menu items in any of its menus: none to copy, none registered */
+     return 0;
+ }
+ 
+ BOOL WINAPI ImeRegisterWord( const WCHAR *reading, DWORD style, const WCHAR *string )
+ {
+-    FIXME( "reading %s, style %lu, string %s stub!\n", debugstr_w(reading), style, debugstr_w(string) );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    TRACE( "reading %s, style %lu, string %s\n", debugstr_w(reading), style, debugstr_w(string) );
++    return dict_register( style, reading, string );
+ }
+ 
+ UINT WINAPI ImeGetRegisterWordStyle( UINT item, STYLEBUFW *style )
+ {
+-    FIXME( "item %u, style %p stub!\n", item, style );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return 0;
++    static const struct { DWORD style; const WCHAR *name; } styles[] =
++    {
++        {IME_REGWORD_STYLE_EUDC, L"End-user-defined character"},
++        {IME_REGWORD_STYLE_USER_FIRST, L"User word"},
++    };
++    UINT i;
++
++    TRACE( "item %u, style %p\n", item, style );
++
++#ifdef SG_MUTANT_IMM_STYLECOUNT
++    if (!item) return 1;
++#endif
++    if (!item) return ARRAY_SIZE(styles);
++    if (!style) return 0;
++    for (i = 0; i < item && i < ARRAY_SIZE(styles); i++)
++    {
++        style[i].dwStyle = styles[i].style;
++        wcscpy( style[i].szDescription, styles[i].name );
++    }
++    return i;
+ }
+ 
+ BOOL WINAPI ImeUnregisterWord( const WCHAR *reading, DWORD style, const WCHAR *string )
+ {
+-    FIXME( "reading %s, style %lu, string %s stub!\n", debugstr_w(reading), style, debugstr_w(string) );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    TRACE( "reading %s, style %lu, string %s\n", debugstr_w(reading), style, debugstr_w(string) );
++    return dict_unregister( style, reading, string );
+ }
+ 
+ UINT WINAPI ImeEnumRegisterWord( REGISTERWORDENUMPROCW proc, const WCHAR *reading, DWORD style,
+                                  const WCHAR *string, void *data )
+ {
+-    FIXME( "proc %p, reading %s, style %lu, string %s, data %p stub!\n",
++    struct dict_word *words;
++    UINT i, count, ret = 0;
++
++    TRACE( "proc %p, reading %s, style %lu, string %s, data %p\n",
+            proc, debugstr_w(reading), style, debugstr_w(string), data );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return 0;
++
++    if (!proc) return 0;
++
++    /* the enumeration works on a copy: the callback may change the dictionary */
++    count = dict_load( &words );
++    for (i = 0; i < count; i++)
++    {
++#ifndef SG_MUTANT_IMM_ENUMFILTER
++        if (reading && wcscmp( reading, words[i].reading )) continue;
++#endif
++        if (style && style != words[i].style) continue;
++        if (string && wcscmp( string, words[i].string )) continue;
++        ret = proc( words[i].reading, words[i].style, words[i].string, data );
++#ifdef SG_MUTANT_IMM_ENUMSTOP
++        continue;
++#endif
++        if (!ret) break;
++    }
++    dict_free( words, count );
++    return ret;
+ }
+diff --git a/dlls/imm32/imm.c b/dlls/imm32/imm.c
+index dbf8db6..72411f7 100644
+--- a/dlls/imm32/imm.c
++++ b/dlls/imm32/imm.c
+@@ -53,6 +53,7 @@ struct ime
+     HKL hkl;
+     HMODULE module;
+     struct list entry;
++    BOOL is_default; /* the IME of this DLL stands in for a layout that has none */
+ 
+     IMEINFO info;
+     WCHAR ui_class[17];
+@@ -483,6 +484,7 @@ BOOL WINAPI ImmLoadIME( HKL hkl )
+     else if (!(ime->module = LoadLibraryW( buffer ))) use_default_ime = TRUE;
+     else use_default_ime = FALSE;
+ 
++    ime->is_default = use_default_ime;
+     if (use_default_ime)
+     {
+         if (*buffer) WARN( "Failed to load %s, falling back to default.\n", debugstr_w(buffer) );
+@@ -573,6 +575,28 @@ static struct ime *ime_acquire( HKL hkl )
+     return ime;
+ }
+ 
++#define IS_IME_HKL(hkl) ((((ULONG_PTR)(hkl)) & 0xf0000000) == 0xe0000000)
++
++static void ime_release( struct ime *ime );
++
++/* The dictionary, the conversion lists, the escapes and the dialogs belong to an IME: a layout
++ * that has none (the keyboards of the Latin alphabets) answers 0 to them. */
++static struct ime *ime_acquire_for_words( HKL hkl )
++{
++    struct ime *ime = ime_acquire( hkl );
++
++#ifdef SG_MUTANT_IMM_NOIME
++    if (0)
++#else
++    if (ime && ime->is_default && !IS_IME_HKL( hkl ))
++#endif
++    {
++        ime_release( ime );
++        return NULL;
++    }
++    return ime;
++}
++
+ static void ime_release( struct ime *ime )
+ {
+     ULONG ref;
+@@ -852,7 +876,7 @@ BOOL WINAPI ImmConfigureIMEA( HKL hkl, HWND hwnd, DWORD mode, void *data )
+     TRACE( "hkl %p, hwnd %p, mode %lu, data %p.\n", hkl, hwnd, mode, data );
+ 
+     if (mode == IME_CONFIG_REGISTERWORD && !data) return FALSE;
+-    if (!(ime = ime_acquire( hkl ))) return FALSE;
++    if (!(ime = ime_acquire_for_words( hkl ))) return FALSE;
+ 
+     if (mode != IME_CONFIG_REGISTERWORD || !ime_is_unicode( ime ))
+         ret = ime->pImeConfigure( hkl, hwnd, mode, data );
+@@ -882,7 +906,7 @@ BOOL WINAPI ImmConfigureIMEW( HKL hkl, HWND hwnd, DWORD mode, void *data )
+     TRACE( "hkl %p, hwnd %p, mode %lu, data %p.\n", hkl, hwnd, mode, data );
+ 
+     if (mode == IME_CONFIG_REGISTERWORD && !data) return FALSE;
+-    if (!(ime = ime_acquire( hkl ))) return FALSE;
++    if (!(ime = ime_acquire_for_words( hkl ))) return FALSE;
+ 
+     if (mode != IME_CONFIG_REGISTERWORD || ime_is_unicode( ime ))
+         ret = ime->pImeConfigure( hkl, hwnd, mode, data );
+@@ -1076,7 +1100,7 @@ UINT WINAPI ImmEnumRegisterWordA( HKL hkl, REGISTERWORDENUMPROCA procA, const ch
+     TRACE( "hkl %p, procA %p, readingA %s, style %lu, stringA %s, user %p.\n", hkl, procA,
+            debugstr_a(readingA), style, debugstr_a(stringA), user );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return 0;
++    if (!(ime = ime_acquire_for_words( hkl ))) return 0;
+ 
+     if (!ime_is_unicode( ime ))
+         ret = ime->pImeEnumRegisterWord( procA, readingA, style, stringA, user );
+@@ -1122,7 +1146,7 @@ UINT WINAPI ImmEnumRegisterWordW( HKL hkl, REGISTERWORDENUMPROCW procW, const WC
+     TRACE( "hkl %p, procW %p, readingW %s, style %lu, stringW %s, user %p.\n", hkl, procW,
+            debugstr_w(readingW), style, debugstr_w(stringW), user );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return 0;
++    if (!(ime = ime_acquire_for_words( hkl ))) return 0;
+ 
+     if (ime_is_unicode( ime ))
+         ret = ime->pImeEnumRegisterWord( procW, readingW, style, stringW, user );
+@@ -1159,7 +1183,7 @@ LRESULT WINAPI ImmEscapeA( HKL hkl, HIMC himc, UINT code, void *data )
+ 
+     TRACE( "hkl %p, himc %p, code %u, data %p.\n", hkl, himc, code, data );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return 0;
++    if (!(ime = ime_acquire_for_words( hkl ))) return 0;
+ 
+     if (!EscapeRequiresWA( code ) || !ime_is_unicode( ime ) || !data)
+         ret = ime->pImeEscape( himc, code, data );
+@@ -1192,7 +1216,7 @@ LRESULT WINAPI ImmEscapeW( HKL hkl, HIMC himc, UINT code, void *data )
+ 
+     TRACE( "hkl %p, himc %p, code %u, data %p.\n", hkl, himc, code, data );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return 0;
++    if (!(ime = ime_acquire_for_words( hkl ))) return 0;
+ 
+     if (!EscapeRequiresWA( code ) || ime_is_unicode( ime ) || !data)
+         ret = ime->pImeEscape( himc, code, data );
+@@ -1381,6 +1405,9 @@ BOOL WINAPI ImmGetCandidateWindow( HIMC himc, DWORD index, CANDIDATEFORM *candid
+ 
+     if (!candidate) return FALSE;
+ 
++#ifndef SG_MUTANT_IMM_CANDBOUNDS
++    if (index >= ARRAY_SIZE(ctx->cfCandForm)) return FALSE;
++#endif
+     if (!(ctx = ImmLockIMC( himc ))) return FALSE;
+     if (ctx->cfCandForm[index].dwIndex == -1) ret = FALSE;
+     else *candidate = ctx->cfCandForm[index];
+@@ -1776,7 +1803,7 @@ DWORD WINAPI ImmGetConversionListA( HKL hkl, HIMC himc, const char *srcA, CANDID
+     TRACE( "hkl %p, himc %p, srcA %s, listA %p, lengthA %lu, flags %#x.\n", hkl, himc,
+            debugstr_a(srcA), listA, lengthA, flags );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return 0;
++    if (!(ime = ime_acquire_for_words( hkl ))) return 0;
+ 
+     if (!ime_is_unicode( ime ))
+         ret = ime->pImeConversionList( himc, srcA, listA, lengthA, flags );
+@@ -1812,7 +1839,7 @@ DWORD WINAPI ImmGetConversionListW( HKL hkl, HIMC himc, const WCHAR *srcW, CANDI
+     TRACE( "hkl %p, himc %p, srcW %s, listW %p, lengthW %lu, flags %#x.\n", hkl, himc,
+            debugstr_w(srcW), listW, lengthW, flags );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return 0;
++    if (!(ime = ime_acquire_for_words( hkl ))) return 0;
+ 
+     if (ime_is_unicode( ime ))
+         ret = ime->pImeConversionList( himc, srcW, listW, lengthW, flags );
+@@ -2033,7 +2060,7 @@ UINT WINAPI ImmGetRegisterWordStyleA( HKL hkl, UINT count, STYLEBUFA *styleA )
+ 
+     TRACE( "hkl %p, count %u, styleA %p.\n", hkl, count, styleA );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return 0;
++    if (!(ime = ime_acquire_for_words( hkl ))) return 0;
+ 
+     if (!ime_is_unicode( ime ))
+         ret = ime->pImeGetRegisterWordStyle( count, styleA );
+@@ -2059,7 +2086,7 @@ UINT WINAPI ImmGetRegisterWordStyleW( HKL hkl, UINT count, STYLEBUFW *styleW )
+ 
+     TRACE( "hkl %p, count %u, styleW %p.\n", hkl, count, styleW );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return 0;
++    if (!(ime = ime_acquire_for_words( hkl ))) return 0;
+ 
+     if (ime_is_unicode( ime ))
+         ret = ime->pImeGetRegisterWordStyle( count, styleW );
+@@ -2293,7 +2320,7 @@ BOOL WINAPI ImmRegisterWordA( HKL hkl, const char *readingA, DWORD style, const
+ 
+     TRACE( "hkl %p, readingA %s, style %lu, stringA %s.\n", hkl, debugstr_a(readingA), style, debugstr_a(stringA) );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return FALSE;
++    if (!(ime = ime_acquire_for_words( hkl ))) return FALSE;
+ 
+     if (!ime_is_unicode( ime ))
+         ret = ime->pImeRegisterWord( readingA, style, stringA );
+@@ -2319,7 +2346,7 @@ BOOL WINAPI ImmRegisterWordW( HKL hkl, const WCHAR *readingW, DWORD style, const
+ 
+     TRACE( "hkl %p, readingW %s, style %lu, stringW %s.\n", hkl, debugstr_w(readingW), style, debugstr_w(stringW) );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return FALSE;
++    if (!(ime = ime_acquire_for_words( hkl ))) return FALSE;
+ 
+     if (ime_is_unicode( ime ))
+         ret = ime->pImeRegisterWord( readingW, style, stringW );
+@@ -2785,9 +2812,56 @@ BOOL WINAPI ImmShowSoftKeyboard(HWND hSoftWnd, int nCmdShow)
+  */
+ BOOL WINAPI ImmSimulateHotKey(HWND hWnd, DWORD dwHotKeyID)
+ {
+-  FIXME("(%p, %ld): stub\n", hWnd, dwHotKeyID);
+-  SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-  return FALSE;
++    DWORD conversion, sentence;
++    BOOL ret = FALSE;
++    HIMC himc;
++
++    TRACE("(%p, %#lx)\n", hWnd, dwHotKeyID);
++
++    if (!IsWindow( hWnd ))
++    {
++        SetLastError( ERROR_INVALID_WINDOW_HANDLE );
++        return FALSE;
++    }
++    if (!(himc = ImmGetContext( hWnd ))) return FALSE;
++
++    /* the hot keys work on the open status and on the conversion mode of the input context */
++    ImmGetConversionStatus( himc, &conversion, &sentence );
++    switch (dwHotKeyID)
++    {
++    case IME_CHOTKEY_IME_NONIME_TOGGLE:
++    case IME_THOTKEY_IME_NONIME_TOGGLE:
++    case IME_JHOTKEY_CLOSE_OPEN:
++        ret = ImmSetOpenStatus( himc, !ImmGetOpenStatus( himc ) );
++        break;
++    case IME_CHOTKEY_SHAPE_TOGGLE:
++    case IME_THOTKEY_SHAPE_TOGGLE:
++    case IME_KHOTKEY_SHAPE_TOGGLE:
++        ret = ImmSetConversionStatus( himc, conversion ^ IME_CMODE_FULLSHAPE, sentence );
++        break;
++    case IME_CHOTKEY_SYMBOL_TOGGLE:
++    case IME_THOTKEY_SYMBOL_TOGGLE:
++        ret = ImmSetConversionStatus( himc, conversion ^ IME_CMODE_SYMBOL, sentence );
++        break;
++    case IME_KHOTKEY_HANJACONVERT:
++        ret = ImmSetConversionStatus( himc, conversion ^ IME_CMODE_HANJACONVERT, sentence );
++        break;
++    case IME_KHOTKEY_ENGLISH:
++#ifdef SG_MUTANT_IMM_HOTKEY
++        ret = ImmSetConversionStatus( himc, conversion & ~IME_CMODE_NATIVE, sentence );
++#else
++        ret = ImmSetConversionStatus( himc, conversion & ~(IME_CMODE_NATIVE | IME_CMODE_HANJACONVERT), sentence );
++#endif
++        break;
++    default:
++        /* the reconversion hot key needs a reconversion engine the IME does not have */
++        WARN( "hot key %#lx not handled\n", dwHotKeyID );
++        SetLastError( ERROR_INVALID_PARAMETER );
++        break;
++    }
++
++    ImmReleaseContext( hWnd, himc );
++    return ret;
+ }
+ 
+ /***********************************************************************
+@@ -2800,7 +2874,7 @@ BOOL WINAPI ImmUnregisterWordA( HKL hkl, const char *readingA, DWORD style, cons
+ 
+     TRACE( "hkl %p, readingA %s, style %lu, stringA %s.\n", hkl, debugstr_a(readingA), style, debugstr_a(stringA) );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return FALSE;
++    if (!(ime = ime_acquire_for_words( hkl ))) return FALSE;
+ 
+     if (!ime_is_unicode( ime ))
+         ret = ime->pImeUnregisterWord( readingA, style, stringA );
+@@ -2826,7 +2900,7 @@ BOOL WINAPI ImmUnregisterWordW( HKL hkl, const WCHAR *readingW, DWORD style, con
+ 
+     TRACE( "hkl %p, readingW %s, style %lu, stringW %s.\n", hkl, debugstr_w(readingW), style, debugstr_w(stringW) );
+ 
+-    if (!(ime = ime_acquire( hkl ))) return FALSE;
++    if (!(ime = ime_acquire_for_words( hkl ))) return FALSE;
+ 
+     if (ime_is_unicode( ime ))
+         ret = ime->pImeUnregisterWord( readingW, style, stringW );
+@@ -3030,6 +3104,10 @@ LPVOID WINAPI ImmLockIMCC(HIMCC imcc)
+ */
+ BOOL WINAPI ImmUnlockIMCC(HIMCC imcc)
+ {
++    /* GlobalUnlock answers TRUE for a handle that is no longer one, an IMCC that was destroyed is not unlocked */
++#ifndef SG_MUTANT_IMM_UNLOCK
++    if (GlobalFlags( imcc ) == GMEM_INVALID_HANDLE) return FALSE;
++#endif
+     return GlobalUnlock(imcc);
+ }
+ 
+@@ -3162,7 +3240,8 @@ BOOL WINAPI ImmProcessKey( HWND hwnd, HKL hkl, UINT vkey, LPARAM lparam, DWORD u
+ */
+ BOOL WINAPI ImmDisableTextFrameService(DWORD idThread)
+ {
+-    FIXME("Stub\n");
++    /* no longer available since Windows Vista, ImmDisableIME is its replacement */
++    TRACE("(%#lx)\n", idThread);
+     return FALSE;
+ }
+ 
+@@ -3206,7 +3285,8 @@ BOOL WINAPI ImmGetHotKey(DWORD hotkey, UINT *modifiers, UINT *key, HKL *hkl)
+  */
+ BOOL WINAPI ImmDisableLegacyIME(void)
+ {
+-    FIXME("stub\n");
++    /* only the IME of this DLL is offered, and it works with every kind of application */
++    TRACE("()\n");
+     return TRUE;
+ }
+ 
+diff --git a/dlls/imm32/tests/imm32.c b/dlls/imm32/tests/imm32.c
+index db73463..d8e89cd 100644
+--- a/dlls/imm32/tests/imm32.c
++++ b/dlls/imm32/tests/imm32.c
+@@ -4282,7 +4282,6 @@ static void test_ImmEnumRegisterWord( BOOL unicode )
+     ok_ret( 0, ImmEnumRegisterWordA( NULL, enum_register_wordA, NULL, 0, NULL, NULL ) );
+     ok_ret( 0, ImmEnumRegisterWordW( hkl, enum_register_wordW, NULL, 0, NULL, NULL ) );
+     ok_ret( 0, ImmEnumRegisterWordA( hkl, enum_register_wordA, NULL, 0, NULL, NULL ) );
+-    todo_wine
+     ok_ret( 0xdeadbeef, GetLastError() );
+ 
+     /* IME_PROP_END_UNLOAD for the IME to unload / reload. */
+@@ -4326,7 +4325,6 @@ static void test_ImmRegisterWord( BOOL unicode )
+     ok_ret( 0, ImmRegisterWordA( NULL, NULL, 0, NULL ) );
+     ok_ret( 0, ImmRegisterWordW( hkl, NULL, 0, NULL ) );
+     ok_ret( 0, ImmRegisterWordA( hkl, NULL, 0, NULL ) );
+-    todo_wine
+     ok_ret( 0xdeadbeef, GetLastError() );
+ 
+     /* IME_PROP_END_UNLOAD for the IME to unload / reload. */
+@@ -4388,7 +4386,6 @@ static void test_ImmGetRegisterWordStyle( BOOL unicode )
+     ok_ret( 0, ImmGetRegisterWordStyleA( NULL, 0, &styleA ) );
+     ok_ret( 0, ImmGetRegisterWordStyleW( hkl, 0, &styleW ) );
+     ok_ret( 0, ImmGetRegisterWordStyleA( hkl, 0, &styleA ) );
+-    todo_wine
+     ok_ret( 0xdeadbeef, GetLastError() );
+ 
+     /* IME_PROP_END_UNLOAD for the IME to unload / reload. */
+@@ -4461,7 +4458,6 @@ static void test_ImmUnregisterWord( BOOL unicode )
+     ok_ret( 0, ImmUnregisterWordA( NULL, NULL, 0, NULL ) );
+     ok_ret( 0, ImmUnregisterWordW( hkl, NULL, 0, NULL ) );
+     ok_ret( 0, ImmUnregisterWordA( hkl, NULL, 0, NULL ) );
+-    todo_wine
+     ok_ret( 0xdeadbeef, GetLastError() );
+ 
+     /* IME_PROP_END_UNLOAD for the IME to unload / reload. */
