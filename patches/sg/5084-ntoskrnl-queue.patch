@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 12:00:00 +0000
+Subject: [PATCH] ntoskrnl: driver-managed queues (KQUEUE).
+
+KeInsertQueue was a FIXME that returned 0 and KeInitializeQueue,
+KeInsertHeadQueue, KeRemoveQueue, KeReadStateQueue and KeRundownQueue were
+unimplemented exports. A queue holds its entries in order; an insert returns
+the number of entries queued before it, an entry inserted while a thread
+waits in KeRemoveQueue goes to that thread; KeRemoveQueue returns
+STATUS_TIMEOUT (as the returned pointer) when nothing arrives within the
+timeout; KeRundownQueue returns the first entry and wakes waiters and
+later removals with STATUS_ABANDONED.
+
+Gate: test/ntoskrnl-queue-gate.sh.
+---
+
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -2979,15 +2979,6 @@
+     return thread->kthread.id.UniqueProcess;
+ }
+ 
+-/***********************************************************************
+- *           KeInsertQueue   (NTOSKRNL.EXE.@)
+- */
+-LONG WINAPI KeInsertQueue(PRKQUEUE Queue, PLIST_ENTRY Entry)
+-{
+-    FIXME( "stub: %p %p\n", Queue, Entry );
+-    return 0;
+-}
+-
+ /* the DPC queue: DPCs run one at a time on a worker, in the order they were queued
+  * (a high-importance one first); DpcData is set while a DPC is in the queue */
+ static KDPC *dpc_head, *dpc_tail;
+diff --git a/dlls/ntoskrnl.exe/sync.c b/dlls/ntoskrnl.exe/sync.c
+--- a/dlls/ntoskrnl.exe/sync.c
++++ b/dlls/ntoskrnl.exe/sync.c
+@@ -1517,3 +1517,180 @@
+ 
+     return entry;
+ }
++
++
++/* KQUEUE: EntryListHead holds the entries, Header.SignalState is their number, ThreadListHead the
++ * threads waiting in KeRemoveQueue (its Flink is NULL once the queue was run down). An entry
++ * inserted while a thread waits goes straight to that thread. */
++struct queue_waiter
++{
++    LIST_ENTRY entry;
++    LIST_ENTRY *got;
++    BOOL done;
++};
++
++static CRITICAL_SECTION queue_cs;
++static CRITICAL_SECTION_DEBUG queue_cs_debug =
++{
++    0, 0, &queue_cs,
++    { &queue_cs_debug.ProcessLocksList, &queue_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": queue_cs") }
++};
++static CRITICAL_SECTION queue_cs = { &queue_cs_debug, -1, 0, 0, 0, 0 };
++static CONDITION_VARIABLE queue_cv = CONDITION_VARIABLE_INIT;
++
++void WINAPI KeInitializeQueue( KQUEUE *queue, ULONG count )
++{
++    TRACE( "queue %p, count %lu.\n", queue, count );
++
++    memset( &queue->Header, 0, sizeof(queue->Header) );
++    queue->Header.Type = 4;  /* QueueObject */
++    queue->Header.Size = sizeof(*queue) / sizeof(ULONG);
++    InitializeListHead( &queue->Header.WaitListHead );
++    InitializeListHead( &queue->EntryListHead );
++    InitializeListHead( &queue->ThreadListHead );
++    queue->CurrentCount = 0;
++    queue->MaximumCount = count ? count : NtCurrentTeb()->Peb->NumberOfProcessors;
++}
++
++static LONG insert_queue( KQUEUE *queue, LIST_ENTRY *entry, BOOL head )
++{
++    LONG previous;
++
++    EnterCriticalSection( &queue_cs );
++    previous = queue->Header.SignalState;
++    if (queue->ThreadListHead.Flink && !IsListEmpty( &queue->ThreadListHead ))
++    {
++        /* a thread is waiting: it gets the entry */
++        struct queue_waiter *waiter = CONTAINING_RECORD( RemoveHeadList( &queue->ThreadListHead ), struct queue_waiter, entry );
++        waiter->got = entry;
++        waiter->done = TRUE;
++        WakeAllConditionVariable( &queue_cv );
++    }
++    else
++    {
++#ifdef SG_MUTANT_QUEUE_TAIL_ORDER
++        if (0)
++#else
++        if (head)
++#endif
++            InsertHeadList( &queue->EntryListHead, entry );
++        else InsertTailList( &queue->EntryListHead, entry );
++        queue->Header.SignalState++;
++    }
++    LeaveCriticalSection( &queue_cs );
++#ifdef SG_MUTANT_QUEUE_PREVIOUS_STATE
++    return 0;
++#endif
++    return previous;
++}
++
++LONG WINAPI KeInsertQueue( KQUEUE *queue, LIST_ENTRY *entry )
++{
++    TRACE( "queue %p, entry %p.\n", queue, entry );
++    return insert_queue( queue, entry, FALSE );
++}
++
++LONG WINAPI KeInsertHeadQueue( KQUEUE *queue, LIST_ENTRY *entry )
++{
++    TRACE( "queue %p, entry %p.\n", queue, entry );
++    return insert_queue( queue, entry, TRUE );
++}
++
++LONG WINAPI KeReadStateQueue( KQUEUE *queue )
++{
++    TRACE( "queue %p.\n", queue );
++    return queue->Header.SignalState;
++}
++
++LIST_ENTRY *WINAPI KeRemoveQueue( KQUEUE *queue, KPROCESSOR_MODE mode, LARGE_INTEGER *timeout )
++{
++    LIST_ENTRY *ret;
++    struct queue_waiter waiter;
++    ULONGLONG end = 0;
++    DWORD ms;
++
++    TRACE( "queue %p, mode %d, timeout %p.\n", queue, mode, timeout );
++
++    EnterCriticalSection( &queue_cs );
++    if (!queue->ThreadListHead.Flink)
++    {
++        LeaveCriticalSection( &queue_cs );
++        return (LIST_ENTRY *)(ULONG_PTR)STATUS_ABANDONED;
++    }
++    if (!IsListEmpty( &queue->EntryListHead ))
++    {
++        ret = RemoveHeadList( &queue->EntryListHead );
++        queue->Header.SignalState--;
++        LeaveCriticalSection( &queue_cs );
++        return ret;
++    }
++    if (timeout && !timeout->QuadPart)
++    {
++        LeaveCriticalSection( &queue_cs );
++        return (LIST_ENTRY *)(ULONG_PTR)STATUS_TIMEOUT;
++    }
++    if (timeout)
++    {
++        LONGLONG t = timeout->QuadPart;
++        if (t > 0)  /* absolute system time */
++        {
++            LARGE_INTEGER now;
++            KeQuerySystemTime( &now );
++            t = now.QuadPart >= t ? 0 : now.QuadPart - t;
++        }
++        end = GetTickCount64() + (-t) / 10000;
++    }
++
++    waiter.got = NULL;
++    waiter.done = FALSE;
++    InsertTailList( &queue->ThreadListHead, &waiter.entry );
++    while (!waiter.done)
++    {
++        if (!queue->ThreadListHead.Flink) break;  /* run down */
++        if (timeout)
++        {
++            ULONGLONG now = GetTickCount64();
++            if (now >= end) break;
++            ms = end - now;
++        }
++        else ms = INFINITE;
++        SleepConditionVariableCS( &queue_cv, &queue_cs, ms );
++    }
++    if (waiter.done) ret = waiter.got;
++    else
++    {
++        if (queue->ThreadListHead.Flink) RemoveEntryList( &waiter.entry );
++#ifdef SG_MUTANT_QUEUE_NO_TIMEOUT
++        ret = NULL;
++#else
++        ret = (LIST_ENTRY *)(ULONG_PTR)(queue->ThreadListHead.Flink ? STATUS_TIMEOUT : STATUS_ABANDONED);
++#endif
++    }
++    LeaveCriticalSection( &queue_cs );
++    return ret;
++}
++
++LIST_ENTRY *WINAPI KeRundownQueue( KQUEUE *queue )
++{
++    LIST_ENTRY *first = NULL;
++
++    TRACE( "queue %p.\n", queue );
++
++    EnterCriticalSection( &queue_cs );
++    if (!IsListEmpty( &queue->EntryListHead ))
++    {
++        first = queue->EntryListHead.Flink;
++        InitializeListHead( &queue->EntryListHead );
++    }
++    queue->Header.SignalState = 0;
++    /* waiting threads wake with STATUS_ABANDONED, later waits fail the same way */
++#ifdef SG_MUTANT_QUEUE_RUNDOWN
++    InitializeListHead( &queue->ThreadListHead );
++#else
++    queue->ThreadListHead.Flink = queue->ThreadListHead.Blink = NULL;
++#endif
++    WakeAllConditionVariable( &queue_cv );
++    LeaveCriticalSection( &queue_cs );
++    return first;
++}
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -584,14 +584,14 @@
+ @ stub KeInitializeMutant
+ @ stdcall KeInitializeMutex(ptr long)
+ @ stdcall KeInitializeGuardedMutex(ptr)
+-@ stub KeInitializeQueue
++@ stdcall KeInitializeQueue(ptr long)
+ @ stdcall KeInitializeSemaphore(ptr long long)
+ @ stdcall KeInitializeSpinLock(ptr) NTOSKRNL_KeInitializeSpinLock
+ @ stdcall KeInitializeTimer(ptr)
+ @ stdcall KeInitializeTimerEx(ptr long)
+ @ stdcall KeInsertByKeyDeviceQueue(ptr ptr long)
+ @ stdcall KeInsertDeviceQueue(ptr ptr)
+-@ stub KeInsertHeadQueue
++@ stdcall KeInsertHeadQueue(ptr ptr)
+ @ stdcall KeInsertQueue(ptr ptr)
+ @ stub KeInsertQueueApc
+ @ stdcall KeInsertQueueDpc(ptr ptr ptr)
+@@ -622,7 +622,7 @@
+ @ stdcall KeReadStateEvent(ptr)
+ @ stub KeReadStateMutant
+ @ stub KeReadStateMutex
+-@ stub KeReadStateQueue
++@ stdcall KeReadStateQueue(ptr)
+ @ stub KeReadStateSemaphore
+ @ stub KeReadStateTimer
+ @ stub KeRegisterBugCheckCallback
+@@ -637,14 +637,14 @@
+ @ stub KeRemoveByKeyDeviceQueueIfBusy
+ @ stdcall KeRemoveDeviceQueue(ptr)
+ @ stdcall KeRemoveEntryDeviceQueue(ptr ptr)
+-@ stub KeRemoveQueue
++@ stdcall KeRemoveQueue(ptr long ptr)
+ @ stdcall KeRemoveQueueDpc(ptr)
+ @ stub KeRemoveSystemServiceTable
+ @ stdcall KeResetEvent(ptr)
+ @ stub KeRestoreFloatingPointState
+ @ stdcall KeRevertToUserAffinityThread()
+ @ stdcall KeRevertToUserAffinityThreadEx(long)
+-@ stub KeRundownQueue
++@ stdcall KeRundownQueue(ptr)
+ @ stub KeSaveFloatingPointState
+ @ stub KeSaveStateForHibernate
+ @ extern KeServiceDescriptorTable
+diff --git a/include/ddk/ntifs.h b/include/ddk/ntifs.h
+--- a/include/ddk/ntifs.h
++++ b/include/ddk/ntifs.h
+@@ -57,6 +57,13 @@
+   LIST_ENTRY ThreadListHead;
+ } KQUEUE, *PKQUEUE, *RESTRICTED_POINTER PRKQUEUE;
+ 
++void WINAPI KeInitializeQueue(PKQUEUE,ULONG);
++LONG WINAPI KeInsertHeadQueue(PKQUEUE,PLIST_ENTRY);
++LONG WINAPI KeInsertQueue(PKQUEUE,PLIST_ENTRY);
++LONG WINAPI KeReadStateQueue(PKQUEUE);
++PLIST_ENTRY WINAPI KeRemoveQueue(PKQUEUE,KPROCESSOR_MODE,PLARGE_INTEGER);
++PLIST_ENTRY WINAPI KeRundownQueue(PKQUEUE);
++
+ typedef enum _FS_FILTER_STREAM_FO_NOTIFICATION_TYPE
+ {
+     NotifyTypeCreate  = 0,
+-- 
+2.47.0
