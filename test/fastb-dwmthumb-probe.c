@@ -2,12 +2,16 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include <stdio.h>
+#include <tlhelp32.h>
 #ifndef DWM_E_COMPOSITIONDISABLED
 #define DWM_E_COMPOSITIONDISABLED ((HRESULT)0x80263001)
 #endif
 #include <string.h>
 
 static int failures;
+#ifndef IDLE_MS
+#define IDLE_MS 6000
+#endif
 #define CHECK(c, ...) do { if (!(c)) { failures++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static COLORREF src_left = RGB(255, 0, 0), src_right = RGB(0, 0, 255);
@@ -34,10 +38,12 @@ static LRESULT CALLBACK src_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
+static int dest_paints;
 static LRESULT CALLBACK dest_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_PAINT)
     {
+        dest_paints++;
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
         RECT r;
@@ -71,6 +77,36 @@ static COLORREF pixel(HWND hwnd, int x, int y)
 static int is_near(COLORREF c, int r, int g, int b, int tol)
 {
     return abs((int)GetRValue(c) - r) <= tol && abs((int)GetGValue(c) - g) <= tol && abs((int)GetBValue(c) - b) <= tol;
+}
+
+static int thread_count(void)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te = { sizeof(te) };
+    int n = 0;
+    if (snap == INVALID_HANDLE_VALUE) return -1;
+    if (Thread32First(snap, &te))
+        do { if (te.th32OwnerProcessID == GetCurrentProcessId()) n++; } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+    return n;
+}
+
+static ULONGLONG cpu_ms(void)
+{
+    FILETIME c, e, k, u;
+    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    return (((ULONGLONG)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((ULONGLONG)u.dwHighDateTime << 32 | u.dwLowDateTime)) / 10000;
+}
+
+static void idle_wait(DWORD ms)
+{
+    DWORD end = GetTickCount() + ms;
+    MSG msg;
+    while (GetTickCount() < end)
+    {
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 100, QS_ALLINPUT);
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+    }
 }
 
 static int child_main(void)
@@ -235,7 +271,7 @@ int main(int argc, char **argv)
     /* the source changes: the thumbnail follows */
     src_left = RGB(0, 255, 0);
     InvalidateRect(src, NULL, TRUE);
-    pump(700);
+    pump(1700);
     CHECK(is_near(pixel(dest, 40, 70), 0, 255, 0, 12), "thumbnail follows the source %06lx", pixel(dest, 40, 70));
 
     /* source rectangle: the right half only */
@@ -268,7 +304,7 @@ int main(int argc, char **argv)
     /* a translucent picture that changes is blended over the background again, not over itself */
     src_left = RGB(255, 0, 0);
     InvalidateRect(src, NULL, TRUE);
-    pump(900);
+    pump(1700);
     {
         COLORREF c = pixel(dest, 40, 70);
         CHECK(GetRValue(c) > 230 && GetGValue(c) > 100 && GetGValue(c) < 160 && GetBValue(c) > 100 && GetBValue(c) < 160, "half opacity, changed picture %06lx", c);
@@ -296,11 +332,58 @@ int main(int argc, char **argv)
     CHECK(hr == S_OK && size.cx == r.right && size.cy == r.bottom, "client source size %ldx%ld vs %ldx%ld", size.cx, size.cy, r.right, r.bottom);
 
     /* unregistering gives it back too */
+    pump(1500);
+    CHECK(!is_near(pixel(dest, 40, 70), 255, 255, 255, 30), "thumbnail on screen before unregistering: %06lx", pixel(dest, 40, 70));
     CHECK(DwmUnregisterThumbnail(t) == S_OK, "unregister");
     pump(500);
     CHECK(is_near(pixel(dest, 40, 70), 255, 255, 255, 2), "area after unregistering %06lx", pixel(dest, 40, 70));
     CHECK(DwmUpdateThumbnailProperties(t, &props) == E_INVALIDARG, "properties after unregistering");
     CHECK(DwmQueryThumbnailSourceSize(t, &size) == E_INVALIDARG, "size after unregistering");
+
+    /* cost: thumbnails kept registered and visible while nothing changes */
+    {
+        HTHUMBNAIL th[3];
+        HWND dest2 = CreateWindowA("SgThumbDest", "dest2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 400, 200, 300, 250, NULL, NULL, wc.hInstance, NULL);
+        int base, with, i, paints0;
+        ULONGLONG cpu0, used;
+
+        idle_wait(500);
+        base = thread_count();
+        memset(&props, 0, sizeof(props));
+        props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY;
+        props.fVisible = TRUE;
+        props.opacity = 255;
+        for (i = 0; i < 3; i++)
+        {
+            SetRect(&props.rcDestination, 5 + i * 95, 10, 5 + i * 95 + 90, 80);
+            CHECK(DwmRegisterThumbnail(dest2, src, &th[i]) == S_OK, "register %d", i);
+            CHECK(DwmUpdateThumbnailProperties(th[i], &props) == S_OK, "show %d", i);
+        }
+        idle_wait(2000);
+        with = thread_count();
+        CHECK(base >= 0 && with == base + 1, "one painting thread for any number of thumbnails: %d -> %d", base, with);
+        paints0 = dest_paints;
+        cpu0 = cpu_ms();
+        idle_wait(IDLE_MS);
+        used = cpu_ms() - cpu0;
+        printf("note: %d ms idle with 3 visible thumbnails: %I64u ms of CPU, %d destination repaints\n", IDLE_MS, used, dest_paints - paints0);
+        CHECK(used < IDLE_MS / 20, "3 idle thumbnails used %I64u ms of CPU in %d ms", used, IDLE_MS);
+        CHECK(dest_paints - paints0 <= 2, "the destination was repainted %d times while nothing changed", dest_paints - paints0);
+        for (i = 0; i < 3; i++) CHECK(DwmUnregisterThumbnail(th[i]) == S_OK, "unregister %d", i);
+        idle_wait(1500);
+        CHECK(thread_count() == base, "the painting thread ends with the last thumbnail: %d vs %d", thread_count(), base);
+
+        /* and with the destination window */
+        CHECK(DwmRegisterThumbnail(dest2, src, &th[0]) == S_OK, "register again");
+        SetRect(&props.rcDestination, 10, 10, 110, 90);
+        DwmUpdateThumbnailProperties(th[0], &props);
+        idle_wait(500);
+        CHECK(thread_count() == base + 1, "thread running again: %d", thread_count());
+        DestroyWindow(dest2);
+        idle_wait(2500);
+        CHECK(thread_count() == base, "the thread ends with the destination window: %d vs %d", thread_count(), base);
+        CHECK(DwmUpdateThumbnailProperties(th[0], &props) == E_INVALIDARG, "thumbnail of a destroyed destination");
+    }
 
     printf(failures ? "RESULT: FAIL (%d)\n" : "RESULT: PASS\n", failures);
     return failures != 0;
