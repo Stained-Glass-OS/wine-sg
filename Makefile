@@ -2702,3 +2702,7 @@ test-difxapi:
 
 # appxpackaging (5505) is checked by test-appx (test/appx-gate.sh), whose
 # bundle-manifest checks are the new ones.
+
+# tbs (5517): argument checks before TBS_E_TPM_NOT_FOUND.
+test-tbs:
+	WINE=$(PREFIX)/bin/wine test/tbs-gate.sh
