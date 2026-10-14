@@ -35,3 +35,29 @@ IO_STATUS_BLOCK; `IRP_MN_REMOVE_DEVICE` then reaches winebus `remove_pending_irp
 IRP (ntoskrnl.c:2093 writes `*irp->UserIosb`) into that dead stack. Fix sketch: winebus sets a cancel
 routine on the parked read IRP; hidclass calls IoCancelIrp and waits for the IRP event before leaving the
 thread. Touches upstream-owned paths in two drivers, so left for a decision.
+
+## hal: IRQL and port I/O
+
+- `KfRaiseIrql`, `KfLowerIrql`, `KeGetCurrentIrql` (hal, i386/arm) and the x86_64 `KfRaiseIrql`/`KeLowerIrql`
+  in ntoskrnl are all logging stubs. A real implementation keeps one IRQL per thread (a thread-local in
+  ntoskrnl, exported to hal), raises in `KeAcquireSpinLock*` and the DPC/work-item runners, and lowers in the
+  release routines. Proposal: do it once in ntoskrnl, with hal forwarding. It changes what every driver sees
+  from `KeGetCurrentIrql()` (always PASSIVE_LEVEL today), so it wants a decision and a broad driver test run.
+- `READ_PORT_*`/`WRITE_PORT_*` on x86 need `iopl`/`ioperm`, i.e. Unix root (or CAP_SYS_RAWIO). The machine
+  server is deliberately unprivileged. Proposal: leave them as they are (return 0 / ignore) unless a
+  privileged helper process is wanted for specific legacy hardware.
+
+## wineusb.sys: unhandled URB functions, flags and ioctls
+
+Three diagnostics for URB functions/flags/internal ioctls the driver does not map to libusb. Each is
+documented, but none can be verified without a USB device; this kernel has no `dummy_hcd` or `usbip`.
+Proposal: a drafter with USB hardware (or a usbip loopback) implements them as a set: GET_STATUS_FROM_*,
+SET/CLEAR_FEATURE_*, RESET_PIPE, ISOCH_TRANSFER, the `USBD_TRANSFER_DIRECTION`/short-transfer flags, and
+`IOCTL_INTERNAL_USB_GET_PORT_STATUS`/`RESET_PORT`.
+
+## ndis.sys: NdisRegisterProtocol
+
+Protocol drivers (firewalls, packet capture such as WinPcap's npf.sys) call it from `DriverEntry`, then
+expect `BindAdapterHandler` for each adapter and the send/receive path. Wine has only an ioctl view of
+the host's interfaces. A binding model (an NDIS adapter per host interface, packets through AF_PACKET via a
+privileged helper) is a design and a security decision; failing the registration remains the safe answer.
