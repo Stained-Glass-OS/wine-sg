@@ -2734,3 +2734,6 @@ test-dllclass:
 # schedsvc monthly triggers (5528).
 test-taskmonth:
 	WINE=$(PREFIX)/bin/wine test/taskmonth-gate.sh
+
+test-dllhost:
+	WINE=$(PREFIX)/bin/wine test/dllhost-gate.sh
