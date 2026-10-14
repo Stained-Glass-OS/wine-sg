@@ -2682,6 +2682,10 @@ test-dwmthumb:
 test-nsi:
 	WINE=$(PREFIX)/bin/wine test/nsi-gate.sh
 
+# authz (5513): resource manager, client contexts, AuthzAccessCheck.
+test-authz:
+	WINE=$(PREFIX)/bin/wine test/authz-gate.sh
+
 # apphelp (5502): ShimFlushCache needs an administrator, SdbGetAppPatchDir.
 test-apphelp:
 	WINE=$(PREFIX)/bin/wine test/apphelp-gate.sh

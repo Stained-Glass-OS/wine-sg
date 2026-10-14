@@ -88,3 +88,16 @@ an administrator or LocalSystem. Patch 5512 loads the hive without checking them
 success to everyone, and programs that run unprivileged here (every ordinary user of the shared prefix) would
 start to fail. Proposal: enforce them only for a token that is not the caller's own user (loading someone
 else's hive is the real risk); keep the self case open. Needs a decision.
+
+## authz: contexts from a SID, security event sources
+
+- `AuthzInitializeContextFromSid`: a client context needs the SID's groups. Windows asks the domain (an S4U
+  logon, or `AUTHZ_SKIP_TOKEN_GROUPS` for a context of the SID alone). Proposal: with
+  `AUTHZ_SKIP_TOKEN_GROUPS` build a context whose check uses only that SID (plus Everyone/Authenticated Users);
+  otherwise let the domain-join path (sg-domain-logon's SID/group files, patch 0205) supply the groups. The
+  access check then needs a token-less mode (an own DACL evaluation instead of NtAccessCheck).
+- `AuthzInstallSecurityEventSource`: writing the Security log's registry is an audit-configuration change in a
+  shared prefix; proposal: allow it for SYSTEM/administrators only (the registry DACL already says that for
+  HKLM) and have the event log service pick sources up from there.
+- kernelbase `AccessCheckByType` (and the other `AccessCheckByType*`) are stubs that always fail; not in this
+  queue, but authz and anything doing object-type access checks need them.
