@@ -80,3 +80,11 @@ directory and calls the existing install path on Commit. Both change what lands 
   as on Windows). It changes what UDP programs see by default, so it wants a broad network-program test run.
 - `DisconnectEx` with `TF_REUSE_SOCKET`: the afd socket object needs a "reset" request that replaces the Linux
   fd with a fresh one of the same type and returns the object to the unconnected state.
+
+## userenv: privileges for LoadUserProfile
+
+The LoadUserProfile page requires SE_RESTORE_NAME and SE_BACKUP_NAME in the caller's token and, since XP SP2,
+an administrator or LocalSystem. Patch 5512 loads the hive without checking them: the old fake returned
+success to everyone, and programs that run unprivileged here (every ordinary user of the shared prefix) would
+start to fail. Proposal: enforce them only for a token that is not the caller's own user (loading someone
+else's hive is the real risk); keep the self case open. Needs a decision.
