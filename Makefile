@@ -2714,3 +2714,11 @@ test-setx:
 # arp (5520): the ARP table, -s and -d.
 test-arp:
 	WINE=$(PREFIX)/bin/wine test/arp-gate.sh
+
+# msiexec (5521): /f with a product code.
+test-msiexec-repair:
+	WINE=$(PREFIX)/bin/wine test/msiexec-repair-gate.sh
+
+# pnputil (5522): driver packages.
+test-pnputil:
+	WINE=$(PREFIX)/bin/wine test/pnputil-gate.sh
