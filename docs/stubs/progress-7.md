@@ -22,3 +22,9 @@ Verdict: **the container can build Wine and run it; work can proceed.**
   1. dwmapi_test.exe exits 148 silently at start on both architectures (the first run saw EXCEPTION_INT_DIVIDE_BY_ZERO). In the dwmapi batch.
   2. After `wineboot -i`, winedevice.exe (thread hosting hid/winebus, right after `hid:fdo_pnp_dispatch Unhandled minor function 0x13`) takes an unhandled write page fault at ntoskrnl.exe+0x132e2 (a Unix stack address ending ...FE80), same offset every run. Seen only with WINEDEBUG=-all/err; vanishes under +seh tracing. winebus.sys is in the queue; to be examined there.
 - Hygiene: run `wineserver -k` per prefix before reusing a display; never `pkill -f wineserver` from the shell running the command.
+
+## Queue status (2026-10-14)
+All 467 items of gap-CLOUD.json have a row in triage-7.tsv with evidence: 102 implemented (patches 5500-5534, each with a gate and a mutant shown failing, built from a clean series-applied tree), 51 windows-matches, 96 no-ground-truth, 69 not-applicable, 149 escalate (grouped in escalate-7.md).
+- Last batches: 5530/5531 (COM surrogate bitness, dllhost GetMarshalSizeMax; `make test-dllhost`), 5532 (rpcss ept_lookup + rpcrt4 RpcMgmtEpEltInq*; rpcrt4 `test_endpoint_inquiry`), 5533 (loadperf lodctr/unlodctr; `make test-loadperf`), 5534 (fontsub CreateFontPackage subsetting; `make test-fontsub`).
+- Not done inside the implemented items (each stated in its patches/notes/NNNN.txt): taskschd's own trigger objects for monthly triggers; package formats and the name-language filter in fontsub; loadperf's trusted-library checksum and error codes (unverified).
+- A gate that starts a COM surrogate or any detached process must write the probe's output to a file, not a pipe: the surrogate inherits the pipe and keeps `$(...)` from ever returning.
