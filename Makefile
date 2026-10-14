@@ -2681,3 +2681,7 @@ test-dwmthumb:
 # a network namespace of the gate's own (unshare -rn).
 test-nsi:
 	WINE=$(PREFIX)/bin/wine test/nsi-gate.sh
+
+# apphelp (5502): ShimFlushCache needs an administrator, SdbGetAppPatchDir.
+test-apphelp:
+	WINE=$(PREFIX)/bin/wine test/apphelp-gate.sh
