@@ -86,6 +86,12 @@ start_fake ""
 phase events
 stop_fake
 
+# DesiredAccuracyInMeters, Geopoint (patch 3670): 50 m asks GeoClue for the exact level, 5000 m for the default one
+start_fake ""
+phase scalar
+expect "scalar: 50 m then 5000 m ask for the exact then the default level" "$(grep -- 'Set RequestedAccuracyLevel' "$T/log" | sed 's/.*=//' | tr '\n' ' ')" "8 5 "
+stop_fake
+
 for p in deny-hklm deny-hkcu deny-np; do
     start_fake ""
     phase $p
@@ -96,6 +102,7 @@ done
 # the bus is up but nothing owns org.freedesktop.GeoClue2
 : > "$T/log"
 phase absent
+phase default
 
 [ $FAIL = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $FAIL
