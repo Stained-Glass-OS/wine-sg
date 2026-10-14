@@ -2695,3 +2695,6 @@ test-newdev:
 # fresh prefix (no display needed).
 test-difxapi:
 	WINE=$(PREFIX)/bin/wine test/difxapi-gate.sh
+
+# appxpackaging (5505) is checked by test-appx (test/appx-gate.sh), whose
+# bundle-manifest checks are the new ones.
