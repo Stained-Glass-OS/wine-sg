@@ -17,7 +17,14 @@ T=$(mktemp -d /var/tmp/sg-fastnetbios.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
-TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/fastnetbios-probe.c" \
+# the name table functions are taken from netbios.c of the tree under test, on every run
+SRC="${NETBIOS_SRC:-${WINE_INCLUDE:+$WINE_INCLUDE/../dlls/netapi32/netbios.c}}"
+[ -n "$SRC" ] && [ -f "$SRC" ] || { echo "FAIL  set NETBIOS_SRC (or WINE_INCLUDE) to the tree under test: no netbios.c"; exit 1; }
+{ grep '^#define SG_MUTANT_' "$SRC"
+  awk '/^\/\* NCBADDNAME, NCBADDGRNAME: the name goes/ {on=1} /^static UCHAR nbAStat\(/ {on=0} on' "$SRC"; } > "$T/fastnetbios-names.inc"
+grep -q 'static UCHAR nbAddName' "$T/fastnetbios-names.inc" && grep -q 'static UCHAR nbDelName' "$T/fastnetbios-names.inc" \
+    || { echo "FAIL  the name table functions are not in $SRC"; exit 1; }
+TMPDIR=/var/tmp "$MINGW" -O1 -I"$T" -o "$T/probe.exe" "$HERE/fastnetbios-probe.c" \
     || { echo "FAIL  probe did not build"; exit 1; }
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1

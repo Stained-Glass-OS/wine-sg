@@ -1,6 +1,6 @@
 /* netapi32 netbios: the local name table (NCBADDNAME, NCBADDGRNAME, NCBDELNAME, the names in NCBASTAT).
  * The build environments of the gate have no NetBIOS adapter, so the functions of the table are
- * extracted from netbios.c into fastnetbios-names.inc (kept equal by the gate script) and run here. */
+ * extracted by the gate script from netbios.c of the tree under test, on every run, and run here. */
 #include <windows.h>
 #include <nb30.h>
 #include <stdio.h>
