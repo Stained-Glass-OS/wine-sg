@@ -630,6 +630,20 @@ static void test_ftp(void)
     if (con) InternetCloseHandle(con);
     InternetCloseHandle(ses);
 
+    /* localhost bypasses the proxy by default; "<-loopback>" removes that */
+    sprintf(proxy, "ftp=ftp://127.0.0.1:1");
+    ses = InternetOpenA("t", INTERNET_OPEN_TYPE_PROXY, proxy, NULL, 0);
+    ftp_last_user[0] = 0;
+    con = InternetConnectA(ses, "localhost", ftp_port, "joe", "pw", INTERNET_SERVICE_FTP, INTERNET_FLAG_PASSIVE, 0);
+    CHECK(con != NULL && !strcmp(ftp_last_user, "joe"), "loopback bypasses the proxy '%s'", ftp_last_user);
+    if (con) InternetCloseHandle(con);
+    InternetCloseHandle(ses);
+    ses = InternetOpenA("t", INTERNET_OPEN_TYPE_PROXY, proxy, "<-loopback>", 0);
+    con = InternetConnectA(ses, "localhost", ftp_port, "joe", "pw", INTERNET_SERVICE_FTP, INTERNET_FLAG_PASSIVE, 0);
+    CHECK(con == NULL, "<-loopback> uses the proxy");
+    if (con) InternetCloseHandle(con);
+    InternetCloseHandle(ses);
+
     /* a proxy that is not named for FTP (CERN) is not used for FTP */
     sprintf(proxy, "127.0.0.1:%d", ftp_port);
     ses = InternetOpenA("t", INTERNET_OPEN_TYPE_PROXY, proxy, NULL, 0);
@@ -693,6 +707,12 @@ static void test_gopher(void)
     SetLastError(0);
     CHECK(!gettype(NULL, &type) && GetLastError() == ERROR_INVALID_PARAMETER, "null locator");
     CHECK(gettype("zname\tsel\thost\t70", &type) && type == GOPHER_TYPE_UNKNOWN, "unknown type char %lx", type);
+
+    ses = InternetOpenA("t", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    SetLastError(0);
+    CHECK(InternetConnectA(ses, "127.0.0.1", 70, NULL, NULL, INTERNET_SERVICE_GOPHER, 0, 0) == NULL &&
+          GetLastError() == ERROR_INTERNET_INVALID_OPERATION, "gopher connect %lu", GetLastError());
+    InternetCloseHandle(ses);
 
     /* the network functions need a gopher session, which cannot exist */
     SetLastError(0);
