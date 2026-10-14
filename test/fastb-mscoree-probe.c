@@ -103,6 +103,30 @@ static void test_config_stream(HMODULE mscoree)
     hr = CALL(st, 7, HRESULT, void*, ULARGE_INTEGER, ULARGE_INTEGER*, ULARGE_INTEGER*)(st, mem, sz, &rd, &wr);
     CHECK(hr == S_OK && rd.QuadPart == 4, "CopyTo to end read=%I64u", rd.QuadPart);
     CHECK(CALL(st, 8, HRESULT, DWORD)(st, 0) == S_OK, "Commit");
+    {
+        ULARGE_INTEGER z = {{0}}, one = {{1}};
+        Obj *clone = NULL;
+        char b1[2], b2[2];
+        ULONG g1 = 0, g2 = 0;
+
+        CHECK(CALL(st, 6, HRESULT, ULARGE_INTEGER)(st, z) == 0x80030005, "SetSize read-only");
+        CHECK(CALL(st, 9, HRESULT)(st) == S_OK, "Revert");
+        CHECK(CALL(st, 10, HRESULT, ULARGE_INTEGER, ULARGE_INTEGER, DWORD)(st, z, one, 1) == 0x80030001, "LockRegion");
+        CHECK(CALL(st, 11, HRESULT, ULARGE_INTEGER, ULARGE_INTEGER, DWORD)(st, z, one, 1) == 0x80030001, "UnlockRegion");
+        mv.QuadPart = 3;
+        CALL(st, 5, HRESULT, LARGE_INTEGER, DWORD, ULARGE_INTEGER*)(st, mv, STREAM_SEEK_SET, &np);
+        hr = CALL(st, 13, HRESULT, Obj**)(st, &clone);
+        CHECK(hr == S_OK && clone, "Clone %lx", hr);
+        if (clone)
+        {
+            /* independent seek pointers, both starting at 3 */
+            CALL(clone, 3, HRESULT, void*, ULONG, ULONG*)(clone, b1, 2, &g1);
+            CALL(clone, 3, HRESULT, void*, ULONG, ULONG*)(clone, b1, 2, &g1);
+            CALL(st, 3, HRESULT, void*, ULONG, ULONG*)(st, b2, 2, &g2);
+            CHECK(g1 == 2 && g2 == 2 && !memcmp(b2, "34", 2) && !memcmp(b1, "56", 2), "Clone reads %.2s %.2s", b1, b2);
+            CALL(clone, 2, ULONG)(clone);
+        }
+    }
     CALL(mem, 2, ULONG)(mem);
     CALL(st, 2, ULONG)(st);
     DeleteFileW(path);
