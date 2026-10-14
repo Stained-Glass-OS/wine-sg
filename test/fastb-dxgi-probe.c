@@ -96,10 +96,10 @@ int main(void)
         sd.Width = 64; sd.Height = 64; sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; sd.SampleDesc.Count = 1;
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = 2; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         hr = IDXGIFactory2_CreateSwapChainForCoreWindow(factory, (IUnknown *)dev, NULL, &sd, NULL, &sc); CHECK(hr == ERR_INVALID_CALL && !sc, "null window %#lx", hr);
-        hr = IDXGIFactory2_CreateSwapChainForCoreWindow(factory, NULL, unk, &sd, NULL, &sc); CHECK(hr == ERR_INVALID_CALL, "null device %#lx", hr);
-        hr = IDXGIFactory2_CreateSwapChainForCoreWindow(factory, (IUnknown *)dev, unk, NULL, NULL, &sc); CHECK(hr == ERR_INVALID_CALL, "null desc %#lx", hr);
+        sc = (void *)0xdeadbeef; hr = IDXGIFactory2_CreateSwapChainForCoreWindow(factory, NULL, unk, &sd, NULL, &sc); CHECK(hr == ERR_INVALID_CALL && !sc, "null device %#lx", hr);
+        sc = (void *)0xdeadbeef; hr = IDXGIFactory2_CreateSwapChainForCoreWindow(factory, (IUnknown *)dev, unk, NULL, NULL, &sc); CHECK(hr == ERR_INVALID_CALL && !sc, "null desc %#lx", hr);
         hr = IDXGIFactory2_CreateSwapChainForCoreWindow(factory, (IUnknown *)dev, unk, &sd, NULL, NULL); CHECK(hr == ERR_INVALID_CALL, "null out %#lx", hr);
-        hr = IDXGIFactory2_CreateSwapChainForCoreWindow(factory, (IUnknown *)dev, (IUnknown *)&plain, &sd, NULL, &sc); CHECK(hr == ERR_INVALID_CALL && !sc, "no interop %#lx", hr);
+        sc = (void *)0xdeadbeef; hr = IDXGIFactory2_CreateSwapChainForCoreWindow(factory, (IUnknown *)dev, (IUnknown *)&plain, &sd, NULL, &sc); CHECK(hr == ERR_INVALID_CALL && !sc, "no interop %#lx", hr);
         w.hwnd = NULL;
         hr = IDXGIFactory2_CreateSwapChainForCoreWindow(factory, (IUnknown *)dev, unk, &sd, NULL, &sc); CHECK(hr == ERR_INVALID_CALL && !sc, "NULL hwnd %#lx", hr);
         w.hwnd = win;
