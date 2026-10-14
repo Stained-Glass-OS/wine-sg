@@ -776,6 +776,30 @@ static void test_streams(void)
     MsiViewClose(view);
     MsiCloseHandle(view);
 
+    /* read a just-inserted stream, then commit: the commit copies it from the start */
+    MsiDatabaseOpenViewA(db, "SELECT * FROM `_Streams`", &view);
+    MsiViewExecute(view, 0);
+    rec = stream_rec("s4", "stream four");
+    r = MsiViewModify(view, MSIMODIFY_INSERT, rec);
+    OK(r == ERROR_SUCCESS, "INSERT s4: %u", r);
+    MsiCloseHandle(rec);
+    MsiViewClose(view);
+    MsiCloseHandle(view);
+    MsiDatabaseOpenViewA(db, "SELECT * FROM `_Streams` WHERE `Name` = 's4'", &view);
+    MsiViewExecute(view, 0);
+    r = MsiViewFetch(view, &rec);
+    OK(r == ERROR_SUCCESS, "fetch s4: %u", r);
+    if (!r)
+    {
+        memset(buf, 0, sizeof(buf));
+        sz = sizeof(buf);
+        r = MsiRecordReadStream(rec, 2, buf, &sz);
+        OK(!r && sz == 11 && !strcmp(buf, "stream four"), "read s4 before commit: %u %lu", r, (unsigned long)sz);
+        MsiCloseHandle(rec);
+    }
+    MsiViewClose(view);
+    MsiCloseHandle(view);
+
     /* commit: temporary rows are not saved */
     r = MsiDatabaseCommit(db);
     OK(r == ERROR_SUCCESS, "commit: %u", r);
@@ -785,6 +809,20 @@ static void test_streams(void)
     OK(stream_in_view(db, "s1renamed") == 1 && stream_in_view(db, "s3") == 1, "saved streams are there");
     OK(stream_in_view(db, "tmp1") == 0, "temporary stream was not saved");
     OK(stream_in_view(db, "s2") == 0, "deleted stream is gone");
+    MsiDatabaseOpenViewA(db, "SELECT * FROM `_Streams` WHERE `Name` = 's4'", &view);
+    MsiViewExecute(view, 0);
+    r = MsiViewFetch(view, &rec);
+    OK(r == ERROR_SUCCESS, "fetch s4 after reopen: %u", r);
+    if (!r)
+    {
+        memset(buf, 0, sizeof(buf));
+        sz = sizeof(buf);
+        r = MsiRecordReadStream(rec, 2, buf, &sz);
+        OK(!r && sz == 11 && !strcmp(buf, "stream four"), "s4 content saved: %u %lu '%s'", r, (unsigned long)sz, buf);
+        MsiCloseHandle(rec);
+    }
+    MsiViewClose(view);
+    MsiCloseHandle(view);
     MsiCloseHandle(db);
     DeleteFileA(dbfile);
 }
