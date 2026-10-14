@@ -2676,3 +2676,8 @@ test-wicidxpal:
 # (64- and 32-bit probe under Xvfb in the shell desktop).
 test-dwmthumb:
 	WINE=$(PREFIX)/bin/wine test/dwmthumb-gate.sh
+
+# nsiproxy.sys (5501): IP helper statistics and tables against the kernel, in
+# a network namespace of the gate's own (unshare -rn).
+test-nsi:
+	WINE=$(PREFIX)/bin/wine test/nsi-gate.sh
