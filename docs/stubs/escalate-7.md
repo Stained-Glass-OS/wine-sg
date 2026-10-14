@@ -61,3 +61,12 @@ Protocol drivers (firewalls, packet capture such as WinPcap's npf.sys) call it f
 expect `BindAdapterHandler` for each adapter and the send/receive path. Wine has only an ioctl view of
 the host's interfaces. A binding model (an NDIS adapter per host interface, packets through AF_PACKET via a
 privileged helper) is a design and a security decision; failing the registration remains the safe answer.
+
+## sxs: IAssemblyCache::CreateAssemblyCacheItem and install references
+
+`CreateAssemblyCacheItem` needs an `IAssemblyCacheItem` that collects streams (manifest, files) and
+commits them into WinSxS; `UninstallAssembly` with a `FUSION_INSTALL_REFERENCE` needs a reference count per
+assembly (the dispositions STILL_IN_USE, HAS_INSTALL_REFERENCES, REFERENCE_NOT_FOUND). Proposal: a
+`References` list in the assembly's directory next to its manifest, written by InstallAssembly when a
+reference is given; CreateAssemblyCacheItem then becomes a wrapper that stages streams in a temp
+directory and calls the existing install path on Commit. Both change what lands in the shared WinSxS.
