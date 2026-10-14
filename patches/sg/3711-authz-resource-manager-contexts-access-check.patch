@@ -1,0 +1,1686 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] authz: resource managers, client contexts and the access check (3711)
+
+authz: resource managers, client contexts and the access check
+
+Every authz function used to fail with ERROR_CALL_NOT_IMPLEMENTED. Now:
+resource managers (SeAuditPrivilege unless AUTHZ_RM_FLAG_NO_AUDIT, the
+dynamic-access and dynamic-group callbacks), client contexts from a token, a
+SID (account groups from the local account database) or another context,
+AuthzAddSidsToContext, AuthzGetInformationFromContext, and AuthzAccessCheck
+with cached results (AuthzCachedAccessCheck, AuthzFreeHandle). The access
+check follows the documented DACL rules: ordered ACEs, deny-only and disabled
+groups, owner implicit rights and OWNER RIGHTS, PRINCIPAL_SELF, callback ACEs,
+privileges for WRITE_OWNER and ACCESS_SYSTEM_SECURITY, restricting SIDs, and
+concatenated optional descriptors. AuthzInstall/UninstallSecurityEventSource
+write the documented registry values. Object type lists and conditional
+expressions are not evaluated (see the notes).
+---
+diff --git a/dlls/authz/Makefile.in b/dlls/authz/Makefile.in
+index 53befbb..4a4fb0e 100644
+--- a/dlls/authz/Makefile.in
++++ b/dlls/authz/Makefile.in
+@@ -1,4 +1,5 @@
+ MODULE    = authz.dll
++IMPORTS   = advapi32 netapi32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+diff --git a/dlls/authz/authz.c b/dlls/authz/authz.c
+index 6f54293..55f93cf 100644
+--- a/dlls/authz/authz.c
++++ b/dlls/authz/authz.c
+@@ -1,32 +1,272 @@
+ /*
+- * AUTHZ Implementation
++ * Authz: resource managers, client contexts and access checks
+  *
+- * Copyright 2009 Austin English
++ * The access check follows Microsoft's documented rules for a discretionary
++ * ACL: the owner's implicit READ_CONTROL and WRITE_DAC (unless an OWNER RIGHTS
++ * entry replaces them), ACEs evaluated in order, deny-only groups matching deny
++ * entries only, PRINCIPAL_SELF replaced by the request's SID, callback ACEs
++ * decided by the resource manager's callback, privileges for WRITE_OWNER and
++ * ACCESS_SYSTEM_SECURITY, and a second pass over the restricting SIDs.
+  *
+- * This library is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU Lesser General Public
+- * License as published by the Free Software Foundation; either
+- * version 2.1 of the License, or (at your option) any later version.
+- *
+- * This library is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * Lesser General Public License for more details.
+- *
+- * You should have received a copy of the GNU Lesser General Public
+- * License along with this library; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ * Not done: object type lists (they fail with ERROR_NOT_SUPPORTED rather than
++ * being checked as a flat object), conditional-expression evaluation (a
++ * conditional callback ACE is unknown: an allow entry does not apply, a deny
++ * entry does), auditing (an audit event handle cannot be created yet) and
++ * central access policies.
+  */
++
+ #include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winreg.h"
++#include "winternl.h"
++#include "sddl.h"
++#include "lmaccess.h"
++#include "lmapibuf.h"
++#include "lmerr.h"
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ #include "authz.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(authz);
+ 
++#define MAGIC_RM      0x4d52585a
++#define MAGIC_CTX     0x5843585a
++#define MAGIC_RESULTS 0x5352585a
++
++struct object
++{
++    struct list entry;
++    DWORD magic;
++};
++
++static struct list objects = LIST_INIT( objects );
++static CRITICAL_SECTION objects_cs;
++static CRITICAL_SECTION_DEBUG objects_cs_debug =
++{
++    0, 0, &objects_cs,
++    { &objects_cs_debug.ProcessLocksList, &objects_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": objects_cs") }
++};
++static CRITICAL_SECTION objects_cs = { &objects_cs_debug, -1, 0, 0, 0, 0 };
++
++struct rm
++{
++    struct object obj;
++    DWORD flags;
++    PFN_AUTHZ_DYNAMIC_ACCESS_CHECK check;
++    PFN_AUTHZ_COMPUTE_DYNAMIC_GROUPS compute;
++    PFN_AUTHZ_FREE_DYNAMIC_GROUPS free_groups;
++    WCHAR *name;
++    LONG refs;       /* contexts made from it */
++    BOOL freed;
++};
++
++struct sid_entry
++{
++    PSID sid;
++    DWORD attrs;
++};
++
++struct sid_array
++{
++    struct sid_entry *entries;
++    DWORD count;
++};
++
++struct ctx
++{
++    struct object obj;
++    struct rm *rm;
++    struct sid_entry user;
++    struct sid_array groups, restricted, capabilities;
++    LUID_AND_ATTRIBUTES *privs;
++    DWORD priv_count;
++    PSID appcontainer;
++    LARGE_INTEGER expire;
++    LUID id;
++    DWORD flags;
++};
++
++struct results
++{
++    struct object obj;
++    struct ctx *ctx;
++    PSECURITY_DESCRIPTOR *sds;  /* primary first */
++    DWORD sd_count;
++    BOOL deep;
++};
++
++static void *alloc_object( SIZE_T size, DWORD magic )
++{
++    struct object *obj = calloc( 1, size );
++
++    if (!obj)
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return NULL;
++    }
++    obj->magic = magic;
++    EnterCriticalSection( &objects_cs );
++    list_add_tail( &objects, &obj->entry );
++    LeaveCriticalSection( &objects_cs );
++    return obj;
++}
++
++/* handles are checked against the list: a stale or foreign handle is refused,
++ * not dereferenced */
++static BOOL valid_object( void *handle, DWORD magic )
++{
++    struct object *obj;
++    BOOL found = FALSE;
++
++    if (!handle) return FALSE;
++    EnterCriticalSection( &objects_cs );
++    LIST_FOR_EACH_ENTRY( obj, &objects, struct object, entry )
++        if (obj == handle && obj->magic == magic) { found = TRUE; break; }
++    LeaveCriticalSection( &objects_cs );
++    return found;
++}
++
++static void unlink_object( struct object *obj )
++{
++    EnterCriticalSection( &objects_cs );
++    list_remove( &obj->entry );
++    obj->magic = 0;
++    LeaveCriticalSection( &objects_cs );
++}
++
++static void free_sid_array( struct sid_array *array )
++{
++    DWORD i;
++
++    for (i = 0; i < array->count; i++) free( array->entries[i].sid );
++    free( array->entries );
++    array->entries = NULL;
++    array->count = 0;
++}
++
++static BOOL append_sid( struct sid_array *array, PSID sid, DWORD attrs )
++{
++    struct sid_entry *entries;
++    DWORD len;
++    PSID copy;
++
++    if (!IsValidSid( sid ))
++    {
++        SetLastError( ERROR_INVALID_SID );
++        return FALSE;
++    }
++    len = GetLengthSid( sid );
++    if (!(copy = malloc( len )) || !CopySid( len, copy, sid ))
++    {
++        free( copy );
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++    if (!(entries = realloc( array->entries, (array->count + 1) * sizeof(*entries) )))
++    {
++        free( copy );
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++    array->entries = entries;
++    entries[array->count].sid = copy;
++    entries[array->count].attrs = attrs;
++    array->count++;
++    return TRUE;
++}
++
++static BOOL copy_sid_array( struct sid_array *dst, const struct sid_array *src )
++{
++    DWORD i;
++
++    for (i = 0; i < src->count; i++)
++        if (!append_sid( dst, src->entries[i].sid, src->entries[i].attrs )) return FALSE;
++    return TRUE;
++}
++
++static void free_ctx_contents( struct ctx *ctx )
++{
++    free( ctx->user.sid );
++    free_sid_array( &ctx->groups );
++    free_sid_array( &ctx->restricted );
++    free_sid_array( &ctx->capabilities );
++    free( ctx->privs );
++    free( ctx->appcontainer );
++}
++
++static void destroy_ctx( struct ctx *ctx )
++{
++    unlink_object( &ctx->obj );
++    free_ctx_contents( ctx );
++    free( ctx );
++}
++
++static PSID dup_sid( PSID sid )
++{
++    DWORD len;
++    PSID copy;
++
++    if (!sid) return NULL;
++    len = GetLengthSid( sid );
++    if ((copy = malloc( len ))) CopySid( len, copy, sid );
++    return copy;
++}
++
++static BOOL set_priv_list( struct ctx *ctx, const LUID_AND_ATTRIBUTES *privs, DWORD count )
++{
++    LUID_AND_ATTRIBUTES *copy;
++
++    if (!count) return TRUE;
++    if (!(copy = malloc( count * sizeof(*copy) )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++    memcpy( copy, privs, count * sizeof(*copy) );
++    ctx->privs = copy;
++    ctx->priv_count = count;
++    return TRUE;
++}
++
++/* dynamic groups: the resource manager's callback adds SIDs to a new context */
++static BOOL add_dynamic_groups( struct ctx *ctx, void *args )
++{
++    SID_AND_ATTRIBUTES *sids = NULL, *restricted = NULL;
++    DWORD count = 0, rcount = 0, i;
++    BOOL ret = TRUE;
++
++    if (!ctx->rm || !ctx->rm->compute) return TRUE;
++    if (!ctx->rm->compute( (AUTHZ_CLIENT_CONTEXT_HANDLE)ctx, args, &sids, &count, &restricted, &rcount ))
++        return FALSE;
++    for (i = 0; ret && i < count; i++) ret = append_sid( &ctx->groups, sids[i].Sid, sids[i].Attributes );
++    for (i = 0; ret && i < rcount; i++) ret = append_sid( &ctx->restricted, restricted[i].Sid, restricted[i].Attributes );
++    if (ctx->rm->free_groups)
++    {
++        if (sids) ctx->rm->free_groups( sids );
++        if (restricted) ctx->rm->free_groups( restricted );
++    }
++    return ret;
++}
++
++static struct ctx *new_ctx( struct rm *rm, LARGE_INTEGER *expire, LUID id, DWORD flags )
++{
++    struct ctx *ctx;
++
++    if (!(ctx = alloc_object( sizeof(*ctx), MAGIC_CTX ))) return NULL;
++    ctx->rm = rm;
++    if (expire) ctx->expire = *expire;
++    else ctx->expire.QuadPart = 0x7fffffffffffffffLL;
++    ctx->id = id;
++    ctx->flags = flags;
++    return ctx;
++}
++
+ /***********************************************************************
+  *              AuthzInitializeResourceManager (AUTHZ.@)
+  */
+@@ -34,11 +274,66 @@ BOOL WINAPI AuthzInitializeResourceManager(DWORD flags, PFN_AUTHZ_DYNAMIC_ACCESS
+         PFN_AUTHZ_COMPUTE_DYNAMIC_GROUPS compute_dyn_groups, PFN_AUTHZ_FREE_DYNAMIC_GROUPS free_dyn_groups,
+         const WCHAR *managername, AUTHZ_RESOURCE_MANAGER_HANDLE *handle )
+ {
+-    FIXME("(0x%lx,%p,%p,%p,%s,%p): stub\n", flags, access_checker,
+-        compute_dyn_groups, free_dyn_groups,
+-        debugstr_w(managername), handle);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return FALSE;
++    struct rm *rm;
++
++    TRACE("(0x%lx,%p,%p,%p,%s,%p)\n", flags, access_checker, compute_dyn_groups, free_dyn_groups,
++          debugstr_w(managername), handle);
++
++    if ((flags & ~(AUTHZ_RM_FLAG_NO_AUDIT | AUTHZ_RM_FLAG_INITIALIZE_UNDER_IMPERSONATION |
++                   AUTHZ_RM_FLAG_NO_CENTRAL_ACCESS_POLICIES)) || !handle)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    if (!(flags & AUTHZ_RM_FLAG_NO_AUDIT))
++    {
++        /* auditing needs SeAuditPrivilege enabled in the identity the manager
++         * is initialized as: the process token, or the thread's under
++         * impersonation */
++        BYTE buffer[1024];
++        TOKEN_PRIVILEGES *privs = (TOKEN_PRIVILEGES *)buffer;
++        HANDLE token = NULL;
++        BOOL enabled = FALSE;
++        DWORD len, i;
++        LUID audit;
++
++        if ((flags & AUTHZ_RM_FLAG_INITIALIZE_UNDER_IMPERSONATION))
++            OpenThreadToken( GetCurrentThread(), TOKEN_QUERY, TRUE, &token );
++        if (!token && !OpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &token )) return FALSE;
++        if (LookupPrivilegeValueW( NULL, L"SeAuditPrivilege", &audit ) &&
++            GetTokenInformation( token, TokenPrivileges, buffer, sizeof(buffer), &len ))
++        {
++            for (i = 0; i < privs->PrivilegeCount; i++)
++                if (privs->Privileges[i].Luid.LowPart == audit.LowPart &&
++                    privs->Privileges[i].Luid.HighPart == audit.HighPart &&
++                    (privs->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED))
++                    enabled = TRUE;
++        }
++        CloseHandle( token );
++#ifndef SG_MUTANT_RM_NO_AUDIT_PRIV
++        if (!enabled)
++        {
++            SetLastError( ERROR_PRIVILEGE_NOT_HELD );
++            return FALSE;
++        }
++#endif
++    }
++
++    if (!(rm = alloc_object( sizeof(*rm), MAGIC_RM ))) return FALSE;
++    rm->flags = flags;
++    rm->check = access_checker;
++    rm->compute = compute_dyn_groups;
++    rm->free_groups = free_dyn_groups;
++    if (managername && !(rm->name = wcsdup( managername )))
++    {
++        unlink_object( &rm->obj );
++        free( rm );
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++    *handle = (AUTHZ_RESOURCE_MANAGER_HANDLE)rm;
++    return TRUE;
+ }
+ 
+ /***********************************************************************
+@@ -46,49 +341,267 @@ BOOL WINAPI AuthzInitializeResourceManager(DWORD flags, PFN_AUTHZ_DYNAMIC_ACCESS
+  */
+ BOOL WINAPI AuthzFreeResourceManager(AUTHZ_RESOURCE_MANAGER_HANDLE handle)
+ {
+-    FIXME("%p\n", handle);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return FALSE;
++    struct rm *rm = (struct rm *)handle;
++
++    TRACE("%p\n", handle);
++
++    if (!valid_object( rm, MAGIC_RM ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    unlink_object( &rm->obj );
++    /* contexts made from it keep working with the callbacks they were made with */
++    rm->freed = TRUE;
++    free( rm->name );
++    free( rm );
++    return TRUE;
+ }
+ 
+ /***********************************************************************
+  *              AuthzInstallSecurityEventSource (AUTHZ.@)
+  */
++static const WCHAR event_source_root[] = L"System\\CurrentControlSet\\Services\\EventLog\\Security";
++
+ BOOL WINAPI AuthzInstallSecurityEventSource(DWORD flags, AUTHZ_SOURCE_SCHEMA_REGISTRATION *registration)
+ {
+-    FIXME("(0x%lx,%p): stub\n", flags, registration);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return FALSE;
+-}
++    WCHAR *path;
++    HKEY key;
++    LONG err;
++    SIZE_T len;
+ 
++    TRACE("(0x%lx,%p)\n", flags, registration);
++
++    if (flags || !registration || !registration->szEventSourceName || !registration->szEventSourceName[0] ||
++        wcschr( registration->szEventSourceName, '\\' ) ||
++        !registration->szEventMessageFile || !registration->szEventAccessStringsFile)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    len = wcslen( event_source_root ) + wcslen( registration->szEventSourceName ) + 2;
++    if (!(path = malloc( len * sizeof(WCHAR) )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++    swprintf( path, len, L"%s\\%s", event_source_root, registration->szEventSourceName );
++    err = RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL );
++    free( path );
++    if (err)
++    {
++        SetLastError( err );
++        return FALSE;
++    }
++    err = RegSetValueExW( key, L"EventMessageFile", 0, REG_SZ, (const BYTE *)registration->szEventMessageFile,
++                          (wcslen( registration->szEventMessageFile ) + 1) * sizeof(WCHAR) );
++    if (!err)
++        err = RegSetValueExW( key, L"ParameterMessageFile", 0, REG_SZ,
++#ifdef SG_MUTANT_EVENT_PARAM
++                              (const BYTE *)registration->szEventMessageFile,
++                              (wcslen( registration->szEventMessageFile ) + 1) * sizeof(WCHAR) );
++#else
++                              (const BYTE *)registration->szEventAccessStringsFile,
++                              (wcslen( registration->szEventAccessStringsFile ) + 1) * sizeof(WCHAR) );
++#endif
++    if (!err && registration->szEventSourceXmlSchemaFile)
++        err = RegSetValueExW( key, L"XmlSchemaFile", 0, REG_SZ,
++                              (const BYTE *)registration->szEventSourceXmlSchemaFile,
++                              (wcslen( registration->szEventSourceXmlSchemaFile ) + 1) * sizeof(WCHAR) );
++    RegCloseKey( key );
++    if (err)
++    {
++        SetLastError( err );
++        return FALSE;
++    }
++    return TRUE;
++}
+ 
+ /***********************************************************************
+- *              AuthzAccessCheck (AUTHZ.@)
++ *              AuthzUninstallSecurityEventSource (AUTHZ.@)
+  */
+-BOOL WINAPI AuthzAccessCheck(DWORD flags, AUTHZ_CLIENT_CONTEXT_HANDLE client_context,
+-        AUTHZ_ACCESS_REQUEST *request, AUTHZ_AUDIT_EVENT_HANDLE audit_event,
+-        PSECURITY_DESCRIPTOR security, PSECURITY_DESCRIPTOR *optional_security,
+-        DWORD optional_security_count, AUTHZ_ACCESS_REPLY *reply,
+-        AUTHZ_ACCESS_CHECK_RESULTS_HANDLE *access_check_result)
++BOOL WINAPI AuthzUninstallSecurityEventSource(DWORD flags, const WCHAR *name)
+ {
+-    FIXME("(0x%lx,%p,%p,%p,%p,%p,0x%lx,%p,%p): stub\n", flags, client_context,
+-            request, audit_event, security, optional_security,
+-            optional_security_count, reply, access_check_result);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return FALSE;
++    HKEY root;
++    LONG err;
++
++    TRACE("(0x%lx,%s)\n", flags, debugstr_w(name));
++
++    if (flags || !name || !name[0] || wcschr( name, '\\' ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if ((err = RegOpenKeyExW( HKEY_LOCAL_MACHINE, event_source_root, 0, KEY_ALL_ACCESS, &root )))
++    {
++        SetLastError( err );
++        return FALSE;
++    }
++    err = RegDeleteTreeW( root, name );
++    RegCloseKey( root );
++    if (err)
++    {
++        SetLastError( err );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/* ---- client contexts ---- */
++
++static BOOL token_groups_to_entries( const TOKEN_GROUPS *groups, struct sid_array *out )
++{
++    DWORD i;
++
++    for (i = 0; i < groups->GroupCount; i++)
++        if (!append_sid( out, groups->Groups[i].Sid, groups->Groups[i].Attributes )) return FALSE;
++    return TRUE;
+ }
+ 
++static void *query_token( HANDLE token, TOKEN_INFORMATION_CLASS class )
++{
++    DWORD len = 0;
++    void *buf;
++
++    GetTokenInformation( token, class, NULL, 0, &len );
++    if (!len) return NULL;
++    if (!(buf = malloc( len ))) return NULL;
++    if (!GetTokenInformation( token, class, buf, len, &len ))
++    {
++        free( buf );
++        return NULL;
++    }
++    return buf;
++}
+ 
+ /***********************************************************************
+- *              AuthzFreeContext (AUTHZ.@)
++ *              AuthzInitializeContextFromToken (AUTHZ.@)
+  */
+-BOOL WINAPI AuthzFreeContext(AUTHZ_CLIENT_CONTEXT_HANDLE client_context)
++BOOL WINAPI AuthzInitializeContextFromToken(DWORD flags, HANDLE token_handle,
++        AUTHZ_RESOURCE_MANAGER_HANDLE resource_manager, LARGE_INTEGER *expire_time,
++        LUID id, void *dynamic_group, AUTHZ_CLIENT_CONTEXT_HANDLE *client_context)
+ {
+-    FIXME("(%p): stub\n", client_context);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return FALSE;
++    struct rm *rm = (struct rm *)resource_manager;
++    TOKEN_USER *user = NULL;
++    TOKEN_GROUPS *groups = NULL, *restricted = NULL, *caps = NULL;
++    TOKEN_PRIVILEGES *privs = NULL;
++    TOKEN_APPCONTAINER_INFORMATION *ac = NULL;
++    struct ctx *ctx = NULL;
++    BOOL ret = FALSE;
++
++    TRACE("(0x%lx,%p,%p,%p,%08lx:%08lx,%p,%p)\n", flags, token_handle, resource_manager,
++          expire_time, id.HighPart, id.LowPart, dynamic_group, client_context);
++
++    if (flags || !client_context)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (rm && !valid_object( rm, MAGIC_RM ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(user = query_token( token_handle, TokenUser ))) return FALSE;
++    if (!(groups = query_token( token_handle, TokenGroups ))) goto done;
++    restricted = query_token( token_handle, TokenRestrictedSids );
++    privs = query_token( token_handle, TokenPrivileges );
++    caps = query_token( token_handle, TokenCapabilities );
++    ac = query_token( token_handle, TokenAppContainerSid );
++
++    if (!(ctx = new_ctx( rm, expire_time, id, 0 ))) goto done;
++    if (!(ctx->user.sid = dup_sid( user->User.Sid )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        goto fail;
++    }
++    ctx->user.attrs = user->User.Attributes;
++    if (!IsValidSid( ctx->user.sid ) && (SetLastError( ERROR_INVALID_SID ), TRUE)) goto fail;
++    if (groups->GroupCount && !token_groups_to_entries( groups, &ctx->groups )) goto fail;
++    if (restricted && restricted->GroupCount && !token_groups_to_entries( restricted, &ctx->restricted )) goto fail;
++    if (caps && caps->GroupCount && !token_groups_to_entries( caps, &ctx->capabilities )) goto fail;
++    if (ac && ac->TokenAppContainer) ctx->appcontainer = dup_sid( ac->TokenAppContainer );
++    if (privs && !set_priv_list( ctx, privs->Privileges, privs->PrivilegeCount )) goto fail;
++    if (!add_dynamic_groups( ctx, dynamic_group )) goto fail;
++
++    *client_context = (AUTHZ_CLIENT_CONTEXT_HANDLE)ctx;
++    ret = TRUE;
++    goto done;
++
++fail:
++    destroy_ctx( ctx );
++done:
++    free( user );
++    free( groups );
++    free( restricted );
++    free( privs );
++    free( caps );
++    free( ac );
++    return ret;
+ }
+ 
++static BOOL well_known_sid( WELL_KNOWN_SID_TYPE type, struct sid_array *array, DWORD attrs )
++{
++    BYTE sid[SECURITY_MAX_SID_SIZE];
++    DWORD len = sizeof(sid);
++
++    return CreateWellKnownSid( type, NULL, sid, &len ) && append_sid( array, sid, attrs );
++}
++
++/* groups of a user account: the world, authenticated users and the local
++ * groups the account database lists for it */
++static BOOL add_account_groups( struct ctx *ctx, PSID sid )
++{
++    const DWORD attrs = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
++    WCHAR *name = NULL, *domain = NULL;
++    DWORD name_len = 0, domain_len = 0, entries = 0, total = 0, i;
++    LOCALGROUP_USERS_INFO_0 *info = NULL;
++    SID_NAME_USE use;
++    BOOL ret = FALSE;
++
++    LookupAccountSidW( NULL, sid, NULL, &name_len, NULL, &domain_len, &use );
++    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) return FALSE;
++    if (!(name = malloc( name_len * sizeof(WCHAR) )) || !(domain = malloc( domain_len * sizeof(WCHAR) )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        goto done;
++    }
++    if (!LookupAccountSidW( NULL, sid, name, &name_len, domain, &domain_len, &use )) goto done;
++    if (use != SidTypeUser && use != 9 /* SidTypeComputer */)
++    {
++        SetLastError( ERROR_NONE_MAPPED );
++        goto done;
++    }
++
++#ifndef SG_MUTANT_NO_WORLD
++    if (!well_known_sid( WinWorldSid, &ctx->groups, attrs )) goto done;
++#endif
++    if (!well_known_sid( WinAuthenticatedUserSid, &ctx->groups, attrs )) goto done;
++    if (!NetUserGetLocalGroups( NULL, name, 0, 0, (BYTE **)&info, MAX_PREFERRED_LENGTH, &entries, &total ))
++    {
++        for (i = 0; i < entries; i++)
++        {
++            BYTE gsid[SECURITY_MAX_SID_SIZE];
++            DWORD gsid_len = sizeof(gsid), dlen = 0;
++            WCHAR *dom;
++            SID_NAME_USE guse;
++
++            LookupAccountNameW( NULL, info[i].lgrui0_name, NULL, &gsid_len, NULL, &dlen, &guse );
++            gsid_len = sizeof(gsid);
++            if (!(dom = malloc( (dlen + 1) * sizeof(WCHAR) ))) continue;
++            if (LookupAccountNameW( NULL, info[i].lgrui0_name, gsid, &gsid_len, dom, &dlen, &guse ))
++                append_sid( &ctx->groups, gsid, attrs );
++            free( dom );
++        }
++        NetApiBufferFree( info );
++    }
++    ret = TRUE;
++done:
++    free( name );
++    free( domain );
++    return ret;
++}
+ 
+ /***********************************************************************
+  *              AuthzInitializeContextFromSid (AUTHZ.@)
+@@ -97,22 +610,886 @@ BOOL WINAPI AuthzInitializeContextFromSid(DWORD flags, PSID sid,
+         AUTHZ_RESOURCE_MANAGER_HANDLE resource_manager, LARGE_INTEGER *expire_time,
+         LUID id, void *dynamic_group, AUTHZ_CLIENT_CONTEXT_HANDLE *client_context)
+ {
+-    FIXME("(0x%lx,%p,%p,%p,%08lx:%08lx,%p,%p): stub\n", flags, sid, resource_manager,
+-            expire_time, id.HighPart, id.LowPart, dynamic_group, client_context);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++    struct rm *rm = (struct rm *)resource_manager;
++    struct ctx *ctx;
++
++    TRACE("(0x%lx,%p,%p,%p,%08lx:%08lx,%p,%p)\n", flags, sid, resource_manager,
++          expire_time, id.HighPart, id.LowPart, dynamic_group, client_context);
++
++    if ((flags & ~(AUTHZ_SKIP_TOKEN_GROUPS | AUTHZ_REQUIRE_S4U_LOGON | AUTHZ_COMPUTE_PRIVILEGES)) ||
++        !sid || !client_context)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!IsValidSid( sid ))
++    {
++        SetLastError( ERROR_INVALID_SID );
++        return FALSE;
++    }
++    if (rm && !valid_object( rm, MAGIC_RM ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    /* there is no S4U logon to fall back on */
++    if (flags & AUTHZ_REQUIRE_S4U_LOGON)
++    {
++        SetLastError( ERROR_NOT_SUPPORTED );
++        return FALSE;
++    }
++
++    if (!(ctx = new_ctx( rm, expire_time, id, flags ))) return FALSE;
++    if (!(ctx->user.sid = dup_sid( sid )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        goto fail;
++    }
++    ctx->user.attrs = SE_GROUP_ENABLED | SE_GROUP_ENABLED_BY_DEFAULT;
++    if (!(flags & AUTHZ_SKIP_TOKEN_GROUPS) && !add_account_groups( ctx, sid )) goto fail;
++    if (flags & AUTHZ_COMPUTE_PRIVILEGES)
++    {
++        LUID_AND_ATTRIBUTES priv;
++
++        /* what every account holds; the account rights of the SIDs are not
++         * enumerated (no LSA policy database) */
++        if (LookupPrivilegeValueW( NULL, L"SeChangeNotifyPrivilege", &priv.Luid ))
++        {
++            priv.Attributes = SE_PRIVILEGE_ENABLED | SE_PRIVILEGE_ENABLED_BY_DEFAULT;
++            if (!set_priv_list( ctx, &priv, 1 )) goto fail;
++        }
++    }
++    if (!add_dynamic_groups( ctx, dynamic_group )) goto fail;
++    *client_context = (AUTHZ_CLIENT_CONTEXT_HANDLE)ctx;
++    return TRUE;
++
++fail:
++    destroy_ctx( ctx );
+     return FALSE;
+ }
+ 
++static struct ctx *copy_ctx( struct ctx *src, LARGE_INTEGER *expire, LUID id )
++{
++    struct ctx *ctx;
++
++    if (!(ctx = new_ctx( src->rm, expire ? expire : &src->expire, id, src->flags ))) return NULL;
++    if (!(ctx->user.sid = dup_sid( src->user.sid )) || !copy_sid_array( &ctx->groups, &src->groups ) ||
++        !copy_sid_array( &ctx->restricted, &src->restricted ) ||
++        !copy_sid_array( &ctx->capabilities, &src->capabilities ) ||
++        !set_priv_list( ctx, src->privs, src->priv_count ))
++    {
++        if (!GetLastError()) SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        destroy_ctx( ctx );
++        return NULL;
++    }
++    ctx->user.attrs = src->user.attrs;
++    if (src->appcontainer) ctx->appcontainer = dup_sid( src->appcontainer );
++    return ctx;
++}
+ 
+ /***********************************************************************
+- *              AuthzInitializeContextFromToken (AUTHZ.@)
++ *              AuthzInitializeContextFromAuthzContext (AUTHZ.@)
+  */
+-BOOL WINAPI AuthzInitializeContextFromToken(DWORD flags, HANDLE token_handle,
+-        AUTHZ_RESOURCE_MANAGER_HANDLE resource_manager, LARGE_INTEGER *expire_time,
+-        LUID id, void *dynamic_group, AUTHZ_CLIENT_CONTEXT_HANDLE *client_context)
++BOOL WINAPI AuthzInitializeContextFromAuthzContext(DWORD flags, AUTHZ_CLIENT_CONTEXT_HANDLE client_context,
++        LARGE_INTEGER *expire_time, LUID id, void *dynamic_group, AUTHZ_CLIENT_CONTEXT_HANDLE *new_context)
++{
++    struct ctx *src = (struct ctx *)client_context, *ctx;
++
++    TRACE("(0x%lx,%p,%p,%08lx:%08lx,%p,%p)\n", flags, client_context, expire_time,
++          id.HighPart, id.LowPart, dynamic_group, new_context);
++
++    if (flags || !new_context || !valid_object( src, MAGIC_CTX ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(ctx = copy_ctx( src, expire_time, id ))) return FALSE;
++    /* the callback only runs when there are arguments for it */
++    if (dynamic_group && !add_dynamic_groups( ctx, dynamic_group ))
++    {
++        destroy_ctx( ctx );
++        return FALSE;
++    }
++    *new_context = (AUTHZ_CLIENT_CONTEXT_HANDLE)ctx;
++    return TRUE;
++}
++
++/***********************************************************************
++ *              AuthzAddSidsToContext (AUTHZ.@)
++ */
++BOOL WINAPI AuthzAddSidsToContext(AUTHZ_CLIENT_CONTEXT_HANDLE client_context, SID_AND_ATTRIBUTES *sids,
++        DWORD sid_count, SID_AND_ATTRIBUTES *restricted_sids, DWORD restricted_sid_count,
++        AUTHZ_CLIENT_CONTEXT_HANDLE *new_context)
++{
++    struct ctx *src = (struct ctx *)client_context, *ctx;
++    DWORD i;
++
++    TRACE("(%p,%p,%lu,%p,%lu,%p)\n", client_context, sids, sid_count, restricted_sids,
++          restricted_sid_count, new_context);
++
++    if (!new_context || !valid_object( src, MAGIC_CTX ) || (sid_count && !sids) ||
++        (restricted_sid_count && !restricted_sids) || (!sid_count && !restricted_sid_count))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!(ctx = copy_ctx( src, NULL, src->id ))) return FALSE;
++    for (i = 0; i < sid_count; i++)
++        if (!append_sid( &ctx->groups, sids[i].Sid, sids[i].Attributes )) goto fail;
++    for (i = 0; i < restricted_sid_count; i++)
++        if (!append_sid( &ctx->restricted, restricted_sids[i].Sid, restricted_sids[i].Attributes )) goto fail;
++    *new_context = (AUTHZ_CLIENT_CONTEXT_HANDLE)ctx;
++    return TRUE;
++
++fail:
++    destroy_ctx( ctx );
++    return FALSE;
++}
++
++/***********************************************************************
++ *              AuthzFreeContext (AUTHZ.@)
++ */
++BOOL WINAPI AuthzFreeContext(AUTHZ_CLIENT_CONTEXT_HANDLE client_context)
++{
++    struct ctx *ctx = (struct ctx *)client_context;
++
++    TRACE("(%p)\n", client_context);
++
++    if (!valid_object( ctx, MAGIC_CTX ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    destroy_ctx( ctx );
++    return TRUE;
++}
++
++/***********************************************************************
++ *              AuthzGetInformationFromContext (AUTHZ.@)
++ */
++static DWORD groups_size( const struct sid_array *array )
++{
++    DWORD size = offsetof( TOKEN_GROUPS, Groups[array->count] ), i;
++
++    for (i = 0; i < array->count; i++) size += GetLengthSid( array->entries[i].sid );
++    return size;
++}
++
++static void fill_groups( TOKEN_GROUPS *groups, const struct sid_array *array )
++{
++    BYTE *ptr = (BYTE *)&groups->Groups[array->count];
++    DWORD i, len;
++
++    groups->GroupCount = array->count;
++    for (i = 0; i < array->count; i++)
++    {
++        len = GetLengthSid( array->entries[i].sid );
++        CopySid( len, ptr, array->entries[i].sid );
++        groups->Groups[i].Sid = ptr;
++        groups->Groups[i].Attributes = array->entries[i].attrs;
++        ptr += len;
++    }
++}
++
++BOOL WINAPI AuthzGetInformationFromContext(AUTHZ_CLIENT_CONTEXT_HANDLE client_context,
++        AUTHZ_CONTEXT_INFORMATION_CLASS info_class, DWORD size, DWORD *size_required, void *buffer)
++{
++    struct ctx *ctx = (struct ctx *)client_context;
++    static const struct sid_array none;
++    DWORD needed;
++
++    TRACE("(%p,%d,%lu,%p,%p)\n", client_context, info_class, size, size_required, buffer);
++
++    if (!valid_object( ctx, MAGIC_CTX ) || !size_required || (size && !buffer))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    switch (info_class)
++    {
++    case AuthzContextInfoUserSid:
++        needed = sizeof(TOKEN_USER) + GetLengthSid( ctx->user.sid );
++        break;
++    case AuthzContextInfoGroupsSids:
++        needed = groups_size( &ctx->groups );
++        break;
++    case AuthzContextInfoRestrictedSids:
++        needed = groups_size( &ctx->restricted );
++        break;
++    case AuthzContextInfoDeviceSids:
++        needed = groups_size( &none );
++        break;
++    case AuthzContextInfoCapabilitySids:
++        needed = groups_size( &ctx->capabilities );
++        break;
++    case AuthzContextInfoPrivileges:
++        needed = offsetof( TOKEN_PRIVILEGES, Privileges[ctx->priv_count] );
++        break;
++    case AuthzContextInfoExpirationTime:
++        needed = sizeof(LARGE_INTEGER);
++        break;
++    case AuthzContextInfoIdentifier:
++        needed = sizeof(LUID);
++        break;
++    case AuthzContextInfoSecurityAttributes:
++    case AuthzContextInfoUserClaims:
++    case AuthzContextInfoDeviceClaims:
++        needed = sizeof(AUTHZ_SECURITY_ATTRIBUTES_INFORMATION);
++        break;
++    case AuthzContextInfoAppContainerSid:
++        needed = sizeof(TOKEN_APPCONTAINER_INFORMATION) + (ctx->appcontainer ? GetLengthSid( ctx->appcontainer ) : 0);
++        break;
++    default:  /* the reserved classes */
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    *size_required = needed;
++    if (size < needed)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++
++    switch (info_class)
++    {
++    case AuthzContextInfoUserSid:
++    {
++        TOKEN_USER *user = buffer;
++        user->User.Sid = (BYTE *)(user + 1);
++        user->User.Attributes = ctx->user.attrs;
++        CopySid( GetLengthSid( ctx->user.sid ), user->User.Sid, ctx->user.sid );
++        break;
++    }
++    case AuthzContextInfoGroupsSids:        fill_groups( buffer, &ctx->groups ); break;
++    case AuthzContextInfoRestrictedSids:    fill_groups( buffer, &ctx->restricted ); break;
++    case AuthzContextInfoDeviceSids:        fill_groups( buffer, &none ); break;
++    case AuthzContextInfoCapabilitySids:    fill_groups( buffer, &ctx->capabilities ); break;
++    case AuthzContextInfoPrivileges:
++    {
++        TOKEN_PRIVILEGES *privs = buffer;
++        privs->PrivilegeCount = ctx->priv_count;
++        if (ctx->priv_count) memcpy( privs->Privileges, ctx->privs, ctx->priv_count * sizeof(*ctx->privs) );
++        break;
++    }
++    case AuthzContextInfoExpirationTime:    *(LARGE_INTEGER *)buffer = ctx->expire; break;
++    case AuthzContextInfoIdentifier:        *(LUID *)buffer = ctx->id; break;
++    case AuthzContextInfoSecurityAttributes:
++    case AuthzContextInfoUserClaims:
++    case AuthzContextInfoDeviceClaims:
++    {
++        /* tokens here carry no claims: the list is empty */
++        AUTHZ_SECURITY_ATTRIBUTES_INFORMATION *claims = buffer;
++        memset( claims, 0, sizeof(*claims) );
++        claims->Version = AUTHZ_SECURITY_ATTRIBUTES_INFORMATION_VERSION_V1;
++        break;
++    }
++    case AuthzContextInfoAppContainerSid:
++    {
++        TOKEN_APPCONTAINER_INFORMATION *ac = buffer;
++        if (ctx->appcontainer)
++        {
++            ac->TokenAppContainer = (BYTE *)(ac + 1);
++            CopySid( GetLengthSid( ctx->appcontainer ), ac->TokenAppContainer, ctx->appcontainer );
++        }
++        else ac->TokenAppContainer = NULL;
++        break;
++    }
++    default: break;
++    }
++    return TRUE;
++}
++
++/* ---- the access check ---- */
++
++#define IMPLICIT_OWNER_RIGHTS (READ_CONTROL | WRITE_DAC)
++#define ALL_ACCESS_BITS       (STANDARD_RIGHTS_ALL | SPECIFIC_RIGHTS_ALL)
++
++struct view
++{
++    PSID user;                 /* NULL in the restricted pass */
++    DWORD user_attrs;
++    const struct sid_entry *entries;
++    DWORD count;
++};
++
++static BOOL view_has_sid( const struct view *view, PSID sid, BOOL for_deny )
++{
++    DWORD i;
++
++    if (view->user && EqualSid( view->user, sid ))
++    {
++        if (view->user_attrs & SE_GROUP_USE_FOR_DENY_ONLY) return for_deny;
++        return TRUE;
++    }
++    for (i = 0; i < view->count; i++)
++    {
++        DWORD attrs = view->entries[i].attrs;
++
++        if (!EqualSid( view->entries[i].sid, sid )) continue;
++        if (attrs & SE_GROUP_USE_FOR_DENY_ONLY)
++        {
++#ifdef SG_MUTANT_DENY_ONLY_ALLOWS
++            return TRUE;
++#else
++            if (for_deny) return TRUE;
++            continue;
++#endif
++        }
++#ifdef SG_MUTANT_DISABLED_GROUP_MATCHES
++        return TRUE;
++#else
++        if (attrs & SE_GROUP_ENABLED) return TRUE;
++#endif
++    }
++    return FALSE;
++}
++
++struct ace_info
+ {
+-    FIXME("(0x%lx,%p,%p,%p,%08lx:%08lx,%p,%p): stub\n", flags, token_handle, resource_manager,
+-            expire_time, id.HighPart, id.LowPart, dynamic_group, client_context);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++    ACE_HEADER *header;
++    BOOL allow, callback, object, typed;
++    ACCESS_MASK mask;
++    PSID sid;
++};
++
++/* the parts of an ACE the check needs, or FALSE for an entry that takes no
++ * part in a DACL check (audit, label, compound, malformed) */
++static BOOL parse_ace( ACE_HEADER *ace, DWORD room, struct ace_info *info )
++{
++    DWORD offset;
++    DWORD sid_len;
++
++    memset( info, 0, sizeof(*info) );
++    if (room < sizeof(ACE_HEADER) + sizeof(DWORD) || ace->AceSize < sizeof(ACE_HEADER) + sizeof(DWORD) ||
++        ace->AceSize > room || (ace->AceSize & 3))
++        return FALSE;
++    info->header = ace;
++    switch (ace->AceType)
++    {
++    case ACCESS_ALLOWED_ACE_TYPE:                 info->allow = TRUE; break;
++    case ACCESS_DENIED_ACE_TYPE:                  break;
++    case ACCESS_ALLOWED_OBJECT_ACE_TYPE:          info->allow = TRUE; info->object = TRUE; break;
++    case ACCESS_DENIED_OBJECT_ACE_TYPE:           info->object = TRUE; break;
++    case ACCESS_ALLOWED_CALLBACK_ACE_TYPE:        info->allow = TRUE; info->callback = TRUE; break;
++    case ACCESS_DENIED_CALLBACK_ACE_TYPE:         info->callback = TRUE; break;
++    case ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: info->allow = TRUE; info->callback = TRUE; info->object = TRUE; break;
++    case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:  info->callback = TRUE; info->object = TRUE; break;
++    default: return FALSE;
++    }
++    info->mask = *(ACCESS_MASK *)(ace + 1);
++    offset = sizeof(ACE_HEADER) + sizeof(DWORD);
++    if (info->object)
++    {
++        DWORD flags;
++
++        if (ace->AceSize < offset + sizeof(DWORD)) return FALSE;
++        flags = *(DWORD *)((BYTE *)ace + offset);
++        offset += sizeof(DWORD);
++        if (flags & ACE_OBJECT_TYPE_PRESENT) { info->typed = TRUE; offset += sizeof(GUID); }
++        if (flags & ACE_INHERITED_OBJECT_TYPE_PRESENT) offset += sizeof(GUID);
++    }
++    if (ace->AceSize < offset + 8) return FALSE;
++    info->sid = (BYTE *)ace + offset;
++    sid_len = 8 + ((SID *)info->sid)->SubAuthorityCount * sizeof(DWORD);
++    if (((SID *)info->sid)->SubAuthorityCount == 0 || ((SID *)info->sid)->SubAuthorityCount > SID_MAX_SUB_AUTHORITIES ||
++        offset + sid_len > ace->AceSize)
++        return FALSE;
++    return TRUE;
++}
++
++#define MAX_ACLS 33
++
++struct acl_list
++{
++    ACL *acls[MAX_ACLS];
++    DWORD count;
++};
++
++static BOOL sid_is_owner_rights( PSID sid )
++{
++    SID_IDENTIFIER_AUTHORITY auth = { SECURITY_CREATOR_SID_AUTHORITY };
++    SID *s = sid;
++
++    return !memcmp( &s->IdentifierAuthority, &auth, sizeof(auth) ) && s->SubAuthorityCount == 1 &&
++           s->SubAuthority[0] == SECURITY_CREATOR_OWNER_RIGHTS_RID;
++}
++
++static BOOL sid_is_principal_self( PSID sid )
++{
++    SID_IDENTIFIER_AUTHORITY auth = { SECURITY_NT_AUTHORITY };
++    SID *s = sid;
++
++    return !memcmp( &s->IdentifierAuthority, &auth, sizeof(auth) ) && s->SubAuthorityCount == 1 &&
++           s->SubAuthority[0] == SECURITY_PRINCIPAL_SELF_RID;
++}
++
++static BOOL acls_have_owner_rights( const struct acl_list *list )
++{
++    DWORD a, i;
++
++    for (a = 0; a < list->count; a++)
++    {
++        ACL *acl = list->acls[a];
++        BYTE *ptr = (BYTE *)(acl + 1);
++
++        for (i = 0; i < acl->AceCount; i++)
++        {
++            struct ace_info info;
++            DWORD room = (BYTE *)acl + acl->AclSize - ptr;
++
++            if (room < sizeof(ACE_HEADER) || !parse_ace( (ACE_HEADER *)ptr, room, &info )) break;
++            if (!(info.header->AceFlags & INHERIT_ONLY_ACE) && sid_is_owner_rights( info.sid )) return TRUE;
++            ptr += info.header->AceSize;
++        }
++    }
+     return FALSE;
+ }
++
++enum ace_decision { ACE_APPLIES, ACE_SKIP, ACE_ERROR };
++
++/* a conditional callback ACE ("artx" data) is not evaluated: unknown */
++static BOOL ace_is_conditional( const struct ace_info *info )
++{
++    DWORD offset = (BYTE *)info->sid - (BYTE *)info->header;
++    DWORD len = 8 + ((SID *)info->sid)->SubAuthorityCount * sizeof(DWORD);
++
++    offset += len;
++    return info->header->AceSize >= offset + 4 && !memcmp( (BYTE *)info->header + offset, "artx", 4 );
++}
++
++static enum ace_decision callback_decision( struct ctx *ctx, const struct ace_info *info, void *args )
++{
++    BOOL applicable = FALSE;
++
++    if (ace_is_conditional( info ) || !ctx->rm || !ctx->rm->check)
++    {
++        /* unknown: an allow entry is left out, a deny entry stands */
++#ifdef SG_MUTANT_CB_ALLOW_UNKNOWN
++        return ACE_APPLIES;
++#else
++        return info->allow ? ACE_SKIP : ACE_APPLIES;
++#endif
++    }
++    if (!ctx->rm->check( (AUTHZ_CLIENT_CONTEXT_HANDLE)ctx, info->header, args, &applicable )) return ACE_ERROR;
++    return applicable ? ACE_APPLIES : ACE_SKIP;
++}
++
++/* the access the DACLs give a view, before privileges: the bits granted by the
++ * first matching allow entries not already denied */
++static BOOL dacl_rights( struct ctx *ctx, const struct view *view, const struct acl_list *list, PSID owner,
++                         PSID self_sid, void *args, ACCESS_MASK *granted )
++{
++    ACCESS_MASK granted_bits = 0, denied = 0;
++#ifdef SG_MUTANT_OWNER_RIGHTS_IGNORED
++    BOOL owner_rights_ace = FALSE;
++#else
++    BOOL owner_rights_ace = acls_have_owner_rights( list );
++#endif
++    BOOL is_owner = owner && view_has_sid( view, owner, FALSE );
++    DWORD a, i;
++
++    if (is_owner && !owner_rights_ace)
++    {
++#ifndef SG_MUTANT_NO_IMPLICIT_OWNER
++        granted_bits = IMPLICIT_OWNER_RIGHTS;
++#endif
++    }
++
++    for (a = 0; a < list->count; a++)
++    {
++        ACL *acl = list->acls[a];
++        BYTE *ptr = (BYTE *)(acl + 1);
++
++        for (i = 0; i < acl->AceCount; i++)
++        {
++            struct ace_info info;
++            DWORD room = (BYTE *)acl + acl->AclSize - ptr;
++            PSID sid;
++            BOOL match;
++
++            if (room < sizeof(ACE_HEADER)) return TRUE;
++            if (!parse_ace( (ACE_HEADER *)ptr, room, &info ))
++            {
++                if (room >= sizeof(ACE_HEADER) && ((ACE_HEADER *)ptr)->AceSize >= sizeof(ACE_HEADER) &&
++                    ((ACE_HEADER *)ptr)->AceSize <= room && !(((ACE_HEADER *)ptr)->AceSize & 3))
++                {
++                    ptr += ((ACE_HEADER *)ptr)->AceSize;  /* an entry that takes no part */
++                    continue;
++                }
++                return TRUE;  /* a malformed ACL stops the walk */
++            }
++            ptr += info.header->AceSize;
++
++#ifndef SG_MUTANT_INHERIT_ONLY
++            if (info.header->AceFlags & INHERIT_ONLY_ACE) continue;
++#endif
++            /* without an object type list only the entries that cover the
++             * whole object count */
++#ifndef SG_MUTANT_TYPED_APPLIES
++            if (info.typed) continue;
++#endif
++
++            sid = info.sid;
++            if (sid_is_principal_self( sid ))
++            {
++#ifdef SG_MUTANT_SELF_ANY
++                if (info.allow) { sid = info.sid; goto matched; }
++#endif
++                if (!self_sid) continue;
++                sid = self_sid;
++            }
++            if (sid_is_owner_rights( sid )) match = is_owner;
++            else match = view_has_sid( view, sid, !info.allow );
++            if (!match) continue;
++#ifdef SG_MUTANT_SELF_ANY
++        matched:
++#endif
++            if (info.callback)
++            {
++                enum ace_decision d = callback_decision( ctx, &info, args );
++
++                if (d == ACE_ERROR) return FALSE;
++                if (d == ACE_SKIP) continue;
++            }
++
++            if (info.allow)
++            {
++#ifdef SG_MUTANT_DENY_IGNORED
++                granted_bits |= info.mask;
++#else
++                granted_bits |= info.mask & ~denied;
++#endif
++            }
++            else
++                denied |= info.mask & ~granted_bits;
++        }
++    }
++    *granted = granted_bits;
++    return TRUE;
++}
++
++static BOOL ctx_has_privilege( struct ctx *ctx, const WCHAR *name )
++{
++    LUID luid;
++    DWORD i;
++
++    if (!LookupPrivilegeValueW( NULL, name, &luid )) return FALSE;
++    for (i = 0; i < ctx->priv_count; i++)
++        if (ctx->privs[i].Luid.LowPart == luid.LowPart && ctx->privs[i].Luid.HighPart == luid.HighPart)
++            return !!(ctx->privs[i].Attributes & SE_PRIVILEGE_ENABLED);
++    return FALSE;
++}
++
++struct check_input
++{
++    PSECURITY_DESCRIPTOR *sds;   /* primary first */
++    DWORD sd_count;
++};
++
++/* every ACL of the object: the primary DACL then the optional ones (a NULL
++ * ACL there is an empty one); *null_dacl is set for a NULL primary DACL */
++static BOOL collect_acls( const struct check_input *in, struct acl_list *list, PSID *owner, BOOL *null_dacl )
++{
++    BOOL present, defaulted;
++    ACL *acl;
++    DWORD i;
++
++    list->count = 0;
++    *null_dacl = FALSE;
++    if (in->sd_count > MAX_ACLS) return FALSE;
++    if (!GetSecurityDescriptorOwner( in->sds[0], owner, &defaulted )) return FALSE;
++    if (!GetSecurityDescriptorDacl( in->sds[0], &present, &acl, &defaulted )) return FALSE;
++    if (!*owner || !present)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!acl) *null_dacl = TRUE;
++    else list->acls[list->count++] = acl;
++
++    for (i = 1; i < in->sd_count; i++)
++    {
++        if (!in->sds[i] || !IsValidSecurityDescriptor( in->sds[i] ))
++        {
++            SetLastError( ERROR_INVALID_SECURITY_DESCR );
++            return FALSE;
++        }
++        if (!GetSecurityDescriptorDacl( in->sds[i], &present, &acl, &defaulted )) return FALSE;
++        if (present && acl) list->acls[list->count++] = acl;
++#ifdef SG_MUTANT_OPT_NULL_ALLOWS
++        if (present && !acl) *null_dacl = TRUE;
++#endif
++    }
++    return TRUE;
++}
++
++/* the access a context holds on the object, as a mask of every bit it could be
++ * given; *status is the per-result error */
++static BOOL max_rights( struct ctx *ctx, const struct check_input *in, PSID self_sid, void *args,
++                        ACCESS_MASK *rights )
++{
++    struct acl_list list;
++    PSID owner;
++    BOOL null_dacl;
++    struct view view;
++    ACCESS_MASK pass = 0, restricted_pass;
++
++    if (!collect_acls( in, &list, &owner, &null_dacl )) return FALSE;
++
++    if (null_dacl)
++        pass = ALL_ACCESS_BITS;
++    else
++    {
++        view.user = ctx->user.sid;
++        view.user_attrs = ctx->user.attrs;
++        view.entries = ctx->groups.entries;
++        view.count = ctx->groups.count;
++        if (!dacl_rights( ctx, &view, &list, owner, self_sid, args, &pass )) return FALSE;
++    }
++
++    if (ctx->restricted.count)
++    {
++#ifndef SG_MUTANT_NO_RESTRICTED_PASS
++        if (null_dacl) restricted_pass = ALL_ACCESS_BITS;
++        else
++        {
++            view.user = NULL;
++            view.user_attrs = 0;
++            view.entries = ctx->restricted.entries;
++            view.count = ctx->restricted.count;
++            if (!dacl_rights( ctx, &view, &list, owner, self_sid, args, &restricted_pass )) return FALSE;
++        }
++        pass &= restricted_pass;
++#endif
++    }
++    *rights = pass;
++    return TRUE;
++}
++
++static BOOL check_request( struct ctx *ctx, const struct check_input *in, AUTHZ_ACCESS_REQUEST *request,
++                           AUTHZ_ACCESS_REPLY *reply )
++{
++    ACCESS_MASK desired = request->DesiredAccess, rights, mask = 0, plain;
++    DWORD error = ERROR_SUCCESS;
++
++    if (!max_rights( ctx, in, request->PrincipalSelfSid, request->OptionalArguments, &rights )) return FALSE;
++
++    if (desired & ACCESS_SYSTEM_SECURITY)
++    {
++        if (ctx_has_privilege( ctx, L"SeSecurityPrivilege" )) rights |= ACCESS_SYSTEM_SECURITY;
++#ifndef SG_MUTANT_SECURITY_PRIV_FREE
++        else error = ERROR_PRIVILEGE_NOT_HELD;
++#else
++        rights |= ACCESS_SYSTEM_SECURITY;
++#endif
++    }
++    if (ctx_has_privilege( ctx, L"SeTakeOwnershipPrivilege" )) rights |= WRITE_OWNER;
++    if ((desired & MAXIMUM_ALLOWED) && ctx_has_privilege( ctx, L"SeSecurityPrivilege" )) rights |= ACCESS_SYSTEM_SECURITY;
++
++    if (!desired) error = ERROR_ACCESS_DENIED;
++    else if (!error)
++    {
++        plain = desired & ~MAXIMUM_ALLOWED;
++        if ((desired & MAXIMUM_ALLOWED))
++        {
++            if (!rights || (plain & ~rights)) error = ERROR_ACCESS_DENIED;
++            else mask = rights;
++        }
++        else if (plain & ~rights) error = ERROR_ACCESS_DENIED;
++        else mask = plain;
++    }
++
++    reply->GrantedAccessMask[0] = error ? 0 : mask;
++    reply->Error[0] = error;
++    if (reply->SaclEvaluationResults) reply->SaclEvaluationResults[0] = 0;
++    return TRUE;
++}
++
++static BOOL validate_request( AUTHZ_ACCESS_REQUEST *request, AUTHZ_ACCESS_REPLY *reply )
++{
++    if (!request || !reply || !reply->GrantedAccessMask || !reply->Error)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (request->ObjectTypeList || request->ObjectTypeListLength)
++    {
++        /* property-level checks are not implemented: a flat check of such a
++         * request would answer for the wrong thing */
++        SetLastError( ERROR_NOT_SUPPORTED );
++        return FALSE;
++    }
++    if (reply->ResultListLength != 1)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (request->PrincipalSelfSid && !IsValidSid( request->PrincipalSelfSid ))
++    {
++        SetLastError( ERROR_INVALID_SID );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static void free_results( struct results *res )
++{
++    DWORD i;
++
++    unlink_object( &res->obj );
++    if (res->deep) for (i = 0; i < res->sd_count; i++) free( res->sds[i] );
++    free( res->sds );
++    free( res );
++}
++
++static PSECURITY_DESCRIPTOR deep_copy_sd( PSECURITY_DESCRIPTOR sd )
++{
++    DWORD len = 0;
++    PSECURITY_DESCRIPTOR copy;
++
++    MakeSelfRelativeSD( sd, NULL, &len );
++    if (!len || !(copy = malloc( len ))) return NULL;
++    if (!MakeSelfRelativeSD( sd, copy, &len ))
++    {
++        free( copy );
++        return NULL;
++    }
++    return copy;
++}
++
++/***********************************************************************
++ *              AuthzAccessCheck (AUTHZ.@)
++ */
++BOOL WINAPI AuthzAccessCheck(DWORD flags, AUTHZ_CLIENT_CONTEXT_HANDLE client_context,
++        AUTHZ_ACCESS_REQUEST *request, AUTHZ_AUDIT_EVENT_HANDLE audit_event,
++        PSECURITY_DESCRIPTOR security, PSECURITY_DESCRIPTOR *optional_security,
++        DWORD optional_security_count, AUTHZ_ACCESS_REPLY *reply,
++        AUTHZ_ACCESS_CHECK_RESULTS_HANDLE *access_check_result)
++{
++    struct ctx *ctx = (struct ctx *)client_context;
++    PSECURITY_DESCRIPTOR *sds;
++    struct check_input in;
++    struct results *res = NULL;
++    DWORD i;
++    BOOL ret = FALSE;
++
++    TRACE("(0x%lx,%p,%p,%p,%p,%p,0x%lx,%p,%p)\n", flags, client_context, request, audit_event,
++          security, optional_security, optional_security_count, reply, access_check_result);
++
++    if ((flags & ~AUTHZ_ACCESS_CHECK_NO_DEEP_COPY_SD) || !security ||
++        ((flags & AUTHZ_ACCESS_CHECK_NO_DEEP_COPY_SD) && !access_check_result) ||
++        (optional_security_count && !optional_security) || optional_security_count >= MAX_ACLS)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!valid_object( ctx, MAGIC_CTX ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (audit_event)
++    {
++        /* audit event handles cannot be made yet */
++        SetLastError( ERROR_INVALID_HANDLE );
++        return FALSE;
++    }
++    if (!validate_request( request, reply )) return FALSE;
++    if (!IsValidSecurityDescriptor( security ))
++    {
++        SetLastError( ERROR_INVALID_SECURITY_DESCR );
++        return FALSE;
++    }
++
++    if (!(sds = malloc( (optional_security_count + 1) * sizeof(*sds) )))
++    {
++        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++        return FALSE;
++    }
++    sds[0] = security;
++    for (i = 0; i < optional_security_count; i++) sds[i + 1] = optional_security[i];
++    in.sds = sds;
++    in.sd_count = optional_security_count + 1;
++
++    if (!check_request( ctx, &in, request, reply )) goto done;
++
++    if (access_check_result)
++    {
++        if (!(res = alloc_object( sizeof(*res), MAGIC_RESULTS ))) goto done;
++        res->ctx = ctx;
++        res->sd_count = in.sd_count;
++        res->sds = sds;
++#ifdef SG_MUTANT_NO_DEEPCOPY
++        res->deep = FALSE;
++#else
++        res->deep = !(flags & AUTHZ_ACCESS_CHECK_NO_DEEP_COPY_SD);
++#endif
++        if (res->deep)
++        {
++            for (i = 0; i < in.sd_count; i++)
++                if (!(res->sds[i] = deep_copy_sd( sds[i] )))
++                {
++                    DWORD j;
++                    for (j = 0; j < i; j++) free( res->sds[j] );
++                    unlink_object( &res->obj );
++                    free( res );
++                    res = NULL;
++                    SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++                    goto done;
++                }
++        }
++        sds = NULL;  /* now the handle's */
++        *access_check_result = (AUTHZ_ACCESS_CHECK_RESULTS_HANDLE)res;
++    }
++    ret = TRUE;
++done:
++    free( sds );
++    return ret;
++}
++
++/***********************************************************************
++ *              AuthzCachedAccessCheck (AUTHZ.@)
++ */
++BOOL WINAPI AuthzCachedAccessCheck(DWORD flags, AUTHZ_ACCESS_CHECK_RESULTS_HANDLE handle,
++        AUTHZ_ACCESS_REQUEST *request, AUTHZ_AUDIT_EVENT_HANDLE audit_event, AUTHZ_ACCESS_REPLY *reply)
++{
++    struct results *res = (struct results *)handle;
++    struct check_input in;
++
++    TRACE("(0x%lx,%p,%p,%p,%p)\n", flags, handle, request, audit_event, reply);
++
++    if (flags || !valid_object( res, MAGIC_RESULTS ) || !valid_object( res->ctx, MAGIC_CTX ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (audit_event)
++    {
++        SetLastError( ERROR_INVALID_HANDLE );
++        return FALSE;
++    }
++    if (!validate_request( request, reply )) return FALSE;
++    in.sds = res->sds;
++    in.sd_count = res->sd_count;
++    return check_request( res->ctx, &in, request, reply );
++}
++
++/***********************************************************************
++ *              AuthzFreeHandle (AUTHZ.@)
++ */
++BOOL WINAPI AuthzFreeHandle(AUTHZ_ACCESS_CHECK_RESULTS_HANDLE handle)
++{
++    struct results *res = (struct results *)handle;
++
++    TRACE("(%p)\n", handle);
++
++    if (!valid_object( res, MAGIC_RESULTS ))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    free_results( res );
++    return TRUE;
++}
+diff --git a/dlls/authz/authz.spec b/dlls/authz/authz.spec
+index 933e3d5..154d8eb 100644
+--- a/dlls/authz/authz.spec
++++ b/dlls/authz/authz.spec
+@@ -1,14 +1,14 @@
+ @ stdcall AuthzAccessCheck(long long ptr long ptr ptr long ptr ptr)
+-@ stub AuthzAddSidsToContext
+-@ stub AuthzCachedAccessCheck
++@ stdcall AuthzAddSidsToContext(ptr ptr long ptr long ptr)
++@ stdcall AuthzCachedAccessCheck(long ptr ptr ptr ptr)
+ @ stub AuthzEnumerateSecurityEventSources
+ @ stub AuthzEvaluateSacl
+ @ stub AuthzFreeAuditEvent
+ @ stdcall AuthzFreeContext(long)
+-@ stub AuthzFreeHandle
++@ stdcall AuthzFreeHandle(ptr)
+ @ stdcall AuthzFreeResourceManager(ptr)
+-@ stub AuthzGetInformationFromContext
+-@ stub AuthzInitializeContextFromAuthzContext
++@ stdcall AuthzGetInformationFromContext(ptr long long ptr ptr)
++@ stdcall AuthzInitializeContextFromAuthzContext(long ptr ptr int64 ptr ptr)
+ @ stdcall AuthzInitializeContextFromSid(long ptr long ptr int64 ptr ptr)
+ @ stdcall AuthzInitializeContextFromToken(long long long ptr int64 ptr ptr)
+ @ stub AuthzInitializeObjectAccessAuditEvent
+@@ -19,7 +19,7 @@
+ @ stub AuthzRegisterSecurityEventSource
+ @ stub AuthzReportSecurityEvent
+ @ stub AuthzReportSecurityEventFromParams
+-@ stub AuthzUninstallSecurityEventSource
++@ stdcall AuthzUninstallSecurityEventSource(long wstr)
+ @ stub AuthzUnregisterSecurityEventSource
+ @ stub AuthziAllocateAuditParams
+ @ stub AuthziCheckContextMembership
+diff --git a/include/authz.h b/include/authz.h
+index d93372a..2c86d15 100644
+--- a/include/authz.h
++++ b/include/authz.h
+@@ -29,6 +29,50 @@ DECLARE_HANDLE(AUTHZ_RESOURCE_MANAGER_HANDLE);
+ DECLARE_HANDLE(AUTHZ_AUDIT_EVENT_HANDLE);
+ 
+ typedef AUTHZ_ACCESS_CHECK_RESULTS_HANDLE *PAUTHZ_ACCESS_CHECK_RESULTS_HANDLE;
++typedef AUTHZ_RESOURCE_MANAGER_HANDLE *PAUTHZ_RESOURCE_MANAGER_HANDLE;
++
++#define AUTHZ_SKIP_TOKEN_GROUPS     0x2
++#define AUTHZ_REQUIRE_S4U_LOGON     0x4
++#define AUTHZ_COMPUTE_PRIVILEGES    0x8
++
++#define AUTHZ_ACCESS_CHECK_NO_DEEP_COPY_SD 0x1
++
++#define AUTHZ_RM_FLAG_NO_AUDIT                       0x1
++#define AUTHZ_RM_FLAG_INITIALIZE_UNDER_IMPERSONATION 0x2
++#define AUTHZ_RM_FLAG_NO_CENTRAL_ACCESS_POLICIES     0x4
++
++#define AUTHZ_ALLOW_MULTIPLE_SOURCE_INSTANCES 0x1
++#define AUTHZ_MIGRATED_LEGACY_PUBLISHER       0x2
++
++typedef enum _AUTHZ_CONTEXT_INFORMATION_CLASS
++{
++    AuthzContextInfoUserSid = 1,
++    AuthzContextInfoGroupsSids,
++    AuthzContextInfoRestrictedSids,
++    AuthzContextInfoPrivileges,
++    AuthzContextInfoExpirationTime,
++    AuthzContextInfoServerContext,
++    AuthzContextInfoIdentifier,
++    AuthzContextInfoSource,
++    AuthzContextInfoAll,
++    AuthzContextInfoAuthenticationId,
++    AuthzContextInfoSecurityAttributes,
++    AuthzContextInfoDeviceSids,
++    AuthzContextInfoUserClaims,
++    AuthzContextInfoDeviceClaims,
++    AuthzContextInfoAppContainerSid,
++    AuthzContextInfoCapabilitySids
++} AUTHZ_CONTEXT_INFORMATION_CLASS;
++
++typedef struct _AUTHZ_SECURITY_ATTRIBUTES_INFORMATION
++{
++    WORD  Version;
++    WORD  Reserved;
++    ULONG AttributeCount;
++    void *Attribute;
++} AUTHZ_SECURITY_ATTRIBUTES_INFORMATION, *PAUTHZ_SECURITY_ATTRIBUTES_INFORMATION;
++
++#define AUTHZ_SECURITY_ATTRIBUTES_INFORMATION_VERSION_V1 1
+ typedef AUTHZ_CLIENT_CONTEXT_HANDLE *PAUTHZ_CLIENT_CONTEXT_HANDLE;
+ 
+ typedef BOOL (CALLBACK *PFN_AUTHZ_COMPUTE_DYNAMIC_GROUPS) (
+@@ -102,6 +146,17 @@ BOOL WINAPI AuthzAccessCheck(DWORD flags, AUTHZ_CLIENT_CONTEXT_HANDLE client_con
+         DWORD optional_security_count, AUTHZ_ACCESS_REPLY *reply,
+         AUTHZ_ACCESS_CHECK_RESULTS_HANDLE *access_check_result);
+ 
++BOOL WINAPI AuthzCachedAccessCheck(DWORD flags, AUTHZ_ACCESS_CHECK_RESULTS_HANDLE results,
++        AUTHZ_ACCESS_REQUEST *request, AUTHZ_AUDIT_EVENT_HANDLE audit_event, AUTHZ_ACCESS_REPLY *reply);
++BOOL WINAPI AuthzFreeHandle(AUTHZ_ACCESS_CHECK_RESULTS_HANDLE results);
++BOOL WINAPI AuthzGetInformationFromContext(AUTHZ_CLIENT_CONTEXT_HANDLE client_context,
++        AUTHZ_CONTEXT_INFORMATION_CLASS info_class, DWORD size, DWORD *size_required, void *buffer);
++BOOL WINAPI AuthzAddSidsToContext(AUTHZ_CLIENT_CONTEXT_HANDLE client_context, SID_AND_ATTRIBUTES *sids,
++        DWORD sid_count, SID_AND_ATTRIBUTES *restricted_sids, DWORD restricted_sid_count,
++        AUTHZ_CLIENT_CONTEXT_HANDLE *new_context);
++BOOL WINAPI AuthzInitializeContextFromAuthzContext(DWORD flags, AUTHZ_CLIENT_CONTEXT_HANDLE client_context,
++        LARGE_INTEGER *expire_time, LUID id, void *dynamic_group, AUTHZ_CLIENT_CONTEXT_HANDLE *new_context);
++BOOL WINAPI AuthzUninstallSecurityEventSource(DWORD flags, const WCHAR *name);
+ BOOL WINAPI AuthzFreeContext(AUTHZ_CLIENT_CONTEXT_HANDLE client_context);
+ BOOL WINAPI AuthzFreeResourceManager(AUTHZ_RESOURCE_MANAGER_HANDLE handle);
+ 
