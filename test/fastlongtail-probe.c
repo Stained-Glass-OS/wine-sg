@@ -195,6 +195,36 @@ int main(void)
         EXPECT(st == ERROR_SUCCESS && value == 1);
         st = DnsQueryConfig(DnsConfigAdapterInfo, 0, NULL, NULL, &value, &len);
         EXPECT(st != ERROR_SUCCESS);
+        /* the values come from the TCP/IP parameters */
+        {
+            HKEY k, ik; DWORD one = 1, zero = 0, three = 3;
+            RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Services\\Tcpip\\Parameters", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &k, NULL);
+            RegCreateKeyExW(k, L"Interfaces\\{FASTLT00-0000-0000-0000-000000000001}", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &ik, NULL);
+            RegSetValueExW(k, L"DisableDynamicUpdate", 0, REG_DWORD, (BYTE *)&one, sizeof(one));
+            RegSetValueExW(k, L"DefaultRegistrationMaxAddressCount", 0, REG_DWORD, (BYTE *)&three, sizeof(three));
+            value = 0xdead; len = sizeof(value);
+            st = DnsQueryConfig(DnsConfigPrimaryHostNameRegistrationEnabled, 0, NULL, NULL, &value, &len);
+            EXPECT(st == ERROR_SUCCESS && value == 0);
+            value = 0xdead; len = sizeof(value);
+            st = DnsQueryConfig(DnsConfigAddressRegistrationMaxCount, 0, NULL, NULL, &value, &len);
+            EXPECT(st == ERROR_SUCCESS && value == 3);
+            RegSetValueExW(k, L"DisableDynamicUpdate", 0, REG_DWORD, (BYTE *)&zero, sizeof(zero));
+            RegSetValueExW(ik, L"RegistrationEnabled", 0, REG_DWORD, (BYTE *)&zero, sizeof(zero));
+            value = 0xdead; len = sizeof(value);
+            st = DnsQueryConfig(DnsConfigAdapterHostNameRegistrationEnabled, 0, L"{FASTLT00-0000-0000-0000-000000000001}", NULL, &value, &len);
+            EXPECT(st == ERROR_SUCCESS && value == 0);
+            RegSetValueExW(ik, L"RegistrationEnabled", 0, REG_DWORD, (BYTE *)&one, sizeof(one));
+            value = 0xdead; len = sizeof(value);
+            st = DnsQueryConfig(DnsConfigAdapterHostNameRegistrationEnabled, 0, L"{FASTLT00-0000-0000-0000-000000000001}", NULL, &value, &len);
+            EXPECT(st == ERROR_SUCCESS && value == 1);
+            st = DnsQueryConfig(DnsConfigAdapterHostNameRegistrationEnabled, 0, NULL, NULL, &value, &len);
+            EXPECT(st == ERROR_INVALID_PARAMETER);
+            RegDeleteValueW(k, L"DefaultRegistrationMaxAddressCount");
+            RegDeleteValueW(k, L"DisableDynamicUpdate");
+            RegCloseKey(ik);
+            RegDeleteKeyW(k, L"Interfaces\\{FASTLT00-0000-0000-0000-000000000001}");
+            RegCloseKey(k);
+        }
     }
 
     /* propsys: a GUID from sixteen bytes */
