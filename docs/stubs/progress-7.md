@@ -28,3 +28,7 @@ All 467 items of gap-CLOUD.json have a row in triage-7.tsv with evidence: 102 im
 - Last batches: 5530/5531 (COM surrogate bitness, dllhost GetMarshalSizeMax; `make test-dllhost`), 5532 (rpcss ept_lookup + rpcrt4 RpcMgmtEpEltInq*; rpcrt4 `test_endpoint_inquiry`), 5533 (loadperf lodctr/unlodctr; `make test-loadperf`), 5534 (fontsub CreateFontPackage subsetting; `make test-fontsub`).
 - Not done inside the implemented items (each stated in its patches/notes/NNNN.txt): taskschd's own trigger objects for monthly triggers; package formats and the name-language filter in fontsub; loadperf's trusted-library checksum and error codes (unverified).
 - A gate that starts a COM surrogate or any detached process must write the probe's output to a file, not a pipe: the surrogate inherits the pipe and keeps `$(...)` from ever returning.
+
+## Round 3 (verdict fixes for triage-7.tsv)
+90 corrected lines appended to docs/stubs/triage-7.tsv (the last line per dll+function wins), each with evidence of its own: windows-matches only with a test line or a fetched docs statement; callable code no longer marked not-applicable; bookkeeping lines replaced by real verdicts; escalations carry a proposal. Items that should become code carry the interim verdict implement-pending; the code batches (patches 5600-5799, branches stubs-7c / stubs-6d) replace those lines with implemented plus the patch number.
+Source of the research: the audit docs/stubs/TRIAGE-AUDIT.md rows for this file.
