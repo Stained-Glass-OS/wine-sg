@@ -1,0 +1,1001 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ncrypt: PKCS #8 private key blobs, plain and under a secret
+
+ncrypt: PKCS #8 private key blobs, plain and under a secret
+
+NCryptExportKey and NCryptImportKey handle NCRYPT_PKCS8_PRIVATE_KEY_BLOB for
+RSA keys: a PrivateKeyInfo, or with NCRYPTBUFFER_PKCS_SECRET an
+EncryptedPrivateKeyInfo using PBES2 (PBKDF2 with HMAC-SHA256, AES in CBC mode).
+---
+--- a/dlls/ncrypt/Makefile.in
++++ b/dlls/ncrypt/Makefile.in
+@@ -7,4 +7,5 @@ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
+ 	main.c \
++	pkcs8.c \
+ 	protect.c
+--- a/dlls/ncrypt/main.c
++++ b/dlls/ncrypt/main.c
+@@ -1119,6 +1119,12 @@ static BOOL get_blob_algid(const BCRYPT_KEY_BLOB *header, DWORD size, enum algid
+     }
+ }
+ 
++/* pkcs8.c */
++SECURITY_STATUS pkcs8_export(BCRYPT_KEY_HANDLE key, const NCryptBufferDesc *desc, BYTE *output, DWORD output_len,
++                             DWORD *ret_len);
++SECURITY_STATUS pkcs8_to_rsa_blob(BCRYPT_ALG_HANDLE rsa_alg, const BYTE *data, DWORD data_len,
++                                  const NCryptBufferDesc *desc, BYTE **blob, DWORD *blob_len);
++
+ /* defined below (after crypt_data, which they call) */
+ static SECURITY_STATUS unwrap_key_for_transport(NCRYPT_KEY_HANDLE decrypt_key, const BYTE *blob, DWORD blob_len,
+                                                  BYTE **plain, DWORD *plain_len);
+@@ -1149,7 +1155,6 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
+             return ret;
+         data = decrypted;
+     }
+-    header = (BCRYPT_KEY_BLOB *)data;
+     if (flags & ~(NCRYPT_SILENT_FLAG | NCRYPT_MACHINE_KEY_FLAG | NCRYPT_OVERWRITE_KEY_FLAG |
+                   NCRYPT_DO_NOT_FINALIZE_FLAG))
+     {
+@@ -1157,6 +1162,25 @@ SECURITY_STATUS WINAPI NCryptImportKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_H
+         free(decrypted);
+         return NTE_BAD_FLAGS;
+     }
++    if (!lstrcmpW(type, L"PKCS8_PRIVATEKEY"))
++    {
++        /* the RSA key inside, as the blob the rest of this function knows */
++        BYTE *blob;
++        DWORD blob_len;
++        SECURITY_STATUS ret;
++
++        if ((ret = pkcs8_to_rsa_blob(algorithms[RSA].handle, data, datasize, params, &blob, &blob_len)))
++        {
++            free(decrypted);
++            return ret;
++        }
++        free(decrypted);
++        decrypted = blob;
++        data = blob;
++        datasize = blob_len;
++        type = BCRYPT_RSAFULLPRIVATE_BLOB;
++    }
++    header = (BCRYPT_KEY_BLOB *)data;
+     /* a name among the parameters makes the imported key a kept one */
+     if (params)
+         for (i = 0; i < params->cBuffers; i++)
+@@ -1260,7 +1284,7 @@ SECURITY_STATUS WINAPI NCryptExportKey(NCRYPT_KEY_HANDLE key, NCRYPT_KEY_HANDLE
+     if (!object) return NTE_INVALID_HANDLE;
+     if (!type || !ret_len) return NTE_INVALID_PARAMETER;
+     if (!object->key.finalized || !object->key.bcrypt_key) return NTE_BAD_KEY_STATE;
+-    if (params)
++    if (params && lstrcmpW(type, L"PKCS8_PRIVATEKEY"))
+     {
+         FIXME("Parameter information not implemented\n");
+         return NTE_NOT_SUPPORTED;
+@@ -1282,6 +1306,13 @@ SECURITY_STATUS WINAPI NCryptExportKey(NCRYPT_KEY_HANDLE key, NCRYPT_KEY_HANDLE
+     }
+ #endif
+ 
++    if (!lstrcmpW(type, L"PKCS8_PRIVATEKEY"))
++    {
++        /* an RSA key, with an optional secret to encrypt it under */
++        if (encrypt_key || object->key.algid != RSA) return NTE_NOT_SUPPORTED;
++        return pkcs8_export(object->key.bcrypt_key, params, output, output_len, ret_len);
++    }
++
+     if (encrypt_key)
+     {
+         BYTE *plain;
+new file mode 100644
+--- /dev/null
++++ b/dlls/ncrypt/pkcs8.c
+@@ -0,0 +1,713 @@
++/*
++ * PKCS #8 private key blobs for NCryptExportKey and NCryptImportKey
++ *
++ * A PrivateKeyInfo (RFC 5208) holding an RSA key, optionally encrypted under
++ * a secret with PBES2 (RFC 8018): PBKDF2 with an HMAC, then AES in CBC mode.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winnls.h"
++#include "wincrypt.h"
++#include "ncrypt.h"
++#include "bcrypt.h"
++#include "ncrypt_internal.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(ncrypt);
++
++#define PKCS_BUFFER_ALG_OID  41
++#define PKCS_BUFFER_ALG_PARAM 42
++#define PKCS_BUFFER_SECRET   46
++
++#define PBES2_ITERATIONS 10000
++#define PBES2_SALT_SIZE  16
++
++static const char oid_rsa[] = "1.2.840.113549.1.1.1";
++static const char oid_pbes2[] = "1.2.840.113549.1.5.13";
++static const char oid_pbkdf2[] = "1.2.840.113549.1.5.12";
++static const char oid_hmac_sha1[] = "1.2.840.113549.2.7";
++static const char oid_hmac_sha256[] = "1.2.840.113549.2.9";
++static const char oid_hmac_sha384[] = "1.2.840.113549.2.10";
++static const char oid_hmac_sha512[] = "1.2.840.113549.2.11";
++static const char oid_aes128_cbc[] = "2.16.840.1.101.3.4.1.2";
++static const char oid_aes192_cbc[] = "2.16.840.1.101.3.4.1.22";
++static const char oid_aes256_cbc[] = "2.16.840.1.101.3.4.1.42";
++
++struct pkcs8_private_key_info
++{
++    DWORD                      Version;
++    CRYPT_ALGORITHM_IDENTIFIER Algorithm;
++    CRYPT_DER_BLOB             PrivateKey;
++    CRYPT_ATTRIBUTES          *pAttributes;
++};
++
++struct pkcs8_encrypted_info
++{
++    CRYPT_ALGORITHM_IDENTIFIER EncryptionAlgorithm;
++    CRYPT_DATA_BLOB            EncryptedPrivateKey;
++};
++
++struct params
++{
++    const WCHAR *secret;
++    const char *alg_oid;
++};
++
++static SECURITY_STATUS ntstatus_to_security(NTSTATUS status)
++{
++    switch (status)
++    {
++    case STATUS_SUCCESS:           return ERROR_SUCCESS;
++    case STATUS_NO_MEMORY:         return NTE_NO_MEMORY;
++    case STATUS_NOT_SUPPORTED:     return NTE_NOT_SUPPORTED;
++    case STATUS_BUFFER_TOO_SMALL:  return NTE_BUFFER_TOO_SMALL;
++    case STATUS_INVALID_PARAMETER: return NTE_INVALID_PARAMETER;
++    default:                       return NTE_BAD_DATA;
++    }
++}
++
++static SECURITY_STATUS parse_params(const NCryptBufferDesc *desc, struct params *params)
++{
++    ULONG i;
++
++    memset(params, 0, sizeof(*params));
++    if (!desc) return ERROR_SUCCESS;
++    for (i = 0; i < desc->cBuffers; i++)
++    {
++        const NCryptBuffer *buf = &desc->pBuffers[i];
++
++        switch (buf->BufferType)
++        {
++        case PKCS_BUFFER_SECRET:
++            if (!buf->pvBuffer || buf->cbBuffer < sizeof(WCHAR) || (buf->cbBuffer % sizeof(WCHAR)) ||
++                ((const WCHAR *)buf->pvBuffer)[buf->cbBuffer / sizeof(WCHAR) - 1])
++                return NTE_INVALID_PARAMETER;
++            params->secret = buf->pvBuffer;
++            break;
++        case PKCS_BUFFER_ALG_OID:
++            if (!buf->pvBuffer || !buf->cbBuffer || ((const char *)buf->pvBuffer)[buf->cbBuffer - 1])
++                return NTE_INVALID_PARAMETER;
++            params->alg_oid = buf->pvBuffer;
++            break;
++        case 45: /* NCRYPTBUFFER_PKCS_KEY_NAME: the importing function takes it */
++            break;
++        case PKCS_BUFFER_ALG_PARAM:
++            /* the format of the algorithm parameter is not documented */
++            FIXME("NCRYPTBUFFER_PKCS_ALG_PARAM is not supported\n");
++            return NTE_NOT_SUPPORTED;
++        default:
++            WARN("buffer type %lu is not used by PKCS #8 keys\n", buf->BufferType);
++            return NTE_BAD_FLAGS;
++        }
++    }
++    return ERROR_SUCCESS;
++}
++
++/* The secret as the password bytes of PBKDF2: its UTF-8 form */
++static BYTE *secret_bytes(const WCHAR *secret, DWORD *len)
++{
++    int size = WideCharToMultiByte(CP_UTF8, 0, secret, -1, NULL, 0, NULL, NULL);
++    BYTE *ret;
++
++    if (size <= 0 || !(ret = malloc(size))) return NULL;
++    WideCharToMultiByte(CP_UTF8, 0, secret, -1, (char *)ret, size, NULL, NULL);
++    *len = size - 1;
++    return ret;
++}
++
++struct der_buffer
++{
++    BYTE *data;
++    DWORD len;
++    BOOL failed;
++};
++
++static void buf_add(struct der_buffer *b, const void *p, DWORD n)
++{
++    BYTE *grown;
++
++    if (b->failed) return;
++    if (!(grown = realloc(b->data, b->len + n + 1))) { b->failed = TRUE; return; }
++    memcpy(grown + b->len, p, n);
++    b->data = grown;
++    b->len += n;
++}
++
++/* replaces the content with a TLV of the given tag around it */
++static void buf_wrap(struct der_buffer *b, BYTE tag)
++{
++    BYTE header[4];
++    DWORD n = 2, len = b->len;
++    BYTE *grown;
++
++    if (b->failed) return;
++    header[0] = tag;
++    if (len < 0x80) header[1] = len;
++    else if (len < 0x100) { header[1] = 0x81; header[2] = len; n = 3; }
++    else { header[1] = 0x82; header[2] = len >> 8; header[3] = len; n = 4; }
++    if (!(grown = realloc(b->data, len + n + 1))) { b->failed = TRUE; return; }
++    memmove(grown + n, grown, len);
++    memcpy(grown, header, n);
++    b->data = grown;
++    b->len = len + n;
++}
++
++static void buf_add_oid(struct der_buffer *b, const char *oid)
++{
++    DWORD size = 0;
++    BYTE *der;
++
++    if (b->failed) return;
++    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, X509_OBJECT_IDENTIFIER, &oid, CRYPT_ENCODE_ALLOC_FLAG, NULL, &der, &size))
++    {
++        b->failed = TRUE;
++        return;
++    }
++    buf_add(b, der, size);
++    LocalFree(der);
++}
++
++static void buf_add_octets(struct der_buffer *b, const BYTE *data, DWORD len)
++{
++    BYTE header[2] = { 4, len };
++
++    buf_add(b, header, 2);
++    buf_add(b, data, len);
++}
++
++static void buf_add_uint(struct der_buffer *b, DWORD value)
++{
++    BYTE bytes[6], n = 0;
++    int i;
++
++    for (i = 3; i >= 0; i--)
++    {
++        BYTE v = value >> (i * 8);
++        if (!n && !v && i) continue;
++        if (!n && (v & 0x80)) bytes[2 + n++] = 0;
++        bytes[2 + n++] = v;
++    }
++    bytes[0] = 2;
++    bytes[1] = n;
++    buf_add(b, bytes, 2 + n);
++}
++
++/* A reader for the few shapes of DER the PBES2 parameters have */
++static BOOL der_next(const BYTE **ptr, const BYTE *end, BYTE *tag, const BYTE **content, DWORD *content_len)
++{
++    const BYTE *p = *ptr;
++    DWORD len;
++
++    if (end - p < 2) return FALSE;
++    *tag = *p++;
++    len = *p++;
++    if (len & 0x80)
++    {
++        DWORD n = len & 0x7f;
++        if (!n || n > 3 || end - p < n) return FALSE;
++        for (len = 0; n; n--) len = (len << 8) | *p++;
++    }
++    if (len > end - p) return FALSE;
++    *content = p;
++    *content_len = len;
++    *ptr = p + len;
++    return TRUE;
++}
++
++static BOOL der_oid_string(const BYTE *der, DWORD len, char *out, DWORD out_size)
++{
++    DWORD size = 0;
++    char **oid;
++    BOOL ret = FALSE;
++
++    if (CryptDecodeObjectEx(X509_ASN_ENCODING, X509_OBJECT_IDENTIFIER, der, len, CRYPT_DECODE_ALLOC_FLAG, NULL, &oid, &size))
++    {
++        if (strlen(*oid) < out_size) { strcpy(out, *oid); ret = TRUE; }
++        LocalFree(oid);
++    }
++    return ret;
++}
++
++static const WCHAR *prf_for_oid(const char *oid, ULONG *size)
++{
++    if (!strcmp(oid, oid_hmac_sha1)) { *size = 20; return BCRYPT_SHA1_ALGORITHM; }
++    if (!strcmp(oid, oid_hmac_sha256)) { *size = 32; return BCRYPT_SHA256_ALGORITHM; }
++    if (!strcmp(oid, oid_hmac_sha384)) { *size = 48; return BCRYPT_SHA384_ALGORITHM; }
++    if (!strcmp(oid, oid_hmac_sha512)) { *size = 64; return BCRYPT_SHA512_ALGORITHM; }
++    return NULL;
++}
++
++static BOOL cipher_key_length(const char *oid, DWORD *len)
++{
++    if (!strcmp(oid, oid_aes128_cbc)) { *len = 16; return TRUE; }
++    if (!strcmp(oid, oid_aes192_cbc)) { *len = 24; return TRUE; }
++    if (!strcmp(oid, oid_aes256_cbc)) { *len = 32; return TRUE; }
++    return FALSE;
++}
++
++static NTSTATUS derive_key(const WCHAR *hash_alg, const BYTE *password, DWORD password_len, const BYTE *salt,
++                           DWORD salt_len, ULONGLONG iterations, BYTE *key, DWORD key_len)
++{
++    BCRYPT_ALG_HANDLE alg;
++    NTSTATUS status;
++
++    if ((status = BCryptOpenAlgorithmProvider(&alg, hash_alg, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG))) return status;
++    status = BCryptDeriveKeyPBKDF2(alg, (BYTE *)password, password_len, (BYTE *)salt, salt_len, iterations, key, key_len, 0);
++    BCryptCloseAlgorithmProvider(alg, 0);
++    return status;
++}
++
++static NTSTATUS aes_cbc(BOOL encrypt, const BYTE *key, DWORD key_len, const BYTE *iv, const BYTE *input,
++                        DWORD input_len, BYTE *output, DWORD *output_len)
++{
++    BCRYPT_ALG_HANDLE alg;
++    BCRYPT_KEY_HANDLE handle;
++    BYTE iv_copy[16];
++    NTSTATUS status;
++
++    if ((status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, NULL, 0))) return status;
++    if ((status = BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, (UCHAR *)BCRYPT_CHAIN_MODE_CBC,
++                                    sizeof(BCRYPT_CHAIN_MODE_CBC), 0)) ||
++        (status = BCryptGenerateSymmetricKey(alg, &handle, NULL, 0, (BYTE *)key, key_len, 0)))
++    {
++        BCryptCloseAlgorithmProvider(alg, 0);
++        return status;
++    }
++    memcpy(iv_copy, iv, sizeof(iv_copy));
++    if (encrypt)
++        status = BCryptEncrypt(handle, (BYTE *)input, input_len, NULL, iv_copy, sizeof(iv_copy), output, *output_len,
++                               output_len, BCRYPT_BLOCK_PADDING);
++    else
++        status = BCryptDecrypt(handle, (BYTE *)input, input_len, NULL, iv_copy, sizeof(iv_copy), output, *output_len,
++                               output_len, BCRYPT_BLOCK_PADDING);
++    BCryptDestroyKey(handle);
++    BCryptCloseAlgorithmProvider(alg, 0);
++    return status;
++}
++
++/* PBES2-params ::= SEQUENCE { keyDerivationFunc, encryptionScheme } */
++static SECURITY_STATUS encode_params(const char *cipher_oid, const BYTE *salt, const BYTE *iv, struct der_buffer *out)
++{
++    static const BYTE null[] = { 5, 0 };
++    struct der_buffer kdf = { 0 }, scheme = { 0 }, prf = { 0 }, kdf_params = { 0 };
++
++    buf_add_oid(&prf, oid_hmac_sha256);
++    buf_add(&prf, null, sizeof(null));
++    buf_wrap(&prf, 0x30);
++
++    buf_add_octets(&kdf_params, salt, PBES2_SALT_SIZE);
++    buf_add_uint(&kdf_params, PBES2_ITERATIONS);
++    buf_add(&kdf_params, prf.data, prf.len);
++    buf_wrap(&kdf_params, 0x30);
++
++    buf_add_oid(&kdf, oid_pbkdf2);
++    buf_add(&kdf, kdf_params.data, kdf_params.len);
++    buf_wrap(&kdf, 0x30);
++
++    buf_add_oid(&scheme, cipher_oid);
++    buf_add_octets(&scheme, iv, 16);
++    buf_wrap(&scheme, 0x30);
++
++    buf_add(out, kdf.data, kdf.len);
++    buf_add(out, scheme.data, scheme.len);
++    buf_wrap(out, 0x30);
++
++    free(prf.data); free(kdf_params.data); free(kdf.data); free(scheme.data);
++    if (kdf.failed || scheme.failed || prf.failed || kdf_params.failed || out->failed) return NTE_NO_MEMORY;
++    return ERROR_SUCCESS;
++}
++
++static SECURITY_STATUS copy_out(const BYTE *data, DWORD len, BYTE *output, DWORD output_len, DWORD *ret_len)
++{
++    *ret_len = len;
++    if (!output) return ERROR_SUCCESS;
++    if (output_len < len) return NTE_BUFFER_TOO_SMALL;
++    memcpy(output, data, len);
++    return ERROR_SUCCESS;
++}
++
++static void copy_reversed(BYTE *dst, const BYTE *src, DWORD len)
++{
++    DWORD i;
++    for (i = 0; i < len; i++) dst[i] = src[len - 1 - i];
++}
++
++/* BCRYPT_RSAFULLPRIVATE_BLOB (big-endian) to the CryptoAPI private key blob (little-endian) */
++static BYTE *full_blob_to_capi(const BYTE *blob, DWORD blob_len, DWORD *capi_len)
++{
++    const BCRYPT_RSAKEY_BLOB *rsa = (const BCRYPT_RSAKEY_BLOB *)blob;
++    DWORD half, full, fields;
++    const BYTE *src;
++    BYTE *capi, *dst;
++    BLOBHEADER *hdr;
++    RSAPUBKEY *pub;
++
++    if (blob_len < sizeof(*rsa) || rsa->Magic != BCRYPT_RSAFULLPRIVATE_MAGIC) return NULL;
++    full = rsa->cbModulus;
++    half = rsa->cbPrime1;
++    if (rsa->cbPublicExp > 4 || rsa->cbPrime2 != half) return NULL;
++    fields = rsa->cbPublicExp + full + half * 2 + half * 3 + full;
++    if (blob_len < sizeof(*rsa) + fields) return NULL;
++
++    *capi_len = sizeof(*hdr) + sizeof(*pub) + full + half * 5 + full;
++    if (!(capi = calloc(1, *capi_len))) return NULL;
++    hdr = (BLOBHEADER *)capi;
++    hdr->bType = PRIVATEKEYBLOB;
++    hdr->bVersion = CUR_BLOB_VERSION;
++    hdr->aiKeyAlg = CALG_RSA_KEYX;
++    pub = (RSAPUBKEY *)(hdr + 1);
++    pub->magic = 0x32415352; /* RSA2 */
++    pub->bitlen = rsa->BitLength;
++    src = (const BYTE *)(rsa + 1);
++    {
++        DWORD i;
++        for (i = 0; i < rsa->cbPublicExp; i++) pub->pubexp = (pub->pubexp << 8) | src[i];
++    }
++    src += rsa->cbPublicExp;
++    dst = (BYTE *)(pub + 1);
++    copy_reversed(dst, src, full); dst += full; src += full;                       /* modulus */
++    copy_reversed(dst, src, half); dst += half; src += half;                       /* prime1 */
++    copy_reversed(dst, src, half); dst += half; src += half;                       /* prime2 */
++    copy_reversed(dst, src, half); dst += half; src += half;                       /* exponent1 */
++    copy_reversed(dst, src, half); dst += half; src += half;                       /* exponent2 */
++    copy_reversed(dst, src, half); dst += half; src += half;                       /* coefficient */
++    copy_reversed(dst, src, full);                                                 /* private exponent */
++    return capi;
++}
++
++SECURITY_STATUS pkcs8_export(BCRYPT_KEY_HANDLE key, const NCryptBufferDesc *desc, BYTE *output, DWORD output_len,
++                             DWORD *ret_len)
++{
++    struct pkcs8_private_key_info info = { 0 };
++    struct pkcs8_encrypted_info enc = { { 0 } };
++    BYTE *capi = NULL, *rsa = NULL, *pkcs8 = NULL, *result = NULL, *cipher = NULL;
++    BYTE null[] = { 5, 0 }, salt[PBES2_SALT_SIZE], iv[16], aes_key[32];
++    struct der_buffer params = { 0 };
++    DWORD capi_len, rsa_len = 0, pkcs8_len = 0, result_len, key_len, cipher_len;
++    const char *cipher_oid = oid_aes256_cbc;
++    struct params p;
++    SECURITY_STATUS ret;
++    NTSTATUS status;
++
++    if ((ret = parse_params(desc, &p))) return ret;
++#ifdef SG_MUTANT_PKCS8_IGNORE_SECRET
++    p.secret = NULL; p.alg_oid = NULL;
++#endif
++    if (p.alg_oid && !strcmp(p.alg_oid, oid_pbes2)) p.alg_oid = NULL;
++    if (p.alg_oid)
++    {
++        if (!cipher_key_length(p.alg_oid, &key_len)) return NTE_NOT_SUPPORTED;
++        cipher_oid = p.alg_oid;
++    }
++    if (p.alg_oid && !p.secret) return NTE_INVALID_PARAMETER;
++
++    {
++        BYTE *full;
++        DWORD full_len;
++
++        if ((status = BCryptExportKey(key, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, 0, &full_len, 0)))
++            return ntstatus_to_security(status);
++        if (!(full = malloc(full_len))) return NTE_NO_MEMORY;
++        if ((status = BCryptExportKey(key, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, full, full_len, &full_len, 0)))
++        {
++            free(full);
++            return ntstatus_to_security(status);
++        }
++        capi = full_blob_to_capi(full, full_len, &capi_len);
++        RtlSecureZeroMemory(full, full_len);
++        free(full);
++        if (!capi) return NTE_BAD_DATA;
++    }
++    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_RSA_PRIVATE_KEY, capi, CRYPT_ENCODE_ALLOC_FLAG, NULL, &rsa, &rsa_len))
++    {
++        WARN("RSA private key encoding failed: %08lx\n", GetLastError());
++        ret = NTE_BAD_DATA;
++        goto done;
++    }
++
++    info.Version = 0;
++    info.Algorithm.pszObjId = (char *)oid_rsa;
++    info.Algorithm.Parameters.cbData = sizeof(null);
++    info.Algorithm.Parameters.pbData = null;
++    info.PrivateKey.cbData = rsa_len;
++    info.PrivateKey.pbData = rsa;
++    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_PRIVATE_KEY_INFO, &info, CRYPT_ENCODE_ALLOC_FLAG, NULL, &pkcs8, &pkcs8_len))
++    {
++        WARN("PrivateKeyInfo encoding failed: %08lx\n", GetLastError());
++        ret = NTE_BAD_DATA;
++        goto done;
++    }
++
++    if (!p.secret)
++    {
++        ret = copy_out(pkcs8, pkcs8_len, output, output_len, ret_len);
++        goto done;
++    }
++
++    /* PBES2 */
++    {
++        BYTE *password;
++        DWORD password_len;
++
++        cipher_key_length(cipher_oid, &key_len);
++        if ((status = BCryptGenRandom(NULL, salt, sizeof(salt), BCRYPT_USE_SYSTEM_PREFERRED_RNG)) ||
++            (status = BCryptGenRandom(NULL, iv, sizeof(iv), BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
++        {
++            ret = ntstatus_to_security(status);
++            goto done;
++        }
++        if (!(password = secret_bytes(p.secret, &password_len)))
++        {
++            ret = NTE_NO_MEMORY;
++            goto done;
++        }
++#ifndef SG_MUTANT_PKCS8_NO_KDF
++        status = derive_key(BCRYPT_SHA256_ALGORITHM, password, password_len, salt, sizeof(salt), PBES2_ITERATIONS, aes_key, key_len);
++#else
++        memset(aes_key, 0, sizeof(aes_key)); status = 0;
++#endif
++        RtlSecureZeroMemory(password, password_len);
++        free(password);
++        if (status)
++        {
++            ret = ntstatus_to_security(status);
++            goto done;
++        }
++    }
++    cipher_len = pkcs8_len + 16;
++    if (!(cipher = malloc(cipher_len)))
++    {
++        ret = NTE_NO_MEMORY;
++        goto done;
++    }
++    status = aes_cbc(TRUE, aes_key, key_len, iv, pkcs8, pkcs8_len, cipher, &cipher_len);
++    RtlSecureZeroMemory(aes_key, sizeof(aes_key));
++    if (status)
++    {
++        ret = ntstatus_to_security(status);
++        goto done;
++    }
++    if ((ret = encode_params(cipher_oid, salt, iv, &params))) goto done;
++
++    enc.EncryptionAlgorithm.pszObjId = (char *)oid_pbes2;
++    enc.EncryptionAlgorithm.Parameters.cbData = params.len;
++    enc.EncryptionAlgorithm.Parameters.pbData = params.data;
++    enc.EncryptedPrivateKey.cbData = cipher_len;
++    enc.EncryptedPrivateKey.pbData = cipher;
++    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_ENCRYPTED_PRIVATE_KEY_INFO, &enc, CRYPT_ENCODE_ALLOC_FLAG, NULL, &result,
++                             &result_len))
++    {
++        ret = NTE_BAD_DATA;
++        goto done;
++    }
++    ret = copy_out(result, result_len, output, output_len, ret_len);
++
++done:
++    if (capi) { RtlSecureZeroMemory(capi, capi_len); free(capi); }
++    if (rsa) { RtlSecureZeroMemory(rsa, rsa_len); LocalFree(rsa); }
++    if (pkcs8) { RtlSecureZeroMemory(pkcs8, pkcs8_len); LocalFree(pkcs8); }
++    LocalFree(result);
++    free(cipher);
++    free(params.data);
++    return ret;
++}
++
++/* PBES2 parameters to the key and the iv: decrypts the encrypted info into a PrivateKeyInfo */
++static SECURITY_STATUS decrypt_info(const struct pkcs8_encrypted_info *enc, const WCHAR *secret, BYTE **plain,
++                                    DWORD *plain_len)
++{
++    const BYTE *p = enc->EncryptionAlgorithm.Parameters.pbData, *end, *seq, *kdf, *kdf_end, *scheme, *scheme_end;
++    DWORD seq_len, kdf_len, scheme_len;
++    const BYTE *salt = NULL, *iv = NULL, *prf_content = NULL;
++    DWORD salt_len = 0, iv_len = 0, prf_len = 0, key_len = 0, password_len, out_len, i;
++    ULONGLONG iterations = 0;
++    char oid[64], cipher_oid[64], prf_oid[64];
++    const WCHAR *hash_alg;
++    ULONG hash_size;
++    BYTE tag, aes_key[32], *password, *out;
++    const BYTE *c;
++    NTSTATUS status;
++
++    if (strcmp(enc->EncryptionAlgorithm.pszObjId, oid_pbes2)) return NTE_NOT_SUPPORTED;
++    if (!secret) return NTE_INVALID_PARAMETER;
++    if (!p) return NTE_BAD_DATA;
++    end = p + enc->EncryptionAlgorithm.Parameters.cbData;
++    if (!der_next(&p, end, &tag, &seq, &seq_len) || tag != 0x30) return NTE_BAD_DATA;
++    end = seq + seq_len;
++    p = seq;
++    /* keyDerivationFunc */
++    if (!der_next(&p, end, &tag, &kdf, &kdf_len) || tag != 0x30) return NTE_BAD_DATA;
++    /* encryptionScheme */
++    if (!der_next(&p, end, &tag, &scheme, &scheme_len) || tag != 0x30) return NTE_BAD_DATA;
++    kdf_end = kdf + kdf_len;
++    scheme_end = scheme + scheme_len;
++
++    p = kdf;
++    if (!der_next(&p, kdf_end, &tag, &c, &i) || tag != 6) return NTE_BAD_DATA;
++    if (!der_oid_string(c - 2, i + 2, oid, sizeof(oid))) return NTE_BAD_DATA;
++    TRACE("kdf %s\n", debugstr_a(oid));
++    if (strcmp(oid, oid_pbkdf2)) return NTE_NOT_SUPPORTED;
++    if (!der_next(&p, kdf_end, &tag, &c, &i) || tag != 0x30) return NTE_BAD_DATA;
++    {
++        const BYTE *q = c, *qend = c + i, *v;
++        DWORD vlen;
++
++        if (!der_next(&q, qend, &tag, &v, &vlen) || tag != 4)
++        {
++            WARN("salt tag %02x\n", tag);
++            return NTE_NOT_SUPPORTED;  /* only a specified salt */
++        }
++        salt = v; salt_len = vlen;
++        if (!der_next(&q, qend, &tag, &v, &vlen) || tag != 2 || vlen > 4) return NTE_BAD_DATA;
++        for (i = 0; i < vlen; i++) iterations = (iterations << 8) | v[i];
++        if (q < qend)
++        {
++            const BYTE *save = q;
++            if (!der_next(&q, qend, &tag, &v, &vlen)) return NTE_BAD_DATA;
++            if (tag == 2)
++            {
++                for (key_len = 0, i = 0; i < vlen; i++) key_len = (key_len << 8) | v[i];
++            }
++            else q = save;
++        }
++        if (q < qend)
++        {
++            if (!der_next(&q, qend, &tag, &v, &vlen) || tag != 0x30) return NTE_BAD_DATA;
++            prf_content = v; prf_len = vlen;
++        }
++    }
++    if (!iterations || !salt_len) return NTE_BAD_DATA;
++    if (prf_content)
++    {
++        const BYTE *q = prf_content;
++        const BYTE *v;
++        DWORD vlen;
++
++        if (!der_next(&q, prf_content + prf_len, &tag, &v, &vlen) || tag != 6) return NTE_BAD_DATA;
++        if (!der_oid_string(v - 2, vlen + 2, prf_oid, sizeof(prf_oid))) return NTE_BAD_DATA;
++    }
++    else strcpy(prf_oid, oid_hmac_sha1);
++    TRACE("prf %s\n", debugstr_a(prf_oid));
++    if (!(hash_alg = prf_for_oid(prf_oid, &hash_size))) return NTE_NOT_SUPPORTED;
++
++    p = scheme;
++    if (!der_next(&p, scheme_end, &tag, &c, &i) || tag != 6) return NTE_BAD_DATA;
++    if (!der_oid_string(c - 2, i + 2, cipher_oid, sizeof(cipher_oid))) return NTE_BAD_DATA;
++    TRACE("cipher %s\n", debugstr_a(cipher_oid));
++    if (!cipher_key_length(cipher_oid, &i)) return NTE_NOT_SUPPORTED;
++    if (key_len && key_len != i) return NTE_BAD_DATA;
++    key_len = i;
++    if (!der_next(&p, scheme_end, &tag, &c, &iv_len) || tag != 4 || iv_len != 16) return NTE_BAD_DATA;
++    iv = c;
++
++    if (!(password = secret_bytes(secret, &password_len))) return NTE_NO_MEMORY;
++    status = derive_key(hash_alg, password, password_len, salt, salt_len, iterations, aes_key, key_len);
++    RtlSecureZeroMemory(password, password_len);
++    free(password);
++    if (status) return ntstatus_to_security(status);
++
++    out_len = enc->EncryptedPrivateKey.cbData;
++    if (!(out = malloc(out_len ? out_len : 1))) return NTE_NO_MEMORY;
++    status = aes_cbc(FALSE, aes_key, key_len, iv, enc->EncryptedPrivateKey.pbData, enc->EncryptedPrivateKey.cbData, out,
++                     &out_len);
++    RtlSecureZeroMemory(aes_key, sizeof(aes_key));
++    if (status)
++    {
++        free(out);
++        /* a wrong secret mostly shows as bad padding */
++        return NTE_BAD_DATA;
++    }
++    *plain = out;
++    *plain_len = out_len;
++    return ERROR_SUCCESS;
++}
++
++/* The key from a PKCS #8 blob as a BCRYPT_RSAFULLPRIVATE_BLOB, which NCryptImportKey knows how to import */
++SECURITY_STATUS pkcs8_to_rsa_blob(BCRYPT_ALG_HANDLE rsa_alg, const BYTE *data, DWORD data_len,
++                                  const NCryptBufferDesc *desc, BYTE **blob, DWORD *blob_len)
++{
++    struct pkcs8_private_key_info *info = NULL;
++    struct pkcs8_encrypted_info *enc = NULL;
++    BYTE *plain = NULL, *capi = NULL, *out;
++    DWORD size, plain_len = 0, capi_len = 0, out_len;
++    BCRYPT_KEY_HANDLE key = NULL;
++    struct params p;
++    SECURITY_STATUS ret;
++    NTSTATUS status;
++
++    if ((ret = parse_params(desc, &p))) return ret;
++
++    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, PKCS_PRIVATE_KEY_INFO, data, data_len, CRYPT_DECODE_ALLOC_FLAG, NULL, &info,
++                             &size))
++    {
++        if (!CryptDecodeObjectEx(X509_ASN_ENCODING, PKCS_ENCRYPTED_PRIVATE_KEY_INFO, data, data_len, CRYPT_DECODE_ALLOC_FLAG,
++                                 NULL, &enc, &size))
++            return NTE_BAD_DATA;
++        if ((ret = decrypt_info(enc, p.secret, &plain, &plain_len))) goto done;
++        if (!CryptDecodeObjectEx(X509_ASN_ENCODING, PKCS_PRIVATE_KEY_INFO, plain, plain_len, CRYPT_DECODE_ALLOC_FLAG, NULL,
++                                 &info, &size))
++        {
++            ret = NTE_BAD_DATA;
++            goto done;
++        }
++    }
++    if (strcmp(info->Algorithm.pszObjId, oid_rsa))
++    {
++        ret = NTE_NOT_SUPPORTED;
++        goto done;
++    }
++    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, PKCS_RSA_PRIVATE_KEY, info->PrivateKey.pbData, info->PrivateKey.cbData,
++                             CRYPT_DECODE_ALLOC_FLAG, NULL, &capi, &capi_len))
++    {
++        ret = NTE_BAD_DATA;
++        goto done;
++    }
++    if ((status = BCryptImportKeyPair(rsa_alg, NULL, LEGACY_RSAPRIVATE_BLOB, &key, capi, capi_len, 0)))
++    {
++        ret = ntstatus_to_security(status);
++        goto done;
++    }
++    if ((status = BCryptExportKey(key, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, 0, &out_len, 0)) ||
++        !(out = malloc(out_len)))
++    {
++        ret = status ? ntstatus_to_security(status) : NTE_NO_MEMORY;
++        goto done;
++    }
++    if ((status = BCryptExportKey(key, NULL, BCRYPT_RSAFULLPRIVATE_BLOB, out, out_len, &out_len, 0)))
++    {
++        free(out);
++        ret = ntstatus_to_security(status);
++        goto done;
++    }
++    *blob = out;
++    *blob_len = out_len;
++    ret = ERROR_SUCCESS;
++
++done:
++    if (key) BCryptDestroyKey(key);
++    if (capi) { RtlSecureZeroMemory(capi, capi_len); LocalFree(capi); }
++    if (plain) { RtlSecureZeroMemory(plain, plain_len); free(plain); }
++    LocalFree(info);
++    LocalFree(enc);
++    return ret;
++}
+--- a/dlls/ncrypt/tests/Makefile.in
++++ b/dlls/ncrypt/tests/Makefile.in
+@@ -1,5 +1,5 @@
+ TESTDLL   = ncrypt.dll
+-IMPORTS   = ncrypt
++IMPORTS   = ncrypt crypt32
+ 
+ SOURCES = \
+ 	ncrypt.c
+--- a/dlls/ncrypt/tests/ncrypt.c
++++ b/dlls/ncrypt/tests/ncrypt.c
+@@ -20,6 +20,7 @@
+ #include <stdarg.h>
+ #include <windef.h>
+ #include <winbase.h>
++#include <wincrypt.h>
+ #include <ncrypt.h>
+ #include <bcrypt.h>
+ 
+@@ -818,6 +819,169 @@ static void test_NCryptExportKey(void)
+     NCryptFreeObject(prov);
+ }
+ 
++#ifndef NCRYPTBUFFER_PKCS_ALG_OID
++#define NCRYPTBUFFER_PKCS_ALG_OID 41
++#define NCRYPTBUFFER_PKCS_ALG_ID 43
++#define NCRYPTBUFFER_PKCS_SECRET 46
++#endif
++
++typedef struct
++{
++    DWORD Version;
++    CRYPT_ALGORITHM_IDENTIFIER Algorithm;
++    CRYPT_DER_BLOB PrivateKey;
++    CRYPT_ATTRIBUTES *pAttributes;
++} test_private_key_info;
++
++typedef struct
++{
++    CRYPT_ALGORITHM_IDENTIFIER EncryptionAlgorithm;
++    CRYPT_DATA_BLOB EncryptedPrivateKey;
++} test_encrypted_info;
++
++static DWORD first_difference(const BYTE *a, const BYTE *b, DWORD len)
++{
++    DWORD i;
++    for (i = 0; i < len; i++) if (a[i] != b[i]) break;
++    return i;
++}
++
++static void test_pkcs8_export(void)
++{
++    static const WCHAR secret[] = L"correct horse", wrong[] = L"battery staple";
++    static const char aes128[] = "2.16.840.1.101.3.4.1.2";
++    NCryptBuffer buffers[2];
++    NCryptBufferDesc desc = { 0, 1, buffers };
++    NCRYPT_PROV_HANDLE prov;
++    NCRYPT_KEY_HANDLE key, key2;
++    BYTE plain[2048], enc[2048], blob1[1024], blob2[1024];
++    DWORD size, plain_size, enc_size, size1, size2, policy;
++    test_private_key_info *info;
++    test_encrypted_info *einfo;
++    SECURITY_STATUS ret;
++    DWORD decoded_size;
++
++    ret = NCryptOpenStorageProvider(&prov, NULL, 0);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    ret = NCryptCreatePersistedKey(prov, &key, BCRYPT_RSA_ALGORITHM, NULL, 0, 0);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    policy = NCRYPT_ALLOW_EXPORT_FLAG | NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
++    ret = NCryptSetProperty(key, NCRYPT_EXPORT_POLICY_PROPERTY, (BYTE *)&policy, sizeof(policy), 0);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    ret = NCryptFinalizeKey(key, 0);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++
++    /* without parameters: a PrivateKeyInfo holding the RSAPrivateKey */
++    size = 0;
++    ret = NCryptExportKey(key, 0, L"PKCS8_PRIVATEKEY", NULL, NULL, 0, &size, 0);
++    ok(ret == ERROR_SUCCESS && size > 0, "got %#lx, %lu\n", ret, size);
++    ret = NCryptExportKey(key, 0, L"PKCS8_PRIVATEKEY", NULL, plain, size - 1, &plain_size, 0);
++    ok(ret == NTE_BUFFER_TOO_SMALL, "got %#lx\n", ret);
++    ret = NCryptExportKey(key, 0, L"PKCS8_PRIVATEKEY", NULL, plain, sizeof(plain), &plain_size, 0);
++    ok(ret == ERROR_SUCCESS && plain_size == size, "got %#lx, %lu\n", ret, plain_size);
++    ok(CryptDecodeObjectEx(X509_ASN_ENCODING, (LPCSTR)44, plain, plain_size, CRYPT_DECODE_ALLOC_FLAG, NULL, &info,
++            &decoded_size), "decode failed: %08lx\n", GetLastError());
++    if (info)
++    {
++        BYTE *capi;
++
++        ok(info->Version == 0, "got version %lu\n", info->Version);
++        ok(!strcmp(info->Algorithm.pszObjId, "1.2.840.113549.1.1.1"), "got %s\n", info->Algorithm.pszObjId);
++        ok(info->Algorithm.Parameters.cbData == 2 && info->Algorithm.Parameters.pbData[0] == 5, "wrong parameters\n");
++        ok(CryptDecodeObjectEx(X509_ASN_ENCODING, PKCS_RSA_PRIVATE_KEY, info->PrivateKey.pbData, info->PrivateKey.cbData,
++                CRYPT_DECODE_ALLOC_FLAG, NULL, &capi, &decoded_size), "RSA key decode failed: %08lx\n", GetLastError());
++        if (capi) LocalFree(capi);
++        LocalFree(info);
++    }
++
++    /* and it imports back as the same key (the private exponent, the last 128 bytes of a 1024 bit key's blob, may be
++     * another of the equivalent values) */
++    ret = NCryptImportKey(prov, 0, L"PKCS8_PRIVATEKEY", NULL, &key2, plain, plain_size, 0);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    if (!ret)
++    {
++        policy = NCRYPT_ALLOW_EXPORT_FLAG | NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
++        ret = NCryptSetProperty(key2, NCRYPT_EXPORT_POLICY_PROPERTY, (BYTE *)&policy, sizeof(policy), 0);
++        ret = NCryptExportKey(key, 0, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, blob1, sizeof(blob1), &size1, 0);
++        ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++        ret = NCryptExportKey(key2, 0, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, blob2, sizeof(blob2), &size2, 0);
++        ok(ret == ERROR_SUCCESS && size1 == size2 && !memcmp(blob1, blob2, size1 - 128), "got %#lx: not the same key (%lu, %lu, first difference at %lu)\n", ret, size1, size2, first_difference(blob1, blob2, min(size1, size2)));
++        NCryptFreeObject(key2);
++    }
++
++    /* under a secret: PBES2 */
++    buffers[0].cbBuffer = sizeof(secret);
++    buffers[0].BufferType = NCRYPTBUFFER_PKCS_SECRET;
++    buffers[0].pvBuffer = (void *)secret;
++    ret = NCryptExportKey(key, 0, L"PKCS8_PRIVATEKEY", &desc, enc, sizeof(enc), &enc_size, 0);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    ok(enc_size != plain_size && memcmp(enc, plain, min(enc_size, plain_size)), "not encrypted\n");
++    ok(!CryptDecodeObjectEx(X509_ASN_ENCODING, (LPCSTR)44, enc, enc_size, CRYPT_DECODE_ALLOC_FLAG, NULL, &info,
++            &decoded_size), "decoded an encrypted key as plain\n");
++    ok(CryptDecodeObjectEx(X509_ASN_ENCODING, (LPCSTR)45, enc, enc_size, CRYPT_DECODE_ALLOC_FLAG, NULL, &einfo,
++            &decoded_size), "decode failed: %08lx\n", GetLastError());
++    if (einfo)
++    {
++        ok(!strcmp(einfo->EncryptionAlgorithm.pszObjId, "1.2.840.113549.1.5.13"), "got %s\n",
++                einfo->EncryptionAlgorithm.pszObjId);
++        ok(einfo->EncryptedPrivateKey.cbData >= plain_size && !(einfo->EncryptedPrivateKey.cbData % 16),
++                "got %lu bytes\n", einfo->EncryptedPrivateKey.cbData);
++        LocalFree(einfo);
++    }
++
++    ret = NCryptImportKey(prov, 0, L"PKCS8_PRIVATEKEY", NULL, &key2, enc, enc_size, 0);
++    ok(ret == NTE_INVALID_PARAMETER, "without the secret: got %#lx\n", ret);
++    buffers[0].cbBuffer = sizeof(wrong);
++    buffers[0].pvBuffer = (void *)wrong;
++    ret = NCryptImportKey(prov, 0, L"PKCS8_PRIVATEKEY", &desc, &key2, enc, enc_size, 0);
++    ok(ret == NTE_BAD_DATA, "wrong secret: got %#lx\n", ret);
++    buffers[0].cbBuffer = sizeof(secret);
++    buffers[0].pvBuffer = (void *)secret;
++    ret = NCryptImportKey(prov, 0, L"PKCS8_PRIVATEKEY", &desc, &key2, enc, enc_size, 0);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    if (!ret)
++    {
++        policy = NCRYPT_ALLOW_EXPORT_FLAG | NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
++        NCryptSetProperty(key2, NCRYPT_EXPORT_POLICY_PROPERTY, (BYTE *)&policy, sizeof(policy), 0);
++        ret = NCryptExportKey(key2, 0, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, blob2, sizeof(blob2), &size2, 0);
++        ok(ret == ERROR_SUCCESS && size1 == size2 && !memcmp(blob1, blob2, size1 - 128), "got %#lx: not the same key (%lu, %lu, first difference at %lu)\n", ret, size1, size2, first_difference(blob1, blob2, min(size1, size2)));
++        NCryptFreeObject(key2);
++    }
++
++    /* two exports of the same key under the same secret differ (salt and iv) */
++    {
++        BYTE enc2[2048];
++        DWORD enc2_size;
++
++        ret = NCryptExportKey(key, 0, L"PKCS8_PRIVATEKEY", &desc, enc2, sizeof(enc2), &enc2_size, 0);
++        ok(ret == ERROR_SUCCESS && (enc2_size != enc_size || memcmp(enc, enc2, enc_size)), "same encoding twice\n");
++    }
++
++    /* a cipher by object identifier */
++    buffers[1].cbBuffer = sizeof(aes128);
++    buffers[1].BufferType = NCRYPTBUFFER_PKCS_ALG_OID;
++    buffers[1].pvBuffer = (void *)aes128;
++    desc.cBuffers = 2;
++    ret = NCryptExportKey(key, 0, L"PKCS8_PRIVATEKEY", &desc, enc, sizeof(enc), &enc_size, 0);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    ret = NCryptImportKey(prov, 0, L"PKCS8_PRIVATEKEY", &desc, &key2, enc, enc_size, 0);
++    ok(ret == ERROR_SUCCESS, "got %#lx\n", ret);
++    if (!ret) NCryptFreeObject(key2);
++    buffers[1].pvBuffer = (void *)"1.2.3.4";
++    buffers[1].cbBuffer = 8;
++    ret = NCryptExportKey(key, 0, L"PKCS8_PRIVATEKEY", &desc, enc, sizeof(enc), &enc_size, 0);
++    ok(ret == NTE_NOT_SUPPORTED, "got %#lx\n", ret);
++
++    /* a buffer type the blob does not use */
++    desc.cBuffers = 1;
++    buffers[0].BufferType = NCRYPTBUFFER_PKCS_ALG_ID;
++    ret = NCryptExportKey(key, 0, L"PKCS8_PRIVATEKEY", &desc, enc, sizeof(enc), &enc_size, 0);
++    ok(ret == NTE_BAD_FLAGS, "got %#lx\n", ret);
++
++    NCryptFreeObject(key);
++    NCryptFreeObject(prov);
++}
++
+ START_TEST(ncrypt)
+ {
+     test_key_import_rsa();
+@@ -830,4 +994,5 @@ START_TEST(ncrypt)
+     test_NCryptIsAlgSupported();
+     test_NCryptEncrypt();
+     test_NCryptExportKey();
++    test_pkcs8_export();
+ }
