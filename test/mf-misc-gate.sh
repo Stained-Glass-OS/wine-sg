@@ -19,6 +19,7 @@ command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW not installed"; exit 77; 
 command -v xvfb-run >/dev/null || { echo "SKIP: needs xvfb-run"; exit 77; }
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-mfmisc.XXXXXX)
+export WINE_SG_FAKE_CAMERAS=none
 export WINEPREFIX="$T/prefix" WINEDEBUG=err+all,fixme+all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
