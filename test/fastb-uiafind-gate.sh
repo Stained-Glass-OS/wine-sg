@@ -1,6 +1,8 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
 # uiautomationcore (patch 3568): the *WithOptions finders with a traversal order (post order, last to first), compared with the windows. test/fastb-uiafind-probe.c.
+# Also (5917): a captioned window's non-client parts come before its child windows walking last to first.
+# Mutants (5917, uiautomationcore/uia_provider.c): SG_MUTANT_NC_CLIENT_CHILD, SG_MUTANT_NC_PARENT_LINK; SG_MUTANT_NC_CONTROL_TYPE is progman's.
 #
 #   WINE=/opt/wine-sg/bin/wine test/fastb-uiafind-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

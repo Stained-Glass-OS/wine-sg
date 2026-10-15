@@ -248,7 +248,8 @@ check "net share lists (nothing shared here)" "$(has 'There are no entries in th
 run 'net share nosuchshare'
 check "an unknown share is an error" "$(has 'network name cannot be found' && [ "$(rc)" = 2 ]; echo $?)"
 run 'net'
-check "net names helpmsg and share" "$(has 'HELPMSG, SHARE'; echo $?)"
+# (3528 put LOCALGROUP between them in the list: both names, not their neighbourhood)
+check "net names helpmsg and share" "$(has 'HELPMSG, ' && has ' SHARE, '; echo $?)"
 run 'tasklist /fo csv /nh /fi "imagename eq services.exe"'
 check "tasklist csv" "$(has '^"services.exe","[0-9]*"'; echo $?)"
 run 'tasklist /svc /fo csv /fi "imagename eq services.exe"'

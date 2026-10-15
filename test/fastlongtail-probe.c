@@ -282,7 +282,15 @@ int main(void)
         EXPECT(!byname((SOCKET)0x1234, &name, &qos) && WSAGetLastError() == WSAENOTSOCK);
         SetLastError(0xdeadbeef);
         EXPECT(!byname(s, NULL, &qos) && WSAGetLastError() == WSAEFAULT);
-        EXPECT(byname(s, &name, &qos));
+        /* the enumeration with no buffer ({0, NULL} succeeded): replaced at
+         * integration, superseded by 3715 (documented: the enumeration is asked
+         * with buf pointing to an empty string, and a buffer that is not valid
+         * is WSAEFAULT); the enumeration with an empty string still succeeds */
+        {
+            char empty[8] = "";
+            WSABUF list = { sizeof(empty), empty };
+            EXPECT(byname(s, &list, &qos));
+        }
         name.len = 1;
         name.buf = buf;
         EXPECT(!byname(s, &name, &qos));

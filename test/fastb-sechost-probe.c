@@ -44,7 +44,14 @@ static void test_service(void)
     CHECK(!ret && err == ERROR_INSUFFICIENT_BUFFER && need == sizeof(PREF), "size query: %d err %lu need %lu", ret, err, need);
     memset(&out, 0x55, sizeof(out));
     ret = QueryServiceConfig2W(svc, SERVICE_CONFIG_PREFERRED_NODE, (BYTE *)&out, sizeof(out), &need);
-    CHECK(ret && out.fDelete && out.usPreferredNode == 0, "unset: %d node %u delete %u err %lu", ret, out.usPreferredNode, out.fDelete, GetLastError());
+    /* Preferred node, decided at integration (coordinator 2026-10-15): the
+     * SERVICE_PREFERRED_NODE_INFO / ChangeServiceConfig2 / QueryServiceConfig2
+     * pages are silent on (a) the query of an unset node and (b) a node above
+     * the highest NUMA node, so 3214's behaviour is kept for both: an unset node
+     * is ERROR_FILE_NOT_FOUND (3673 expected success with fDelete), and the
+     * node number is stored as given (3673 expected ERROR_INVALID_PARAMETER).
+     * 3673's checks for both were replaced; superseded by 3214. */
+    CHECK(!ret && GetLastError() == ERROR_FILE_NOT_FOUND, "unset: %d err %lu", ret, GetLastError());
 
     info.usPreferredNode = 0; info.fDelete = FALSE;
     ret = ChangeServiceConfig2W(svc, SERVICE_CONFIG_PREFERRED_NODE, &info);
@@ -56,17 +63,14 @@ static void test_service(void)
     ret = QueryServiceConfig2A(svc, SERVICE_CONFIG_PREFERRED_NODE, (BYTE *)&out, sizeof(out), &need);
     CHECK(ret && !out.fDelete && out.usPreferredNode == 0, "ANSI query: %d err %lu", ret, GetLastError());
 
-    info.usPreferredNode = 200; info.fDelete = FALSE;
-    SetLastError(0);
-    ret = ChangeServiceConfig2W(svc, SERVICE_CONFIG_PREFERRED_NODE, &info);
-    CHECK(!ret && GetLastError() == ERROR_INVALID_PARAMETER, "invalid node: %d err %lu", ret, GetLastError());
+    /* "invalid node" (200 refused): removed, superseded by 3214 (see above) */
 
     info.usPreferredNode = 0; info.fDelete = TRUE;
     ret = ChangeServiceConfig2A(svc, SERVICE_CONFIG_PREFERRED_NODE, &info);
     CHECK(ret, "ANSI delete: %lu", GetLastError());
     memset(&out, 0x55, sizeof(out));
     ret = QueryServiceConfig2W(svc, SERVICE_CONFIG_PREFERRED_NODE, (BYTE *)&out, sizeof(out), &need);
-    CHECK(ret && out.fDelete, "after delete: %d delete %u", ret, out.fDelete);
+    CHECK(!ret && GetLastError() == ERROR_FILE_NOT_FOUND, "after delete: unset again: %d err %lu", ret, GetLastError());
 
     DeleteService(svc);
     CloseServiceHandle(svc);

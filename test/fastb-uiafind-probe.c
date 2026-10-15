@@ -186,6 +186,38 @@ int main(void)
         if (req) IUIAutomationCacheRequest_Release(req);
     }
 
+    /* a captioned window: its non-client parts (title bar...) are children after its child
+     * windows; walking last to first goes through the parts and on to the child windows
+     * (5917: a part's parent is the non-client provider), and no part is the window's client */
+    {
+        HWND cap = CreateWindowA("static", "Cap", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 300, 200, 0, 0, 0, 0);
+        IUIAutomationElement *cap_elem = NULL;
+        IUIAutomationElement9 *cap9 = NULL;
+        int k, has_btn = 0;
+
+        CreateWindowA("button", "CapBtn", WS_CHILD | WS_VISIBLE, 5, 5, 60, 20, cap, (HMENU)9, 0, 0);
+        IUIAutomation_ElementFromHandle(uia, (UIA_HWND)cap, &cap_elem);
+        if (cap_elem) IUIAutomationElement_QueryInterface(cap_elem, &IID_IUIAutomationElement9, (void **)&cap9);
+        array = NULL;
+        if (cap9) IUIAutomationElement9_FindAllWithOptions(cap9, TreeScope_Children, cond, TreeTraversalOptions_LastToFirstOrder, NULL, &array);
+        check(array != NULL, "captioned window: children last to first");
+        if (array)
+        {
+            collect(array, &got);
+            show("got", &got);
+            for (k = 0; k < got.n; k++)
+            {
+                if (!wcscmp(got.names[k], L"CapBtn")) has_btn++;
+            }
+            check(got.n > 1 && has_btn == 1 && !wcscmp(got.names[got.n - 1], L"CapBtn"),
+                  "captioned window: the child window comes last, after the non-client parts");
+            IUIAutomationElementArray_Release(array);
+        }
+        if (cap9) IUIAutomationElement9_Release(cap9);
+        if (cap_elem) IUIAutomationElement_Release(cap_elem);
+        DestroyWindow(cap);
+    }
+
     {
         BOOL (WINAPI *get_desc)(BSTR *) = (void *)GetProcAddress(GetModuleHandleA("uiautomationcore.dll"), "UiaGetErrorDescription");
         ICreateErrorInfo *create = NULL;

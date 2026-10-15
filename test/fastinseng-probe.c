@@ -58,13 +58,17 @@ int main(void)
     if (hr == S_OK)
     {
         CHECK(e->lpVtbl->SetBaseUrl(e, "http://example.invalid/") == S_OK, "base url");
-        CHECK(e->lpVtbl->SetBaseUrl(e, NULL) == E_INVALIDARG, "null url");
+        /* "null url" (SetBaseUrl(NULL) is E_INVALIDARG): removed at integration,
+         * superseded by 3650 (kept engine: NULL clears the base URL; undocumented,
+         * same rule as the guess conflicts in integ guess-conflicts.md). */
         CHECK(e->lpVtbl->SetDownloadDir(e, "C:\\dl") == S_OK, "download dir");
         CHECK(e->lpVtbl->SetInstallDrive(e, 'D') == S_OK, "drive");
         CHECK(e->lpVtbl->SetInstallDrive(e, '1') == E_INVALIDARG, "bad drive");
         CHECK(e->lpVtbl->SetInstallOptions(e, 3) == S_OK, "options");
         CHECK(e->lpVtbl->SetHWND(e, NULL) == S_OK, "hwnd");
-        CHECK(e->lpVtbl->SetLocalCif(e, "x.cif") == S_OK, "local cif");
+        /* "local cif" (a missing x.cif is accepted): removed at integration,
+         * superseded by 3650 (kept engine: SetLocalCif loads the CIF, so a missing
+         * file is an error; 3650's gate checks that). */
         CHECK(e->lpVtbl->Suspend(e) == S_OK && e->lpVtbl->Resume(e) == S_OK, "suspend/resume");
         hr = e->lpVtbl->RegisterCallback(e, &cb);
         CHECK(hr == S_OK && cb_ref == 2, "register %08lx ref %ld", hr, cb_ref);

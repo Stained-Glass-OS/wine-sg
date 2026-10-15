@@ -51,11 +51,13 @@ int main(void)
     check(p, 1, L"LDAP://server.example/o=internet/ou=mid/cn=bar", "WINDOWS");
     check(p, 2, L"LDAP://o=internet/ou=mid/cn=bar", "WINDOWS_NO_SERVER");
     check(p, 3, L"o=internet/ou=mid/cn=bar", "WINDOWS_DN");
-    check(p, 4, L"o=internet/ou=mid", "WINDOWS_PARENT");
+    /* WINDOWS_PARENT / X500_PARENT: superseded by 3032 (documented: the
+     * ADS_FORMAT_ENUM parent formats carry the provider and server, like the
+     * other WINDOWS/X500 formats; fastactiveds checks them). 3677's checks of
+     * a bare parent DN were removed at integration. */
     check(p, 5, L"LDAP://server.example/cn=bar,ou=mid,o=internet", "X500");
     check(p, 6, L"LDAP://cn=bar,ou=mid,o=internet", "X500_NO_SERVER");
     check(p, 7, L"cn=bar,ou=mid,o=internet", "X500_DN");
-    check(p, 8, L"ou=mid,o=internet", "X500_PARENT");
     check(p, 9, L"server.example", "SERVER");
     check(p, 10, L"LDAP", "PROVIDER");
     check(p, 11, L"cn=bar", "LEAF");
@@ -64,13 +66,13 @@ int main(void)
     p->v->Set(p, path, 1);
     SysFreeString(path);
     check(p, 3, L"o=internet/cn=a\\,b", "WINDOWS_DN with an escaped comma");
-    check(p, 8, L"o=internet", "X500_PARENT with an escaped comma");
+    /* X500_PARENT with an escaped comma: removed, superseded by 3032 (see above) */
 
     path = SysAllocString(L"LDAP://x/o=internet");
     p->v->Set(p, path, 1);
     SysFreeString(path);
-    check(p, 4, L"", "WINDOWS_PARENT of a single element");
-    check(p, 8, L"", "X500_PARENT of a single element");
+    /* WINDOWS_PARENT / X500_PARENT of a single element: removed, superseded
+     * by 3032 (documented: provider://server/ prefix, see above) */
     check(p, 2, L"LDAP://o=internet", "WINDOWS_NO_SERVER single");
 
     p->v->Release(p);

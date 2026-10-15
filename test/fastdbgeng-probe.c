@@ -48,5 +48,7 @@ int main(void)
     control->lpVtbl->Release(control);
     client->lpVtbl->Release(client);
     printf("%d failure(s)\n", failures);
+    /* the gate looks for the RESULT line (it was never printed: the gate could not pass) */
+    printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
     return failures != 0;
 }

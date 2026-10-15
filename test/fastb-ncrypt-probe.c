@@ -51,7 +51,13 @@ static void try_key(NCRYPT_PROV_HANDLE prov, const WCHAR *alg, const char *label
     free(der);
 
     st = NCryptExportKey(key, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, &desc, NULL, 0, &len2, 0);
-    CHECK(st == NTE_NOT_SUPPORTED, "%s parameters are refused %#lx", label, st);
+    if (!wcscmp(alg, BCRYPT_RSA_ALGORITHM))
+        /* RSA PKCS8 export with parameters: superseded by 5621 at integration
+         * (documented: NCRYPTBUFFER_PKCS_* parameters select the encrypted
+         * PKCS8 form, which 5621 implements for RSA), so it now succeeds. */
+        CHECK(st == 0 && len2 > 0, "%s parameters are accepted (5621) %#lx", label, st);
+    else
+        CHECK(st == NTE_NOT_SUPPORTED, "%s parameters are refused %#lx", label, st);
     st = NCryptExportKey(key, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, NULL, NULL, 0, &len2, 0x80);
     CHECK(st == NTE_BAD_FLAGS, "%s bad flags %#lx", label, st);
 

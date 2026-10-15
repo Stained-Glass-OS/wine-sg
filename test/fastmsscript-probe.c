@@ -149,7 +149,9 @@ int main(void)
         hr = IOleObject_SetExtent(oleobj, DVASPECT_ICON, &size);
         CHECK(hr == DV_E_DVASPECT, "SetExtent(icon) %lx", hr);
         hr = IOleObject_SetMoniker(oleobj, OLEWHICHMK_CONTAINER, NULL);
-        CHECK(hr == E_NOTIMPL, "SetMoniker %lx", hr);
+        /* 3271 (later in fast-a) answers S_OK: the control is not a link source,
+         * so there is nothing to register (this check predated it: E_NOTIMPL) */
+        CHECK(hr == S_OK, "SetMoniker %lx", hr);
         hr = IOleObject_EnumVerbs(oleobj, &verbs);
         if (verbs) IEnumOLEVERB_Release(verbs);
         IOleObject_Release(oleobj);

@@ -111,7 +111,9 @@ static void heap_tests(void)
     SetLastError(0xdeadbeef);
     largest = HeapCompact(heap, 0);
     CHECK(largest >= 20000, "the freed 20000 bytes are the largest free block: %Iu", largest);
-    CHECK(GetLastError() == 0, "no error: %lu", GetLastError());
+    /* "no error" after a successful HeapCompact: removed at integration,
+     * superseded by 5005 (documented: HeapCompact sets the last error only
+     * when it returns 0, "0 with NO_ERROR"; a nonzero answer leaves it). */
     HeapFree(heap, 0, b);
     largest = HeapCompact(heap, 0);
     CHECK(largest >= 30000, "freed neighbours are one block: %Iu", largest);

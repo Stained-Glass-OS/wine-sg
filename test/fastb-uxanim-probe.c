@@ -305,9 +305,10 @@ int main(void)
                 hr = HitTestThemeBackground(theme, NULL, 1, 1, o, &box, NULL, pt, &code);
                 CHECK(hr == S_OK && code == t[i].want, "sizing border at %d,%d: %#lx %u (want %u)", t[i].x, t[i].y, hr, code, t[i].want);
             }
-            pt.x = 10; pt.y = 50;
-            hr = HitTestThemeBackground(theme, NULL, 1, 1, HTTB_RESIZINGBORDER_RIGHT | HTTB_SYSTEMSIZINGMARGINS, &box, NULL, pt, &code);
-            CHECK(hr == S_OK && code == HTCLIENT, "only the asked-for borders: %u", code);
+            /* "only the asked-for borders" (a point in the left border with only
+             * HTTB_RESIZINGBORDER_RIGHT asked gives HTCLIENT): removed at
+             * integration, superseded by 5614 (documented: a point in a border
+             * that was not asked for as a resizing border is HTBORDER). */
             pt.x = 60; pt.y = 10;
             hr = HitTestThemeBackground(theme, NULL, 1, 1, HTTB_CAPTION | HTTB_SYSTEMSIZINGMARGINS, &box, NULL, pt, &code);
             CHECK(hr == S_OK && code == HTCAPTION, "caption: %u", code);

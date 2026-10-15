@@ -26,6 +26,15 @@ run() {
     timeout -s KILL 180 env DISPLAY= "$WINE" cmd /c 'c:\a.bat' 2>&1 </dev/null | tr -d '\r' > "$T/o"
 }
 me=$(id -un)
+# Environment, not a defect (coordinator 2026-10-15): when the host has an
+# sgwine group that does not list the running user, DECISIONS item 7 (3180,
+# sg-admind) makes that user none of the computer's users, so "Users has $me"
+# and the group memberships cannot hold. The membership checks are skipped and
+# the gate ends with SKIP (77) unless something else failed.
+ENVSKIP=0
+if g=$(getent group sgwine); then
+    case ",$(echo "$g" | cut -d: -f4)," in *",$me,"*) ;; *) ENVSKIP=1 ;; esac
+fi
 
 echo "== tasklist /m"
 run 'tasklist /m ntdll*'
@@ -48,7 +57,9 @@ check "unknown user" "$(grep -q 'could not be found' "$T/o"; echo $?)"
 run 'net localgroup'
 check "groups listed" "$(grep -q '^\*Administrators' "$T/o" && grep -q '^\*Users' "$T/o"; echo $?)"
 run 'net localgroup Users'
+if [ $ENVSKIP = 1 ]; then echo "      SKIP  Users has $me (host sgwine group without $me)"; else
 check "Users has $me" "$(grep -q "^$me\$" "$T/o"; echo $?)"
+fi
 run 'net localgroup nosuchgroup'
 check "unknown group" "$(grep -q 'does not exist' "$T/o"; echo $?)"
 
@@ -98,10 +109,13 @@ echo "== tasklist /fi modules, NetUserGetLocalGroups"
 run 'tasklist /fi "modules eq shell32.dll" /nh /fo csv'
 check "processes with shell32" "$(grep -q '^"cmd.exe"' "$T/o"; echo $?)"
 run "net user $me"
+if [ $ENVSKIP = 1 ]; then echo "      SKIP  net user shows local group memberships (host sgwine group without $me)"; else
 check "net user shows local group memberships" "$(grep -q 'Local Group Memberships .*\*Users' "$T/o"; echo $?)"
+fi
 echo "== robocopy /maxage /minage"
 run 'mkdir c:\rs & echo a> c:\rs\new.txt & echo b> c:\rs\old.txt & robocopy c:\rs c:\rd /maxage:1800 /njh /njs /ndl & dir /b c:\rd'
 check "files younger than the limit are copied" "$(grep -q '^new.txt' "$T/o"; echo $?)"
 run 'robocopy c:\rs c:\rd2 /minage:1800 /njh /njs /ndl & dir /b c:\rd2'
 check "nothing is old enough" "$(! grep -q 'new.txt' "$T/o"; echo $?)"
+[ $RC = 0 ] && [ $ENVSKIP = 1 ] && { echo "SKIP: host sgwine group without $me (environment, see above)"; exit 77; }
 exit $RC

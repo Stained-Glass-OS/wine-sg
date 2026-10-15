@@ -57,5 +57,7 @@ int main(void)
     CHECK(pHtmlHelpA(NULL, "C:\\no\\such\\file.chm", HH_KEYWORD_LOOKUP, (DWORD_PTR)&link) == NULL);
 
     printf("%d failure(s)\n", failures);
+    /* the gate looks for the RESULT line (it was never printed: the gate could not pass) */
+    printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
     return failures != 0;
 }

@@ -871,8 +871,11 @@ int main(void)
     g_mock.supported = ~0u;
     hr = IUIAutomationElement_GetCurrentPattern(element, UIA_InvokePatternId, NULL);
     check(hr == E_POINTER, "no pointer = %#lx", hr);
+    /* 5800 (integ-2026-10) gave every pattern its client object, Selection too
+     * (this checked that it had none yet: E_NOTIMPL) */
     unk = pattern(UIA_SelectionPatternId, &hr);
-    check(hr == E_NOTIMPL, "Selection has no client object yet = %#lx", hr);
+    check(hr == S_OK && unk, "Selection has a client object = %#lx", hr);
+    if (unk) IUnknown_Release(unk);
     g_mock.supported = PAT(UIA_InvokePatternId) | PAT(UIA_ExpandCollapsePatternId) | PAT(UIA_TogglePatternId)
             | PAT(UIA_ValuePatternId) | PAT(UIA_RangeValuePatternId) | PAT(UIA_SelectionItemPatternId)
             | PAT(UIA_ScrollItemPatternId) | PAT(UIA_ScrollPatternId) | PAT(UIA_DockPatternId) | PAT(UIA_TransformPatternId)

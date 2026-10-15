@@ -312,7 +312,9 @@ static void test_all(void)
         SERVICE_FAILURE_ACTIONSA fa = { 60, (LPSTR)"reboot msg", (LPSTR)"cmd.exe /c x", 2, acts };
         SERVICE_RPC_REQUIRED_PRIVILEGES_INFO pi = { sizeof(privs), (BYTE *)privs };
         SERVICE_DELAYED_AUTO_START_INFO da = { 1 };
-        SERVICE_PREFERRED_NODE_INFO pn = { 3, 0 };
+        /* node 0: every machine has it (node 3 does not exist on most test
+         * machines; the node is stored as given, see fastb-sechost) */
+        SERVICE_PREFERRED_NODE_INFO pn = { 0, 0 };
         BYTE q[512];
         struct { USHORT size; char text[1]; } *d = (void *)q;
         struct service_failure_actions *f = (void *)q;
@@ -373,7 +375,7 @@ static void test_all(void)
         ERR(err, 0);
         err = svcctl_QueryServiceConfig2A(svc, SERVICE_CONFIG_PREFERRED_NODE, q, sizeof(q), &needed);
         ERR(err, 0);
-        OK(needed == sizeof(SERVICE_PREFERRED_NODE_INFO) && ((SERVICE_PREFERRED_NODE_INFO *)q)->usPreferredNode == 3 &&
+        OK(needed == sizeof(SERVICE_PREFERRED_NODE_INFO) && ((SERVICE_PREFERRED_NODE_INFO *)q)->usPreferredNode == 0 &&
            !((SERVICE_PREFERRED_NODE_INFO *)q)->fDelete, "preferred node %u", ((SERVICE_PREFERRED_NODE_INFO *)q)->usPreferredNode);
         err = svcctl_QueryServiceConfig2W(svc, SERVICE_CONFIG_PREFERRED_NODE, q, 2, &needed);
         ERR(err, ERROR_INSUFFICIENT_BUFFER);

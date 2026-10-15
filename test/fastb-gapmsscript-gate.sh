@@ -1,6 +1,7 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
 # msscript.ocx events, connection points, OLE object (patches 3658): runs msscript.ocx_test.exe from the build tree
+# Three return-code checks of 3658 (GetMoniker/EnumVerbs/DoVerb) are superseded by 3271 (documented codes): removed in 5916.
 #
 #   WINE=/path/to/build/wine test/fastb-gapmsscript-gate.sh      (needs dlls/msscript.ocx/tests built beside it)
 #   SG_XVFB_N=260 to name the display

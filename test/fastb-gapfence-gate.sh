@@ -29,7 +29,10 @@ XN=${SG_XVFB_N:+-n $SG_XVFB_N}
 [ -n "$XN" ] || XN=-a
 timeout -s KILL 1600 xvfb-run $XN -s '-screen 0 1024x768x24' "$T/run.sh"
 cat "$T/out"
-if grep "Test failed" "$T/out" | grep -Evq 'd3d11.c:(20691|28875|28929|28938|6263|6285):'; then exit 1; fi
+# The known stock failures (llvmpipe) by line: 3629 removed two todo blocks of 6 lines before them,
+# so with 3629 applied (integ-2026-10) they are 6 lines earlier; both sets are listed. The failure set is
+# the same as origin/main's d3d11 run (compared at integration).
+if grep "Test failed" "$T/out" | grep -Evq 'd3d11.c:(20691|28875|28929|28938|20685|28869|28923|28932|6263|6285):'; then exit 1; fi
 grep -q "tests executed" "$T/out" || exit 1
 echo "RESULT: PASS"
 exit 0

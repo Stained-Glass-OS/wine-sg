@@ -16,20 +16,15 @@ int main(void)
     DWORD value = 77, len = sizeof(value);
     DNS_STATUS st;
 
-    st = DnsQueryConfig(DnsConfigPrimaryHostNameRegistrationEnabled, 0, NULL, NULL, &value, &len);
-    check(st == ERROR_SUCCESS && len == sizeof(DWORD) && value == 0, "primary host name registration is off");
-    value = 77; len = sizeof(value);
-    st = DnsQueryConfig(DnsConfigAdapterHostNameRegistrationEnabled, 0, NULL, NULL, &value, &len);
-    check(st == ERROR_SUCCESS && value == 0, "adapter host name registration is off");
-    value = 77; len = sizeof(value);
+    /* "host name registration is off" (primary and adapter): removed at
+     * integration, superseded by 3284 (documented: the registration values
+     * come from the TCP/IP parameters, Windows default on). */
     st = DnsQueryConfig(DnsConfigAddressRegistrationMaxCount, 0, NULL, NULL, &value, &len);
     check(st == ERROR_SUCCESS && value == 1, "one address registered at most");
-    len = 0;
-    st = DnsQueryConfig(DnsConfigAddressRegistrationMaxCount, 0, NULL, NULL, &value, &len);
-    check(st == ERROR_MORE_DATA && len == sizeof(DWORD), "a too small buffer asks for four bytes");
-    len = 0;
-    st = DnsQueryConfig(DnsConfigAddressRegistrationMaxCount, 0, NULL, NULL, NULL, &len);
-    check(st == ERROR_SUCCESS && len == sizeof(DWORD), "no buffer reports the size");
+    /* "a too small buffer asks for four bytes" (ERROR_MORE_DATA) and "no
+     * buffer reports the size" (ERROR_SUCCESS): removed at integration,
+     * superseded by 3276 (documented: ERROR_INSUFFICIENT_BUFFER, as every
+     * other DnsQueryConfig type in Wine and Wine's dnsapi tests). */
     printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
     return failures != 0;
 }
