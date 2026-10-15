@@ -1,0 +1,828 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 12:00:00 +0000
+Subject: [PATCH] rpcrt4: RpcMgmtSetCancelTimeout, and the timeout of cancelled calls (3313)
+
+CORE review: RPC (DECISIONS-2 RPC-NDR).
+
+RpcMgmtSetCancelTimeout was a stub and RpcCancelThread/RpcCancelThreadEx
+always abandoned the call at once. Now the cancel timeout is per thread (the
+default is to wait for ever): a cancel with no time abandons the call, any
+other tells the server (PKT_CO_CANCEL, which RpcServerTestCancel sees) and the
+call ends with the server's answer, or fails when the time is over -
+RPC_S_CALL_CANCELLED after RpcCancelThreadEx, RPC_S_CALL_FAILED after
+RpcCancelThread. RpcAsyncCancelCall(FALSE) applies the timeout of the calling
+thread to the asynchronous call the same way.
+---
+
+diff --git a/dlls/rpcrt4/rpcrt4_main.c b/dlls/rpcrt4/rpcrt4_main.c
+--- a/dlls/rpcrt4/rpcrt4_main.c
++++ b/dlls/rpcrt4/rpcrt4_main.c
+@@ -52,6 +52,7 @@
+ 
+ #include "rpc_binding.h"
+ #include "rpc_server.h"
++#include "rpc_message.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -93,6 +94,12 @@
+     RpcConnection *connection;
+     RpcBinding *server_binding;
+     struct context_handle_list *context_handle_list;
++    /* seconds to wait for a server to answer a cancelled call: RpcMgmtSetCancelTimeout */
++    LONG cancel_timeout;
++    /* the status the call being received ends with when it was cancelled by a timeout, or 0 */
++    LONG cancel_status;
++    /* changes with every call, for a timer to cancel the call it was started for */
++    ULONG call_serial;
+ };
+ 
+ struct interface_header
+@@ -933,15 +940,30 @@
+     return RPC_S_ENTRY_NOT_FOUND;
+ }
+ 
++static struct threaddata *get_or_create_threaddata(void);
++
+ /******************************************************************************
+  * RpcMgmtSetCancelTimeout   (rpcrt4.@)
+  */
+ RPC_STATUS RPC_ENTRY RpcMgmtSetCancelTimeout(LONG Timeout)
+ {
+-    FIXME("(%ld): stub\n", Timeout);
++    struct threaddata *tdata = get_or_create_threaddata();
++
++    TRACE("(%ld)\n", Timeout);
++
++    if (!tdata) return RPC_S_OUT_OF_MEMORY;
++    /* the calls this thread makes from now on; anything negative waits for ever */
++    tdata->cancel_timeout = Timeout < 0 ? RPC_C_CANCEL_INFINITE_TIMEOUT : Timeout;
+     return RPC_S_OK;
+ }
+ 
++/* the cancel timeout of the calling thread */
++LONG RPCRT4_GetThreadCancelTimeout(void)
++{
++    struct threaddata *tdata = get_or_create_threaddata();
++    return tdata ? tdata->cancel_timeout : RPC_C_CANCEL_INFINITE_TIMEOUT;
++}
++
+ static struct threaddata *get_or_create_threaddata(void)
+ {
+     struct threaddata *tdata = NtCurrentTeb()->ReservedForNtRpc;
+@@ -953,6 +975,11 @@
+         InitializeCriticalSectionEx(&tdata->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+         tdata->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": threaddata.cs");
+         tdata->thread_id = GetCurrentThreadId();
++#ifdef SG_MUTANT_CANCELTO_DEFAULT0
++        tdata->cancel_timeout = 0;
++#else
++        tdata->cancel_timeout = RPC_C_CANCEL_INFINITE_TIMEOUT;
++#endif
+ 
+         EnterCriticalSection(&threaddata_cs);
+         list_add_tail(&threaddata_list, &tdata->entry);
+@@ -971,9 +998,28 @@
+ 
+     EnterCriticalSection(&tdata->cs);
+     tdata->connection = Connection;
++    if (Connection)
++    {
++        tdata->call_serial++;
++        tdata->cancel_status = 0;
++    }
+     LeaveCriticalSection(&tdata->cs);
+ }
+ 
++/* the status a cancelled call ends with (0 if it was not cancelled by the thread's timeout) */
++LONG RPCRT4_TakeThreadCancelStatus(void)
++{
++    struct threaddata *tdata = get_or_create_threaddata();
++    LONG status;
++
++    if (!tdata) return 0;
++    EnterCriticalSection(&tdata->cs);
++    status = tdata->cancel_status;
++    tdata->cancel_status = 0;
++    LeaveCriticalSection(&tdata->cs);
++    return status;
++}
++
+ void RPCRT4_SetThreadCurrentCallHandle(RpcBinding *Binding)
+ {
+     struct threaddata *tdata = get_or_create_threaddata();
+@@ -1043,7 +1089,42 @@
+     return context_handle;
+ }
+ 
+-static RPC_STATUS rpc_cancel_thread(DWORD target_tid)
++struct cancel_timer
++{
++    DWORD thread_id;
++    ULONG serial;
++    LONG status;
++};
++
++/* the time to wait for the server is over: the call the timer was started for ends */
++static void CALLBACK cancel_timer_proc(PTP_CALLBACK_INSTANCE instance, void *arg, PTP_TIMER pool_timer)
++{
++    struct cancel_timer *timer = arg;
++    struct threaddata *tdata;
++
++    EnterCriticalSection(&threaddata_cs);
++    LIST_FOR_EACH_ENTRY(tdata, &threaddata_list, struct threaddata, entry)
++        if (tdata->thread_id == timer->thread_id)
++        {
++            EnterCriticalSection(&tdata->cs);
++            if (tdata->connection && tdata->call_serial == timer->serial)
++            {
++                tdata->cancel_status = timer->status;
++                rpcrt4_conn_cancel_call(tdata->connection);
++            }
++            LeaveCriticalSection(&tdata->cs);
++            break;
++        }
++    LeaveCriticalSection(&threaddata_cs);
++    free(timer);
++    CloseThreadpoolTimer(pool_timer);
++}
++
++/* Cancels the call a thread is waiting for.  With a timeout of 0 the call is abandoned now.
++ * Otherwise the server is told about the cancel and the call goes on until the server answers,
++ * or for as many seconds as the timeout says (or for ever): then it is abandoned and fails with
++ * status.  timeout is the one of the target thread (RpcMgmtSetCancelTimeout) when use_thread is set. */
++static RPC_STATUS rpc_cancel_thread(DWORD target_tid, LONG timeout, BOOL use_thread, LONG status)
+ {
+     struct threaddata *tdata;
+ 
+@@ -1052,7 +1133,48 @@
+         if (tdata->thread_id == target_tid)
+         {
+             EnterCriticalSection(&tdata->cs);
+-            if (tdata->connection) rpcrt4_conn_cancel_call(tdata->connection);
++            if (use_thread) timeout = tdata->cancel_timeout;
++            if (tdata->connection)
++            {
++#ifdef SG_MUTANT_CANCELTO_ALWAYSNOW
++                timeout = 0;
++#endif
++                if (!timeout)
++                {
++                    tdata->cancel_status = RPC_S_CALL_CANCELLED;
++                    rpcrt4_conn_cancel_call(tdata->connection);
++                }
++                else
++                {
++#ifndef SG_MUTANT_CANCELTO_NOPDU
++                    RPCRT4_SendCancel(tdata->connection);
++#endif
++                    if (timeout > 0)
++                    {
++                        struct cancel_timer *timer = malloc(sizeof(*timer));
++                        PTP_TIMER pool_timer;
++                        FILETIME due;
++                        LONGLONG ticks = -(LONGLONG)min(timeout, 4000000) * 1000 * 10000;
++
++#ifdef SG_MUTANT_CANCELTO_NOTIMER
++                        free(timer); timer = NULL;
++#endif
++                        if (timer)
++                        {
++                            timer->thread_id = target_tid;
++                            timer->serial = tdata->call_serial;
++                            timer->status = status;
++                            if ((pool_timer = CreateThreadpoolTimer(cancel_timer_proc, timer, NULL)))
++                            {
++                                due.dwLowDateTime = (DWORD)ticks;
++                                due.dwHighDateTime = (DWORD)(ticks >> 32);
++                                SetThreadpoolTimer(pool_timer, &due, 0, 0);
++                            }
++                            else free(timer);
++                        }
++                    }
++                }
++            }
+             LeaveCriticalSection(&tdata->cs);
+             break;
+         }
+@@ -1066,8 +1188,14 @@
+  */
+ RPC_STATUS RPC_ENTRY RpcCancelThread(void* ThreadHandle)
+ {
++    DWORD target_tid;
++
+     TRACE("(%p)\n", ThreadHandle);
+-    return RpcCancelThreadEx(ThreadHandle, 0);
++
++    target_tid = GetThreadId(ThreadHandle);
++    if (!target_tid) return RPC_S_INVALID_ARG;
++    /* the target thread's own timeout; if the server does not answer in time the call fails */
++    return rpc_cancel_thread(target_tid, 0, TRUE, RPC_S_CALL_FAILED);
+ }
+ 
+ /******************************************************************************
+@@ -1077,17 +1205,12 @@
+ {
+     DWORD target_tid;
+ 
+-    FIXME("(%p, %ld)\n", ThreadHandle, Timeout);
++    TRACE("(%p, %ld)\n", ThreadHandle, Timeout);
+ 
+     target_tid = GetThreadId(ThreadHandle);
+     if (!target_tid)
+         return RPC_S_INVALID_ARG;
+ 
+-    if (Timeout)
+-    {
+-        FIXME("(%p, %ld)\n", ThreadHandle, Timeout);
+-        return RPC_S_OK;
+-    }
+-    else
+-        return rpc_cancel_thread(target_tid);
++    return rpc_cancel_thread(target_tid, Timeout < 0 ? RPC_C_CANCEL_INFINITE_TIMEOUT : Timeout, FALSE,
++                             RPC_S_CALL_CANCELLED);
+ }
+diff --git a/dlls/rpcrt4/rpc_async.c b/dlls/rpcrt4/rpc_async.c
+--- a/dlls/rpcrt4/rpc_async.c
++++ b/dlls/rpcrt4/rpc_async.c
+@@ -29,6 +29,7 @@
+ #include "rpcasync.h"
+ 
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ #include "rpc_binding.h"
+ #include "rpc_message.h"
+@@ -169,6 +170,77 @@
+     return I_RpcAsyncAbortCall(pAsync, ExceptionCode);
+ }
+ 
++/* the calls whose cancel timeout is running: ended when the time is over unless they complete first */
++struct async_cancel
++{
++    struct list entry;
++    ULONG64 id;
++    struct async_call_data *data;
++    RpcConnection *conn;
++};
++
++static CRITICAL_SECTION async_cancel_cs;
++static CRITICAL_SECTION_DEBUG async_cancel_cs_debug =
++{
++    0, 0, &async_cancel_cs,
++    { &async_cancel_cs_debug.ProcessLocksList, &async_cancel_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": async_cancel_cs") }
++};
++static CRITICAL_SECTION async_cancel_cs = { &async_cancel_cs_debug, -1, 0, 0, 0, 0 };
++static struct list async_cancels = LIST_INIT(async_cancels);
++static ULONG64 async_cancel_next_id;
++
++/* abandons the call: the thread waiting for the response gives up and the notification is sent; it
++ * may be about to start waiting, when there is nothing to cancel yet: try again for a while */
++static void async_abandon_call(struct async_call_data *data, RpcConnection *conn)
++{
++    int i;
++
++    InterlockedExchange(&data->cancelled, 1);
++    for (i = 0; i < 100 && data->call_status == RPC_S_ASYNC_CALL_PENDING; i++)
++    {
++#ifndef SG_MUTANT_ASYNCRPC_NOCANCELIO
++        rpcrt4_conn_cancel_call(conn);
++#endif
++        Sleep(10);
++    }
++}
++
++static void CALLBACK async_cancel_timer_proc(PTP_CALLBACK_INSTANCE instance, void *arg, PTP_TIMER pool_timer)
++{
++    ULONG64 id = (ULONG_PTR)arg;
++    struct async_cancel *cancel;
++
++    EnterCriticalSection(&async_cancel_cs);
++    LIST_FOR_EACH_ENTRY(cancel, &async_cancels, struct async_cancel, entry)
++        if (cancel->id == id)
++        {
++            /* the call is still there, as it is in the list */
++            list_remove(&cancel->entry);
++            if (cancel->data->call_status == RPC_S_ASYNC_CALL_PENDING)
++                async_abandon_call(cancel->data, cancel->conn);
++            free(cancel);
++            break;
++        }
++    LeaveCriticalSection(&async_cancel_cs);
++    CloseThreadpoolTimer(pool_timer);
++}
++
++/* the call ends: no timer may touch it any more */
++void RPCRT4_ForgetAsyncCancels(struct async_call_data *data)
++{
++    struct async_cancel *cancel, *next;
++
++    EnterCriticalSection(&async_cancel_cs);
++    LIST_FOR_EACH_ENTRY_SAFE(cancel, next, &async_cancels, struct async_cancel, entry)
++        if (cancel->data == data)
++        {
++            list_remove(&cancel->entry);
++            free(cancel);
++        }
++    LeaveCriticalSection(&async_cancel_cs);
++}
++
+ /***********************************************************************
+  *           RpcAsyncCancelCall [RPCRT4.@]
+  *
+@@ -189,6 +261,8 @@
+ {
+     struct async_call_data *data;
+     RpcConnection *conn;
++    RPC_STATUS status;
++    LONG timeout;
+ 
+     TRACE("(%p, %s)\n", pAsync, fAbortCall ? "TRUE" : "FALSE");
+ 
+@@ -203,20 +277,52 @@
+ 
+     if (fAbortCall)
+     {
+-        int i;
++        async_abandon_call(data, conn);
++        return RPC_S_OK;
++    }
+ 
+-        InterlockedExchange(&data->cancelled, 1);
+-        /* the thread waiting for the response gives up, and the notification is sent; it may be
+-         * about to start waiting, when there is nothing to cancel yet: try again for a while */
+-        for (i = 0; i < 100 && data->call_status == RPC_S_ASYNC_CALL_PENDING; i++)
+-        {
+-#ifndef SG_MUTANT_ASYNCRPC_NOCANCELIO
+-            rpcrt4_conn_cancel_call(conn);
++    status = RPCRT4_SendCancel(conn);
++    if (status) return status;
++
++    /* the server has the time of RpcMgmtSetCancelTimeout (of this thread) to answer: none, and the
++     * call is abandoned now, a limit, and it is when the time is over, none, and it goes on */
++    timeout = RPCRT4_GetThreadCancelTimeout();
++#ifdef SG_MUTANT_CANCELTO_ASYNCINFINITE
++    timeout = RPC_C_CANCEL_INFINITE_TIMEOUT;
++#endif
++    if (!timeout) async_abandon_call(data, conn);
++    else if (timeout > 0)
++    {
++        struct async_cancel *cancel = malloc(sizeof(*cancel));
++        PTP_TIMER pool_timer;
++        FILETIME due;
++        LONGLONG ticks = -(LONGLONG)min(timeout, 4000000) * 1000 * 10000;
++
++        if (!cancel) return RPC_S_OUT_OF_MEMORY;
++        cancel->data = data;
++        cancel->conn = conn;
++        EnterCriticalSection(&async_cancel_cs);
++        cancel->id = ++async_cancel_next_id;
++        list_add_tail(&async_cancels, &cancel->entry);
++        LeaveCriticalSection(&async_cancel_cs);
++#ifdef SG_MUTANT_CANCELTO_NOASYNCTIMER
++        if (0)
++#else
++        if ((pool_timer = CreateThreadpoolTimer(async_cancel_timer_proc, (void *)(ULONG_PTR)cancel->id, NULL)))
+ #endif
+-            Sleep(10);
++        {
++            due.dwLowDateTime = (DWORD)ticks;
++            due.dwHighDateTime = (DWORD)(ticks >> 32);
++            SetThreadpoolTimer(pool_timer, &due, 0, 0);
++        }
++        else
++        {
++            EnterCriticalSection(&async_cancel_cs);
++            list_remove(&cancel->entry);
++            LeaveCriticalSection(&async_cancel_cs);
++            free(cancel);
++            return RPC_S_OUT_OF_RESOURCES;
+         }
+-        return RPC_S_OK;
+     }
+-
+-    return RPCRT4_SendCancel(conn);
++    return RPC_S_OK;
+ }
+diff --git a/dlls/rpcrt4/rpc_binding.h b/dlls/rpcrt4/rpc_binding.h
+--- a/dlls/rpcrt4/rpc_binding.h
++++ b/dlls/rpcrt4/rpc_binding.h
+@@ -265,6 +265,8 @@
+ RPC_STATUS RpcTransport_ParseTopOfTower(const unsigned char *tower_data, size_t tower_size, char **protseq, char **networkaddr, char **endpoint);
+ 
+ void RPCRT4_SetThreadCurrentConnection(RpcConnection *Connection);
++LONG RPCRT4_TakeThreadCancelStatus(void);
++LONG RPCRT4_GetThreadCancelTimeout(void);
+ void RPCRT4_SetThreadCurrentCallHandle(RpcBinding *Binding);
+ RpcBinding *RPCRT4_GetThreadCurrentCallHandle(void);
+ void RPCRT4_PushThreadContextHandle(NDR_SCONTEXT SContext);
+diff --git a/dlls/rpcrt4/rpc_message.c b/dlls/rpcrt4/rpc_message.c
+--- a/dlls/rpcrt4/rpc_message.c
++++ b/dlls/rpcrt4/rpc_message.c
+@@ -1616,6 +1616,14 @@
+ 
+ fail:
+   RPCRT4_SetThreadCurrentConnection(NULL);
++  if (status != RPC_S_OK)
++  {
++    /* the call was abandoned because the server did not answer a cancel in time */
++    LONG cancelled = RPCRT4_TakeThreadCancelStatus();
++#ifndef SG_MUTANT_CANCELTO_NOSTATUS
++    if (cancelled) status = cancelled;
++#endif
++  }
+   if (CurrentHeader != *Header)
+     free(CurrentHeader);
+   if (status != RPC_S_OK) {
+diff --git a/dlls/rpcrt4/ndr_stubless.c b/dlls/rpcrt4/ndr_stubless.c
+--- a/dlls/rpcrt4/ndr_stubless.c
++++ b/dlls/rpcrt4/ndr_stubless.c
+@@ -1867,6 +1867,7 @@
+     client_free_handle(pStubMsg, pProcHeader, async_call_data->pHandleFormat, async_call_data->hBinding);
+ 
+     I_RpcFree(pStubMsg->StackTop);
++    RPCRT4_ForgetAsyncCancels(async_call_data);
+     I_RpcFree(async_call_data);
+ 
+     TRACE("-- 0x%lx\n", status);
+diff --git a/dlls/rpcrt4/ndr_stubless.h b/dlls/rpcrt4/ndr_stubless.h
+--- a/dlls/rpcrt4/ndr_stubless.h
++++ b/dlls/rpcrt4/ndr_stubless.h
+@@ -281,3 +281,4 @@
+ RPC_STATUS NdrpCompleteAsyncClientCall(RPC_ASYNC_STATE *pAsync, void *Reply);
+ RPC_STATUS NdrpCompleteAsyncServerCall(RPC_ASYNC_STATE *pAsync, void *Reply);
+ void NdrpFreeAsyncServerCall(RPC_ASYNC_STATE *pAsync, BOOL free_params);
++void RPCRT4_ForgetAsyncCancels(struct async_call_data *data);
+diff --git a/test/rpcrt4-canceltimeout-gate.sh b/test/rpcrt4-canceltimeout-gate.sh
+new file mode 100644
+--- /dev/null
++++ b/test/rpcrt4-canceltimeout-gate.sh
+@@ -0,0 +1,67 @@
++#!/bin/sh
++. "$(dirname "$0")/scratch-home.sh"
++# CORE rpcrt4: the cancel timeout: RpcMgmtSetCancelTimeout, RpcCancelThread(Ex), RpcAsyncCancelCall, widl-generated stubs in two processes
++# over ncalrpc and ncacn_ip_tcp on 127.0.0.1, 64+32 bit.
++#
++#   WINE=/path/to/build/wine test/rpcrt4-canceltimeout-gate.sh   (WINESERVER=..., WIDL=... when not beside $WINE)
++# Mutants: CANCELTO_* (see patches/notes/3313.txt).  SG_QUICK=1: 64-bit only.
++set -u
++HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
++WINE="${WINE:-/opt/wine-sg/bin/wine}"
++WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
++[ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
++[ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
++WIDL="${WIDL:-$(dirname "$WINE")/tools/widl/widl}"
++[ -x "$WIDL" ] || WIDL="$(dirname "$WINE")/widl"
++[ -x "$WIDL" ] || { echo "SKIP: no widl"; exit 77; }
++"$WIDL" --help 2>&1 | grep -q . || exit 77
++for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
++    command -v $cc >/dev/null || { echo "SKIP: $cc not installed"; exit 77; }
++done
++RC=0
++T=$(mktemp -d /var/tmp/sg-rpcrt4-cant.XXXXXX)
++export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
++SRV=""
++cleanup() { [ -n "$SRV" ] && kill "$SRV" 2>/dev/null; "$WINESERVER" -k 2>/dev/null; rm -rf "$T" "${SG_GATE_HOME:-$T}"; }
++trap cleanup EXIT INT TERM
++for a in x86_64 i686; do
++    case $a in x86_64) m=--win64; ;; *) m=--win32; esac
++    mkdir -p "$T/$a"
++    cp "$HERE/rpcrt4-canceltimeout.idl" "$T/$a/"
++    (cd "$T/$a" && "$WIDL" $m -Oif --prefix-server=s_ -h -H rpcrt4-canceltimeout.h -o /dev/null rpcrt4-canceltimeout.idl \
++        && "$WIDL" $m -Oif --prefix-server=s_ -c -o rpcrt4-canceltimeout_c.c rpcrt4-canceltimeout.idl \
++        && "$WIDL" $m -Oif --prefix-server=s_ -s -o rpcrt4-canceltimeout_s.c rpcrt4-canceltimeout.idl) \
++        || { echo "FAIL  widl did not run ($a)"; exit 1; }
++    TMPDIR=/var/tmp $a-w64-mingw32-gcc -O1 -I"$T/$a" -o "$T/probe-$a.exe" "$HERE/rpcrt4-canceltimeout-probe.c" \
++        "$T/$a/rpcrt4-canceltimeout_c.c" "$T/$a/rpcrt4-canceltimeout_s.c" -lrpcrt4 \
++        || { echo "FAIL  probe did not build ($a)"; exit 1; }
++done
++mkdir -p "$WINEPREFIX"
++timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
++"$WINESERVER" -w
++ARCHES="x86_64 i686"; [ "${SG_QUICK:-}" = 1 ] && ARCHES=x86_64
++for a in $ARCHES; do
++    for t in "ncalrpc sg_cant_ep" "ncacn_ip_tcp 49189"; do
++        for pair in "server client"; do
++            set -- $pair
++            echo "== $a $t: $1 / $2"
++            : > "$T/server.out"
++            (cd "$T" && exec timeout -s KILL 240 env DISPLAY= "$WINE" "$T/probe-$a.exe" $1 $t >"$T/server.out" 2>&1 </dev/null) &
++            SRV=$!
++            n=0
++            until grep -q READY "$T/server.out" 2>/dev/null || [ $n -ge 60 ]; do sleep 1; n=$((n + 1)); done
++            grep -q READY "$T/server.out" || { echo "FAIL  the server did not start"; cat "$T/server.out"; RC=1; kill $SRV 2>/dev/null; SRV=""; continue; }
++            arg=$t
++            out=$(cd "$T" && timeout -s KILL 300 env DISPLAY= "$WINE" "$T/probe-$a.exe" $2 $arg 2>/dev/null </dev/null | tr -d '\r')
++            printf '%s\n' "$out" | grep -v '^PASS' | sed 's/^/      /'
++            printf '%s\n' "$out" | grep -c '^PASS' | sed 's/^/      passed: /'
++            printf '%s\n' "$out" | grep -qx 'RESULT: PASS' || { RC=1; grep '^server:' "$T/server.out" | head -20 | sed 's/^/      /'; }
++            n=0
++            while kill -0 $SRV 2>/dev/null && [ $n -lt 10 ]; do sleep 1; n=$((n + 1)); done
++            kill $SRV 2>/dev/null; SRV=""
++            "$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null
++        done
++    done
++done
++[ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
++exit "$RC"
+diff --git a/test/rpcrt4-canceltimeout-probe.c b/test/rpcrt4-canceltimeout-probe.c
+new file mode 100644
+--- /dev/null
++++ b/test/rpcrt4-canceltimeout-probe.c
+@@ -0,0 +1,280 @@
++/* The cancel timeout (RpcMgmtSetCancelTimeout, RpcCancelThread, RpcCancelThreadEx, RpcAsyncCancelCall) between two processes:
++ * a widl-generated client and server over ncalrpc and ncacn_ip_tcp on 127.0.0.1.
++ *   probe server PROTSEQ ENDPOINT    Slow(ms, poll): waits ms; with poll it returns 77 when the client cancelled
++ *   probe client PROTSEQ ENDPOINT    runs the checks, prints RESULT: PASS or FAIL */
++#include <windows.h>
++#include <setjmp.h>
++#include <rpc.h>
++#include <rpcndr.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "rpcrt4-canceltimeout.h"
++
++static int failures;
++static void check(int ok, const char *what)
++{
++    printf("%s  %s\n", ok ? "PASS" : "FAIL", what);
++    fflush(stdout);
++    if (!ok) failures++;
++}
++
++void *__RPC_USER MIDL_user_allocate(size_t size) { return malloc(size); }
++void __RPC_USER MIDL_user_free(void *p) { free(p); }
++
++static LONG slow(handle_t h, LONG ms, LONG poll)
++{
++    LONG i;
++    for (i = 0; i < ms / 10; i++)
++    {
++        Sleep(10);
++        if (poll && RpcServerTestCancel(h) == RPC_S_CALL_CANCELLED) return 77;
++    }
++    return 0;
++}
++
++LONG s_Slow(handle_t h, LONG ms, LONG poll) { return slow(h, ms, poll); }
++
++void s_ASlow(PRPC_ASYNC_STATE a, handle_t h, LONG ms, LONG poll, LONG *ret)
++{
++    *ret = slow(h, ms, poll);
++    RpcAsyncCompleteCall(a, NULL);
++}
++
++void s_Stop(handle_t h) { RpcMgmtStopServerListening(NULL); }
++
++static int run_server(const char *protseq, const char *endpoint)
++{
++    RPC_STATUS status;
++
++    status = RpcServerUseProtseqEpA((RPC_CSTR)protseq, RPC_C_PROTSEQ_MAX_REQS_DEFAULT, (RPC_CSTR)endpoint, NULL);
++    if (status) { printf("server: RpcServerUseProtseqEp failed %lu\n", status); return 1; }
++    status = RpcServerRegisterIf(s_CanT_v1_0_s_ifspec, NULL, NULL);
++    if (status) { printf("server: RpcServerRegisterIf failed %lu\n", status); return 1; }
++    printf("READY\n");
++    fflush(stdout);
++    status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, FALSE);
++    printf("server: done (%lu)\n", status);
++    return 0;
++}
++
++/* ---- client: a thread makes a call, the main thread cancels it ---- */
++
++static DWORD tls;
++struct call
++{
++    jmp_buf jb;
++    volatile int armed;
++    handle_t h;
++    LONG ms, poll;
++    LONG timeout;            /* RpcMgmtSetCancelTimeout in the calling thread, or -2: leave the default */
++    BOOL async;
++    HANDLE ready;
++    HANDLE thread;
++    DWORD took;
++    LONG ret;
++    ULONG exception;
++};
++
++/* the exception of a failed call ends it: the thread jumps back to where the call was made */
++static LONG CALLBACK catch_exception(EXCEPTION_POINTERS *ep)
++{
++    struct call *c = TlsGetValue(tls);
++
++    if (!c || !c->armed) return EXCEPTION_CONTINUE_SEARCH;
++    c->armed = 0;
++    c->exception = ep->ExceptionRecord->ExceptionCode;
++    longjmp(c->jb, 1);
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
++static DWORD WINAPI call_thread(void *arg)
++{
++    struct call *c = arg;
++    DWORD t0;
++
++    if (c->timeout != -2) RpcMgmtSetCancelTimeout(c->timeout);
++    TlsSetValue(tls, c);
++    SetEvent(c->ready);
++    t0 = GetTickCount();
++    if (!setjmp(c->jb))
++    {
++        c->armed = 1;
++        c->ret = Slow(c->h, c->ms, c->poll);
++        c->armed = 0;
++    }
++    c->took = GetTickCount() - t0;
++    return 0;
++}
++
++static void start_call(struct call *c, handle_t h, LONG ms, LONG poll, LONG timeout)
++{
++    HANDLE self;
++
++    memset(c, 0, sizeof(*c));
++    c->h = h; c->ms = ms; c->poll = poll; c->timeout = timeout;
++    c->ready = CreateEventA(NULL, FALSE, FALSE, NULL);
++    c->thread = CreateThread(NULL, 0, call_thread, c, 0, NULL);
++    WaitForSingleObject(c->ready, 5000);
++    Sleep(400);             /* in the call */
++    (void)self;
++}
++
++static void end_call(struct call *c)
++{
++    WaitForSingleObject(c->thread, 20000);
++    CloseHandle(c->thread);
++    CloseHandle(c->ready);
++}
++
++static void run_checks(handle_t h)
++{
++    struct call c;
++    char what[200];
++    RPC_ASYNC_STATE a;
++    HANDLE ev;
++    LONG ret;
++    RPC_STATUS status;
++    DWORD t0, took;
++
++    /* RpcCancelThreadEx with no time: the call is abandoned now */
++    start_call(&c, h, 6000, 0, -2);
++    RpcCancelThreadEx(c.thread, 0);
++    end_call(&c);
++    sprintf(what, "RpcCancelThreadEx(0): the call is abandoned at once (took %lu ms, exception %lu)", c.took, c.exception);
++    check(c.exception == RPC_S_CALL_CANCELLED && c.took < 3000, what);
++
++    /* RpcCancelThreadEx with 1 second against a manager which does not look: the call fails when the second is over */
++    start_call(&c, h, 6000, 0, -2);
++    RpcCancelThreadEx(c.thread, 1);
++    end_call(&c);
++    sprintf(what, "RpcCancelThreadEx(1): the call fails with RPC_S_CALL_CANCELLED after about a second (took %lu ms, exception %lu)", c.took, c.exception);
++    check(c.exception == RPC_S_CALL_CANCELLED && c.took >= 1200 && c.took < 4000, what);
++
++    /* ... against a manager which looks: it ends the call before the time is over */
++    start_call(&c, h, 6000, 1, -2);
++    RpcCancelThreadEx(c.thread, 4);
++    end_call(&c);
++    sprintf(what, "RpcCancelThreadEx(4): the server sees the cancel and answers (ret %ld, exception %lu, took %lu ms)", c.ret, c.exception, c.took);
++    check(c.ret == 77 && !c.exception && c.took < 3500, what);
++
++    /* the cancel timeout of the thread making the call, default (for ever): RpcCancelThread forwards the cancel and waits */
++    start_call(&c, h, 6000, 1, -2);
++    RpcCancelThread(c.thread);
++    end_call(&c);
++    sprintf(what, "RpcCancelThread, default timeout: the server answers the cancel (ret %ld, exception %lu, took %lu ms)", c.ret, c.exception, c.took);
++    check(c.ret == 77 && !c.exception && c.took < 3500, what);
++
++    /* RpcMgmtSetCancelTimeout(1) in the calling thread: the call fails with RPC_S_CALL_FAILED after about a second */
++    start_call(&c, h, 6000, 0, 1);
++    RpcCancelThread(c.thread);
++    end_call(&c);
++    sprintf(what, "RpcMgmtSetCancelTimeout(1) + RpcCancelThread: the call fails after about a second (took %lu ms, exception %lu)", c.took, c.exception);
++    check(c.exception == RPC_S_CALL_FAILED && c.took >= 1200 && c.took < 4000, what);
++
++    /* RpcMgmtSetCancelTimeout(0): RpcCancelThread abandons the call now */
++    start_call(&c, h, 6000, 0, 0);
++    RpcCancelThread(c.thread);
++    end_call(&c);
++    sprintf(what, "RpcMgmtSetCancelTimeout(0) + RpcCancelThread: the call is abandoned at once (took %lu ms, exception %lu)", c.took, c.exception);
++    check(c.exception == RPC_S_CALL_CANCELLED && c.took < 3000, what);
++
++    ret = Slow(h, 50, 0);
++    check(ret == 0, "the binding is usable afterwards");
++
++    /* asynchronous calls: RpcAsyncCancelCall(FALSE) with the cancel timeout of the thread */
++    RpcMgmtSetCancelTimeout(RPC_C_CANCEL_INFINITE_TIMEOUT);
++    ev = CreateEventA(NULL, TRUE, FALSE, NULL);
++    RpcAsyncInitializeHandle(&a, sizeof(a)); a.NotificationType = RpcNotificationTypeEvent; a.u.hEvent = ev;
++    ret = 0;
++    ASlow(&a, h, 6000, 1, &ret);
++    Sleep(400);
++    RpcAsyncCancelCall(&a, FALSE);
++    t0 = GetTickCount();
++    check(WaitForSingleObject(ev, 8000) == WAIT_OBJECT_0, "async, default timeout: the polling server ends the call");
++    took = GetTickCount() - t0;
++    status = RpcAsyncCompleteCall(&a, NULL);
++    sprintf(what, "... with the result of the server (status %lu, ret %ld, %lu ms)", status, ret, took);
++    check(!status && ret == 77 && took < 3500, what);
++    CloseHandle(ev);
++
++    RpcMgmtSetCancelTimeout(1);
++    ev = CreateEventA(NULL, TRUE, FALSE, NULL);
++    RpcAsyncInitializeHandle(&a, sizeof(a)); a.NotificationType = RpcNotificationTypeEvent; a.u.hEvent = ev;
++    ASlow(&a, h, 6000, 0, &ret);
++    Sleep(400);
++    RpcAsyncCancelCall(&a, FALSE);
++    t0 = GetTickCount();
++    check(WaitForSingleObject(ev, 8000) == WAIT_OBJECT_0, "async, timeout of 1 second, a manager which does not look: the call ends");
++    took = GetTickCount() - t0;
++    status = RpcAsyncCompleteCall(&a, NULL);
++    sprintf(what, "... after about a second, cancelled (status %lu, %lu ms)", status, took);
++    check(status == RPC_S_CALL_CANCELLED && took >= 400 && took < 4000, what);
++    CloseHandle(ev);
++
++    RpcMgmtSetCancelTimeout(0);
++    ev = CreateEventA(NULL, TRUE, FALSE, NULL);
++    RpcAsyncInitializeHandle(&a, sizeof(a)); a.NotificationType = RpcNotificationTypeEvent; a.u.hEvent = ev;
++    ASlow(&a, h, 6000, 0, &ret);
++    Sleep(400);
++    t0 = GetTickCount();
++    RpcAsyncCancelCall(&a, FALSE);
++    check(WaitForSingleObject(ev, 8000) == WAIT_OBJECT_0, "async, timeout 0: the call is abandoned at once");
++    took = GetTickCount() - t0;
++    status = RpcAsyncCompleteCall(&a, NULL);
++    sprintf(what, "... cancelled (status %lu, %lu ms)", status, took);
++    check(status == RPC_S_CALL_CANCELLED && took < 1500, what);
++    CloseHandle(ev);
++
++    /* the call completes before the timer: nothing happens to it afterwards */
++    RpcMgmtSetCancelTimeout(2);
++    ev = CreateEventA(NULL, TRUE, FALSE, NULL);
++    RpcAsyncInitializeHandle(&a, sizeof(a)); a.NotificationType = RpcNotificationTypeEvent; a.u.hEvent = ev;
++    ASlow(&a, h, 6000, 1, &ret);
++    Sleep(400);
++    RpcAsyncCancelCall(&a, FALSE);
++    WaitForSingleObject(ev, 8000);
++    status = RpcAsyncCompleteCall(&a, NULL);
++    CloseHandle(ev);
++    Sleep(2500);        /* the timer runs out with the call gone */
++    ret = Slow(h, 50, 0);
++    check(!status && ret == 0, "a call which ended first is not touched when its timer runs out");
++}
++
++static int run_client(const char *protseq, const char *endpoint)
++{
++    RPC_STATUS status;
++    RPC_CSTR str = NULL;
++    handle_t h = NULL;
++
++    status = RpcStringBindingComposeA(NULL, (RPC_CSTR)protseq, (RPC_CSTR)(strcmp(protseq, "ncalrpc") ? "127.0.0.1" : NULL),
++                                      (RPC_CSTR)endpoint, NULL, &str);
++    if (!status) status = RpcBindingFromStringBindingA(str, &h);
++    check(!status, "binding");
++    if (status) return 1;
++    RpcStringFreeA(&str);
++    run_checks(h);
++    Stop(h);
++    RpcBindingFree(&h);
++    printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
++    return failures != 0;
++}
++
++static LONG WINAPI filter(EXCEPTION_POINTERS *ep)
++{
++    printf("FAIL  exception %08lx\n", ep->ExceptionRecord->ExceptionCode);
++    printf("RESULT: FAIL\n");
++    fflush(stdout);
++    ExitProcess(3);
++    return EXCEPTION_EXECUTE_HANDLER;
++}
++
++int main(int argc, char **argv)
++{
++    SetUnhandledExceptionFilter(filter);
++    tls = TlsAlloc();
++    AddVectoredExceptionHandler(1, catch_exception);
++    if (argc < 4) return 2;
++    if (!strcmp(argv[1], "server")) return run_server(argv[2], argv[3]);
++    return run_client(argv[2], argv[3]);
++}
+diff --git a/test/rpcrt4-canceltimeout.idl b/test/rpcrt4-canceltimeout.idl
+new file mode 100644
+--- /dev/null
++++ b/test/rpcrt4-canceltimeout.idl
+@@ -0,0 +1,7 @@
++[uuid(5ee0e9e7-b001-4c01-9001-0123456789ab), version(1.0)]
++interface CanT
++{
++    long Slow([in] handle_t h, [in] long ms, [in] long poll);
++    [async] void ASlow([in] handle_t h, [in] long ms, [in] long poll, [out] long *ret);
++    void Stop([in] handle_t h);
++}
+-- 
+2.47.0

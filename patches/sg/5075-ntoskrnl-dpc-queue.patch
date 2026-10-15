@@ -1,0 +1,195 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntoskrnl.exe: Queue and run DPCs.
+
+A DPC queue: KeInsertQueueDpc queues a DPC (FALSE when it is already queued)
+and a worker runs the queued DPCs one at a time, in order, a HighImportance
+DPC first, with the DPC, its context and both arguments; KeInsertQueueDpc
+returned TRUE and never ran the routine. KeRemoveQueueDpc (a stub export)
+takes a queued DPC out; KeFlushQueuedDpcs returns once every queued DPC has
+run. KeSetTargetProcessorDpcEx returns its NTSTATUS and refuses a processor
+that is not there (STATUS_INVALID_PARAMETER); it and KeSetTargetProcessorDpc
+record the processor in the DPC (it still runs on the worker).
+
+Gate: test/ntoskrnl-dpcqueue-gate.sh (a probe driver; 64-bit, a WoW64 host skips).
+---
+ dlls/ntoskrnl.exe/ntoskrnl.c        | 126 ++++++++++++++++++++++++++++++++++--
+ dlls/ntoskrnl.exe/ntoskrnl.exe.spec |   2 +-
+ 2 files changed, 121 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index 5a9cc97..bff0c26 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -2977,13 +2977,111 @@ LONG WINAPI KeInsertQueue(PRKQUEUE Queue, PLIST_ENTRY Entry)
+     return 0;
+ }
+ 
++/* the DPC queue: DPCs run one at a time on a worker, in the order they were queued
++ * (a high-importance one first); DpcData is set while a DPC is in the queue */
++static KDPC *dpc_head, *dpc_tail;
++
++static inline KDPC *next_dpc( const KDPC *dpc )
++{
++    return dpc->DpcListEntry.Next ? CONTAINING_RECORD( dpc->DpcListEntry.Next, KDPC, DpcListEntry ) : NULL;
++}
++static BOOL dpc_worker_running;
++static CONDITION_VARIABLE dpc_idle = CONDITION_VARIABLE_INIT;
++static CRITICAL_SECTION dpc_cs;
++static CRITICAL_SECTION_DEBUG dpc_cs_debug =
++{
++    0, 0, &dpc_cs,
++    { &dpc_cs_debug.ProcessLocksList, &dpc_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": dpc_cs") }
++};
++static CRITICAL_SECTION dpc_cs = { &dpc_cs_debug, -1, 0, 0, 0, 0 };
++
++static void CALLBACK dpc_worker( TP_CALLBACK_INSTANCE *instance, void *context )
++{
++    KDPC *dpc;
++
++    for (;;)
++    {
++        EnterCriticalSection( &dpc_cs );
++        if (!(dpc = dpc_head))
++        {
++            dpc_worker_running = FALSE;
++            WakeAllConditionVariable( &dpc_idle );
++            LeaveCriticalSection( &dpc_cs );
++            return;
++        }
++        dpc_head = next_dpc( dpc );
++        if (!dpc_head) dpc_tail = NULL;
++        dpc->DpcListEntry.Next = NULL;
++        dpc->DpcData = NULL;   /* it may queue itself again */
++        LeaveCriticalSection( &dpc_cs );
++
++        TRACE( "calling dpc %p routine %p\n", dpc, dpc->DeferredRoutine );
++        dpc->DeferredRoutine( dpc, dpc->DeferredContext, dpc->SystemArgument1, dpc->SystemArgument2 );
++    }
++}
++
+ /***********************************************************************
+  *           KeInsertQueueDpc   (NTOSKRNL.EXE.@)
+  */
+ BOOLEAN WINAPI KeInsertQueueDpc(PRKDPC Dpc, PVOID SystemArgument1, PVOID SystemArgument2)
+ {
+-    FIXME( "stub: (%p %p %p)\n", Dpc, SystemArgument1, SystemArgument2 );
+-    return TRUE;
++    BOOLEAN ret = FALSE;
++
++    TRACE( "(%p %p %p)\n", Dpc, SystemArgument1, SystemArgument2 );
++
++    EnterCriticalSection( &dpc_cs );
++#ifndef SG_MUTANT_DPC_REQUEUE
++    if (!Dpc->DpcData)
++#endif
++    {
++        Dpc->SystemArgument1 = SystemArgument1;
++        Dpc->SystemArgument2 = SystemArgument2;
++        Dpc->DpcData = &dpc_head;
++        Dpc->DpcListEntry.Next = NULL;
++        if (Dpc->Importance == HighImportance && dpc_head)
++        {
++            Dpc->DpcListEntry.Next = &dpc_head->DpcListEntry;
++            dpc_head = Dpc;
++        }
++        else
++        {
++            if (dpc_tail) dpc_tail->DpcListEntry.Next = &Dpc->DpcListEntry;
++            else dpc_head = Dpc;
++            dpc_tail = Dpc;
++        }
++        if (!dpc_worker_running && TrySubmitThreadpoolCallback( dpc_worker, NULL, NULL ))
++            dpc_worker_running = TRUE;
++        ret = TRUE;
++    }
++    LeaveCriticalSection( &dpc_cs );
++    return ret;
++}
++
++/***********************************************************************
++ *           KeRemoveQueueDpc   (NTOSKRNL.EXE.@)
++ */
++BOOLEAN WINAPI KeRemoveQueueDpc( KDPC *dpc )
++{
++    KDPC *prev = NULL, *cur;
++    BOOLEAN ret = FALSE;
++
++    TRACE( "%p\n", dpc );
++
++    EnterCriticalSection( &dpc_cs );
++    for (cur = dpc_head; cur && dpc->DpcData; prev = cur, cur = next_dpc( cur ))
++    {
++        if (cur != dpc) continue;
++        if (prev) prev->DpcListEntry.Next = dpc->DpcListEntry.Next;
++        else dpc_head = next_dpc( dpc );
++        if (dpc_tail == dpc) dpc_tail = prev;
++        dpc->DpcListEntry.Next = NULL;
++        dpc->DpcData = NULL;
++        ret = TRUE;
++        break;
++    }
++    LeaveCriticalSection( &dpc_cs );
++    return ret;
+ }
+ 
+ /**********************************************************************
+@@ -3819,9 +3917,18 @@ VOID WINAPI KeSetImportanceDpc(PRKDPC dpc, KDPC_IMPORTANCE importance)
+ /***********************************************************************
+  *          KeSetTargetProcessorDpcEx   (NTOSKRNL.EXE.@)
+  */
+-VOID WINAPI KeSetTargetProcessorDpcEx(PRKDPC dpc, PPROCESSOR_NUMBER process_number)
++NTSTATUS WINAPI KeSetTargetProcessorDpcEx(PRKDPC dpc, PPROCESSOR_NUMBER process_number)
+ {
+-    FIXME("%p, %p stub\n", dpc, process_number);
++    TRACE("%p, %p\n", dpc, process_number);
++
++    /* one group; the DPC records its processor, it runs on the DPC worker whatever it is */
++    if (process_number->Group || process_number->Reserved ||
++        process_number->Number >= KeQueryActiveProcessorCountEx( 0 ))
++        return STATUS_INVALID_PARAMETER;
++#ifndef SG_MUTANT_DPC_TARGET_IGNORED
++    dpc->Number = process_number->Number;
++#endif
++    return STATUS_SUCCESS;
+ }
+ 
+ /***********************************************************************
+@@ -3829,7 +3936,9 @@ VOID WINAPI KeSetTargetProcessorDpcEx(PRKDPC dpc, PPROCESSOR_NUMBER process_numb
+  */
+ VOID WINAPI KeSetTargetProcessorDpc(PRKDPC dpc, CCHAR number)
+ {
+-    FIXME("%p, %d stub\n", dpc, number);
++    TRACE("%p, %d\n", dpc, number);
++
++    dpc->Number = (UCHAR)number;
+ }
+ 
+ /***********************************************************************
+@@ -4672,7 +4781,12 @@ NTSTATUS WINAPI SeLocateProcessImageName(PEPROCESS process, UNICODE_STRING **ima
+  */
+ void WINAPI KeFlushQueuedDpcs(void)
+ {
+-    FIXME("stub!\n");
++    TRACE( "\n" );
++
++    /* every DPC queued so far has run once the worker is idle */
++    EnterCriticalSection( &dpc_cs );
++    while (dpc_worker_running) SleepConditionVariableCS( &dpc_idle, &dpc_cs, INFINITE );
++    LeaveCriticalSection( &dpc_cs );
+ }
+ 
+ /*********************************************************************
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+index 276e166..2b842e0 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -636,7 +636,7 @@
+ @ stdcall KeRemoveDeviceQueue(ptr)
+ @ stub KeRemoveEntryDeviceQueue
+ @ stub KeRemoveQueue
+-@ stub KeRemoveQueueDpc
++@ stdcall KeRemoveQueueDpc(ptr)
+ @ stub KeRemoveSystemServiceTable
+ @ stdcall KeResetEvent(ptr)
+ @ stub KeRestoreFloatingPointState

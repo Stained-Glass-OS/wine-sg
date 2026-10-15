@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-deskhover test-deskerase test-dpifollow test-hungwake test-savename test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg test-layeredblend test-linuxicon test-shellnew test-glassvk test-elevfolders test-displaycfg test-pss test-pyimports test-ownerrights test-ptracecap test-proxyblanket test-comlauncher test-cloakpaint test-gpupriority test-dbghelpinline test-regfsync test-sysversions test-drivewatch test-systemtemp test-desktopfront test-mcastif test-prtsc test-stiinf test-usbtree test-gpahook test-autoplay test-envreload test-iconhandler test-gdipfamily test-dirshare test-elevtray test-anotherwindow test-threadclass test-fetabs test-linuxbash test-embedmaxgrab test-toastactivate test-netfx3 test-smbshare test-smbview test-netuse test-mapcred test-wmiprinter test-cupsmodel test-devkeyread test-cupsrefresh test-pentouch test-drvpkg test-psdriver test-unidrvxl test-unidrvrast test-psplugin test-cpsui test-drvui test-netport test-printproc test-dwsubst test-ptcaps test-smoothshapes test-iconframes test-touch test-keybutton test-hiddenmax test-tlbbase test-comsvc test-privacysettings test-dwspacing test-msgboxicons test-credkeyring test-latepen test-wininet-listentimeout test-onlineid-ticket test-richtxsrv2 test-d2dsharedview test-rotransformerror test-cputime test-fileinfo test-procsettings test-memprotect test-userapis test-kbmisc test-cpusets test-werreg test-devfamily test-aclentries test-richinit test-bufpaint test-dwmattrs test-muipath test-stockicon test-enumjobs test-replacefile test-svcdepend test-sysshutdown test-advsec test-shcorebits test-fontquery test-guithread test-ipnotify test-apprestart test-minidumpx test-joblimits test-fmtsupport test-printnotify test-diskinfo test-perfcount test-taskdisp test-taskinfo test-taskxml test-bitsjob test-bitsmore test-mmcss test-devtree test-pinterfaceiid test-taskprogress test-winappid test-childpolicy test-smallstubs2 test-asynclock test-uilangs test-shellapp test-shelldisp test-wshshell test-textstreams test-fsoitems test-wshnet test-vbsbuiltins test-vbsdyncode test-jsstubs test-nsplookup test-wscatalog test-gdipquality test-hotkeyexec test-zipfolder test-thumbbar test-xplacement test-tsfsinks test-certresync test-inputpane test-jumplist test-evtquery test-audiotopo test-dxcore test-dmanip test-imglist2 test-lvtv test-toolbar2 test-ccmisc test-ole32misc test-oapict test-tlbcreate test-roerror test-guires test-powerreq test-ncryptksp test-cryptrest test-etwtrace test-uiaevents test-msgfilter test-uiabridge test-shellmisc test-oleaccstd test-sockmisc test-netlist test-bestroute test-fileflags test-dwritemisc test-certfind test-pfxexport test-smallstubs3 test-aptshutdown test-cmifaces test-cmnotify test-powerschemes test-capsdhcp test-procquota test-credprotect test-creduiwin test-wtsnotify test-appdefault test-propkeyname test-setupcm test-urlmonparse test-urlmonzone test-boundary test-devicemap test-gentable test-perflib test-ncryptwrap test-netuserinfo test-wintrusthelp test-wtssession test-accdisp test-accprop test-d3d11featx test-d3d11misc test-comctlstub test-comdlgitem test-msxmlstub test-shlwapistub test-blockreason test-fwenv test-regmulti test-shellhook test-bcryptconfig test-bcryptoaep test-bcryptresolve test-crypt32aux test-dnsapihelp test-iphlpapient test-powerlegacy test-tapiline test-dxgistat test-dxgiswap test-jpegexif test-wicxform test-dsound-stubs test-lockserver test-mf-misc test-mfplat-buffers test-mfplat-bytestream test-wgi-device test-wgi-stubs test-wgst-mpegaudio test-wgst-wmreader test-winmm-misc test-wmc-stubs test-wmdev-stubs test-wmedia-stubs test-wmspeech test-wmspeech2 test-xinput-audio test-mitigate test-usersessions test-adocmd test-dtdcode test-ebrowser test-folderview test-jsonweb test-mimebody test-mimeopt test-mimesave test-msxmlcoll test-msxmlpersist test-mxwdom test-ofnull test-printfldr test-propbag test-propvar2 test-propvec test-pvstring test-richedoc test-richeedit test-richepara test-richesearch test-richesel test-secidom test-setupclass test-setupnodeprop test-setupspace test-sfileinfo test-sfparse test-shexecargs test-shlinkstub test-tabmru test-tbsep test-webverbs test-createfile test-fcache test-fileioctl test-fsmisc test-globalmem test-inputapi test-iosb test-lznt1 test-monhandle test-ntdllmisc test-ntinfoval test-olecompat test-pipeid test-profile test-pseudowait test-registry test-rpcbind test-rtlquery test-sppi test-svcdup test-svcfail test-svcname test-uimisc test-validdata test-wca test-winplace test-writevm test-crypt32cs test-crypt32dec test-crypt32msg test-mscoree-hash test-mscoree-sn test-netapi32ground test-netwrite test-regstorethrough test-suspend test-tapihandles test-tapiphone test-tapitrans test-winhttpground test-wininetground test-wintrustadmin test-wintrustcat test-wintrustcatw test-wintrustfind test-ws2ground test-wsreader test-wswriter test-wtsaction test-d2dctl test-d2dmesh test-d2dtarget test-d3d113res test-d3dshare test-d3dxline test-dwbidi test-dwfaceref test-dwhit test-dxgidup test-gdipimg test-gdipstat test-metawriter test-uiacache test-uiacom test-uiacpat test-uiapat test-wicblock test-wicenc test-wicicc test-wicinfo test-wicquery test-wicsave test-dinput-misc test-dmcontent-styletracks test-dmime-audiopath test-dmime-perf test-dmime-tracks test-dmloader-streams test-dplayx-dp4 test-dplayx-lobby test-dplayx-sp test-dplayx-v1 test-dpnet-session test-evr-filter test-evr-mixer test-evr-presenter test-mfme test-mfplay test-mfrest-helpers test-mfsrcsnk test-qdvd-nav test-qedit-amstream test-qedit-mediadet test-qedit-msvfw32 test-qedit-timeline test-quartz-graph test-quartz-vmr test-sapi-mmaudio test-sapi-stream test-sapi-token test-sapi-voice test-wgdmo-colorconv test-wgdmo-resampler test-wgdmo-wma test-wgrest-sink test-wgrest-source test-wgrest-wmreader test-wgvid-aacdec test-wgvid-h264enc test-wgvid-vproc test-wgvid-wmvdec test-wmp-state test-wmv-config test-wmv-misc test-wmv-reader test-winstasd test-wtstoken test-logonuser test-runasuser test-accesscheck test-actctxfast test-combasemisc test-dirchange test-endtask test-enumsettings test-procinfo2 test-sdmisc test-sysclasses test-tfcreate test-d2dtxt test-d2dvb test-d3drmface test-d3drmframe test-d3drmpath test-d3drmtexdev test-d3dxanim test-d3dxconv test-d3dxddspal test-d3dxdxt test-d3dxfont test-d3dxisect test-d3dxmesh test-d3dxsavetex test-d3dxtga test-dcompobj test-dwfactref test-dwfont test-dwset test-dwsetaxes test-dwtab test-dwwrap test-gdipdisp test-gdipdrv test-gdipinit test-gdipmeas test-gdipnn test-gdiprgn test-oleaccproxy test-uiaiface test-wicdds test-wichbm test-wicpnginfo test-dinputtodo test-dmcontent-band test-dmcontent-compos test-dmcontent-style test-dmusic-ports test-dmusic-synth test-mfrest2 test-quartz-rest test-wmvw-header test-wmvw-profile test-wmvw-writer test-wmvw-xml test-xact-wave test-adoconn test-adorecords test-cwmo test-dinput-hidusage test-dinputleft test-dmcompose test-dmcontent-play test-dmime-conv test-dmscript test-evr-classfactory test-evr-mfexports test-mc-audiostate test-mf-sequencer test-mfplat-mediabuf test-mfplat-mtconv test-mfplat-pdser test-mfplat-plugin test-mfplat-vidrep test-mfplat-vih test-quartz-collections test-quartz-fullscreen test-quartz-misc test-wgasync test-winmmthru test-winmmtodo-dsound test-winmmtodo-winmm test-wmp-collections test-wmvw-sysprof test-adostream test-cc3 test-diskspace2 test-mimemsg test-mimeprops test-propconv test-propstore2 test-recentdocs test-richpaste test-setupprop test-shcore2 test-shdataobj test-shellord test-idealproc test-monikeredge test-regorder test-volumetime test-bcryptground test-crypt32ground test-dnsapiqueryex test-msicomppath test-msicost test-msifilever test-msiground test-msipatch test-msiprodinfo test-msisignature test-ncryptdpapi test-secur32sasl test-secur32schannel test-taskschdground test-wbemcom test-wbemproc test-wbemsettings test-winhttpsocket test-wininetcrack test-wininetnoreply test-wintrusthashonly test-wmic test-wsarray test-wsheap test-wslistener test-wsstart test-wsvalue test-d2dbmpcc test-d3drmclone test-d3drmfaces test-d3drmmb test-d3dxsampler test-dcomp3d test-dcompsurface test-dwritewoff test-gdipconv test-gdipdual test-uiacachetree test-uiagroup test-uianorm test-uiaopts test-wicico test-wicidxpal test-hklmsd test-amstream-alloc test-amstream-smoke test-avifil32-palchange test-avifil32-smoke test-concrt-context test-concrt-exc-locks test-concrt-helpers test-concrt-queue-iter test-crt-cgets test-crt-concurrency test-crt-context-yield test-crt-dbgheap test-crt-eh-helpers test-crt-exc-misc test-crt-find32i64 test-crt-heap test-crt-imagebase test-crt-internals test-crt-ismbb test-crt-iswcsym test-crt-mbcasemap-data test-crt-misc test-crt-norm test-crt-old-handlers test-crt-platform test-crt-portio test-crt-printf test-crt-scanf test-crt-string-s test-crt-systime test-crt-uchar test-crt-win32-wrappers test-devenum-smoke test-dmsynth-dls1 test-dpvoice-factory test-dsdmo-smoke test-dxva2-smoke test-evr-fullscreen test-gamebar-smoke test-mciavi32-smoke test-mciqtz32-smoke test-media-misc-smoke test-mediacontrol-smoke test-mf-seekpause test-mf-smoke test-mfplat-smoke test-mfreadwrite-smoke test-mmdevapi-smoke test-mp3dmod-dmo test-msacm32-metrics test-msacm32-smoke test-msdmo-smoke test-msvcp-access-forms test-msvcp-atomic-wait test-msvcp-c-collate test-msvcp-codecvt-utf test-msvcp-collate test-msvcp-eptr-swap test-msvcp-errcat test-msvcp-fs-misc test-msvcp-locale-ops test-msvcp-locinfo test-msvcp-makeloc test-msvcp-messages test-msvcp-misc-older test-msvcp-money test-msvcp-old-exports test-msvcp-old-forms test-msvcp-old-members test-msvcp-platform test-msvcp-random-mp test-msvcp-stream-move test-msvcp-streambuf test-msvcp-threads-c test-msvcp-timeget test-msvcp-ushort-read test-msvcp-ushort-read-older test-msvcp-wcomplex test-msvcp-wstod test-msvcp-xexc test-msvcp-xfsopen test-msvcp-yarn-facetbase test-msvcp100-misc test-msvcp140-2-smf test-msvcp140-crt-wrappers test-msvcp60-assign test-msvcp60-complex test-msvcp60-dateorder test-msvcp60-doraise test-msvcp60-exceptions test-msvcp60-getcat test-msvcp60-locale-call test-msvcp60-std-exceptions test-msvcp60-streambuf-misc test-msvcp60-timeget test-msvcp60-traits-assign test-msvcp70-complex test-msvcr100-task-canceled test-msvfw32-smoke test-qasf-smoke test-qcap-smoke test-qdvd-smoke test-quartz-dsound-focus test-quartz-graph-forward test-quartz-vmr9-alloc test-rtworkq-platform-events test-ucrt-dmath test-vcomp-dynamic-i8 test-vcrt-module-wrappers test-wmp-moniker test-wmvcore-playlist-burn test-wmvcore-smoke
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-deskhover test-deskerase test-dpifollow test-hungwake test-savename test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg test-layeredblend test-linuxicon test-shellnew test-glassvk test-elevfolders test-displaycfg test-pss test-pyimports test-ownerrights test-ptracecap test-proxyblanket test-comlauncher test-cloakpaint test-gpupriority test-dbghelpinline test-regfsync test-sysversions test-drivewatch test-systemtemp test-desktopfront test-mcastif test-prtsc test-stiinf test-usbtree test-gpahook test-autoplay test-envreload test-iconhandler test-gdipfamily test-dirshare test-elevtray test-anotherwindow test-threadclass test-fetabs test-linuxbash test-embedmaxgrab test-toastactivate test-netfx3 test-smbshare test-smbview test-netuse test-mapcred test-wmiprinter test-cupsmodel test-devkeyread test-cupsrefresh test-pentouch test-drvpkg test-psdriver test-unidrvxl test-unidrvrast test-psplugin test-cpsui test-drvui test-netport test-printproc test-dwsubst test-ptcaps test-smoothshapes test-iconframes test-touch test-keybutton test-hiddenmax test-tlbbase test-comsvc test-privacysettings test-dwspacing test-msgboxicons test-credkeyring test-latepen test-wininet-listentimeout test-onlineid-ticket test-richtxsrv2 test-d2dsharedview test-rotransformerror test-cputime test-fileinfo test-procsettings test-memprotect test-userapis test-kbmisc test-cpusets test-werreg test-devfamily test-aclentries test-richinit test-bufpaint test-dwmattrs test-muipath test-stockicon test-enumjobs test-replacefile test-svcdepend test-sysshutdown test-advsec test-shcorebits test-fontquery test-guithread test-ipnotify test-apprestart test-minidumpx test-joblimits test-fmtsupport test-printnotify test-diskinfo test-perfcount test-taskdisp test-taskinfo test-taskxml test-bitsjob test-bitsmore test-mmcss test-devtree test-pinterfaceiid test-taskprogress test-winappid test-childpolicy test-smallstubs2 test-asynclock test-uilangs test-shellapp test-shelldisp test-wshshell test-textstreams test-fsoitems test-wshnet test-vbsbuiltins test-vbsdyncode test-jsstubs test-nsplookup test-wscatalog test-gdipquality test-hotkeyexec test-zipfolder test-thumbbar test-xplacement test-tsfsinks test-certresync test-inputpane test-jumplist test-evtquery test-audiotopo test-dxcore test-dmanip test-imglist2 test-lvtv test-toolbar2 test-ccmisc test-ole32misc test-oapict test-tlbcreate test-roerror test-guires test-powerreq test-ncryptksp test-cryptrest test-etwtrace test-uiaevents test-msgfilter test-uiabridge test-shellmisc test-oleaccstd test-sockmisc test-netlist test-bestroute test-fileflags test-dwritemisc test-certfind test-pfxexport test-smallstubs3 test-aptshutdown test-cmifaces test-cmnotify test-powerschemes test-capsdhcp test-procquota test-credprotect test-creduiwin test-wtsnotify test-appdefault test-propkeyname test-setupcm test-urlmonparse test-urlmonzone test-boundary test-devicemap test-gentable test-perflib test-ncryptwrap test-netuserinfo test-wintrusthelp test-wtssession test-accdisp test-accprop test-d3d11featx test-d3d11misc test-comctlstub test-comdlgitem test-msxmlstub test-shlwapistub test-blockreason test-fwenv test-regmulti test-shellhook test-bcryptconfig test-bcryptoaep test-bcryptresolve test-crypt32aux test-dnsapihelp test-iphlpapient test-powerlegacy test-tapiline test-dxgistat test-dxgiswap test-jpegexif test-wicxform test-dsound-stubs test-lockserver test-mf-misc test-mfplat-buffers test-mfplat-bytestream test-wgi-device test-wgi-stubs test-wgst-mpegaudio test-wgst-wmreader test-winmm-misc test-wmc-stubs test-wmdev-stubs test-wmedia-stubs test-wmspeech test-wmspeech2 test-xinput-audio test-mitigate test-usersessions test-adocmd test-dtdcode test-ebrowser test-folderview test-jsonweb test-mimebody test-mimeopt test-mimesave test-msxmlcoll test-msxmlpersist test-mxwdom test-ofnull test-printfldr test-propbag test-propvar2 test-propvec test-pvstring test-richedoc test-richeedit test-richepara test-richesearch test-richesel test-secidom test-setupclass test-setupnodeprop test-setupspace test-sfileinfo test-sfparse test-shexecargs test-shlinkstub test-tabmru test-tbsep test-webverbs test-createfile test-fcache test-fileioctl test-fsmisc test-globalmem test-inputapi test-iosb test-lznt1 test-monhandle test-ntdllmisc test-ntinfoval test-olecompat test-pipeid test-profile test-pseudowait test-registry test-rpcbind test-rtlquery test-sppi test-svcdup test-svcfail test-svcname test-uimisc test-validdata test-wca test-winplace test-writevm test-crypt32cs test-crypt32dec test-crypt32msg test-mscoree-hash test-mscoree-sn test-netapi32ground test-netwrite test-regstorethrough test-suspend test-tapihandles test-tapiphone test-tapitrans test-winhttpground test-wininetground test-wintrustadmin test-wintrustcat test-wintrustcatw test-wintrustfind test-ws2ground test-wsreader test-wswriter test-wtsaction test-d2dctl test-d2dmesh test-d2dtarget test-d3d113res test-d3dshare test-d3dxline test-dwbidi test-dwfaceref test-dwhit test-dxgidup test-gdipimg test-gdipstat test-metawriter test-uiacache test-uiacom test-uiacpat test-uiapat test-wicblock test-wicenc test-wicicc test-wicinfo test-wicquery test-wicsave test-dinput-misc test-dmcontent-styletracks test-dmime-audiopath test-dmime-perf test-dmime-tracks test-dmloader-streams test-dplayx-dp4 test-dplayx-lobby test-dplayx-sp test-dplayx-v1 test-dpnet-session test-evr-filter test-evr-mixer test-evr-presenter test-mfme test-mfplay test-mfrest-helpers test-mfsrcsnk test-qdvd-nav test-qedit-amstream test-qedit-mediadet test-qedit-msvfw32 test-qedit-timeline test-quartz-graph test-quartz-vmr test-sapi-mmaudio test-sapi-stream test-sapi-token test-sapi-voice test-wgdmo-colorconv test-wgdmo-resampler test-wgdmo-wma test-wgrest-sink test-wgrest-source test-wgrest-wmreader test-wgvid-aacdec test-wgvid-h264enc test-wgvid-vproc test-wgvid-wmvdec test-wmp-state test-wmv-config test-wmv-misc test-wmv-reader test-winstasd test-wtstoken test-logonuser test-runasuser test-accesscheck test-actctxfast test-combasemisc test-dirchange test-endtask test-enumsettings test-procinfo2 test-sdmisc test-sysclasses test-tfcreate test-d2dtxt test-d2dvb test-d3drmface test-d3drmframe test-d3drmpath test-d3drmtexdev test-d3dxanim test-d3dxconv test-d3dxddspal test-d3dxdxt test-d3dxfont test-d3dxisect test-d3dxmesh test-d3dxsavetex test-d3dxtga test-dcompobj test-dwfactref test-dwfont test-dwset test-dwsetaxes test-dwtab test-dwwrap test-gdipdisp test-gdipdrv test-gdipinit test-gdipmeas test-gdipnn test-gdiprgn test-oleaccproxy test-uiaiface test-wicdds test-wichbm test-wicpnginfo test-dinputtodo test-dmcontent-band test-dmcontent-compos test-dmcontent-style test-dmusic-ports test-dmusic-synth test-mfrest2 test-quartz-rest test-wmvw-header test-wmvw-profile test-wmvw-writer test-wmvw-xml test-xact-wave test-adoconn test-adorecords test-cwmo test-dinput-hidusage test-dinputleft test-dmcompose test-dmcontent-play test-dmime-conv test-dmscript test-evr-classfactory test-evr-mfexports test-mc-audiostate test-mf-sequencer test-mfplat-mediabuf test-mfplat-mtconv test-mfplat-pdser test-mfplat-plugin test-mfplat-vidrep test-mfplat-vih test-quartz-collections test-quartz-fullscreen test-quartz-misc test-wgasync test-winmmthru test-winmmtodo-dsound test-winmmtodo-winmm test-wmp-collections test-wmvw-sysprof test-adostream test-cc3 test-diskspace2 test-mimemsg test-mimeprops test-propconv test-propstore2 test-recentdocs test-richpaste test-setupprop test-shcore2 test-shdataobj test-shellord test-idealproc test-monikeredge test-regorder test-volumetime test-bcryptground test-crypt32ground test-dnsapiqueryex test-msicomppath test-msicost test-msifilever test-msiground test-msipatch test-msiprodinfo test-msisignature test-ncryptdpapi test-secur32sasl test-secur32schannel test-taskschdground test-wbemcom test-wbemproc test-wbemsettings test-winhttpsocket test-wininetcrack test-wininetnoreply test-wintrusthashonly test-wmic test-wsarray test-wsheap test-wslistener test-wsstart test-wsvalue test-d2dbmpcc test-d3drmclone test-d3drmfaces test-d3drmmb test-d3dxsampler test-dcomp3d test-dcompsurface test-dwritewoff test-gdipconv test-gdipdual test-uiacachetree test-uiagroup test-uianorm test-uiaopts test-wicico test-wicidxpal test-hklmsd test-amstream-alloc test-amstream-smoke test-avifil32-palchange test-avifil32-smoke test-concrt-context test-concrt-exc-locks test-concrt-helpers test-concrt-queue-iter test-crt-cgets test-crt-concurrency test-crt-context-yield test-crt-dbgheap test-crt-eh-helpers test-crt-exc-misc test-crt-find32i64 test-crt-heap test-crt-imagebase test-crt-internals test-crt-ismbb test-crt-iswcsym test-crt-mbcasemap-data test-crt-misc test-crt-norm test-crt-old-handlers test-crt-platform test-crt-portio test-crt-printf test-crt-scanf test-crt-string-s test-crt-systime test-crt-uchar test-crt-win32-wrappers test-devenum-smoke test-dmsynth-dls1 test-dpvoice-factory test-dsdmo-smoke test-dxva2-smoke test-evr-fullscreen test-gamebar-smoke test-mciavi32-smoke test-mciqtz32-smoke test-media-misc-smoke test-mediacontrol-smoke test-mf-seekpause test-mf-smoke test-mfplat-smoke test-mfreadwrite-smoke test-mmdevapi-smoke test-mp3dmod-dmo test-msacm32-metrics test-msacm32-smoke test-msdmo-smoke test-msvcp-access-forms test-msvcp-atomic-wait test-msvcp-c-collate test-msvcp-codecvt-utf test-msvcp-collate test-msvcp-eptr-swap test-msvcp-errcat test-msvcp-fs-misc test-msvcp-locale-ops test-msvcp-locinfo test-msvcp-makeloc test-msvcp-messages test-msvcp-misc-older test-msvcp-money test-msvcp-old-exports test-msvcp-old-forms test-msvcp-old-members test-msvcp-platform test-msvcp-random-mp test-msvcp-stream-move test-msvcp-streambuf test-msvcp-threads-c test-msvcp-timeget test-msvcp-ushort-read test-msvcp-ushort-read-older test-msvcp-wcomplex test-msvcp-wstod test-msvcp-xexc test-msvcp-xfsopen test-msvcp-yarn-facetbase test-msvcp100-misc test-msvcp140-2-smf test-msvcp140-crt-wrappers test-msvcp60-assign test-msvcp60-complex test-msvcp60-dateorder test-msvcp60-doraise test-msvcp60-exceptions test-msvcp60-getcat test-msvcp60-locale-call test-msvcp60-std-exceptions test-msvcp60-streambuf-misc test-msvcp60-timeget test-msvcp60-traits-assign test-msvcp70-complex test-msvcr100-task-canceled test-msvfw32-smoke test-qasf-smoke test-qcap-smoke test-qdvd-smoke test-quartz-dsound-focus test-quartz-graph-forward test-quartz-vmr9-alloc test-rtworkq-platform-events test-ucrt-dmath test-vcomp-dynamic-i8 test-vcrt-module-wrappers test-wmp-moniker test-wmvcore-playlist-burn test-wmvcore-smoke test-advapi32-efs test-advapi32-hwprofile test-advapi32-reflection test-advapi32-servicebits test-bcrypt-aeswrap test-bcrypt-algnotfound test-bcrypt-decryptflags test-bcrypt-importpair test-bcrypt-propnotsupported test-combase-ctxcallback test-combase-ctxprops test-combase-defctx test-combase-handlerconnected test-combase-hpalette test-combase-logicalid test-combase-stdmarshal-disconnect test-combase-stdmarshal-null test-crypt32-adddisposition test-crypt32-closecheck test-crypt32-hexa test-crypt32-universalstring test-cryptobuffer-convert test-cryptowinrt-inspectable test-gdi32-smalltextout test-kernel32-pipesession test-kernel32-pipestate test-kernel32-regquota test-kernel32-symlinka test-kernel32-ums test-kernel32-wow64selector test-kernel32-zombifyactctx test-kernelbase-affinityupdate test-kernelbase-consolemouse test-kernelbase-georfc1766 test-kernelbase-shregcreate test-kernelbase-shregdel test-kernelbase-urlescapecomponent test-kernelbase-urlfixup test-kernelbase-urlisappliable test-ntdll-bitmap-backward test-ntdll-compactheap test-ntdll-compressioninfo test-ntdll-filealign test-ntdll-flushwrites test-ntdll-fsobjectid test-ntdll-iopending test-ntdll-placeholder test-ntdll-powercaps test-ntdll-querydir-async test-ntdll-regalign64 test-ntdll-regioninfo test-ntdll-subsystem test-ntdll-symlink test-ntdll-timerqueue-event test-ntdll-xpress-edges test-ntdll-xpress test-ntoskrnl-callback test-ntoskrnl-confinfo test-ntoskrnl-csq test-ntoskrnl-dpc test-ntoskrnl-dpcqueue test-ntoskrnl-drvext test-ntoskrnl-errorlog test-ntoskrnl-harderror test-ntoskrnl-iocreate test-ntoskrnl-iotimer test-ntoskrnl-loadimage test-ntoskrnl-mdl test-ntoskrnl-netiotest test-ntoskrnl-ntddi test-ntoskrnl-obref test-ntoskrnl-pnptest test-ntoskrnl-procgroup test-ntoskrnl-procname test-ntoskrnl-queue test-ntoskrnl-regs test-ntoskrnl-reinit test-ntoskrnl-resclaim test-ntoskrnl-shutdown test-ntoskrnl-startio test-ole32-cachefreeze test-ole32-callas test-ole32-colorset test-ole32-enumskip test-ole32-handler test-ole32-monikers test-ole32-olestreamex test-ole32-proptimes test-ole32-setdata test-ole32-staticdata test-ole32-stgconvert test-ole32-stgopenex test-ole32-viewcallas test-oleaut32-hfont test-oleaut32-propbag-qa test-oleaut32-propframe-initial test-oleaut32-recinfo test-oleaut32-tlcallas test-oleaut32-typelibname test-onlineid-inspectable test-rpcrt4-async test-rpcrt4-async-rpc test-rpcrt4-canceltimeout test-rpcrt4-clearout test-rpcrt4-comtimeout test-rpcrt4-convert test-rpcrt4-cstruct test-rpcrt4-fcwstring test-rpcrt4-httprts test-rpcrt4-ifids test-rpcrt4-pipe test-rpcrt4-ptrgap test-rpcrt4-unregifex test-user32-ddedisconnect test-webcore-inspectable test-webcore-mapview test-win32u-coloradjust test-win32u-getpixelclip test-win32u-lockwindowupdate test-win32u-mouseinpointer test-win32u-openadapterhdc test-win32u-openadaptername
 
 all: build
 
@@ -3010,3 +3010,369 @@ test-wmvcore-playlist-burn:
 
 test-wmvcore-smoke:
 	WINE=$(PREFIX)/bin/wine test/wmvcore-smoke-gate.sh
+
+test-advapi32-efs:
+	WINE=$(PREFIX)/bin/wine test/advapi32-efs-gate.sh
+
+test-advapi32-hwprofile:
+	WINE=$(PREFIX)/bin/wine test/advapi32-hwprofile-gate.sh
+
+test-advapi32-reflection:
+	WINE=$(PREFIX)/bin/wine test/advapi32-reflection-gate.sh
+
+test-advapi32-servicebits:
+	WINE=$(PREFIX)/bin/wine test/advapi32-servicebits-gate.sh
+
+test-bcrypt-aeswrap:
+	WINE=$(PREFIX)/bin/wine test/bcrypt-aeswrap-gate.sh
+
+test-bcrypt-algnotfound:
+	WINE=$(PREFIX)/bin/wine test/bcrypt-algnotfound-gate.sh
+
+test-bcrypt-decryptflags:
+	WINE=$(PREFIX)/bin/wine test/bcrypt-decryptflags-gate.sh
+
+test-bcrypt-importpair:
+	WINE=$(PREFIX)/bin/wine test/bcrypt-importpair-gate.sh
+
+test-bcrypt-propnotsupported:
+	WINE=$(PREFIX)/bin/wine test/bcrypt-propnotsupported-gate.sh
+
+test-combase-ctxcallback:
+	WINE=$(PREFIX)/bin/wine test/combase-ctxcallback-gate.sh
+
+test-combase-ctxprops:
+	WINE=$(PREFIX)/bin/wine test/combase-ctxprops-gate.sh
+
+test-combase-defctx:
+	WINE=$(PREFIX)/bin/wine test/combase-defctx-gate.sh
+
+test-combase-handlerconnected:
+	WINE=$(PREFIX)/bin/wine test/combase-handlerconnected-gate.sh
+
+test-combase-hpalette:
+	WINE=$(PREFIX)/bin/wine test/combase-hpalette-gate.sh
+
+test-combase-logicalid:
+	WINE=$(PREFIX)/bin/wine test/combase-logicalid-gate.sh
+
+test-combase-stdmarshal-disconnect:
+	WINE=$(PREFIX)/bin/wine test/combase-stdmarshal-disconnect-gate.sh
+
+test-combase-stdmarshal-null:
+	WINE=$(PREFIX)/bin/wine test/combase-stdmarshal-null-gate.sh
+
+test-crypt32-adddisposition:
+	WINE=$(PREFIX)/bin/wine test/crypt32-adddisposition-gate.sh
+
+test-crypt32-closecheck:
+	WINE=$(PREFIX)/bin/wine test/crypt32-closecheck-gate.sh
+
+test-crypt32-hexa:
+	WINE=$(PREFIX)/bin/wine test/crypt32-hexa-gate.sh
+
+test-crypt32-universalstring:
+	WINE=$(PREFIX)/bin/wine test/crypt32-universalstring-gate.sh
+
+test-cryptobuffer-convert:
+	WINE=$(PREFIX)/bin/wine test/cryptobuffer-convert-gate.sh
+
+test-cryptowinrt-inspectable:
+	WINE=$(PREFIX)/bin/wine test/cryptowinrt-inspectable-gate.sh
+
+test-gdi32-smalltextout:
+	WINE=$(PREFIX)/bin/wine test/gdi32-smalltextout-gate.sh
+
+test-kernel32-pipesession:
+	WINE=$(PREFIX)/bin/wine test/kernel32-pipesession-gate.sh
+
+test-kernel32-pipestate:
+	WINE=$(PREFIX)/bin/wine test/kernel32-pipestate-gate.sh
+
+test-kernel32-regquota:
+	WINE=$(PREFIX)/bin/wine test/kernel32-regquota-gate.sh
+
+test-kernel32-symlinka:
+	WINE=$(PREFIX)/bin/wine test/kernel32-symlinka-gate.sh
+
+test-kernel32-ums:
+	WINE=$(PREFIX)/bin/wine test/kernel32-ums-gate.sh
+
+test-kernel32-wow64selector:
+	WINE=$(PREFIX)/bin/wine test/kernel32-wow64selector-gate.sh
+
+test-kernel32-zombifyactctx:
+	WINE=$(PREFIX)/bin/wine test/kernel32-zombifyactctx-gate.sh
+
+test-kernelbase-affinityupdate:
+	WINE=$(PREFIX)/bin/wine test/kernelbase-affinityupdate-gate.sh
+
+test-kernelbase-consolemouse:
+	WINE=$(PREFIX)/bin/wine test/kernelbase-consolemouse-gate.sh
+
+test-kernelbase-georfc1766:
+	WINE=$(PREFIX)/bin/wine test/kernelbase-georfc1766-gate.sh
+
+test-kernelbase-shregcreate:
+	WINE=$(PREFIX)/bin/wine test/kernelbase-shregcreate-gate.sh
+
+test-kernelbase-shregdel:
+	WINE=$(PREFIX)/bin/wine test/kernelbase-shregdel-gate.sh
+
+test-kernelbase-urlescapecomponent:
+	WINE=$(PREFIX)/bin/wine test/kernelbase-urlescapecomponent-gate.sh
+
+test-kernelbase-urlfixup:
+	WINE=$(PREFIX)/bin/wine test/kernelbase-urlfixup-gate.sh
+
+test-kernelbase-urlisappliable:
+	WINE=$(PREFIX)/bin/wine test/kernelbase-urlisappliable-gate.sh
+
+test-ntdll-bitmap-backward:
+	WINE=$(PREFIX)/bin/wine test/ntdll-bitmap-backward-gate.sh
+
+test-ntdll-compactheap:
+	WINE=$(PREFIX)/bin/wine test/ntdll-compactheap-gate.sh
+
+test-ntdll-compressioninfo:
+	WINE=$(PREFIX)/bin/wine test/ntdll-compressioninfo-gate.sh
+
+test-ntdll-filealign:
+	WINE=$(PREFIX)/bin/wine test/ntdll-filealign-gate.sh
+
+test-ntdll-flushwrites:
+	WINE=$(PREFIX)/bin/wine test/ntdll-flushwrites-gate.sh
+
+test-ntdll-fsobjectid:
+	WINE=$(PREFIX)/bin/wine test/ntdll-fsobjectid-gate.sh
+
+test-ntdll-iopending:
+	WINE=$(PREFIX)/bin/wine test/ntdll-iopending-gate.sh
+
+test-ntdll-placeholder:
+	WINE=$(PREFIX)/bin/wine test/ntdll-placeholder-gate.sh
+
+test-ntdll-powercaps:
+	WINE=$(PREFIX)/bin/wine test/ntdll-powercaps-gate.sh
+
+test-ntdll-querydir-async:
+	WINE=$(PREFIX)/bin/wine test/ntdll-querydir-async-gate.sh
+
+test-ntdll-regalign64:
+	WINE=$(PREFIX)/bin/wine test/ntdll-regalign64-gate.sh
+
+test-ntdll-regioninfo:
+	WINE=$(PREFIX)/bin/wine test/ntdll-regioninfo-gate.sh
+
+test-ntdll-subsystem:
+	WINE=$(PREFIX)/bin/wine test/ntdll-subsystem-gate.sh
+
+test-ntdll-symlink:
+	WINE=$(PREFIX)/bin/wine test/ntdll-symlink-gate.sh
+
+test-ntdll-timerqueue-event:
+	WINE=$(PREFIX)/bin/wine test/ntdll-timerqueue-event-gate.sh
+
+test-ntdll-xpress-edges:
+	WINE=$(PREFIX)/bin/wine test/ntdll-xpress-edges-gate.sh
+
+test-ntdll-xpress:
+	WINE=$(PREFIX)/bin/wine test/ntdll-xpress-gate.sh
+
+test-ntoskrnl-callback:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-callback-gate.sh
+
+test-ntoskrnl-confinfo:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-confinfo-gate.sh
+
+test-ntoskrnl-csq:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-csq-gate.sh
+
+test-ntoskrnl-dpc:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-dpc-gate.sh
+
+test-ntoskrnl-dpcqueue:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-dpcqueue-gate.sh
+
+test-ntoskrnl-drvext:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-drvext-gate.sh
+
+test-ntoskrnl-errorlog:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-errorlog-gate.sh
+
+test-ntoskrnl-harderror:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-harderror-gate.sh
+
+test-ntoskrnl-iocreate:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-iocreate-gate.sh
+
+test-ntoskrnl-iotimer:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-iotimer-gate.sh
+
+test-ntoskrnl-loadimage:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-loadimage-gate.sh
+
+test-ntoskrnl-mdl:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-mdl-gate.sh
+
+test-ntoskrnl-netiotest:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-netiotest-gate.sh
+
+test-ntoskrnl-ntddi:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-ntddi-gate.sh
+
+test-ntoskrnl-obref:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-obref-gate.sh
+
+test-ntoskrnl-pnptest:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-pnptest-gate.sh
+
+test-ntoskrnl-procgroup:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-procgroup-gate.sh
+
+test-ntoskrnl-procname:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-procname-gate.sh
+
+test-ntoskrnl-queue:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-queue-gate.sh
+
+test-ntoskrnl-regs:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-regs-gate.sh
+
+test-ntoskrnl-reinit:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-reinit-gate.sh
+
+test-ntoskrnl-resclaim:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-resclaim-gate.sh
+
+test-ntoskrnl-shutdown:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-shutdown-gate.sh
+
+test-ntoskrnl-startio:
+	WINE=$(PREFIX)/bin/wine test/ntoskrnl-startio-gate.sh
+
+test-ole32-cachefreeze:
+	WINE=$(PREFIX)/bin/wine test/ole32-cachefreeze-gate.sh
+
+test-ole32-callas:
+	WINE=$(PREFIX)/bin/wine test/ole32-callas-gate.sh
+
+test-ole32-colorset:
+	WINE=$(PREFIX)/bin/wine test/ole32-colorset-gate.sh
+
+test-ole32-enumskip:
+	WINE=$(PREFIX)/bin/wine test/ole32-enumskip-gate.sh
+
+test-ole32-handler:
+	WINE=$(PREFIX)/bin/wine test/ole32-handler-gate.sh
+
+test-ole32-monikers:
+	WINE=$(PREFIX)/bin/wine test/ole32-monikers-gate.sh
+
+test-ole32-olestreamex:
+	WINE=$(PREFIX)/bin/wine test/ole32-olestreamex-gate.sh
+
+test-ole32-proptimes:
+	WINE=$(PREFIX)/bin/wine test/ole32-proptimes-gate.sh
+
+test-ole32-setdata:
+	WINE=$(PREFIX)/bin/wine test/ole32-setdata-gate.sh
+
+test-ole32-staticdata:
+	WINE=$(PREFIX)/bin/wine test/ole32-staticdata-gate.sh
+
+test-ole32-stgconvert:
+	WINE=$(PREFIX)/bin/wine test/ole32-stgconvert-gate.sh
+
+test-ole32-stgopenex:
+	WINE=$(PREFIX)/bin/wine test/ole32-stgopenex-gate.sh
+
+test-ole32-viewcallas:
+	WINE=$(PREFIX)/bin/wine test/ole32-viewcallas-gate.sh
+
+test-oleaut32-hfont:
+	WINE=$(PREFIX)/bin/wine test/oleaut32-hfont-gate.sh
+
+test-oleaut32-propbag-qa:
+	WINE=$(PREFIX)/bin/wine test/oleaut32-propbag-qa-gate.sh
+
+test-oleaut32-propframe-initial:
+	WINE=$(PREFIX)/bin/wine test/oleaut32-propframe-initial-gate.sh
+
+test-oleaut32-recinfo:
+	WINE=$(PREFIX)/bin/wine test/oleaut32-recinfo-gate.sh
+
+test-oleaut32-tlcallas:
+	WINE=$(PREFIX)/bin/wine test/oleaut32-tlcallas-gate.sh
+
+test-oleaut32-typelibname:
+	WINE=$(PREFIX)/bin/wine test/oleaut32-typelibname-gate.sh
+
+test-onlineid-inspectable:
+	WINE=$(PREFIX)/bin/wine test/onlineid-inspectable-gate.sh
+
+test-rpcrt4-async:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-async-gate.sh
+
+test-rpcrt4-async-rpc:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-async-rpc-gate.sh
+
+test-rpcrt4-canceltimeout:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-canceltimeout-gate.sh
+
+test-rpcrt4-clearout:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-clearout-gate.sh
+
+test-rpcrt4-comtimeout:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-comtimeout-gate.sh
+
+test-rpcrt4-convert:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-convert-gate.sh
+
+test-rpcrt4-cstruct:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-cstruct-gate.sh
+
+test-rpcrt4-fcwstring:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-fcwstring-gate.sh
+
+test-rpcrt4-httprts:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-httprts-gate.sh
+
+test-rpcrt4-ifids:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-ifids-gate.sh
+
+test-rpcrt4-pipe:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-pipe-gate.sh
+
+test-rpcrt4-ptrgap:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-ptrgap-gate.sh
+
+test-rpcrt4-unregifex:
+	WINE=$(PREFIX)/bin/wine test/rpcrt4-unregifex-gate.sh
+
+test-user32-ddedisconnect:
+	WINE=$(PREFIX)/bin/wine test/user32-ddedisconnect-gate.sh
+
+test-webcore-inspectable:
+	WINE=$(PREFIX)/bin/wine test/webcore-inspectable-gate.sh
+
+test-webcore-mapview:
+	WINE=$(PREFIX)/bin/wine test/webcore-mapview-gate.sh
+
+test-win32u-coloradjust:
+	WINE=$(PREFIX)/bin/wine test/win32u-coloradjust-gate.sh
+
+test-win32u-getpixelclip:
+	WINE=$(PREFIX)/bin/wine test/win32u-getpixelclip-gate.sh
+
+test-win32u-lockwindowupdate:
+	WINE=$(PREFIX)/bin/wine test/win32u-lockwindowupdate-gate.sh
+
+test-win32u-mouseinpointer:
+	WINE=$(PREFIX)/bin/wine test/win32u-mouseinpointer-gate.sh
+
+test-win32u-openadapterhdc:
+	WINE=$(PREFIX)/bin/wine test/win32u-openadapterhdc-gate.sh
+
+test-win32u-openadaptername:
+	WINE=$(PREFIX)/bin/wine test/win32u-openadaptername-gate.sh
