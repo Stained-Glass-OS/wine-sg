@@ -12,8 +12,11 @@ static int f;
 
 typedef struct { DWORD dwSize, dwFlags, dwInSpeed, dwOutSpeed; } QOC;
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* argv[1]: "offline" (a network namespace with no route) or "online" (one with a default route): the
+     * outcome is then known, not read from the host's own routing table */
+    const char *mode = argc > 1 ? argv[1] : "host";
     BOOL (WINAPI *pDestA)(const char *, QOC *), (WINAPI *pDestW)(const WCHAR *, QOC *);
     HRESULT (WINAPI *pInet)(void);
     HMODULE s = LoadLibraryA("sensapi.dll"), c = LoadLibraryA("connect.dll");
@@ -46,12 +49,18 @@ int main(void)
     /* a public address: reachable exactly when the routing table has an interface for it */
     a.sin_addr.s_addr = htonl(0x08080808);
     err = GetBestInterfaceEx((SOCKADDR *)&a, &index);
+    if (!strcmp(mode, "offline")) CHECK(err != NO_ERROR, "the namespace was meant to have no route, got %lu", err);
+    if (!strcmp(mode, "online")) CHECK(err == NO_ERROR, "the namespace was meant to have a default route, got %lu", err);
     ok = pDestA("8.8.8.8", NULL);
     CHECK(ok == (err == NO_ERROR), "8.8.8.8: reachable %d, routing table says %lu", ok, err);
+    if (!strcmp(mode, "offline")) CHECK(!ok, "8.8.8.8 must be unreachable with no route");
+    if (!strcmp(mode, "online")) CHECK(ok, "8.8.8.8 must be reachable with a default route");
     if (pInet)
     {
         HRESULT hr = pInet();
         CHECK(hr == (err == NO_ERROR ? S_OK : S_FALSE), "IsInternetConnected %#lx, routing table says %lu", hr, err);
+        if (!strcmp(mode, "offline")) CHECK(hr == S_FALSE, "IsInternetConnected %#lx with no route", hr);
+        if (!strcmp(mode, "online")) CHECK(hr == S_OK, "IsInternetConnected %#lx with a default route", hr);
     }
     else CHECK(0, "connect.dll has no IsInternetConnected");
     printf("note: default route %s\n", err == NO_ERROR ? "present" : "absent");
