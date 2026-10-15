@@ -35,6 +35,15 @@ Suites (user32 win32u, 64 and 32 vs the series-applied base): no new failures (u
 
 - 5215 win32u FlashWindowEx timers (47). 5216 win32u/wow64win accessibility SPI sets (66).
 
+## 2026-10-14, batch 3: patches 5215-5221
+- 5215 win32u FlashWindowEx timers (47). 5216 win32u/wow64win accessibility SPI sets (66).
+- 5217 win32u ActivateKeyboardLayout aliased layouts (699) + WM_INPUTLANGCHANGE charset for UTF-8 locales.
+- 5218 win32u ETO_NUMERICSLOCAL / ETO_NUMERICSLATIN (717).
+- 5219 win32u wglShareLists for software OpenGL (720).
+- 5220 win32u D3DKMTQueryAdapterInfo for 5 types (65): PARTIAL, escalated (other types need hardware KMD data).
+- 5221 user32 XDnD data object GetDataHere / GetCanonicalFormatEtc (627, 628).
+Suites (gdi32 user32 win32u, 64 and 32, vs the series-applied base): no new failures.
+
 ## Still open (see /var/tmp/fast-b/s6c-STATE.md)
 gdi32: 40 (remaining EMR types: GLS, DRAWESCAPE, EXTESCAPE, NAMEDESCAPE, STARTDOC, COLORCORRECTPALETTE, SETLINKEDUFI, COLORMATCHTOTARGETW), 232/233 UpdateICMRegKey, 237-240 + 838 OpenType (GSUB/GPOS formats, alternate glyphs, feature filtering), 938/939/965 umpd Eng*.
 user32: 627/628 clipboard data object (needs an XDnD gate), 651 RegisterTouchHitTestingWindow, 656 devnotify W->A, 659 SetDisplayConfig, 662 DdeQueryConvInfo remote.

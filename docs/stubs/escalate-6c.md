@@ -8,3 +8,4 @@
 - 651 RegisterTouchHitTestingWindow (5208, partial): WM_TOUCHHITTESTING is not sent; needs the hit-testing protocol on the 1150 touch path plus PackTouchHitTestingProximityEvaluation (652).
 - 645/646 WINNLSEnableIME / WINNLSGetEnableStatus (5213, partial): the IME_WINDOWUPDATE effect is missing.
 - 659 SetDisplayConfig (5209): changes real display modes; CORE review: display (virtual desktop / compositor path unverified, gate on Xvfb only).
+- 65 NtGdiDdDDIQueryAdapterInfo (5220, partial): the types that carry hardware KMD data (UMDRIVERNAME, ADAPTERADDRESS, ADAPTERREGISTRYINFO, MODELIST, DRIVERVERSION, WDDM caps ...) stay STATUS_NOT_IMPLEMENTED.
