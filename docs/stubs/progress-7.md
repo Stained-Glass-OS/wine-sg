@@ -15,3 +15,5 @@ Done (implemented, with the new conformance unit dlls/uiautomationcore/tests/pat
 Triaged no-ground-truth (reason in the tsv): MSAA role/state to pattern mapping (msaa_provider_GetPatternProvider), contents of the default proxy factory table, the landmark GUIDs of UiaLookupId, property conditions on Double/Point/Rect/Element values, UiaProviderFromIAccessible undefined flag bits.
 
 Conformance: full uiautomationcore suite (patterns 1636 checks, uiautomation 8278 checks), 64- and 32-bit, no new failures against the unmodified base (outputs compared with cmpsuite.py).
+
+cleancheck (clean tarball plus the series, configure, build of dlls/uiautomationcore and its tests): CLEAN-OK. The skipped patches (3590, 3636) are fast-b's own.
