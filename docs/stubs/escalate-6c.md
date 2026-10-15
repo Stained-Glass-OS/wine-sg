@@ -9,3 +9,6 @@
 - 645/646 WINNLSEnableIME / WINNLSGetEnableStatus (5213, partial): the IME_WINDOWUPDATE effect is missing.
 - 659 SetDisplayConfig (5209): changes real display modes; CORE review: display (virtual desktop / compositor path unverified, gate on Xvfb only).
 - 65 NtGdiDdDDIQueryAdapterInfo (5220, partial): the types that carry hardware KMD data (UMDRIVERNAME, ADAPTERADDRESS, ADAPTERREGISTRYINFO, MODELIST, DRIVERVERSION, WDDM caps ...) stay STATUS_NOT_IMPLEMENTED.
+- 40 PlayEnhMetaFileRecord (5222, partial): EMR_GLSRECORD / GLSBOUNDEDRECORD (OpenGL data format unspecified), EMR_COLORCORRECTPALETTE and EMR_COLORMATCHTOTARGETW (need WCS) are not played.
+- 232/233 UpdateICMRegKey (5223, partial): ICM_SETDEFAULTPROFILE, matcher registration and DEVMODE query not done.
+- 965 XFORMOBJ_iGetXform: needs engine-created XFORMOBJs first.

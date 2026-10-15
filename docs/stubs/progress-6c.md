@@ -44,7 +44,18 @@ Suites (user32 win32u, 64 and 32 vs the series-applied base): no new failures (u
 - 5221 user32 XDnD data object GetDataHere / GetCanonicalFormatEtc (627, 628).
 Suites (gdi32 user32 win32u, 64 and 32, vs the series-applied base): no new failures.
 
-## Still open (see /var/tmp/fast-b/s6c-STATE.md)
-gdi32: 40 (remaining EMR types: GLS, DRAWESCAPE, EXTESCAPE, NAMEDESCAPE, STARTDOC, COLORCORRECTPALETTE, SETLINKEDUFI, COLORMATCHTOTARGETW), 232/233 UpdateICMRegKey, 237-240 + 838 OpenType (GSUB/GPOS formats, alternate glyphs, feature filtering), 938/939/965 umpd Eng*.
-user32: 627/628 clipboard data object (needs an XDnD gate), 651 RegisterTouchHitTestingWindow, 656 devnotify W->A, 659 SetDisplayConfig, 662 DdeQueryConvInfo remote.
-win32u: 47 FlashWindowEx timers, 65 QueryAdapterInfo types, 66 SPI accessibility sets, 699 aliased keyboard layout, 713 MNS_AUTODISMISS, 717 ETO_NUMERICS*, 720 wglShareLists.
+## 2026-10-14, batch 4: patches 5222-5225
+- 5222 gdi32 EMF playback of EXTESCAPE / DRAWESCAPE / NAMEDESCAPE and the UFI records (40): PARTIAL (GLS, COLORCORRECTPALETTE, COLORMATCHTOTARGETW still not played), escalated.
+- 5223 gdi32 UpdateICMRegKey add / query / delete through mscms (232, 233): PARTIAL (default profile, CMM registration, DEVMODE query), escalated.
+- 5224 gdi32 OpenType: GSUB ChainContextSubst format 1, GPOS ContextPos format 1 and 3, GPOS ChainContextPos format 1 and 2, ScriptGetFontAlternateGlyphs, ScriptGetFontFeatureTags filtering (237, 238, 239, 240, 838).
+- 5225 gdi32 EngCreateClip / EngDeleteClip (939, 938). XFORMOBJ_iGetXform (965) escalated: no engine path creates an XFORMOBJ.
+Suites (gdi32, usp10, 64 and 32, vs the series-applied base): no new failures.
+
+## Final tally (stubs-6c queue, 2026-10-14)
+- Implemented fully (38): gdi32 223, 224, 227, 972, 973, 216-220, 228-231, 237-240, 838, 938, 939; user32 624, 627, 628, 633, 634, 635, 636, 656, 659, 662; win32u 47, 66, 699, 713, 717, 718, 720.
+- Added by the coordinator, implemented: 669 (D3DKMTEscape).
+- Partial, escalated, not counted implemented (7): gdi32 40, 232, 233; user32 651, 645, 646; win32u 65.
+- Triaged with evidence (3): 234 (no ground truth), 965 (no engine XFORMOBJ), 995 (needs per-process DPI in wineserver).
+
+## Still open
+(none: see the tally above)
