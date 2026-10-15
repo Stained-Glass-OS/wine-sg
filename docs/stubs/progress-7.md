@@ -13,3 +13,6 @@
 - SHFormatDrive: sg-admind "format" verb (wire format is a proposal, see patches/notes/5811.txt); tests use a regular file and a stand-in spool.
 - Triaged: wiaservc AddDeviceDlg (scanner/camera, not touched), gamingtcui ShowProfileCardUI (no Xbox service).
 - Escalated: rasdlg RasEntryDlgW (needs the RAS phonebook backend, still a stub in this base; proposal in triage-7r4.tsv).
+
+### Clean build
+CLEAN-OK (clean tarball + series, dlls/shell32 and its tests, patches 5810 and 5811).
