@@ -1,0 +1,1565 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 12:00:00 +0000
+Subject: [PATCH] rpcrt4: NDR [pipe] support in the interpreter (3310)
+
+CORE review: RPC (DECISIONS-2 RPC-NDR).
+
+A procedure with a pipe parameter (Oi2 HasPipes, parameter attribute
+IsPipe, FC_PIPE type format) is no longer refused with
+RPC_X_WRONG_STUB_VERSION.  A pipe is a sequence of chunks: a count
+(4 byte aligned) and that many elements marshalled as the pipe's element
+type, ended by a chunk of none; the pipes follow the other [in] parameters
+of a request and come before the other [out] parameters and the return
+value of a response, in the order of the parameters.
+
+Client (ndr_client_call): the elements of the [in] pipes are pulled from the
+caller's Pull routine (in pieces of at most 64 KB) after the other [in]
+parameters, the elements of the [out] pipes are handed to its Push routine
+(into buffers from its Alloc, in the pieces Alloc gave), with a final Push of
+none.  Server (NdrStubCall2): the manager routine gets a pipe whose Pull
+reads the request and whose Push writes the response; a pipe the manager
+left unread is skipped, one it did not end is ended.  Whole directions are
+buffered (no streaming); the wire format is the streamed one.
+---
+
+diff --git a/dlls/rpcrt4/ndr_pipe.c b/dlls/rpcrt4/ndr_pipe.c
+new file mode 100644
+--- /dev/null
++++ b/dlls/rpcrt4/ndr_pipe.c
+@@ -0,0 +1,554 @@
++/*
++ * NDR [pipe] support for the interpreter
++ *
++ * A pipe is a sequence of chunks.  A chunk is the number of elements it holds (a 32 bit
++ * integer, 4 byte aligned) followed by the elements, each marshalled as the type of the pipe's
++ * elements; the sequence ends with a chunk of no elements.  The data of the pipes follows the
++ * other parameters in the buffer: the [in] pipes follow the other [in] parameters of the
++ * request, and the [out] pipes come before the other [out] parameters and the return value of
++ * the response, in the order of the parameters.
++ *
++ * The stubs here buffer a whole direction of the call: a client collects all the elements of its
++ * [in] pipes (with their pull callbacks) before it sends the request, and the elements of the
++ * [out] pipes are pushed to the caller once the response is complete; a server hands the [in]
++ * elements of the request to its manager routine as it pulls them and collects what it pushes
++ * into the response, which is sent when the routine returns.  The wire format is the one of
++ * streamed pipes, so a peer which streams interoperates, but a pipe cannot be longer than
++ * memory and the two directions do not overlap.
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winerror.h"
++
++#include "objbase.h"
++#include "rpc.h"
++#include "rpcproxy.h"
++
++#include "wine/exception.h"
++#include "wine/debug.h"
++
++#include "ndr_misc.h"
++#include "ndr_stubless.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(rpc);
++
++#define NDR_TABLE_MASK 127
++
++/* what the application sees of a pipe: the struct MIDL (and widl) declares for a pipe type */
++struct ndr_pipe_struct
++{
++    void (WINAPI *Pull)(char *state, void *buf, ULONG esize, ULONG *ecount);
++    void (WINAPI *Push)(char *state, void *buf, ULONG ecount);
++    void (WINAPI *Alloc)(char *state, ULONG bsize, void **buf, ULONG *bcount);
++    char *state;
++};
++
++struct ndr_pipes;
++
++struct ndr_pipe
++{
++    struct ndr_pipes *pipes;
++    const NDR_PARAM_OIF *param;
++    const unsigned char *elem_format;   /* the type of an element */
++    ULONG mem_size;                     /* of an element */
++    BOOL is_in, is_out;
++    struct ndr_pipe_struct *app;        /* the struct on the stack (or the pointer to it) */
++    struct ndr_pipe_struct own;         /* server: what the stack gets */
++    /* server, [in]: the chunk being read */
++    ULONG left;
++    BOOL in_end;
++    /* server, [out]: the terminating chunk was written */
++    BOOL out_end;
++};
++
++struct ndr_pipes
++{
++    MIDL_STUB_MESSAGE *msg;
++    BOOL server;
++    unsigned int count;
++    struct ndr_pipe *pipe;
++    /* where the elements of the [in] pipes are read from: the request of a server, the response
++     * of a client */
++    unsigned char *rbuf, *rend, *rcur;
++    /* where the chunks are written: the request of a client, the response of a server */
++    unsigned char *wbuf;
++    ULONG wlen, wcap;
++    BOOL wown;                          /* wbuf is ours (server) */
++};
++
++static inline void align_pointer_clear( unsigned char **ptr, unsigned int align )
++{
++    ULONG_PTR mask = align - 1;
++    unsigned char *aligned = (unsigned char *)(((ULONG_PTR)*ptr + mask) & ~mask);
++
++    memset( *ptr, 0, aligned - *ptr );
++    *ptr = aligned;
++}
++
++static inline void align_length( ULONG *len, unsigned int align )
++{
++    *len = (*len + align - 1) & ~(align - 1);
++}
++
++static struct ndr_pipe_struct *param_pipe_struct( unsigned char *stack, const NDR_PARAM_OIF *param )
++{
++#ifdef _WIN64
++    /* a structure this large is passed by reference */
++    return *(struct ndr_pipe_struct **)(stack + param->stack_offset);
++#else
++    return (struct ndr_pipe_struct *)(stack + param->stack_offset);
++#endif
++}
++
++struct ndr_pipes *ndr_pipes_create( MIDL_STUB_MESSAGE *msg, PFORMAT_STRING params, unsigned int count,
++                                    BOOL server )
++{
++    const NDR_PARAM_OIF *param = (const NDR_PARAM_OIF *)params;
++    struct ndr_pipes *pipes;
++    unsigned int i, n = 0;
++
++    for (i = 0; i < count; i++) if (param[i].attr.IsPipe) n++;
++    if (!n) return NULL;
++
++    pipes = calloc( 1, sizeof(*pipes) );
++    if (pipes) pipes->pipe = calloc( n, sizeof(*pipes->pipe) );
++    if (!pipes || !pipes->pipe)
++    {
++        free( pipes );
++        RpcRaiseException( RPC_X_NO_MEMORY );
++    }
++    pipes->msg = msg;
++    pipes->server = server;
++
++    for (i = 0; i < count; i++)
++    {
++        struct ndr_pipe *pipe;
++        const unsigned char *format;
++
++        if (!param[i].attr.IsPipe) continue;
++        pipe = &pipes->pipe[pipes->count++];
++        pipe->pipes = pipes;
++        pipe->param = &param[i];
++        pipe->is_in = param[i].attr.IsIn;
++        pipe->is_out = param[i].attr.IsOut;
++        format = &msg->StubDesc->pFormatTypes[param[i].u.type_offset];
++        if (*format != FC_PIPE)
++        {
++            ERR( "pipe parameter %u has format 0x%02x\n", i, *format );
++            ndr_pipes_free( pipes );
++            RpcRaiseException( RPC_X_BAD_STUB_DATA );
++        }
++        pipe->elem_format = format + 2 + *(const SHORT *)(format + 2);
++        pipe->mem_size = *(const USHORT *)(format + 4);
++        if (!pipe->mem_size)
++        {
++            ndr_pipes_free( pipes );
++            RpcRaiseException( RPC_X_BAD_STUB_DATA );
++        }
++    }
++    return pipes;
++}
++
++void ndr_pipes_free( struct ndr_pipes *pipes )
++{
++    if (!pipes) return;
++    if (pipes->wown) free( pipes->wbuf );
++    free( pipes->pipe );
++    free( pipes );
++}
++
++static void *grow( void *buf, ULONG *cap, ULONG needed )
++{
++    ULONG new_cap = *cap;
++    void *ret;
++
++    if (needed <= *cap && buf) return buf;
++    if (new_cap < 4096) new_cap = 4096;
++    while (new_cap < needed)
++    {
++        if (new_cap > 0x7fffffff / 2) { new_cap = needed; break; }
++        new_cap *= 2;
++    }
++    if (!(ret = realloc( buf, new_cap ))) RpcRaiseException( RPC_X_NO_MEMORY );
++    *cap = new_cap;
++    return ret;
++}
++
++/* a message to marshal or unmarshal with the stream positioned in, a copy so that the stub's own
++ * state is left alone */
++static void init_msg( struct ndr_pipes *pipes, MIDL_STUB_MESSAGE *msg, RPC_MESSAGE *rpc_msg )
++{
++    *msg = *pipes->msg;
++    *rpc_msg = *pipes->msg->RpcMsg;
++    msg->RpcMsg = rpc_msg;
++}
++
++/* appends a chunk of count elements (none: the end of the pipe) to the stream being written */
++static void put_chunk( struct ndr_pipe *pipe, const unsigned char *elems, ULONG count )
++{
++    struct ndr_pipes *pipes = pipe->pipes;
++    MIDL_STUB_MESSAGE msg;
++    RPC_MESSAGE rpc_msg;
++    NDR_BUFFERSIZE sizer;
++    NDR_MARSHALL marshaller;
++    ULONG i, len = pipes->wlen;
++    unsigned char *p;
++
++    init_msg( pipes, &msg, &rpc_msg );
++
++    sizer = NdrBufferSizer[*pipe->elem_format & NDR_TABLE_MASK];
++    marshaller = NdrMarshaller[*pipe->elem_format & NDR_TABLE_MASK];
++    if (!sizer || !marshaller)
++    {
++        FIXME( "pipe elements of format 0x%02x not supported\n", *pipe->elem_format );
++        RpcRaiseException( RPC_X_BAD_STUB_DATA );
++    }
++
++#ifndef SG_MUTANT_PIPE_NOALIGN
++    align_length( &len, 4 );
++#endif
++    len += 4;
++    msg.BufferLength = len;
++    for (i = 0; i < count; i++) sizer( &msg, (unsigned char *)elems + (SIZE_T)i * pipe->mem_size, (PFORMAT_STRING)pipe->elem_format );
++    if (msg.BufferLength < len || msg.BufferLength > 0x7fffffff) RpcRaiseException( RPC_X_BAD_STUB_DATA );
++
++    pipes->wbuf = grow( pipes->wbuf, &pipes->wcap, msg.BufferLength );
++    rpc_msg.Buffer = pipes->wbuf;
++    rpc_msg.BufferLength = msg.BufferLength;
++    msg.BufferLength = rpc_msg.BufferLength;
++    msg.BufferStart = pipes->wbuf;
++    msg.Buffer = pipes->wbuf + pipes->wlen;
++    p = msg.Buffer;
++#ifndef SG_MUTANT_PIPE_NOALIGN
++    align_pointer_clear( &p, 4 );
++#endif
++    p[0] = count & 0xff;
++    p[1] = (count >> 8) & 0xff;
++    p[2] = (count >> 16) & 0xff;
++    p[3] = (count >> 24) & 0xff;
++    msg.Buffer = p + 4;
++    for (i = 0; i < count; i++) marshaller( &msg, (unsigned char *)elems + (SIZE_T)i * pipe->mem_size, (PFORMAT_STRING)pipe->elem_format );
++    pipes->wlen = msg.Buffer - pipes->wbuf;
++}
++
++/* the number of elements of the next chunk: 0 for the end of the pipe */
++static ULONG get_chunk_count( struct ndr_pipes *pipes )
++{
++    ULONG count;
++
++#ifndef SG_MUTANT_PIPE_NOALIGN
++    align_pointer_clear( &pipes->rcur, 4 );
++#endif
++    if (pipes->rcur + 4 < pipes->rcur || pipes->rcur + 4 > pipes->rend)
++    {
++        ERR( "pipe data ends in the middle of a chunk header\n" );
++        RpcRaiseException( RPC_X_BAD_STUB_DATA );
++    }
++    count = pipes->rcur[0] | (pipes->rcur[1] << 8) | (pipes->rcur[2] << 16) | ((ULONG)pipes->rcur[3] << 24);
++    pipes->rcur += 4;
++    return count;
++}
++
++/* reads count elements of the current chunk */
++static void get_elements( struct ndr_pipe *pipe, unsigned char *dest, ULONG count )
++{
++    struct ndr_pipes *pipes = pipe->pipes;
++    MIDL_STUB_MESSAGE msg;
++    RPC_MESSAGE rpc_msg;
++    NDR_UNMARSHALL unmarshaller;
++    ULONG i;
++
++    unmarshaller = NdrUnmarshaller[*pipe->elem_format & NDR_TABLE_MASK];
++    if (!unmarshaller)
++    {
++        FIXME( "pipe elements of format 0x%02x not supported\n", *pipe->elem_format );
++        RpcRaiseException( RPC_X_BAD_STUB_DATA );
++    }
++    init_msg( pipes, &msg, &rpc_msg );
++    msg.BufferStart = pipes->rbuf;
++    msg.BufferEnd = pipes->rend;
++    msg.Buffer = pipes->rcur;
++    rpc_msg.Buffer = pipes->rbuf;
++    rpc_msg.BufferLength = pipes->rend - pipes->rbuf;
++    msg.BufferLength = rpc_msg.BufferLength;
++    for (i = 0; i < count; i++)
++    {
++        unsigned char *elem = dest + (SIZE_T)i * pipe->mem_size;
++        unmarshaller( &msg, &elem, (PFORMAT_STRING)pipe->elem_format, 0 );
++    }
++    pipes->rcur = msg.Buffer;
++}
++
++/* reads up to max elements, of the current chunk or of the next one: 0 at the end of the pipe */
++static ULONG read_elements( struct ndr_pipe *pipe, unsigned char *dest, ULONG max )
++{
++    ULONG n;
++
++    if (pipe->in_end) return 0;
++    if (!pipe->left)
++    {
++        if (!(pipe->left = get_chunk_count( pipe->pipes )))
++        {
++            pipe->in_end = TRUE;
++            return 0;
++        }
++    }
++    n = min( max, pipe->left );
++    if (n) get_elements( pipe, dest, n );
++    pipe->left -= n;
++    return n;
++}
++
++/* reads the rest of a pipe which was not read to its end */
++static void skip_pipe( struct ndr_pipe *pipe )
++{
++    unsigned char *scratch;
++
++#ifdef SG_MUTANT_PIPE_NOSKIP
++    return;
++#endif
++    if (pipe->in_end) return;
++    if (!(scratch = malloc( pipe->mem_size ))) RpcRaiseException( RPC_X_NO_MEMORY );
++    while (read_elements( pipe, scratch, 1 )) ;
++    free( scratch );
++}
++
++/* client */
++
++#define CLIENT_CHUNK_BYTES 65536
++
++static void CALLBACK ndr_pipes_free_buffer( BOOL normal, void *buf )
++{
++    free( buf );
++}
++
++void ndr_pipes_client_send( struct ndr_pipes *pipes, void **stack_top )
++{
++    MIDL_STUB_MESSAGE *msg = pipes->msg;
++    unsigned int i;
++
++    pipes->wbuf = msg->RpcMsg->Buffer;
++    pipes->wcap = msg->RpcMsg->BufferLength;
++    pipes->wlen = msg->Buffer - (unsigned char *)msg->RpcMsg->Buffer;
++    pipes->wown = FALSE;
++
++    for (i = 0; i < pipes->count; i++)
++    {
++        struct ndr_pipe *pipe = &pipes->pipe[i];
++        struct ndr_pipe_struct *app = param_pipe_struct( (unsigned char *)stack_top, pipe->param );
++        ULONG cap = max( 1, CLIENT_CHUNK_BYTES / pipe->mem_size ), count;
++        unsigned char *buf;
++
++        pipe->app = app;
++        if (!pipe->is_in) continue;
++        if (!app || !app->Pull) RpcRaiseException( RPC_X_NULL_REF_POINTER );
++
++        if (!(buf = malloc( (SIZE_T)cap * pipe->mem_size ))) RpcRaiseException( RPC_X_NO_MEMORY );
++        __TRY
++        {
++            for (;;)
++            {
++                count = 0;
++                app->Pull( app->state, buf, cap, &count );
++                if (count > cap)
++                {
++                    ERR( "the pull routine of pipe %u returned %lu elements for a buffer of %lu\n", i, count, cap );
++                    RpcRaiseException( RPC_X_BAD_STUB_DATA );
++                }
++#ifdef SG_MUTANT_PIPE_NOEND
++                if (!count) break;
++#endif
++                put_chunk( pipe, buf, count );
++                if (!count) break;
++            }
++        }
++        __FINALLY_CTX( ndr_pipes_free_buffer, buf )
++    }
++
++    msg->RpcMsg->Buffer = pipes->wbuf;
++    msg->RpcMsg->BufferLength = pipes->wlen;
++    msg->Buffer = pipes->wbuf + pipes->wlen;
++    msg->BufferLength = pipes->wlen;
++}
++
++/* the response of a client call has arrived: hand the elements of the [out] pipes to the caller */
++void ndr_pipes_client_receive( struct ndr_pipes *pipes, void **stack_top )
++{
++    MIDL_STUB_MESSAGE *msg = pipes->msg;
++    unsigned int i;
++
++    pipes->rbuf = msg->BufferStart;
++    pipes->rend = msg->BufferEnd;
++    pipes->rcur = msg->Buffer;
++
++    for (i = 0; i < pipes->count; i++)
++    {
++        struct ndr_pipe *pipe = &pipes->pipe[i];
++        struct ndr_pipe_struct *app = param_pipe_struct( (unsigned char *)stack_top, pipe->param );
++        ULONG count, got;
++
++        if (!pipe->is_out) continue;
++        if (!app || !app->Push) RpcRaiseException( RPC_X_NULL_REF_POINTER );
++
++        for (;;)
++        {
++            if (!(count = get_chunk_count( pipes ))) break;
++            pipe->left = count;
++            while (pipe->left)
++            {
++                unsigned char *buf = NULL, *own = NULL;
++
++                got = pipe->left;
++                if (app->Alloc)
++                {
++                    ULONG bcount = 0;
++                    app->Alloc( app->state, pipe->left * pipe->mem_size, (void **)&buf, &bcount );
++                    if (!buf || !bcount) RpcRaiseException( RPC_S_OUT_OF_RESOURCES );
++#ifdef SG_MUTANT_PIPE_ALLOCIGNORE
++                    got = pipe->left;
++#else
++                    got = min( bcount, pipe->left );
++#endif
++                }
++                else
++                {
++                    got = min( got, max( 1, CLIENT_CHUNK_BYTES / pipe->mem_size ));
++                    if (!(own = buf = malloc( (SIZE_T)got * pipe->mem_size ))) RpcRaiseException( RPC_X_NO_MEMORY );
++                }
++                __TRY
++                {
++                    get_elements( pipe, buf, got );
++                    pipe->left -= got;
++                    app->Push( app->state, buf, got );
++                }
++                __FINALLY_CTX( ndr_pipes_free_buffer, own )
++            }
++        }
++#ifndef SG_MUTANT_PIPE_CLIENTEND
++        app->Push( app->state, NULL, 0 );
++#endif
++    }
++    msg->Buffer = pipes->rcur;
++}
++
++/* server */
++
++static void WINAPI server_pull( char *state, void *buf, ULONG esize, ULONG *ecount )
++{
++    struct ndr_pipe *pipe = (struct ndr_pipe *)state;
++    struct ndr_pipes *pipes = pipe->pipes;
++    unsigned int i;
++
++    /* the pipes are read in order: what the manager left of the earlier ones is skipped */
++    for (i = 0; &pipes->pipe[i] != pipe; i++)
++        if (pipes->pipe[i].is_in) skip_pipe( &pipes->pipe[i] );
++
++    *ecount = esize ? read_elements( pipe, buf, esize ) : 0;
++}
++
++static void WINAPI server_push( char *state, void *buf, ULONG ecount )
++{
++    struct ndr_pipe *pipe = (struct ndr_pipe *)state;
++
++    if (pipe->out_end)
++    {
++        ERR( "push to a pipe which has ended\n" );
++        RpcRaiseException( RPC_X_PIPE_CLOSED );
++    }
++    if (ecount && !buf) RpcRaiseException( RPC_X_NULL_REF_POINTER );
++    put_chunk( pipe, buf, ecount );
++    if (!ecount) pipe->out_end = TRUE;
++}
++
++static void WINAPI server_alloc( char *state, ULONG bsize, void **buf, ULONG *bcount )
++{
++    struct ndr_pipe *pipe = (struct ndr_pipe *)state;
++
++    *buf = I_RpcAllocate( bsize );
++    *bcount = *buf ? bsize / pipe->mem_size : 0;
++}
++
++/* gives the pipe parameter its struct on the stack of the manager routine */
++void ndr_pipes_server_setup( struct ndr_pipes *pipes, const NDR_PARAM_OIF *param, unsigned char *arg )
++{
++    unsigned int i;
++
++    for (i = 0; i < pipes->count; i++)
++    {
++        struct ndr_pipe *pipe = &pipes->pipe[i];
++
++        if (pipe->param != param) continue;
++        pipe->own.Pull = server_pull;
++        pipe->own.Push = server_push;
++        pipe->own.Alloc = server_alloc;
++        pipe->own.state = (char *)pipe;
++#ifdef _WIN64
++        *(struct ndr_pipe_struct **)arg = &pipe->own;
++#else
++        *(struct ndr_pipe_struct *)arg = pipe->own;
++#endif
++        return;
++    }
++}
++
++/* the [in] parameters have been unmarshalled: the pipes follow */
++void ndr_pipes_server_start( struct ndr_pipes *pipes )
++{
++    MIDL_STUB_MESSAGE *msg = pipes->msg;
++
++    pipes->rbuf = msg->BufferStart;
++    pipes->rend = msg->BufferEnd;
++    pipes->rcur = msg->Buffer;
++}
++
++/* the manager routine has returned: ends the [out] pipes it did not end, and returns the length
++ * of the pipes' data */
++ULONG ndr_pipes_server_finish( struct ndr_pipes *pipes )
++{
++    unsigned int i;
++
++    for (i = 0; i < pipes->count; i++)
++    {
++        struct ndr_pipe *pipe = &pipes->pipe[i];
++
++        if (!pipe->is_out || pipe->out_end) continue;
++#ifdef SG_MUTANT_PIPE_NOTERM
++        continue;
++#endif
++        put_chunk( pipe, NULL, 0 );
++        pipe->out_end = TRUE;
++    }
++    pipes->wown = TRUE;
++    return pipes->wlen;
++}
++
++/* the response buffer: the data of the pipes, with room for the other [out] parameters after it */
++void ndr_pipes_server_get_buffer( struct ndr_pipes *pipes, MIDL_STUB_MESSAGE *msg, RPC_MESSAGE *rpc_msg )
++{
++    pipes->wbuf = grow( pipes->wbuf, &pipes->wcap, max( msg->BufferLength, 1 ) );
++    rpc_msg->Buffer = pipes->wbuf;
++    rpc_msg->BufferLength = msg->BufferLength;
++    pipes->wown = FALSE;  /* the runtime owns the buffer now */
++    msg->Buffer = pipes->wbuf + pipes->wlen;
++}
+diff --git a/dlls/rpcrt4/ndr_stubless.c b/dlls/rpcrt4/ndr_stubless.c
+--- a/dlls/rpcrt4/ndr_stubless.c
++++ b/dlls/rpcrt4/ndr_stubless.c
+@@ -488,6 +488,9 @@
+         unsigned char *pArg = pStubMsg->StackTop + params[i].stack_offset;
+         PFORMAT_STRING pTypeFormat = (PFORMAT_STRING)&pStubMsg->StubDesc->pFormatTypes[params[i].u.type_offset];
+ 
++        /* the data of a pipe is not part of the parameters' (see ndr_pipe.c) */
++        if (params[i].attr.IsPipe) continue;
++
+ #ifndef __i386__  /* floats are passed as doubles through varargs functions */
+         float f;
+ 
+@@ -669,6 +672,7 @@
+     void *This;
+     PFORMAT_STRING handle_format;
+     handle_t hbinding;
++    struct ndr_pipes *pipes;
+ };
+ 
+ static void CALLBACK ndr_client_call_finally(BOOL normal, void *arg)
+@@ -681,10 +685,7 @@
+         NdrCorrelationFree(ctx->stub_msg);
+     }
+ 
+-    if (ctx->Oif_flags.HasPipes)
+-    {
+-        /* NdrPipesDone(...) */
+-    }
++    ndr_pipes_free(ctx->pipes);
+ 
+     /* free the full pointer translation tables */
+     if (ctx->proc_header->Oi_flags & Oi_FULL_PTR_USED)
+@@ -735,6 +736,7 @@
+     finally_ctx.This = This;
+     finally_ctx.handle_format = handle_format;
+     finally_ctx.hbinding = hbinding;
++    finally_ctx.pipes = NULL;
+ 
+     __TRY
+     {
+@@ -759,10 +761,9 @@
+ 
+         if (Oif_flags.HasPipes)
+         {
+-            FIXME("pipes not supported yet\n");
+-            RpcRaiseException(RPC_X_WRONG_STUB_VERSION); /* FIXME: remove when implemented */
+-            /* init pipes package */
+-            /* NdrPipesInitialize(...) */
++            /* the pipes are for remote procedures (MIDL does not allow them in an interface of objects) */
++            if (proc_header->Oi_flags & Oi_OBJECT_PROC) RpcRaiseException(RPC_X_WRONG_STUB_VERSION);
++            finally_ctx.pipes = ndr_pipes_create(stub_msg, format, number_of_params, FALSE);
+         }
+         if (ext_flags.HasNewCorrDesc)
+         {
+@@ -799,8 +800,6 @@
+         TRACE( "GETBUFFER\n" );
+         if (proc_header->Oi_flags & Oi_OBJECT_PROC)
+             NdrProxyGetBuffer(This, stub_msg);
+-        else if (Oif_flags.HasPipes)
+-            FIXME("pipes not supported yet\n");
+         else if (proc_header->handle_type == FC_AUTO_HANDLE)
+ #if 0
+             NdrNsGetBuffer(stub_msg, stub_msg->BufferLength, hBinding);
+@@ -815,13 +814,13 @@
+         client_do_args(stub_msg, format, STUBLESS_MARSHAL, fpu_args,
+                        number_of_params, (unsigned char *)&retval);
+ 
++        /* the elements of the [in] pipes follow the other parameters */
++        if (finally_ctx.pipes) ndr_pipes_client_send(finally_ctx.pipes, stack_top);
++
+         /* 5. SENDRECEIVE */
+         TRACE( "SENDRECEIVE\n" );
+         if (proc_header->Oi_flags & Oi_OBJECT_PROC)
+             NdrProxySendReceive(This, stub_msg);
+-        else if (Oif_flags.HasPipes)
+-            /* NdrPipesSendReceive(...) */
+-            FIXME("pipes not supported yet\n");
+         else if (proc_header->handle_type == FC_AUTO_HANDLE)
+ #if 0
+             NdrNsSendReceive(stub_msg, stub_msg->Buffer, pStubDesc->IMPLICIT_HANDLE_INFO.pAutoHandle);
+@@ -836,6 +835,9 @@
+         if ((rpc_msg.DataRepresentation & 0x0000FFFFUL) != NDR_LOCAL_DATA_REPRESENTATION)
+             NdrConvert(stub_msg, format);
+ 
++        /* the elements of the [out] pipes come before the other parameters */
++        if (finally_ctx.pipes) ndr_pipes_client_receive(finally_ctx.pipes, stack_top);
++
+         /* 6. UNMARSHAL */
+         TRACE( "UNMARSHAL\n" );
+         client_do_args(stub_msg, format, STUBLESS_UNMARSHAL, fpu_args,
+@@ -1137,7 +1139,7 @@
+ 
+ static LONG_PTR *stub_do_args(MIDL_STUB_MESSAGE *pStubMsg,
+                               PFORMAT_STRING pFormat, enum stubless_phase phase,
+-                              unsigned short number_of_params)
++                              unsigned short number_of_params, struct ndr_pipes *pipes)
+ {
+     const NDR_PARAM_OIF *params = (const NDR_PARAM_OIF *)pFormat;
+     unsigned int i;
+@@ -1148,6 +1150,14 @@
+         unsigned char *pArg = pStubMsg->StackTop + params[i].stack_offset;
+         const unsigned char *pTypeFormat = &pStubMsg->StubDesc->pFormatTypes[params[i].u.type_offset];
+ 
++        if (params[i].attr.IsPipe)
++        {
++            /* the manager routine gets a pipe whose callbacks read the request and write the response */
++            if (!pipes) RpcRaiseException(RPC_X_WRONG_STUB_VERSION);
++            if (phase == STUBLESS_UNMARSHAL) ndr_pipes_server_setup(pipes, &params[i], pArg);
++            continue;
++        }
++
+         TRACE("param[%d]: %p -> %p type %02x %s\n", i,
+               pArg, *(unsigned char **)pArg,
+               params[i].attr.IsBasetype ? params[i].u.type_format_char : *pTypeFormat,
+@@ -1254,6 +1264,8 @@
+     LONG_PTR *retval_ptr = NULL;
+     /* correlation cache */
+     ULONG_PTR NdrCorrCache[256];
++    /* the pipes of the call */
++    struct ndr_pipes *pipes = NULL;
+ 
+     TRACE("pThis %p, pChannel %p, pRpcMsg %p, pdwStubPhase %p\n", pThis, pChannel, pRpcMsg, pdwStubPhase);
+ 
+@@ -1362,13 +1374,6 @@
+             pFormat += extensions->Size;
+         }
+ 
+-        if (Oif_flags.HasPipes)
+-        {
+-            FIXME("pipes not supported yet\n");
+-            RpcRaiseException(RPC_X_WRONG_STUB_VERSION); /* FIXME: remove when implemented */
+-            /* init pipes package */
+-            /* NdrPipesInitialize(...) */
+-        }
+         if (ext_flags.HasNewCorrDesc)
+         {
+             /* initialize extra correlation package */
+@@ -1385,6 +1390,13 @@
+                                     NdrCorrCache, sizeof(NdrCorrCache), &number_of_params );
+     }
+ 
++    if (Oif_flags.HasPipes)
++    {
++        /* the pipes are for remote procedures (MIDL does not allow them in an interface of objects) */
++        if (pProcHeader->Oi_flags & Oi_OBJECT_PROC) RpcRaiseException(RPC_X_WRONG_STUB_VERSION);
++        pipes = ndr_pipes_create(&stubMsg, pFormat, number_of_params, TRUE);
++    }
++
+     /* convert strings, floating point values and endianness into our
+      * preferred format */
+     if ((pRpcMsg->DataRepresentation & 0x0000FFFFUL) != NDR_LOCAL_DATA_REPRESENTATION)
+@@ -1396,6 +1408,9 @@
+         switch (phase)
+         {
+         case STUBLESS_CALLSERVER:
++            /* the pipes follow the other [in] parameters */
++            if (pipes) ndr_pipes_server_start(pipes);
++
+             /* call the server function */
+             if (pServerInfo->ThunkTable && pServerInfo->ThunkTable[pRpcMsg->ProcNum])
+                 pServerInfo->ThunkTable[pRpcMsg->ProcNum](&stubMsg);
+@@ -1424,12 +1439,17 @@
+             }
+ 
+             stubMsg.Buffer = NULL;
+-            stubMsg.BufferLength = 0;
++            /* the response starts with what the manager pushed into the [out] pipes */
++            stubMsg.BufferLength = pipes ? ndr_pipes_server_finish(pipes) : 0;
+ 
+             break;
+         case STUBLESS_GETBUFFER:
+             if (pProcHeader->Oi_flags & Oi_OBJECT_PROC)
+                 NdrStubGetBuffer(pThis, pChannel, &stubMsg);
++            else if (pipes)
++            {
++                ndr_pipes_server_get_buffer(pipes, &stubMsg, pRpcMsg);
++            }
+             else
+             {
+                 RPC_STATUS Status;
+@@ -1448,7 +1468,7 @@
+         case STUBLESS_MARSHAL:
+         case STUBLESS_MUSTFREE:
+         case STUBLESS_FREE:
+-            retval_ptr = stub_do_args(&stubMsg, pFormat, phase, number_of_params);
++            retval_ptr = stub_do_args(&stubMsg, pFormat, phase, number_of_params, pipes);
+             break;
+         default:
+             ERR("shouldn't reach here. phase %d\n", phase);
+@@ -1464,10 +1484,7 @@
+         NdrCorrelationFree(&stubMsg);
+     }
+ 
+-    if (Oif_flags.HasPipes)
+-    {
+-        /* NdrPipesDone(...) */
+-    }
++    ndr_pipes_free(pipes);
+ 
+     /* free the full pointer translation tables */
+     if (pProcHeader->Oi_flags & Oi_FULL_PTR_USED)
+@@ -2068,11 +2085,11 @@
+ 
+     /* 1. UNMARSHAL */
+     TRACE("UNMARSHAL\n");
+-    stub_do_args(async_call_data->pStubMsg, pFormat, STUBLESS_UNMARSHAL, async_call_data->number_of_params);
++    stub_do_args(async_call_data->pStubMsg, pFormat, STUBLESS_UNMARSHAL, async_call_data->number_of_params, NULL);
+ 
+     /* 2. INITOUT */
+     TRACE("INITOUT\n");
+-    async_call_data->retval_ptr = stub_do_args(async_call_data->pStubMsg, pFormat, STUBLESS_INITOUT, async_call_data->number_of_params);
++    async_call_data->retval_ptr = stub_do_args(async_call_data->pStubMsg, pFormat, STUBLESS_INITOUT, async_call_data->number_of_params, NULL);
+ 
+     /* 3. CALLSERVER */
+     TRACE("CALLSERVER\n");
+@@ -2137,7 +2154,7 @@
+         case STUBLESS_MARSHAL:
+         case STUBLESS_MUSTFREE:
+         case STUBLESS_FREE:
+-            stub_do_args(pStubMsg, async_call_data->pHandleFormat, phase, async_call_data->number_of_params);
++            stub_do_args(pStubMsg, async_call_data->pHandleFormat, phase, async_call_data->number_of_params, NULL);
+             break;
+         default:
+             ERR("shouldn't reach here. phase %d\n", phase);
+diff --git a/dlls/rpcrt4/ndr_stubless.h b/dlls/rpcrt4/ndr_stubless.h
+--- a/dlls/rpcrt4/ndr_stubless.h
++++ b/dlls/rpcrt4/ndr_stubless.h
+@@ -256,6 +256,16 @@
+     STUBLESS_FREE
+ };
+ 
++struct ndr_pipes;
++struct ndr_pipes *ndr_pipes_create( MIDL_STUB_MESSAGE *msg, PFORMAT_STRING params, unsigned int count, BOOL server );
++void ndr_pipes_free( struct ndr_pipes *pipes );
++void ndr_pipes_client_send( struct ndr_pipes *pipes, void **stack_top );
++void ndr_pipes_client_receive( struct ndr_pipes *pipes, void **stack_top );
++void ndr_pipes_server_setup( struct ndr_pipes *pipes, const NDR_PARAM_OIF *param, unsigned char *arg );
++void ndr_pipes_server_start( struct ndr_pipes *pipes );
++ULONG ndr_pipes_server_finish( struct ndr_pipes *pipes );
++void ndr_pipes_server_get_buffer( struct ndr_pipes *pipes, MIDL_STUB_MESSAGE *msg, RPC_MESSAGE *rpc_msg );
++
+ DWORD calc_arg_size(MIDL_STUB_MESSAGE *pStubMsg, PFORMAT_STRING pFormat);
+ void client_do_args( PMIDL_STUB_MESSAGE pStubMsg, PFORMAT_STRING pFormat, enum stubless_phase phase,
+                      BOOLEAN fpu_args, unsigned short number_of_params, unsigned char *pRetVal );
+diff --git a/dlls/rpcrt4/Makefile.in b/dlls/rpcrt4/Makefile.in
+--- a/dlls/rpcrt4/Makefile.in
++++ b/dlls/rpcrt4/Makefile.in
+@@ -15,6 +15,7 @@
+ 	ndr_fullpointer.c \
+ 	ndr_marshall.c \
+ 	ndr_ole.c \
++	ndr_pipe.c \
+ 	ndr_stubless.c \
+ 	ndr_typelib.c \
+ 	ndr_types.idl \
+diff --git a/test/rpcrt4-pipe.idl b/test/rpcrt4-pipe.idl
+new file mode 100644
+--- /dev/null
++++ b/test/rpcrt4-pipe.idl
+@@ -0,0 +1,17 @@
++[uuid(5ee0e9e4-b001-4c01-9001-0123456789ab), version(1.0)]
++interface PipeT
++{
++    typedef struct { long a; short b; } REC;
++    typedef pipe long LPIPE;
++    typedef pipe REC RECPIPE;
++    typedef pipe char CPIPE;
++    typedef pipe hyper HPIPE;
++
++    long SumIn([in] handle_t h, [in] LPIPE p, [in] long scale);
++    void Gen([in] handle_t h, [in] long n, [in] long chunk, [out] LPIPE p);
++    void Echo([in] handle_t h, [in,out] LPIPE p);
++    void Recs([in] handle_t h, [in] RECPIPE r, [out] long *total, [out] CPIPE c);
++    long Skip([in] handle_t h, [in] LPIPE first, [in] LPIPE second, [in] long take_first);
++    long Mixed([in] handle_t h, [in] long a, [in] HPIPE in_p, [in] short b, [out] HPIPE out_p, [out] long *c);
++    void Stop([in] handle_t h);
++}
+diff --git a/test/rpcrt4-pipe-probe.c b/test/rpcrt4-pipe-probe.c
+new file mode 100644
+--- /dev/null
++++ b/test/rpcrt4-pipe-probe.c
+@@ -0,0 +1,611 @@
++/* NDR [pipe] between two processes: a widl-generated client and server (ncalrpc and ncacn_ip_tcp on 127.0.0.1).
++ *   probe server PROTSEQ ENDPOINT    serves until the client calls Stop
++ *   probe client PROTSEQ ENDPOINT    runs the checks, prints RESULT: PASS or FAIL
++ * Pipes of long, of a structure, of hyper and of char (the chunk header and the elements are aligned apart),
++ * [in], [out] and [in, out], megabytes of data, short and long pull and push calls, an Alloc which gives less than
++ * asked, a manager which leaves a pipe unread, and pipes between the other parameters and the return value. */
++#include <windows.h>
++#include <rpc.h>
++#include <rpcndr.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "rpcrt4-pipe.h"
++
++static int failures;
++static void check(int ok, const char *what)
++{
++    static DWORD last;
++    DWORD now = GetTickCount();
++    printf("%s  %s (%lu ms)\n", ok ? "PASS" : "FAIL", what, last ? now - last : 0);
++    last = now;
++    fflush(stdout);
++    if (!ok) failures++;
++}
++
++void *__RPC_USER MIDL_user_allocate(size_t size) { return malloc(size); }
++void __RPC_USER MIDL_user_free(void *p) { free(p); }
++
++#define N_BIG 1200000  /* 4.8 MB of long */
++#define VAL(i) ((LONG)((ULONG)(i) * 3u + 1u))
++
++/* ---- server: the manager routines ---- */
++
++static LONG sum_pipe(LPIPE p)
++{
++    LONG buf[777];
++    ULONG n, sum = 0, i;
++    for (;;)
++    {
++        n = 0;
++        p.Pull(p.state, buf, 777, &n);
++        if (!n) break;
++        for (i = 0; i < n; i++) sum += (ULONG)buf[i];
++    }
++    return (LONG)sum;
++}
++
++LONG s_SumIn(handle_t h, LPIPE p, LONG scale)
++{
++    return sum_pipe(p) * scale;
++}
++
++void s_Gen(handle_t h, LONG n, LONG chunk, LPIPE p)
++{
++    /* a negative chunk size: the manager forgets to end the pipe (the stub does it) */
++    BOOL forget = chunk < 0;
++    LONG *buf;
++    LONG done = 0, i;
++    if (forget) chunk = -chunk;
++    buf = malloc(chunk * sizeof(LONG));
++    while (done < n)
++    {
++        LONG count = min(chunk, n - done);
++        for (i = 0; i < count; i++) buf[i] = VAL(done + i);
++        p.Push(p.state, buf, count);
++        done += count;
++    }
++    if (!forget) p.Push(p.state, buf, 0);
++    free(buf);
++}
++
++void s_Echo(handle_t h, LPIPE p)
++{
++    LONG buf[500];
++    ULONG n, i;
++    for (;;)
++    {
++        n = 0;
++        p.Pull(p.state, buf, 500, &n);
++        if (!n) break;
++        for (i = 0; i < n; i++) buf[i] += 1;
++        p.Push(p.state, buf, n);
++    }
++    p.Push(p.state, buf, 0);
++}
++
++void s_Recs(handle_t h, RECPIPE r, LONG *total, CPIPE c)
++{
++    REC buf[100];
++    char out[100];
++    ULONG n, i, count = 0;
++    LONG sum = 0;
++    for (;;)
++    {
++        n = 0;
++        r.Pull(r.state, buf, 100, &n);
++        if (!n) break;
++        for (i = 0; i < n; i++)
++        {
++            sum += buf[i].a + buf[i].b;
++            out[i] = 'A' + (count + i) % 26;
++        }
++        count += n;
++        c.Push(c.state, out, n);
++    }
++    c.Push(c.state, out, 0);
++    *total = sum;
++}
++
++LONG s_Skip(handle_t h, LPIPE first, LPIPE second, LONG take_first)
++{
++    LONG sum = 0;
++    if (take_first) sum += sum_pipe(first);
++    sum += sum_pipe(second);
++    return sum;
++}
++
++LONG s_Mixed(handle_t h, LONG a, HPIPE in_p, short b, HPIPE out_p, LONG *c)
++{
++    LONGLONG buf[64], sum = 0;
++    ULONG n, i;
++    for (;;)
++    {
++        n = 0;
++        in_p.Pull(in_p.state, buf, 64, &n);
++        if (!n) break;
++        for (i = 0; i < n; i++) sum += buf[i];
++    }
++    buf[0] = sum;
++    buf[1] = sum + 1;
++    out_p.Push(out_p.state, buf, 2);
++    buf[0] = a;
++    out_p.Push(out_p.state, buf, 1);
++    out_p.Push(out_p.state, buf, 0);
++    *c = a + b;
++    return a * b;
++}
++
++void s_Stop(handle_t h)
++{
++    RpcMgmtStopServerListening(NULL);
++}
++
++/* ---- client: sources and sinks ---- */
++
++struct src { LONG n, next; ULONG calls; };
++
++static void WINAPI src_pull(char *state, LONG *buf, ULONG esize, ULONG *ecount)
++{
++    struct src *s = (struct src *)state;
++    ULONG want = 1 + (s->calls++ * 37) % 5000, i;
++    if (want > esize) want = esize;
++    if (want > (ULONG)(s->n - s->next)) want = s->n - s->next;
++    for (i = 0; i < want; i++) buf[i] = VAL(s->next + i);
++    s->next += want;
++    *ecount = want;
++}
++
++struct sink { LONG next, add, bad, ended, pushes; ULONG max_chunk; };
++
++static void WINAPI sink_alloc(char *state, ULONG bsize, LONG **buf, ULONG *bcount)
++{
++    *buf = malloc(bsize);
++    *bcount = min(bsize / sizeof(LONG), 1000);
++}
++
++static void WINAPI sink_push(char *state, LONG *buf, ULONG ecount)
++{
++    struct sink *s = (struct sink *)state;
++    ULONG i;
++    if (!ecount)
++    {
++        s->ended++;
++        free(buf);
++        return;
++    }
++    s->pushes++;
++    if (ecount > s->max_chunk) s->max_chunk = ecount;
++    for (i = 0; i < ecount; i++)
++        if (buf[i] != VAL(s->next + i) + s->add) s->bad++;
++    s->next += ecount;
++    free(buf);
++}
++
++struct rsrc { LONG n, next; };
++
++static void WINAPI rec_pull(char *state, REC *buf, ULONG esize, ULONG *ecount)
++{
++    struct rsrc *s = (struct rsrc *)state;
++    ULONG want = min(esize, 41), i;
++    if (want > (ULONG)(s->n - s->next)) want = s->n - s->next;
++    for (i = 0; i < want; i++) { buf[i].a = (s->next + i) * 5; buf[i].b = (short)((s->next + i) % 100); }
++    s->next += want;
++    *ecount = want;
++}
++
++struct csink { LONG count, bad, ended; };
++
++static void WINAPI char_alloc(char *state, ULONG bsize, char **buf, ULONG *bcount)
++{
++    *buf = malloc(bsize);
++    *bcount = bsize;
++}
++
++static void WINAPI char_push(char *state, char *buf, ULONG ecount)
++{
++    struct csink *s = (struct csink *)state;
++    ULONG i;
++    if (!ecount) { s->ended++; free(buf); return; }
++    for (i = 0; i < ecount; i++)
++        if (buf[i] != 'A' + (s->count + i) % 26) s->bad++;
++    s->count += ecount;
++    free(buf);
++}
++
++struct hsrc { LONG n, next; };
++
++static void WINAPI hyper_pull(char *state, LONGLONG *buf, ULONG esize, ULONG *ecount)
++{
++    struct hsrc *s = (struct hsrc *)state;
++    ULONG want = min(esize, 9), i;
++    if (want > (ULONG)(s->n - s->next)) want = s->n - s->next;
++    for (i = 0; i < want; i++) buf[i] = ((LONGLONG)1 << 40) + s->next + i;
++    s->next += want;
++    *ecount = want;
++}
++
++struct hsink { LONGLONG v[8]; LONG count, ended; };
++
++static void WINAPI hyper_alloc(char *state, ULONG bsize, LONGLONG **buf, ULONG *bcount)
++{
++    *buf = malloc(bsize);
++    *bcount = bsize / sizeof(LONGLONG);
++}
++
++static void WINAPI hyper_push(char *state, LONGLONG *buf, ULONG ecount)
++{
++    struct hsink *s = (struct hsink *)state;
++    ULONG i;
++    if (!ecount) { s->ended++; free(buf); return; }
++    for (i = 0; i < ecount && s->count < 8; i++) s->v[s->count++] = buf[i];
++    free(buf);
++}
++
++struct echo { LONG n, next; ULONG calls; LONG rnext, bad, ended; };
++
++static void WINAPI echo_pull(char *state, LONG *buf, ULONG esize, ULONG *ecount)
++{
++    struct echo *e = (struct echo *)state;
++    ULONG want = min(esize, 1 + (e->calls++ * 13) % 900), i;
++    if (want > (ULONG)(e->n - e->next)) want = e->n - e->next;
++    for (i = 0; i < want; i++) buf[i] = VAL(e->next + i);
++    e->next += want;
++    *ecount = want;
++}
++
++static void WINAPI echo_alloc(char *state, ULONG bsize, LONG **buf, ULONG *bcount)
++{
++    *buf = malloc(bsize);
++    *bcount = bsize / sizeof(LONG);
++}
++
++static void WINAPI echo_push(char *state, LONG *buf, ULONG ecount)
++{
++    struct echo *e = (struct echo *)state;
++    ULONG i;
++    if (!ecount) { e->ended++; free(buf); return; }
++    for (i = 0; i < ecount; i++)
++        if (buf[i] != VAL(e->rnext + i) + 1) e->bad++;
++    e->rnext += ecount;
++    free(buf);
++}
++
++static ULONG expect_sum(LONG n)
++{
++    ULONG sum = 0;
++    LONG i;
++    for (i = 0; i < n; i++) sum += (ULONG)VAL(i);
++    return sum;
++}
++
++static void run_checks(handle_t h)
++{
++    struct src s;
++    struct sink k;
++    struct echo e;
++    LPIPE in, out, io;
++    LONG ret;
++
++    /* [in] pipe, megabytes, with the other parameters around it */
++    memset(&s, 0, sizeof(s)); s.n = N_BIG;
++    in.Pull = src_pull; in.Push = NULL; in.Alloc = NULL; in.state = (char *)&s;
++    ret = SumIn(h, in, 3);
++    check(ret == (LONG)(expect_sum(N_BIG) * 3u), "[in] pipe of 1.2 million longs: the sum comes back scaled by the other parameter");
++    check(s.next == N_BIG && s.calls > 200, "the stub pulled the source to its end with many pull calls");
++
++    memset(&s, 0, sizeof(s)); s.n = 0;
++    ret = SumIn(h, in, 7);
++    check(ret == 0, "an empty [in] pipe");
++
++    memset(&s, 0, sizeof(s)); s.n = 1;
++    ret = SumIn(h, in, 7);
++    check(ret == 7, "an [in] pipe of one element");
++
++    /* [out] pipe */
++    memset(&k, 0, sizeof(k));
++    out.Pull = NULL; out.Push = sink_push; out.Alloc = sink_alloc; out.state = (char *)&k;
++    Gen(h, N_BIG, 4096, out);
++    check(k.next == N_BIG && k.bad == 0 && k.ended == 1, "[out] pipe of 1.2 million longs in chunks of 4096: every element, one end");
++    check(k.max_chunk <= 1000 && k.pushes >= 1200, "an Alloc which gives less than asked: the stub pushes in pieces of the size it got");
++
++    memset(&k, 0, sizeof(k));
++    Gen(h, 0, 10, out);
++    check(k.next == 0 && k.ended == 1 && k.pushes == 0, "an empty [out] pipe");
++
++    memset(&k, 0, sizeof(k));
++    Gen(h, 1, 10, out);
++    check(k.next == 1 && k.bad == 0 && k.ended == 1, "an [out] pipe of one element");
++
++    /* a manager which forgets to end its [out] pipe: the stub ends it */
++    memset(&k, 0, sizeof(k));
++    Gen(h, 1000, -300, out);
++    check(k.next == 1000 && k.bad == 0 && k.ended == 1, "an [out] pipe the manager did not end is ended when the manager returns");
++
++    /* [in, out] pipe: pulled and pushed back, interleaved on the server */
++    memset(&e, 0, sizeof(e)); e.n = 100000;
++    io.Pull = echo_pull; io.Push = echo_push; io.Alloc = echo_alloc; io.state = (char *)&e;
++    Echo(h, io);
++    check(e.rnext == 100000 && e.bad == 0 && e.ended == 1, "[in, out] pipe of 100000 longs: every element comes back incremented");
++
++    /* a pipe of structures, an [out] pipe of char and an [out] long after them */
++    {
++        struct rsrc rs = { 5000, 0 };
++        struct csink cs = { 0, 0, 0 };
++        RECPIPE rp;
++        CPIPE cp;
++        LONG total = 0, want = 0, i;
++
++        rp.Pull = rec_pull; rp.Push = NULL; rp.Alloc = NULL; rp.state = (char *)&rs;
++        cp.Pull = NULL; cp.Push = char_push; cp.Alloc = char_alloc; cp.state = (char *)&cs;
++        for (i = 0; i < 5000; i++) want += i * 5 + i % 100;
++        Recs(h, rp, &total, cp);
++        check(total == want, "[in] pipe of structures (long, short): the [out] long after the pipes is right");
++        check(cs.count == 5000 && cs.bad == 0 && cs.ended == 1, "[out] pipe of char: 5000 bytes in order, one end");
++    }
++
++    /* a manager which never reads the first pipe, then one which reads both */
++    {
++        struct src a, b;
++        LPIPE pa, pb;
++
++        memset(&a, 0, sizeof(a)); a.n = 5000;
++        memset(&b, 0, sizeof(b)); b.n = 7000;
++        pa.Pull = pb.Pull = src_pull; pa.Push = pb.Push = NULL; pa.Alloc = pb.Alloc = NULL;
++        pa.state = (char *)&a; pb.state = (char *)&b;
++        ret = Skip(h, pa, pb, 0);
++        check(ret == (LONG)expect_sum(7000), "a manager which leaves the first [in] pipe unread still reads the second");
++        check(a.next == 5000 && b.next == 7000, "the client's pull routines ran to the end all the same");
++
++        memset(&a, 0, sizeof(a)); a.n = 5000;
++        memset(&b, 0, sizeof(b)); b.n = 7000;
++        ret = Skip(h, pa, pb, 1);
++        check(ret == (LONG)(expect_sum(5000) + expect_sum(7000)), "a manager which reads both pipes");
++    }
++
++    /* pipes between the other parameters: hyper elements (8 byte aligned), [out] pipe, [out] long, return value */
++    {
++        struct hsrc hs = { 100, 0 };
++        struct hsink hk;
++        HPIPE hi, ho;
++        LONG c = 0;
++        LONGLONG sum = 0;
++        int i;
++
++        memset(&hk, 0, sizeof(hk));
++        hi.Pull = hyper_pull; hi.Push = NULL; hi.Alloc = NULL; hi.state = (char *)&hs;
++        ho.Pull = NULL; ho.Push = hyper_push; ho.Alloc = hyper_alloc; ho.state = (char *)&hk;
++        for (i = 0; i < 100; i++) sum += ((LONGLONG)1 << 40) + i;
++        ret = Mixed(h, 1000, hi, -7, ho, &c);
++        check(ret == -7000 && c == 993, "the return value and the [out] long after the pipes");
++        check(hk.count == 3 && hk.v[0] == sum && hk.v[1] == sum + 1 && hk.v[2] == 1000 && hk.ended == 1,
++              "hyper pipes: the sum of 100 values (8 byte elements) comes back in an [out] pipe");
++    }
++}
++
++
++/* ---- the wire: requests and responses written out by hand ---- */
++
++#define U32(v) (v) & 0xff, ((v) >> 8) & 0xff, ((v) >> 16) & 0xff, ((v) >> 24) & 0xff
++#define U64(v) U32((unsigned)(v)), U32((unsigned)((unsigned long long)(v) >> 32))
++
++/* SumIn(h, pipe of VAL(0), VAL(1), VAL(2) pulled 1 then 2 at a time, 3): the non-pipe parameter first,
++ * then the chunks: a count and the elements, the end a chunk of none */
++static const unsigned char sumin_req[] = {
++    U32(3),
++    U32(1), U32(1),
++    U32(2), U32(4), U32(7),
++    U32(0)
++};
++static const unsigned char sumin_resp[] = { U32(36) };
++
++/* Mixed(h, 1000, pipe of 1<<40, (1<<40)+1, -7, out pipe, &c): long, short (2 bytes of padding),
++ * the chunk (its count, 4 bytes of padding so that the hyper elements are 8 byte aligned), the end */
++#define H0 (1ULL << 40)
++#define HS (2ULL * H0 + 1)
++static const unsigned char mixed_req[] = {
++    U32(1000), 0xf9, 0xff, 0, 0,
++    U32(2), U32(0), U64(H0), U64(H0 + 1),
++    U32(0)
++};
++/* the [out] pipe first: chunk of 2 (sum, sum+1), chunk of 1 (1000), the end; then the [out] long and the return value */
++static const unsigned char mixed_resp[] = {
++    U32(2), U32(0), U64(HS), U64(HS + 1),
++    U32(1), U32(0), U64(1000),
++    U32(0),
++    U32(993),
++    U32((unsigned)-7000)
++};
++
++static void raw_reply(PRPC_MESSAGE msg, const void *data, ULONG len)
++{
++    msg->BufferLength = len;
++    if (I_RpcGetBuffer(msg)) RpcRaiseException(RPC_S_OUT_OF_MEMORY);
++    memcpy(msg->Buffer, data, len);
++}
++
++static void dump(const char *what, const unsigned char *p, ULONG len)
++{
++    ULONG i;
++    printf("raw: %s (%lu bytes):", what, len);
++    for (i = 0; i < len; i++) printf(" %02x", p[i]);
++    printf("\n");
++    fflush(stdout);
++}
++
++static BOOL raw_expect(PRPC_MESSAGE msg, const char *what, const void *req, ULONG len)
++{
++    BOOL ok = msg->BufferLength == len && !memcmp(msg->Buffer, req, len);
++    if (!ok)
++    {
++        printf("raw: the %s request is not what the wire format asks for\n", what);
++        dump("expected", req, len);
++        dump("got", msg->Buffer, msg->BufferLength);
++    }
++    return ok;
++}
++
++static void __RPC_STUB raw_sumin(PRPC_MESSAGE msg)
++{
++    static const unsigned char bad[] = { U32(0xdeadbeef) };
++    if (raw_expect(msg, "SumIn", sumin_req, sizeof(sumin_req))) raw_reply(msg, sumin_resp, sizeof(sumin_resp));
++    else raw_reply(msg, bad, sizeof(bad));
++}
++
++static void __RPC_STUB raw_mixed(PRPC_MESSAGE msg)
++{
++    unsigned char bad[sizeof(mixed_resp)];
++    if (raw_expect(msg, "Mixed", mixed_req, sizeof(mixed_req))) raw_reply(msg, mixed_resp, sizeof(mixed_resp));
++    else { memset(bad, 0xee, sizeof(bad)); raw_reply(msg, bad, sizeof(bad)); }
++}
++
++static void __RPC_STUB raw_stop(PRPC_MESSAGE msg)
++{
++    raw_reply(msg, "", 0);
++    RpcMgmtStopServerListening(NULL);
++}
++
++static void __RPC_STUB raw_other(PRPC_MESSAGE msg)
++{
++    printf("raw: unexpected call of procedure %u\n", msg->ProcNum);
++    RpcRaiseException(RPC_S_PROCNUM_OUT_OF_RANGE);
++}
++
++static RPC_SERVER_INTERFACE raw_if;
++static RPC_DISPATCH_TABLE raw_table;
++static RPC_DISPATCH_FUNCTION raw_funcs[7] = { raw_sumin, raw_other, raw_other, raw_other, raw_other, raw_mixed, raw_stop };
++
++static int run_server_if(const char *protseq, const char *endpoint, RPC_IF_HANDLE ifh)
++{
++    RPC_STATUS status;
++
++    status = RpcServerUseProtseqEpA((RPC_CSTR)protseq, RPC_C_PROTSEQ_MAX_REQS_DEFAULT, (RPC_CSTR)endpoint, NULL);
++    if (status) { printf("server: RpcServerUseProtseqEp failed %lu\n", status); return 1; }
++    status = RpcServerRegisterIf(ifh, NULL, NULL);
++    if (status) { printf("server: RpcServerRegisterIf failed %lu\n", status); return 1; }
++    printf("READY\n");
++    fflush(stdout);
++    status = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, FALSE);
++    printf("server: done (%lu)\n", status);
++    return 0;
++}
++
++static int run_server(const char *protseq, const char *endpoint)
++{
++    return run_server_if(protseq, endpoint, s_PipeT_v1_0_s_ifspec);
++}
++
++static int run_rawserver(const char *protseq, const char *endpoint)
++{
++    memcpy(&raw_if, s_PipeT_v1_0_s_ifspec, sizeof(raw_if));
++    raw_table.DispatchTableCount = 7;
++    raw_table.DispatchTable = raw_funcs;
++    raw_if.DispatchTable = &raw_table;
++    return run_server_if(protseq, endpoint, (RPC_IF_HANDLE)&raw_if);
++}
++
++/* a request sent as bytes to the real server; the response must be the bytes of the wire format */
++static RPC_STATUS raw_call(handle_t h, unsigned proc, const void *req, ULONG len, unsigned char **resp, ULONG *resp_len)
++{
++    RPC_MESSAGE m;
++    RPC_STATUS status;
++
++    memset(&m, 0, sizeof(m));
++    m.Handle = h;
++    m.ProcNum = proc | RPC_FLAGS_VALID_BIT;
++    m.RpcInterfaceInformation = (void *)PipeT_v1_0_c_ifspec;
++    m.DataRepresentation = NDR_LOCAL_DATA_REPRESENTATION;
++    m.BufferLength = len;
++    status = I_RpcGetBuffer(&m);
++    if (status) return status;
++    memcpy(m.Buffer, req, len);
++    status = I_RpcSendReceive(&m);
++    if (status) return status;
++    *resp = malloc(m.BufferLength);
++    memcpy(*resp, m.Buffer, m.BufferLength);
++    *resp_len = m.BufferLength;
++    I_RpcFreeBuffer(&m);
++    return RPC_S_OK;
++}
++
++static void run_rawclient(handle_t h)
++{
++    unsigned char *resp;
++    ULONG len;
++    RPC_STATUS status;
++
++    status = raw_call(h, 0, sumin_req, sizeof(sumin_req), &resp, &len);
++    check(!status && len == sizeof(sumin_resp) && !memcmp(resp, sumin_resp, len),
++          "the server stub reads a request of the wire format by hand and answers with the bytes of the format (SumIn)");
++    if (!status && (len != sizeof(sumin_resp) || memcmp(resp, sumin_resp, len))) dump("SumIn response", resp, len);
++
++    status = raw_call(h, 5, mixed_req, sizeof(mixed_req), &resp, &len);
++    check(!status && len == sizeof(mixed_resp) && !memcmp(resp, mixed_resp, len),
++          "the same with 8 byte elements and the [out] pipe before the other [out] parameters (Mixed)");
++    if (!status && (len != sizeof(mixed_resp) || memcmp(resp, mixed_resp, len))) dump("Mixed response", resp, len);
++}
++
++/* the widl client against a server which checks the request bytes */
++static void run_rawcheck(handle_t h)
++{
++    struct src s;
++    struct hsrc hs = { 2, 0 };
++    struct hsink hk;
++    LPIPE in;
++    HPIPE hi, ho;
++    LONG ret, c = 0;
++
++    memset(&s, 0, sizeof(s)); s.n = 3;
++    in.Pull = src_pull; in.Push = NULL; in.Alloc = NULL; in.state = (char *)&s;
++    ret = SumIn(h, in, 3);
++    check(ret == 36, "the client stub sends the request of the wire format (SumIn)");
++
++    memset(&hk, 0, sizeof(hk));
++    hi.Pull = hyper_pull; hi.Push = NULL; hi.Alloc = NULL; hi.state = (char *)&hs;
++    ho.Pull = NULL; ho.Push = hyper_push; ho.Alloc = hyper_alloc; ho.state = (char *)&hk;
++    ret = Mixed(h, 1000, hi, -7, ho, &c);
++    check(ret == -7000 && c == 993 && hk.count == 3 && hk.v[0] == (LONGLONG)HS && hk.v[1] == (LONGLONG)HS + 1 && hk.v[2] == 1000 && hk.ended == 1,
++          "and reads the response of the wire format (Mixed)");
++}
++
++static int run_client(const char *protseq, const char *endpoint, int mode)
++{
++    RPC_STATUS status;
++    RPC_CSTR str = NULL;
++    handle_t h = NULL;
++
++    status = RpcStringBindingComposeA(NULL, (RPC_CSTR)protseq, (RPC_CSTR)(strcmp(protseq, "ncalrpc") ? "127.0.0.1" : NULL),
++                                      (RPC_CSTR)endpoint, NULL, &str);
++    if (!status) status = RpcBindingFromStringBindingA(str, &h);
++    check(!status, "binding");
++    if (status) return 1;
++    RpcStringFreeA(&str);
++
++    if (mode == 1) run_rawclient(h);
++    else if (mode == 2) run_rawcheck(h);
++    else run_checks(h);
++    Stop(h);
++    RpcBindingFree(&h);
++    printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
++    return failures != 0;
++}
++
++static LONG WINAPI filter(EXCEPTION_POINTERS *ep)
++{
++    printf("FAIL  exception %08lx\n", ep->ExceptionRecord->ExceptionCode);
++    printf("RESULT: FAIL\n");
++    fflush(stdout);
++    ExitProcess(3);
++    return EXCEPTION_EXECUTE_HANDLER;
++}
++
++int main(int argc, char **argv)
++{
++    SetUnhandledExceptionFilter(filter);
++    if (argc < 4) return 2;
++    if (!strcmp(argv[1], "server")) return run_server(argv[2], argv[3]);
++    if (!strcmp(argv[1], "rawserver")) return run_rawserver(argv[2], argv[3]);
++    if (!strcmp(argv[1], "rawclient")) return run_client(argv[2], argv[3], 1);
++    if (!strcmp(argv[1], "rawcheck")) return run_client(argv[2], argv[3], 2);
++    return run_client(argv[2], argv[3], 0);
++}
+diff --git a/test/rpcrt4-pipe-gate.sh b/test/rpcrt4-pipe-gate.sh
+new file mode 100644
+--- /dev/null
++++ b/test/rpcrt4-pipe-gate.sh
+@@ -0,0 +1,68 @@
++#!/bin/sh
++. "$(dirname "$0")/scratch-home.sh"
++# CORE rpcrt4: NDR [pipe] (widl-generated client and server in two processes, ncalrpc and ncacn_ip_tcp on 127.0.0.1), 64+32 bit.
++#
++#   WINE=/path/to/build/wine test/rpcrt4-pipe-gate.sh   (WINESERVER=..., WIDL=... when not beside $WINE)
++# Mutants: PIPE_* (see patches/notes/3309.txt).
++set -u
++HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
++WINE="${WINE:-/opt/wine-sg/bin/wine}"
++WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
++[ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
++[ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
++WIDL="${WIDL:-$(dirname "$WINE")/tools/widl/widl}"
++[ -x "$WIDL" ] || WIDL="$(dirname "$WINE")/widl"
++[ -x "$WIDL" ] || { echo "SKIP: no widl"; exit 77; }
++"$WIDL" --help 2>&1 | grep -q . || exit 77
++for cc in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
++    command -v $cc >/dev/null || { echo "SKIP: $cc not installed"; exit 77; }
++done
++RC=0
++T=$(mktemp -d /var/tmp/sg-rpcrt4-pipe.XXXXXX)
++export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
++SRV=""
++cleanup() { [ -n "$SRV" ] && kill "$SRV" 2>/dev/null; "$WINESERVER" -k 2>/dev/null; rm -rf "$T" "${SG_GATE_HOME:-$T}"; }
++trap cleanup EXIT INT TERM
++for a in x86_64 i686; do
++    case $a in x86_64) m=--win64; ;; *) m=--win32; esac
++    mkdir -p "$T/$a"
++    cp "$HERE/rpcrt4-pipe.idl" "$T/$a/"
++    (cd "$T/$a" && "$WIDL" $m -Oif --prefix-server=s_ -h -H rpcrt4-pipe.h -o /dev/null rpcrt4-pipe.idl \
++        && "$WIDL" $m -Oif --prefix-server=s_ -c -o rpcrt4-pipe_c.c rpcrt4-pipe.idl \
++        && "$WIDL" $m -Oif --prefix-server=s_ -s -o rpcrt4-pipe_s.c rpcrt4-pipe.idl) \
++        || { echo "FAIL  widl did not run ($a)"; exit 1; }
++    TMPDIR=/var/tmp $a-w64-mingw32-gcc -O1 -I"$T/$a" -o "$T/probe-$a.exe" "$HERE/rpcrt4-pipe-probe.c" \
++        "$T/$a/rpcrt4-pipe_c.c" "$T/$a/rpcrt4-pipe_s.c" -lrpcrt4 \
++        || { echo "FAIL  probe did not build ($a)"; exit 1; }
++done
++mkdir -p "$WINEPREFIX"
++timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
++"$WINESERVER" -w
++# SG_QUICK=1: 64-bit ncalrpc only; SG_QUICK=tcp: 64-bit ncacn_ip_tcp only (for the mutants)
++ARCHES="x86_64 i686"; T1="ncalrpc sg_pipe_ep"; T2="ncacn_ip_tcp 49187"
++case "${SG_QUICK:-}" in 1) ARCHES=x86_64; T2="";; tcp) ARCHES=x86_64; T1="";; esac
++for a in $ARCHES; do
++    for t in "$T1" "$T2"; do
++        [ -n "$t" ] || continue
++        for pair in "server client" "rawserver rawcheck" "server rawclient"; do
++            set -- $pair
++            echo "== $a $t: $1 / $2"
++            : > "$T/server.out"
++            (cd "$T" && exec timeout -s KILL 240 env DISPLAY= "$WINE" "$T/probe-$a.exe" $1 $t >"$T/server.out" 2>&1 </dev/null) &
++            SRV=$!
++            n=0
++            until grep -q READY "$T/server.out" 2>/dev/null || [ $n -ge 60 ]; do sleep 1; n=$((n + 1)); done
++            grep -q READY "$T/server.out" || { echo "FAIL  the server did not start"; cat "$T/server.out"; RC=1; kill $SRV 2>/dev/null; SRV=""; continue; }
++            out=$(cd "$T" && timeout -s KILL 200 env DISPLAY= "$WINE" "$T/probe-$a.exe" $2 $t 2>/dev/null </dev/null | tr -d '\r')
++            printf '%s\n' "$out" | sed 's/^/      /'
++            printf '%s\n' "$out" | grep -qx 'RESULT: PASS' || { RC=1; grep '^raw:' "$T/server.out" | sed 's/^/      server /'; }
++            # the server leaves when the client called Stop
++            n=0
++            while kill -0 $SRV 2>/dev/null && [ $n -lt 15 ]; do sleep 1; n=$((n + 1)); done
++            kill $SRV 2>/dev/null; SRV=""
++            "$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null
++        done
++    done
++done
++[ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
++exit "$RC"
+diff --git a/patches/notes/3310.txt b/patches/notes/3310.txt
+new file mode 100644
+--- /dev/null
++++ b/patches/notes/3310.txt
+@@ -0,0 +1,7 @@
++CORE: integrator must review (rpcrt4 is loaded by everything). CORE review: RPC
++3310 rpcrt4: NDR [pipe] in the interpreter (DECISIONS-2 RPC-NDR). Needs widl 3309 for the gate.
++Implements: ndr_pipe.c (chunks, element marshalling through the format tables, client Pull/Push/Alloc, server Pull/Push/Alloc, skipping of unread pipes, ending of unended ones), hooks in ndr_client_call and NdrStubCall2 (stub_do_args/client_do_args skip IsPipe parameters).
++Unverified / guesses (no Windows to compare): the FC_PIPE format layout and parameter flags (shared with widl 3309); Alloc's bcount in elements; Pull's esize in elements; chunk header alignment 4; [out] pipes before the other [out] parameters. Not done: streaming (a pipe longer than memory; in and out data overlapping in time), pipes with asynchronous calls (RPC_X_WRONG_STUB_VERSION kept), pipes of types with pointers or conformance, pipes in object (DCOM) interfaces (MIDL forbids them). A fault raised in the middle of a call leaks the call's pipe state (NdrStubCall2 has no unwinding).
++Gate test/rpcrt4-pipe-gate.sh: widl-generated client and server in two processes over ncalrpc and ncacn_ip_tcp, 64+32 bit: [in]/[out]/[in,out] pipes of long, structure, hyper, char; 4.8 MB; empty; partial Alloc; unread pipe; unended pipe; pipes among other parameters and return value; a hand-written wire format of the request/response checked both ways (raw server, raw client).
++Mutants shown caught: PIPE_NOALIGN, PIPE_NOEND, PIPE_NOSKIP, PIPE_ALLOCIGNORE, PIPE_CLIENTEND, PIPE_NOTERM.
++Conformance: rpcrt4 suites 64/32 same failures as the base (rpc.rpc 8, server 1: environment), ole32, combase unchanged.
+-- 
+2.47.0
