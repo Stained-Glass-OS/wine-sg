@@ -1,0 +1,1580 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Tue, 13 Oct 2026 13:02:57 -0700
+Subject: [PATCH] msdaps: row and rowset proxies, ICommand::Execute parameters,
+ Bind for other objects (3191)
+
+row_server.c: the rowset proxy and server forward RestartPosition, Compare, GetRowsByBookmark and Hash
+(the bookmark arrays travel as one buffer), GetReferencedRowset and GetSpecification, AddRefAccessor; IRow::
+GetSourceRowset and Open for rows and for other objects; the server hands back rowsets wrapped so they marshal
+as rowset servers; IMarshal::DisconnectObject. usrmarshal.c: ICommand::Execute marshals DBPARAMS (the rows
+and the data behind their pointer slots, as an RMTPACK; output parameters come back), IBindResource::Bind
+for objects other than rows and rowsets.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+
+diff --git a/dlls/msdaps/row_server.c b/dlls/msdaps/row_server.c
+index e7f9574..1b2fb40 100644
+--- a/dlls/msdaps/row_server.c
++++ b/dlls/msdaps/row_server.c
+@@ -101,7 +101,9 @@ static HRESULT WINAPI server_QueryInterface(IWineRowServer *iface, REFIID riid,
+     }
+     else
+     {
+-        if(!IsEqualIID(riid, &IID_IMarshal)) /* We use standard marshalling */
++        static const GUID iid_extconn = {0x00000019,0,0,{0xc0,0,0,0,0,0,0,0x46}};
++        /* We use standard marshalling: IMarshal and IExternalConnection are asked for and not there */
++        if(!IsEqualIID(riid, &IID_IMarshal) && !IsEqualIID(riid, &iid_extconn))
+             FIXME("interface %s not implemented\n", debugstr_guid(riid));
+         return E_NOINTERFACE;
+     }
+@@ -156,6 +158,119 @@ static HRESULT WINAPI server_GetMarshal(IWineRowServer *iface, IMarshal **marsha
+     return S_OK;
+ }
+ 
++/* An object the server hands back for a rowset it created from a provider object (GetSourceRowset,
++   GetReferencedRowset): it marshals as a new rowset server around that object. */
++typedef struct
++{
++    IUnknown IUnknown_iface;
++    LONG ref;
++    IWineRowServer *server;
++    IMarshal *marshal;
++    IUnknown *inner;
++} wrapped_rowset;
++
++static inline wrapped_rowset *impl_from_wrapped(IUnknown *iface)
++{
++    return CONTAINING_RECORD(iface, wrapped_rowset, IUnknown_iface);
++}
++
++static HRESULT WINAPI wrapped_QueryInterface(IUnknown *iface, REFIID riid, void **obj)
++{
++    wrapped_rowset *This = impl_from_wrapped(iface);
++
++    *obj = NULL;
++    if(IsEqualIID(riid, &IID_IUnknown))
++        *obj = iface;
++    else if(IsEqualIID(riid, &IID_IMarshal))
++        *obj = This->marshal;
++    else
++        return IUnknown_QueryInterface(This->inner, riid, obj);
++
++    IUnknown_AddRef((IUnknown *)*obj);
++    return S_OK;
++}
++
++static ULONG WINAPI wrapped_AddRef(IUnknown *iface)
++{
++    wrapped_rowset *This = impl_from_wrapped(iface);
++    return InterlockedIncrement(&This->ref);
++}
++
++static ULONG WINAPI wrapped_Release(IUnknown *iface)
++{
++    wrapped_rowset *This = impl_from_wrapped(iface);
++    LONG ref = InterlockedDecrement(&This->ref);
++
++    if(!ref)
++    {
++        IMarshal_Release(This->marshal);
++        IWineRowServer_Release(This->server);
++        IUnknown_Release(This->inner);
++        HeapFree(GetProcessHeap(), 0, This);
++    }
++    return ref;
++}
++
++static const IUnknownVtbl wrapped_vtbl = { wrapped_QueryInterface, wrapped_AddRef, wrapped_Release };
++
++/* Checks that rowset supports riid, then returns an object that marshals as a rowset server for it. */
++static HRESULT wrap_rowset(IUnknown *rowset, REFIID riid, IUnknown **out)
++{
++    wrapped_rowset *w;
++    IUnknown *check;
++    HRESULT hr;
++
++    *out = NULL;
++    hr = IUnknown_QueryInterface(rowset, riid, (void **)&check);
++    if(FAILED(hr)) return hr;
++    IUnknown_Release(check);
++
++    w = HeapAlloc(GetProcessHeap(), 0, sizeof(*w));
++    if(!w) return E_OUTOFMEMORY;
++
++    hr = CoCreateInstance(&CLSID_wine_rowset_server, NULL, CLSCTX_INPROC_SERVER, &IID_IWineRowServer,
++                          (void **)&w->server);
++    if(FAILED(hr))
++    {
++        HeapFree(GetProcessHeap(), 0, w);
++        return hr;
++    }
++    IWineRowServer_SetInnerUnk(w->server, rowset);
++    IWineRowServer_GetMarshal(w->server, &w->marshal);
++    IUnknown_AddRef(rowset);
++    w->inner = rowset;
++    w->IUnknown_iface.lpVtbl = &wrapped_vtbl;
++    w->ref = 1;
++    *out = &w->IUnknown_iface;
++    return S_OK;
++}
++
++/* The bookmark arrays travel as one buffer: bookmark i is rgcb[i] bytes long. */
++static HRESULT unpack_bookmarks(DBCOUNTITEM count, const DBBKMARK rgcb[], ULONG packed_len, const BYTE *packed,
++                                const BYTE ***ptrs)
++{
++    const BYTE **p;
++    ULONG_PTR off = 0;
++    DBCOUNTITEM i;
++
++    *ptrs = NULL;
++    if(!count) return S_OK;
++    p = CoTaskMemAlloc(count * sizeof(*p));
++    if(!p) return E_OUTOFMEMORY;
++    for(i = 0; i < count; i++)
++    {
++        if(rgcb[i] > packed_len || off + rgcb[i] > packed_len)
++        {
++            CoTaskMemFree(p);
++            return E_INVALIDARG;
++        }
++        p[i] = packed + off;
++        off += rgcb[i];
++    }
++    *ptrs = p;
++    return S_OK;
++}
++
+ static HRESULT WINAPI server_GetColumns(IWineRowServer* iface, DBORDINAL num_cols,
+                                         wine_getcolumns_in *in_data, wine_getcolumns_out *out_data)
+ {
+@@ -208,8 +323,34 @@ static HRESULT WINAPI server_GetSourceRowset(IWineRowServer* iface, REFIID riid,
+                                              HROW *phRow)
+ {
+     server *This = impl_from_IWineRowServer(iface);
+-    FIXME("(%p): stub\n", This);
+-    return E_NOTIMPL;
++    IRow *row;
++    IUnknown *rowset = NULL;
++    HRESULT hr;
++
++    TRACE("(%p)->(%s, %p, %p)\n", This, debugstr_guid(riid), ppRowset, phRow);
++
++    *ppRowset = NULL;
++    *phRow = DB_NULL_HROW;
++
++    hr = IUnknown_QueryInterface(This->inner_unk, &IID_IRow, (void**)&row);
++    if(FAILED(hr)) return hr;
++
++    hr = IRow_GetSourceRowset(row, riid, &rowset, phRow);
++    IRow_Release(row);
++
++    if(SUCCEEDED(hr) && rowset)
++    {
++#ifdef SG_MUTANT_MSD_NO_WRAP
++        HRESULT hr2 = IUnknown_QueryInterface(rowset, riid, (void **)ppRowset);
++#else
++        HRESULT hr2 = wrap_rowset(rowset, riid, ppRowset);
++#endif
++        IUnknown_Release(rowset);
++        if(FAILED(hr2)) hr = hr2;
++    }
++
++    TRACE("returning %08lx\n", hr);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI server_Open(IWineRowServer* iface, IUnknown *pUnkOuter, DBID *pColumnID,
+@@ -233,10 +374,16 @@ static HRESULT WINAPI server_Open(IWineRowServer* iface, IUnknown *pUnkOuter, DB
+ 
+     if(IsEqualGUID(rguidColumnType, &DBGUID_ROWSET))
+         hr = CoCreateInstance(&CLSID_wine_rowset_server, NULL, CLSCTX_INPROC_SERVER, &IID_IWineRowServer, (void**)&new_server);
++    else if(IsEqualGUID(rguidColumnType, &DBGUID_ROW))
++        hr = CoCreateInstance(&CLSID_wine_row_server, NULL, CLSCTX_INPROC_SERVER, &IID_IWineRowServer, (void**)&new_server);
+     else
+     {
+-        FIXME("Unhandled object %s\n", debugstr_guid(rguidColumnType));
+-        hr = E_NOTIMPL;
++        /* a stream or a provider-specific object: no server of ours knows its interfaces, so it goes
++           out as the provider made it and is marshaled through riid's own proxy */
++        hr = IRow_Open(row, NULL, pColumnID, rguidColumnType, dwBindFlags, riid, ppUnk);
++        IRow_Release(row);
++        TRACE("returning %08lx\n", hr);
++        return hr;
+     }
+ 
+     if(FAILED(hr))
+@@ -388,8 +535,19 @@ static HRESULT WINAPI server_ReleaseRows(IWineRowServer* iface, DBCOUNTITEM cRow
+ static HRESULT WINAPI server_RestartPosition(IWineRowServer* iface, HCHAPTER hReserved)
+ {
+     server *This = impl_from_IWineRowServer(iface);
+-    FIXME("(%p)->(%08Ix): stub\n", This, hReserved);
+-    return E_NOTIMPL;
++    IRowset *rowset;
++    HRESULT hr;
++
++    TRACE("(%p)->(%08Ix)\n", This, hReserved);
++
++    hr = IUnknown_QueryInterface(This->inner_unk, &IID_IRowset, (void**)&rowset);
++    if(FAILED(hr)) return hr;
++
++    hr = IRowset_RestartPosition(rowset, hReserved);
++    IRowset_Release(rowset);
++
++    TRACE("returning %08lx\n", hr);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI server_Compare(IWineRowServer *iface, HCHAPTER hReserved, DBBKMARK cbBookmark1,
+@@ -397,8 +555,21 @@ static HRESULT WINAPI server_Compare(IWineRowServer *iface, HCHAPTER hReserved,
+                                      DBCOMPARE *pComparison)
+ {
+     server *This = impl_from_IWineRowServer(iface);
+-    FIXME("(%p): stub\n", This);
+-    return E_NOTIMPL;
++    IRowsetLocate *rowsetlocate;
++    HRESULT hr;
++
++    TRACE("(%p)->(%08Ix, %Id, %p, %Id, %p, %p)\n", This, hReserved, cbBookmark1, pBookmark1, cbBookmark2,
++          pBookmark2, pComparison);
++
++    hr = IUnknown_QueryInterface(This->inner_unk, &IID_IRowsetLocate, (void**)&rowsetlocate);
++    if(FAILED(hr)) return hr;
++
++    hr = IRowsetLocate_Compare(rowsetlocate, hReserved, cbBookmark1, pBookmark1, cbBookmark2, pBookmark2,
++                               pComparison);
++    IRowsetLocate_Release(rowsetlocate);
++
++    TRACE("returning %08lx\n", hr);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI server_GetRowsAt(IWineRowServer *iface, HWATCHREGION hReserved1, HCHAPTER hReserved2,
+@@ -426,21 +597,59 @@ static HRESULT WINAPI server_GetRowsAt(IWineRowServer *iface, HWATCHREGION hRese
+ }
+ 
+ static HRESULT WINAPI server_GetRowsByBookmark(IWineRowServer *iface, HCHAPTER hReserved, DBCOUNTITEM cRows,
+-                                               const DBBKMARK rgcbBookmarks[], const BYTE * rgpBookmarks[],
++                                               const DBBKMARK rgcbBookmarks[], ULONG cbPacked, const BYTE *packed,
+                                                HROW rghRows[], DBROWSTATUS rgRowStatus[])
+ {
+     server *This = impl_from_IWineRowServer(iface);
+-    FIXME("(%p): stub\n", This);
+-    return E_NOTIMPL;
++    IRowsetLocate *rowsetlocate;
++    const BYTE **ptrs;
++    HRESULT hr;
++
++    TRACE("(%p)->(%08Ix, %Id, %p, %lu, %p, %p, %p)\n", This, hReserved, cRows, rgcbBookmarks, cbPacked, packed,
++          rghRows, rgRowStatus);
++
++    hr = unpack_bookmarks(cRows, rgcbBookmarks, cbPacked, packed, &ptrs);
++    if(FAILED(hr)) return hr;
++
++    hr = IUnknown_QueryInterface(This->inner_unk, &IID_IRowsetLocate, (void**)&rowsetlocate);
++    if(SUCCEEDED(hr))
++    {
++        hr = IRowsetLocate_GetRowsByBookmark(rowsetlocate, hReserved, cRows, rgcbBookmarks, ptrs, rghRows,
++                                             rgRowStatus);
++        IRowsetLocate_Release(rowsetlocate);
++    }
++    CoTaskMemFree(ptrs);
++
++    TRACE("returning %08lx\n", hr);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI server_Hash(IWineRowServer *iface, HCHAPTER hReserved, DBBKMARK cBookmarks,
+-                                  const DBBKMARK rgcbBookmarks[], const BYTE * rgpBookmarks[],
++                                  const DBBKMARK rgcbBookmarks[], ULONG cbPacked, const BYTE *packed,
+                                   DBHASHVALUE rgHashedValues[], DBROWSTATUS rgBookmarkStatus[])
+ {
+     server *This = impl_from_IWineRowServer(iface);
+-    FIXME("(%p): stub\n", This);
+-    return E_NOTIMPL;
++    IRowsetLocate *rowsetlocate;
++    const BYTE **ptrs;
++    HRESULT hr;
++
++    TRACE("(%p)->(%08Ix, %Id, %p, %lu, %p, %p, %p)\n", This, hReserved, cBookmarks, rgcbBookmarks, cbPacked,
++          packed, rgHashedValues, rgBookmarkStatus);
++
++    hr = unpack_bookmarks(cBookmarks, rgcbBookmarks, cbPacked, packed, &ptrs);
++    if(FAILED(hr)) return hr;
++
++    hr = IUnknown_QueryInterface(This->inner_unk, &IID_IRowsetLocate, (void**)&rowsetlocate);
++    if(SUCCEEDED(hr))
++    {
++        hr = IRowsetLocate_Hash(rowsetlocate, hReserved, cBookmarks, rgcbBookmarks, ptrs, rgHashedValues,
++                                rgBookmarkStatus);
++        IRowsetLocate_Release(rowsetlocate);
++    }
++    CoTaskMemFree(ptrs);
++
++    TRACE("returning %08lx\n", hr);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI server_GetProperties(IWineRowServer* iface, ULONG cPropertyIDSets,
+@@ -467,24 +676,70 @@ static HRESULT WINAPI server_GetReferencedRowset(IWineRowServer* iface, DBORDINA
+                                                  REFIID riid, IUnknown **ppReferencedRowset)
+ {
+     server *This = impl_from_IWineRowServer(iface);
+-    FIXME("(%p): stub\n", This);
+-    return E_NOTIMPL;
++    IRowsetInfo *rowsetinfo;
++    IUnknown *rowset = NULL;
++    HRESULT hr;
++
++    TRACE("(%p)->(%Id, %s, %p)\n", This, iOrdinal, debugstr_guid(riid), ppReferencedRowset);
++
++    *ppReferencedRowset = NULL;
++
++    hr = IUnknown_QueryInterface(This->inner_unk, &IID_IRowsetInfo, (void**)&rowsetinfo);
++    if(FAILED(hr)) return hr;
++
++    hr = IRowsetInfo_GetReferencedRowset(rowsetinfo, iOrdinal, riid, &rowset);
++    IRowsetInfo_Release(rowsetinfo);
++
++    if(SUCCEEDED(hr) && rowset)
++    {
++        HRESULT hr2 = wrap_rowset(rowset, riid, ppReferencedRowset);
++        IUnknown_Release(rowset);
++        if(FAILED(hr2)) hr = hr2;
++    }
++
++    TRACE("returning %08lx\n", hr);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI server_GetSpecification(IWineRowServer* iface, REFIID riid,
+                                                IUnknown **ppSpecification)
+ {
+     server *This = impl_from_IWineRowServer(iface);
+-    FIXME("(%p): stub\n", This);
+-    return E_NOTIMPL;
++    IRowsetInfo *rowsetinfo;
++    HRESULT hr;
++
++    TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(riid), ppSpecification);
++
++    *ppSpecification = NULL;
++
++    hr = IUnknown_QueryInterface(This->inner_unk, &IID_IRowsetInfo, (void**)&rowsetinfo);
++    if(FAILED(hr)) return hr;
++
++    /* the command or session object marshals through riid's own proxy */
++    hr = IRowsetInfo_GetSpecification(rowsetinfo, riid, ppSpecification);
++    IRowsetInfo_Release(rowsetinfo);
++
++    TRACE("returning %08lx\n", hr);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI server_AddRefAccessor(IWineRowServer* iface, HACCESSOR hAccessor,
+                                             DBREFCOUNT *pcRefCount)
+ {
+     server *This = impl_from_IWineRowServer(iface);
+-    FIXME("(%p): stub\n", This);
+-    return E_NOTIMPL;
++    HRESULT hr;
++    IAccessor *accessor;
++
++    TRACE("(%p)->(%08Ix, %p)\n", This, hAccessor, pcRefCount);
++
++    hr = IUnknown_QueryInterface(This->inner_unk, &IID_IAccessor, (void**)&accessor);
++    if(FAILED(hr)) return hr;
++
++    hr = IAccessor_AddRefAccessor(accessor, hAccessor, pcRefCount);
++    IAccessor_Release(accessor);
++
++    TRACE("returning %08lx\n", hr);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI server_CreateAccessor(IWineRowServer* iface, DBACCESSORFLAGS dwAccessorFlags,
+@@ -721,10 +976,28 @@ static HRESULT WINAPI row_GetSourceRowset(IRow* iface, REFIID riid, IUnknown **p
+                                           HROW *phRow)
+ {
+     row_proxy *This = impl_from_IRow(iface);
++    IUnknown *unk = NULL;
++    HROW hrow = DB_NULL_HROW;
++    HRESULT hr;
++
++    TRACE("(%p)->(%s, %p, %p)\n", This, debugstr_guid(riid), ppRowset, phRow);
+ 
+-    FIXME("(%p)->(%s, %p, %p): stub\n", This, debugstr_guid(riid), ppRowset, phRow);
++    if(ppRowset) *ppRowset = NULL;
++    if(phRow) *phRow = DB_NULL_HROW;
++    if(!riid) return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    hr = IWineRowServer_GetSourceRowset(This->server, riid, &unk, &hrow);
++    if(phRow) *phRow = hrow;
++    if(unk)
++    {
++        if(ppRowset && SUCCEEDED(hr))
++        {
++            HRESULT hr2 = IUnknown_QueryInterface(unk, riid, (void **)ppRowset);
++            if(FAILED(hr2)) hr = hr2;
++        }
++        IUnknown_Release(unk);
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI row_Open(IRow* iface, IUnknown *pUnkOuter,
+@@ -922,6 +1195,33 @@ static ULONG WINAPI rowsetlocate_Release(IRowsetLocate *iface)
+     return ref;
+ }
+ 
++static HRESULT pack_bookmarks(DBCOUNTITEM count, const DBBKMARK rgcb[], const BYTE *ptrs[], ULONG *len, BYTE **out)
++{
++    ULONG_PTR total = 0, off = 0;
++    DBCOUNTITEM i;
++    BYTE *buf;
++
++    for(i = 0; i < count; i++)
++    {
++        if(rgcb[i] && !ptrs[i]) return E_INVALIDARG;
++        if(rgcb[i] > 0x7fffffff || total + rgcb[i] > 0x7fffffff) return E_INVALIDARG;
++        total += rgcb[i];
++    }
++
++    buf = CoTaskMemAlloc(total ? total : 1);
++    if(!buf) return E_OUTOFMEMORY;
++    for(i = 0; i < count; i++)
++    {
++        if(rgcb[i]) memcpy(buf + off, ptrs[i], rgcb[i]);
++#ifndef SG_MUTANT_MSD_BM_OFFSET
++        off += rgcb[i];
++#endif
++    }
++    *len = total;
++    *out = buf;
++    return S_OK;
++}
++
+ static HRESULT WINAPI rowsetlocate_AddRefRows(IRowsetLocate *iface, DBCOUNTITEM cRows, const HROW rghRows[],
+                                               DBREFCOUNT rgRefCounts[], DBROWSTATUS rgRowStatus[])
+ {
+@@ -1038,17 +1338,32 @@ static HRESULT WINAPI rowsetlocate_RestartPosition(IRowsetLocate* iface, HCHAPTE
+ {
+     rowset_proxy *This = impl_from_IRowsetLocate(iface);
+ 
+-    FIXME("(%p)->(%Ix): stub\n", This, hReserved);
++    TRACE("(%p)->(%Ix)\n", This, hReserved);
+ 
+-    return E_NOTIMPL;
++#ifdef SG_MUTANT_MSD_RESTART
++    IWineRowServer_RestartPosition(This->server, hReserved);
++    return S_OK;
++#endif
++    return IWineRowServer_RestartPosition(This->server, hReserved);
+ }
+ 
+ static HRESULT WINAPI rowsetlocate_Compare(IRowsetLocate *iface, HCHAPTER hReserved, DBBKMARK cbBookmark1, const BYTE *pBookmark1,
+                                            DBBKMARK cbBookmark2, const BYTE *pBookmark2, DBCOMPARE *pComparison)
+ {
+     rowset_proxy *This = impl_from_IRowsetLocate(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++    static const BYTE none;
++
++    TRACE("(%p)->(%Ix, %Id, %p, %Id, %p, %p)\n", This, hReserved, cbBookmark1, pBookmark1, cbBookmark2,
++          pBookmark2, pComparison);
++
++    if(!pComparison) return E_INVALIDARG;
++#ifdef SG_MUTANT_MSD_CMP_LEN
++    cbBookmark2 = cbBookmark1;
++#endif
++    if(!pBookmark1) pBookmark1 = &none;
++    if(!pBookmark2) pBookmark2 = &none;
++    return IWineRowServer_Compare(This->server, hReserved, cbBookmark1, pBookmark1, cbBookmark2, pBookmark2,
++                                  pComparison);
+ }
+ 
+ static HRESULT WINAPI rowsetlocate_GetRowsAt(IRowsetLocate *iface, HWATCHREGION hReserved1, HCHAPTER hReserved2, DBBKMARK cbBookmark,
+@@ -1079,16 +1394,62 @@ static HRESULT WINAPI rowsetlocate_GetRowsByBookmark(IRowsetLocate *iface, HCHAP
+                                                      const BYTE * rgpBookmarks[], HROW rghRows[], DBROWSTATUS rgRowStatus[])
+ {
+     rowset_proxy *This = impl_from_IRowsetLocate(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++    DBROWSTATUS *status = rgRowStatus;
++    BYTE *packed;
++    ULONG len;
++    HRESULT hr;
++
++    TRACE("(%p)->(%Ix, %Id, %p, %p, %p, %p)\n", This, hReserved, cRows, rgcbBookmarks, rgpBookmarks, rghRows,
++          rgRowStatus);
++
++    if(!cRows) return S_OK;
++    if(!rgcbBookmarks || !rgpBookmarks || !rghRows) return E_INVALIDARG;
++
++    hr = pack_bookmarks(cRows, rgcbBookmarks, rgpBookmarks, &len, &packed);
++    if(FAILED(hr)) return hr;
++
++    if(!status && !(status = CoTaskMemAlloc(cRows * sizeof(status[0]))))
++    {
++        CoTaskMemFree(packed);
++        return E_OUTOFMEMORY;
++    }
++
++    hr = IWineRowServer_GetRowsByBookmark(This->server, hReserved, cRows, rgcbBookmarks, len, packed, rghRows, status);
++
++    if(status != rgRowStatus) CoTaskMemFree(status);
++    CoTaskMemFree(packed);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI rowsetlocate_Hash(IRowsetLocate *iface, HCHAPTER hReserved, DBBKMARK cBookmarks, const DBBKMARK rgcbBookmarks[],
+                                         const BYTE * rgpBookmarks[], DBHASHVALUE rgHashedValues[], DBROWSTATUS rgBookmarkStatus[])
+ {
+     rowset_proxy *This = impl_from_IRowsetLocate(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++    DBROWSTATUS *status = rgBookmarkStatus;
++    BYTE *packed;
++    ULONG len;
++    HRESULT hr;
++
++    TRACE("(%p)->(%Ix, %Id, %p, %p, %p, %p)\n", This, hReserved, cBookmarks, rgcbBookmarks, rgpBookmarks,
++          rgHashedValues, rgBookmarkStatus);
++
++    if(!cBookmarks) return S_OK;
++    if(!rgcbBookmarks || !rgpBookmarks || !rgHashedValues) return E_INVALIDARG;
++
++    hr = pack_bookmarks(cBookmarks, rgcbBookmarks, rgpBookmarks, &len, &packed);
++    if(FAILED(hr)) return hr;
++
++    if(!status && !(status = CoTaskMemAlloc(cBookmarks * sizeof(status[0]))))
++    {
++        CoTaskMemFree(packed);
++        return E_OUTOFMEMORY;
++    }
++
++    hr = IWineRowServer_Hash(This->server, hReserved, cBookmarks, rgcbBookmarks, len, packed, rgHashedValues, status);
++
++    if(status != rgBookmarkStatus) CoTaskMemFree(status);
++    CoTaskMemFree(packed);
++    return hr;
+ }
+ 
+ static const IRowsetLocateVtbl rowsetlocate_vtbl =
+@@ -1143,15 +1504,37 @@ static HRESULT WINAPI rowsetinfo_GetReferencedRowset(IRowsetInfo *iface, DBORDIN
+                                                      IUnknown **ppReferencedRowset)
+ {
+     rowset_proxy *This = impl_from_IRowsetInfo(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++    IUnknown *unk = NULL;
++    HRESULT hr;
++
++    TRACE("(%p)->(%Id, %s, %p)\n", This, iOrdinal, debugstr_guid(riid), ppReferencedRowset);
++
++    if(ppReferencedRowset) *ppReferencedRowset = NULL;
++    if(!riid || !ppReferencedRowset) return E_INVALIDARG;
++
++    hr = IWineRowServer_GetReferencedRowset(This->server, iOrdinal, riid, &unk);
++    if(unk)
++    {
++        if(SUCCEEDED(hr))
++        {
++            HRESULT hr2 = IUnknown_QueryInterface(unk, riid, (void **)ppReferencedRowset);
++            if(FAILED(hr2)) hr = hr2;
++        }
++        IUnknown_Release(unk);
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI rowsetinfo_GetSpecification(IRowsetInfo *iface, REFIID riid, IUnknown **ppSpecification)
+ {
+     rowset_proxy *This = impl_from_IRowsetInfo(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(riid), ppSpecification);
++
++    if(ppSpecification) *ppSpecification = NULL;
++    if(!riid || !ppSpecification) return E_INVALIDARG;
++
++    return IWineRowServer_GetSpecification(This->server, riid, ppSpecification);
+ }
+ 
+ static const IRowsetInfoVtbl rowsetinfo_vtbl =
+@@ -1185,8 +1568,14 @@ static ULONG WINAPI accessor_Release(IAccessor *iface)
+ static HRESULT WINAPI accessor_AddRefAccessor(IAccessor *iface, HACCESSOR hAccessor, DBREFCOUNT *pcRefCount)
+ {
+     rowset_proxy *This = impl_from_IAccessor(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++    DBREFCOUNT ref = 0;
++    HRESULT hr;
++
++    TRACE("(%p)->(%08Ix, %p)\n", This, hAccessor, pcRefCount);
++
++    hr = IWineRowServer_AddRefAccessor(This->server, hAccessor, &ref);
++    if(pcRefCount) *pcRefCount = ref;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI accessor_CreateAccessor(IAccessor *iface, DBACCESSORFLAGS dwAccessorFlags, DBCOUNTITEM cBindings,
+@@ -1276,9 +1665,8 @@ static HRESULT create_proxy(IWineRowServer *server, const CLSID *class, IUnknown
+         return create_row_proxy(server, obj);
+     else if(IsEqualGUID(class, &CLSID_wine_rowset_proxy))
+         return create_rowset_proxy(server, obj);
+-    else
+-        FIXME("Unhandled proxy class %s\n", debugstr_guid(class));
+-    return E_NOTIMPL;
++    ERR("Unhandled proxy class %s\n", debugstr_guid(class));
++    return E_INVALIDARG;
+ }
+ 
+ /* Marshal impl */
+@@ -1413,9 +1801,10 @@ static HRESULT WINAPI marshal_ReleaseMarshalData(IMarshal *iface, IStream *strea
+ static HRESULT WINAPI marshal_DisconnectObject(IMarshal *iface, DWORD dwReserved)
+ {
+     marshal *This = impl_from_IMarshal(iface);
+-    FIXME("(%p)->(%08lx)\n", This, dwReserved);
++    TRACE("(%p)->(%08lx)\n", This, dwReserved);
+ 
+-    return E_NOTIMPL;
++    /* sever the connections other processes hold to the server this marshaler stands for */
++    return CoDisconnectObject(This->outer, dwReserved);
+ }
+ 
+ static const IMarshalVtbl marshal_vtbl =
+diff --git a/dlls/msdaps/row_server.idl b/dlls/msdaps/row_server.idl
+index 4c42a40..91d9657 100644
+--- a/dlls/msdaps/row_server.idl
++++ b/dlls/msdaps/row_server.idl
+@@ -64,8 +64,10 @@ typedef struct
+                        [in, size_is((ULONG)num_cols)] wine_getcolumns_in *in_data,
+                        [out, size_is((ULONG)num_cols)] wine_getcolumns_out *out_cols);
+ 
++    /* the rowset comes back as IUnknown (a wrapper that marshals as a rowset server); the proxy asks
++       it for riid */
+     HRESULT GetSourceRowset([in] REFIID riid,
+-                            [out, iid_is(riid)] IUnknown **ppRowset,
++                            [out] IUnknown **ppRowset,
+                             [out] HROW *phRow);
+ 
+     HRESULT Open([in, unique] IUnknown *pUnkOuter,
+@@ -135,17 +137,21 @@ typedef struct
+                       [out] DBCOUNTITEM *pcRowsObtained,
+                       [out, size_is(,(ULONG)cRows)] HROW **prghRows);
+ 
++    /* The bookmarks of the two array methods travel concatenated in one buffer: the length of each is
++       in rgcbBookmarks, and IDL cannot express an array of variable-sized pointees. */
+     HRESULT GetRowsByBookmark([in] HCHAPTER hReserved,
+                               [in] DBCOUNTITEM cRows,
+                               [in, size_is((ULONG)cRows)] const DBBKMARK rgcbBookmarks[],
+-                              [in, size_is((ULONG)cRows)] const BYTE *rgpBookmarks[],
++                              [in] ULONG cbPacked,
++                              [in, size_is(cbPacked)] const BYTE *packed,
+                               [out, size_is((ULONG)cRows)] HROW rghRows[],
+                               [out, size_is((ULONG)cRows)] DBROWSTATUS rgRowStatus[]);
+ 
+     HRESULT Hash([in] HCHAPTER hReserved,
+                  [in] DBBKMARK cBookmarks,
+                  [in, size_is((ULONG)cBookmarks)] const DBBKMARK rgcbBookmarks[],
+-                 [in, size_is((ULONG)cBookmarks)] const BYTE *rgpBookmarks[],
++                 [in] ULONG cbPacked,
++                 [in, size_is(cbPacked)] const BYTE *packed,
+                  [out, size_is((ULONG)cBookmarks)] DBHASHVALUE rgHashedValues[],
+                  [out, size_is((ULONG)cBookmarks)] DBROWSTATUS rgBookmarkStatus[]);
+ 
+@@ -158,7 +164,7 @@ typedef struct
+ 
+     HRESULT GetReferencedRowset([in] DBORDINAL iOrdinal,
+                                 [in] REFIID riid,
+-                                [out, iid_is(riid)] IUnknown **ppReferencedRowset);
++                                [out] IUnknown **ppReferencedRowset);
+ 
+     HRESULT GetSpecification([in] REFIID riid,
+                              [out, iid_is(riid)] IUnknown **ppSpecification);
+diff --git a/dlls/msdaps/usrmarshal.c b/dlls/msdaps/usrmarshal.c
+index 188ca08..9eba835 100644
+--- a/dlls/msdaps/usrmarshal.c
++++ b/dlls/msdaps/usrmarshal.c
+@@ -31,6 +31,9 @@
+ #include "oleauto.h"
+ #include "oledb.h"
+ 
++#include "propidl.h"
++#include "oledberr.h"
++
+ #include "row_server.h"
+ 
+ #include "wine/debug.h"
+@@ -40,6 +43,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(oledb);
+ /* IID_NULL lives in libuuid, which would clash with the GUIDs this DLL defines itself */
+ static const IID null_iid;
+ 
++static void remember_accessor_size(HACCESSOR handle, DBLENGTH row_size);
++static void forget_accessor_size(HACCESSOR handle);
++
+ /* Strings that the local interfaces point into one buffer (column names, descriptions) travel as the
+  * buffer and an offset in bytes for each pointer (all ones: none). The buffer's length on the wire is
+  * in characters. */
+@@ -791,22 +797,29 @@ HRESULT __RPC_STUB IBindResource_Bind_Stub(IBindResource* This, IUnknown *pUnkOu
+ 
+     *ppUnk = NULL;
+ 
++    impl_session.pUnkOuter = pSessionUnkOuter;
++    impl_session.piid = piid;
++    impl_session.pSession = NULL;
++
+     if(IsEqualGUID(rguid, &DBGUID_ROWSET))
+         hr = CoCreateInstance(&CLSID_wine_rowset_server, NULL, CLSCTX_INPROC_SERVER, &IID_IWineRowServer, (void**)&server);
+     else if(IsEqualGUID(rguid, &DBGUID_ROW))
+         hr = CoCreateInstance(&CLSID_wine_row_server, NULL, CLSCTX_INPROC_SERVER, &IID_IWineRowServer, (void**)&server);
+     else
+     {
+-        hr = E_NOTIMPL;
+-        FIXME("Unhandled object %s\n", debugstr_guid(rguid));
++        /* a stream, a document or a provider-specific object: it goes out as the provider made it and is
++           marshaled through the proxy of riid */
++#ifdef SG_MUTANT_MSD_BIND_OTHER
++        return E_NOTIMPL;
++#endif
++        hr = IBindResource_Bind(This, NULL, pwszURL, dwBindURLFlags, rguid, riid, pAuthenticate,
++                                ppSession ? &impl_session : NULL, pdwBindStatus, ppUnk);
++        if(ppSession) *ppSession = impl_session.pSession;
++        return hr;
+     }
+ 
+     if(FAILED(hr)) return hr;
+ 
+-    impl_session.pUnkOuter = pSessionUnkOuter;
+-    impl_session.piid = piid;
+-    impl_session.pSession = NULL;
+-
+     IWineRowServer_GetMarshal(server, &marshal);
+ 
+     hr = IBindResource_Bind(This, (IUnknown*)marshal, pwszURL, dwBindURLFlags, rguid, &IID_IUnknown, pAuthenticate,
+@@ -948,6 +961,7 @@ HRESULT CALLBACK IAccessor_CreateAccessor_Proxy(IAccessor* This, DBACCESSORFLAGS
+ 
+     hr = IAccessor_RemoteCreateAccessor_Proxy(This, dwAccessorFlags, cBindings, (DBBINDING *)rgBindings,
+                                               cbRowSize, phAccessor, rgStatus, &error);
++    if(SUCCEEDED(hr) && (dwAccessorFlags & DBACCESSOR_PARAMETERDATA)) remember_accessor_size(*phAccessor, cbRowSize);
+     if(error)
+     {
+         SetErrorInfo(0, error);
+@@ -1023,6 +1037,7 @@ HRESULT CALLBACK IAccessor_ReleaseAccessor_Proxy(IAccessor* This, HACCESSOR hAcc
+     TRACE("(%p)->(%Ix, %p)\n", This, hAccessor, pcRefCount);
+ 
+     hr = IAccessor_RemoteReleaseAccessor_Proxy(This, hAccessor, &ref, &error);
++    if(SUCCEEDED(hr) && !ref) forget_accessor_size(hAccessor);
+ 
+     if(pcRefCount) *pcRefCount = ref;
+     if(error)
+@@ -1178,34 +1193,683 @@ HRESULT __RPC_STUB ICommand_Cancel_Stub(ICommand* This, IErrorInfo **ppErrorInfo
+     return hr;
+ }
+ 
++/* ICommand::Execute with parameters.
++ *
++ * DBPARAMS holds cParamSets rows of parameter data in the layout of an accessor's bindings. The rows
++ * travel as one RMTPACK: the bytes of the rows (and the data that value slots point to, appended after
++ * them) are the first BSTR of rgBSTR, and every slot that holds an owned pointer (BSTR, VARIANT,
++ * PROPVARIANT, IUnknown, IDispatch, SAFEARRAY, or any BYREF data) holds the 1-based position of its
++ * content in the pack's arrays instead (BYREF data: 1 + offset into the bytes). The row stride
++ * travels in ulGuidOffset. Output and input/output parameters come back the same way in pOutputParams. */
++
++#define PARAM_IO_IN  1
++#define PARAM_IO_OUT 2
++
++enum slot_kind { SLOT_NONE, SLOT_BSTR, SLOT_VARIANT, SLOT_PROPVARIANT, SLOT_UNKNOWN, SLOT_DISPATCH, SLOT_ARRAY,
++                 SLOT_BYREF, SLOT_VECTOR };
++
++static size_t dbtype_fixed_size(DBTYPE type)
++{
++    switch(type)
++    {
++    case DBTYPE_I1: case DBTYPE_UI1: return 1;
++    case DBTYPE_I2: case DBTYPE_UI2: case DBTYPE_BOOL: return 2;
++    case DBTYPE_I4: case DBTYPE_UI4: case DBTYPE_R4: case DBTYPE_ERROR: return 4;
++    case DBTYPE_I8: case DBTYPE_UI8: case DBTYPE_R8: case DBTYPE_CY: case DBTYPE_DATE: case DBTYPE_FILETIME: return 8;
++    case DBTYPE_DECIMAL: return sizeof(DECIMAL);
++    case DBTYPE_GUID: return sizeof(GUID);
++    case DBTYPE_NUMERIC: return sizeof(DB_NUMERIC);
++    case DBTYPE_DBDATE: return sizeof(DBDATE);
++    case DBTYPE_DBTIME: return sizeof(DBTIME);
++    case DBTYPE_DBTIMESTAMP: return sizeof(DBTIMESTAMP);
++    case DBTYPE_HCHAPTER: return sizeof(HCHAPTER);
++    case DBTYPE_VARIANT: return sizeof(VARIANT);
++    case DBTYPE_PROPVARIANT: return sizeof(PROPVARIANT);
++    case DBTYPE_BSTR: case DBTYPE_IUNKNOWN: case DBTYPE_IDISPATCH: return sizeof(void *);
++    default: return 0;
++    }
++}
++
++static enum slot_kind binding_slot_kind(DBTYPE type)
++{
++    if(type & DBTYPE_BYREF) return SLOT_BYREF;
++    if(type & DBTYPE_ARRAY) return SLOT_ARRAY;
++    if(type & DBTYPE_VECTOR) return SLOT_VECTOR;
++    switch(type)
++    {
++    case DBTYPE_BSTR: return SLOT_BSTR;
++    case DBTYPE_VARIANT: return SLOT_VARIANT;
++    case DBTYPE_PROPVARIANT: return SLOT_PROPVARIANT;
++    case DBTYPE_IUNKNOWN: return SLOT_UNKNOWN;
++    case DBTYPE_IDISPATCH: return SLOT_DISPATCH;
++    default: return SLOT_NONE;
++    }
++}
++
++/* size of the value slot of a binding in the row */
++static size_t binding_slot_size(const DBBINDING *b)
++{
++    DBTYPE t = b->wType;
++
++    if(t & (DBTYPE_BYREF | DBTYPE_ARRAY)) return sizeof(void *);
++    if(t & DBTYPE_VECTOR) return sizeof(DBVECTOR);
++    switch(t)
++    {
++    case DBTYPE_STR: case DBTYPE_WSTR: case DBTYPE_BYTES: case DBTYPE_VARNUMERIC: case DBTYPE_UDT:
++        return b->cbMaxLen;
++    default:
++        return dbtype_fixed_size(t);
++    }
++}
++
++static BOOL binding_in_io(const DBBINDING *b, DWORD io)
++{
++    DWORD have = b->eParamIO ? b->eParamIO : DBPARAMIO_INPUT;
++    return (have & io) != 0;
++}
++
++static size_t bindings_row_extent(const DBBINDING *b, DBCOUNTITEM n)
++{
++    size_t extent = 0, end;
++    DBCOUNTITEM i;
++
++    for(i = 0; i < n; i++)
++    {
++        if((b[i].dwPart & DBPART_STATUS) && (end = b[i].obStatus + sizeof(DBSTATUS)) > extent) extent = end;
++        if((b[i].dwPart & DBPART_LENGTH) && (end = b[i].obLength + sizeof(DBLENGTH)) > extent) extent = end;
++        if((b[i].dwPart & DBPART_VALUE) && (end = b[i].obValue + binding_slot_size(&b[i])) > extent) extent = end;
++    }
++    return extent;
++}
++
++/* the row sizes the accessors were created with: the stride between parameter sets cannot be got back
++   from the provider */
++static struct { HACCESSOR handle; DBLENGTH row_size; } accessor_sizes[64];
++static CRITICAL_SECTION accessor_sizes_cs;
++static CRITICAL_SECTION_DEBUG accessor_sizes_cs_debug =
++{
++    0, 0, &accessor_sizes_cs, { &accessor_sizes_cs_debug.ProcessLocksList, &accessor_sizes_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": accessor_sizes_cs") }
++};
++static CRITICAL_SECTION accessor_sizes_cs = { &accessor_sizes_cs_debug, -1, 0, 0, 0, 0 };
++
++static void remember_accessor_size(HACCESSOR handle, DBLENGTH row_size)
++{
++    unsigned int i, free_slot = ~0u;
++
++    EnterCriticalSection(&accessor_sizes_cs);
++    for(i = 0; i < ARRAY_SIZE(accessor_sizes); i++)
++    {
++        if(accessor_sizes[i].handle == handle) { free_slot = i; break; }
++        if(!accessor_sizes[i].handle && free_slot == ~0u) free_slot = i;
++    }
++    if(free_slot != ~0u)
++    {
++        accessor_sizes[free_slot].handle = handle;
++        accessor_sizes[free_slot].row_size = row_size;
++    }
++    LeaveCriticalSection(&accessor_sizes_cs);
++}
++
++static void forget_accessor_size(HACCESSOR handle)
++{
++    unsigned int i;
++
++    EnterCriticalSection(&accessor_sizes_cs);
++    for(i = 0; i < ARRAY_SIZE(accessor_sizes); i++)
++        if(accessor_sizes[i].handle == handle) accessor_sizes[i].handle = 0;
++    LeaveCriticalSection(&accessor_sizes_cs);
++}
++
++static DBLENGTH recalled_accessor_size(HACCESSOR handle)
++{
++    DBLENGTH ret = 0;
++    unsigned int i;
++
++    EnterCriticalSection(&accessor_sizes_cs);
++    for(i = 0; i < ARRAY_SIZE(accessor_sizes); i++)
++        if(accessor_sizes[i].handle == handle) ret = accessor_sizes[i].row_size;
++    LeaveCriticalSection(&accessor_sizes_cs);
++    return ret;
++}
++
++/* the number of bytes a BYREF or VECTOR slot's data takes, 0 when there is no data */
++static HRESULT byref_data_size(const DBBINDING *b, const BYTE *row, const void *ptr, size_t *size)
++{
++    DBTYPE base = b->wType & ~(DBTYPE_BYREF | DBTYPE_VECTOR | DBTYPE_ARRAY);
++    DBLENGTH len = 0;
++    BOOL have_len = (b->dwPart & DBPART_LENGTH) != 0;
++
++    if(have_len) memcpy(&len, row + b->obLength, sizeof(len));
++    switch(base)
++    {
++    case DBTYPE_STR:
++        *size = have_len ? len + 1 : strlen(ptr) + 1;
++        return S_OK;
++    case DBTYPE_WSTR:
++        *size = have_len ? len + sizeof(WCHAR) : (lstrlenW(ptr) + 1) * sizeof(WCHAR);
++#ifdef SG_MUTANT_MSD_BYREF_LEN
++        *size -= sizeof(WCHAR);
++#endif
++        return S_OK;
++    case DBTYPE_BYTES: case DBTYPE_VARNUMERIC: case DBTYPE_UDT:
++        if(!have_len) return DB_E_BADBINDINFO;
++        *size = len;
++        return S_OK;
++    default:
++        *size = dbtype_fixed_size(base);
++        return *size ? S_OK : DB_E_BADBINDINFO;
++    }
++}
++
++struct pack_builder
++{
++    BYTE *buf;
++    size_t len, cap;
++    RMTPACK *pk;
++    BOOL deep;
++};
++
++static void *array_append(void **arr, ULONG *count, size_t elem)
++{
++    void *p = CoTaskMemRealloc(*arr, (*count + 1) * elem);
++
++    if(!p) return NULL;
++    *arr = p;
++    memset((BYTE *)p + *count * elem, 0, elem);
++    return (BYTE *)p + (*count)++ * elem;
++}
++
++static HRESULT builder_append_data(struct pack_builder *pb, const void *data, size_t size, ULONG_PTR *off)
++{
++    if(pb->len + size > pb->cap)
++    {
++        size_t cap = max(pb->cap * 2, pb->len + size);
++        BYTE *p = CoTaskMemRealloc(pb->buf, cap);
++        if(!p) return E_OUTOFMEMORY;
++        pb->buf = p;
++        pb->cap = cap;
++    }
++    memcpy(pb->buf + pb->len, data, size);
++    *off = pb->len;
++    pb->len += size;
++    return S_OK;
++}
++
++static void free_pack(RMTPACK *pk, BOOL deep)
++{
++    ULONG i;
++
++    if(deep)
++    {
++        for(i = 1; i < pk->cBSTR; i++) SysFreeString(pk->rgBSTR[i]);
++        for(i = 0; i < pk->cVARIANT; i++) VariantClear(&pk->rgVARIANT[i]);
++        for(i = 0; i < pk->cArray; i++) VariantClear(&pk->rgArray[i]);
++        for(i = 0; i < pk->cPROPVARIANT; i++) PropVariantClear(&pk->rgPROPVARIANT[i]);
++        for(i = 0; i < pk->cIUNKNOWN; i++) if(pk->rgIUNKNOWN[i]) IUnknown_Release(pk->rgIUNKNOWN[i]);
++        for(i = 0; i < pk->cIDISPATCH; i++) if(pk->rgIDISPATCH[i]) IDispatch_Release(pk->rgIDISPATCH[i]);
++    }
++    if(pk->cBSTR) SysFreeString(pk->rgBSTR[0]);
++    CoTaskMemFree(pk->rgBSTR);
++    CoTaskMemFree(pk->rgVARIANT);
++    CoTaskMemFree(pk->rgIDISPATCH);
++    CoTaskMemFree(pk->rgIUNKNOWN);
++    CoTaskMemFree(pk->rgPROPVARIANT);
++    CoTaskMemFree(pk->rgArray);
++    memset(pk, 0, sizeof(*pk));
++}
++
++/* Packs the rows. Slots of bindings that don't go the way io says are zeroed. With deep the pack owns
++   copies of everything the slots point to, otherwise it refers to the caller's data. */
++static HRESULT pack_params(const DBBINDING *b, DBCOUNTITEM nb, const BYTE *data, size_t stride, DBCOUNTITEM nsets,
++                           DWORD io, BOOL deep, RMTPACK *pk)
++{
++    struct pack_builder pb;
++    DBCOUNTITEM s, i;
++    HRESULT hr = S_OK;
++    BSTR *first;
++
++    memset(pk, 0, sizeof(*pk));
++    pb.pk = pk;
++    pb.deep = deep;
++    pb.len = stride * nsets;
++    pb.cap = pb.len ? pb.len : 1;
++    pb.buf = CoTaskMemAlloc(pb.cap);
++    if(!pb.buf) return E_OUTOFMEMORY;
++    memcpy(pb.buf, data, pb.len);
++
++    first = array_append((void **)&pk->rgBSTR, &pk->cBSTR, sizeof(BSTR));   /* the bytes, below */
++    if(!first) hr = E_OUTOFMEMORY;
++
++    for(s = 0; SUCCEEDED(hr) && s < nsets; s++)
++    {
++        for(i = 0; SUCCEEDED(hr) && i < nb; i++)
++        {
++            enum slot_kind kind = binding_slot_kind(b[i].wType);
++            const BYTE *src_row = data + s * stride;
++            size_t off = s * stride + b[i].obValue, slot_size = binding_slot_size(&b[i]);
++            ULONG_PTR idx = 0;
++            void *elem;
++
++            if(kind == SLOT_NONE || !(b[i].dwPart & DBPART_VALUE)) continue;
++            if(!binding_in_io(&b[i], io))
++            {
++                memset(pb.buf + off, 0, slot_size);
++                continue;
++            }
++
++            switch(kind)
++            {
++            case SLOT_BSTR:
++            {
++                BSTR str;
++                memcpy(&str, src_row + b[i].obValue, sizeof(str));
++                if(!str) break;
++                if(!(elem = array_append((void **)&pk->rgBSTR, &pk->cBSTR, sizeof(BSTR)))) { hr = E_OUTOFMEMORY; break; }
++                if(deep && !(str = SysAllocStringByteLen((const char *)str, SysStringByteLen(str)))) { hr = E_OUTOFMEMORY; break; }
++                *(BSTR *)elem = str;
++                idx = pk->cBSTR - 1;
++                break;
++            }
++            case SLOT_VARIANT:
++                if(!(elem = array_append((void **)&pk->rgVARIANT, &pk->cVARIANT, sizeof(VARIANT)))) { hr = E_OUTOFMEMORY; break; }
++                if(deep) hr = VariantCopy(elem, (VARIANT *)(src_row + b[i].obValue));
++                else memcpy(elem, src_row + b[i].obValue, sizeof(VARIANT));
++                idx = pk->cVARIANT;
++                memset(pb.buf + off, 0, slot_size);
++                break;
++            case SLOT_PROPVARIANT:
++                if(!(elem = array_append((void **)&pk->rgPROPVARIANT, &pk->cPROPVARIANT, sizeof(PROPVARIANT)))) { hr = E_OUTOFMEMORY; break; }
++                if(deep) hr = PropVariantCopy(elem, (PROPVARIANT *)(src_row + b[i].obValue));
++                else memcpy(elem, src_row + b[i].obValue, sizeof(PROPVARIANT));
++                idx = pk->cPROPVARIANT;
++                memset(pb.buf + off, 0, slot_size);
++                break;
++            case SLOT_UNKNOWN: case SLOT_DISPATCH:
++            {
++                IUnknown *unk;
++                memcpy(&unk, src_row + b[i].obValue, sizeof(unk));
++                if(!unk) break;
++                if(kind == SLOT_UNKNOWN)
++                {
++                    if(!(elem = array_append((void **)&pk->rgIUNKNOWN, &pk->cIUNKNOWN, sizeof(IUnknown *)))) { hr = E_OUTOFMEMORY; break; }
++                    if(deep) IUnknown_AddRef(unk);
++                    *(IUnknown **)elem = unk;
++                    idx = pk->cIUNKNOWN;
++                }
++                else
++                {
++                    if(!(elem = array_append((void **)&pk->rgIDISPATCH, &pk->cIDISPATCH, sizeof(IDispatch *)))) { hr = E_OUTOFMEMORY; break; }
++                    if(deep) IUnknown_AddRef(unk);
++                    *(IDispatch **)elem = (IDispatch *)unk;
++                    idx = pk->cIDISPATCH;
++                }
++                break;
++            }
++            case SLOT_ARRAY:
++            {
++                SAFEARRAY *sa;
++                memcpy(&sa, src_row + b[i].obValue, sizeof(sa));
++                if(!sa) break;
++                if(!(elem = array_append((void **)&pk->rgArray, &pk->cArray, sizeof(VARIANT)))) { hr = E_OUTOFMEMORY; break; }
++                V_VT((VARIANT *)elem) = VT_ARRAY | (b[i].wType & VT_TYPEMASK);
++                if(deep) hr = SafeArrayCopy(sa, &V_ARRAY((VARIANT *)elem));
++                else V_ARRAY((VARIANT *)elem) = sa;
++                idx = pk->cArray;
++                break;
++            }
++            case SLOT_BYREF:
++            {
++                const void *ptr;
++                size_t size;
++                ULONG_PTR where = 0;
++                memcpy(&ptr, src_row + b[i].obValue, sizeof(ptr));
++                if(!ptr) break;
++                hr = byref_data_size(&b[i], src_row, ptr, &size);
++                if(SUCCEEDED(hr)) hr = builder_append_data(&pb, ptr, size, &where);
++                idx = where + 1;
++                break;
++            }
++            case SLOT_VECTOR:
++            {
++                DBVECTOR vec;
++                DBTYPE base = b[i].wType & ~DBTYPE_VECTOR;
++                size_t size = dbtype_fixed_size(base);
++                ULONG_PTR where;
++                memcpy(&vec, src_row + b[i].obValue, sizeof(vec));
++                if(!vec.ptr || !vec.size) break;
++                if(!size || base == DBTYPE_BSTR || base == DBTYPE_VARIANT || base == DBTYPE_PROPVARIANT ||
++                   base == DBTYPE_IUNKNOWN || base == DBTYPE_IDISPATCH)
++                {
++                    FIXME("vector of type %04x in a parameter\n", base);
++                    hr = DB_E_BADBINDINFO;
++                    break;
++                }
++                hr = builder_append_data(&pb, vec.ptr, vec.size * size, &where);
++                idx = where + 1;
++                break;
++            }
++            default:
++                break;
++            }
++            if(FAILED(hr)) break;
++
++            if(kind == SLOT_VECTOR)
++            {
++                DBVECTOR vec;
++                memcpy(&vec, src_row + b[i].obValue, sizeof(vec));
++                vec.ptr = (void *)idx;
++                memcpy(pb.buf + off, &vec, sizeof(vec));
++            }
++            else if(kind == SLOT_VARIANT || kind == SLOT_PROPVARIANT)
++                memcpy(pb.buf + off, &idx, sizeof(idx));
++            else
++                memcpy(pb.buf + off, &idx, sizeof(idx));
++        }
++    }
++
++    if(SUCCEEDED(hr))
++    {
++        /* the slot positions in the pack refer to the arrays; BSTR 0 holds the bytes */
++        first = &pk->rgBSTR[0];
++        *first = SysAllocStringByteLen((const char *)pb.buf, pb.len);
++        if(!*first) hr = E_OUTOFMEMORY;
++        pk->cbData = pb.len;
++    }
++    CoTaskMemFree(pb.buf);
++    if(FAILED(hr)) free_pack(pk, deep);
++    return hr;
++}
++
++static size_t bounded_strlen(const BYTE *p, size_t max)
++{
++    size_t n = 0;
++    while(n < max && p[n]) n++;
++    return n;
++}
++
++static size_t bounded_wcslen(const BYTE *p, size_t max)
++{
++    size_t n = 0;
++    WCHAR c;
++    while((n + 1) * sizeof(WCHAR) <= max)
++    {
++        memcpy(&c, p + n * sizeof(WCHAR), sizeof(c));
++        if(!c) break;
++        n++;
++    }
++    return n;
++}
++
++/* Reads the content that a slot of the packed rows stands for into a fresh allocation. */
++static HRESULT unpack_slot(const DBBINDING *b, const RMTPACK *pk, const BYTE *packed, size_t packed_len,
++                           const BYTE *slot, BYTE *out)
++{
++    enum slot_kind kind = binding_slot_kind(b->wType);
++    ULONG_PTR idx;
++    HRESULT hr = S_OK;
++
++    if(kind == SLOT_VECTOR)
++    {
++        DBVECTOR vec;
++        memcpy(&vec, slot, sizeof(vec));
++        idx = (ULONG_PTR)vec.ptr;
++    }
++    else
++        memcpy(&idx, slot, sizeof(idx));
++
++    if(!idx)
++    {
++        memset(out, 0, binding_slot_size(b));
++        return S_OK;
++    }
++
++    switch(kind)
++    {
++    case SLOT_BSTR:
++    {
++        BSTR str;
++        if(idx >= pk->cBSTR) return E_INVALIDARG;
++        str = SysAllocStringByteLen((const char *)pk->rgBSTR[idx], SysStringByteLen(pk->rgBSTR[idx]));
++        if(!str) return E_OUTOFMEMORY;
++        memcpy(out, &str, sizeof(str));
++        break;
++    }
++    case SLOT_VARIANT:
++        if(idx > pk->cVARIANT) return E_INVALIDARG;
++        VariantInit((VARIANT *)out);
++        hr = VariantCopy((VARIANT *)out, &pk->rgVARIANT[idx - 1]);
++        break;
++    case SLOT_PROPVARIANT:
++        if(idx > pk->cPROPVARIANT) return E_INVALIDARG;
++        PropVariantInit((PROPVARIANT *)out);
++        hr = PropVariantCopy((PROPVARIANT *)out, &pk->rgPROPVARIANT[idx - 1]);
++        break;
++    case SLOT_UNKNOWN:
++        if(idx > pk->cIUNKNOWN) return E_INVALIDARG;
++        if(pk->rgIUNKNOWN[idx - 1]) IUnknown_AddRef(pk->rgIUNKNOWN[idx - 1]);
++        memcpy(out, &pk->rgIUNKNOWN[idx - 1], sizeof(IUnknown *));
++        break;
++    case SLOT_DISPATCH:
++        if(idx > pk->cIDISPATCH) return E_INVALIDARG;
++        if(pk->rgIDISPATCH[idx - 1]) IDispatch_AddRef(pk->rgIDISPATCH[idx - 1]);
++        memcpy(out, &pk->rgIDISPATCH[idx - 1], sizeof(IDispatch *));
++        break;
++    case SLOT_ARRAY:
++    {
++        SAFEARRAY *sa = NULL;
++        if(idx > pk->cArray) return E_INVALIDARG;
++        if(V_ARRAY(&pk->rgArray[idx - 1])) hr = SafeArrayCopy(V_ARRAY(&pk->rgArray[idx - 1]), &sa);
++        memcpy(out, &sa, sizeof(sa));
++        break;
++    }
++    case SLOT_BYREF: case SLOT_VECTOR:
++    {
++        size_t size, off = idx - 1;
++        void *copy;
++        if(kind == SLOT_BYREF)
++        {
++            /* the size comes from the bytes themselves: a string ends with its terminator, and the other
++               types are as long as the length part says; the row the length part is in is the one
++               this slot is in */
++            DBTYPE base = b->wType & ~DBTYPE_BYREF;
++            if(base == DBTYPE_STR) size = off < packed_len ? bounded_strlen(packed + off, packed_len - off) + 1 : 0;
++            else if(base == DBTYPE_WSTR)
++                size = off < packed_len ? (bounded_wcslen(packed + off, packed_len - off) + 1) * sizeof(WCHAR) : 0;
++            else if(base == DBTYPE_BYTES || base == DBTYPE_VARNUMERIC || base == DBTYPE_UDT)
++            {
++                DBLENGTH len = 0;
++                if(b->dwPart & DBPART_LENGTH) memcpy(&len, slot - b->obValue + b->obLength, sizeof(len));
++                size = len;
++            }
++            else
++                size = dbtype_fixed_size(base);
++        }
++        else
++        {
++            DBVECTOR vec;
++            memcpy(&vec, slot, sizeof(vec));
++            size = vec.size * dbtype_fixed_size(b->wType & ~DBTYPE_VECTOR);
++        }
++        if(off > packed_len || size > packed_len - off) return E_INVALIDARG;
++        copy = CoTaskMemAlloc(size ? size : 1);
++        if(!copy) return E_OUTOFMEMORY;
++        memcpy(copy, packed + off, size);
++        if(kind == SLOT_VECTOR)
++        {
++            DBVECTOR vec;
++            memcpy(&vec, slot, sizeof(vec));
++            vec.ptr = copy;
++            memcpy(out, &vec, sizeof(vec));
++        }
++        else
++            memcpy(out, &copy, sizeof(copy));
++        break;
++    }
++    default:
++        break;
++    }
++    return hr;
++}
++
++/* Releases what the slots of the rows that go the way io says own. */
++static void free_param_slots(const DBBINDING *b, DBCOUNTITEM nb, BYTE *data, size_t stride, DBCOUNTITEM nsets, DWORD io)
++{
++    DBCOUNTITEM s, i;
++
++    for(s = 0; s < nsets; s++)
++    {
++        for(i = 0; i < nb; i++)
++        {
++            enum slot_kind kind = binding_slot_kind(b[i].wType);
++            BYTE *slot = data + s * stride + b[i].obValue;
++
++            if(kind == SLOT_NONE || !(b[i].dwPart & DBPART_VALUE) || !binding_in_io(&b[i], io)) continue;
++            switch(kind)
++            {
++            case SLOT_BSTR: { BSTR str; memcpy(&str, slot, sizeof(str)); SysFreeString(str); break; }
++            case SLOT_VARIANT: VariantClear((VARIANT *)slot); break;
++            case SLOT_PROPVARIANT: PropVariantClear((PROPVARIANT *)slot); break;
++            case SLOT_UNKNOWN: case SLOT_DISPATCH:
++            {
++                IUnknown *unk;
++                memcpy(&unk, slot, sizeof(unk));
++                if(unk) IUnknown_Release(unk);
++                break;
++            }
++            case SLOT_ARRAY: { SAFEARRAY *sa; memcpy(&sa, slot, sizeof(sa)); if(sa) SafeArrayDestroy(sa); break; }
++            case SLOT_BYREF: { void *p; memcpy(&p, slot, sizeof(p)); CoTaskMemFree(p); break; }
++            case SLOT_VECTOR: { DBVECTOR v; memcpy(&v, slot, sizeof(v)); CoTaskMemFree(v.ptr); break; }
++            default: break;
++            }
++            memset(slot, 0, binding_slot_size(&b[i]));
++        }
++    }
++}
++
++/* Unpacks into dest. With whole every byte of the rows is copied (dest is a new buffer) and the slots
++   that go the way io says get fresh allocations; otherwise only the status, length and value of the
++   bindings that go the way io says are replaced (dest is the caller's data). */
++static HRESULT unpack_params(const DBBINDING *b, DBCOUNTITEM nb, const RMTPACK *pk, size_t stride, DBCOUNTITEM nsets,
++                             DWORD io, BOOL whole, BYTE *dest)
++{
++    const BYTE *packed;
++    size_t packed_len;
++    DBCOUNTITEM s, i;
++    HRESULT hr = S_OK;
++
++    if(!pk->cBSTR || !pk->rgBSTR[0]) return E_INVALIDARG;
++    packed = (const BYTE *)pk->rgBSTR[0];
++    packed_len = SysStringByteLen(pk->rgBSTR[0]);
++    if(stride * nsets > packed_len) return E_INVALIDARG;
++    if(whole) memcpy(dest, packed, stride * nsets);
++
++    for(s = 0; SUCCEEDED(hr) && s < nsets; s++)
++    {
++        const BYTE *src_row = packed + s * stride;
++        BYTE *dst_row = dest + s * stride;
++
++        for(i = 0; SUCCEEDED(hr) && i < nb; i++)
++        {
++            enum slot_kind kind = binding_slot_kind(b[i].wType);
++
++            if(!binding_in_io(&b[i], io)) continue;
++            if(!whole)
++            {
++                if(b[i].dwPart & DBPART_STATUS) memcpy(dst_row + b[i].obStatus, src_row + b[i].obStatus, sizeof(DBSTATUS));
++                if(b[i].dwPart & DBPART_LENGTH) memcpy(dst_row + b[i].obLength, src_row + b[i].obLength, sizeof(DBLENGTH));
++                if((b[i].dwPart & DBPART_VALUE) && kind == SLOT_NONE)
++                    memcpy(dst_row + b[i].obValue, src_row + b[i].obValue, binding_slot_size(&b[i]));
++            }
++            if(kind != SLOT_NONE && (b[i].dwPart & DBPART_VALUE))
++                hr = unpack_slot(&b[i], pk, packed, packed_len, src_row + b[i].obValue, dst_row + b[i].obValue);
++        }
++    }
++    return hr;
++}
++
+ HRESULT CALLBACK ICommand_Execute_Proxy(ICommand* This, IUnknown *pUnkOuter, REFIID riid,
+                                         DBPARAMS *pParams, DBROWCOUNT *pcRowsAffected, IUnknown **ppRowset)
+ {
+     HRESULT hr;
+-    DBROWCOUNT affected;
++    DBROWCOUNT affected = 0;
++    RMTPACK in_pack, out_pack, *in_ptr = NULL, *out_ptr = NULL;
++    DBBINDING *bindings = NULL;
++    DBCOUNTITEM nb = 0, nsets = 0;
++    HACCESSOR accessor = 0;
++    size_t stride = 0;
++    BOOL has_output = FALSE;
++    DBCOUNTITEM i;
+ 
+-    *ppRowset = NULL;
++    if(ppRowset) *ppRowset = NULL;
+ 
+     TRACE("(%p)->(%p, %s, %p, %p, %p)\n", This, pUnkOuter, debugstr_guid(riid), pParams,
+           pcRowsAffected, ppRowset);
+ 
+-    if(pParams)
+-    {
+-        FIXME("Unhandled params {%p, %Id, %08Ix}\n", pParams->pData, pParams->cParamSets, pParams->hAccessor);
+-        return E_NOTIMPL;
+-    }
+-
+     if(pUnkOuter)
+     {
+         FIXME("Aggregation not supported\n");
+         return CLASS_E_NOAGGREGATION;
+     }
+ 
+-    hr = ICommand_RemoteExecute_Proxy(This, pUnkOuter, riid, 0, 0, NULL, 0, NULL, NULL, 0, NULL, NULL, &affected,
+-                                      ppRowset);
++    memset(&out_pack, 0, sizeof(out_pack));
++
++    if(pParams && pParams->pData && pParams->hAccessor)
++    {
++        IAccessor *acc;
++        DBACCESSORFLAGS flags;
++        DBLENGTH recalled;
++        size_t extent;
++
++        TRACE("params {%p, %Id, %08Ix}\n", pParams->pData, pParams->cParamSets, pParams->hAccessor);
++        accessor = pParams->hAccessor;
++        nsets = pParams->cParamSets ? pParams->cParamSets : 1;
++
++        hr = ICommand_QueryInterface(This, &IID_IAccessor, (void **)&acc);
++        if(FAILED(hr)) return hr;
++        hr = IAccessor_GetBindings(acc, accessor, &flags, &nb, &bindings);
++        IAccessor_Release(acc);
++        if(FAILED(hr)) return hr;
++
++        extent = bindings_row_extent(bindings, nb);
++        recalled = recalled_accessor_size(accessor);
++        stride = recalled >= extent ? recalled : extent;
++#ifdef SG_MUTANT_MSD_NO_STRIDE
++        stride = extent;
++#endif
++        if(!stride || nsets > 0x10000000 / stride)
++        {
++            CoTaskMemFree(bindings);
++            return E_INVALIDARG;
++        }
++
++        hr = pack_params(bindings, nb, pParams->pData, stride, nsets, PARAM_IO_IN, FALSE, &in_pack);
++        if(FAILED(hr))
++        {
++            CoTaskMemFree(bindings);
++            return hr;
++        }
++        in_ptr = &in_pack;
++        out_ptr = &out_pack;
++        for(i = 0; i < nb; i++) if(binding_in_io(&bindings[i], PARAM_IO_OUT) && bindings[i].eParamIO) has_output = TRUE;
++    }
++
++    hr = ICommand_RemoteExecute_Proxy(This, pUnkOuter, riid, accessor, nsets, NULL, stride, in_ptr, out_ptr, nb, bindings,
++                                      NULL, &affected, ppRowset);
+ 
+     TRACE("Execute returns %08lx\n", hr);
+ 
++    if(in_ptr)
++    {
++        if(SUCCEEDED(hr) && has_output && out_pack.cBSTR)
++        {
++            HRESULT hr2 = unpack_params(bindings, nb, &out_pack, stride, nsets, PARAM_IO_OUT, FALSE, pParams->pData);
++            if(FAILED(hr2)) hr = hr2;
++        }
++        free_pack(&in_pack, FALSE);
++        free_pack(&out_pack, TRUE);
++        CoTaskMemFree(bindings);
++    }
+     if(pcRowsAffected) *pcRowsAffected = affected;
+ 
+     return hr;
+@@ -1216,35 +1880,99 @@ HRESULT __RPC_STUB ICommand_Execute_Stub(ICommand* This, IUnknown *pUnkOuter, RE
+                                          RMTPACK *pOutputParams, DBCOUNTITEM cBindings, DBBINDING *rgBindings,
+                                          DBSTATUS *rgStatus, DBROWCOUNT *pcRowsAffected, IUnknown **ppRowset)
+ {
+-    IWineRowServer *rowset_server;
+-    IMarshal *marshal;
++    IWineRowServer *rowset_server = NULL;
++    IMarshal *marshal = NULL;
+     IUnknown *obj = NULL;
++    DBPARAMS params, *pparams = NULL;
++    BYTE *data = NULL;
++    size_t stride = ulGuidOffset;
+     HRESULT hr;
+ 
+     TRACE("(%p)->(%p, %s, %08Ix, %Id, %p, %ld, %p, %p, %Id, %p, %p, %p, %p)\n", This, pUnkOuter, debugstr_guid(riid),
+           hAccessor, cParamSets, pGuid, ulGuidOffset, pInputParams, pOutputParams, cBindings, rgBindings, rgStatus,
+           pcRowsAffected, ppRowset);
+ 
+-    *ppRowset = NULL;
++    if(ppRowset) *ppRowset = NULL;
+ 
+-    hr = CoCreateInstance(&CLSID_wine_rowset_server, NULL, CLSCTX_INPROC_SERVER, &IID_IWineRowServer, (void**)&rowset_server);
+-    if(FAILED(hr)) return hr;
++    if(pInputParams && hAccessor)
++    {
++        if(!stride || !cParamSets || cParamSets > 0x10000000 / stride) return E_INVALIDARG;
++        data = CoTaskMemAlloc(stride * cParamSets);
++        if(!data) return E_OUTOFMEMORY;
++        hr = unpack_params(rgBindings, cBindings, pInputParams, stride, cParamSets, PARAM_IO_IN | PARAM_IO_OUT, TRUE, data);
++        if(FAILED(hr))
++        {
++            free_param_slots(rgBindings, cBindings, data, stride, cParamSets, PARAM_IO_IN | PARAM_IO_OUT);
++            CoTaskMemFree(data);
++            return hr;
++        }
++        params.pData = data;
++        params.cParamSets = cParamSets;
++        params.hAccessor = hAccessor;
++        pparams = &params;
++    }
+ 
+-    IWineRowServer_GetMarshal(rowset_server, &marshal);
++    if(ppRowset)
++    {
++        hr = CoCreateInstance(&CLSID_wine_rowset_server, NULL, CLSCTX_INPROC_SERVER, &IID_IWineRowServer, (void**)&rowset_server);
++        if(SUCCEEDED(hr)) IWineRowServer_GetMarshal(rowset_server, &marshal);
++    }
++    else
++        hr = S_OK;
+ 
+-    hr = ICommand_Execute(This, (IUnknown*)marshal, &IID_IUnknown, NULL, pcRowsAffected, &obj);
++    if(SUCCEEDED(hr))
++        hr = ICommand_Execute(This, (IUnknown*)marshal, &IID_IUnknown, pparams, pcRowsAffected, ppRowset ? &obj : NULL);
+ 
+-    IMarshal_Release(marshal);
++    if(marshal) IMarshal_Release(marshal);
++
++    if(pparams)
++    {
++#ifdef SG_MUTANT_MSD_NO_OUTPUT
++        if(0)
++#else
++        if(SUCCEEDED(hr) && pOutputParams)
++#endif
++        {
++            RMTPACK out;
++            DBCOUNTITEM i;
++            BOOL has_output = FALSE;
++
++            for(i = 0; i < cBindings; i++)
++                if(rgBindings[i].eParamIO & DBPARAMIO_OUTPUT) has_output = TRUE;
++            if(has_output)
++            {
++                HRESULT hr2 = pack_params(rgBindings, cBindings, data, stride, cParamSets, PARAM_IO_OUT, TRUE, &out);
++                if(SUCCEEDED(hr2))
++                    *pOutputParams = out;
++                else
++                    hr = hr2;
++            }
++        }
++        /* everything the parameter rows hold is ours again: the output was copied into the pack */
++        free_param_slots(rgBindings, cBindings, data, stride, cParamSets, PARAM_IO_IN | PARAM_IO_OUT);
++        CoTaskMemFree(data);
++    }
+ 
+     if(FAILED(hr))
+     {
+-        IWineRowServer_Release(rowset_server);
++        if(rowset_server) IWineRowServer_Release(rowset_server);
+         return hr;
+     }
+ 
+-    IWineRowServer_SetInnerUnk(rowset_server, obj);
+-    hr = IUnknown_QueryInterface(obj, riid, (void**)ppRowset);
+-    IUnknown_Release(obj);
++    if(rowset_server)
++    {
++        HRESULT hr2 = S_OK;
++
++        if(obj)
++        {
++            IWineRowServer_SetInnerUnk(rowset_server, obj);
++            hr2 = IUnknown_QueryInterface(obj, riid, (void**)ppRowset);
++            IUnknown_Release(obj);
++        }
++        else
++            IWineRowServer_Release(rowset_server), rowset_server = NULL;
++        if(FAILED(hr2)) hr = hr2;
++    }
+ 
+     return hr;
+ }

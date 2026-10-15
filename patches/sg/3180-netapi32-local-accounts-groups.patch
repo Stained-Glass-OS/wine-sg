@@ -1,0 +1,1343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Tue, 13 Oct 2026 09:36:59 -0700
+Subject: [PATCH] netapi32: local accounts and local groups
+ (NetUserAdd/Del/SetInfo, NetLocalGroup*, NetGroupAddUser)
+
+Account changes go the way this system keeps accounts, for administrators only
+(ERROR_ACCESS_DENIED otherwise):
+- NetUserAdd / NetUserDel / NetUserSetInfo (password levels) are sg-admind
+  requests (user-add, user-remove keep, user-password); a refusal is mapped to
+  NERR_UserExists, NERR_PasswordTooShort, NERR_BadUsername, ERROR_LAST_ADMIN.
+  Accounts are read from /etc/passwd and /etc/group (sgwine, sg-admins).
+- Local group Administrators is the administrator accounts: adding or removing a
+  local account is sg-admind user-type administrator|standard. Users is the
+  standard accounts. Every other local group and every member that is not a
+  local account is kept in the prefix registry (HKLM\Software\Wine\SG\LocalGroups)
+  and changes no Unix group.
+- NetLocalGroupAdd/Del/SetInfo/GetInfo/Enum/GetMembers (levels 0-3)/AddMember(s)/
+  DelMember(s)/SetMembers with the documented errors (NERR_GroupNotFound,
+  ERROR_ALIAS_EXISTS, ERROR_MEMBER_IN_ALIAS, ERROR_NO_SUCH_MEMBER,
+  ERROR_MEMBER_NOT_IN_ALIAS, ERROR_SPECIAL_ACCOUNT for built-in groups); nothing
+  changes when any member of a list is wrong.
+- NetGroupAddUser: this computer is not a domain controller (NERR_NotPrimary).
+Without sg-admind (a plain Wine) the old process-local user list stays.
+
+Gate: test/fastnetacct-gate.sh with a stand-in sg-admind spool and /etc.
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+
+diff --git a/dlls/netapi32/Makefile.in b/dlls/netapi32/Makefile.in
+index 6ae54f8..992c0e8 100644
+--- a/dlls/netapi32/Makefile.in
++++ b/dlls/netapi32/Makefile.in
+@@ -8,6 +8,7 @@ SOURCES = \
+ 	atsvc.idl \
+ 	nbcmdqueue.c \
+ 	nbnamecache.c \
++	localacct.c \
+ 	nbt.c \
+ 	netapi32.c \
+ 	netbios.c \
+diff --git a/dlls/netapi32/localacct.c b/dlls/netapi32/localacct.c
+new file mode 100644
+index 0000000..ce1de19
+--- /dev/null
++++ b/dlls/netapi32/localacct.c
+@@ -0,0 +1,733 @@
++/*
++ * netapi32: local accounts and local groups (Stained Glass OS)
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Where the accounts live on this system:
++ *
++ *  - A person's account is a Unix account (uid 1000..59999) in the sgwine
++ *    group; an administrator is also in sg-admins. They are created, removed
++ *    and given a new password or type by sg-admind (verbs user-add,
++ *    user-remove, user-password, user-type), whose spool only an elevated
++ *    program (SYSTEM) can write. /etc/passwd and /etc/group are read to see
++ *    them (SG_ACCOUNTS_ROOT names another directory, for tests).
++ *  - The local group Administrators is the administrator accounts: adding a
++ *    local account to it makes the account an administrator, removing it makes
++ *    the account standard. The local group Users is the standard accounts.
++ *  - Every other local group, and members that are not local accounts (well
++ *    known SIDs, domain accounts), are kept in the prefix registry
++ *    (HKLM\Software\Wine\SG\LocalGroups\NAME: Comment, Members) and change no
++ *    Unix group.
++ *
++ * Every change needs an administrator (ERROR_ACCESS_DENIED otherwise). Without
++ * sg-admind (a plain Wine) local accounts are the process-local list that
++ * netapi32.c keeps, and Administrators/Users membership is recorded in the
++ * registry like any other group. */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "windef.h"
++#include "winbase.h"
++#include "winnls.h"
++#include "winreg.h"
++#include "sddl.h"
++#include "lm.h"
++#include "lmaccess.h"
++#include "lmapibuf.h"
++#include "wine/debug.h"
++#include "wine/sgfirewall.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(netapi32);
++
++extern BOOL sg_is_administrator(void);
++extern BOOL sg_admind_present(void);
++extern BOOL sg_account_exists(const WCHAR *name);
++extern DWORD sg_admin_change(const WCHAR *const *fields, int n);
++
++static const WCHAR groups_key[] = L"Software\\Wine\\SG\\LocalGroups";
++
++static const struct { const WCHAR *name, *comment; } builtin_groups[] =
++{
++    { L"Administrators",       L"Administrators have complete and unrestricted access to the computer" },
++    { L"Backup Operators",     L"Backup Operators can override security restrictions for the sole purpose of backing up or restoring files" },
++    { L"Guests",               L"Guests have the same access as members of the Users group by default, except for the Guest account which is further restricted" },
++    { L"Power Users",          L"Power Users are included for backwards compatibility and possess limited administrative powers" },
++    { L"Remote Desktop Users", L"Members in this group are granted the right to logon remotely" },
++    { L"Users",                L"Users are prevented from making accidental or intentional system-wide changes and can run most applications" },
++};
++
++static BOOL is_builtin( const WCHAR *name )
++{
++    unsigned int i;
++    for (i = 0; i < ARRAY_SIZE(builtin_groups); i++) if (!wcsicmp( name, builtin_groups[i].name )) return TRUE;
++    return FALSE;
++}
++
++/* ---- the Unix account files -------------------------------------------------------------- */
++
++static char *read_account_file( const WCHAR *file )
++{
++    WCHAR dir[MAX_PATH + 16], path[MAX_PATH + 32];
++    HANDLE h;
++    DWORD size, got = 0;
++    char *text;
++
++    sgfw_unix_path( L"SG_ACCOUNTS_ROOT", L"/etc", dir, ARRAY_SIZE(dir) );
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", dir, file );
++    h = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL );
++    if (h == INVALID_HANDLE_VALUE) return NULL;
++    size = GetFileSize( h, NULL );
++    if (size == INVALID_FILE_SIZE || size > (1 << 22) || !(text = malloc( size + 1 ))) { CloseHandle( h ); return NULL; }
++    ReadFile( h, text, size, &got, NULL );
++    CloseHandle( h );
++    text[got] = 0;
++    return text;
++}
++
++static void to_utf8( const WCHAR *in, char *out, int len )
++{
++    if (!WideCharToMultiByte( CP_UTF8, 0, in, -1, out, len, NULL, NULL )) out[0] = 0;
++}
++
++static WCHAR *dup_utf8( const char *s, int len )
++{
++    WCHAR *w;
++    int n = MultiByteToWideChar( CP_UTF8, 0, s, len, NULL, 0 );
++    if (!(w = malloc( (n + 1) * sizeof(WCHAR) ))) return NULL;
++    MultiByteToWideChar( CP_UTF8, 0, s, len, w, n );
++    w[n] = 0;
++    return w;
++}
++
++static const char *const reserved_names[] = { "root", "sgsystem", "sguser", "sggreet", "nobody", "daemon", "bin",
++                                              "sys", "admin", "administrator", "guest", "system" };
++
++struct passwd_line { char name[128]; unsigned int uid, gid; };
++
++/* the next /etc/passwd line at *pos; FALSE at the end */
++static BOOL next_passwd( const char **pos, struct passwd_line *e )
++{
++    const char *p = *pos, *end;
++    int field;
++
++    while (*p)
++    {
++        const char *f[7];
++        end = strchr( p, '\n' );
++        if (!end) end = p + strlen( p );
++        f[0] = p;
++        for (field = 1; field < 4 && f[field - 1]; field++)
++        {
++            f[field] = memchr( f[field - 1], ':', end - f[field - 1] );
++            if (f[field]) f[field]++;
++        }
++        if (field == 4 && f[3])
++        {
++            const char *c1 = f[1] - 1;
++            size_t n = c1 - f[0];
++            if (n && n < sizeof(e->name))
++            {
++                memcpy( e->name, f[0], n );
++                e->name[n] = 0;
++                e->uid = strtoul( f[2], NULL, 10 );
++                e->gid = strtoul( f[3], NULL, 10 );
++                *pos = *end ? end + 1 : end;
++                return TRUE;
++            }
++        }
++        p = *end ? end + 1 : end;
++    }
++    *pos = p;
++    return FALSE;
++}
++
++static BOOL local_person( const struct passwd_line *e )
++{
++    unsigned int i;
++    if (e->uid < 1000 || e->uid >= 60000) return FALSE;
++    for (i = 0; i < ARRAY_SIZE(reserved_names); i++) if (!strcmp( e->name, reserved_names[i] )) return FALSE;
++    return TRUE;
++}
++
++/* membership of the Unix group in /etc/group text: listed, or by primary gid */
++static BOOL in_unix_group( const char *groups, const char *group, const struct passwd_line *e )
++{
++    const char *p = groups;
++    size_t glen = strlen( group );
++
++    while (p && *p)
++    {
++        const char *end = strchr( p, '\n' ), *c;
++        if (!end) end = p + strlen( p );
++        if (!strncmp( p, group, glen ) && p[glen] == ':')
++        {
++            char *list;
++            const char *gid;
++            c = p + glen + 1;
++            c = memchr( c, ':', end - c );                /* after the password */
++            if (c)
++            {
++                gid = ++c;
++                if ((unsigned int)strtoul( gid, NULL, 10 ) == e->gid) return TRUE;
++                c = memchr( c, ':', end - c );
++                if (c)
++                {
++                    size_t n = end - (c + 1);
++                    if ((list = malloc( n + 3 )))
++                    {
++                        const char *hit;
++                        size_t elen = strlen( e->name );
++                        list[0] = ','; memcpy( list + 1, c + 1, n ); list[n + 1] = ','; list[n + 2] = 0;
++                        for (hit = list; (hit = strstr( hit, e->name )); hit++)
++                            if (hit > list && hit[-1] == ',' && hit[elen] == ',') { free( list ); return TRUE; }
++                        free( list );
++                    }
++                }
++            }
++            return FALSE;
++        }
++        p = *end ? end + 1 : end;
++    }
++    return FALSE;
++}
++
++static const char *env_group( const WCHAR *var, const char *def, char *buf, int len )
++{
++    WCHAR w[64];
++    if (GetEnvironmentVariableW( var, w, ARRAY_SIZE(w) ) && w[0]) { to_utf8( w, buf, len ); return buf; }
++    return def;
++}
++
++/* the local accounts (people), as names; admin: 0 all, 1 administrators only, 2 standard only */
++static DWORD list_accounts( int admin, WCHAR ***names, DWORD *count )
++{
++    char abuf[64], wbuf[64], *passwd, *group;
++    const char *agroup = env_group( L"SG_ADMIN_GROUP", "sg-admins", abuf, sizeof(abuf) );
++    const char *wgroup = env_group( L"SG_WINE_GROUP", "sgwine", wbuf, sizeof(wbuf) );
++    const char *pos;
++    struct passwd_line e;
++    WCHAR **list = NULL;
++    DWORD n = 0, cap = 0;
++
++    *names = NULL; *count = 0;
++    if (!(passwd = read_account_file( L"passwd" ))) return NERR_Success;
++    group = read_account_file( L"group" );
++    for (pos = passwd; next_passwd( &pos, &e ); )
++    {
++        BOOL is_admin;
++        if (!local_person( &e )) continue;
++        if (!group || !in_unix_group( group, wgroup, &e )) continue;
++        is_admin = in_unix_group( group, agroup, &e );
++        if ((admin == 1 && !is_admin) || (admin == 2 && is_admin)) continue;
++        if (n == cap)
++        {
++            WCHAR **bigger = realloc( list, (cap = cap ? cap * 2 : 8) * sizeof(*list) );
++            if (!bigger) break;
++            list = bigger;
++        }
++        if (!(list[n] = dup_utf8( e.name, -1 ))) break;
++        n++;
++    }
++    free( passwd ); free( group );
++    *names = list; *count = n;
++    return NERR_Success;
++}
++
++static void free_names( WCHAR **list, DWORD n )
++{
++    DWORD i;
++    for (i = 0; i < n; i++) free( list[i] );
++    free( list );
++}
++
++BOOL sg_account_exists( const WCHAR *name )
++{
++    WCHAR **list;
++    DWORD i, n;
++    BOOL found = FALSE;
++
++    if (!name || !name[0]) return FALSE;
++    list_accounts( 0, &list, &n );
++    for (i = 0; i < n; i++) if (!wcsicmp( list[i], name )) found = TRUE;
++    free_names( list, n );
++    return found;
++}
++
++static BOOL account_is_admin( const WCHAR *name )
++{
++    WCHAR **list;
++    DWORD i, n;
++    BOOL found = FALSE;
++
++    list_accounts( 1, &list, &n );
++    for (i = 0; i < n; i++) if (!wcsicmp( list[i], name )) found = TRUE;
++    free_names( list, n );
++    return found;
++}
++
++/* ---- sg-admind --------------------------------------------------------------------------- */
++
++BOOL sg_admind_present(void)
++{
++    WCHAR dir[MAX_PATH + 16], path[MAX_PATH + 32];
++    DWORD attr;
++
++    sgfw_unix_path( L"SG_ADMIN_SPOOL", L"/run/stained-glass-admin", dir, ARRAY_SIZE(dir) );
++    swprintf( path, ARRAY_SIZE(path), L"%s\\requests", dir );
++    attr = GetFileAttributesW( path );
++    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
++}
++
++BOOL sg_is_administrator(void)
++{
++    SID_IDENTIFIER_AUTHORITY nt = { SECURITY_NT_AUTHORITY };
++    PSID admins;
++    BOOL member = FALSE;
++
++    if (!AllocateAndInitializeSid( &nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins ))
++        return FALSE;
++#ifdef SG_MUTANT_ACCT_NOADMIN
++    member = TRUE;
++#else
++    if (!CheckTokenMembership( NULL, admins, &member )) member = FALSE;
++#endif
++    FreeSid( admins );
++    return member;
++}
++
++/* a request to sg-admind, its refusal reason as a Network Management error */
++DWORD sg_admin_change( const WCHAR *const *fields, int n )
++{
++    WCHAR msg[256];
++    DWORD err = sgfw_admin_request( fields, n, 30000, msg, ARRAY_SIZE(msg) );
++
++    if (!err) return NERR_Success;
++    if (err == ERROR_PRIVILEGE_NOT_HELD) return ERROR_ACCESS_DENIED;
++    if (err == ERROR_TIMEOUT) return NERR_InternalError;
++    if (wcsstr( msg, L"already an account" )) return NERR_UserExists;
++    if (wcsstr( msg, L"only administrator" )) return ERROR_LAST_ADMIN;
++    if (wcsstr( msg, L"no account named" )) return NERR_UserNotFound;
++    if (wcsstr( msg, L"password" ) || wcsstr( msg, L"Password" )) return NERR_PasswordTooShort;
++    if (wcsstr( msg, L"valid account name" ) || wcsstr( msg, L"reserved" )) return NERR_BadUsername;
++    return ERROR_ACCESS_DENIED;
++}
++
++DWORD sg_user_add( const WCHAR *name, const WCHAR *password )
++{
++    const WCHAR *f[5] = { L"user-add", name, L"", L"standard", password };
++    if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++    return sg_admin_change( f, 5 );
++}
++
++DWORD sg_user_del( const WCHAR *name )
++{
++    const WCHAR *f[3] = { L"user-remove", name, L"keep" };
++    if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++    return sg_admin_change( f, 3 );
++}
++
++DWORD sg_user_password( const WCHAR *name, const WCHAR *password )
++{
++    const WCHAR *f[3] = { L"user-password", name, password };
++    if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++    return sg_admin_change( f, 3 );
++}
++
++/* ---- the groups in the registry ----------------------------------------------------------- */
++
++static HKEY open_group( const WCHAR *name, BOOL create )
++{
++    WCHAR path[256 + 64];
++    HKEY key = NULL;
++
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", groups_key, name );
++    if (create) RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL );
++    else RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_ALL_ACCESS, &key );
++    return key;
++}
++
++static BOOL group_exists( const WCHAR *name )
++{
++    HKEY key;
++    if (is_builtin( name )) return TRUE;
++    if (!(key = open_group( name, FALSE ))) return FALSE;
++    RegCloseKey( key );
++    return TRUE;
++}
++
++/* a multi-string of the members recorded for the group (malloc'd, double-zero terminated) */
++static WCHAR *recorded_members( const WCHAR *group, DWORD *chars )
++{
++    HKEY key = open_group( group, FALSE );
++    DWORD type, size = 0;
++    WCHAR *data = NULL;
++
++    *chars = 0;
++    if (key && !RegQueryValueExW( key, L"Members", NULL, &type, NULL, &size ) && type == REG_MULTI_SZ && size >= 2 * sizeof(WCHAR))
++    {
++        if ((data = malloc( size + 2 * sizeof(WCHAR) )))
++        {
++            if (RegQueryValueExW( key, L"Members", NULL, &type, (BYTE *)data, &size )) { free( data ); data = NULL; }
++            else { data[size / sizeof(WCHAR)] = 0; data[size / sizeof(WCHAR) + 1] = 0; *chars = size / sizeof(WCHAR); }
++        }
++    }
++    if (key) RegCloseKey( key );
++    return data;
++}
++
++static DWORD store_members( const WCHAR *group, const WCHAR *const *names, DWORD n )
++{
++    HKEY key = open_group( group, TRUE );
++    DWORD i, total = 1;
++    WCHAR *buf, *p;
++    LSTATUS ret;
++
++    if (!key) return ERROR_ACCESS_DENIED;
++    for (i = 0; i < n; i++) total += wcslen( names[i] ) + 1;
++    if (!(buf = malloc( (total + 1) * sizeof(WCHAR) ))) { RegCloseKey( key ); return ERROR_NOT_ENOUGH_MEMORY; }
++    for (p = buf, i = 0; i < n; i++) { wcscpy( p, names[i] ); p += wcslen( p ) + 1; }
++    *p++ = 0;
++    if (!n) *p++ = 0;
++    ret = RegSetValueExW( key, L"Members", 0, REG_MULTI_SZ, (BYTE *)buf, (p - buf) * sizeof(WCHAR) );
++    free( buf );
++    RegCloseKey( key );
++    return ret ? ERROR_ACCESS_DENIED : NERR_Success;
++}
++
++static void computer_name( WCHAR *buf, DWORD len )
++{
++    DWORD size = len;
++    if (!GetComputerNameW( buf, &size )) wcscpy( buf, L"COMPUTER" );
++}
++
++/* The members of a group as "DOMAIN\name" strings (malloc'd array of malloc'd strings). */
++DWORD sg_localgroup_members( const WCHAR *group, WCHAR ***out, DWORD *count )
++{
++    WCHAR comp[MAX_COMPUTERNAME_LENGTH + 1], **accts = NULL, *rec, *p, **list = NULL;
++    DWORD i, n = 0, na = 0, chars, total;
++    int implicit = !wcsicmp( group, L"Administrators" ) ? 1 : !wcsicmp( group, L"Users" ) ? 2 : 0;
++
++    *out = NULL; *count = 0;
++    if (!group_exists( group )) return NERR_GroupNotFound;
++    computer_name( comp, ARRAY_SIZE(comp) );
++    if (implicit) list_accounts( implicit, &accts, &na );
++    if (implicit == 1 && !na && sg_is_administrator())
++    {
++        /* no administrator account is known (a plain Wine): the user running this one is one */
++        WCHAR user[UNLEN + 1];
++        DWORD len = ARRAY_SIZE(user);
++        if (GetUserNameW( user, &len ) && (accts = calloc( 1, sizeof(*accts) )) && (accts[0] = malloc( len * sizeof(WCHAR) )))
++        {
++            wcscpy( accts[0], user );
++            na = 1;
++        }
++    }
++    rec = recorded_members( group, &chars );
++    total = na;
++    if (rec) for (p = rec; *p; p += wcslen( p ) + 1) total++;
++    if (total && !(list = calloc( total, sizeof(*list) ))) { free_names( accts, na ); free( rec ); return ERROR_NOT_ENOUGH_MEMORY; }
++    for (i = 0; i < na; i++)
++    {
++        if ((list[n] = malloc( (wcslen( comp ) + wcslen( accts[i] ) + 2) * sizeof(WCHAR) )))
++            { swprintf( list[n], wcslen( comp ) + wcslen( accts[i] ) + 2, L"%s\\%s", comp, accts[i] ); n++; }
++    }
++    if (rec)
++        for (p = rec; *p; p += wcslen( p ) + 1)
++        {
++            DWORD j;
++            for (j = 0; j < n; j++) if (!wcsicmp( list[j], p )) break;
++            if (j < n) continue;
++            if ((list[n] = malloc( (wcslen( p ) + 1) * sizeof(WCHAR) ))) { wcscpy( list[n], p ); n++; }
++        }
++    free_names( accts, na ); free( rec );
++    *out = list; *count = n;
++    return NERR_Success;
++}
++
++/* A member as given by the caller: level 0 a SID, level 3 "DOMAIN\name" or "name". */
++struct member
++{
++    WCHAR display[MAX_COMPUTERNAME_LENGTH + UNLEN + 4];  /* the entry as listed and recorded */
++    WCHAR user[UNLEN + 1];                               /* the local account, if it is one */
++    BOOL local;
++};
++
++static DWORD resolve_member( DWORD level, const BYTE *buf, DWORD index, struct member *m )
++{
++    WCHAR comp[MAX_COMPUTERNAME_LENGTH + 1], name[UNLEN + 1], domain[MAX_COMPUTERNAME_LENGTH + 64], text[300];
++    const WCHAR *given = NULL, *slash;
++    SID_NAME_USE use;
++    DWORD nlen = ARRAY_SIZE(name), dlen = ARRAY_SIZE(domain);
++
++    memset( m, 0, sizeof(*m) );
++    computer_name( comp, ARRAY_SIZE(comp) );
++    if (level == 0)
++    {
++        PSID sid = ((const LOCALGROUP_MEMBERS_INFO_0 *)buf)[index].lgrmi0_sid;
++        if (!sid || !IsValidSid( sid )) return ERROR_NO_SUCH_MEMBER;
++        if (!LookupAccountSidW( NULL, sid, name, &nlen, domain, &dlen, &use )) return ERROR_NO_SUCH_MEMBER;
++        swprintf( text, ARRAY_SIZE(text), L"%s\\%s", domain, name );
++        given = text;
++    }
++    else if (level == 3) given = ((const LOCALGROUP_MEMBERS_INFO_3 *)buf)[index].lgrmi3_domainandname;
++    else return ERROR_INVALID_LEVEL;
++    if (!given || !given[0]) return ERROR_NO_SUCH_MEMBER;
++
++    if ((slash = wcschr( given, '\\' )))
++    {
++        size_t dl = slash - given;
++        if (!dl || (dl == wcslen( comp ) && !wcsnicmp( given, comp, dl )) || (dl == 1 && given[0] == '.'))
++            lstrcpynW( name, slash + 1, ARRAY_SIZE(name) ), dl = 0;
++        else
++        {
++            /* a domain account or a well known one: it has to resolve */
++            dlen = ARRAY_SIZE(domain);
++            if (wcslen( given ) >= ARRAY_SIZE(m->display)) return ERROR_NO_SUCH_MEMBER;
++            {
++                BYTE sidbuf[SECURITY_MAX_SID_SIZE];
++                DWORD sl = sizeof(sidbuf);
++                if (!LookupAccountNameW( NULL, given, sidbuf, &sl, domain, &dlen, &use )) return ERROR_NO_SUCH_MEMBER;
++            }
++            wcscpy( m->display, given );
++            return NERR_Success;
++        }
++        if (dl) return ERROR_NO_SUCH_MEMBER;
++    }
++    else
++    {
++        if (wcslen( given ) > UNLEN) return ERROR_NO_SUCH_MEMBER;
++        wcscpy( name, given );
++    }
++    if (sg_account_exists( name ))
++    {
++        m->local = TRUE;
++        wcscpy( m->user, name );
++        swprintf( m->display, ARRAY_SIZE(m->display), L"%s\\%s", comp, name );
++        return NERR_Success;
++    }
++    /* a name the system knows (a built-in account, a user of this prefix) */
++    {
++        BYTE sidbuf[SECURITY_MAX_SID_SIZE];
++        DWORD sl = sizeof(sidbuf);
++        dlen = ARRAY_SIZE(domain);
++        if (!LookupAccountNameW( NULL, name, sidbuf, &sl, domain, &dlen, &use )) return ERROR_NO_SUCH_MEMBER;
++        swprintf( m->display, ARRAY_SIZE(m->display), L"%s\\%s", dlen ? domain : comp, name );
++    }
++    return NERR_Success;
++}
++
++static BOOL listed( WCHAR **list, DWORD n, const WCHAR *display )
++{
++    DWORD i;
++    for (i = 0; i < n; i++) if (!wcsicmp( list[i], display )) return TRUE;
++    return FALSE;
++}
++
++/* the change of one resolved member; add or remove */
++static DWORD apply_member( const WCHAR *group, const struct member *m, BOOL add )
++{
++    int implicit = !wcsicmp( group, L"Administrators" ) ? 1 : !wcsicmp( group, L"Users" ) ? 2 : 0;
++    WCHAR *rec, *p, **keep = NULL;
++    DWORD chars, n = 0, ret, i;
++
++#ifdef SG_MUTANT_ACCT_NOTYPE
++    if (0)
++#else
++    if (m->local && implicit && sg_admind_present())
++#endif
++    {
++        BOOL admin = account_is_admin( m->user );
++        if (implicit == 1)
++        {
++            const WCHAR *f[3] = { L"user-type", m->user, add ? L"administrator" : L"standard" };
++            if (add == admin) return NERR_Success;
++            return sg_admin_change( f, 3 );
++        }
++        /* Users: a standard account is a member by being one */
++        if (!admin) return add ? NERR_Success : ERROR_ACCESS_DENIED;
++    }
++    rec = recorded_members( group, &chars );
++    if (rec) for (p = rec; *p; p += wcslen( p ) + 1) n++;
++    if (!(keep = calloc( n + 1, sizeof(*keep) ))) { free( rec ); return ERROR_NOT_ENOUGH_MEMORY; }
++    n = 0;
++    if (rec) for (p = rec; *p; p += wcslen( p ) + 1) if (add || wcsicmp( p, m->display )) keep[n++] = p;
++    if (add) keep[n++] = (WCHAR *)m->display;
++    ret = store_members( group, (const WCHAR *const *)keep, n );
++    (void)i;
++    free( keep ); free( rec );
++    return ret;
++}
++
++/* mode 0 add, 1 delete, 2 set */
++DWORD sg_localgroup_change( const WCHAR *group, DWORD level, const BYTE *buf, DWORD total, int mode )
++{
++    struct member *m;
++    WCHAR **cur;
++    DWORD i, j, ncur, ret;
++
++    if (level != 0 && level != 3) return ERROR_INVALID_LEVEL;
++    if (!group || !group[0]) return NERR_GroupNotFound;
++    if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++    if (!group_exists( group )) return NERR_GroupNotFound;
++    if (total && !buf) return ERROR_INVALID_PARAMETER;
++    if (!(m = calloc( total + 1, sizeof(*m) ))) return ERROR_NOT_ENOUGH_MEMORY;
++    if ((ret = sg_localgroup_members( group, &cur, &ncur ))) { free( m ); return ret; }
++
++    /* nothing changes when any member is wrong */
++    for (i = 0; i < total && !ret; i++)
++    {
++        if ((ret = resolve_member( level, buf, i, &m[i] ))) break;
++        if (mode == 0 && listed( cur, ncur, m[i].display )) ret = ERROR_MEMBER_IN_ALIAS;
++        if (mode == 1 && !listed( cur, ncur, m[i].display )) ret = ERROR_MEMBER_NOT_IN_ALIAS;
++    }
++    if (ret) goto done;
++
++    if (mode == 2)
++    {
++        /* take out what is not in the new list, then add what is missing */
++        for (j = 0; j < ncur && !ret; j++)
++        {
++            struct member old = {0};
++            BOOL keep = FALSE;
++            WCHAR *bs = wcschr( cur[j], '\\' );
++            for (i = 0; i < total; i++) if (!wcsicmp( m[i].display, cur[j] )) keep = TRUE;
++            if (keep) continue;
++            lstrcpynW( old.display, cur[j], ARRAY_SIZE(old.display) );
++            if (bs && sg_account_exists( bs + 1 )) { old.local = TRUE; wcscpy( old.user, bs + 1 ); }
++            ret = apply_member( group, &old, FALSE );
++        }
++        for (i = 0; i < total && !ret; i++)
++            if (!listed( cur, ncur, m[i].display )) ret = apply_member( group, &m[i], TRUE );
++    }
++    else for (i = 0; i < total && !ret; i++) ret = apply_member( group, &m[i], mode == 0 );
++done:
++    free_names( cur, ncur );
++    free( m );
++    return ret;
++}
++
++static BOOL valid_group_name( const WCHAR *name )
++{
++    size_t len;
++    if (!name || !(len = wcslen( name )) || len > 256 || name[len - 1] == '.') return FALSE;
++    for (; *name; name++)
++        if (*name < 32 || wcschr( L"\"/\\[]:|<>+=;,?*", *name )) return FALSE;
++    return TRUE;
++}
++
++DWORD sg_localgroup_add( const WCHAR *name, const WCHAR *comment, DWORD *parm_err )
++{
++    HKEY key;
++
++    TRACE( "%s\n", debugstr_w( name ));
++    if (!valid_group_name( name )) { if (parm_err) *parm_err = LOCALGROUP_NAME_PARMNUM; return ERROR_INVALID_PARAMETER; }
++    if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++    if (group_exists( name )) return ERROR_ALIAS_EXISTS;
++    if (sg_account_exists( name )) return NERR_UserExists;
++    if (!(key = open_group( name, TRUE ))) return ERROR_ACCESS_DENIED;
++    if (comment) RegSetValueExW( key, L"Comment", 0, REG_SZ, (const BYTE *)comment, (wcslen( comment ) + 1) * sizeof(WCHAR) );
++    RegCloseKey( key );
++    return NERR_Success;
++}
++
++DWORD sg_localgroup_del( const WCHAR *name )
++{
++    WCHAR path[256 + 64];
++
++    if (!name || !name[0]) return NERR_GroupNotFound;
++    if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++    if (is_builtin( name )) return ERROR_SPECIAL_ACCOUNT;
++    if (!group_exists( name )) return NERR_GroupNotFound;
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", groups_key, name );
++    return RegDeleteTreeW( HKEY_LOCAL_MACHINE, path ) ? ERROR_ACCESS_DENIED : NERR_Success;
++}
++
++/* the group's comment (malloc'd, may be empty) */
++DWORD sg_localgroup_comment( const WCHAR *name, WCHAR **comment )
++{
++    HKEY key;
++    DWORD type, size = 0, i;
++    WCHAR *text = NULL;
++
++    *comment = NULL;
++    if (!name || !group_exists( name )) return NERR_GroupNotFound;
++    if ((key = open_group( name, FALSE )))
++    {
++        if (!RegQueryValueExW( key, L"Comment", NULL, &type, NULL, &size ) && type == REG_SZ && (text = malloc( size + 2 )))
++        {
++            if (RegQueryValueExW( key, L"Comment", NULL, &type, (BYTE *)text, &size )) { free( text ); text = NULL; }
++            else text[size / sizeof(WCHAR)] = 0;
++        }
++        RegCloseKey( key );
++    }
++    if (!text)
++    {
++        const WCHAR *def = L"";
++        for (i = 0; i < ARRAY_SIZE(builtin_groups); i++) if (!wcsicmp( name, builtin_groups[i].name )) def = builtin_groups[i].comment;
++        text = malloc( (wcslen( def ) + 1) * sizeof(WCHAR) );
++        if (text) wcscpy( text, def );
++    }
++    *comment = text;
++    return text ? NERR_Success : ERROR_NOT_ENOUGH_MEMORY;
++}
++
++DWORD sg_localgroup_setinfo( const WCHAR *name, const WCHAR *comment )
++{
++    HKEY key;
++
++    if (!name || !group_exists( name )) return NERR_GroupNotFound;
++    if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++    if (!(key = open_group( name, TRUE ))) return ERROR_ACCESS_DENIED;
++    RegSetValueExW( key, L"Comment", 0, REG_SZ, (const BYTE *)comment, (wcslen( comment ) + 1) * sizeof(WCHAR) );
++    RegCloseKey( key );
++    return NERR_Success;
++}
++
++/* every local group name: the built-in ones, then those created */
++DWORD sg_localgroup_names( WCHAR ***out, DWORD *count )
++{
++    HKEY key;
++    WCHAR **list, name[260];
++    DWORD i, n = 0, extra = 0, len;
++
++    *out = NULL; *count = 0;
++    if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, groups_key, 0, KEY_READ, &key ))
++    {
++        RegQueryInfoKeyW( key, NULL, NULL, NULL, &extra, NULL, NULL, NULL, NULL, NULL, NULL, NULL );
++    }
++    else key = NULL;
++    if (!(list = calloc( ARRAY_SIZE(builtin_groups) + extra + 1, sizeof(*list) ))) { if (key) RegCloseKey( key ); return ERROR_NOT_ENOUGH_MEMORY; }
++    for (i = 0; i < ARRAY_SIZE(builtin_groups); i++)
++    {
++        if ((list[n] = malloc( (wcslen( builtin_groups[i].name ) + 1) * sizeof(WCHAR) ))) wcscpy( list[n++], builtin_groups[i].name );
++    }
++    for (i = 0; key && i < extra; i++)
++    {
++        len = ARRAY_SIZE(name);
++        if (RegEnumKeyExW( key, i, name, &len, NULL, NULL, NULL, NULL )) break;
++        if (is_builtin( name )) continue;
++        if ((list[n] = malloc( (len + 1) * sizeof(WCHAR) ))) { wcscpy( list[n], name ); n++; }
++    }
++    if (key) RegCloseKey( key );
++    *out = list; *count = n;
++    return NERR_Success;
++}
++
++void sg_free_names( WCHAR **list, DWORD n ) { free_names( list, n ); }
+diff --git a/dlls/netapi32/netapi32.c b/dlls/netapi32/netapi32.c
+index d3c0a48..091c194 100644
+--- a/dlls/netapi32/netapi32.c
++++ b/dlls/netapi32/netapi32.c
+@@ -1212,6 +1212,32 @@ struct sam_user
+ 
+ static struct list user_list = LIST_INIT( user_list );
+ 
++
++/* localacct.c */
++extern BOOL sg_is_administrator(void);
++extern BOOL sg_admind_present(void);
++extern BOOL sg_account_exists(const WCHAR *name);
++extern DWORD sg_user_add(const WCHAR *name, const WCHAR *password);
++extern DWORD sg_user_del(const WCHAR *name);
++extern DWORD sg_user_password(const WCHAR *name, const WCHAR *password);
++extern DWORD sg_localgroup_add(const WCHAR *name, const WCHAR *comment, DWORD *parm_err);
++extern DWORD sg_localgroup_del(const WCHAR *name);
++extern DWORD sg_localgroup_comment(const WCHAR *name, WCHAR **comment);
++extern DWORD sg_localgroup_setinfo(const WCHAR *name, const WCHAR *comment);
++extern DWORD sg_localgroup_names(WCHAR ***out, DWORD *count);
++extern DWORD sg_localgroup_members(const WCHAR *group, WCHAR ***out, DWORD *count);
++extern DWORD sg_localgroup_change(const WCHAR *group, DWORD level, const BYTE *buf, DWORD total, int mode);
++extern void sg_free_names(WCHAR **list, DWORD n);
++
++static BOOL valid_account_name(const WCHAR *name)
++{
++    size_t len;
++    if (!name || !(len = wcslen(name)) || len > LM20_UNLEN || name[len - 1] == '.') return FALSE;
++    for (; *name; name++)
++        if (*name < 32 || wcschr(L"\"/\\[]:|<>+=;,?*", *name)) return FALSE;
++    return TRUE;
++}
++
+ /************************************************************
+  *                NETAPI_ValidateServername
+  *
+@@ -1292,11 +1318,24 @@ NET_API_STATUS WINAPI NetUserAdd(LPCWSTR servername,
+     NET_API_STATUS status;
+     struct sam_user * su = NULL;
+ 
+-    FIXME("(%s, %ld, %p, %p) stub!\n", debugstr_w(servername), level, bufptr, parm_err);
++    TRACE("(%s, %ld, %p, %p)\n", debugstr_w(servername), level, bufptr, parm_err);
+ 
+     if((status = NETAPI_ValidateServername(servername)) != NERR_Success)
+         return status;
+ 
++    if (sg_admind_present() && level >= 1 && level <= 4)
++    {
++        /* accounts are the system's: created by sg-admind for an administrator */
++        PUSER_INFO_1 ui = (PUSER_INFO_1) bufptr;
++
++        if (!ui || !ui->usri1_name) return ERROR_INVALID_PARAMETER;
++        if (!valid_account_name(ui->usri1_name)) return NERR_BadUsername;
++        if (ui->usri1_password && lstrlenW(ui->usri1_password) > PWLEN) return NERR_PasswordTooShort;
++        if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++        if (NETAPI_FindUser(ui->usri1_name) || sg_account_exists(ui->usri1_name)) return NERR_UserExists;
++        return sg_user_add(ui->usri1_name, ui->usri1_password ? ui->usri1_password : L"");
++    }
++
+     switch(level)
+     {
+     /* Level 3 and 4 are identical for the purposes of NetUserAdd */
+@@ -1371,7 +1410,15 @@ NET_API_STATUS WINAPI NetUserDel(LPCWSTR servername, LPCWSTR username)
+         return status;
+ 
+     if ((user = NETAPI_FindUser(username)) == NULL)
++    {
++        if (sg_admind_present() && sg_account_exists(username))
++        {
++            /* the account goes, its files stay (Windows keeps the profile) */
++            if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++            return sg_user_del(username);
++        }
+         return NERR_UserNotFound;
++    }
+ 
+     list_remove(&user->entry);
+ 
+@@ -1383,6 +1430,55 @@ NET_API_STATUS WINAPI NetUserDel(LPCWSTR servername, LPCWSTR username)
+     return NERR_Success;
+ }
+ 
++/************************************************************
++ *                NetUserSetInfo  (NETAPI32.@)
++ *
++ * The password is what can be changed: on a system with sg-admind, for an
++ * administrator, through the account's real password; the other fields of the
++ * levels that carry them are not stored anywhere.
++ */
++NET_API_STATUS WINAPI NetUserSetInfo(LPCWSTR servername, LPCWSTR username, DWORD level, LPBYTE buf, LPDWORD parm_err)
++{
++    NET_API_STATUS status;
++    const WCHAR *password = NULL;
++    struct sam_user *user;
++
++    TRACE("(%s, %s, %ld, %p, %p)\n", debugstr_w(servername), debugstr_w(username), level, buf, parm_err);
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    switch (level)
++    {
++    case 1: case 2: case 3: case 4: case 1003: break;
++    case 0: case 21: case 22: case 1005: case 1006: case 1007: case 1008: case 1009: case 1010: case 1011: case 1012:
++    case 1013: case 1014: case 1017: case 1018: case 1020: case 1024: case 1025: case 1051: case 1052: case 1053:
++        return buf ? ERROR_NOT_SUPPORTED : ERROR_INVALID_PARAMETER;
++    default: return ERROR_INVALID_LEVEL;
++    }
++    if (!buf || !username) return ERROR_INVALID_PARAMETER;
++    switch (level)
++    {
++    case 1: password = ((USER_INFO_1 *)buf)->usri1_password; break;
++    case 2: password = ((USER_INFO_2 *)buf)->usri2_password; break;
++    case 3: password = ((USER_INFO_3 *)buf)->usri3_password; break;
++    case 4: password = ((USER_INFO_4 *)buf)->usri4_password; break;
++    case 1003: password = ((USER_INFO_1003 *)buf)->usri1003_password; break;
++    }
++    if (password && lstrlenW(password) > PWLEN) return NERR_PasswordTooShort;
++
++    if ((user = NETAPI_FindUser(username)))
++    {
++        if (!sg_is_administrator() && !NETAPI_IsCurrentUser(username)) return ERROR_ACCESS_DENIED;
++        if (password) lstrcpyW(user->user_password, password);
++        return NERR_Success;
++    }
++    if (sg_admind_present() && sg_account_exists(username))
++    {
++        if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++        return password && password[0] ? sg_user_password(username, password) : NERR_Success;
++    }
++    return NERR_UserNotFound;
++}
++
+ /************************************************************
+  *                NetUserGetInfo  (NETAPI32.@)
+  */
+@@ -1426,7 +1522,7 @@ NetUserGetInfo(LPCWSTR servername, LPCWSTR username, DWORD level,
+ #endif
+     }
+ 
+-    if(!NETAPI_FindUser(username) && !NETAPI_IsCurrentUser(username))
++    if(!NETAPI_FindUser(username) && !NETAPI_IsCurrentUser(username) && !sg_account_exists(username))
+     {
+         TRACE("User %s is unknown.\n", debugstr_w(username));
+         return NERR_UserNotFound;
+@@ -2245,9 +2341,14 @@ NET_API_STATUS WINAPI NetGetAnyDCName(LPCWSTR servername, LPCWSTR domainname, LP
+ NET_API_STATUS WINAPI
+ NetGroupAddUser(LPCWSTR servername, LPCWSTR groupname, LPCWSTR username)
+ {
+-    FIXME("(%s, %s, %s) stub!\n", debugstr_w(servername),
+-          debugstr_w(groupname), debugstr_w(username));
+-    return NERR_Success;
++    NET_API_STATUS status;
++
++    TRACE("(%s, %s, %s)\n", debugstr_w(servername), debugstr_w(groupname), debugstr_w(username));
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    /* global groups belong to a domain controller's directory: this computer is not one */
++    if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++    return NERR_NotPrimary;
+ }
+ 
+ /************************************************************
+@@ -2755,9 +2856,15 @@ NET_API_STATUS WINAPI NetLocalGroupAdd(
+     LPBYTE buf,
+     LPDWORD parm_err)
+ {
+-    FIXME("(%s %ld %p %p) stub!\n", debugstr_w(servername), level, buf,
+-          parm_err);
+-    return NERR_Success;
++    NET_API_STATUS status;
++    const LOCALGROUP_INFO_1 *info = (const LOCALGROUP_INFO_1 *)buf;
++
++    TRACE("(%s %ld %p %p)\n", debugstr_w(servername), level, buf, parm_err);
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    if (level != 0 && level != 1) return ERROR_INVALID_LEVEL;
++    if (!info) return ERROR_INVALID_PARAMETER;
++    return sg_localgroup_add(info->lgrpi1_name, level == 1 ? info->lgrpi1_comment : NULL, parm_err);
+ }
+ 
+ /************************************************************
+@@ -2768,9 +2875,10 @@ NET_API_STATUS WINAPI NetLocalGroupAddMember(
+     LPCWSTR groupname,
+     PSID membersid)
+ {
+-    FIXME("(%s %s %p) stub!\n", debugstr_w(servername),
+-          debugstr_w(groupname), membersid);
+-    return NERR_Success;
++    LOCALGROUP_MEMBERS_INFO_0 member = { membersid };
++
++    TRACE("(%s %s %p)\n", debugstr_w(servername), debugstr_w(groupname), membersid);
++    return NetLocalGroupAddMembers(servername, groupname, 0, (LPBYTE)&member, 1);
+ }
+ 
+ /************************************************************
+@@ -2783,9 +2891,12 @@ NET_API_STATUS WINAPI NetLocalGroupAddMembers(
+     LPBYTE buf,
+     DWORD totalentries)
+ {
+-    FIXME("(%s %s %ld %p %ld) stub!\n", debugstr_w(servername),
+-          debugstr_w(groupname), level, buf, totalentries);
+-    return NERR_Success;
++    NET_API_STATUS status;
++
++    TRACE("(%s %s %ld %p %ld)\n", debugstr_w(servername), debugstr_w(groupname), level, buf, totalentries);
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    return sg_localgroup_change(groupname, level, buf, totalentries, 0);
+ }
+ 
+ /************************************************************
+@@ -2795,8 +2906,12 @@ NET_API_STATUS WINAPI NetLocalGroupDel(
+     LPCWSTR servername,
+     LPCWSTR groupname)
+ {
+-    FIXME("(%s %s) stub!\n", debugstr_w(servername), debugstr_w(groupname));
+-    return NERR_Success;
++    NET_API_STATUS status;
++
++    TRACE("(%s %s)\n", debugstr_w(servername), debugstr_w(groupname));
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    return sg_localgroup_del(groupname);
+ }
+ 
+ /************************************************************
+@@ -2807,9 +2922,10 @@ NET_API_STATUS WINAPI NetLocalGroupDelMember(
+     LPCWSTR groupname,
+     PSID membersid)
+ {
+-    FIXME("(%s %s %p) stub!\n", debugstr_w(servername),
+-          debugstr_w(groupname), membersid);
+-    return NERR_Success;
++    LOCALGROUP_MEMBERS_INFO_0 member = { membersid };
++
++    TRACE("(%s %s %p)\n", debugstr_w(servername), debugstr_w(groupname), membersid);
++    return NetLocalGroupDelMembers(servername, groupname, 0, (LPBYTE)&member, 1);
+ }
+ 
+ /************************************************************
+@@ -2822,9 +2938,12 @@ NET_API_STATUS WINAPI NetLocalGroupDelMembers(
+     LPBYTE buf,
+     DWORD totalentries)
+ {
+-    FIXME("(%s %s %ld %p %ld) stub!\n", debugstr_w(servername),
+-          debugstr_w(groupname), level, buf, totalentries);
+-    return NERR_Success;
++    NET_API_STATUS status;
++
++    TRACE("(%s %s %ld %p %ld)\n", debugstr_w(servername), debugstr_w(groupname), level, buf, totalentries);
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    return sg_localgroup_change(groupname, level, buf, totalentries, 1);
+ }
+ 
+ /************************************************************
+@@ -2839,10 +2958,53 @@ NET_API_STATUS WINAPI NetLocalGroupEnum(
+     LPDWORD totalentries,
+     PDWORD_PTR resumehandle)
+ {
+-    FIXME("(%s %ld %p %ld %p %p %p) stub!\n", debugstr_w(servername),
+-          level, bufptr, prefmaxlen, entriesread, totalentries, resumehandle);
+-    *entriesread = 0;
+-    *totalentries = 0;
++    NET_API_STATUS status;
++    WCHAR **names, *comment;
++    DWORD i, n, size, fixed, tail;
++    BYTE *buf;
++    WCHAR *str;
++
++    TRACE("(%s %ld %p %ld %p %p %p)\n", debugstr_w(servername), level, bufptr, prefmaxlen, entriesread,
++          totalentries, resumehandle);
++    if (!bufptr || !entriesread || !totalentries) return ERROR_INVALID_PARAMETER;
++    *bufptr = NULL; *entriesread = *totalentries = 0;
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    if (level != 0 && level != 1) return ERROR_INVALID_LEVEL;
++    if ((status = sg_localgroup_names(&names, &n))) return status;
++
++    fixed = level == 0 ? sizeof(LOCALGROUP_INFO_0) : sizeof(LOCALGROUP_INFO_1);
++    size = n * fixed;
++    for (i = 0; i < n; i++)
++    {
++        size += (wcslen(names[i]) + 1) * sizeof(WCHAR);
++        if (level == 1 && !sg_localgroup_comment(names[i], &comment)) { size += (wcslen(comment) + 1) * sizeof(WCHAR); free(comment); }
++    }
++    tail = size;
++    if ((status = NetApiBufferAllocate(size ? size : 1, (void **)&buf))) { sg_free_names(names, n); return status; }
++    str = (WCHAR *)(buf + n * fixed);
++    for (i = 0; i < n; i++)
++    {
++        LOCALGROUP_INFO_1 *info = (LOCALGROUP_INFO_1 *)(buf + i * fixed);
++        info->lgrpi1_name = str;
++        wcscpy(str, names[i]);
++        str += wcslen(str) + 1;
++        if (level == 1)
++        {
++            if (!sg_localgroup_comment(names[i], &comment))
++            {
++                info->lgrpi1_comment = str;
++                wcscpy(str, comment);
++                str += wcslen(str) + 1;
++                free(comment);
++            }
++            else info->lgrpi1_comment = NULL;
++        }
++    }
++    (void)tail;
++    sg_free_names(names, n);
++    *bufptr = buf;
++    *entriesread = *totalentries = n;
+     return NERR_Success;
+ }
+ 
+@@ -2855,25 +3017,55 @@ NET_API_STATUS WINAPI NetLocalGroupGetInfo(
+     DWORD level,
+     LPBYTE* bufptr)
+ {
+-    static const WCHAR commentW[] = L"No comment";
++    NET_API_STATUS status;
++    WCHAR *comment;
+     LOCALGROUP_INFO_1* info;
+     DWORD size;
+ 
+-    FIXME("(%s %s %ld %p) semi-stub!\n", debugstr_w(servername),
+-          debugstr_w(groupname), level, bufptr);
+-
+-    size = sizeof(*info) + sizeof(WCHAR) * (lstrlenW(groupname)+1) + sizeof(commentW);
+-    NetApiBufferAllocate(size, (LPVOID*)&info);
+-
+-    info->lgrpi1_name = (LPWSTR)(info + 1);
+-    lstrcpyW(info->lgrpi1_name, groupname);
+-
+-    info->lgrpi1_comment = info->lgrpi1_name + lstrlenW(groupname) + 1;
+-    lstrcpyW(info->lgrpi1_comment, commentW);
+-
+-    *bufptr = (LPBYTE)info;
++    TRACE("(%s %s %ld %p)\n", debugstr_w(servername), debugstr_w(groupname), level, bufptr);
++    if (!bufptr) return ERROR_INVALID_PARAMETER;
++    *bufptr = NULL;
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    if (level != 0 && level != 1 && level != 1002) return ERROR_INVALID_LEVEL;
++    if ((status = sg_localgroup_comment(groupname, &comment))) return status;
+ 
+-    return NERR_Success;
++    if (level == 0)
++    {
++        LOCALGROUP_INFO_0 *i0;
++        size = sizeof(*i0) + sizeof(WCHAR) * (lstrlenW(groupname) + 1);
++        if (!(status = NetApiBufferAllocate(size, (void **)&i0)))
++        {
++            i0->lgrpi0_name = (WCHAR *)(i0 + 1);
++            lstrcpyW(i0->lgrpi0_name, groupname);
++            *bufptr = (LPBYTE)i0;
++        }
++    }
++    else if (level == 1002)
++    {
++        LOCALGROUP_INFO_1002 *i2;
++        size = sizeof(*i2) + sizeof(WCHAR) * (lstrlenW(comment) + 1);
++        if (!(status = NetApiBufferAllocate(size, (void **)&i2)))
++        {
++            i2->lgrpi1002_comment = (WCHAR *)(i2 + 1);
++            lstrcpyW(i2->lgrpi1002_comment, comment);
++            *bufptr = (LPBYTE)i2;
++        }
++    }
++    else
++    {
++        size = sizeof(*info) + sizeof(WCHAR) * (lstrlenW(groupname) + 1 + lstrlenW(comment) + 1);
++        if (!(status = NetApiBufferAllocate(size, (void **)&info)))
++        {
++            info->lgrpi1_name = (LPWSTR)(info + 1);
++            lstrcpyW(info->lgrpi1_name, groupname);
++            info->lgrpi1_comment = info->lgrpi1_name + lstrlenW(groupname) + 1;
++            lstrcpyW(info->lgrpi1_comment, comment);
++            *bufptr = (LPBYTE)info;
++        }
++    }
++    free(comment);
++    return status;
+ }
+ 
+ /************************************************************
+@@ -2889,44 +3081,88 @@ NET_API_STATUS WINAPI NetLocalGroupGetMembers(
+     LPDWORD totalentries,
+     PDWORD_PTR resumehandle)
+ {
+-    FIXME("(%s %s %ld %p %ld, %p %p %p) stub!\n", debugstr_w(servername),
+-          debugstr_w(localgroupname), level, bufptr, prefmaxlen, entriesread,
+-          totalentries, resumehandle);
++    NET_API_STATUS status;
++    WCHAR **names;
++    DWORD i, n, fixed, size, used = 0;
++    struct entry { WCHAR *display; BYTE sid[SECURITY_MAX_SID_SIZE]; DWORD sidlen; SID_NAME_USE use; } *e;
++    BYTE *buf;
++    WCHAR *str;
++    SID *sidarea;
+ 
+-    if (level == 3)
++    TRACE("(%s %s %ld %p %ld, %p %p %p)\n", debugstr_w(servername), debugstr_w(localgroupname), level, bufptr,
++          prefmaxlen, entriesread, totalentries, resumehandle);
++    if (!bufptr || !entriesread || !totalentries) return ERROR_INVALID_PARAMETER;
++    *bufptr = NULL; *entriesread = *totalentries = 0;
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    if (level > 3) return ERROR_INVALID_LEVEL;
++    if ((status = sg_localgroup_members(localgroupname, &names, &n))) return status;
++    if (!(e = calloc(n + 1, sizeof(*e)))) { sg_free_names(names, n); return ERROR_NOT_ENOUGH_MEMORY; }
++
++    /* levels with a SID list only the members that have one */
++    for (i = 0; i < n; i++)
++    {
++        WCHAR domain[MAX_COMPUTERNAME_LENGTH + 64];
++        DWORD dl = ARRAY_SIZE(domain);
++        const WCHAR *bs = wcschr(names[i], '\\');
++
++        e[used].display = names[i];
++        if (level != 3)
++        {
++            e[used].sidlen = sizeof(e[used].sid);
++            if (!LookupAccountNameW(NULL, names[i], (PSID)e[used].sid, &e[used].sidlen, domain, &dl, &e[used].use) &&
++                !(bs && LookupAccountNameW(NULL, bs + 1, (PSID)e[used].sid, &e[used].sidlen, domain, &dl, &e[used].use)))
++                continue;
++        }
++        used++;
++    }
++    fixed = level == 0 ? sizeof(LOCALGROUP_MEMBERS_INFO_0) : level == 1 ? sizeof(LOCALGROUP_MEMBERS_INFO_1)
++          : level == 2 ? sizeof(LOCALGROUP_MEMBERS_INFO_2) : sizeof(LOCALGROUP_MEMBERS_INFO_3);
++    size = used * fixed;
++    for (i = 0; i < used; i++)
+     {
+-        WCHAR userName[MAX_COMPUTERNAME_LENGTH + 1];
+-        DWORD userNameLen;
+-        DWORD len,needlen;
+-        PLOCALGROUP_MEMBERS_INFO_3 ptr;
+-
+-        /* still a stub,  current user is belonging to all groups */
+-
+-        *totalentries = 1;
+-        *entriesread = 0;
+-
+-        userNameLen = MAX_COMPUTERNAME_LENGTH + 1;
+-        if (!GetUserNameW(userName,&userNameLen))
+-            return ERROR_NOT_ENOUGH_MEMORY;
+-
+-        needlen = sizeof(LOCALGROUP_MEMBERS_INFO_3) +
+-             (userNameLen+2) * sizeof(WCHAR);
+-        if (prefmaxlen != MAX_PREFERRED_LENGTH)
+-            len = min(prefmaxlen,needlen);
+-        else
+-            len = needlen;
+-
+-        NetApiBufferAllocate(len, (LPVOID *) bufptr);
+-        if (len < needlen)
+-            return ERROR_MORE_DATA;
+-
+-        ptr = (PLOCALGROUP_MEMBERS_INFO_3)*bufptr;
+-        ptr->lgrmi3_domainandname = (LPWSTR)(*bufptr+sizeof(LOCALGROUP_MEMBERS_INFO_3));
+-        lstrcpyW(ptr->lgrmi3_domainandname,userName);
+-
+-        *entriesread = 1;
++        const WCHAR *nm = level == 1 && wcschr(e[i].display, '\\') ? wcschr(e[i].display, '\\') + 1 : e[i].display;
++        if (level != 0) size += (wcslen(nm) + 1) * sizeof(WCHAR);
++        if (level != 3) size += (e[i].sidlen + 7) & ~7;
+     }
++    if (prefmaxlen != MAX_PREFERRED_LENGTH && size > prefmaxlen)
++        status = ERROR_MORE_DATA;
++    else
++        status = NetApiBufferAllocate(size ? size : 1, (void **)&buf);
++    if (status) { free(e); sg_free_names(names, n); return status; }
+ 
++    sidarea = (SID *)(buf + used * fixed);
++    str = (WCHAR *)((BYTE *)sidarea + 0);
++    if (level != 3)
++    {
++        BYTE *p = (BYTE *)sidarea;
++        for (i = 0; i < used; i++) p += (e[i].sidlen + 7) & ~7;
++        str = (WCHAR *)p;
++    }
++    {
++        BYTE *sp = (BYTE *)sidarea;
++        for (i = 0; i < used; i++)
++        {
++            BYTE *rec = buf + i * fixed;
++            SID *sid = NULL;
++            WCHAR *name = NULL;
++            const WCHAR *nm = level == 1 && wcschr(e[i].display, '\\') ? wcschr(e[i].display, '\\') + 1 : e[i].display;
++
++            if (level != 3) { sid = (SID *)sp; memcpy(sid, e[i].sid, e[i].sidlen); sp += (e[i].sidlen + 7) & ~7; }
++            if (level != 0) { name = str; wcscpy(str, nm); str += wcslen(str) + 1; }
++            switch (level)
++            {
++            case 0: ((LOCALGROUP_MEMBERS_INFO_0 *)rec)->lgrmi0_sid = sid; break;
++            case 1: { LOCALGROUP_MEMBERS_INFO_1 *r = (void *)rec; r->lgrmi1_sid = sid; r->lgrmi1_sidusage = e[i].use; r->lgrmi1_name = name; break; }
++            case 2: { LOCALGROUP_MEMBERS_INFO_2 *r = (void *)rec; r->lgrmi2_sid = sid; r->lgrmi2_sidusage = e[i].use; r->lgrmi2_domainandname = name; break; }
++            case 3: ((LOCALGROUP_MEMBERS_INFO_3 *)rec)->lgrmi3_domainandname = name; break;
++            }
++        }
++    }
++    free(e);
++    sg_free_names(names, n);
++    *bufptr = buf;
++    *entriesread = *totalentries = used;
+     return NERR_Success;
+ }
+ 
+@@ -2940,9 +3176,22 @@ NET_API_STATUS WINAPI NetLocalGroupSetInfo(
+     LPBYTE buf,
+     LPDWORD parm_err)
+ {
+-    FIXME("(%s %s %ld %p %p) stub!\n", debugstr_w(servername),
+-          debugstr_w(groupname), level, buf, parm_err);
+-    return NERR_Success;
++    NET_API_STATUS status;
++    const WCHAR *comment;
++
++    TRACE("(%s %s %ld %p %p)\n", debugstr_w(servername), debugstr_w(groupname), level, buf, parm_err);
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    if (level != 0 && level != 1 && level != 1002) return ERROR_INVALID_LEVEL;
++    if (!buf) return ERROR_INVALID_PARAMETER;
++    if (level == 0)
++    {
++        /* renaming a group is not offered: the name is the group's identity here */
++        if (!sg_is_administrator()) return ERROR_ACCESS_DENIED;
++        return ERROR_NOT_SUPPORTED;
++    }
++    comment = level == 1 ? ((LOCALGROUP_INFO_1 *)buf)->lgrpi1_comment : ((LOCALGROUP_INFO_1002 *)buf)->lgrpi1002_comment;
++    return sg_localgroup_setinfo(groupname, comment ? comment : L"");
+ }
+ 
+ /************************************************************
+@@ -2955,9 +3204,12 @@ NET_API_STATUS WINAPI NetLocalGroupSetMembers(
+     LPBYTE buf,
+     DWORD totalentries)
+ {
+-    FIXME("(%s %s %ld %p %ld) stub!\n", debugstr_w(servername),
+-            debugstr_w(groupname), level, buf, totalentries);
+-    return NERR_Success;
++    NET_API_STATUS status;
++
++    TRACE("(%s %s %ld %p %ld)\n", debugstr_w(servername), debugstr_w(groupname), level, buf, totalentries);
++    if ((status = NETAPI_ValidateServername(servername)) != NERR_Success) return status;
++    if (!NETAPI_IsLocalComputer(servername)) return ERROR_BAD_NETPATH;
++    return sg_localgroup_change(groupname, level, buf, totalentries, 2);
+ }
+ 
+ /************************************************************
+diff --git a/dlls/netapi32/netapi32.spec b/dlls/netapi32/netapi32.spec
+index f5fd444..2ced546 100644
+--- a/dlls/netapi32/netapi32.spec
++++ b/dlls/netapi32/netapi32.spec
+@@ -216,7 +216,7 @@
+ @ stdcall NetUserModalsGet(wstr long ptr)
+ @ stub NetUserModalsSet
+ @ stub NetUserSetGroups
+-@ stub NetUserSetInfo
++@ stdcall NetUserSetInfo(wstr wstr long ptr ptr)
+ @ stdcall NetWkstaGetInfo(wstr long ptr)
+ @ stub NetWkstaSetInfo
+ @ stub NetWkstaTransportAdd
