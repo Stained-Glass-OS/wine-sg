@@ -123,3 +123,7 @@ Scope change from the coordinator: crypt32/bcrypt/wintrust/cryptowinrt/onlineid/
   XPRESS_HUFF from MS-XCA (360 361 362); escalated with proposals: 1 (volume lock), 11 (job classes), 395 (volume label), 405/981
   (cdrom ioctls), 439 (key write time), 444 (working set of other processes). ntdll full suites 64/32 vs base: no new failures (the
   32-bit ntdll.virtual syscall-thunk test needs a prefix made with the new build).
+- 2026-10-14 (Fast A, ole32): 5106 IEnumGUID::Skip (985 986), 5107 default handler GetDataHere/GetRunningClass/Update/LockRunning/SetContainedObject
+  (493 869 987 988 989; 494 no-ground-truth), 5108 STGM_CONVERT (499), 5109 StgOpenStorageEx riid (505), 5110 OleConvertIStorageToOLESTREAMEx (506),
+  5111 data cache GetColorSet (509), 5112 OleCreateStaticFromData render options (519; 517 OleSetMenuDescriptor no-ground-truth), 5113 file moniker
+  ParseDisplayName + anti-moniker GetDisplayName (460 461). ole32 full suites 64/32: 0 failures after each patch.
