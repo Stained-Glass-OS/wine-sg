@@ -27,6 +27,22 @@ int main(int argc, char **argv)
     for (i = 0; i < 8; i++) if (i < 2 || i >= 6) HeapFree(heap, 0, blocks[i]);
     HeapDestroy(heap);
     check(heapmin && heapmin() == 0, "msvcrt _heapmin succeeds");
+
+    /* a heap that cannot grow, filled to the last block: nothing free is 0
+     * with no error, not a failure */
+    heap = HeapCreate(0, 0x2000, 0x2000);
+    {
+        static const SIZE_T sizes[] = { 0x200, 0x40, 0x10, 1 };
+        void *p;
+        int n = 0, s;
+        for (s = 0; s < 4; s++) while ((p = HeapAlloc(heap, 0, sizes[s]))) n++;
+        check(n > 0, "filled a fixed heap with %d blocks", n);
+        SetLastError(0xdeadbeef);
+        largest = HeapCompact(heap, 0);
+        check(largest == 0 ? GetLastError() == NO_ERROR : largest < 0x2000,
+              "a full heap: HeapCompact %Iu, error %lu", largest, GetLastError());
+    }
+    HeapDestroy(heap);
     printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
     return !!failures;
 }
