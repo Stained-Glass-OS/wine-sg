@@ -13,16 +13,21 @@
 static void sgf_u16(unsigned char **p, unsigned v) { (*p)[0] = v >> 8; (*p)[1] = v; *p += 2; }
 static void sgf_u32(unsigned char **p, unsigned v) { sgf_u16(p, v >> 16); sgf_u16(p, v & 0xffff); }
 
+/* an optional GPOS table, set before sgf_build */
+static const unsigned char *sgf_gpos;
+static unsigned sgf_gpos_len;
+
 struct sgf_table { char tag[5]; unsigned char *data; unsigned len; };
 
 static unsigned char *sgf_build(const char *family, const unsigned char *gsub, unsigned gsub_len, unsigned *out_len)
 {
-    struct sgf_table t[11];
+    struct sgf_table t[12];
     unsigned n = 0, i, off, total;
     unsigned char *p, *out;
     size_t flen = strlen(family);
 
 #define NEWT(tg, size) do { memcpy(t[n].tag, tg, 5); t[n].len = (size); t[n].data = calloc(1, (size) + 4); p = t[n].data; n++; } while (0)
+    if (sgf_gpos) { NEWT("GPOS", sgf_gpos_len); memcpy(t[n - 1].data, sgf_gpos, sgf_gpos_len); }
     if (gsub) { NEWT("GSUB", gsub_len); memcpy(t[n - 1].data, gsub, gsub_len); }
     /* OS/2 version 1, 86 bytes */
     NEWT("OS/2", 86);
