@@ -1,0 +1,1872 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Mon, 12 Oct 2026 14:29:39 -0700
+Subject: [PATCH] httpapi, http.sys: several URLs per group, service
+ configuration, properties, file chunks, loopback only
+
+- URL groups hold any number of URLs (invalid URL gives ERROR_INVALID_PARAMETER, a duplicate
+  ERROR_ALREADY_EXISTS), closing a group or session unregisters its URLs, bad group ids no longer crash;
+  the todo_wine marks in tests/httpapi.c for this are removed
+- HttpSet/Query/DeleteServiceConfiguration store URL ACLs, the IP listen list and the two timeouts in the
+  HTTP service's registry key; HTTPS certificate bindings are not supported
+- Set/Query properties of request queues, server sessions and URL groups read back what was set;
+  HttpShutdownRequestQueue aborts pending receives
+- response chunks may come from a file handle or the (process-local) fragment cache; HttpAddFragmentToCache,
+  HttpReadFragmentFromCache, HttpFlushResponseCache
+- http.sys listens on the loopback interface only (all interfaces only when 0.0.0.0 is listed in the
+  service's ListenOnlyList), sends complete responses on a non-blocking socket, honours the DISCONNECT flag
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+
+diff --git a/dlls/http.sys/http.c b/dlls/http.sys/http.c
+index edf099b..a22efc9 100644
+--- a/dlls/http.sys/http.c
++++ b/dlls/http.sys/http.c
+@@ -724,6 +724,75 @@ static struct listening_socket *get_listening_socket(unsigned short port)
+     return NULL;
+ }
+ 
++/* Servers listen on the loopback interface only, unless an administrator explicitly allowed
++ * all interfaces by listing 0.0.0.0 in the HTTP service's ListenOnlyList setting. */
++static BOOL listen_on_all_interfaces(void)
++{
++    static const WCHAR path[] = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\HTTP\\Parameters";
++    static const WCHAR name[] = L"ListenOnlyList";
++    UNICODE_STRING key_name, value_name;
++    OBJECT_ATTRIBUTES attr;
++    KEY_VALUE_PARTIAL_INFORMATION *info;
++    ULONG size = 0;
++    HANDLE key;
++    BOOL ret = FALSE;
++
++    RtlInitUnicodeString(&key_name, path);
++    InitializeObjectAttributes(&attr, &key_name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
++    if (ZwOpenKey(&key, KEY_QUERY_VALUE, &attr)) return FALSE;
++
++    RtlInitUnicodeString(&value_name, name);
++    ZwQueryValueKey(key, &value_name, KeyValuePartialInformation, NULL, 0, &size);
++    if (size && (info = malloc(size + 2 * sizeof(WCHAR))))
++    {
++        if (!ZwQueryValueKey(key, &value_name, KeyValuePartialInformation, info, size, &size)
++                && info->Type == REG_MULTI_SZ)
++        {
++            const WCHAR *p = (const WCHAR *)info->Data;
++            const WCHAR *end = (const WCHAR *)(info->Data + info->DataLength);
++
++            while (p < end && *p)
++            {
++                if (!wcscmp(p, L"0.0.0.0")) ret = TRUE;
++                p += wcslen(p) + 1;
++            }
++        }
++        free(info);
++    }
++    ZwClose(key);
++    return ret;
++}
++
++/* Sends the whole buffer on a non-blocking socket. */
++static BOOL send_all(SOCKET s, const char *buffer, int len)
++{
++    int tries = 0;
++
++    while (len > 0)
++    {
++        int ret = send(s, buffer, len, 0);
++
++        if (ret >= 0)
++        {
++            buffer += ret;
++            len -= ret;
++            tries = 0;
++        }
++        else if (WSAGetLastError() == WSAEWOULDBLOCK && tries++ < 50)
++        {
++            fd_set set;
++            struct timeval timeout = {0, 100000};
++
++            FD_ZERO(&set);
++            FD_SET(s, &set);
++            select(0, NULL, &set, NULL, &timeout);
++        }
++        else
++            return FALSE;
++    }
++    return TRUE;
++}
++
+ static NTSTATUS http_add_url(struct request_queue *queue, IRP *irp)
+ {
+     const struct http_add_url_params *params = irp->AssociatedIrp.SystemBuffer;
+@@ -798,7 +867,7 @@ static NTSTATUS http_add_url(struct request_queue *queue, IRP *irp)
+         }
+ 
+         addr.sin_family = AF_INET;
+-        addr.sin_addr.S_un.S_addr = INADDR_ANY;
++        addr.sin_addr.S_un.S_addr = listen_on_all_interfaces() ? INADDR_ANY : htonl(INADDR_LOOPBACK);
+         value = 1;
+         setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char *)&value, sizeof(value));
+         if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == -1)
+@@ -1004,10 +1073,20 @@ static NTSTATUS http_send_response(struct request_queue *queue, IRP *irp)
+ 
+     if ((conn = get_connection(response->id)))
+     {
+-        if (send(conn->socket, response->buffer, response->len, 0) >= 0)
++        if (send_all(conn->socket, response->buffer, response->len))
+         {
++            irp->IoStatus.Information = response->len;
++
++            if ((response->response_flags & HTTP_SEND_RESPONSE_FLAG_DISCONNECT)
++                    && !(response->response_flags & HTTP_SEND_RESPONSE_FLAG_MORE_DATA))
++            {
++                close_connection(conn);
++                LeaveCriticalSection(&http_cs);
++                return STATUS_SUCCESS;
++            }
++
+             /* Clean up the connection if we are not sending more response data. */
+-            if (response->response_flags != HTTP_SEND_RESPONSE_FLAG_MORE_DATA)
++            if (!(response->response_flags & HTTP_SEND_RESPONSE_FLAG_MORE_DATA))
+             {
+                 if (conn->content_len)
+                 {
+diff --git a/dlls/httpapi/httpapi.spec b/dlls/httpapi/httpapi.spec
+index 7a5f275..2a39227 100644
+--- a/dlls/httpapi/httpapi.spec
++++ b/dlls/httpapi/httpapi.spec
+@@ -1,4 +1,4 @@
+-@ stub HttpAddFragmentToCache
++@ stdcall HttpAddFragmentToCache(ptr wstr ptr ptr ptr)
+ @ stdcall HttpAddUrl(ptr wstr ptr)
+ @ stdcall HttpAddUrlToUrlGroup(int64 wstr int64 long)
+ @ stub HttpCancelHttpRequest
+@@ -11,14 +11,14 @@
+ @ stdcall HttpCreateServerSession(long ptr long)
+ @ stdcall HttpCreateUrlGroup(int64 ptr long)
+ @ stdcall HttpDeleteServiceConfiguration(ptr long ptr long ptr)
+-@ stub HttpFlushResponseCache
++@ stdcall HttpFlushResponseCache(ptr wstr long ptr)
+ @ stub HttpGetCounters
+ @ stdcall HttpInitialize(long long ptr)
+-@ stub HttpQueryRequestQueueProperty
+-@ stub HttpQueryServerSessionProperty
++@ stdcall HttpQueryRequestQueueProperty(ptr long ptr long long ptr ptr)
++@ stdcall HttpQueryServerSessionProperty(int64 long ptr long ptr)
+ @ stdcall HttpQueryServiceConfiguration(ptr long ptr long ptr long ptr ptr)
+-@ stub HttpQueryUrlGroupProperty
+-@ stub HttpReadFragmentFromCache
++@ stdcall HttpQueryUrlGroupProperty(int64 long ptr long ptr)
++@ stdcall HttpReadFragmentFromCache(ptr wstr ptr ptr long ptr ptr)
+ @ stub HttpReceiveClientCertificate
+ @ stdcall HttpReceiveHttpRequest(ptr int64 long ptr long ptr ptr)
+ @ stdcall HttpReceiveRequestEntityBody(ptr int64 long ptr long ptr ptr)
+@@ -30,7 +30,7 @@
+ @ stdcall HttpSetServerSessionProperty(int64 long ptr long)
+ @ stdcall HttpSetServiceConfiguration(ptr long ptr long ptr)
+ @ stdcall HttpSetUrlGroupProperty(int64 long ptr long)
+-@ stub HttpShutdownRequestQueue
++@ stdcall HttpShutdownRequestQueue(ptr)
+ @ stdcall HttpTerminate(long ptr)
+ @ stub HttpWaitForDemandStart
+ @ stub HttpWaitForDisconnect
+diff --git a/dlls/httpapi/httpapi_main.c b/dlls/httpapi/httpapi_main.c
+index d1c2667..643c6bf 100644
+--- a/dlls/httpapi/httpapi_main.c
++++ b/dlls/httpapi/httpapi_main.c
+@@ -22,11 +22,38 @@
+ #include "wine/http.h"
+ #include "winsvc.h"
+ #include "winternl.h"
++#include "winsock2.h"
++#include "sddl.h"
+ #include "wine/debug.h"
+ #include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(http);
+ 
++static CRITICAL_SECTION httpapi_cs;
++static CRITICAL_SECTION_DEBUG httpapi_cs_debug =
++{
++    0, 0, &httpapi_cs,
++    { &httpapi_cs_debug.ProcessLocksList, &httpapi_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": httpapi_cs") }
++};
++static CRITICAL_SECTION httpapi_cs = { &httpapi_cs_debug, -1, 0, 0, 0, 0 };
++
++/* Service configuration records (the layouts are documented, but not all are in http.h). */
++typedef enum { ConfigQueryExact, ConfigQueryNext, ConfigQueryMax } CONFIG_QUERY_TYPE;
++
++typedef struct { WCHAR *pUrlPrefix; } CONFIG_URLACL_KEY;
++typedef struct { WCHAR *pStringSecurityDescriptor; } CONFIG_URLACL_PARAM;
++typedef struct { CONFIG_URLACL_KEY KeyDesc; CONFIG_URLACL_PARAM ParamDesc; } CONFIG_URLACL_SET;
++typedef struct { CONFIG_QUERY_TYPE QueryDesc; CONFIG_URLACL_KEY KeyDesc; DWORD dwToken; } CONFIG_URLACL_QUERY;
++
++typedef struct { USHORT AddrLength; SOCKADDR *pAddress; } CONFIG_IP_LISTEN_PARAM;
++typedef struct { ULONG AddrCount; SOCKADDR_STORAGE AddrList[1]; } CONFIG_IP_LISTEN_QUERY;
++
++typedef struct { ULONG KeyDesc; } CONFIG_TIMEOUT_KEY;
++typedef struct { ULONG KeyDesc; USHORT ParamDesc; } CONFIG_TIMEOUT_SET;
++
++static const WCHAR parameters_key[] = L"System\\CurrentControlSet\\Services\\HTTP\\Parameters";
++
+ /***********************************************************************
+  *        HttpInitialize       (HTTPAPI.@)
+  *
+@@ -50,7 +77,8 @@ ULONG WINAPI HttpInitialize(HTTPAPI_VERSION version, ULONG flags, void *reserved
+ 
+     if (flags & ~HTTP_INITIALIZE_SERVER)
+     {
+-        FIXME("Unhandled flags %#lx.\n", flags);
++        /* HTTP_INITIALIZE_CONFIG only touches the configuration store, which needs no service */
++        TRACE("Unhandled flags %#lx.\n", flags);
+         return ERROR_SUCCESS;
+     }
+ 
+@@ -92,10 +120,47 @@ ULONG WINAPI HttpInitialize(HTTPAPI_VERSION version, ULONG flags, void *reserved
+  */
+ ULONG WINAPI HttpTerminate( ULONG flags, PVOID reserved )
+ {
+-    FIXME( "(0x%lx, %p): stub!\n", flags, reserved );
++    TRACE( "(0x%lx, %p)\n", flags, reserved );
++
++    if (reserved) return ERROR_INVALID_PARAMETER;
+     return NO_ERROR;
+ }
+ 
++static HKEY open_config_key(const WCHAR *subkey, BOOL create, REGSAM access, LONG *err)
++{
++    WCHAR path[256];
++    HKEY key = NULL;
++
++    if (*subkey)
++        swprintf(path, ARRAY_SIZE(path), L"%ls\\%ls", parameters_key, subkey);
++    else
++        wcscpy(path, parameters_key);
++    if (create)
++        *err = RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, access, NULL, &key, NULL);
++    else
++        *err = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, access, &key);
++    return key;
++}
++
++static ULONG check_config_args(HANDLE handle, HTTP_SERVICE_CONFIG_ID type, OVERLAPPED *ovl)
++{
++    if (handle || ovl) return ERROR_INVALID_PARAMETER;
++    if ((int)type < 0 || type >= HttpServiceConfigMax) return ERROR_INVALID_PARAMETER;
++    return ERROR_SUCCESS;
++}
++
++static BOOL is_valid_url_prefix(const WCHAR *url)
++{
++    const WCHAR *p;
++
++    if (!_wcsnicmp(url, L"http://", 7)) p = url + 7;
++    else if (!_wcsnicmp(url, L"https://", 8)) p = url + 8;
++    else return FALSE;
++    /* http://host:port/path/ */
++    if (!(p = wcschr(p, ':')) || !iswdigit(p[1])) return FALSE;
++    return wcschr(p, '/') != NULL && url[wcslen(url) - 1] == '/';
++}
++
+ /***********************************************************************
+  *        HttpDeleteServiceConfiguration     (HTTPAPI.@)
+  *
+@@ -115,10 +180,90 @@ ULONG WINAPI HttpTerminate( ULONG flags, PVOID reserved )
+ ULONG WINAPI HttpDeleteServiceConfiguration( HANDLE handle, HTTP_SERVICE_CONFIG_ID type,
+                  PVOID config, ULONG length, LPOVERLAPPED overlapped )
+ {
+-    FIXME( "(%p, %d, %p, %ld, %p): stub!\n", handle, type, config, length, overlapped );
+-    return NO_ERROR;
++    ULONG ret;
++    LONG err;
++    HKEY key;
++
++    TRACE( "(%p, %d, %p, %ld, %p)\n", handle, type, config, length, overlapped );
++
++    if ((ret = check_config_args( handle, type, overlapped ))) return ret;
++
++    switch (type)
++    {
++    case HttpServiceConfigUrlAclInfo:
++    {
++        const CONFIG_URLACL_SET *set = config;
++
++        if (!config || length < sizeof(*set) || !set->KeyDesc.pUrlPrefix) return ERROR_INVALID_PARAMETER;
++        if (!is_valid_url_prefix( set->KeyDesc.pUrlPrefix )) return ERROR_INVALID_PARAMETER;
++        if (!(key = open_config_key( L"UrlAclInfo", FALSE, KEY_SET_VALUE, &err ))) return ERROR_FILE_NOT_FOUND;
++        err = RegDeleteValueW( key, set->KeyDesc.pUrlPrefix );
++        RegCloseKey( key );
++        return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? ERROR_FILE_NOT_FOUND : err;
++    }
++    case HttpServiceConfigIPListenList:
++    {
++        const CONFIG_IP_LISTEN_PARAM *param = config;
++        WCHAR addr[64], *list, *p, *out;
++        DWORD size, i = 0, len;
++        BOOL found = FALSE;
++
++        if (!config || length < sizeof(*param) || !param->pAddress || param->AddrLength < sizeof(SOCKADDR_IN))
++            return ERROR_INVALID_PARAMETER;
++        if (param->pAddress->sa_family != AF_INET) return ERROR_INVALID_PARAMETER;
++        {
++            const BYTE *a = (const BYTE *)&((SOCKADDR_IN *)param->pAddress)->sin_addr;
++            swprintf( addr, ARRAY_SIZE(addr), L"%u.%u.%u.%u", a[0], a[1], a[2], a[3] );
++        }
++        if (!(key = open_config_key( L"", FALSE, KEY_QUERY_VALUE | KEY_SET_VALUE, &err ))) return ERROR_FILE_NOT_FOUND;
++        size = 0;
++        if (RegQueryValueExW( key, L"ListenOnlyList", NULL, NULL, NULL, &size ) || !size)
++        {
++            RegCloseKey( key );
++            return ERROR_FILE_NOT_FOUND;
++        }
++        list = malloc( size + 2 * sizeof(WCHAR) );
++        if (!list) { RegCloseKey( key ); return ERROR_OUTOFMEMORY; }
++        RegQueryValueExW( key, L"ListenOnlyList", NULL, NULL, (BYTE *)list, &size );
++        list[size / sizeof(WCHAR)] = list[size / sizeof(WCHAR) + 1] = 0;
++        out = malloc( size + 2 * sizeof(WCHAR) );
++        if (!out) { free( list ); RegCloseKey( key ); return ERROR_OUTOFMEMORY; }
++        for (p = list; *p; p += len + 1)
++        {
++            len = wcslen( p );
++            if (!wcscmp( p, addr )) { found = TRUE; continue; }
++            memcpy( out + i, p, (len + 1) * sizeof(WCHAR) );
++            i += len + 1;
++        }
++        out[i++] = 0;
++        if (found) err = i > 1 ? RegSetValueExW( key, L"ListenOnlyList", 0, REG_MULTI_SZ, (BYTE *)out, i * sizeof(WCHAR) )
++                               : RegDeleteValueW( key, L"ListenOnlyList" );
++        free( out );
++        free( list );
++        RegCloseKey( key );
++        return found ? err : ERROR_FILE_NOT_FOUND;
++    }
++    case HttpServiceConfigTimeout:
++    {
++        const CONFIG_TIMEOUT_KEY *tkey = config;
++        static const WCHAR *names[] = { L"IdleConnectionTimeout", L"HeaderWaitTimeout" };
++
++        if (!config || length < sizeof(*tkey) || tkey->KeyDesc >= ARRAY_SIZE(names)) return ERROR_INVALID_PARAMETER;
++        if (!(key = open_config_key( L"", FALSE, KEY_SET_VALUE, &err ))) return ERROR_SUCCESS;
++        RegDeleteValueW( key, names[tkey->KeyDesc] );
++        RegCloseKey( key );
++        return ERROR_SUCCESS;
++    }
++    case HttpServiceConfigSSLCertInfo:
++        /* HTTPS is not implemented, so no certificate binding can exist */
++        return ERROR_FILE_NOT_FOUND;
++    default:
++        return ERROR_INVALID_PARAMETER;
++    }
+ }
+ 
++
++
+ /***********************************************************************
+  *        HttpQueryServiceConfiguration     (HTTPAPI.@)
+  *
+@@ -142,9 +287,156 @@ ULONG WINAPI HttpQueryServiceConfiguration( HANDLE handle, HTTP_SERVICE_CONFIG_I
+                  PVOID query, ULONG query_len, PVOID buffer, ULONG buffer_len,
+                  PULONG data_len, LPOVERLAPPED overlapped )
+ {
+-    FIXME( "(%p, %d, %p, %ld, %p, %ld, %p, %p): stub!\n", handle, type, query, query_len,
++    ULONG ret;
++    LONG err;
++    HKEY key;
++
++    TRACE( "(%p, %d, %p, %ld, %p, %ld, %p, %p)\n", handle, type, query, query_len,
+             buffer, buffer_len, data_len, overlapped );
+-    return ERROR_FILE_NOT_FOUND;
++
++    if ((ret = check_config_args( handle, type, overlapped ))) return ret;
++
++    switch (type)
++    {
++    case HttpServiceConfigUrlAclInfo:
++    {
++        const CONFIG_URLACL_QUERY *q = query;
++        WCHAR *name = NULL, *sddl = NULL;
++        DWORD name_len, sddl_size, needed;
++        CONFIG_URLACL_SET *out = buffer;
++
++        if (!query || query_len < sizeof(*q) || q->QueryDesc >= ConfigQueryMax) return ERROR_INVALID_PARAMETER;
++        if (!(key = open_config_key( L"UrlAclInfo", FALSE, KEY_QUERY_VALUE, &err )))
++            return q->QueryDesc == ConfigQueryExact ? ERROR_FILE_NOT_FOUND : ERROR_NO_MORE_ITEMS;
++
++        if (q->QueryDesc == ConfigQueryExact)
++        {
++            if (!q->KeyDesc.pUrlPrefix || !is_valid_url_prefix( q->KeyDesc.pUrlPrefix ))
++            {
++                RegCloseKey( key );
++                return ERROR_INVALID_PARAMETER;
++            }
++            if (!(name = wcsdup( q->KeyDesc.pUrlPrefix )))
++            {
++                RegCloseKey( key );
++                return ERROR_OUTOFMEMORY;
++            }
++            if (RegQueryValueExW( key, name, NULL, NULL, NULL, &sddl_size ))
++            {
++                free( name );
++                RegCloseKey( key );
++                return ERROR_FILE_NOT_FOUND;
++            }
++        }
++        else
++        {
++            /* enumerate: dwToken is the zero based index of the record */
++            RegQueryInfoKeyW( key, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &name_len, &sddl_size, NULL, NULL );
++            name = malloc( (name_len + 1) * sizeof(WCHAR) );
++            name_len++;
++            err = name ? RegEnumValueW( key, q->dwToken, name, &name_len, NULL, NULL, NULL, NULL ) : ERROR_OUTOFMEMORY;
++            if (err)
++            {
++                free( name );
++                RegCloseKey( key );
++                return err;
++            }
++            RegQueryValueExW( key, name, NULL, NULL, NULL, &sddl_size );
++        }
++
++        sddl = malloc( sddl_size + sizeof(WCHAR) );
++        if (!sddl)
++        {
++            free( name );
++            RegCloseKey( key );
++            return ERROR_OUTOFMEMORY;
++        }
++        RegQueryValueExW( key, name, NULL, NULL, (BYTE *)sddl, &sddl_size );
++        sddl[sddl_size / sizeof(WCHAR)] = 0;
++        RegCloseKey( key );
++
++        needed = sizeof(*out) + (wcslen( name ) + 1 + wcslen( sddl ) + 1) * sizeof(WCHAR);
++        if (data_len) *data_len = needed;
++        if (!buffer || buffer_len < needed)
++            ret = ERROR_INSUFFICIENT_BUFFER;
++        else
++        {
++            WCHAR *strings = (WCHAR *)(out + 1);
++
++            out->KeyDesc.pUrlPrefix = strings;
++            wcscpy( strings, name );
++            strings += wcslen( name ) + 1;
++            out->ParamDesc.pStringSecurityDescriptor = strings;
++            wcscpy( strings, sddl );
++            ret = ERROR_SUCCESS;
++        }
++        free( name );
++        free( sddl );
++        return ret;
++    }
++    case HttpServiceConfigIPListenList:
++    {
++        CONFIG_IP_LISTEN_QUERY *out = buffer;
++        WCHAR *list, *p;
++        DWORD size = 0, count = 0, needed, i = 0;
++
++        if (!(key = open_config_key( L"", FALSE, KEY_QUERY_VALUE, &err ))) return ERROR_FILE_NOT_FOUND;
++        if (RegQueryValueExW( key, L"ListenOnlyList", NULL, NULL, NULL, &size ) || !size)
++        {
++            RegCloseKey( key );
++            return ERROR_FILE_NOT_FOUND;
++        }
++        list = malloc( size + 2 * sizeof(WCHAR) );
++        if (!list) { RegCloseKey( key ); return ERROR_OUTOFMEMORY; }
++        RegQueryValueExW( key, L"ListenOnlyList", NULL, NULL, (BYTE *)list, &size );
++        RegCloseKey( key );
++        list[size / sizeof(WCHAR)] = list[size / sizeof(WCHAR) + 1] = 0;
++        for (p = list; *p; p += wcslen( p ) + 1) count++;
++
++        needed = offsetof(CONFIG_IP_LISTEN_QUERY, AddrList[count]);
++        if (data_len) *data_len = needed;
++        if (!buffer || buffer_len < needed)
++        {
++            free( list );
++            return ERROR_INSUFFICIENT_BUFFER;
++        }
++        memset( out, 0, needed );
++        out->AddrCount = count;
++        for (p = list; *p; p += wcslen( p ) + 1, i++)
++        {
++            SOCKADDR_IN *sin = (SOCKADDR_IN *)&out->AddrList[i];
++            unsigned int a[4];
++
++            sin->sin_family = AF_INET;
++            if (swscanf( p, L"%u.%u.%u.%u", &a[0], &a[1], &a[2], &a[3] ) == 4)
++                sin->sin_addr.S_un.S_addr = a[0] | (a[1] << 8) | (a[2] << 16) | (a[3] << 24);
++        }
++        free( list );
++        return ERROR_SUCCESS;
++    }
++    case HttpServiceConfigTimeout:
++    {
++        const CONFIG_TIMEOUT_KEY *tkey = query;
++        static const WCHAR *names[] = { L"IdleConnectionTimeout", L"HeaderWaitTimeout" };
++        DWORD value = 120, size = sizeof(value);
++
++        if (!query || query_len < sizeof(*tkey) || tkey->KeyDesc >= ARRAY_SIZE(names)) return ERROR_INVALID_PARAMETER;
++        if (data_len) *data_len = sizeof(USHORT);
++        if (!buffer || buffer_len < sizeof(USHORT)) return ERROR_INSUFFICIENT_BUFFER;
++        if ((key = open_config_key( L"", FALSE, KEY_QUERY_VALUE, &err )))
++        {
++            RegQueryValueExW( key, names[tkey->KeyDesc], NULL, NULL, (BYTE *)&value, &size );
++            RegCloseKey( key );
++        }
++        *(USHORT *)buffer = value;
++        return ERROR_SUCCESS;
++    }
++    case HttpServiceConfigSSLCertInfo:
++        /* HTTPS is not implemented, so no certificate binding can exist */
++        return ERROR_FILE_NOT_FOUND;
++    default:
++        return ERROR_INVALID_PARAMETER;
++    }
+ }
+ 
+ /***********************************************************************
+@@ -166,8 +458,93 @@ ULONG WINAPI HttpQueryServiceConfiguration( HANDLE handle, HTTP_SERVICE_CONFIG_I
+ ULONG WINAPI HttpSetServiceConfiguration( HANDLE handle, HTTP_SERVICE_CONFIG_ID type,
+                  PVOID config, ULONG length, LPOVERLAPPED overlapped )
+ {
+-    FIXME( "(%p, %d, %p, %ld, %p): stub!\n", handle, type, config, length, overlapped );
+-    return NO_ERROR;
++    ULONG ret;
++    LONG err;
++    HKEY key;
++
++    TRACE( "(%p, %d, %p, %ld, %p)\n", handle, type, config, length, overlapped );
++
++    if ((ret = check_config_args( handle, type, overlapped ))) return ret;
++
++    switch (type)
++    {
++    case HttpServiceConfigUrlAclInfo:
++    {
++        const CONFIG_URLACL_SET *set = config;
++        PSECURITY_DESCRIPTOR sd;
++
++        if (!config || length < sizeof(*set) || !set->KeyDesc.pUrlPrefix || !set->ParamDesc.pStringSecurityDescriptor)
++            return ERROR_INVALID_PARAMETER;
++        if (!is_valid_url_prefix( set->KeyDesc.pUrlPrefix )) return ERROR_INVALID_PARAMETER;
++        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW( set->ParamDesc.pStringSecurityDescriptor,
++                SDDL_REVISION_1, &sd, NULL ))
++            return ERROR_INVALID_PARAMETER;
++        LocalFree( sd );
++
++        if (!(key = open_config_key( L"UrlAclInfo", TRUE, KEY_QUERY_VALUE | KEY_SET_VALUE, &err ))) return err;
++        if (!RegQueryValueExW( key, set->KeyDesc.pUrlPrefix, NULL, NULL, NULL, NULL ))
++            err = ERROR_ALREADY_EXISTS;
++        else
++            err = RegSetValueExW( key, set->KeyDesc.pUrlPrefix, 0, REG_SZ,
++                    (const BYTE *)set->ParamDesc.pStringSecurityDescriptor,
++                    (wcslen( set->ParamDesc.pStringSecurityDescriptor ) + 1) * sizeof(WCHAR) );
++        RegCloseKey( key );
++        return err;
++    }
++    case HttpServiceConfigIPListenList:
++    {
++        const CONFIG_IP_LISTEN_PARAM *param = config;
++        WCHAR addr[64], *list, *out, *p;
++        DWORD size = 0, len, i = 0;
++
++        if (!config || length < sizeof(*param) || !param->pAddress || param->AddrLength < sizeof(SOCKADDR_IN))
++            return ERROR_INVALID_PARAMETER;
++        if (param->pAddress->sa_family != AF_INET) return ERROR_INVALID_PARAMETER;
++        {
++            const BYTE *a = (const BYTE *)&((SOCKADDR_IN *)param->pAddress)->sin_addr;
++            swprintf( addr, ARRAY_SIZE(addr), L"%u.%u.%u.%u", a[0], a[1], a[2], a[3] );
++        }
++        if (!(key = open_config_key( L"", TRUE, KEY_QUERY_VALUE | KEY_SET_VALUE, &err ))) return err;
++        RegQueryValueExW( key, L"ListenOnlyList", NULL, NULL, NULL, &size );
++        list = calloc( 1, size + 2 * sizeof(WCHAR) );
++        out = calloc( 1, size + (wcslen( addr ) + 2) * sizeof(WCHAR) );
++        if (!list || !out) { free( list ); free( out ); RegCloseKey( key ); return ERROR_OUTOFMEMORY; }
++        if (size) RegQueryValueExW( key, L"ListenOnlyList", NULL, NULL, (BYTE *)list, &size );
++        for (p = list; *p; p += len + 1)
++        {
++            len = wcslen( p );
++            if (!wcscmp( p, addr )) { free( list ); free( out ); RegCloseKey( key ); return ERROR_ALREADY_EXISTS; }
++            memcpy( out + i, p, (len + 1) * sizeof(WCHAR) );
++            i += len + 1;
++        }
++        wcscpy( out + i, addr );
++        i += wcslen( addr ) + 1;
++        out[i++] = 0;
++        err = RegSetValueExW( key, L"ListenOnlyList", 0, REG_MULTI_SZ, (BYTE *)out, i * sizeof(WCHAR) );
++        free( list );
++        free( out );
++        RegCloseKey( key );
++        return err;
++    }
++    case HttpServiceConfigTimeout:
++    {
++        const CONFIG_TIMEOUT_SET *set = config;
++        static const WCHAR *names[] = { L"IdleConnectionTimeout", L"HeaderWaitTimeout" };
++        DWORD value;
++
++        if (!config || length < sizeof(*set) || set->KeyDesc >= ARRAY_SIZE(names)) return ERROR_INVALID_PARAMETER;
++        if (!(key = open_config_key( L"", TRUE, KEY_SET_VALUE, &err ))) return err;
++        value = set->ParamDesc;
++        err = RegSetValueExW( key, names[set->KeyDesc], 0, REG_DWORD, (BYTE *)&value, sizeof(value) );
++        RegCloseKey( key );
++        return err;
++    }
++    case HttpServiceConfigSSLCertInfo:
++        FIXME( "HTTPS certificate bindings are not supported.\n" );
++        return ERROR_CALL_NOT_IMPLEMENTED;
++    default:
++        return ERROR_INVALID_PARAMETER;
++    }
+ }
+ 
+ /***********************************************************************
+@@ -285,7 +662,7 @@ ULONG WINAPI HttpReceiveRequestEntityBody(HANDLE queue, HTTP_REQUEST_ID id, ULON
+             queue, wine_dbgstr_longlong(id), flags, buffer, size, ret_size, ovl);
+ 
+     if (flags)
+-        FIXME("Ignoring flags %#lx.\n", flags);
++        WARN("Ignoring flags %#lx.\n", flags);
+ 
+     if (!ovl)
+     {
+@@ -334,7 +711,7 @@ ULONG WINAPI HttpReceiveHttpRequest(HANDLE queue, HTTP_REQUEST_ID id, ULONG flag
+             queue, wine_dbgstr_longlong(id), flags, request, size, ret_size, ovl);
+ 
+     if (flags & ~HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY)
+-        FIXME("Ignoring flags %#lx.\n", flags & ~HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY);
++        WARN("Ignoring flags %#lx.\n", flags & ~HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY);
+ 
+     if (size < sizeof(HTTP_REQUEST_V1))
+         return ERROR_INSUFFICIENT_BUFFER;
+@@ -365,6 +742,251 @@ ULONG WINAPI HttpReceiveHttpRequest(HANDLE queue, HTTP_REQUEST_ID id, ULONG flag
+     return ret;
+ }
+ 
++/* The response cache is private to the process that fills it. */
++struct cache_entry
++{
++    struct list entry;
++    WCHAR *url;
++    BYTE *data;
++    ULONG size;
++    ULONGLONG expires; /* GetTickCount64() value, 0 = never */
++};
++
++static struct list response_cache = LIST_INIT(response_cache);
++
++static struct cache_entry *find_cache_entry(const WCHAR *url)
++{
++    ULONGLONG now = GetTickCount64();
++    struct cache_entry *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &response_cache, struct cache_entry, entry)
++    {
++        if (entry->expires && entry->expires <= now)
++        {
++            list_remove(&entry->entry);
++            free(entry->url);
++            free(entry->data);
++            free(entry);
++        }
++        else if (!wcsicmp(entry->url, url))
++            return entry;
++    }
++    return NULL;
++}
++
++/* Reads the bytes selected by a file chunk. The caller frees the buffer. */
++static ULONG read_file_chunk(const HTTP_DATA_CHUNK *chunk, BYTE **data, ULONG *size)
++{
++    LARGE_INTEGER file_size;
++    ULONGLONG start = chunk->FromFileHandle.ByteRange.StartingOffset.QuadPart;
++    ULONGLONG length = chunk->FromFileHandle.ByteRange.Length.QuadPart;
++    DWORD read = 0;
++    OVERLAPPED ovl = {};
++    BYTE *buf;
++
++    if (!GetFileSizeEx(chunk->FromFileHandle.FileHandle, &file_size))
++        return GetLastError();
++    if (start > (ULONGLONG)file_size.QuadPart)
++        return ERROR_INVALID_PARAMETER;
++    if (length == HTTP_BYTE_RANGE_TO_EOF)
++        length = file_size.QuadPart - start;
++    if (start + length > (ULONGLONG)file_size.QuadPart || length > 0x7fffffff)
++        return ERROR_INVALID_PARAMETER;
++
++    if (!(buf = malloc(length ? length : 1)))
++        return ERROR_OUTOFMEMORY;
++    ovl.Offset = (DWORD)start;
++    ovl.OffsetHigh = start >> 32;
++    ovl.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
++    if (length && !ReadFile(chunk->FromFileHandle.FileHandle, buf, length, &read, &ovl))
++    {
++        DWORD err = GetLastError();
++        if (err == ERROR_IO_PENDING)
++            err = GetOverlappedResult(chunk->FromFileHandle.FileHandle, &ovl, &read, TRUE) ? 0 : GetLastError();
++        if (err)
++        {
++            CloseHandle(ovl.hEvent);
++            free(buf);
++            return err;
++        }
++    }
++    CloseHandle(ovl.hEvent);
++    if (read != length)
++    {
++        free(buf);
++        return ERROR_HANDLE_EOF;
++    }
++    *data = buf;
++    *size = length;
++    return ERROR_SUCCESS;
++}
++
++/* Resolves a data chunk to memory. *allocated is set when the caller must free *data. */
++static ULONG resolve_chunk(const HTTP_DATA_CHUNK *chunk, BYTE **data, ULONG *size, BOOL *allocated)
++{
++    *allocated = FALSE;
++    switch (chunk->DataChunkType)
++    {
++    case HttpDataChunkFromMemory:
++        *data = chunk->FromMemory.pBuffer;
++        *size = chunk->FromMemory.BufferLength;
++        return ERROR_SUCCESS;
++    case HttpDataChunkFromFileHandle:
++    {
++        ULONG ret = read_file_chunk(chunk, data, size);
++        *allocated = !ret;
++        return ret;
++    }
++    case HttpDataChunkFromFragmentCache:
++    {
++        struct cache_entry *entry;
++        WCHAR *name;
++        ULONG ret = ERROR_FILE_NOT_FOUND;
++
++        if (!chunk->FromFragmentCache.pFragmentName) return ERROR_INVALID_PARAMETER;
++        {
++            USHORT name_len = chunk->FromFragmentCache.FragmentNameLength / sizeof(WCHAR);
++            if (!(name = malloc((name_len + 1) * sizeof(WCHAR)))) return ERROR_OUTOFMEMORY;
++            memcpy(name, chunk->FromFragmentCache.pFragmentName, name_len * sizeof(WCHAR));
++            name[name_len] = 0;
++        }
++        EnterCriticalSection(&httpapi_cs);
++        if ((entry = find_cache_entry(name)))
++        {
++            if ((*data = malloc(entry->size ? entry->size : 1)))
++            {
++                memcpy(*data, entry->data, entry->size);
++                *size = entry->size;
++                *allocated = TRUE;
++                ret = ERROR_SUCCESS;
++            }
++            else ret = ERROR_OUTOFMEMORY;
++        }
++        LeaveCriticalSection(&httpapi_cs);
++        free(name);
++        return ret;
++    }
++    default:
++        FIXME("Unhandled data chunk type %u.\n", chunk->DataChunkType);
++        return ERROR_INVALID_PARAMETER;
++    }
++}
++
++/***********************************************************************
++ *        HttpAddFragmentToCache     (HTTPAPI.@)
++ */
++ULONG WINAPI HttpAddFragmentToCache(HANDLE queue, const WCHAR *url, HTTP_DATA_CHUNK *chunk,
++        HTTP_CACHE_POLICY *policy, OVERLAPPED *ovl)
++{
++    struct cache_entry *entry, *old;
++    BOOL allocated;
++    BYTE *data;
++    ULONG ret, size;
++
++    TRACE("queue %p, url %s, chunk %p, policy %p, ovl %p.\n", queue, debugstr_w(url), chunk, policy, ovl);
++
++    if (!queue || queue == INVALID_HANDLE_VALUE) return ERROR_INVALID_HANDLE;
++    if (!url || !chunk || !policy || policy->Policy >= HttpCachePolicyMaximum) return ERROR_INVALID_PARAMETER;
++    if (policy->Policy == HttpCachePolicyNocache) return ERROR_INVALID_PARAMETER;
++
++    if ((ret = resolve_chunk(chunk, &data, &size, &allocated))) return ret;
++    if (!(entry = calloc(1, sizeof(*entry))) || !(entry->url = wcsdup(url)) || !(entry->data = malloc(size ? size : 1)))
++    {
++        if (entry) { free(entry->url); free(entry); }
++        if (allocated) free(data);
++        return ERROR_OUTOFMEMORY;
++    }
++    memcpy(entry->data, data, size);
++    entry->size = size;
++    if (policy->Policy == HttpCachePolicyTimeToLive)
++        entry->expires = GetTickCount64() + (ULONGLONG)policy->SecondsToLive * 1000;
++    if (allocated) free(data);
++
++    EnterCriticalSection(&httpapi_cs);
++    if ((old = find_cache_entry(url)))
++    {
++        list_remove(&old->entry);
++        free(old->url);
++        free(old->data);
++        free(old);
++    }
++    list_add_tail(&response_cache, &entry->entry);
++    LeaveCriticalSection(&httpapi_cs);
++    return ERROR_SUCCESS;
++}
++
++/***********************************************************************
++ *        HttpReadFragmentFromCache     (HTTPAPI.@)
++ */
++ULONG WINAPI HttpReadFragmentFromCache(HANDLE queue, const WCHAR *url, HTTP_BYTE_RANGE *range,
++        void *buffer, ULONG size, ULONG *bytes_read, OVERLAPPED *ovl)
++{
++    struct cache_entry *entry;
++    ULONGLONG start = 0, length;
++    ULONG ret = ERROR_SUCCESS;
++
++    TRACE("queue %p, url %s, range %p, buffer %p, size %lu, bytes_read %p, ovl %p.\n",
++            queue, debugstr_w(url), range, buffer, size, bytes_read, ovl);
++
++    if (!queue || queue == INVALID_HANDLE_VALUE) return ERROR_INVALID_HANDLE;
++    if (!url) return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&httpapi_cs);
++    if (!(entry = find_cache_entry(url)))
++    {
++        LeaveCriticalSection(&httpapi_cs);
++        return ERROR_FILE_NOT_FOUND;
++    }
++    length = entry->size;
++    if (range)
++    {
++        start = range->StartingOffset.QuadPart;
++        if (start > entry->size) ret = ERROR_INVALID_PARAMETER;
++        else if (range->Length.QuadPart == HTTP_BYTE_RANGE_TO_EOF) length = entry->size - start;
++        else if (start + range->Length.QuadPart > entry->size) ret = ERROR_INVALID_PARAMETER;
++        else length = range->Length.QuadPart;
++    }
++    if (!ret)
++    {
++        if (bytes_read) *bytes_read = length;
++        if (!buffer || size < length) ret = ERROR_MORE_DATA;
++        else memcpy(buffer, entry->data + start, length);
++    }
++    LeaveCriticalSection(&httpapi_cs);
++    return ret;
++}
++
++/***********************************************************************
++ *        HttpFlushResponseCache     (HTTPAPI.@)
++ */
++ULONG WINAPI HttpFlushResponseCache(HANDLE queue, const WCHAR *url, ULONG flags, OVERLAPPED *ovl)
++{
++    struct cache_entry *entry, *next;
++    size_t len;
++    BOOL found = FALSE;
++
++    TRACE("queue %p, url %s, flags %#lx, ovl %p.\n", queue, debugstr_w(url), flags, ovl);
++
++    if (!queue || queue == INVALID_HANDLE_VALUE) return ERROR_INVALID_HANDLE;
++    if (!url || (flags & ~1)) return ERROR_INVALID_PARAMETER;
++
++    len = wcslen(url);
++    EnterCriticalSection(&httpapi_cs);
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &response_cache, struct cache_entry, entry)
++    {
++        if (flags & 1 ? !_wcsnicmp(entry->url, url, len) : !wcsicmp(entry->url, url))
++        {
++            list_remove(&entry->entry);
++            free(entry->url);
++            free(entry->data);
++            free(entry);
++            found = TRUE;
++        }
++    }
++    LeaveCriticalSection(&httpapi_cs);
++    return found ? ERROR_SUCCESS : ERROR_FILE_NOT_FOUND;
++}
++
+ static void format_date(char *buffer)
+ {
+     static const char day_names[7][4] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+@@ -423,31 +1045,47 @@ ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags,
+     ULONG ret = ERROR_SUCCESS;
+     int len, body_len = 0;
+     char *p, dummy[12];
+-    USHORT i;
++    BYTE **chunk_data = NULL;
++    ULONG *chunk_size = NULL;
++    BOOL *chunk_alloc = NULL;
++    USHORT i, resolved = 0;
+ 
+     TRACE("queue %p, id %s, flags %#lx, response %p, cache_policy %p, "
+             "ret_size %p, reserved1 %p, reserved2 %#lx, ovl %p, log_data %p.\n",
+             queue, wine_dbgstr_longlong(id), flags, response, cache_policy,
+             ret_size, reserved1, reserved2, ovl, log_data);
+ 
+-    if (flags & ~HTTP_SEND_RESPONSE_FLAG_MORE_DATA)
+-        FIXME("Unhandled flags %#lx.\n", flags & ~HTTP_SEND_RESPONSE_FLAG_MORE_DATA);
++    if (flags & ~(HTTP_SEND_RESPONSE_FLAG_DISCONNECT | HTTP_SEND_RESPONSE_FLAG_MORE_DATA
++            | HTTP_SEND_RESPONSE_FLAG_BUFFER_DATA | HTTP_SEND_RESPONSE_FLAG_ENABLE_NAGLING))
++        WARN("Ignoring flags %#lx.\n", flags);
++    if (!response)
++        return ERROR_INVALID_PARAMETER;
+     if (response->s.Flags)
+-        FIXME("Unhandled response flags %#lx.\n", response->s.Flags);
++        WARN("Ignoring response flags %#lx.\n", response->s.Flags);
+     if (cache_policy)
+-        WARN("Ignoring cache_policy.\n");
++        TRACE("Ignoring cache_policy.\n");
+     if (log_data)
+         WARN("Ignoring log_data.\n");
+ 
+-    len = 12 + sprintf(dummy, "%hu", response->s.StatusCode) + response->s.ReasonLength;
+-    for (i = 0; i < response->s.EntityChunkCount; ++i)
++    if (response->s.EntityChunkCount)
+     {
+-        if (response->s.pEntityChunks[i].DataChunkType != HttpDataChunkFromMemory)
++        chunk_data = calloc(response->s.EntityChunkCount, sizeof(*chunk_data));
++        chunk_size = calloc(response->s.EntityChunkCount, sizeof(*chunk_size));
++        chunk_alloc = calloc(response->s.EntityChunkCount, sizeof(*chunk_alloc));
++        if (!chunk_data || !chunk_size || !chunk_alloc)
+         {
+-            FIXME("Unhandled data chunk type %u.\n", response->s.pEntityChunks[i].DataChunkType);
+-            return ERROR_CALL_NOT_IMPLEMENTED;
++            ret = ERROR_OUTOFMEMORY;
++            goto done;
+         }
+-        body_len += response->s.pEntityChunks[i].FromMemory.BufferLength;
++    }
++
++    len = 12 + sprintf(dummy, "%hu", response->s.StatusCode) + response->s.ReasonLength;
++    for (i = 0; i < response->s.EntityChunkCount; ++i)
++    {
++        if ((ret = resolve_chunk(&response->s.pEntityChunks[i], &chunk_data[i], &chunk_size[i], &chunk_alloc[i])))
++            goto done;
++        resolved = i + 1;
++        body_len += chunk_size[i];
+     }
+     len += body_len;
+     for (i = 0; i < HttpHeaderResponseMaximum; ++i)
+@@ -470,7 +1108,10 @@ ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags,
+     len += 2;
+ 
+     if (!(buffer = malloc(offsetof(struct http_response, buffer[len]))))
+-        return ERROR_OUTOFMEMORY;
++    {
++        ret = ERROR_OUTOFMEMORY;
++        goto done;
++    }
+     buffer->id = id;
+     buffer->response_flags = flags;
+     buffer->len = len;
+@@ -500,9 +1141,8 @@ ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags,
+     p += 2;
+     for (i = 0; i < response->s.EntityChunkCount; ++i)
+     {
+-        const HTTP_DATA_CHUNK *chunk = &response->s.pEntityChunks[i];
+-        memcpy(p, chunk->FromMemory.pBuffer, chunk->FromMemory.BufferLength);
+-        p += chunk->FromMemory.BufferLength;
++        memcpy(p, chunk_data[i], chunk_size[i]);
++        p += chunk_size[i];
+     }
+ 
+     if (!ovl)
+@@ -513,6 +1153,12 @@ ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags,
+         ret = GetLastError();
+ 
+     free(buffer);
++done:
++    for (i = 0; i < resolved; ++i)
++        if (chunk_alloc[i]) free(chunk_data[i]);
++    free(chunk_data);
++    free(chunk_size);
++    free(chunk_alloc);
+     return ret;
+ }
+ 
+@@ -544,9 +1190,12 @@ ULONG WINAPI HttpSendResponseEntityBody(HANDLE queue, HTTP_REQUEST_ID id,
+     struct http_response *buffer;
+     OVERLAPPED dummy_ovl = {};
+     ULONG ret = NO_ERROR;
++    BYTE **chunk_data = NULL;
++    ULONG *chunk_size = NULL;
++    BOOL *chunk_alloc = NULL;
++    USHORT i, resolved = 0;
+     int len = 0;
+     char *p;
+-    USHORT i;
+ 
+     TRACE("queue %p, id %s, flags %#lx, entity_chunk_count %u, entity_chunks %p, "
+             "ret_size %p, reserved1 %p, reserved2 %#lx, ovl %p, log_data %p\n",
+@@ -556,24 +1205,40 @@ ULONG WINAPI HttpSendResponseEntityBody(HANDLE queue, HTTP_REQUEST_ID id,
+     if (!id)
+         return ERROR_CONNECTION_INVALID;
+ 
+-    if (flags & ~HTTP_SEND_RESPONSE_FLAG_MORE_DATA)
+-        FIXME("Unhandled flags %#lx.\n", flags & ~HTTP_SEND_RESPONSE_FLAG_MORE_DATA);
++    if (flags & ~(HTTP_SEND_RESPONSE_FLAG_DISCONNECT | HTTP_SEND_RESPONSE_FLAG_MORE_DATA
++            | HTTP_SEND_RESPONSE_FLAG_BUFFER_DATA | HTTP_SEND_RESPONSE_FLAG_ENABLE_NAGLING))
++        WARN("Ignoring flags %#lx.\n", flags);
+     if (log_data)
+         WARN("Ignoring log_data.\n");
+ 
+-    /* Compute the length of the body. */
+-    for (i = 0; i < entity_chunk_count; ++i)
++    if (entity_chunk_count)
+     {
+-        if (entity_chunks[i].DataChunkType != HttpDataChunkFromMemory)
++        if (!entity_chunks)
++            return ERROR_INVALID_PARAMETER;
++        chunk_data = calloc(entity_chunk_count, sizeof(*chunk_data));
++        chunk_size = calloc(entity_chunk_count, sizeof(*chunk_size));
++        chunk_alloc = calloc(entity_chunk_count, sizeof(*chunk_alloc));
++        if (!chunk_data || !chunk_size || !chunk_alloc)
+         {
+-            FIXME("Unhandled data chunk type %u.\n", entity_chunks[i].DataChunkType);
+-            return ERROR_CALL_NOT_IMPLEMENTED;
++            ret = ERROR_OUTOFMEMORY;
++            goto done;
+         }
+-        len += entity_chunks[i].FromMemory.BufferLength;
++    }
++
++    /* Compute the length of the body. */
++    for (i = 0; i < entity_chunk_count; ++i)
++    {
++        if ((ret = resolve_chunk(&entity_chunks[i], &chunk_data[i], &chunk_size[i], &chunk_alloc[i])))
++            goto done;
++        resolved = i + 1;
++        len += chunk_size[i];
+     }
+ 
+     if (!(buffer = malloc(offsetof(struct http_response, buffer[len]))))
+-        return ERROR_OUTOFMEMORY;
++    {
++        ret = ERROR_OUTOFMEMORY;
++        goto done;
++    }
+     buffer->id = id;
+     buffer->response_flags = flags;
+     buffer->len = len;
+@@ -581,9 +1246,8 @@ ULONG WINAPI HttpSendResponseEntityBody(HANDLE queue, HTTP_REQUEST_ID id,
+     p = buffer->buffer;
+     for (i = 0; i < entity_chunk_count; ++i)
+     {
+-        const HTTP_DATA_CHUNK *chunk = &entity_chunks[i];
+-        memcpy(p, chunk->FromMemory.pBuffer, chunk->FromMemory.BufferLength);
+-        p += chunk->FromMemory.BufferLength;
++        memcpy(p, chunk_data[i], chunk_size[i]);
++        p += chunk_size[i];
+     }
+ 
+     if (!ovl)
+@@ -598,17 +1262,121 @@ ULONG WINAPI HttpSendResponseEntityBody(HANDLE queue, HTTP_REQUEST_ID id,
+         ret = GetLastError();
+ 
+     free(buffer);
++done:
++    for (i = 0; i < resolved; ++i)
++        if (chunk_alloc[i]) free(chunk_data[i]);
++    free(chunk_data);
++    free(chunk_size);
++    free(chunk_alloc);
+     return ret;
+ }
+ 
++struct group_url
++{
++    struct list entry;
++    WCHAR *url;
++    HTTP_URL_CONTEXT context;
++};
++
+ struct url_group
+ {
+     struct list entry, session_entry;
+     HANDLE queue;
+-    WCHAR *url;
+-    HTTP_URL_CONTEXT context;
++    struct list urls;
++};
++
++/* Properties set on a server object are kept so that they can be queried back. */
++enum prop_owner { OWNER_SESSION, OWNER_GROUP, OWNER_QUEUE };
++
++struct stored_property
++{
++    struct list entry;
++    enum prop_owner owner;
++    ULONGLONG key;
++    HTTP_SERVER_PROPERTY property;
++    ULONG length;
++    BYTE data[1];
+ };
+ 
++static struct list stored_properties = LIST_INIT(stored_properties);
++
++static struct stored_property *find_property(enum prop_owner owner, ULONGLONG key, HTTP_SERVER_PROPERTY property)
++{
++    struct stored_property *prop;
++
++    LIST_FOR_EACH_ENTRY(prop, &stored_properties, struct stored_property, entry)
++    {
++        if (prop->owner == owner && prop->key == key && prop->property == property)
++            return prop;
++    }
++    return NULL;
++}
++
++static ULONG store_property(enum prop_owner owner, ULONGLONG key, HTTP_SERVER_PROPERTY property,
++        const void *value, ULONG length)
++{
++    struct stored_property *prop, *old;
++
++    if (!(prop = malloc(offsetof(struct stored_property, data[length]))))
++        return ERROR_OUTOFMEMORY;
++    prop->owner = owner;
++    prop->key = key;
++    prop->property = property;
++    prop->length = length;
++    memcpy(prop->data, value, length);
++
++    EnterCriticalSection(&httpapi_cs);
++    if ((old = find_property(owner, key, property)))
++    {
++        list_remove(&old->entry);
++        free(old);
++    }
++    list_add_tail(&stored_properties, &prop->entry);
++    LeaveCriticalSection(&httpapi_cs);
++    return ERROR_SUCCESS;
++}
++
++static void free_properties(enum prop_owner owner, ULONGLONG key)
++{
++    struct stored_property *prop, *next;
++
++    EnterCriticalSection(&httpapi_cs);
++    LIST_FOR_EACH_ENTRY_SAFE(prop, next, &stored_properties, struct stored_property, entry)
++    {
++        if (prop->owner == owner && prop->key == key)
++        {
++            list_remove(&prop->entry);
++            free(prop);
++        }
++    }
++    LeaveCriticalSection(&httpapi_cs);
++}
++
++static ULONG query_property(enum prop_owner owner, ULONGLONG key, HTTP_SERVER_PROPERTY property,
++        void *value, ULONG length, ULONG *ret_length)
++{
++    struct stored_property *prop;
++    ULONG ret = ERROR_SUCCESS;
++
++    if (property >= HttpServerListenEndpointProperty + 3) return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&httpapi_cs);
++    prop = find_property(owner, key, property);
++    if (!prop)
++    {
++        /* a property that was never set reads back as an empty record, except for the state */
++        LeaveCriticalSection(&httpapi_cs);
++        return ERROR_FILE_NOT_FOUND;
++    }
++    if (ret_length) *ret_length = prop->length;
++    if (length < prop->length || !value)
++        ret = ERROR_MORE_DATA;
++    else
++        memcpy(value, prop->data, prop->length);
++    LeaveCriticalSection(&httpapi_cs);
++    return ret;
++}
++
+ static struct list url_groups = LIST_INIT(url_groups);
+ 
+ static struct url_group *get_url_group(HTTP_URL_GROUP_ID id)
+@@ -661,7 +1429,9 @@ ULONG WINAPI HttpCreateServerSession(HTTPAPI_VERSION version, HTTP_SERVER_SESSIO
+     if (!(session = malloc(sizeof(*session))))
+         return ERROR_OUTOFMEMORY;
+ 
++    EnterCriticalSection(&httpapi_cs);
+     list_add_tail(&server_sessions, &session->entry);
++    LeaveCriticalSection(&httpapi_cs);
+     list_init(&session->groups);
+ 
+     *id = (ULONG_PTR)session;
+@@ -678,14 +1448,20 @@ ULONG WINAPI HttpCloseServerSession(HTTP_SERVER_SESSION_ID id)
+ 
+     TRACE("id %s.\n", wine_dbgstr_longlong(id));
+ 
++    EnterCriticalSection(&httpapi_cs);
+     if (!(session = get_server_session(id)))
++    {
++        LeaveCriticalSection(&httpapi_cs);
+         return ERROR_INVALID_PARAMETER;
++    }
++    list_remove(&session->entry);
++    LeaveCriticalSection(&httpapi_cs);
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(group, group_next, &session->groups, struct url_group, session_entry)
+     {
+         HttpCloseUrlGroup((ULONG_PTR)group);
+     }
+-    list_remove(&session->entry);
++    free_properties(OWNER_SESSION, id);
+     free(session);
+     return ERROR_SUCCESS;
+ }
+@@ -701,33 +1477,66 @@ ULONG WINAPI HttpCreateUrlGroup(HTTP_SERVER_SESSION_ID session_id, HTTP_URL_GROU
+     TRACE("session_id %s, group_id %p, reserved %#lx.\n",
+           wine_dbgstr_longlong(session_id), group_id, reserved);
+ 
++    if (!group_id)
++        return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&httpapi_cs);
+     if (!(session = get_server_session(session_id)))
++    {
++        LeaveCriticalSection(&httpapi_cs);
+         return ERROR_INVALID_PARAMETER;
++    }
+ 
+     if (!(group = calloc(1, sizeof(*group))))
++    {
++        LeaveCriticalSection(&httpapi_cs);
+         return ERROR_OUTOFMEMORY;
++    }
++    list_init(&group->urls);
+     list_add_tail(&url_groups, &group->entry);
+     list_add_tail(&session->groups, &group->session_entry);
++    LeaveCriticalSection(&httpapi_cs);
+ 
+     *group_id = (ULONG_PTR)group;
+ 
+     return ERROR_SUCCESS;
+ }
+ 
++static void free_group_url(struct group_url *url)
++{
++    list_remove(&url->entry);
++    free(url->url);
++    free(url);
++}
++
+ /***********************************************************************
+  *        HttpCloseUrlGroup     (HTTPAPI.@)
+  */
+ ULONG WINAPI HttpCloseUrlGroup(HTTP_URL_GROUP_ID id)
+ {
++    struct group_url *url, *url_next;
+     struct url_group *group;
+ 
+     TRACE("id %s.\n", wine_dbgstr_longlong(id));
+ 
++    EnterCriticalSection(&httpapi_cs);
+     if (!(group = get_url_group(id)))
++    {
++        LeaveCriticalSection(&httpapi_cs);
+         return ERROR_INVALID_PARAMETER;
+-
++    }
+     list_remove(&group->session_entry);
+     list_remove(&group->entry);
++    LeaveCriticalSection(&httpapi_cs);
++
++    /* the URLs are no longer served once the group is gone */
++    LIST_FOR_EACH_ENTRY_SAFE(url, url_next, &group->urls, struct group_url, entry)
++    {
++        if (group->queue)
++            remove_url(group->queue, url->url);
++        free_group_url(url);
++    }
++    free_properties(OWNER_GROUP, id);
+     free(group);
+ 
+     return ERROR_SUCCESS;
+@@ -743,27 +1552,68 @@ ULONG WINAPI HttpSetUrlGroupProperty(HTTP_URL_GROUP_ID id, HTTP_SERVER_PROPERTY
+     TRACE("id %s, property %u, value %p, length %lu.\n",
+             wine_dbgstr_longlong(id), property, value, length);
+ 
++    if (!group || !value || !length)
++        return ERROR_INVALID_PARAMETER;
++
+     switch (property)
+     {
+         case HttpServerBindingProperty:
+         {
+             const HTTP_BINDING_INFO *info = value;
++            struct group_url *url;
++
++            if (length < sizeof(*info))
++                return ERROR_INVALID_PARAMETER;
+ 
+             TRACE("Binding to queue %p.\n", info->RequestQueueHandle);
+             group->queue = info->RequestQueueHandle;
+-            if (group->url)
+-                add_url(group->queue, group->url, group->context);
++            LIST_FOR_EACH_ENTRY(url, &group->urls, struct group_url, entry)
++                add_url(group->queue, url->url, url->context);
++            store_property(OWNER_GROUP, id, property, value, length);
+             return ERROR_SUCCESS;
+         }
+         case HttpServerLoggingProperty:
+             WARN("Ignoring logging property.\n");
+-            return ERROR_SUCCESS;
++            return store_property(OWNER_GROUP, id, property, value, length);
++        case HttpServerAuthenticationProperty:
++        case HttpServerQosProperty:
++        case HttpServerTimeoutsProperty:
++        case HttpServerStateProperty:
++        case HttpServerExtendedAuthenticationProperty:
++        case HttpServerChannelBindProperty:
++        case HttpServerProtectionLevelProperty:
++            /* the settings are kept, requests are not filtered by them */
++            return store_property(OWNER_GROUP, id, property, value, length);
+         default:
+-            FIXME("Unhandled property %u.\n", property);
+-            return ERROR_CALL_NOT_IMPLEMENTED;
++            WARN("Unhandled property %u.\n", property);
++            return ERROR_INVALID_PARAMETER;
+     }
+ }
+ 
++/***********************************************************************
++ *        HttpQueryUrlGroupProperty     (HTTPAPI.@)
++ */
++ULONG WINAPI HttpQueryUrlGroupProperty(HTTP_URL_GROUP_ID id, HTTP_SERVER_PROPERTY property,
++        void *value, ULONG length, ULONG *ret_length)
++{
++    TRACE("id %s, property %u, value %p, length %lu, ret_length %p.\n",
++            wine_dbgstr_longlong(id), property, value, length, ret_length);
++
++    if (!get_url_group(id))
++        return ERROR_INVALID_PARAMETER;
++
++    return query_property(OWNER_GROUP, id, property, value, length, ret_length);
++}
++
++static BOOL url_equal(const WCHAR *a, const WCHAR *b)
++{
++    size_t len_a = wcslen(a), len_b = wcslen(b);
++
++    if (len_a && a[len_a - 1] == '/') len_a--;
++    if (len_b && b[len_b - 1] == '/') len_b--;
++    return len_a == len_b && !_wcsnicmp(a, b, len_a);
++}
++
+ /***********************************************************************
+  *        HttpAddUrlToUrlGroup     (HTTPAPI.@)
+  */
+@@ -771,15 +1621,22 @@ ULONG WINAPI HttpAddUrlToUrlGroup(HTTP_URL_GROUP_ID id, const WCHAR *url,
+         HTTP_URL_CONTEXT context, ULONG reserved)
+ {
+     struct url_group *group = get_url_group(id);
++    struct group_url *entry;
+     ULONG ret;
+ 
+     TRACE("id %s, url %s, context %s, reserved %#lx.\n", wine_dbgstr_longlong(id),
+             debugstr_w(url), wine_dbgstr_longlong(context), reserved);
+ 
+-    if (group->url)
++    if (!group || !url || reserved)
++        return ERROR_INVALID_PARAMETER;
++
++    if (!is_valid_url_prefix(url))
++        return ERROR_INVALID_PARAMETER;
++
++    LIST_FOR_EACH_ENTRY(entry, &group->urls, struct group_url, entry)
+     {
+-        FIXME("Multiple URLs are not handled!\n");
+-        return ERROR_CALL_NOT_IMPLEMENTED;
++        if (url_equal(entry->url, url))
++            return ERROR_ALREADY_EXISTS;
+     }
+ 
+     if (group->queue)
+@@ -789,9 +1646,15 @@ ULONG WINAPI HttpAddUrlToUrlGroup(HTTP_URL_GROUP_ID id, const WCHAR *url,
+             return ret;
+     }
+ 
+-    if (!(group->url = wcsdup(url)))
++    if (!(entry = malloc(sizeof(*entry))))
++        return ERROR_OUTOFMEMORY;
++    if (!(entry->url = wcsdup(url)))
++    {
++        free(entry);
+         return ERROR_OUTOFMEMORY;
+-    group->context = context;
++    }
++    entry->context = context;
++    list_add_tail(&group->urls, &entry->entry);
+ 
+     return ERROR_SUCCESS;
+ }
+@@ -802,22 +1665,38 @@ ULONG WINAPI HttpAddUrlToUrlGroup(HTTP_URL_GROUP_ID id, const WCHAR *url,
+ ULONG WINAPI HttpRemoveUrlFromUrlGroup(HTTP_URL_GROUP_ID id, const WCHAR *url, ULONG flags)
+ {
+     struct url_group *group = get_url_group(id);
++    struct group_url *entry, *next;
++    BOOL found = FALSE;
++    ULONG ret = ERROR_SUCCESS;
+ 
+     TRACE("id %s, url %s, flags %#lx.\n", wine_dbgstr_longlong(id), debugstr_w(url), flags);
+ 
+-    if (!group->url)
+-        return ERROR_FILE_NOT_FOUND;
++    if (!group)
++        return ERROR_INVALID_PARAMETER;
+ 
+-    if (flags)
+-        FIXME("Ignoring flags %#lx.\n", flags);
++    if (flags & ~HTTP_URL_FLAG_REMOVE_ALL)
++        return ERROR_INVALID_PARAMETER;
+ 
+-    free(group->url);
+-    group->url = NULL;
++    if (!(flags & HTTP_URL_FLAG_REMOVE_ALL) && !url)
++        return ERROR_INVALID_PARAMETER;
+ 
+-    if (group->queue)
+-        return remove_url(group->queue, url);
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &group->urls, struct group_url, entry)
++    {
++        if (!(flags & HTTP_URL_FLAG_REMOVE_ALL) && !url_equal(entry->url, url))
++            continue;
++        found = TRUE;
++        if (group->queue)
++        {
++            ULONG err = remove_url(group->queue, entry->url);
++            if (err) ret = err;
++        }
++        free_group_url(entry);
++    }
+ 
+-    return ERROR_SUCCESS;
++    if (!found && !(flags & HTTP_URL_FLAG_REMOVE_ALL))
++        return ERROR_FILE_NOT_FOUND;
++
++    return ret;
+ }
+ 
+ /***********************************************************************
+@@ -853,20 +1732,85 @@ ULONG WINAPI HttpCreateRequestQueue(HTTPAPI_VERSION version, const WCHAR *name,
+ ULONG WINAPI HttpCloseRequestQueue(HANDLE handle)
+ {
+     TRACE("handle %p.\n", handle);
++    free_properties(OWNER_QUEUE, (ULONG_PTR)handle);
+     if (!CloseHandle(handle))
+         return GetLastError();
+     return ERROR_SUCCESS;
+ }
+ 
++/***********************************************************************
++ *        HttpShutdownRequestQueue     (HTTPAPI.@)
++ */
++ULONG WINAPI HttpShutdownRequestQueue(HANDLE queue)
++{
++    TRACE("queue %p.\n", queue);
++
++    if (!queue || queue == INVALID_HANDLE_VALUE)
++        return ERROR_INVALID_HANDLE;
++
++    /* pending HttpReceiveHttpRequest() calls complete with ERROR_OPERATION_ABORTED */
++    if (!CancelIoEx(queue, NULL) && GetLastError() != ERROR_NOT_FOUND)
++        return GetLastError();
++    return ERROR_SUCCESS;
++}
++
+ /***********************************************************************
+  *        HttpSetRequestQueueProperty     (HTTPAPI.@)
+  */
+ ULONG WINAPI HttpSetRequestQueueProperty(HANDLE queue, HTTP_SERVER_PROPERTY property,
+         void *value, ULONG length, ULONG reserved1, void *reserved2)
+ {
+-    FIXME("queue %p, property %u, value %p, length %lu, reserved1 %#lx, reserved2 %p, stub!\n",
++    TRACE("queue %p, property %u, value %p, length %lu, reserved1 %#lx, reserved2 %p.\n",
+             queue, property, value, length, reserved1, reserved2);
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++
++    if (!queue || queue == INVALID_HANDLE_VALUE)
++        return ERROR_INVALID_HANDLE;
++    if (!value || !length || reserved1 || reserved2)
++        return ERROR_INVALID_PARAMETER;
++
++    switch (property)
++    {
++        case HttpServerQueueLengthProperty:
++            if (length < sizeof(ULONG) || !*(ULONG *)value) return ERROR_INVALID_PARAMETER;
++            break;
++        case HttpServerStateProperty:
++        case HttpServer503VerbosityProperty:
++        case HttpServerBindingProperty:
++            break;
++        default:
++            return ERROR_INVALID_PARAMETER;
++    }
++
++    /* the settings are kept, the queue is not limited by them */
++    return store_property(OWNER_QUEUE, (ULONG_PTR)queue, property, value, length);
++}
++
++/***********************************************************************
++ *        HttpQueryRequestQueueProperty     (HTTPAPI.@)
++ */
++ULONG WINAPI HttpQueryRequestQueueProperty(HANDLE queue, HTTP_SERVER_PROPERTY property,
++        void *value, ULONG length, ULONG reserved1, ULONG *ret_length, void *reserved2)
++{
++    TRACE("queue %p, property %u, value %p, length %lu, reserved1 %#lx, ret_length %p, reserved2 %p.\n",
++            queue, property, value, length, reserved1, ret_length, reserved2);
++
++    if (!queue || queue == INVALID_HANDLE_VALUE)
++        return ERROR_INVALID_HANDLE;
++    if (reserved1 || reserved2)
++        return ERROR_INVALID_PARAMETER;
++
++    if (property == HttpServerQueueLengthProperty)
++    {
++        /* the default queue length is 1000 */
++        ULONG ret = query_property(OWNER_QUEUE, (ULONG_PTR)queue, property, value, length, ret_length);
++        if (ret != ERROR_FILE_NOT_FOUND) return ret;
++        if (ret_length) *ret_length = sizeof(ULONG);
++        if (!value || length < sizeof(ULONG)) return ERROR_MORE_DATA;
++        *(ULONG *)value = 1000;
++        return ERROR_SUCCESS;
++    }
++
++    return query_property(OWNER_QUEUE, (ULONG_PTR)queue, property, value, length, ret_length);
+ }
+ 
+ /***********************************************************************
+@@ -878,16 +1822,46 @@ ULONG WINAPI HttpSetServerSessionProperty(HTTP_SERVER_SESSION_ID id,
+     TRACE("id %s, property %u, value %p, length %lu.\n",
+             wine_dbgstr_longlong(id), property, value, length);
+ 
++    if (!get_server_session(id) || !value || !length)
++        return ERROR_INVALID_PARAMETER;
++
+     switch (property)
+     {
+         case HttpServerQosProperty:
+         {
+             const HTTP_QOS_SETTING_INFO *info = value;
+-            FIXME("Ignoring QoS setting %u.\n", info->QosType);
+-            return ERROR_SUCCESS;
++
++            if (length < sizeof(*info))
++                return ERROR_INVALID_PARAMETER;
++            /* the limits are recorded but not enforced */
++            TRACE("QoS setting %u.\n", info->QosType);
++            return store_property(OWNER_SESSION, id, property, value, length);
+         }
++        case HttpServerAuthenticationProperty:
++        case HttpServerLoggingProperty:
++        case HttpServerTimeoutsProperty:
++        case HttpServerStateProperty:
++        case HttpServerExtendedAuthenticationProperty:
++        case HttpServerChannelBindProperty:
++        case HttpServerProtectionLevelProperty:
++            return store_property(OWNER_SESSION, id, property, value, length);
+         default:
+-            FIXME("Unhandled property %u.\n", property);
+-            return ERROR_CALL_NOT_IMPLEMENTED;
++            WARN("Unhandled property %u.\n", property);
++            return ERROR_INVALID_PARAMETER;
+     }
+ }
++
++/***********************************************************************
++ *        HttpQueryServerSessionProperty     (HTTPAPI.@)
++ */
++ULONG WINAPI HttpQueryServerSessionProperty(HTTP_SERVER_SESSION_ID id, HTTP_SERVER_PROPERTY property,
++        void *value, ULONG length, ULONG *ret_length)
++{
++    TRACE("id %s, property %u, value %p, length %lu, ret_length %p.\n",
++            wine_dbgstr_longlong(id), property, value, length, ret_length);
++
++    if (!get_server_session(id))
++        return ERROR_INVALID_PARAMETER;
++
++    return query_property(OWNER_SESSION, id, property, value, length, ret_length);
++}
+diff --git a/dlls/httpapi/tests/httpapi.c b/dlls/httpapi/tests/httpapi.c
+index 06d67f2..ee90105 100644
+--- a/dlls/httpapi/tests/httpapi.c
++++ b/dlls/httpapi/tests/httpapi.c
+@@ -1621,20 +1621,20 @@ static void test_v2_server(void)
+     port = add_url_v2(group);
+ 
+     ret = pHttpAddUrlToUrlGroup(group, L"http://localhost:50000", 0xdeadbeef, 0);
+-    todo_wine ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
+     ret = pHttpAddUrlToUrlGroup(group, L"localhost:50000", 0xdeadbeef, 0);
+-    todo_wine ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
+     ret = pHttpAddUrlToUrlGroup(group, L"localhost:50000/", 0xdeadbeef, 0);
+-    todo_wine ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
+     ret = pHttpAddUrlToUrlGroup(group, L"http://localhost/", 0xdeadbeef, 0);
+-    todo_wine ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
+     ret = pHttpAddUrlToUrlGroup(group, L"http://localhost:/", 0xdeadbeef, 0);
+-    todo_wine ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
+     ret = pHttpAddUrlToUrlGroup(group, L"http://localhost:0/", 0xdeadbeef, 0);
+-    todo_wine ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %u.\n", ret);
+     swprintf(url, ARRAY_SIZE(url), L"http://localhost:%u/", port);
+     ret = pHttpAddUrlToUrlGroup(group, url, 0xdeadbeef, 0);
+-    todo_wine ok(ret == ERROR_ALREADY_EXISTS, "Got error %u.\n", ret);
++    ok(ret == ERROR_ALREADY_EXISTS, "Got error %u.\n", ret);
+ 
+     s = create_client_socket(port);
+     len = sizeof(sockaddr);
+@@ -1859,6 +1859,211 @@ static void test_v2_completion_port(void)
+     ok(!ret, "Failed to close group, error %u.\n", ret);
+ }
+ 
++static void test_service_config(void)
++{
++    static WCHAR prefix[] = L"http://+:50123/wine-test/";
++    static WCHAR bad_prefix[] = L"http://+/wine-test/";
++    static WCHAR sddl[] = L"D:(A;;GX;;;WD)";
++    struct { WCHAR *prefix; WCHAR *sddl; } set;
++    struct { int type; WCHAR *prefix; DWORD token; } query;
++    BYTE buffer[512];
++    SOCKADDR_IN addr = {.sin_family = AF_INET};
++    struct { USHORT len; SOCKADDR *addr; } listen_param = {sizeof(addr), (SOCKADDR *)&addr};
++    struct { ULONG key; USHORT value; } timeout_set;
++    ULONG ret, size;
++
++    set.prefix = prefix;
++    set.sddl = sddl;
++    ret = HttpSetServiceConfiguration(NULL, HttpServiceConfigUrlAclInfo, &set, sizeof(set), NULL);
++    if (ret == ERROR_ACCESS_DENIED)
++    {
++        skip("Not enough permissions to change the HTTP configuration.\n");
++        return;
++    }
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = HttpSetServiceConfiguration(NULL, HttpServiceConfigUrlAclInfo, &set, sizeof(set), NULL);
++    ok(ret == ERROR_ALREADY_EXISTS, "Got error %lu.\n", ret);
++    set.prefix = bad_prefix;
++    ret = HttpSetServiceConfiguration(NULL, HttpServiceConfigUrlAclInfo, &set, sizeof(set), NULL);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %lu.\n", ret);
++    ret = HttpSetServiceConfiguration((HANDLE)1, HttpServiceConfigUrlAclInfo, &set, sizeof(set), NULL);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %lu.\n", ret);
++
++    query.type = 0;
++    query.prefix = prefix;
++    query.token = 0;
++    size = 0;
++    ret = HttpQueryServiceConfiguration(NULL, HttpServiceConfigUrlAclInfo, &query, sizeof(query), buffer, 1, &size, NULL);
++    ok(ret == ERROR_INSUFFICIENT_BUFFER, "Got error %lu.\n", ret);
++    ok(size > 1, "Got size %lu.\n", size);
++    ret = HttpQueryServiceConfiguration(NULL, HttpServiceConfigUrlAclInfo, &query, sizeof(query), buffer, sizeof(buffer), &size, NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++    ok(!wcscmp(((WCHAR **)buffer)[0], prefix) && !wcscmp(((WCHAR **)buffer)[1], sddl), "Got %s, %s.\n",
++            wine_dbgstr_w(((WCHAR **)buffer)[0]), wine_dbgstr_w(((WCHAR **)buffer)[1]));
++
++    ret = HttpDeleteServiceConfiguration(NULL, HttpServiceConfigUrlAclInfo, &set, sizeof(set), NULL);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %lu.\n", ret);
++    set.prefix = prefix;
++    ret = HttpDeleteServiceConfiguration(NULL, HttpServiceConfigUrlAclInfo, &set, sizeof(set), NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = HttpDeleteServiceConfiguration(NULL, HttpServiceConfigUrlAclInfo, &set, sizeof(set), NULL);
++    ok(ret == ERROR_FILE_NOT_FOUND, "Got error %lu.\n", ret);
++    ret = HttpQueryServiceConfiguration(NULL, HttpServiceConfigUrlAclInfo, &query, sizeof(query), buffer, sizeof(buffer), &size, NULL);
++    ok(ret == ERROR_FILE_NOT_FOUND, "Got error %lu.\n", ret);
++
++    addr.sin_addr.S_un.S_addr = htonl(0x7f000001);
++    ret = HttpSetServiceConfiguration(NULL, HttpServiceConfigIPListenList, &listen_param, sizeof(listen_param), NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = HttpSetServiceConfiguration(NULL, HttpServiceConfigIPListenList, &listen_param, sizeof(listen_param), NULL);
++    ok(ret == ERROR_ALREADY_EXISTS, "Got error %lu.\n", ret);
++    ret = HttpQueryServiceConfiguration(NULL, HttpServiceConfigIPListenList, NULL, 0, buffer, sizeof(buffer), &size, NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++    ok(*(ULONG *)buffer == 1, "Got %lu addresses.\n", *(ULONG *)buffer);
++    ret = HttpDeleteServiceConfiguration(NULL, HttpServiceConfigIPListenList, &listen_param, sizeof(listen_param), NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = HttpDeleteServiceConfiguration(NULL, HttpServiceConfigIPListenList, &listen_param, sizeof(listen_param), NULL);
++    ok(ret == ERROR_FILE_NOT_FOUND, "Got error %lu.\n", ret);
++
++    timeout_set.key = 0;
++    timeout_set.value = 77;
++    ret = HttpSetServiceConfiguration(NULL, HttpServiceConfigTimeout, &timeout_set, sizeof(timeout_set), NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = HttpQueryServiceConfiguration(NULL, HttpServiceConfigTimeout, &timeout_set, sizeof(ULONG), buffer, sizeof(buffer), &size, NULL);
++    ok(!ret && *(USHORT *)buffer == 77, "Got error %lu, value %u.\n", ret, *(USHORT *)buffer);
++    ret = HttpDeleteServiceConfiguration(NULL, HttpServiceConfigTimeout, &timeout_set, sizeof(ULONG), NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++}
++
++static void test_fragment_cache(void)
++{
++    static const WCHAR url[] = L"http://localhost:50124/frag";
++    HTTP_CACHE_POLICY policy = {HttpCachePolicyUserInvalidates, 0};
++    HTTP_DATA_CHUNK chunk = {HttpDataChunkFromMemory};
++    HTTP_BYTE_RANGE range;
++    ULONG ret, read;
++    char buffer[16];
++    HANDLE queue;
++
++    ret = HttpCreateHttpHandle(&queue, 0);
++    ok(!ret, "Got error %lu.\n", ret);
++
++    chunk.FromMemory.pBuffer = (void *)"fragment";
++    chunk.FromMemory.BufferLength = 8;
++    ret = HttpAddFragmentToCache(queue, url, &chunk, &policy, NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++
++    memset(buffer, 0, sizeof(buffer));
++    ret = HttpReadFragmentFromCache(queue, url, NULL, buffer, sizeof(buffer), &read, NULL);
++    ok(!ret && read == 8 && !memcmp(buffer, "fragment", 8), "Got error %lu, read %lu.\n", ret, read);
++
++    range.StartingOffset.QuadPart = 2;
++    range.Length.QuadPart = 3;
++    memset(buffer, 0, sizeof(buffer));
++    ret = HttpReadFragmentFromCache(queue, url, &range, buffer, sizeof(buffer), &read, NULL);
++    ok(!ret && read == 3 && !memcmp(buffer, "agm", 3), "Got error %lu, read %lu.\n", ret, read);
++
++    ret = HttpReadFragmentFromCache(queue, url, NULL, buffer, 2, &read, NULL);
++    ok(ret == ERROR_MORE_DATA && read == 8, "Got error %lu, read %lu.\n", ret, read);
++
++    ret = HttpFlushResponseCache(queue, url, 0, NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = HttpReadFragmentFromCache(queue, url, NULL, buffer, sizeof(buffer), &read, NULL);
++    ok(ret == ERROR_FILE_NOT_FOUND, "Got error %lu.\n", ret);
++    ret = HttpFlushResponseCache(queue, url, 0, NULL);
++    ok(ret == ERROR_FILE_NOT_FOUND, "Got error %lu.\n", ret);
++
++    CloseHandle(queue);
++}
++
++static void test_v2_properties_and_urls(void)
++{
++    static const HTTPAPI_VERSION version = {2, 0};
++    ULONG (WINAPI *pHttpQueryUrlGroupProperty)(HTTP_URL_GROUP_ID, HTTP_SERVER_PROPERTY, void *, ULONG, ULONG *);
++    ULONG (WINAPI *pHttpQueryServerSessionProperty)(HTTP_SERVER_SESSION_ID, HTTP_SERVER_PROPERTY, void *, ULONG, ULONG *);
++    ULONG (WINAPI *pHttpSetServerSessionProperty)(HTTP_SERVER_SESSION_ID, HTTP_SERVER_PROPERTY, void *, ULONG);
++    ULONG (WINAPI *pHttpQueryRequestQueueProperty)(HANDLE, HTTP_SERVER_PROPERTY, void *, ULONG, ULONG, ULONG *, void *);
++    ULONG (WINAPI *pHttpSetRequestQueueProperty)(HANDLE, HTTP_SERVER_PROPERTY, void *, ULONG, ULONG, void *);
++    HTTP_SERVER_SESSION_ID session;
++    HTTP_URL_GROUP_ID group;
++    HTTP_BINDING_INFO binding = {{1}}, got;
++    HMODULE mod = GetModuleHandleA("httpapi.dll");
++    ULONG ret, size, length;
++    HANDLE queue;
++
++    pHttpQueryUrlGroupProperty = (void *)GetProcAddress(mod, "HttpQueryUrlGroupProperty");
++    pHttpQueryServerSessionProperty = (void *)GetProcAddress(mod, "HttpQueryServerSessionProperty");
++    pHttpSetServerSessionProperty = (void *)GetProcAddress(mod, "HttpSetServerSessionProperty");
++    pHttpQueryRequestQueueProperty = (void *)GetProcAddress(mod, "HttpQueryRequestQueueProperty");
++    pHttpSetRequestQueueProperty = (void *)GetProcAddress(mod, "HttpSetRequestQueueProperty");
++
++    ret = pHttpCreateServerSession(version, &session, 0);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = pHttpCreateUrlGroup(session, &group, 0);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = pHttpCreateRequestQueue(version, NULL, NULL, 0, &queue);
++    ok(!ret, "Got error %lu.\n", ret);
++
++    /* several URLs per group */
++    ret = pHttpAddUrlToUrlGroup(group, L"http://localhost:50125/a/", 1, 0);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = pHttpAddUrlToUrlGroup(group, L"http://localhost:50125/b/", 2, 0);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = pHttpAddUrlToUrlGroup(group, L"http://localhost:50125/A/", 3, 0);
++    ok(ret == ERROR_ALREADY_EXISTS, "Got error %lu.\n", ret);
++    ret = pHttpAddUrlToUrlGroup(group, NULL, 3, 0);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %lu.\n", ret);
++
++    ret = pHttpSetUrlGroupProperty(group, HttpServerBindingProperty, &binding, sizeof(binding));
++    ok(!ret, "Got error %lu.\n", ret);
++    binding.RequestQueueHandle = queue;
++    ret = pHttpSetUrlGroupProperty(group, HttpServerBindingProperty, &binding, sizeof(binding));
++    ok(!ret, "Got error %lu.\n", ret);
++
++    memset(&got, 0, sizeof(got));
++    size = 0;
++    ret = pHttpQueryUrlGroupProperty(group, HttpServerBindingProperty, &got, sizeof(got), &size);
++    ok(!ret && size == sizeof(got) && got.RequestQueueHandle == queue, "Got error %lu, size %lu.\n", ret, size);
++
++    ret = pHttpRemoveUrlFromUrlGroup(group, L"http://localhost:50125/a/", 0);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = pHttpRemoveUrlFromUrlGroup(group, L"http://localhost:50125/a/", 0);
++    ok(ret == ERROR_FILE_NOT_FOUND, "Got error %lu.\n", ret);
++    ret = pHttpRemoveUrlFromUrlGroup(group, NULL, HTTP_URL_FLAG_REMOVE_ALL);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = pHttpRemoveUrlFromUrlGroup(group, L"http://localhost:50125/b/", 0);
++    ok(ret == ERROR_FILE_NOT_FOUND, "Got error %lu.\n", ret);
++
++    /* the removed URLs can be used again */
++    ret = pHttpAddUrlToUrlGroup(group, L"http://localhost:50125/b/", 2, 0);
++    ok(!ret, "Got error %lu.\n", ret);
++
++    /* properties read back */
++    length = 55;
++    ret = pHttpSetRequestQueueProperty(queue, HttpServerQueueLengthProperty, &length, sizeof(length), 0, NULL);
++    ok(!ret, "Got error %lu.\n", ret);
++    length = 0;
++    ret = pHttpQueryRequestQueueProperty(queue, HttpServerQueueLengthProperty, &length, sizeof(length), 0, &size, NULL);
++    ok(!ret && length == 55, "Got error %lu, length %lu.\n", ret, length);
++
++    length = 7;
++    ret = pHttpSetServerSessionProperty(session, HttpServerStateProperty, &length, sizeof(length));
++    ok(!ret, "Got error %lu.\n", ret);
++    length = 0;
++    ret = pHttpQueryServerSessionProperty(session, HttpServerStateProperty, &length, sizeof(length), &size);
++    ok(!ret && length == 7, "Got error %lu, value %lu.\n", ret, length);
++    ret = pHttpQueryServerSessionProperty(session, HttpServerStateProperty, &length, 1, &size);
++    ok(ret == ERROR_MORE_DATA, "Got error %lu.\n", ret);
++
++    ret = pHttpCloseUrlGroup(group);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = pHttpCloseUrlGroup(group);
++    ok(ret == ERROR_INVALID_PARAMETER, "Got error %lu.\n", ret);
++    ret = pHttpCloseRequestQueue(queue);
++    ok(!ret, "Got error %lu.\n", ret);
++    ret = pHttpCloseServerSession(session);
++    ok(!ret, "Got error %lu.\n", ret);
++}
++
+ START_TEST(httpapi)
+ {
+     HTTPAPI_VERSION version = { 1, 0 };
+@@ -1883,6 +2088,8 @@ START_TEST(httpapi)
+     test_v1_multiple_urls();
+     test_v1_relative_urls();
+     test_v1_urls();
++    test_service_config();
++    test_fragment_cache();
+ 
+     ret = HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
+     ok(!ret, "Failed to terminate, ret %u.\n", ret);
+@@ -1896,6 +2103,7 @@ START_TEST(httpapi)
+         test_v2_queue_after_url();
+         test_v2_bound_port();
+         test_v2_completion_port();
++        test_v2_properties_and_urls();
+ 
+         ret = HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
+         ok(!ret, "Failed to terminate, ret %u.\n", ret);
+diff --git a/include/http.h b/include/http.h
+index 5a45f8f..f958759 100644
+--- a/include/http.h
++++ b/include/http.h
+@@ -466,6 +466,13 @@ typedef struct _HTTP_QOS_SETTING_INFO
+     void *QosSetting;
+ } HTTP_QOS_SETTING_INFO, *PHTTP_QOS_SETTING_INFO;
+ 
++HTTPAPI_LINKAGE ULONG WINAPI HttpAddFragmentToCache(HANDLE queue, const WCHAR *url, HTTP_DATA_CHUNK *chunk, HTTP_CACHE_POLICY *policy, OVERLAPPED *ovl);
++HTTPAPI_LINKAGE ULONG WINAPI HttpFlushResponseCache(HANDLE queue, const WCHAR *url, ULONG flags, OVERLAPPED *ovl);
++HTTPAPI_LINKAGE ULONG WINAPI HttpQueryRequestQueueProperty(HANDLE queue, HTTP_SERVER_PROPERTY property, void *value, ULONG length, ULONG reserved1, ULONG *ret_length, void *reserved2);
++HTTPAPI_LINKAGE ULONG WINAPI HttpQueryServerSessionProperty(HTTP_SERVER_SESSION_ID id, HTTP_SERVER_PROPERTY property, void *value, ULONG length, ULONG *ret_length);
++HTTPAPI_LINKAGE ULONG WINAPI HttpQueryUrlGroupProperty(HTTP_URL_GROUP_ID id, HTTP_SERVER_PROPERTY property, void *value, ULONG length, ULONG *ret_length);
++HTTPAPI_LINKAGE ULONG WINAPI HttpReadFragmentFromCache(HANDLE queue, const WCHAR *url, HTTP_BYTE_RANGE *range, void *buffer, ULONG size, ULONG *bytes_read, OVERLAPPED *ovl);
++HTTPAPI_LINKAGE ULONG WINAPI HttpShutdownRequestQueue(HANDLE queue);
+ HTTPAPI_LINKAGE ULONG WINAPI HttpAddUrl(HANDLE,PCWSTR,PVOID);
+ HTTPAPI_LINKAGE ULONG WINAPI HttpAddUrlToUrlGroup(HTTP_URL_GROUP_ID id, const WCHAR *url, HTTP_URL_CONTEXT context, ULONG reserved);
+ HTTPAPI_LINKAGE ULONG WINAPI HttpCloseRequestQueue(HANDLE handle);

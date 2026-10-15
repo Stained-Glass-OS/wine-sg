@@ -12,7 +12,7 @@ PREFIX  ?= /opt/wine-sg
 DESTDIR ?=
 JOBS    ?= $(shell nproc)
 
-.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-deskhover test-deskerase test-dpifollow test-hungwake test-savename test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg test-layeredblend test-linuxicon test-shellnew test-glassvk test-elevfolders test-displaycfg test-pss test-pyimports test-ownerrights test-ptracecap test-proxyblanket test-comlauncher test-cloakpaint test-gpupriority test-dbghelpinline test-regfsync test-sysversions test-drivewatch test-systemtemp test-desktopfront test-mcastif test-prtsc test-stiinf test-usbtree test-gpahook test-autoplay test-envreload test-iconhandler test-gdipfamily test-dirshare test-elevtray test-anotherwindow test-threadclass test-fetabs test-linuxbash test-embedmaxgrab test-toastactivate test-netfx3 test-smbshare test-smbview test-netuse test-mapcred test-wmiprinter test-cupsmodel test-devkeyread test-cupsrefresh test-pentouch test-drvpkg test-psdriver test-unidrvxl test-unidrvrast test-psplugin test-cpsui test-drvui test-netport test-printproc test-dwsubst test-ptcaps test-smoothshapes test-iconframes test-touch test-keybutton test-hiddenmax test-tlbbase test-comsvc test-privacysettings test-dwspacing test-msgboxicons test-credkeyring test-latepen test-wininet-listentimeout test-onlineid-ticket test-richtxsrv2 test-d2dsharedview test-rotransformerror test-cputime test-fileinfo test-procsettings test-memprotect test-userapis test-kbmisc test-cpusets test-werreg test-devfamily test-aclentries test-richinit test-bufpaint test-dwmattrs test-muipath test-stockicon test-enumjobs test-replacefile test-svcdepend test-sysshutdown test-advsec test-shcorebits test-fontquery test-guithread test-ipnotify test-apprestart test-minidumpx test-joblimits test-fmtsupport test-printnotify test-diskinfo test-perfcount test-taskdisp test-taskinfo test-taskxml test-bitsjob test-bitsmore test-mmcss test-devtree test-pinterfaceiid test-taskprogress test-winappid test-childpolicy test-smallstubs2 test-asynclock test-uilangs test-shellapp test-shelldisp test-wshshell test-textstreams test-fsoitems test-wshnet test-vbsbuiltins test-vbsdyncode test-jsstubs test-nsplookup test-wscatalog test-gdipquality test-hotkeyexec test-zipfolder test-thumbbar test-xplacement test-tsfsinks test-certresync test-inputpane test-jumplist test-evtquery test-audiotopo test-dxcore test-dmanip test-imglist2 test-lvtv test-toolbar2 test-ccmisc test-ole32misc test-oapict test-tlbcreate test-roerror test-guires test-powerreq test-ncryptksp test-cryptrest test-etwtrace test-uiaevents test-msgfilter test-uiabridge test-shellmisc test-oleaccstd test-sockmisc test-netlist test-bestroute test-fileflags test-dwritemisc test-certfind test-pfxexport test-smallstubs3 test-aptshutdown test-cmifaces test-cmnotify test-powerschemes test-capsdhcp test-procquota test-credprotect test-creduiwin test-wtsnotify test-appdefault test-propkeyname test-setupcm test-urlmonparse test-urlmonzone test-boundary test-devicemap test-gentable test-perflib test-ncryptwrap test-netuserinfo test-wintrusthelp test-wtssession test-accdisp test-accprop test-d3d11featx test-d3d11misc test-comctlstub test-comdlgitem test-msxmlstub test-shlwapistub test-blockreason test-fwenv test-regmulti test-shellhook test-bcryptconfig test-bcryptoaep test-bcryptresolve test-crypt32aux test-dnsapihelp test-iphlpapient test-powerlegacy test-tapiline test-dxgistat test-dxgiswap test-jpegexif test-wicxform test-dsound-stubs test-lockserver test-mf-misc test-mfplat-buffers test-mfplat-bytestream test-wgi-device test-wgi-stubs test-wgst-mpegaudio test-wgst-wmreader test-winmm-misc test-wmc-stubs test-wmdev-stubs test-wmedia-stubs test-wmspeech test-wmspeech2 test-xinput-audio test-mitigate test-usersessions test-adocmd test-dtdcode test-ebrowser test-folderview test-jsonweb test-mimebody test-mimeopt test-mimesave test-msxmlcoll test-msxmlpersist test-mxwdom test-ofnull test-printfldr test-propbag test-propvar2 test-propvec test-pvstring test-richedoc test-richeedit test-richepara test-richesearch test-richesel test-secidom test-setupclass test-setupnodeprop test-setupspace test-sfileinfo test-sfparse test-shexecargs test-shlinkstub test-tabmru test-tbsep test-webverbs test-createfile test-fcache test-fileioctl test-fsmisc test-globalmem test-inputapi test-iosb test-lznt1 test-monhandle test-ntdllmisc test-ntinfoval test-olecompat test-pipeid test-profile test-pseudowait test-registry test-rpcbind test-rtlquery test-sppi test-svcdup test-svcfail test-svcname test-uimisc test-validdata test-wca test-winplace test-writevm test-crypt32cs test-crypt32dec test-crypt32msg test-mscoree-hash test-mscoree-sn test-netapi32ground test-netwrite test-regstorethrough test-suspend test-tapihandles test-tapiphone test-tapitrans test-winhttpground test-wininetground test-wintrustadmin test-wintrustcat test-wintrustcatw test-wintrustfind test-ws2ground test-wsreader test-wswriter test-wtsaction test-d2dctl test-d2dmesh test-d2dtarget test-d3d113res test-d3dshare test-d3dxline test-dwbidi test-dwfaceref test-dwhit test-dxgidup test-gdipimg test-gdipstat test-metawriter test-uiacache test-uiacom test-uiacpat test-uiapat test-wicblock test-wicenc test-wicicc test-wicinfo test-wicquery test-wicsave test-dinput-misc test-dmcontent-styletracks test-dmime-audiopath test-dmime-perf test-dmime-tracks test-dmloader-streams test-dplayx-dp4 test-dplayx-lobby test-dplayx-sp test-dplayx-v1 test-dpnet-session test-evr-filter test-evr-mixer test-evr-presenter test-mfme test-mfplay test-mfrest-helpers test-mfsrcsnk test-qdvd-nav test-qedit-amstream test-qedit-mediadet test-qedit-msvfw32 test-qedit-timeline test-quartz-graph test-quartz-vmr test-sapi-mmaudio test-sapi-stream test-sapi-token test-sapi-voice test-wgdmo-colorconv test-wgdmo-resampler test-wgdmo-wma test-wgrest-sink test-wgrest-source test-wgrest-wmreader test-wgvid-aacdec test-wgvid-h264enc test-wgvid-vproc test-wgvid-wmvdec test-wmp-state test-wmv-config test-wmv-misc test-wmv-reader test-winstasd test-wtstoken test-logonuser test-runasuser test-accesscheck test-actctxfast test-combasemisc test-dirchange test-endtask test-enumsettings test-procinfo2 test-sdmisc test-sysclasses test-tfcreate test-d2dtxt test-d2dvb test-d3drmface test-d3drmframe test-d3drmpath test-d3drmtexdev test-d3dxanim test-d3dxconv test-d3dxddspal test-d3dxdxt test-d3dxfont test-d3dxisect test-d3dxmesh test-d3dxsavetex test-d3dxtga test-dcompobj test-dwfactref test-dwfont test-dwset test-dwsetaxes test-dwtab test-dwwrap test-gdipdisp test-gdipdrv test-gdipinit test-gdipmeas test-gdipnn test-gdiprgn test-oleaccproxy test-uiaiface test-wicdds test-wichbm test-wicpnginfo test-dinputtodo test-dmcontent-band test-dmcontent-compos test-dmcontent-style test-dmusic-ports test-dmusic-synth test-mfrest2 test-quartz-rest test-wmvw-header test-wmvw-profile test-wmvw-writer test-wmvw-xml test-xact-wave test-adoconn test-adorecords test-cwmo test-dinput-hidusage test-dinputleft test-dmcompose test-dmcontent-play test-dmime-conv test-dmscript test-evr-classfactory test-evr-mfexports test-mc-audiostate test-mf-sequencer test-mfplat-mediabuf test-mfplat-mtconv test-mfplat-pdser test-mfplat-plugin test-mfplat-vidrep test-mfplat-vih test-quartz-collections test-quartz-fullscreen test-quartz-misc test-wgasync test-winmmthru test-winmmtodo-dsound test-winmmtodo-winmm test-wmp-collections test-wmvw-sysprof test-adostream test-cc3 test-diskspace2 test-mimemsg test-mimeprops test-propconv test-propstore2 test-recentdocs test-richpaste test-setupprop test-shcore2 test-shdataobj test-shellord test-idealproc test-monikeredge test-regorder test-volumetime test-bcryptground test-crypt32ground test-dnsapiqueryex test-msicomppath test-msicost test-msifilever test-msiground test-msipatch test-msiprodinfo test-msisignature test-ncryptdpapi test-secur32sasl test-secur32schannel test-taskschdground test-wbemcom test-wbemproc test-wbemsettings test-winhttpsocket test-wininetcrack test-wininetnoreply test-wintrusthashonly test-wmic test-wsarray test-wsheap test-wslistener test-wsstart test-wsvalue test-d2dbmpcc test-d3drmclone test-d3drmfaces test-d3drmmb test-d3dxsampler test-dcomp3d test-dcompsurface test-dwritewoff test-gdipconv test-gdipdual test-uiacachetree test-uiagroup test-uianorm test-uiaopts test-wicico test-wicidxpal test-hklmsd test-amstream-alloc test-amstream-smoke test-avifil32-palchange test-avifil32-smoke test-concrt-context test-concrt-exc-locks test-concrt-helpers test-concrt-queue-iter test-crt-cgets test-crt-concurrency test-crt-context-yield test-crt-dbgheap test-crt-eh-helpers test-crt-exc-misc test-crt-find32i64 test-crt-heap test-crt-imagebase test-crt-internals test-crt-ismbb test-crt-iswcsym test-crt-mbcasemap-data test-crt-misc test-crt-norm test-crt-old-handlers test-crt-platform test-crt-portio test-crt-printf test-crt-scanf test-crt-string-s test-crt-systime test-crt-uchar test-crt-win32-wrappers test-devenum-smoke test-dmsynth-dls1 test-dpvoice-factory test-dsdmo-smoke test-dxva2-smoke test-evr-fullscreen test-gamebar-smoke test-mciavi32-smoke test-mciqtz32-smoke test-media-misc-smoke test-mediacontrol-smoke test-mf-seekpause test-mf-smoke test-mfplat-smoke test-mfreadwrite-smoke test-mmdevapi-smoke test-mp3dmod-dmo test-msacm32-metrics test-msacm32-smoke test-msdmo-smoke test-msvcp-access-forms test-msvcp-atomic-wait test-msvcp-c-collate test-msvcp-codecvt-utf test-msvcp-collate test-msvcp-eptr-swap test-msvcp-errcat test-msvcp-fs-misc test-msvcp-locale-ops test-msvcp-locinfo test-msvcp-makeloc test-msvcp-messages test-msvcp-misc-older test-msvcp-money test-msvcp-old-exports test-msvcp-old-forms test-msvcp-old-members test-msvcp-platform test-msvcp-random-mp test-msvcp-stream-move test-msvcp-streambuf test-msvcp-threads-c test-msvcp-timeget test-msvcp-ushort-read test-msvcp-ushort-read-older test-msvcp-wcomplex test-msvcp-wstod test-msvcp-xexc test-msvcp-xfsopen test-msvcp-yarn-facetbase test-msvcp100-misc test-msvcp140-2-smf test-msvcp140-crt-wrappers test-msvcp60-assign test-msvcp60-complex test-msvcp60-dateorder test-msvcp60-doraise test-msvcp60-exceptions test-msvcp60-getcat test-msvcp60-locale-call test-msvcp60-std-exceptions test-msvcp60-streambuf-misc test-msvcp60-timeget test-msvcp60-traits-assign test-msvcp70-complex test-msvcr100-task-canceled test-msvfw32-smoke test-qasf-smoke test-qcap-smoke test-qdvd-smoke test-quartz-dsound-focus test-quartz-graph-forward test-quartz-vmr9-alloc test-rtworkq-platform-events test-ucrt-dmath test-vcomp-dynamic-i8 test-vcrt-module-wrappers test-wmp-moniker test-wmvcore-playlist-burn test-wmvcore-smoke test-advapi32-efs test-advapi32-hwprofile test-advapi32-reflection test-advapi32-servicebits test-bcrypt-aeswrap test-bcrypt-algnotfound test-bcrypt-decryptflags test-bcrypt-importpair test-bcrypt-propnotsupported test-combase-ctxcallback test-combase-ctxprops test-combase-defctx test-combase-handlerconnected test-combase-hpalette test-combase-logicalid test-combase-stdmarshal-disconnect test-combase-stdmarshal-null test-crypt32-adddisposition test-crypt32-closecheck test-crypt32-hexa test-crypt32-universalstring test-cryptobuffer-convert test-cryptowinrt-inspectable test-gdi32-smalltextout test-kernel32-pipesession test-kernel32-pipestate test-kernel32-regquota test-kernel32-symlinka test-kernel32-ums test-kernel32-wow64selector test-kernel32-zombifyactctx test-kernelbase-affinityupdate test-kernelbase-consolemouse test-kernelbase-georfc1766 test-kernelbase-shregcreate test-kernelbase-shregdel test-kernelbase-urlescapecomponent test-kernelbase-urlfixup test-kernelbase-urlisappliable test-ntdll-bitmap-backward test-ntdll-compactheap test-ntdll-compressioninfo test-ntdll-filealign test-ntdll-flushwrites test-ntdll-fsobjectid test-ntdll-iopending test-ntdll-placeholder test-ntdll-powercaps test-ntdll-querydir-async test-ntdll-regalign64 test-ntdll-regioninfo test-ntdll-subsystem test-ntdll-symlink test-ntdll-timerqueue-event test-ntdll-xpress-edges test-ntdll-xpress test-ntoskrnl-callback test-ntoskrnl-confinfo test-ntoskrnl-csq test-ntoskrnl-dpc test-ntoskrnl-dpcqueue test-ntoskrnl-drvext test-ntoskrnl-errorlog test-ntoskrnl-harderror test-ntoskrnl-iocreate test-ntoskrnl-iotimer test-ntoskrnl-loadimage test-ntoskrnl-mdl test-ntoskrnl-netiotest test-ntoskrnl-ntddi test-ntoskrnl-obref test-ntoskrnl-pnptest test-ntoskrnl-procgroup test-ntoskrnl-procname test-ntoskrnl-queue test-ntoskrnl-regs test-ntoskrnl-reinit test-ntoskrnl-resclaim test-ntoskrnl-shutdown test-ntoskrnl-startio test-ole32-cachefreeze test-ole32-callas test-ole32-colorset test-ole32-enumskip test-ole32-handler test-ole32-monikers test-ole32-olestreamex test-ole32-proptimes test-ole32-setdata test-ole32-staticdata test-ole32-stgconvert test-ole32-stgopenex test-ole32-viewcallas test-oleaut32-hfont test-oleaut32-propbag-qa test-oleaut32-propframe-initial test-oleaut32-recinfo test-oleaut32-tlcallas test-oleaut32-typelibname test-onlineid-inspectable test-rpcrt4-async test-rpcrt4-async-rpc test-rpcrt4-canceltimeout test-rpcrt4-clearout test-rpcrt4-comtimeout test-rpcrt4-convert test-rpcrt4-cstruct test-rpcrt4-fcwstring test-rpcrt4-httprts test-rpcrt4-ifids test-rpcrt4-pipe test-rpcrt4-ptrgap test-rpcrt4-unregifex test-user32-ddedisconnect test-webcore-inspectable test-webcore-mapview test-win32u-coloradjust test-win32u-getpixelclip test-win32u-lockwindowupdate test-win32u-mouseinpointer test-win32u-openadapterhdc test-win32u-openadaptername test-gdi32-aspect test-gdi32-colorspace test-gdi32-emf-escapes test-gdi32-engclip test-gdi32-gcpclass test-gdi32-opentype test-gdi32-updateicmregkey test-ntdll-sppi test-user32-animrects test-user32-dataobj test-user32-ddelist test-user32-ddepartner test-user32-devnotify-ansi test-user32-dpihosting test-user32-msgbox-help test-user32-setdisplayconfig test-user32-touchht test-user32-winnls-ime test-usp10-justify test-win32u-ddescape test-win32u-eto-numerics test-win32u-flash-timer test-win32u-hkl-alias test-win32u-memfont test-win32u-menu-autodismiss test-win32u-qai test-win32u-spi-access test-win32u-wgl-sharelists
+.PHONY: all build install test deb deps clean distclean lint test-rasdial test-taskdialog test-msitransform test-shellconsole test-pssig test-robocopy test-jscript test-darkmode test-taskbar test-explorer-dark test-d2dlayer test-d2dsvg test-kbchar test-d2dgraph test-advcolor test-focusactivate test-drvkey test-mmdevkey test-ofn test-selflink test-unixexec test-taskview-linux test-xproc-vk test-firstpaint test-fileopadmin test-msiallusers test-verblabel test-taskbarlooks test-fileopresponsive test-mapdrive test-openwith test-drag test-deskhover test-deskerase test-dpifollow test-hungwake test-savename test-folderspeed test-shortcut test-topbar test-msiseltree test-statuscount test-folderwatch test-dcompalpha test-spooler test-desktopbg test-layeredblend test-linuxicon test-shellnew test-glassvk test-elevfolders test-displaycfg test-pss test-pyimports test-ownerrights test-ptracecap test-proxyblanket test-comlauncher test-cloakpaint test-gpupriority test-dbghelpinline test-regfsync test-sysversions test-drivewatch test-systemtemp test-desktopfront test-mcastif test-prtsc test-stiinf test-usbtree test-gpahook test-autoplay test-envreload test-iconhandler test-gdipfamily test-dirshare test-elevtray test-anotherwindow test-threadclass test-fetabs test-linuxbash test-embedmaxgrab test-toastactivate test-netfx3 test-smbshare test-smbview test-netuse test-mapcred test-wmiprinter test-cupsmodel test-devkeyread test-cupsrefresh test-pentouch test-drvpkg test-psdriver test-unidrvxl test-unidrvrast test-psplugin test-cpsui test-drvui test-netport test-printproc test-dwsubst test-ptcaps test-smoothshapes test-iconframes test-touch test-keybutton test-hiddenmax test-tlbbase test-comsvc test-privacysettings test-dwspacing test-msgboxicons test-credkeyring test-latepen test-wininet-listentimeout test-onlineid-ticket test-richtxsrv2 test-d2dsharedview test-rotransformerror test-cputime test-fileinfo test-procsettings test-memprotect test-userapis test-kbmisc test-cpusets test-werreg test-devfamily test-aclentries test-richinit test-bufpaint test-dwmattrs test-muipath test-stockicon test-enumjobs test-replacefile test-svcdepend test-sysshutdown test-advsec test-shcorebits test-fontquery test-guithread test-ipnotify test-apprestart test-minidumpx test-joblimits test-fmtsupport test-printnotify test-diskinfo test-perfcount test-taskdisp test-taskinfo test-taskxml test-bitsjob test-bitsmore test-mmcss test-devtree test-pinterfaceiid test-taskprogress test-winappid test-childpolicy test-smallstubs2 test-asynclock test-uilangs test-shellapp test-shelldisp test-wshshell test-textstreams test-fsoitems test-wshnet test-vbsbuiltins test-vbsdyncode test-jsstubs test-nsplookup test-wscatalog test-gdipquality test-hotkeyexec test-zipfolder test-thumbbar test-xplacement test-tsfsinks test-certresync test-inputpane test-jumplist test-evtquery test-audiotopo test-dxcore test-dmanip test-imglist2 test-lvtv test-toolbar2 test-ccmisc test-ole32misc test-oapict test-tlbcreate test-roerror test-guires test-powerreq test-ncryptksp test-cryptrest test-etwtrace test-uiaevents test-msgfilter test-uiabridge test-shellmisc test-oleaccstd test-sockmisc test-netlist test-bestroute test-fileflags test-dwritemisc test-certfind test-pfxexport test-smallstubs3 test-aptshutdown test-cmifaces test-cmnotify test-powerschemes test-capsdhcp test-procquota test-credprotect test-creduiwin test-wtsnotify test-appdefault test-propkeyname test-setupcm test-urlmonparse test-urlmonzone test-boundary test-devicemap test-gentable test-perflib test-ncryptwrap test-netuserinfo test-wintrusthelp test-wtssession test-accdisp test-accprop test-d3d11featx test-d3d11misc test-comctlstub test-comdlgitem test-msxmlstub test-shlwapistub test-blockreason test-fwenv test-regmulti test-shellhook test-bcryptconfig test-bcryptoaep test-bcryptresolve test-crypt32aux test-dnsapihelp test-iphlpapient test-powerlegacy test-tapiline test-dxgistat test-dxgiswap test-jpegexif test-wicxform test-dsound-stubs test-lockserver test-mf-misc test-mfplat-buffers test-mfplat-bytestream test-wgi-device test-wgi-stubs test-wgst-mpegaudio test-wgst-wmreader test-winmm-misc test-wmc-stubs test-wmdev-stubs test-wmedia-stubs test-wmspeech test-wmspeech2 test-xinput-audio test-mitigate test-usersessions test-adocmd test-dtdcode test-ebrowser test-folderview test-jsonweb test-mimebody test-mimeopt test-mimesave test-msxmlcoll test-msxmlpersist test-mxwdom test-ofnull test-printfldr test-propbag test-propvar2 test-propvec test-pvstring test-richedoc test-richeedit test-richepara test-richesearch test-richesel test-secidom test-setupclass test-setupnodeprop test-setupspace test-sfileinfo test-sfparse test-shexecargs test-shlinkstub test-tabmru test-tbsep test-webverbs test-createfile test-fcache test-fileioctl test-fsmisc test-globalmem test-inputapi test-iosb test-lznt1 test-monhandle test-ntdllmisc test-ntinfoval test-olecompat test-pipeid test-profile test-pseudowait test-registry test-rpcbind test-rtlquery test-sppi test-svcdup test-svcfail test-svcname test-uimisc test-validdata test-wca test-winplace test-writevm test-crypt32cs test-crypt32dec test-crypt32msg test-mscoree-hash test-mscoree-sn test-netapi32ground test-netwrite test-regstorethrough test-suspend test-tapihandles test-tapiphone test-tapitrans test-winhttpground test-wininetground test-wintrustadmin test-wintrustcat test-wintrustcatw test-wintrustfind test-ws2ground test-wsreader test-wswriter test-wtsaction test-d2dctl test-d2dmesh test-d2dtarget test-d3d113res test-d3dshare test-d3dxline test-dwbidi test-dwfaceref test-dwhit test-dxgidup test-gdipimg test-gdipstat test-metawriter test-uiacache test-uiacom test-uiacpat test-uiapat test-wicblock test-wicenc test-wicicc test-wicinfo test-wicquery test-wicsave test-dinput-misc test-dmcontent-styletracks test-dmime-audiopath test-dmime-perf test-dmime-tracks test-dmloader-streams test-dplayx-dp4 test-dplayx-lobby test-dplayx-sp test-dplayx-v1 test-dpnet-session test-evr-filter test-evr-mixer test-evr-presenter test-mfme test-mfplay test-mfrest-helpers test-mfsrcsnk test-qdvd-nav test-qedit-amstream test-qedit-mediadet test-qedit-msvfw32 test-qedit-timeline test-quartz-graph test-quartz-vmr test-sapi-mmaudio test-sapi-stream test-sapi-token test-sapi-voice test-wgdmo-colorconv test-wgdmo-resampler test-wgdmo-wma test-wgrest-sink test-wgrest-source test-wgrest-wmreader test-wgvid-aacdec test-wgvid-h264enc test-wgvid-vproc test-wgvid-wmvdec test-wmp-state test-wmv-config test-wmv-misc test-wmv-reader test-winstasd test-wtstoken test-logonuser test-runasuser test-accesscheck test-actctxfast test-combasemisc test-dirchange test-endtask test-enumsettings test-procinfo2 test-sdmisc test-sysclasses test-tfcreate test-d2dtxt test-d2dvb test-d3drmface test-d3drmframe test-d3drmpath test-d3drmtexdev test-d3dxanim test-d3dxconv test-d3dxddspal test-d3dxdxt test-d3dxfont test-d3dxisect test-d3dxmesh test-d3dxsavetex test-d3dxtga test-dcompobj test-dwfactref test-dwfont test-dwset test-dwsetaxes test-dwtab test-dwwrap test-gdipdisp test-gdipdrv test-gdipinit test-gdipmeas test-gdipnn test-gdiprgn test-oleaccproxy test-uiaiface test-wicdds test-wichbm test-wicpnginfo test-dinputtodo test-dmcontent-band test-dmcontent-compos test-dmcontent-style test-dmusic-ports test-dmusic-synth test-mfrest2 test-quartz-rest test-wmvw-header test-wmvw-profile test-wmvw-writer test-wmvw-xml test-xact-wave test-adoconn test-adorecords test-cwmo test-dinput-hidusage test-dinputleft test-dmcompose test-dmcontent-play test-dmime-conv test-dmscript test-evr-classfactory test-evr-mfexports test-mc-audiostate test-mf-sequencer test-mfplat-mediabuf test-mfplat-mtconv test-mfplat-pdser test-mfplat-plugin test-mfplat-vidrep test-mfplat-vih test-quartz-collections test-quartz-fullscreen test-quartz-misc test-wgasync test-winmmthru test-winmmtodo-dsound test-winmmtodo-winmm test-wmp-collections test-wmvw-sysprof test-adostream test-cc3 test-diskspace2 test-mimemsg test-mimeprops test-propconv test-propstore2 test-recentdocs test-richpaste test-setupprop test-shcore2 test-shdataobj test-shellord test-idealproc test-monikeredge test-regorder test-volumetime test-bcryptground test-crypt32ground test-dnsapiqueryex test-msicomppath test-msicost test-msifilever test-msiground test-msipatch test-msiprodinfo test-msisignature test-ncryptdpapi test-secur32sasl test-secur32schannel test-taskschdground test-wbemcom test-wbemproc test-wbemsettings test-winhttpsocket test-wininetcrack test-wininetnoreply test-wintrusthashonly test-wmic test-wsarray test-wsheap test-wslistener test-wsstart test-wsvalue test-d2dbmpcc test-d3drmclone test-d3drmfaces test-d3drmmb test-d3dxsampler test-dcomp3d test-dcompsurface test-dwritewoff test-gdipconv test-gdipdual test-uiacachetree test-uiagroup test-uianorm test-uiaopts test-wicico test-wicidxpal test-hklmsd test-amstream-alloc test-amstream-smoke test-avifil32-palchange test-avifil32-smoke test-concrt-context test-concrt-exc-locks test-concrt-helpers test-concrt-queue-iter test-crt-cgets test-crt-concurrency test-crt-context-yield test-crt-dbgheap test-crt-eh-helpers test-crt-exc-misc test-crt-find32i64 test-crt-heap test-crt-imagebase test-crt-internals test-crt-ismbb test-crt-iswcsym test-crt-mbcasemap-data test-crt-misc test-crt-norm test-crt-old-handlers test-crt-platform test-crt-portio test-crt-printf test-crt-scanf test-crt-string-s test-crt-systime test-crt-uchar test-crt-win32-wrappers test-devenum-smoke test-dmsynth-dls1 test-dpvoice-factory test-dsdmo-smoke test-dxva2-smoke test-evr-fullscreen test-gamebar-smoke test-mciavi32-smoke test-mciqtz32-smoke test-media-misc-smoke test-mediacontrol-smoke test-mf-seekpause test-mf-smoke test-mfplat-smoke test-mfreadwrite-smoke test-mmdevapi-smoke test-mp3dmod-dmo test-msacm32-metrics test-msacm32-smoke test-msdmo-smoke test-msvcp-access-forms test-msvcp-atomic-wait test-msvcp-c-collate test-msvcp-codecvt-utf test-msvcp-collate test-msvcp-eptr-swap test-msvcp-errcat test-msvcp-fs-misc test-msvcp-locale-ops test-msvcp-locinfo test-msvcp-makeloc test-msvcp-messages test-msvcp-misc-older test-msvcp-money test-msvcp-old-exports test-msvcp-old-forms test-msvcp-old-members test-msvcp-platform test-msvcp-random-mp test-msvcp-stream-move test-msvcp-streambuf test-msvcp-threads-c test-msvcp-timeget test-msvcp-ushort-read test-msvcp-ushort-read-older test-msvcp-wcomplex test-msvcp-wstod test-msvcp-xexc test-msvcp-xfsopen test-msvcp-yarn-facetbase test-msvcp100-misc test-msvcp140-2-smf test-msvcp140-crt-wrappers test-msvcp60-assign test-msvcp60-complex test-msvcp60-dateorder test-msvcp60-doraise test-msvcp60-exceptions test-msvcp60-getcat test-msvcp60-locale-call test-msvcp60-std-exceptions test-msvcp60-streambuf-misc test-msvcp60-timeget test-msvcp60-traits-assign test-msvcp70-complex test-msvcr100-task-canceled test-msvfw32-smoke test-qasf-smoke test-qcap-smoke test-qdvd-smoke test-quartz-dsound-focus test-quartz-graph-forward test-quartz-vmr9-alloc test-rtworkq-platform-events test-ucrt-dmath test-vcomp-dynamic-i8 test-vcrt-module-wrappers test-wmp-moniker test-wmvcore-playlist-burn test-wmvcore-smoke test-advapi32-efs test-advapi32-hwprofile test-advapi32-reflection test-advapi32-servicebits test-bcrypt-aeswrap test-bcrypt-algnotfound test-bcrypt-decryptflags test-bcrypt-importpair test-bcrypt-propnotsupported test-combase-ctxcallback test-combase-ctxprops test-combase-defctx test-combase-handlerconnected test-combase-hpalette test-combase-logicalid test-combase-stdmarshal-disconnect test-combase-stdmarshal-null test-crypt32-adddisposition test-crypt32-closecheck test-crypt32-hexa test-crypt32-universalstring test-cryptobuffer-convert test-cryptowinrt-inspectable test-gdi32-smalltextout test-kernel32-pipesession test-kernel32-pipestate test-kernel32-regquota test-kernel32-symlinka test-kernel32-ums test-kernel32-wow64selector test-kernel32-zombifyactctx test-kernelbase-affinityupdate test-kernelbase-consolemouse test-kernelbase-georfc1766 test-kernelbase-shregcreate test-kernelbase-shregdel test-kernelbase-urlescapecomponent test-kernelbase-urlfixup test-kernelbase-urlisappliable test-ntdll-bitmap-backward test-ntdll-compactheap test-ntdll-compressioninfo test-ntdll-filealign test-ntdll-flushwrites test-ntdll-fsobjectid test-ntdll-iopending test-ntdll-placeholder test-ntdll-powercaps test-ntdll-querydir-async test-ntdll-regalign64 test-ntdll-regioninfo test-ntdll-subsystem test-ntdll-symlink test-ntdll-timerqueue-event test-ntdll-xpress-edges test-ntdll-xpress test-ntoskrnl-callback test-ntoskrnl-confinfo test-ntoskrnl-csq test-ntoskrnl-dpc test-ntoskrnl-dpcqueue test-ntoskrnl-drvext test-ntoskrnl-errorlog test-ntoskrnl-harderror test-ntoskrnl-iocreate test-ntoskrnl-iotimer test-ntoskrnl-loadimage test-ntoskrnl-mdl test-ntoskrnl-netiotest test-ntoskrnl-ntddi test-ntoskrnl-obref test-ntoskrnl-pnptest test-ntoskrnl-procgroup test-ntoskrnl-procname test-ntoskrnl-queue test-ntoskrnl-regs test-ntoskrnl-reinit test-ntoskrnl-resclaim test-ntoskrnl-shutdown test-ntoskrnl-startio test-ole32-cachefreeze test-ole32-callas test-ole32-colorset test-ole32-enumskip test-ole32-handler test-ole32-monikers test-ole32-olestreamex test-ole32-proptimes test-ole32-setdata test-ole32-staticdata test-ole32-stgconvert test-ole32-stgopenex test-ole32-viewcallas test-oleaut32-hfont test-oleaut32-propbag-qa test-oleaut32-propframe-initial test-oleaut32-recinfo test-oleaut32-tlcallas test-oleaut32-typelibname test-onlineid-inspectable test-rpcrt4-async test-rpcrt4-async-rpc test-rpcrt4-canceltimeout test-rpcrt4-clearout test-rpcrt4-comtimeout test-rpcrt4-convert test-rpcrt4-cstruct test-rpcrt4-fcwstring test-rpcrt4-httprts test-rpcrt4-ifids test-rpcrt4-pipe test-rpcrt4-ptrgap test-rpcrt4-unregifex test-user32-ddedisconnect test-webcore-inspectable test-webcore-mapview test-win32u-coloradjust test-win32u-getpixelclip test-win32u-lockwindowupdate test-win32u-mouseinpointer test-win32u-openadapterhdc test-win32u-openadaptername test-gdi32-aspect test-gdi32-colorspace test-gdi32-emf-escapes test-gdi32-engclip test-gdi32-gcpclass test-gdi32-opentype test-gdi32-updateicmregkey test-ntdll-sppi test-user32-animrects test-user32-dataobj test-user32-ddelist test-user32-ddepartner test-user32-devnotify-ansi test-user32-dpihosting test-user32-msgbox-help test-user32-setdisplayconfig test-user32-touchht test-user32-winnls-ime test-usp10-justify test-win32u-ddescape test-win32u-eto-numerics test-win32u-flash-timer test-win32u-hkl-alias test-win32u-memfont test-win32u-menu-autodismiss test-win32u-qai test-win32u-spi-access test-win32u-wgl-sharelists test-richrc test-widl-pipe test-fastactiveds test-fastaddmon test-fastado test-fastado2 test-fastadsldp test-fastadvpack test-fastagile test-fastappdata test-fastappmodel test-fastatl-ax test-fastatl-ax2 test-fastatl-misc test-fastatl30 test-fastbrowseui test-fastcab test-fastcdlg test-fastcloudasn1 test-fastcloudkbd test-fastcloudmapi test-fastcloudnewdev test-fastcloudpcap test-fastcloudprntvpt test-fastcloudqos test-fastcloudspool test-fastcloudsppc test-fastcloudtbs test-fastcloudurl test-fastcloudwsh test-fastclusapi test-fastcomsvcs test-fastcoremsg test-fastdataexchange test-fastdbgeng test-fastddraw test-fastdevenum test-fastdhtmled-b2 test-fastdhtmled test-fastdsui test-fastdwjust test-fastdx8vb test-fastdxgirc test-fastesent test-fastesent2 test-fastextrac32 test-fastfileio test-fastfusion test-fastgameux test-fastglobalization test-fasthhctrl test-fasthidtranslate test-fasthnetcfg test-fasthnetcfg2 test-fasthttpapi test-fastie-bs test-fastie test-fastie-mshtml test-fastie-riched test-fastie-urlmon test-fastieframe-b1 test-fastieframe-events test-fastieframe test-fastieframe-host test-fastieframe-move test-fastieframe-newwin test-fastieframe-showui test-fastieshortcut test-fastimm-ime test-fastinetcomm test-fastinetedit test-fastinetintl test-fastinseng test-fastinspect test-fastiphlp test-fastiq test-fastitss test-fastjsb1 test-fastjscall test-fastjserr test-fastjsintl test-fastjsmisc test-fastjsmode test-fastjsproxy test-fastjstyped test-fastlongtail test-fastmapi test-fastmapi2 test-fastmlang test-fastmpr test-fastmprapi test-fastmsctf test-fastmsctfb1 test-fastmsctfb2 test-fastmsctfprof test-fastmsdaps test-fastmsdapsrow test-fastmsdasql test-fastmshtml test-fastmshtmladopt test-fastmshtmlb1 test-fastmshtmlb2 test-fastmshtmlb3 test-fastmshtmlb4 test-fastmshtmlb5 test-fastmshtmlcssom test-fastmshtmldm test-fastmshtmldoc7 test-fastmshtmldom test-fastmshtmldomex test-fastmshtmlerr test-fastmshtmlevent test-fastmshtmlfile test-fastmshtmlmarkup test-fastmshtmlmedia test-fastmshtmlmisc test-fastmshtmlmo test-fastmshtmlopen test-fastmshtmlpointer test-fastmshtmlrangecmd test-fastmshtmlrc test-fastmshtmlsel test-fastmshtmltrav test-fastmshtmlundo test-fastmshtmlunits test-fastmsi test-fastmsiaut test-fastmsib1 test-fastmsib2 test-fastmsiini test-fastmsimode test-fastmsimtf test-fastmsipkg test-fastmsiprov test-fastmsisrc test-fastmsiusage test-fastmsscript test-fastmsxml-b1 test-fastmsxml-b2 test-fastmsxml test-fastmsxml3 test-fastmsxmlmisc test-fastmsxmlsax test-fastmsxmlwriter test-fastmsxmlxslt test-fastnet-emit1 test-fastnet-host1 test-fastnet-meta1 test-fastnet-sn1 test-fastnet-sn2 test-fastnetacct test-fastnetapi test-fastnetbios test-fastnetmisc test-fastninput test-fastodbccp32 test-fastoldgfx test-fastole32rc test-fastoledb32 test-fastoledlg test-fastopencl test-fastpackager test-fastpdh test-fastpf test-fastprintui test-fastrasapi test-fastrasbook test-fastregini test-fastrometa2 test-fastrometadata test-fastrstrtmgr test-fastscrobj test-fastsensapi test-fastservices test-fastsetjob test-fastsetupapi test-fastsetupimg test-fastshdocvw test-fastshdocvw2 test-fastshell32rc test-fastshlwapi3 test-fastshmisc test-fastsmbios test-fastsockiosb test-fastsubst test-fastsvcenum test-fasttapi test-fastthreadpool test-fastuiarc test-fastuiarepeat test-fasturlmon-b1 test-fasturlmon-b2 test-fasturlmon test-fastvbb1 test-fastvbenum test-fastvberr test-fastvbfor test-fastvbparens test-fastvbs test-fastvidcap test-fastvssapi test-fastwbemdisp test-fastwbemsink test-fastwebabort test-fastwebb1 test-fastwebdesc test-fastwebhdr test-fastwebhttp test-fastwebserv test-fastwebservices test-fastwebsvc2 test-fastwebtypes test-fastwinhlp test-fastwinhttp test-fastwininet-b1 test-fastwininet test-fastwininetenum test-fastwininetgroup test-fastwininetopt test-fastwininetrc test-fastwinstorage test-fastwintypes test-fastwinui test-fastwinui-sched test-fastwlanrc test-fastwpc test-fastwstorage2 test-fastwuapi test-fastwuapi2 test-fastwuapiset test-fastxcfg test-fastxmllite test-fastxolehlp test-g-shared-d3d11 test-g-shared-fence test-g-shared-kmt test-g-shared-kmtmutex test-g-shared-kmtsync test-msix2
 
 all: build
 
@@ -3460,3 +3460,720 @@ test-win32u-spi-access:
 
 test-win32u-wgl-sharelists:
 	WINE=$(PREFIX)/bin/wine test/win32u-wgl-sharelists-gate.sh
+
+test-richrc:
+	WINE=$(PREFIX)/bin/wine test/richrc-gate.sh
+
+test-widl-pipe:
+	WINE=$(PREFIX)/bin/wine test/widl-pipe-gate.sh
+
+test-fastactiveds:
+	WINE=$(PREFIX)/bin/wine test/fastactiveds-gate.sh
+
+test-fastaddmon:
+	WINE=$(PREFIX)/bin/wine test/fastaddmon-gate.sh
+
+test-fastado:
+	WINE=$(PREFIX)/bin/wine test/fastado-gate.sh
+
+test-fastado2:
+	WINE=$(PREFIX)/bin/wine test/fastado2-gate.sh
+
+test-fastadsldp:
+	WINE=$(PREFIX)/bin/wine test/fastadsldp-gate.sh
+
+test-fastadvpack:
+	WINE=$(PREFIX)/bin/wine test/fastadvpack-gate.sh
+
+test-fastagile:
+	WINE=$(PREFIX)/bin/wine test/fastagile-gate.sh
+
+test-fastappdata:
+	WINE=$(PREFIX)/bin/wine test/fastappdata-gate.sh
+
+test-fastappmodel:
+	WINE=$(PREFIX)/bin/wine test/fastappmodel-gate.sh
+
+test-fastatl-ax:
+	WINE=$(PREFIX)/bin/wine test/fastatl-ax-gate.sh
+
+test-fastatl-ax2:
+	WINE=$(PREFIX)/bin/wine test/fastatl-ax2-gate.sh
+
+test-fastatl-misc:
+	WINE=$(PREFIX)/bin/wine test/fastatl-misc-gate.sh
+
+test-fastatl30:
+	WINE=$(PREFIX)/bin/wine test/fastatl30-gate.sh
+
+test-fastbrowseui:
+	WINE=$(PREFIX)/bin/wine test/fastbrowseui-gate.sh
+
+test-fastcab:
+	WINE=$(PREFIX)/bin/wine test/fastcab-gate.sh
+
+test-fastcdlg:
+	WINE=$(PREFIX)/bin/wine test/fastcdlg-gate.sh
+
+test-fastcloudasn1:
+	WINE=$(PREFIX)/bin/wine test/fastcloudasn1-gate.sh
+
+test-fastcloudkbd:
+	WINE=$(PREFIX)/bin/wine test/fastcloudkbd-gate.sh
+
+test-fastcloudmapi:
+	WINE=$(PREFIX)/bin/wine test/fastcloudmapi-gate.sh
+
+test-fastcloudnewdev:
+	WINE=$(PREFIX)/bin/wine test/fastcloudnewdev-gate.sh
+
+test-fastcloudpcap:
+	WINE=$(PREFIX)/bin/wine test/fastcloudpcap-gate.sh
+
+test-fastcloudprntvpt:
+	WINE=$(PREFIX)/bin/wine test/fastcloudprntvpt-gate.sh
+
+test-fastcloudqos:
+	WINE=$(PREFIX)/bin/wine test/fastcloudqos-gate.sh
+
+test-fastcloudspool:
+	WINE=$(PREFIX)/bin/wine test/fastcloudspool-gate.sh
+
+test-fastcloudsppc:
+	WINE=$(PREFIX)/bin/wine test/fastcloudsppc-gate.sh
+
+test-fastcloudtbs:
+	WINE=$(PREFIX)/bin/wine test/fastcloudtbs-gate.sh
+
+test-fastcloudurl:
+	WINE=$(PREFIX)/bin/wine test/fastcloudurl-gate.sh
+
+test-fastcloudwsh:
+	WINE=$(PREFIX)/bin/wine test/fastcloudwsh-gate.sh
+
+test-fastclusapi:
+	WINE=$(PREFIX)/bin/wine test/fastclusapi-gate.sh
+
+test-fastcomsvcs:
+	WINE=$(PREFIX)/bin/wine test/fastcomsvcs-gate.sh
+
+test-fastcoremsg:
+	WINE=$(PREFIX)/bin/wine test/fastcoremsg-gate.sh
+
+test-fastdataexchange:
+	WINE=$(PREFIX)/bin/wine test/fastdataexchange-gate.sh
+
+test-fastdbgeng:
+	WINE=$(PREFIX)/bin/wine test/fastdbgeng-gate.sh
+
+test-fastddraw:
+	WINE=$(PREFIX)/bin/wine test/fastddraw-gate.sh
+
+test-fastdevenum:
+	WINE=$(PREFIX)/bin/wine test/fastdevenum-gate.sh
+
+test-fastdhtmled-b2:
+	WINE=$(PREFIX)/bin/wine test/fastdhtmled-b2-gate.sh
+
+test-fastdhtmled:
+	WINE=$(PREFIX)/bin/wine test/fastdhtmled-gate.sh
+
+test-fastdsui:
+	WINE=$(PREFIX)/bin/wine test/fastdsui-gate.sh
+
+test-fastdwjust:
+	WINE=$(PREFIX)/bin/wine test/fastdwjust-gate.sh
+
+test-fastdx8vb:
+	WINE=$(PREFIX)/bin/wine test/fastdx8vb-gate.sh
+
+test-fastdxgirc:
+	WINE=$(PREFIX)/bin/wine test/fastdxgirc-gate.sh
+
+test-fastesent:
+	WINE=$(PREFIX)/bin/wine test/fastesent-gate.sh
+
+test-fastesent2:
+	WINE=$(PREFIX)/bin/wine test/fastesent2-gate.sh
+
+test-fastextrac32:
+	WINE=$(PREFIX)/bin/wine test/fastextrac32-gate.sh
+
+test-fastfileio:
+	WINE=$(PREFIX)/bin/wine test/fastfileio-gate.sh
+
+test-fastfusion:
+	WINE=$(PREFIX)/bin/wine test/fastfusion-gate.sh
+
+test-fastgameux:
+	WINE=$(PREFIX)/bin/wine test/fastgameux-gate.sh
+
+test-fastglobalization:
+	WINE=$(PREFIX)/bin/wine test/fastglobalization-gate.sh
+
+test-fasthhctrl:
+	WINE=$(PREFIX)/bin/wine test/fasthhctrl-gate.sh
+
+test-fasthidtranslate:
+	WINE=$(PREFIX)/bin/wine test/fasthidtranslate-gate.sh
+
+test-fasthnetcfg:
+	WINE=$(PREFIX)/bin/wine test/fasthnetcfg-gate.sh
+
+test-fasthnetcfg2:
+	WINE=$(PREFIX)/bin/wine test/fasthnetcfg2-gate.sh
+
+test-fasthttpapi:
+	WINE=$(PREFIX)/bin/wine test/fasthttpapi-gate.sh
+
+test-fastie-bs:
+	WINE=$(PREFIX)/bin/wine test/fastie-bs-gate.sh
+
+test-fastie:
+	WINE=$(PREFIX)/bin/wine test/fastie-gate.sh
+
+test-fastie-mshtml:
+	WINE=$(PREFIX)/bin/wine test/fastie-mshtml-gate.sh
+
+test-fastie-riched:
+	WINE=$(PREFIX)/bin/wine test/fastie-riched-gate.sh
+
+test-fastie-urlmon:
+	WINE=$(PREFIX)/bin/wine test/fastie-urlmon-gate.sh
+
+test-fastieframe-b1:
+	WINE=$(PREFIX)/bin/wine test/fastieframe-b1-gate.sh
+
+test-fastieframe-events:
+	WINE=$(PREFIX)/bin/wine test/fastieframe-events-gate.sh
+
+test-fastieframe:
+	WINE=$(PREFIX)/bin/wine test/fastieframe-gate.sh
+
+test-fastieframe-host:
+	WINE=$(PREFIX)/bin/wine test/fastieframe-host-gate.sh
+
+test-fastieframe-move:
+	WINE=$(PREFIX)/bin/wine test/fastieframe-move-gate.sh
+
+test-fastieframe-newwin:
+	WINE=$(PREFIX)/bin/wine test/fastieframe-newwin-gate.sh
+
+test-fastieframe-showui:
+	WINE=$(PREFIX)/bin/wine test/fastieframe-showui-gate.sh
+
+test-fastieshortcut:
+	WINE=$(PREFIX)/bin/wine test/fastieshortcut-gate.sh
+
+test-fastimm-ime:
+	WINE=$(PREFIX)/bin/wine test/fastimm-ime-gate.sh
+
+test-fastinetcomm:
+	WINE=$(PREFIX)/bin/wine test/fastinetcomm-gate.sh
+
+test-fastinetedit:
+	WINE=$(PREFIX)/bin/wine test/fastinetedit-gate.sh
+
+test-fastinetintl:
+	WINE=$(PREFIX)/bin/wine test/fastinetintl-gate.sh
+
+test-fastinseng:
+	WINE=$(PREFIX)/bin/wine test/fastinseng-gate.sh
+
+test-fastinspect:
+	WINE=$(PREFIX)/bin/wine test/fastinspect-gate.sh
+
+test-fastiphlp:
+	WINE=$(PREFIX)/bin/wine test/fastiphlp-gate.sh
+
+test-fastiq:
+	WINE=$(PREFIX)/bin/wine test/fastiq-gate.sh
+
+test-fastitss:
+	WINE=$(PREFIX)/bin/wine test/fastitss-gate.sh
+
+test-fastjsb1:
+	WINE=$(PREFIX)/bin/wine test/fastjsb1-gate.sh
+
+test-fastjscall:
+	WINE=$(PREFIX)/bin/wine test/fastjscall-gate.sh
+
+test-fastjserr:
+	WINE=$(PREFIX)/bin/wine test/fastjserr-gate.sh
+
+test-fastjsintl:
+	WINE=$(PREFIX)/bin/wine test/fastjsintl-gate.sh
+
+test-fastjsmisc:
+	WINE=$(PREFIX)/bin/wine test/fastjsmisc-gate.sh
+
+test-fastjsmode:
+	WINE=$(PREFIX)/bin/wine test/fastjsmode-gate.sh
+
+test-fastjsproxy:
+	WINE=$(PREFIX)/bin/wine test/fastjsproxy-gate.sh
+
+test-fastjstyped:
+	WINE=$(PREFIX)/bin/wine test/fastjstyped-gate.sh
+
+test-fastlongtail:
+	WINE=$(PREFIX)/bin/wine test/fastlongtail-gate.sh
+
+test-fastmapi:
+	WINE=$(PREFIX)/bin/wine test/fastmapi-gate.sh
+
+test-fastmapi2:
+	WINE=$(PREFIX)/bin/wine test/fastmapi2-gate.sh
+
+test-fastmlang:
+	WINE=$(PREFIX)/bin/wine test/fastmlang-gate.sh
+
+test-fastmpr:
+	WINE=$(PREFIX)/bin/wine test/fastmpr-gate.sh
+
+test-fastmprapi:
+	WINE=$(PREFIX)/bin/wine test/fastmprapi-gate.sh
+
+test-fastmsctf:
+	WINE=$(PREFIX)/bin/wine test/fastmsctf-gate.sh
+
+test-fastmsctfb1:
+	WINE=$(PREFIX)/bin/wine test/fastmsctfb1-gate.sh
+
+test-fastmsctfb2:
+	WINE=$(PREFIX)/bin/wine test/fastmsctfb2-gate.sh
+
+test-fastmsctfprof:
+	WINE=$(PREFIX)/bin/wine test/fastmsctfprof-gate.sh
+
+test-fastmsdaps:
+	WINE=$(PREFIX)/bin/wine test/fastmsdaps-gate.sh
+
+test-fastmsdapsrow:
+	WINE=$(PREFIX)/bin/wine test/fastmsdapsrow-gate.sh
+
+test-fastmsdasql:
+	WINE=$(PREFIX)/bin/wine test/fastmsdasql-gate.sh
+
+test-fastmshtml:
+	WINE=$(PREFIX)/bin/wine test/fastmshtml-gate.sh
+
+test-fastmshtmladopt:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmladopt-gate.sh
+
+test-fastmshtmlb1:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlb1-gate.sh
+
+test-fastmshtmlb2:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlb2-gate.sh
+
+test-fastmshtmlb3:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlb3-gate.sh
+
+test-fastmshtmlb4:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlb4-gate.sh
+
+test-fastmshtmlb5:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlb5-gate.sh
+
+test-fastmshtmlcssom:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlcssom-gate.sh
+
+test-fastmshtmldm:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmldm-gate.sh
+
+test-fastmshtmldoc7:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmldoc7-gate.sh
+
+test-fastmshtmldom:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmldom-gate.sh
+
+test-fastmshtmldomex:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmldomex-gate.sh
+
+test-fastmshtmlerr:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlerr-gate.sh
+
+test-fastmshtmlevent:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlevent-gate.sh
+
+test-fastmshtmlfile:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlfile-gate.sh
+
+test-fastmshtmlmarkup:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlmarkup-gate.sh
+
+test-fastmshtmlmedia:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlmedia-gate.sh
+
+test-fastmshtmlmisc:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlmisc-gate.sh
+
+test-fastmshtmlmo:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlmo-gate.sh
+
+test-fastmshtmlopen:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlopen-gate.sh
+
+test-fastmshtmlpointer:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlpointer-gate.sh
+
+test-fastmshtmlrangecmd:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlrangecmd-gate.sh
+
+test-fastmshtmlrc:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlrc-gate.sh
+
+test-fastmshtmlsel:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlsel-gate.sh
+
+test-fastmshtmltrav:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmltrav-gate.sh
+
+test-fastmshtmlundo:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlundo-gate.sh
+
+test-fastmshtmlunits:
+	WINE=$(PREFIX)/bin/wine test/fastmshtmlunits-gate.sh
+
+test-fastmsi:
+	WINE=$(PREFIX)/bin/wine test/fastmsi-gate.sh
+
+test-fastmsiaut:
+	WINE=$(PREFIX)/bin/wine test/fastmsiaut-gate.sh
+
+test-fastmsib1:
+	WINE=$(PREFIX)/bin/wine test/fastmsib1-gate.sh
+
+test-fastmsib2:
+	WINE=$(PREFIX)/bin/wine test/fastmsib2-gate.sh
+
+test-fastmsiini:
+	WINE=$(PREFIX)/bin/wine test/fastmsiini-gate.sh
+
+test-fastmsimode:
+	WINE=$(PREFIX)/bin/wine test/fastmsimode-gate.sh
+
+test-fastmsimtf:
+	WINE=$(PREFIX)/bin/wine test/fastmsimtf-gate.sh
+
+test-fastmsipkg:
+	WINE=$(PREFIX)/bin/wine test/fastmsipkg-gate.sh
+
+test-fastmsiprov:
+	WINE=$(PREFIX)/bin/wine test/fastmsiprov-gate.sh
+
+test-fastmsisrc:
+	WINE=$(PREFIX)/bin/wine test/fastmsisrc-gate.sh
+
+test-fastmsiusage:
+	WINE=$(PREFIX)/bin/wine test/fastmsiusage-gate.sh
+
+test-fastmsscript:
+	WINE=$(PREFIX)/bin/wine test/fastmsscript-gate.sh
+
+test-fastmsxml-b1:
+	WINE=$(PREFIX)/bin/wine test/fastmsxml-b1-gate.sh
+
+test-fastmsxml-b2:
+	WINE=$(PREFIX)/bin/wine test/fastmsxml-b2-gate.sh
+
+test-fastmsxml:
+	WINE=$(PREFIX)/bin/wine test/fastmsxml-gate.sh
+
+test-fastmsxml3:
+	WINE=$(PREFIX)/bin/wine test/fastmsxml3-gate.sh
+
+test-fastmsxmlmisc:
+	WINE=$(PREFIX)/bin/wine test/fastmsxmlmisc-gate.sh
+
+test-fastmsxmlsax:
+	WINE=$(PREFIX)/bin/wine test/fastmsxmlsax-gate.sh
+
+test-fastmsxmlwriter:
+	WINE=$(PREFIX)/bin/wine test/fastmsxmlwriter-gate.sh
+
+test-fastmsxmlxslt:
+	WINE=$(PREFIX)/bin/wine test/fastmsxmlxslt-gate.sh
+
+test-fastnet-emit1:
+	WINE=$(PREFIX)/bin/wine test/fastnet-emit1-gate.sh
+
+test-fastnet-host1:
+	WINE=$(PREFIX)/bin/wine test/fastnet-host1-gate.sh
+
+test-fastnet-meta1:
+	WINE=$(PREFIX)/bin/wine test/fastnet-meta1-gate.sh
+
+test-fastnet-sn1:
+	WINE=$(PREFIX)/bin/wine test/fastnet-sn1-gate.sh
+
+test-fastnet-sn2:
+	WINE=$(PREFIX)/bin/wine test/fastnet-sn2-gate.sh
+
+test-fastnetacct:
+	WINE=$(PREFIX)/bin/wine test/fastnetacct-gate.sh
+
+test-fastnetapi:
+	WINE=$(PREFIX)/bin/wine test/fastnetapi-gate.sh
+
+test-fastnetbios:
+	WINE=$(PREFIX)/bin/wine test/fastnetbios-gate.sh
+
+test-fastnetmisc:
+	WINE=$(PREFIX)/bin/wine test/fastnetmisc-gate.sh
+
+test-fastninput:
+	WINE=$(PREFIX)/bin/wine test/fastninput-gate.sh
+
+test-fastodbccp32:
+	WINE=$(PREFIX)/bin/wine test/fastodbccp32-gate.sh
+
+test-fastoldgfx:
+	WINE=$(PREFIX)/bin/wine test/fastoldgfx-gate.sh
+
+test-fastole32rc:
+	WINE=$(PREFIX)/bin/wine test/fastole32rc-gate.sh
+
+test-fastoledb32:
+	WINE=$(PREFIX)/bin/wine test/fastoledb32-gate.sh
+
+test-fastoledlg:
+	WINE=$(PREFIX)/bin/wine test/fastoledlg-gate.sh
+
+test-fastopencl:
+	WINE=$(PREFIX)/bin/wine test/fastopencl-gate.sh
+
+test-fastpackager:
+	WINE=$(PREFIX)/bin/wine test/fastpackager-gate.sh
+
+test-fastpdh:
+	WINE=$(PREFIX)/bin/wine test/fastpdh-gate.sh
+
+test-fastpf:
+	WINE=$(PREFIX)/bin/wine test/fastpf-gate.sh
+
+test-fastprintui:
+	WINE=$(PREFIX)/bin/wine test/fastprintui-gate.sh
+
+test-fastrasapi:
+	WINE=$(PREFIX)/bin/wine test/fastrasapi-gate.sh
+
+test-fastrasbook:
+	WINE=$(PREFIX)/bin/wine test/fastrasbook-gate.sh
+
+test-fastregini:
+	WINE=$(PREFIX)/bin/wine test/fastregini-gate.sh
+
+test-fastrometa2:
+	WINE=$(PREFIX)/bin/wine test/fastrometa2-gate.sh
+
+test-fastrometadata:
+	WINE=$(PREFIX)/bin/wine test/fastrometadata-gate.sh
+
+test-fastrstrtmgr:
+	WINE=$(PREFIX)/bin/wine test/fastrstrtmgr-gate.sh
+
+test-fastscrobj:
+	WINE=$(PREFIX)/bin/wine test/fastscrobj-gate.sh
+
+test-fastsensapi:
+	WINE=$(PREFIX)/bin/wine test/fastsensapi-gate.sh
+
+test-fastservices:
+	WINE=$(PREFIX)/bin/wine test/fastservices-gate.sh
+
+test-fastsetjob:
+	WINE=$(PREFIX)/bin/wine test/fastsetjob-gate.sh
+
+test-fastsetupapi:
+	WINE=$(PREFIX)/bin/wine test/fastsetupapi-gate.sh
+
+test-fastsetupimg:
+	WINE=$(PREFIX)/bin/wine test/fastsetupimg-gate.sh
+
+test-fastshdocvw:
+	WINE=$(PREFIX)/bin/wine test/fastshdocvw-gate.sh
+
+test-fastshdocvw2:
+	WINE=$(PREFIX)/bin/wine test/fastshdocvw2-gate.sh
+
+test-fastshell32rc:
+	WINE=$(PREFIX)/bin/wine test/fastshell32rc-gate.sh
+
+test-fastshlwapi3:
+	WINE=$(PREFIX)/bin/wine test/fastshlwapi3-gate.sh
+
+test-fastshmisc:
+	WINE=$(PREFIX)/bin/wine test/fastshmisc-gate.sh
+
+test-fastsmbios:
+	WINE=$(PREFIX)/bin/wine test/fastsmbios-gate.sh
+
+test-fastsockiosb:
+	WINE=$(PREFIX)/bin/wine test/fastsockiosb-gate.sh
+
+test-fastsubst:
+	WINE=$(PREFIX)/bin/wine test/fastsubst-gate.sh
+
+test-fastsvcenum:
+	WINE=$(PREFIX)/bin/wine test/fastsvcenum-gate.sh
+
+test-fasttapi:
+	WINE=$(PREFIX)/bin/wine test/fasttapi-gate.sh
+
+test-fastthreadpool:
+	WINE=$(PREFIX)/bin/wine test/fastthreadpool-gate.sh
+
+test-fastuiarc:
+	WINE=$(PREFIX)/bin/wine test/fastuiarc-gate.sh
+
+test-fastuiarepeat:
+	WINE=$(PREFIX)/bin/wine test/fastuiarepeat-gate.sh
+
+test-fasturlmon-b1:
+	WINE=$(PREFIX)/bin/wine test/fasturlmon-b1-gate.sh
+
+test-fasturlmon-b2:
+	WINE=$(PREFIX)/bin/wine test/fasturlmon-b2-gate.sh
+
+test-fasturlmon:
+	WINE=$(PREFIX)/bin/wine test/fasturlmon-gate.sh
+
+test-fastvbb1:
+	WINE=$(PREFIX)/bin/wine test/fastvbb1-gate.sh
+
+test-fastvbenum:
+	WINE=$(PREFIX)/bin/wine test/fastvbenum-gate.sh
+
+test-fastvberr:
+	WINE=$(PREFIX)/bin/wine test/fastvberr-gate.sh
+
+test-fastvbfor:
+	WINE=$(PREFIX)/bin/wine test/fastvbfor-gate.sh
+
+test-fastvbparens:
+	WINE=$(PREFIX)/bin/wine test/fastvbparens-gate.sh
+
+test-fastvbs:
+	WINE=$(PREFIX)/bin/wine test/fastvbs-gate.sh
+
+test-fastvidcap:
+	WINE=$(PREFIX)/bin/wine test/fastvidcap-gate.sh
+
+test-fastvssapi:
+	WINE=$(PREFIX)/bin/wine test/fastvssapi-gate.sh
+
+test-fastwbemdisp:
+	WINE=$(PREFIX)/bin/wine test/fastwbemdisp-gate.sh
+
+test-fastwbemsink:
+	WINE=$(PREFIX)/bin/wine test/fastwbemsink-gate.sh
+
+test-fastwebabort:
+	WINE=$(PREFIX)/bin/wine test/fastwebabort-gate.sh
+
+test-fastwebb1:
+	WINE=$(PREFIX)/bin/wine test/fastwebb1-gate.sh
+
+test-fastwebdesc:
+	WINE=$(PREFIX)/bin/wine test/fastwebdesc-gate.sh
+
+test-fastwebhdr:
+	WINE=$(PREFIX)/bin/wine test/fastwebhdr-gate.sh
+
+test-fastwebhttp:
+	WINE=$(PREFIX)/bin/wine test/fastwebhttp-gate.sh
+
+test-fastwebserv:
+	WINE=$(PREFIX)/bin/wine test/fastwebserv-gate.sh
+
+test-fastwebservices:
+	WINE=$(PREFIX)/bin/wine test/fastwebservices-gate.sh
+
+test-fastwebsvc2:
+	WINE=$(PREFIX)/bin/wine test/fastwebsvc2-gate.sh
+
+test-fastwebtypes:
+	WINE=$(PREFIX)/bin/wine test/fastwebtypes-gate.sh
+
+test-fastwinhlp:
+	WINE=$(PREFIX)/bin/wine test/fastwinhlp-gate.sh
+
+test-fastwinhttp:
+	WINE=$(PREFIX)/bin/wine test/fastwinhttp-gate.sh
+
+test-fastwininet-b1:
+	WINE=$(PREFIX)/bin/wine test/fastwininet-b1-gate.sh
+
+test-fastwininet:
+	WINE=$(PREFIX)/bin/wine test/fastwininet-gate.sh
+
+test-fastwininetenum:
+	WINE=$(PREFIX)/bin/wine test/fastwininetenum-gate.sh
+
+test-fastwininetgroup:
+	WINE=$(PREFIX)/bin/wine test/fastwininetgroup-gate.sh
+
+test-fastwininetopt:
+	WINE=$(PREFIX)/bin/wine test/fastwininetopt-gate.sh
+
+test-fastwininetrc:
+	WINE=$(PREFIX)/bin/wine test/fastwininetrc-gate.sh
+
+test-fastwinstorage:
+	WINE=$(PREFIX)/bin/wine test/fastwinstorage-gate.sh
+
+test-fastwintypes:
+	WINE=$(PREFIX)/bin/wine test/fastwintypes-gate.sh
+
+test-fastwinui:
+	WINE=$(PREFIX)/bin/wine test/fastwinui-gate.sh
+
+test-fastwinui-sched:
+	WINE=$(PREFIX)/bin/wine test/fastwinui-sched-gate.sh
+
+test-fastwlanrc:
+	WINE=$(PREFIX)/bin/wine test/fastwlanrc-gate.sh
+
+test-fastwpc:
+	WINE=$(PREFIX)/bin/wine test/fastwpc-gate.sh
+
+test-fastwstorage2:
+	WINE=$(PREFIX)/bin/wine test/fastwstorage2-gate.sh
+
+test-fastwuapi:
+	WINE=$(PREFIX)/bin/wine test/fastwuapi-gate.sh
+
+test-fastwuapi2:
+	WINE=$(PREFIX)/bin/wine test/fastwuapi2-gate.sh
+
+test-fastwuapiset:
+	WINE=$(PREFIX)/bin/wine test/fastwuapiset-gate.sh
+
+test-fastxcfg:
+	WINE=$(PREFIX)/bin/wine test/fastxcfg-gate.sh
+
+test-fastxmllite:
+	WINE=$(PREFIX)/bin/wine test/fastxmllite-gate.sh
+
+test-fastxolehlp:
+	WINE=$(PREFIX)/bin/wine test/fastxolehlp-gate.sh
+
+test-g-shared-d3d11:
+	WINE=$(PREFIX)/bin/wine test/g-shared-d3d11-gate.sh
+
+test-g-shared-fence:
+	WINE=$(PREFIX)/bin/wine test/g-shared-fence-gate.sh
+
+test-g-shared-kmt:
+	WINE=$(PREFIX)/bin/wine test/g-shared-kmt-gate.sh
+
+test-g-shared-kmtmutex:
+	WINE=$(PREFIX)/bin/wine test/g-shared-kmtmutex-gate.sh
+
+test-g-shared-kmtsync:
+	WINE=$(PREFIX)/bin/wine test/g-shared-kmtsync-gate.sh
+
+test-msix2:
+	WINE=$(PREFIX)/bin/wine test/msix2-gate.sh

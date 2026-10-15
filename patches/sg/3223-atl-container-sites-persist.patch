@@ -1,0 +1,788 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 08:15:52 -0700
+Subject: [PATCH] 3223 atl: container sites, MSHTML: and licensed controls,
+ property map persistence
+
+The ActiveX host (AtlAxWin) answers the container interfaces the way the
+documentation describes them: IOleClientSite::SaveObject saves the control
+through IPersistStreamInit (E_FAIL without it), ShowObject restores a minimized
+container, GetMoniker clears *ppmk, IOleContainer::ParseDisplayName hands the
+name to the control's IParseDisplayName (MK_E_NOOBJECT otherwise, E_INVALIDARG
+for NULLs), ContextSensitiveHelp keeps the help mode, IOleInPlaceSite::Scroll
+moves the object rectangle behind the unchanged clipping rectangle and calls
+SetObjectRects (GetWindowContext sees the scroll), IOleInPlaceFrame keeps the
+active object, InsertMenus adds no menu group, SetMenu/RemoveMenus check their
+menu handle, GetExtendedControl clears *ppDisp and gives E_POINTER for NULL.
+
+AtlAxCreateControl* with a name that starts with "MSHTML:" creates the HTML
+document object and loads the text after the prefix into it as a stream (it
+used to create the web browser and ignore the text); a license key makes
+AtlAxCreateControlLic[Ex] create the control through
+IClassFactory2::CreateInstanceLic.
+
+AtlIPersistStreamInit_Load/Save and AtlIPersistPropertyBag_Load/Save walk the
+property map of the object (properties by DISPID through IDispatch, data
+members by offset, property page entries skipped) instead of returning S_OK.
+
+diff --git a/dlls/atl/atl.c b/dlls/atl/atl.c
+index ec4e790..fedcb4c 100644
+--- a/dlls/atl/atl.c
++++ b/dlls/atl/atl.c
+@@ -265,14 +265,234 @@ HRESULT WINAPI AtlInternalQueryInterface(void* this, const _ATL_INTMAP_ENTRY* pE
+     return rc;
+ }
+ 
++/* The persistence helpers of ATL objects walk the property map of the object.  An entry with
++ * a DISPID is read and written through the IDispatch of the object; an entry without one
++ * (PROP_DATA_ENTRY) names a data member of the object at dwOffsetData.  An entry that has no
++ * description (PROP_PAGE) only names a property page and is not persisted, and the map ends
++ * with the first entry that has no property page CLSID pointer (END_PROP_MAP). */
++
++#define ATL_STREAM_SIGNATURE 0x5354534cu  /* "LSTS" */
++#define ATL_STREAM_VERSION   1
++
++static inline BOOL propmap_end(const ATL_PROPMAP_ENTRY *e)
++{
++    return !e->pclsidPropPage;
++}
++
++static inline BOOL propmap_persisted(const ATL_PROPMAP_ENTRY *e)
++{
++#ifdef SG_MUTANT_ATLAX2_PAGE
++    return TRUE;
++#endif
++    return e->szDesc != NULL;
++}
++
++static UINT propmap_type_size(VARTYPE vt)
++{
++    switch (vt)
++    {
++    case VT_I1: case VT_UI1:             return 1;
++    case VT_I2: case VT_UI2: case VT_BOOL: return 2;
++    case VT_I4: case VT_UI4: case VT_INT: case VT_UINT: case VT_R4: case VT_ERROR: return 4;
++    case VT_I8: case VT_UI8: case VT_R8: case VT_CY: case VT_DATE: return 8;
++    case VT_BSTR:                        return sizeof(BSTR);
++    default:                             return 0;
++    }
++}
++
++/* the data member of the object, as a VARIANT */
++static HRESULT propmap_read_member(const ATL_PROPMAP_ENTRY *e, void *pThis, VARIANT *var)
++{
++    UINT size = propmap_type_size(e->vt);
++    BYTE *data = (BYTE *)pThis + e->dwOffsetData;
++
++    VariantInit(var);
++    if (!size) return DISP_E_BADVARTYPE;
++    if (e->dwSizeData < size) return E_INVALIDARG;
++
++    if (e->vt == VT_BSTR)
++    {
++        BSTR str = *(BSTR *)data;
++        if (str && !(V_BSTR(var) = SysAllocStringLen(str, SysStringLen(str)))) return E_OUTOFMEMORY;
++    }
++    else memcpy(&V_I1(var), data, size);
++    V_VT(var) = e->vt;
++    return S_OK;
++}
++
++static HRESULT propmap_write_member(const ATL_PROPMAP_ENTRY *e, void *pThis, VARIANT *src)
++{
++    UINT size = propmap_type_size(e->vt);
++    BYTE *data = (BYTE *)pThis + e->dwOffsetData;
++    VARIANT var;
++    HRESULT hr;
++
++    if (!size) return DISP_E_BADVARTYPE;
++    if (e->dwSizeData < size) return E_INVALIDARG;
++
++    VariantInit(&var);
++    if (FAILED(hr = VariantChangeType(&var, src, 0, e->vt))) return hr;
++    if (e->vt == VT_BSTR)
++    {
++        BSTR str = NULL;
++        if (V_BSTR(&var) && !(str = SysAllocStringLen(V_BSTR(&var), SysStringLen(V_BSTR(&var)))))
++        {
++            VariantClear(&var);
++            return E_OUTOFMEMORY;
++        }
++        SysFreeString(*(BSTR *)data);
++        *(BSTR *)data = str;
++    }
++    else memcpy(data, &V_I1(&var), size);
++    VariantClear(&var);
++    return S_OK;
++}
++
++static HRESULT propmap_get_dispatch(const ATL_PROPMAP_ENTRY *e, IUnknown *pUnk, IDispatch **disp)
++{
++    const IID *iid = e->piidDispatch && !IsEqualIID(e->piidDispatch, &IID_NULL) ? e->piidDispatch : &IID_IDispatch;
++
++    *disp = NULL;
++    if (!pUnk) return E_INVALIDARG;
++    return IUnknown_QueryInterface(pUnk, iid, (void **)disp);
++}
++
++/* get the value of a property of the object, by its DISPID or from the data member */
++static HRESULT propmap_get_value(const ATL_PROPMAP_ENTRY *e, void *pThis, IUnknown *pUnk, VARIANT *var)
++{
++    DISPPARAMS params = {0};
++    IDispatch *disp;
++    HRESULT hr;
++
++#ifdef SG_MUTANT_ATLAX2_DATA
++    if (!e->dispid) return E_NOTIMPL;
++#endif
++    if (!e->dispid) return propmap_read_member(e, pThis, var);
++
++    if (FAILED(hr = propmap_get_dispatch(e, pUnk, &disp))) return hr;
++    VariantInit(var);
++    hr = IDispatch_Invoke(disp, e->dispid, &IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET,
++                          &params, var, NULL, NULL);
++    IDispatch_Release(disp);
++    return hr;
++}
++
++static HRESULT propmap_set_value(const ATL_PROPMAP_ENTRY *e, void *pThis, IUnknown *pUnk, VARIANT *var)
++{
++    DISPID put = DISPID_PROPERTYPUT;
++    DISPPARAMS params = { var, &put, 1, 1 };
++    IDispatch *disp;
++    HRESULT hr;
++
++    if (!e->dispid) return propmap_write_member(e, pThis, var);
++
++    if (FAILED(hr = propmap_get_dispatch(e, pUnk, &disp))) return hr;
++    hr = IDispatch_Invoke(disp, e->dispid, &IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYPUT,
++                          &params, NULL, NULL, NULL);
++    IDispatch_Release(disp);
++    return hr;
++}
++
++static HRESULT stream_write_all(IStream *stm, const void *data, ULONG size)
++{
++    ULONG written = 0;
++    HRESULT hr = IStream_Write(stm, data, size, &written);
++    if (SUCCEEDED(hr) && written != size) hr = STG_E_MEDIUMFULL;
++    return hr;
++}
++
++/* returns S_FALSE when the stream ended before the first byte */
++static HRESULT stream_read_all(IStream *stm, void *data, ULONG size)
++{
++    ULONG read = 0;
++    HRESULT hr = IStream_Read(stm, data, size, &read);
++    if (FAILED(hr)) return hr;
++    if (!read) return S_FALSE;
++    return read == size ? S_OK : STG_E_READFAULT;
++}
++
++/* A value in the stream is its VARTYPE followed by its data; a BSTR is its length in bytes
++ * (-1 for a null string) followed by the UTF-16 characters.  This is the layout of our own
++ * implementation: it is not the layout of the native library, and streams are not exchangeable. */
++static HRESULT stream_write_value(IStream *stm, const VARIANT *var)
++{
++    DWORD vt = V_VT(var), len;
++    UINT size = propmap_type_size(V_VT(var));
++    HRESULT hr;
++
++    if (!size) return DISP_E_BADVARTYPE;
++    if (FAILED(hr = stream_write_all(stm, &vt, sizeof(vt)))) return hr;
++    if (V_VT(var) == VT_BSTR)
++    {
++        len = V_BSTR(var) ? SysStringByteLen(V_BSTR(var)) : ~0u;
++        if (FAILED(hr = stream_write_all(stm, &len, sizeof(len)))) return hr;
++        return len == ~0u ? S_OK : stream_write_all(stm, V_BSTR(var), len);
++    }
++    return stream_write_all(stm, &V_I1(var), size);
++}
++
++static HRESULT stream_read_value(IStream *stm, VARIANT *var)
++{
++    DWORD vt, len;
++    UINT size;
++    HRESULT hr;
++
++    VariantInit(var);
++    if ((hr = stream_read_all(stm, &vt, sizeof(vt))) != S_OK) return hr == S_FALSE ? STG_E_READFAULT : hr;
++    if (!(size = propmap_type_size(vt))) return DISP_E_BADVARTYPE;
++    if (vt == VT_BSTR)
++    {
++        if ((hr = stream_read_all(stm, &len, sizeof(len))) != S_OK) return hr == S_FALSE ? STG_E_READFAULT : hr;
++        V_VT(var) = VT_BSTR;
++        V_BSTR(var) = NULL;
++        if (len == ~0u) return S_OK;
++        if (len > 0x1000000) return STG_E_READFAULT;
++        if (!(V_BSTR(var) = SysAllocStringByteLen(NULL, len))) return E_OUTOFMEMORY;
++        if (len && (hr = stream_read_all(stm, V_BSTR(var), len)) != S_OK)
++        {
++            VariantClear(var);
++            return hr == S_FALSE ? STG_E_READFAULT : hr;
++        }
++        return S_OK;
++    }
++    V_VT(var) = vt;
++    if ((hr = stream_read_all(stm, &V_I1(var), size)) != S_OK)
++    {
++        V_VT(var) = VT_EMPTY;
++        return hr == S_FALSE ? STG_E_READFAULT : hr;
++    }
++    return S_OK;
++}
++
+ /***********************************************************************
+  *           AtlIPersistStreamInit_Load      [atl100.@]
+  */
+ HRESULT WINAPI AtlIPersistStreamInit_Load( LPSTREAM pStm, ATL_PROPMAP_ENTRY *pMap,
+                                            void *pThis, IUnknown *pUnk)
+ {
+-    FIXME("(%p, %p, %p, %p)\n", pStm, pMap, pThis, pUnk);
++    DWORD header[2];
++    HRESULT hr;
++    int i;
+ 
++    TRACE("(%p, %p, %p, %p)\n", pStm, pMap, pThis, pUnk);
++
++    if (!pStm || !pMap) return E_INVALIDARG;
++
++    if ((hr = stream_read_all(pStm, header, sizeof(header))) != S_OK) return hr == S_FALSE ? E_FAIL : hr;
++#ifndef SG_MUTANT_ATLAX2_STREAMSIG
++    if (header[0] != ATL_STREAM_SIGNATURE || header[1] != ATL_STREAM_VERSION) return E_FAIL;
++#endif
++
++    for (i = 0; !propmap_end(&pMap[i]); i++)
++    {
++        VARIANT var;
++
++        if (!propmap_persisted(&pMap[i])) continue;
++        if (FAILED(hr = stream_read_value(pStm, &var))) return hr;
++        hr = propmap_set_value(&pMap[i], pThis, pUnk, &var);
++        VariantClear(&var);
++        if (FAILED(hr)) WARN("property %s not set: %#lx\n", debugstr_w(pMap[i].szDesc), hr);
++    }
+     return S_OK;
+ }
+ 
+@@ -283,8 +503,27 @@ HRESULT WINAPI AtlIPersistStreamInit_Save(LPSTREAM pStm, BOOL fClearDirty,
+                                           ATL_PROPMAP_ENTRY *pMap, void *pThis,
+                                           IUnknown *pUnk)
+ {
+-    FIXME("(%p, %d, %p, %p, %p)\n", pStm, fClearDirty, pMap, pThis, pUnk);
++    DWORD header[2] = { ATL_STREAM_SIGNATURE, ATL_STREAM_VERSION };
++    HRESULT hr;
++    int i;
++
++    TRACE("(%p, %d, %p, %p, %p)\n", pStm, fClearDirty, pMap, pThis, pUnk);
++
++    if (!pStm || !pMap) return E_INVALIDARG;
++
++    if (FAILED(hr = stream_write_all(pStm, header, sizeof(header)))) return hr;
+ 
++    for (i = 0; !propmap_end(&pMap[i]); i++)
++    {
++        VARIANT var;
++
++        if (!propmap_persisted(&pMap[i])) continue;
++        if (FAILED(hr = propmap_get_value(&pMap[i], pThis, pUnk, &var))) return hr;
++        hr = stream_write_value(pStm, &var);
++        VariantClear(&var);
++        if (FAILED(hr)) return hr;
++    }
++    /* the dirty flag is a member of the object, which clears it itself */
+     return S_OK;
+ }
+ 
+@@ -295,8 +534,36 @@ HRESULT WINAPI AtlIPersistPropertyBag_Load(LPPROPERTYBAG pPropBag, LPERRORLOG pE
+                                            ATL_PROPMAP_ENTRY *pMap, void *pThis,
+                                            IUnknown *pUnk)
+ {
+-    FIXME("(%p, %p, %p, %p, %p)\n", pPropBag, pErrorLog, pMap, pThis, pUnk);
++    int i;
+ 
++    TRACE("(%p, %p, %p, %p, %p)\n", pPropBag, pErrorLog, pMap, pThis, pUnk);
++
++    if (!pPropBag || !pMap) return E_INVALIDARG;
++
++    for (i = 0; !propmap_end(&pMap[i]); i++)
++    {
++        const ATL_PROPMAP_ENTRY *e = &pMap[i];
++        VARIANT var;
++        HRESULT hr;
++
++        if (!propmap_persisted(e)) continue;
++
++        VariantInit(&var);
++        V_VT(&var) = e->vt;
++        /* a property that is not in the bag keeps the value of the object */
++        if (FAILED(hr = IPropertyBag_Read(pPropBag, e->szDesc, &var, pErrorLog)))
++        {
++            TRACE("property %s not in the bag: %#lx\n", debugstr_w(e->szDesc), hr);
++            VariantClear(&var);
++#ifdef SG_MUTANT_ATLAX2_BAGMISSING
++            return hr;
++#endif
++            continue;
++        }
++        hr = propmap_set_value(e, pThis, pUnk, &var);
++        VariantClear(&var);
++        if (FAILED(hr)) WARN("property %s not set: %#lx\n", debugstr_w(e->szDesc), hr);
++    }
+     return S_OK;
+ }
+ 
+@@ -307,8 +574,24 @@ HRESULT WINAPI AtlIPersistPropertyBag_Save(LPPROPERTYBAG pPropBag, BOOL fClearDi
+                                            BOOL fSaveAll, ATL_PROPMAP_ENTRY *pMap,
+                                            void *pThis, IUnknown *pUnk)
+ {
+-    FIXME("(%p, %d, %d, %p, %p, %p)\n", pPropBag, fClearDirty, fSaveAll, pMap, pThis, pUnk);
++    int i;
++
++    TRACE("(%p, %d, %d, %p, %p, %p)\n", pPropBag, fClearDirty, fSaveAll, pMap, pThis, pUnk);
+ 
++    if (!pPropBag || !pMap) return E_INVALIDARG;
++
++    /* all the properties are saved, whatever fSaveAll says */
++    for (i = 0; !propmap_end(&pMap[i]); i++)
++    {
++        VARIANT var;
++        HRESULT hr;
++
++        if (!propmap_persisted(&pMap[i])) continue;
++        if (FAILED(hr = propmap_get_value(&pMap[i], pThis, pUnk, &var))) return hr;
++        hr = IPropertyBag_Write(pPropBag, pMap[i].szDesc, &var);
++        VariantClear(&var);
++        if (FAILED(hr)) return hr;
++    }
+     return S_OK;
+ }
+ 
+diff --git a/dlls/atl/atl_ax.c b/dlls/atl/atl_ax.c
+index 0d03ad6..5a15f88 100644
+--- a/dlls/atl/atl_ax.c
++++ b/dlls/atl/atl_ax.c
+@@ -32,6 +32,8 @@
+ #include "objidl.h"
+ #include "ole2.h"
+ #include "exdisp.h"
++#include "mshtml.h"
++#include "ocidl.h"
+ #include "atlbase.h"
+ #include "atliface.h"
+ #include "atlwin.h"
+@@ -55,6 +57,10 @@ typedef struct IOCS {
+     BOOL fActive, fInPlace, fWindowless;
+     BOOL fCapture;
+     LONG lock_count;
++    IOleInPlaceActiveObject *active_object;
++    POINT scroll;
++    BOOL help_mode;
++    IStream *saved;
+ } IOCS;
+ 
+ /**********************************************************************
+@@ -155,6 +161,13 @@ static HRESULT IOCS_Detach( IOCS *This ) /* remove subclassing */
+         RemovePropW( This->hWnd, L"__WINE_ATL_IOCS" );
+         This->hWnd = NULL;
+     }
++    if ( This->active_object )
++    {
++        IOleInPlaceActiveObject *active = This->active_object;
++
++        This->active_object = NULL;
++        IOleInPlaceActiveObject_Release( active );
++    }
+     if ( This->control )
+     {
+         IOleObject *control = This->control;
+@@ -227,6 +240,7 @@ static ULONG WINAPI OleClientSite_Release(IOleClientSite *iface)
+     if (!ref)
+     {
+         IOCS_Detach( This );
++        if (This->saved) IStream_Release( This->saved );
+         free( This );
+     }
+ 
+@@ -236,15 +250,46 @@ static ULONG WINAPI OleClientSite_Release(IOleClientSite *iface)
+ static HRESULT WINAPI OleClientSite_SaveObject(IOleClientSite *iface)
+ {
+     IOCS *This = impl_from_IOleClientSite(iface);
+-    FIXME( "(%p) - stub\n", This );
+-    return E_NOTIMPL;
++    IPersistStreamInit *persist;
++    IStream *stream;
++    HRESULT hr;
++
++    TRACE( "(%p)\n", This );
++
++    /* the container keeps the persistent state of its object in memory */
++    if (!This->control) return E_FAIL;
++    if (FAILED(IOleObject_QueryInterface( This->control, &IID_IPersistStreamInit, (void **)&persist ))) return E_FAIL;
++    if (FAILED(hr = CreateStreamOnHGlobal( NULL, TRUE, &stream )))
++    {
++        IPersistStreamInit_Release( persist );
++        return hr;
++    }
++#ifdef SG_MUTANT_ATLAX2_SAVE
++    hr = S_OK;
++#else
++    hr = IPersistStreamInit_Save( persist, stream, TRUE );
++#endif
++    IPersistStreamInit_Release( persist );
++    if (FAILED(hr))
++    {
++        IStream_Release( stream );
++        return E_FAIL;
++    }
++    if (This->saved) IStream_Release( This->saved );
++    This->saved = stream;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI OleClientSite_GetMoniker(IOleClientSite *iface, DWORD dwAssign, DWORD dwWhichMoniker, IMoniker **ppmk)
+ {
+     IOCS *This = impl_from_IOleClientSite(iface);
+ 
+-    FIXME( "(%p, 0x%lx, 0x%lx, %p)\n", This, dwAssign, dwWhichMoniker, ppmk );
++    TRACE( "(%p, 0x%lx, 0x%lx, %p)\n", This, dwAssign, dwWhichMoniker, ppmk );
++
++    /* the container does not assign monikers to its object */
++#ifndef SG_MUTANT_ATLAX2_MONIKER
++    if (ppmk) *ppmk = NULL;
++#endif
+     return E_NOTIMPL;
+ }
+ 
+@@ -258,7 +303,15 @@ static HRESULT WINAPI OleClientSite_GetContainer(IOleClientSite *iface, IOleCont
+ static HRESULT WINAPI OleClientSite_ShowObject(IOleClientSite *iface)
+ {
+     IOCS *This = impl_from_IOleClientSite(iface);
+-    FIXME( "(%p) - stub\n", This );
++    HWND root;
++
++    TRACE( "(%p)\n", This );
++
++    /* the container must be visible and not minimized */
++#ifndef SG_MUTANT_ATLAX2_SHOW
++    if (This->hWnd && (root = GetAncestor( This->hWnd, GA_ROOT )) && IsIconic( root ))
++        ShowWindow( root, SW_RESTORE );
++#endif
+     return S_OK;
+ }
+ 
+@@ -272,8 +325,8 @@ static HRESULT WINAPI OleClientSite_OnShowWindow(IOleClientSite *iface, BOOL fSh
+ static HRESULT WINAPI OleClientSite_RequestNewObjectLayout(IOleClientSite *iface)
+ {
+     IOCS *This = impl_from_IOleClientSite(iface);
+-    FIXME( "(%p) - stub\n", This );
+-    return E_NOTIMPL;
++    TRACE( "(%p)\n", This );
++    return E_NOTIMPL;       /* the size of the host window is the container's, not the object's */
+ }
+ 
+ 
+@@ -420,8 +473,27 @@ static HRESULT WINAPI OleContainer_ParseDisplayName(IOleContainer* iface, IBindC
+         LPOLESTR pszDisplayName, ULONG* pchEaten, IMoniker** ppmkOut)
+ {
+     IOCS *This = impl_from_IOleContainer(iface);
+-    FIXME( "(%p,%p,%s,%p,%p) - stub\n", This, pbc, debugstr_w(pszDisplayName), pchEaten, ppmkOut );
+-    return E_NOTIMPL;
++    IParseDisplayName *parser;
++    HRESULT hr = MK_E_NOOBJECT;
++
++    TRACE( "(%p,%p,%s,%p,%p)\n", This, pbc, debugstr_w(pszDisplayName), pchEaten, ppmkOut );
++
++    if (!ppmkOut) return E_INVALIDARG;
++    *ppmkOut = NULL;
++    if (!pszDisplayName || !pchEaten) return E_INVALIDARG;
++    *pchEaten = 0;
++
++    /* the only object of the container is the control: names in its namespace are its own */
++#ifdef SG_MUTANT_ATLAX2_PARSE
++    if (0)
++#else
++    if (This->control && SUCCEEDED(IOleObject_QueryInterface( This->control, &IID_IParseDisplayName, (void **)&parser )))
++#endif
++    {
++        hr = IParseDisplayName_ParseDisplayName( parser, pbc, pszDisplayName, pchEaten, ppmkOut );
++        IParseDisplayName_Release( parser );
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI OleContainer_EnumObjects(IOleContainer* iface, DWORD grfFlags, IEnumUnknown** ppenum)
+@@ -486,8 +558,9 @@ static HRESULT WINAPI OleInPlaceSiteWindowless_GetWindow(IOleInPlaceSiteWindowle
+ static HRESULT WINAPI OleInPlaceSiteWindowless_ContextSensitiveHelp(IOleInPlaceSiteWindowless* iface, BOOL fEnterMode)
+ {
+     IOCS *This = impl_from_IOleInPlaceSiteWindowless(iface);
+-    FIXME("(%p,%d) - stub\n", This, fEnterMode);
+-    return E_NOTIMPL;
++    TRACE("(%p,%d)\n", This, fEnterMode);
++    This->help_mode = !!fEnterMode;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI OleInPlaceSiteWindowless_CanInPlaceActivate(IOleInPlaceSiteWindowless *iface)
+@@ -526,7 +599,10 @@ static HRESULT WINAPI OleInPlaceSiteWindowless_GetWindowContext(IOleInPlaceSiteW
+     if ( lprcClipRect )
+         *lprcClipRect = This->size;
+     if ( lprcPosRect )
++    {
+         *lprcPosRect = This->size;
++        OffsetRect( lprcPosRect, -This->scroll.x, -This->scroll.y );
++    }
+ 
+     if ( frame )
+     {
+@@ -551,8 +627,31 @@ static HRESULT WINAPI OleInPlaceSiteWindowless_GetWindowContext(IOleInPlaceSiteW
+ static HRESULT WINAPI OleInPlaceSiteWindowless_Scroll(IOleInPlaceSiteWindowless *iface, SIZE scrollExtent)
+ {
+     IOCS *This = impl_from_IOleInPlaceSiteWindowless(iface);
+-    FIXME("(%p) - stub\n", This);
+-    return E_NOTIMPL;
++    RECT pos;
++
++    TRACE("(%p,%ldx%ld)\n", This, scrollExtent.cx, scrollExtent.cy);
++
++    /* the object moves the other way, behind the same clipping rectangle */
++#ifdef SG_MUTANT_ATLAX2_SCROLL
++    This->scroll.x -= scrollExtent.cx;
++    This->scroll.y -= scrollExtent.cy;
++#else
++    This->scroll.x += scrollExtent.cx;
++    This->scroll.y += scrollExtent.cy;
++#endif
++    if (This->control && This->fInPlace)
++    {
++        IOleInPlaceObject *object;
++
++        pos = This->size;
++        OffsetRect( &pos, -This->scroll.x, -This->scroll.y );
++        if (SUCCEEDED(IOleObject_QueryInterface( This->control, &IID_IOleInPlaceObject, (void **)&object )))
++        {
++            IOleInPlaceObject_SetObjectRects( object, &pos, &This->size );
++            IOleInPlaceObject_Release( object );
++        }
++    }
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI OleInPlaceSiteWindowless_OnUIDeactivate(IOleInPlaceSiteWindowless *iface, BOOL fUndoable)
+@@ -766,6 +865,7 @@ static HRESULT WINAPI OleInPlaceFrame_ContextSensitiveHelp(IOleInPlaceFrame *ifa
+ {
+     IOCS *This = impl_from_IOleInPlaceFrame(iface);
+     TRACE( "(%p,%d)\n", This, fEnterMode );
++    This->help_mode = !!fEnterMode;
+     return S_OK;
+ }
+ 
+@@ -794,7 +894,14 @@ static HRESULT WINAPI OleInPlaceFrame_SetActiveObject(IOleInPlaceFrame *iface, I
+ {
+     IOCS *This = impl_from_IOleInPlaceFrame(iface);
+ 
+-    FIXME( "(%p,%p,%s) - stub\n", This, pActiveObject, debugstr_w(pszObjName) );
++    TRACE( "(%p,%p,%s)\n", This, pActiveObject, debugstr_w(pszObjName) );
++
++    /* the name is for the title bar, which always shows the name of the container */
++#ifndef SG_MUTANT_ATLAX2_ACTIVE
++    if (pActiveObject) IOleInPlaceActiveObject_AddRef( pActiveObject );
++#endif
++    if (This->active_object) IOleInPlaceActiveObject_Release( This->active_object );
++    This->active_object = pActiveObject;
+     return S_OK;
+ }
+ 
+@@ -802,24 +909,38 @@ static HRESULT WINAPI OleInPlaceFrame_InsertMenus(IOleInPlaceFrame *iface, HMENU
+ {
+     IOCS *This = impl_from_IOleInPlaceFrame(iface);
+ 
+-    FIXME( "(%p,%p,%p) - stub\n", This, hmenuShared, lpMenuWidths );
+-    return E_NOTIMPL;
++    TRACE( "(%p,%p,%p)\n", This, hmenuShared, lpMenuWidths );
++
++    if (!hmenuShared || !IsMenu( hmenuShared ) || !lpMenuWidths) return E_INVALIDARG;
++    /* the container has no menus to add to the composite menu */
++#ifndef SG_MUTANT_ATLAX2_MENUS
++    lpMenuWidths->width[0] = lpMenuWidths->width[2] = lpMenuWidths->width[4] = 0;
++#endif
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI OleInPlaceFrame_SetMenu(IOleInPlaceFrame *iface, HMENU hmenuShared, HOLEMENU holemenu, HWND hwndActiveObject)
+ {
+     IOCS *This = impl_from_IOleInPlaceFrame(iface);
+ 
+-    FIXME( "(%p,%p,%p,%p) - stub\n", This, hmenuShared, holemenu, hwndActiveObject );
+-    return E_NOTIMPL;
++    TRACE( "(%p,%p,%p,%p)\n", This, hmenuShared, holemenu, hwndActiveObject );
++
++    /* NULL takes the shared menu away; the host window has no menu bar to install it on */
++#ifndef SG_MUTANT_ATLAX2_SETMENU
++    if (hmenuShared && !IsMenu( hmenuShared )) return E_INVALIDARG;
++#endif
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI OleInPlaceFrame_RemoveMenus(IOleInPlaceFrame *iface, HMENU hmenuShared)
+ {
+     IOCS *This = impl_from_IOleInPlaceFrame(iface);
+ 
+-    FIXME( "(%p, %p) - stub\n", This, hmenuShared );
+-    return E_NOTIMPL;
++    TRACE( "(%p, %p)\n", This, hmenuShared );
++
++    if (!hmenuShared || !IsMenu( hmenuShared )) return E_INVALIDARG;
++    /* the container added nothing to the composite menu */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI OleInPlaceFrame_SetStatusText(IOleInPlaceFrame *iface, LPCOLESTR pszStatusText)
+@@ -880,8 +1001,14 @@ static HRESULT WINAPI OleControlSite_LockInPlaceActive( IOleControlSite* This, B
+ }
+ static HRESULT WINAPI OleControlSite_GetExtendedControl( IOleControlSite* This, IDispatch** ppDisp)
+ {
+-    FIXME( "\n" );
++    TRACE( "(%p,%p)\n", This, ppDisp );
++
++#ifdef SG_MUTANT_ATLAX2_EXTCTL
+     return E_NOTIMPL;
++#endif
++    if (!ppDisp) return E_POINTER;
++    *ppDisp = NULL;
++    return E_NOTIMPL;       /* the host does not wrap its control in an extended control */
+ }
+ static HRESULT WINAPI OleControlSite_TransformCoords( IOleControlSite* iface, POINTL* pPtlHimetric, POINTF* pPtfContainer, DWORD dwFlags)
+ {
+@@ -926,8 +1053,8 @@ static HRESULT WINAPI OleControlSite_OnFocus( IOleControlSite* This, BOOL fGotFo
+ }
+ static HRESULT WINAPI OleControlSite_ShowPropertyFrame( IOleControlSite* This)
+ {
+-    FIXME( "\n" );
+-    return E_NOTIMPL;
++    TRACE( "(%p)\n", This );
++    return E_NOTIMPL;       /* the control shows its own property pages */
+ }
+ 
+ 
+@@ -1034,7 +1161,10 @@ static void IOCS_OnSize( IOCS* This, LPCRECT rect )
+ 
+         if ( SUCCEEDED( IOleObject_QueryInterface( This->control, &IID_IOleInPlaceObject, (void**)&wl ) ) )
+         {
+-            IOleInPlaceObject_SetObjectRects( wl, rect, rect );
++            RECT pos = *rect;
++
++            OffsetRect( &pos, -This->scroll.x, -This->scroll.y );
++            IOleInPlaceObject_SetObjectRects( wl, &pos, rect );
+             IOleInPlaceObject_Release( wl );
+         }
+     }
+@@ -1204,6 +1334,13 @@ static enum content get_content_type(LPCOLESTR name, CLSID *control_id)
+         CLSIDFromProgID(name, control_id) == S_OK)
+         return IsGUID;
+ 
++    if (!wcsnicmp(name, L"mshtml:", 7))
++    {
++        /* the text after the prefix is an HTML stream for the HTML document object */
++        *control_id = CLSID_HTMLDocument;
++        return IsHTML;
++    }
++
+     if (PathIsURLW (name) ||
+         UrlApplySchemeW(name, new_urlW, &size, URL_APPLY_GUESSSCHEME|URL_APPLY_GUESSFILE) == S_OK)
+     {
+@@ -1211,14 +1348,28 @@ static enum content get_content_type(LPCOLESTR name, CLSID *control_id)
+         return IsURL;
+     }
+ 
+-    if (!wcsnicmp(name, L"mshtml:", 7))
++    return IsUnknown;
++}
++
++/* the HTML text of a name that starts with "MSHTML:", as the stream the HTML document loads from */
++static IStream *create_html_stream(const WCHAR *text)
++{
++    int len = WideCharToMultiByte( CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL );
++    IStream *stream;
++    HGLOBAL mem;
++    char *data;
++
++    if (len <= 1) return NULL;
++    if (!(mem = GlobalAlloc( GMEM_MOVEABLE, len - 1 ))) return NULL;
++    data = GlobalLock( mem );
++    WideCharToMultiByte( CP_UTF8, 0, text, -1, data, len, NULL, NULL );
++    GlobalUnlock( mem );
++    if (FAILED(CreateStreamOnHGlobal( mem, TRUE, &stream )))
+     {
+-        FIXME("mshtml prefix not implemented\n");
+-        *control_id = CLSID_WebBrowser;
+-        return IsHTML;
++        GlobalFree( mem );
++        return NULL;
+     }
+-
+-    return IsUnknown;
++    return stream;
+ }
+ 
+ /***********************************************************************
+@@ -1243,9 +1394,6 @@ HRESULT WINAPI AtlAxCreateControlLicEx(LPCOLESTR lpszName, HWND hWnd,
+     TRACE("(%s %p %p %p %p %p %p %s)\n", debugstr_w(lpszName), hWnd, pStream,
+             ppUnkContainer, ppUnkControl, iidSink, punkSink, debugstr_w(lic));
+ 
+-    if (lic)
+-        FIXME("semi stub\n");
+-
+     if (ppUnkContainer) *ppUnkContainer = NULL;
+     if (ppUnkControl) *ppUnkControl = NULL;
+ 
+@@ -1257,8 +1405,25 @@ HRESULT WINAPI AtlAxCreateControlLicEx(LPCOLESTR lpszName, HWND hWnd,
+     if (content == IsUnknown)
+         return CO_E_CLASSSTRING;
+ 
+-    hRes = CoCreateInstance( &controlId, 0, CLSCTX_ALL, &IID_IOleObject,
+-            (void**) &pControl );
++    hRes = E_NOINTERFACE;
++#ifdef SG_MUTANT_ATLAX2_LIC
++    if (0)
++#else
++    if (lic)
++#endif
++    {
++        /* a licensed control is created by the class factory with the license key */
++        IClassFactory2 *factory2;
++
++        if (SUCCEEDED(hRes = CoGetClassObject( &controlId, CLSCTX_ALL, NULL, &IID_IClassFactory2, (void **)&factory2 )))
++        {
++            hRes = IClassFactory2_CreateInstanceLic( factory2, NULL, NULL, &IID_IOleObject, lic, (void **)&pControl );
++            IClassFactory2_Release( factory2 );
++        }
++    }
++    /* without a license key, or for a class that has no licensing, the control is created as usual */
++    if (!lic || hRes == E_NOINTERFACE || hRes == REGDB_E_CLASSNOTREG)
++        hRes = CoCreateInstance( &controlId, 0, CLSCTX_ALL, &IID_IOleObject, (void**) &pControl );
+     if ( FAILED( hRes ) )
+     {
+         WARN( "cannot create ActiveX control %s instance - error 0x%08lx\n",
+@@ -1269,10 +1434,20 @@ HRESULT WINAPI AtlAxCreateControlLicEx(LPCOLESTR lpszName, HWND hWnd,
+     hRes = IOleObject_QueryInterface( pControl, &IID_IPersistStreamInit, (void**) &pPSInit );
+     if ( SUCCEEDED( hRes ) )
+     {
+-        if (!pStream)
++        IStream *html = NULL;
++
++#ifdef SG_MUTANT_ATLAX2_HTML
++        if (content == IsHTML) html = create_html_stream( lpszName + 6 );
++#else
++        if (content == IsHTML) html = create_html_stream( lpszName + 7 );
++#endif
++        if (html)
++            IPersistStreamInit_Load( pPSInit, html );
++        else if (!pStream)
+             IPersistStreamInit_InitNew( pPSInit );
+         else
+             IPersistStreamInit_Load( pPSInit, pStream );
++        if (html) IStream_Release( html );
+         IPersistStreamInit_Release( pPSInit );
+     } else
+         WARN("cannot get IID_IPersistStreamInit out of control\n");
