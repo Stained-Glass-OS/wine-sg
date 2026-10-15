@@ -537,6 +537,30 @@ static int client(HWND hwnd)
             SysFreeString(nm);
             IUIAutomationElement3_Release(el3);
         }
+        /* a child without IRawElementProviderSimple2 passes the call on to its parent */
+        if (uia && el)
+        {
+            IUIAutomationTreeWalker *walker = NULL;
+            IUIAutomationElement *child = NULL;
+            IUIAutomationElement3 *child3 = NULL;
+
+            IUIAutomation_get_RawViewWalker(uia, &walker);
+            if (walker) IUIAutomationTreeWalker_GetFirstChildElement(walker, el, &child);
+            check(child != NULL, "the window has a child element");
+            if (child) IUIAutomationElement_QueryInterface(child, &IID_IUIAutomationElement3, (void **)&child3);
+            if (child3)
+            {
+                hr = child3->lpVtbl->ShowContextMenu(child3);
+                check(hr == S_OK, "ShowContextMenu on the child succeeds through its parent");
+                nm = NULL;
+                IUIAutomationElement_get_CurrentName(el, &nm);
+                check(nm && !lstrcmpW(nm, L"Menu 2"), "the parent's ShowContextMenu ran for the child");
+                SysFreeString(nm);
+                IUIAutomationElement3_Release(child3);
+            }
+            if (child) IUIAutomationElement_Release(child);
+            if (walker) IUIAutomationTreeWalker_Release(walker);
+        }
         if (el) IUIAutomationElement_Release(el);
         if (uia) IUIAutomation_Release(uia);
     }
