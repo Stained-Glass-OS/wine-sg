@@ -1,0 +1,593 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 12:00:00 +0000
+Subject: [PATCH] netio.sys: datagram sockets (patch 5100)
+
+WskSendTo, WskReceiveFrom, WskSendMessages and the datagram dispatch table;
+finishes gap-CORE item 1067. Gate with four mutants.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+---
+
+diff --git a/dlls/netio.sys/netio.c b/dlls/netio.sys/netio.c
+--- a/dlls/netio.sys/netio.c
++++ b/dlls/netio.sys/netio.c
+@@ -33,6 +33,9 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(netio);
+ 
++int WINAPI WSASendMsg(SOCKET s, LPWSAMSG msg, DWORD flags, LPDWORD sent, LPWSAOVERLAPPED overlapped,
++        LPWSAOVERLAPPED_COMPLETION_ROUTINE completion);
++
+ struct _WSK_CLIENT
+ {
+     WSK_REGISTRATION *registration;
+@@ -1208,6 +1211,377 @@
+     wsk_receive_ex,
+ };
+ 
++struct recv_from_state
++{
++    WSAMSG msg;
++    SOCKADDR_STORAGE name;
++    SOCKADDR *remote_address;
++    ULONG *control_length;
++    ULONG *control_flags;
++    WSABUF bufs[1];
++};
++
++static LPFN_WSARECVMSG pWSARecvMsg;
++
++static BOOL WINAPI init_recvmsg_function(INIT_ONCE *once, void *param, void **context)
++{
++    GUID recvmsg_guid = WSAID_WSARECVMSG;
++    SOCKET s = (SOCKET)param;
++    DWORD size;
++
++    if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &recvmsg_guid, sizeof(recvmsg_guid),
++            &pWSARecvMsg, sizeof(pWSARecvMsg), &size, NULL, NULL))
++    {
++        ERR("Could not get WSARecvMsg address, error %u.\n", WSAGetLastError());
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/* The datagram arrived (or not): hand the sender, the control data and its flags back. */
++static void receive_from_finish(struct wsk_pending_io *io, DWORD length, int error)
++{
++    struct recv_from_state *state = io->tmp;
++    NTSTATUS status = STATUS_SUCCESS;
++
++    /* the byte count of the completed request is in the overlapped structure, also when the
++     * call completed at once or ended with the message-too-long error */
++    length = io->ovr.InternalHigh;
++
++    if (error == WSAEMSGSIZE)
++    {
++        /* the datagram was larger than the buffer: it is cut short, MSG_TRUNC says so */
++#ifndef SG_MUTANT_NETIO_DGTRUNC
++        state->msg.dwFlags |= MSG_TRUNC;
++#endif
++        error = 0;
++    }
++    if (error)
++    {
++        dispatch_pending_io(io, sock_error_to_ntstatus(error), 0);
++        return;
++    }
++
++#ifndef SG_MUTANT_NETIO_DGFROM
++    if (state->remote_address)
++        memcpy(state->remote_address, &state->name,
++                min((size_t)state->msg.namelen, (size_t)sockaddr_length((SOCKADDR *)&state->name)));
++#endif
++#ifndef SG_MUTANT_NETIO_DGCTRL
++    if (state->control_length)
++        *state->control_length = state->msg.Control.len;
++#endif
++    if (state->control_flags)
++        *state->control_flags = state->msg.dwFlags & (MSG_BCAST | MSG_MCAST | MSG_TRUNC | MSG_CTRUNC);
++    dispatch_pending_io(io, status, length);
++}
++
++static void WINAPI receive_from_callback(TP_CALLBACK_INSTANCE *instance, void *socket_, TP_WAIT *wait,
++        TP_WAIT_RESULT wait_result)
++{
++    struct wsk_socket_internal *socket = socket_;
++    struct wsk_pending_io *io;
++    DWORD length, flags;
++
++    TRACE("instance %p, socket %p, wait %p, wait_result %#lx.\n", instance, socket, wait, wait_result);
++
++    lock_socket(socket);
++    io = find_pending_io(socket, wait);
++
++    if (WSAGetOverlappedResult(socket->s, &io->ovr, &length, FALSE, &flags))
++        receive_from_finish(io, length, 0);
++    else
++        receive_from_finish(io, length, WSAGetLastError());
++
++    unlock_socket(socket);
++}
++
++static NTSTATUS WINAPI wsk_receive_from(WSK_SOCKET *socket, WSK_BUF *buffer, ULONG flags,
++        SOCKADDR *remote_address, ULONG *control_length, CMSGHDR *control_info, ULONG *control_flags, IRP *irp)
++{
++    struct wsk_socket_internal *s = wsk_socket_internal_from_wsk_socket(socket);
++    static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
++    struct recv_from_state *state;
++    struct wsk_pending_io *io;
++    WSABUF *bufs;
++    DWORD length = 0;
++    int count, error;
++
++    TRACE("socket %p, buffer %p, flags %#lx, remote_address %p, control_length %p, control_info %p, "
++            "control_flags %p, irp %p.\n", socket, buffer, flags, remote_address, control_length,
++            control_info, control_flags, irp);
++
++    if (!irp)
++        return STATUS_INVALID_PARAMETER;
++
++    irp->IoStatus.Information = 0;
++
++    if (flags || !buffer || (control_length && *control_length && !control_info))
++    {
++        dispatch_irp(irp, STATUS_INVALID_PARAMETER);
++        return STATUS_PENDING;
++    }
++
++    if (!InitOnceExecuteOnce(&init_once, init_recvmsg_function, (void *)s->s, NULL))
++    {
++        dispatch_irp(irp, STATUS_UNSUCCESSFUL);
++        return STATUS_PENDING;
++    }
++
++    if ((count = wsk_buf_to_wsabufs(buffer, &bufs)) < 0)
++    {
++        dispatch_irp(irp, STATUS_INVALID_PARAMETER);
++        return STATUS_PENDING;
++    }
++
++    lock_socket(s);
++    if (!(state = calloc(1, offsetof(struct recv_from_state, bufs[count ? count : 1])))
++            || !(io = allocate_pending_io(s, receive_from_callback, irp)))
++    {
++        free(state);
++        free(bufs);
++        dispatch_irp(irp, STATUS_INSUFFICIENT_RESOURCES);
++        unlock_socket(s);
++        return STATUS_PENDING;
++    }
++
++    memcpy(state->bufs, bufs, count * sizeof(*bufs));
++    free(bufs);
++    state->remote_address = remote_address;
++    state->control_length = control_length;
++    state->control_flags = control_flags;
++    state->msg.name = (SOCKADDR *)&state->name;
++    state->msg.namelen = sizeof(state->name);
++    state->msg.lpBuffers = state->bufs;
++    state->msg.dwBufferCount = count;
++    if (control_length && control_info)
++    {
++        state->msg.Control.len = *control_length;
++        state->msg.Control.buf = (char *)control_info;
++    }
++    io->tmp = state;
++
++    if (!pWSARecvMsg(s->s, &state->msg, &length, &io->ovr, NULL))
++        receive_from_finish(io, length, 0);
++    else if ((error = WSAGetLastError()) == WSA_IO_PENDING)
++        SetThreadpoolWait(io->tp_wait, io->ovr.hEvent, NULL);
++    else
++        receive_from_finish(io, length, error);
++
++    unlock_socket(s);
++
++    return STATUS_PENDING;
++}
++
++struct send_to_state
++{
++    WSAMSG msg;
++    WSABUF bufs[1];
++};
++
++static NTSTATUS WINAPI wsk_send_to(WSK_SOCKET *socket, WSK_BUF *buffer, ULONG flags, SOCKADDR *remote_address,
++        ULONG control_info_length, CMSGHDR *control_info, IRP *irp)
++{
++    struct wsk_socket_internal *s = wsk_socket_internal_from_wsk_socket(socket);
++    struct send_to_state *state;
++    struct wsk_pending_io *io;
++    WSAMSG *msg;
++    WSABUF *bufs;
++    DWORD length = 0;
++    int count, error;
++
++    TRACE("socket %p, buffer %p, flags %#lx, remote_address %p, control_info_length %lu, control_info %p, "
++            "irp %p.\n", socket, buffer, flags, remote_address, control_info_length, control_info, irp);
++
++    if (!irp)
++        return STATUS_INVALID_PARAMETER;
++
++    irp->IoStatus.Information = 0;
++
++    if (flags || !buffer || (control_info_length && !control_info))
++    {
++        dispatch_irp(irp, STATUS_INVALID_PARAMETER);
++        return STATUS_PENDING;
++    }
++
++    if ((count = wsk_buf_to_wsabufs(buffer, &bufs)) < 0)
++    {
++        dispatch_irp(irp, STATUS_INVALID_PARAMETER);
++        return STATUS_PENDING;
++    }
++
++    lock_socket(s);
++    if (!(state = calloc(1, offsetof(struct send_to_state, bufs[count ? count : 1])))
++            || !(io = allocate_pending_io(s, send_receive_callback, irp)))
++    {
++        free(state);
++        free(bufs);
++        dispatch_irp(irp, STATUS_INSUFFICIENT_RESOURCES);
++        unlock_socket(s);
++        return STATUS_PENDING;
++    }
++
++    /* the message and its buffer array stay with the request until it completes */
++    memcpy(state->bufs, bufs, count * sizeof(*bufs));
++    free(bufs);
++    msg = &state->msg;
++    msg->lpBuffers = state->bufs;
++    msg->dwBufferCount = count;
++    if (remote_address)
++    {
++        msg->name = remote_address;
++        msg->namelen = sockaddr_length(remote_address);
++    }
++    if (control_info_length)
++    {
++        msg->Control.len = control_info_length;
++        msg->Control.buf = (char *)control_info;
++    }
++    io->tmp = state;
++
++    if (!WSASendMsg(s->s, msg, 0, &length, &io->ovr, NULL))
++        dispatch_pending_io(io, STATUS_SUCCESS, length);
++    else if ((error = WSAGetLastError()) == WSA_IO_PENDING)
++        SetThreadpoolWait(io->tp_wait, io->ovr.hEvent, NULL);
++    else
++        dispatch_pending_io(io, sock_error_to_ntstatus(error), 0);
++
++    unlock_socket(s);
++
++    return STATUS_PENDING;
++}
++
++/* A datagram socket never gets datagram indication lists from this subsystem (WskReceiveFromEvent
++ * is not driven), so a list handed back here was not ours. */
++static NTSTATUS WINAPI wsk_release_datagram(WSK_SOCKET *socket, WSK_DATAGRAM_INDICATION *datagram_indication)
++{
++    WARN("socket %p, datagram_indication %p: no indications are given out.\n", socket, datagram_indication);
++
++    return STATUS_INVALID_PARAMETER;
++}
++
++struct wsk_send_messages_context
++{
++    struct wsk_socket_internal *socket;
++    WSK_BUF_LIST *buffer_list;
++    SOCKADDR_STORAGE remote_address;
++    BOOL has_remote;
++    ULONG control_info_length;
++    CMSGHDR *control_info;
++    IRP *irp;
++};
++
++static void WINAPI send_messages_callback(TP_CALLBACK_INSTANCE *instance, void *context_)
++{
++    struct wsk_send_messages_context *context = context_;
++    NTSTATUS status = STATUS_SUCCESS;
++    ULONG_PTR total = 0;
++    WSK_BUF_LIST *entry;
++
++    TRACE("instance %p, context %p.\n", instance, context);
++
++    /* every entry of the list is one datagram */
++    for (entry = context->buffer_list; entry; entry = entry->Next)
++    {
++        WSAMSG msg = {0};
++        WSABUF *bufs;
++        DWORD sent;
++        int count;
++
++        if ((count = wsk_buf_to_wsabufs(&entry->Buffer, &bufs)) < 0)
++        {
++            status = STATUS_INVALID_PARAMETER;
++            break;
++        }
++        msg.lpBuffers = bufs;
++        msg.dwBufferCount = count;
++        if (context->has_remote)
++        {
++            msg.name = (SOCKADDR *)&context->remote_address;
++            msg.namelen = sockaddr_length((SOCKADDR *)&context->remote_address);
++        }
++        if (context->control_info_length)
++        {
++            msg.Control.len = context->control_info_length;
++            msg.Control.buf = (char *)context->control_info;
++        }
++        if (WSASendMsg(context->socket->s, &msg, 0, &sent, NULL, NULL))
++            status = sock_error_to_ntstatus(WSAGetLastError());
++        else
++            total += sent;
++        free(bufs);
++#ifdef SG_MUTANT_NETIO_DGLIST
++        break;
++#endif
++        if (status)
++            break;
++    }
++
++    context->irp->IoStatus.Information = status ? 0 : total;
++    dispatch_irp(context->irp, status);
++    free(context);
++}
++
++static NTSTATUS WINAPI wsk_send_messages(WSK_SOCKET *socket, WSK_BUF_LIST *buffer_list, ULONG flags,
++        SOCKADDR *remote_address, ULONG control_info_length, CMSGHDR *control_info, IRP *irp)
++{
++    struct wsk_socket_internal *s = wsk_socket_internal_from_wsk_socket(socket);
++    struct wsk_send_messages_context *context;
++
++    TRACE("socket %p, buffer_list %p, flags %#lx, remote_address %p, control_info_length %lu, "
++            "control_info %p, irp %p.\n", socket, buffer_list, flags, remote_address,
++            control_info_length, control_info, irp);
++
++    if (!irp)
++        return STATUS_INVALID_PARAMETER;
++
++    irp->IoStatus.Information = 0;
++
++    if (flags || !buffer_list || (control_info_length && !control_info))
++    {
++        dispatch_irp(irp, STATUS_INVALID_PARAMETER);
++        return STATUS_PENDING;
++    }
++
++    if (!(context = calloc(1, sizeof(*context))))
++    {
++        dispatch_irp(irp, STATUS_INSUFFICIENT_RESOURCES);
++        return STATUS_PENDING;
++    }
++
++    context->socket = s;
++    context->buffer_list = buffer_list;
++    if (remote_address)
++    {
++        memcpy(&context->remote_address, remote_address, sockaddr_length(remote_address));
++        context->has_remote = TRUE;
++    }
++    context->control_info_length = control_info_length;
++    context->control_info = control_info;
++    context->irp = irp;
++
++    if (!TrySubmitThreadpoolCallback(send_messages_callback, context, NULL))
++    {
++        dispatch_irp(irp, STATUS_UNSUCCESSFUL);
++        free(context);
++    }
++    return STATUS_PENDING;
++}
++
++static const WSK_PROVIDER_DATAGRAM_DISPATCH wsk_provider_datagram_dispatch =
++{
++    {
++        wsk_control_socket,
++        wsk_close_socket,
++    },
++    wsk_bind,
++    wsk_send_to,
++    wsk_receive_from,
++    wsk_release_datagram,
++    wsk_get_local_address,
++    wsk_send_messages,
++};
++
+ static NTSTATUS WINAPI wsk_socket(WSK_CLIENT *client, ADDRESS_FAMILY address_family, USHORT socket_type,
+         ULONG protocol, ULONG flags, void *socket_context, const void *dispatch, PEPROCESS owning_process,
+         PETHREAD owning_thread, SECURITY_DESCRIPTOR *security_descriptor, IRP *irp)
+@@ -1262,6 +1636,10 @@
+             socket->wsk_socket.Dispatch = &wsk_provider_stream_dispatch;
+             break;
+ 
++        case WSK_FLAG_DATAGRAM_SOCKET:
++            socket->wsk_socket.Dispatch = &wsk_provider_datagram_dispatch;
++            break;
++
+         case WSK_FLAG_LISTEN_SOCKET:
+             socket->wsk_socket.Dispatch = &wsk_provider_listen_dispatch;
+             break;
+diff --git a/dlls/ntoskrnl.exe/tests/driver_netio.c b/dlls/ntoskrnl.exe/tests/driver_netio.c
+--- a/dlls/ntoskrnl.exe/tests/driver_netio.c
++++ b/dlls/ntoskrnl.exe/tests/driver_netio.c
+@@ -1194,6 +1194,165 @@
+     close_test_socket(listener);
+ }
+ 
++#define TEST_MSG_TRUNC 0x0100
++#define TEST_IP_PKTINFO 19
++
++static WSK_SOCKET *dgram_create(struct sockaddr_in *bound)
++{
++    const WSK_PROVIDER_DATAGRAM_DISPATCH *dd;
++    struct sockaddr_in addr;
++    WSK_SOCKET *socket;
++    NTSTATUS status;
++
++    memset(&addr, 0, sizeof(addr));
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    socket = create_test_socket(SOCK_DGRAM, IPPROTO_UDP, WSK_FLAG_DATAGRAM_SOCKET);
++    dd = socket->Dispatch;
++    prepare_irp();
++    status = finish_irp(dd->WskBind(socket, (SOCKADDR *)&addr, 0, wsk_irp));
++    ok(status == STATUS_SUCCESS, "dgram bind: got unexpected status %#lx.\n", status);
++    prepare_irp();
++    status = finish_irp(dd->WskGetLocalAddress(socket, (SOCKADDR *)bound, wsk_irp));
++    ok(status == STATUS_SUCCESS && bound->sin_port, "dgram local address: got unexpected status %#lx.\n", status);
++    return socket;
++}
++
++static void test_wsk_datagram_socket(void)
++{
++    const WSK_PROVIDER_DATAGRAM_DISPATCH *da, *db;
++    struct sockaddr_in addr_a, addr_b, from;
++    WSK_SOCKET *a, *b;
++    NTSTATUS status;
++    WSK_BUF wsk_buf, rbuf;
++    void *sbuf1, *sbuf2, *rdata;
++    MDL *smdl1, *smdl2, *rmdl;
++    ULONG control_length, control_flags, one = 1;
++    char control[128];
++    WSK_BUF_LIST list[2];
++    struct async recv_async;
++    unsigned int i;
++
++    a = dgram_create(&addr_a);
++    b = dgram_create(&addr_b);
++    da = a->Dispatch;
++    db = b->Dispatch;
++
++    smdl1 = alloc_buffer(&sbuf1, 8);
++    memcpy(sbuf1, "datagram", 8);
++    smdl2 = alloc_buffer(&sbuf2, 8);
++    memcpy(sbuf2, "second!!", 8);
++    rmdl = alloc_buffer(&rdata, 64);
++    async_init(&recv_async);
++
++    wsk_buf.Mdl = smdl1;
++    wsk_buf.Offset = 0;
++    wsk_buf.Length = 8;
++    rbuf.Mdl = rmdl;
++    rbuf.Offset = 0;
++    rbuf.Length = 64;
++
++    /* argument checks */
++    prepare_irp();
++    status = finish_irp(db->WskSendTo(b, &wsk_buf, 1, (SOCKADDR *)&addr_a, 0, NULL, wsk_irp));
++    ok(status == STATUS_INVALID_PARAMETER, "sendto flags: got unexpected status %#lx.\n", status);
++    prepare_irp();
++    status = finish_irp(db->WskSendTo(b, &wsk_buf, 0, (SOCKADDR *)&addr_a, 8, NULL, wsk_irp));
++    ok(status == STATUS_INVALID_PARAMETER, "sendto control without buffer: got unexpected status %#lx.\n", status);
++    prepare_irp();
++    status = finish_irp(da->WskReceiveFrom(a, &rbuf, 1, NULL, NULL, NULL, NULL, wsk_irp));
++    ok(status == STATUS_INVALID_PARAMETER, "receivefrom flags: got unexpected status %#lx.\n", status);
++
++    /* a datagram with its sender */
++    memset(&from, 0, sizeof(from));
++    control_flags = 0xdeadbeef;
++    status = da->WskReceiveFrom(a, &rbuf, 0, (SOCKADDR *)&from, NULL, NULL, &control_flags, async_prepare(&recv_async));
++    ok(status == STATUS_PENDING, "receivefrom: got unexpected status %#lx.\n", status);
++    prepare_irp();
++    status = finish_irp(db->WskSendTo(b, &wsk_buf, 0, (SOCKADDR *)&addr_a, 0, NULL, wsk_irp));
++    ok(status == STATUS_SUCCESS && wsk_irp->IoStatus.Information == 8, "sendto: status %#lx, %Iu bytes.\n",
++            status, wsk_irp->IoStatus.Information);
++    status = async_wait(&recv_async, STATUS_PENDING, 3000);
++    ok(status == STATUS_SUCCESS && recv_async.irp->IoStatus.Information == 8 && !memcmp(rdata, "datagram", 8),
++            "receivefrom: status %#lx, %Iu bytes.\n", status, recv_async.irp->IoStatus.Information);
++    ok(from.sin_family == AF_INET && from.sin_port == addr_b.sin_port && from.sin_addr.s_addr == addr_b.sin_addr.s_addr,
++            "receivefrom: sender family %u port %u.\n", from.sin_family, ntohs(from.sin_port));
++    ok(control_flags == 0, "receivefrom: got control flags %#lx.\n", control_flags);
++
++    /* two chunks of a chained buffer are one datagram */
++    smdl1->Next = smdl2;
++    wsk_buf.Length = 16;
++    prepare_irp();
++    status = finish_irp(db->WskSendTo(b, &wsk_buf, 0, (SOCKADDR *)&addr_a, 0, NULL, wsk_irp));
++    ok(status == STATUS_SUCCESS && wsk_irp->IoStatus.Information == 16, "chained sendto: status %#lx, %Iu bytes.\n",
++            status, wsk_irp->IoStatus.Information);
++    memset(rdata, 0, 64);
++    status = da->WskReceiveFrom(a, &rbuf, 0, NULL, NULL, NULL, NULL, async_prepare(&recv_async));
++    status = async_wait(&recv_async, status, 3000);
++    ok(status == STATUS_SUCCESS && recv_async.irp->IoStatus.Information == 16 && !memcmp(rdata, "datagramsecond!!", 16),
++            "chained receivefrom: status %#lx, %Iu bytes.\n", status, recv_async.irp->IoStatus.Information);
++    smdl1->Next = NULL;
++
++    /* a datagram longer than the buffer is cut short and flagged */
++    wsk_buf.Length = 8;
++    prepare_irp();
++    status = finish_irp(db->WskSendTo(b, &wsk_buf, 0, (SOCKADDR *)&addr_a, 0, NULL, wsk_irp));
++    ok(status == STATUS_SUCCESS, "sendto: got unexpected status %#lx.\n", status);
++    rbuf.Length = 4;
++    control_flags = 0;
++    status = da->WskReceiveFrom(a, &rbuf, 0, NULL, NULL, NULL, &control_flags, async_prepare(&recv_async));
++    status = async_wait(&recv_async, status, 3000);
++    ok(status == STATUS_SUCCESS && recv_async.irp->IoStatus.Information == 4,
++            "truncated: status %#lx, %Iu bytes.\n", status, recv_async.irp->IoStatus.Information);
++    ok(control_flags & TEST_MSG_TRUNC, "truncated: got control flags %#lx.\n", control_flags);
++    rbuf.Length = 64;
++
++    /* control information: the packet info of the destination */
++    status = da->Basic.WskControlSocket(a, WskSetOption, TEST_IP_PKTINFO, IPPROTO_IP, sizeof(one), &one, 0, NULL, NULL, NULL);
++    ok(status == STATUS_SUCCESS, "IP_PKTINFO: got unexpected status %#lx.\n", status);
++    prepare_irp();
++    status = finish_irp(db->WskSendTo(b, &wsk_buf, 0, (SOCKADDR *)&addr_a, 0, NULL, wsk_irp));
++    ok(status == STATUS_SUCCESS, "sendto: got unexpected status %#lx.\n", status);
++    control_length = sizeof(control);
++    control_flags = 0;
++    status = da->WskReceiveFrom(a, &rbuf, 0, NULL, &control_length, (CMSGHDR *)control, &control_flags,
++            async_prepare(&recv_async));
++    status = async_wait(&recv_async, status, 3000);
++    ok(status == STATUS_SUCCESS && recv_async.irp->IoStatus.Information == 8,
++            "control: status %#lx, %Iu bytes.\n", status, recv_async.irp->IoStatus.Information);
++    ok(control_length >= sizeof(CMSGHDR) && control_length < sizeof(control), "control: got length %lu.\n", control_length);
++
++    /* a list of datagrams */
++    memset(list, 0, sizeof(list));
++    list[0].Next = &list[1];
++    list[0].Buffer.Mdl = smdl1;
++    list[0].Buffer.Length = 8;
++    list[1].Buffer.Mdl = smdl2;
++    list[1].Buffer.Length = 5;
++    prepare_irp();
++    status = finish_irp(db->WskSendMessages(b, list, 0, (SOCKADDR *)&addr_a, 0, NULL, wsk_irp));
++    ok(status == STATUS_SUCCESS && wsk_irp->IoStatus.Information == 13, "sendmessages: status %#lx, %Iu bytes.\n",
++            status, wsk_irp->IoStatus.Information);
++    for (i = 0; i < 2; ++i)
++    {
++        control_length = 0;
++        status = da->WskReceiveFrom(a, &rbuf, 0, NULL, NULL, NULL, NULL, async_prepare(&recv_async));
++        status = async_wait(&recv_async, status, 3000);
++        ok(status == STATUS_SUCCESS && recv_async.irp->IoStatus.Information == (i ? 5 : 8),
++                "sendmessages datagram %u: status %#lx, %Iu bytes.\n", i, status, recv_async.irp->IoStatus.Information);
++    }
++    prepare_irp();
++    status = finish_irp(db->WskSendMessages(b, list, 1, (SOCKADDR *)&addr_a, 0, NULL, wsk_irp));
++    ok(status == STATUS_INVALID_PARAMETER, "sendmessages flags: got unexpected status %#lx.\n", status);
++
++    async_free(&recv_async);
++    free_buffer(smdl1, sbuf1);
++    free_buffer(smdl2, sbuf2);
++    free_buffer(rmdl, rdata);
++    close_test_socket(a);
++    close_test_socket(b);
++}
++
+ static void test_wsk_control_socket(void)
+ {
+     static const struct
+@@ -1285,6 +1444,7 @@
+     test_wsk_socket_connect();
+     test_wsk_get_name_info();
+     test_wsk_socket_kinds();
++    test_wsk_datagram_socket();
+ 
+     irp->IoStatus.Information = 0;
+     return STATUS_SUCCESS;
+-- 
+2.47.0
