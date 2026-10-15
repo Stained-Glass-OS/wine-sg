@@ -1,7 +1,7 @@
 # Decisions, round 2 (coordinator, 2026-10-14)
 
 Source: the escalation register (1209 open escalations in 112 decision
-groups, docs/stubs/ESCALATIONS.md; the machine;
+groups, docs/stubs/ESCALATIONS.md;
 group ids below are its ids). David: "We duplicate Windows as we can" and
 "max compat with windows software". DECISIONS.md items 1-10 still stand.
 
