@@ -45,6 +45,8 @@ static HRESULT (WINAPI *pLegSelect)(PATOBJ, LONG);
 static HRESULT (WINAPI *pLegAction)(PATOBJ);
 static HRESULT (WINAPI *pLegSetValue)(PATOBJ, LPCWSTR);
 static HRESULT (WINAPI *pLegGetAcc)(PATOBJ, IAccessible **);
+static HRESULT (WINAPI *pGridGetItem)(PATOBJ, int, int, HUIANODE *);
+static HRESULT (WINAPI *pFindItem)(PATOBJ, HUIANODE, PROPERTYID, VARIANT, HUIANODE *);
 
 static int failures;
 static char logbuf[1024];
@@ -92,6 +94,8 @@ struct mock
     IMultipleViewProvider multiview;
     ISynchronizedInputProvider sync;
     ILegacyIAccessibleProvider legacy;
+    IGridProvider grid;
+    IItemContainerProvider container;
     LONG ref;
     unsigned supported;       /* bit n: pattern 10000+n is available */
     BOOL has_fragment;
@@ -126,6 +130,8 @@ FROM(IVirtualizedItemProvider, virt)
 FROM(IMultipleViewProvider, multiview)
 FROM(ISynchronizedInputProvider, sync)
 FROM(ILegacyIAccessibleProvider, legacy)
+FROM(IGridProvider, grid)
+FROM(IItemContainerProvider, container)
 
 static HRESULT mock_qi(struct mock *m, REFIID riid, void **ppv)
 {
@@ -147,6 +153,8 @@ static HRESULT mock_qi(struct mock *m, REFIID riid, void **ppv)
     else if (IsEqualIID(riid, &IID_IMultipleViewProvider)) *ppv = &m->multiview;
     else if (IsEqualIID(riid, &IID_ISynchronizedInputProvider)) *ppv = &m->sync;
     else if (IsEqualIID(riid, &IID_ILegacyIAccessibleProvider)) *ppv = &m->legacy;
+    else if (IsEqualIID(riid, &IID_IGridProvider)) *ppv = &m->grid;
+    else if (IsEqualIID(riid, &IID_IItemContainerProvider)) *ppv = &m->container;
     else return E_NOINTERFACE;
     InterlockedIncrement(&m->ref);
     return S_OK;
@@ -174,6 +182,8 @@ IUNK(virt, IVirtualizedItemProvider)
 IUNK(multiview, IMultipleViewProvider)
 IUNK(sync, ISynchronizedInputProvider)
 IUNK(legacy, ILegacyIAccessibleProvider)
+IUNK(grid, IGridProvider)
+IUNK(container, IItemContainerProvider)
 
 static HRESULT result(struct mock *m)
 {
@@ -324,6 +334,44 @@ static HRESULT WINAPI dock_SetDockPosition(IDockProvider *iface, enum DockPositi
     logf_("Dock(%d);", pos);
     return result(from_dock(iface));
 }
+
+/* a grid of one cell (row 1, column 2): the element itself; an item container that finds the item whose
+ * Name is "x" after nothing, and none after the element itself */
+static HRESULT WINAPI grid_GetItem(IGridProvider *iface, int row, int column, IRawElementProviderSimple **ret)
+{
+    struct mock *m = from_grid(iface);
+
+    logf_("GridItem(%d,%d);", row, column);
+    *ret = NULL;
+    if (row == 1 && column == 2)
+    {
+        *ret = &m->simple;
+        InterlockedIncrement(&m->ref);
+    }
+    return result(m);
+}
+static HRESULT WINAPI grid_get_RowCount(IGridProvider *iface, int *ret) { *ret = 2; return S_OK; }
+static HRESULT WINAPI grid_get_ColumnCount(IGridProvider *iface, int *ret) { *ret = 3; return S_OK; }
+static IGridProviderVtbl grid_vtbl = { .QueryInterface = grid_QI, .AddRef = grid_AddRef, .Release = grid_Release,
+    .GetItem = grid_GetItem, .get_RowCount = grid_get_RowCount, .get_ColumnCount = grid_get_ColumnCount };
+
+static HRESULT WINAPI container_FindItemByProperty(IItemContainerProvider *iface, IRawElementProviderSimple *start,
+        PROPERTYID prop, VARIANT value, IRawElementProviderSimple **ret)
+{
+    struct mock *m = from_container(iface);
+
+    logf_("Find(%s,%d,%d,%ls);", start ? "elem" : "none", prop, V_VT(&value), V_VT(&value) == VT_BSTR ? V_BSTR(&value) : L"");
+    *ret = NULL;
+    if (!start && V_VT(&value) == VT_BSTR && !wcscmp(V_BSTR(&value), L"x"))
+    {
+        *ret = &m->simple;
+        InterlockedIncrement(&m->ref);
+    }
+    return result(m);
+}
+static IItemContainerProviderVtbl container_vtbl = { .QueryInterface = container_QI, .AddRef = container_AddRef,
+    .Release = container_Release, .FindItemByProperty = container_FindItemByProperty };
+
 static IDockProviderVtbl dock_vtbl = { .QueryInterface = dock_QI, .AddRef = dock_AddRef, .Release = dock_Release,
     .SetDockPosition = dock_SetDockPosition };
 
@@ -422,6 +470,8 @@ static void mock_init(struct mock *m)
     m->scrollitem.lpVtbl = &scrollitem_vtbl;
     m->scroll.lpVtbl = &scroll_vtbl;
     m->dock.lpVtbl = &dock_vtbl;
+    m->grid.lpVtbl = &grid_vtbl;
+    m->container.lpVtbl = &container_vtbl;
     m->transform.lpVtbl = &transform_vtbl;
     m->window.lpVtbl = &window_vtbl;
     m->virt.lpVtbl = &virt_vtbl;
@@ -891,6 +941,84 @@ done:
     DestroyWindow(hwnd);
 }
 
+
+static void test_node_patterns(HUIANODE node)
+{
+    HUIANODE found = NULL, found2 = NULL;
+    PATOBJ obj = NULL;
+    VARIANT v;
+    HRESULT hr;
+
+    /* Grid.GetItem: the cell's element comes back as a node of the same element */
+    hr = pUiaGetPatternProvider(node, UIA_GridPatternId, &obj);
+    check(hr == S_OK && obj, "GridPattern: pattern object (%#lx)", hr);
+    if (obj)
+    {
+        logbuf[0] = 0;
+        hr = pGridGetItem(obj, 1, 2, &found);
+        check(hr == S_OK && found && !strcmp(logbuf, "GridItem(1,2);"), "GridPattern_GetItem(1,2) %#lx log '%s'", hr, logbuf);
+        if (found)
+        {
+            VARIANT name;
+            /* the node can be used: its pattern object is the same provider */
+            hr = pUiaGetPatternProvider(found, UIA_GridPatternId, &(PATOBJ){0});
+            check(SUCCEEDED(hr), "GridPattern: the returned node is usable (%#lx)", hr);
+            UiaNodeRelease(found);
+            (void)name;
+        }
+        found = (HUIANODE)0xdeadbeef;
+        logbuf[0] = 0;
+        hr = pGridGetItem(obj, 5, 5, &found);
+        check(hr == S_OK && !found, "GridPattern_GetItem(5,5): no element, node %p (%#lx)", found, hr);
+        g_mock.fail = E_FAIL;
+        hr = pGridGetItem(obj, 1, 2, &found);
+        check(hr == E_FAIL, "GridPattern_GetItem: provider error passes through (%#lx)", hr);
+        hr = pGridGetItem(obj, 1, 2, NULL);
+        check(hr == E_INVALIDARG, "GridPattern_GetItem: NULL out (%#lx)", hr);
+        pUiaPatternRelease(obj);
+    }
+
+    obj = NULL;
+    hr = pUiaGetPatternProvider(node, UIA_ItemContainerPatternId, &obj);
+    check(hr == S_OK && obj, "ItemContainerPattern: pattern object (%#lx)", hr);
+    if (obj)
+    {
+        V_VT(&v) = VT_BSTR;
+        V_BSTR(&v) = SysAllocString(L"x");
+        logbuf[0] = 0;
+        hr = pFindItem(obj, NULL, UIA_NamePropertyId, v, &found);
+        check(hr == S_OK && found && !strcmp(logbuf, "Find(none,30005,8,x);"), "FindItemByProperty(NULL,Name,x) %#lx log '%s'", hr, logbuf);
+        if (found)
+        {
+            HUIANODE local = NULL;
+
+            /* start after a node that came back from a pattern call: a stand-in answers for it */
+            logbuf[0] = 0;
+            hr = pFindItem(obj, found, UIA_NamePropertyId, v, &found2);
+            check(hr == S_OK && !found2 && !strcmp(logbuf, "Find(elem,30005,8,x);"),
+                  "FindItemByProperty(after a returned node) finds nothing %#lx node %p log '%s'", hr, found2, logbuf);
+            UiaNodeRelease(found);
+            if (SUCCEEDED(UiaNodeFromProvider(&g_mock.simple, &local)) && local)
+            {
+                logbuf[0] = 0;
+                hr = pFindItem(obj, local, UIA_NamePropertyId, v, &found2);
+                check(hr == S_OK && !found2 && !strcmp(logbuf, "Find(elem,30005,8,x);"),
+                      "FindItemByProperty(after a local node) finds nothing %#lx node %p log '%s'", hr, found2, logbuf);
+                UiaNodeRelease(local);
+            }
+        }
+        SysFreeString(V_BSTR(&v));
+        V_BSTR(&v) = SysAllocString(L"y");
+        found = (HUIANODE)0xdeadbeef;
+        hr = pFindItem(obj, NULL, UIA_NamePropertyId, v, &found);
+        check(hr == S_OK && !found, "FindItemByProperty(y) finds nothing (%#lx)", hr);
+        SysFreeString(V_BSTR(&v));
+        hr = pFindItem(obj, NULL, UIA_NamePropertyId, v, NULL);
+        check(hr == E_INVALIDARG, "FindItemByProperty: NULL out (%#lx)", hr);
+        pUiaPatternRelease(obj);
+    }
+}
+
 #define LOAD(var, name) do { var = (void *)GetProcAddress(mod, name); if (!var) { printf("FAIL  no %s\nRESULT: FAIL\n", name); return 1; } } while (0)
 
 int main(void)
@@ -932,6 +1060,8 @@ int main(void)
     LOAD(pLegAction, "LegacyIAccessiblePattern_DoDefaultAction");
     LOAD(pLegSetValue, "LegacyIAccessiblePattern_SetValue");
     LOAD(pLegGetAcc, "LegacyIAccessiblePattern_GetIAccessible");
+    LOAD(pGridGetItem, "GridPattern_GetItem");
+    LOAD(pFindItem, "ItemContainerPattern_FindItemByProperty");
 
     mock_init(&g_mock);
     g_mock.supported = 0xffffffffu;
@@ -941,6 +1071,7 @@ int main(void)
     test_table(node);
     test_values(node);
     test_errors(node);
+    test_node_patterns(node);
     UiaNodeRelease(node);
     test_missing_interface();
     test_set_focus();

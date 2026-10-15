@@ -139,7 +139,7 @@ int main(void)
         if (found) IUIAutomationElement_Release(found);
         found = NULL;
         hr = IUIAutomationElement9_FindFirstWithOptions(top9, TreeScope_Descendants, c2, TreeTraversalOptions_PostOrder, NULL, &found);
-        check(hr == E_NOTIMPL, "post order is not available (%#lx)", hr);
+        check(hr == S_OK && found, "post order finds the button too (%#lx)", hr);
         if (found) IUIAutomationElement_Release(found);
     }
 done:

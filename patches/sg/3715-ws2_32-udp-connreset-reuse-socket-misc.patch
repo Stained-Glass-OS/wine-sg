@@ -1,0 +1,776 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ws2_32: SIO_UDP_CONNRESET, DisconnectEx socket reuse, WSACancelAsyncRequest, WSAJoinLeaf and more (3715)
+
+ws2_32: SIO_UDP_CONNRESET (ICMP port unreachable on UDP), DisconnectEx(TF_REUSE_SOCKET), WSACancelAsyncRequest, WSApSetPostRoutine, WPUCompleteOverlappedRequest, WSAJoinLeaf, WSAGetQOSByName
+
+CORE review (wineserver sock.c, ntdll unix socket/server/file). No new server
+request: two new AFD ioctls (306, 307), so only server, ntdll.so and ws2_32 change.
+See patches/notes/3715.txt for behaviour, limits and what is guessed.
+
+Rebased at integration (integ-2026-10) onto 3279 (fast-a): WSAGetQOSByName was implemented by 3279 and 3715 (and drafter 7's 5511); 3715's kept (RECONCILE-CLOUD ws2_32 verdict KEEP-A=3715; it follows the documented template enumeration: an empty name string in a buffer of non-zero length lists the (no) templates). 3279's version and mutant SG_MUTANT_WSAQOS dropped.
+---
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -7036,6 +7036,8 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
+                                     in_buffer, in_size, out_buffer, out_size );
+         /* Stained Glass OS: the firewall learns which program listens */
+         if (!status && (device == FILE_DEVICE_BEEP || device == FILE_DEVICE_NETWORK)) sg_firewall_notify( handle, code );
++        if ((!status || status == STATUS_PENDING) && sock_ioctl_replaces_fd( code ))
++            server_invalidate_fd_cache( handle );
+     }
+     return status;
+ }
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1095,6 +1095,24 @@ static int remove_fd_from_cache( HANDLE handle )
+ }
+ 
+ 
++/***********************************************************************
++ *           server_invalidate_fd_cache
++ *
++ * Stained Glass OS: the server replaced the Unix fd behind a handle (DisconnectEx with
++ * TF_REUSE_SOCKET): forget, and close, the copy this process cached.
++ */
++void server_invalidate_fd_cache( HANDLE handle )
++{
++    sigset_t sigset;
++    int fd;
++
++    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
++    fd = remove_fd_from_cache( handle );
++    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++    if (fd != -1) close( fd );
++}
++
++
+ /***********************************************************************
+  *           server_get_unix_fd
+  *
+diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -740,6 +740,18 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
+             errno = EWOULDBLOCK;
+ 
+         if (errno != EWOULDBLOCK) WARN( "recvmsg: %s\n", strerror( errno ) );
++#ifdef linux
++        if (errno == ECONNREFUSED)
++        {
++            int type;
++            socklen_t len = sizeof(type);
++
++            /* An ICMP port unreachable on a UDP socket: the server reads the error queue and decides
++             * whether this receive fails (SIO_UDP_CONNRESET), so just try again. */
++            if (!getsockopt( fd, SOL_SOCKET, SO_TYPE, &type, &len ) && type == SOCK_DGRAM)
++                return STATUS_DEVICE_NOT_READY;
++        }
++#endif
+         return sock_errno_to_status( errno );
+     }
+ 
+@@ -1640,6 +1652,12 @@ static void sg_firewall_notify_send( int fd, const struct afd_sendmsg_params *pa
+ 
+ 
+ 
++/* Stained Glass OS: the ioctls after which the server holds a new Unix fd for the handle */
++BOOL sock_ioctl_replaces_fd( UINT code )
++{
++    return code == IOCTL_AFD_WINE_DISCONNECT_REUSE;
++}
++
+ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io,
+                      UINT code, void *in_buffer, UINT in_size, void *out_buffer, UINT out_size )
+ {
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -221,6 +221,8 @@ extern unsigned int server_wait( const union select_op *select_op, data_size_t s
+                                  const LARGE_INTEGER *timeout );
+ extern unsigned int server_queue_process_apc( HANDLE process, const union apc_call *call,
+                                               union apc_result *result );
++extern void server_invalidate_fd_cache( HANDLE handle );
++extern BOOL sock_ioctl_replaces_fd( UINT code );
+ extern int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
+                                int *needs_close, enum server_fd_type *type, unsigned int *options );
+ extern void wine_server_send_fd( int fd );
+diff --git a/dlls/ws2_32/async.c b/dlls/ws2_32/async.c
+--- a/dlls/ws2_32/async.c
++++ b/dlls/ws2_32/async.c
+@@ -35,12 +35,15 @@
+  */
+ 
+ #include "ws2_32_private.h"
++#include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
+ 
+ 
+ struct async_query_header
+ {
++    struct list entry;    /* in pending_queries */
++    BOOL   cancelled;
+     LPARAM (*func)( struct async_query_header *query );
+     HWND   hWnd;
+     UINT   uMsg;
+@@ -240,11 +243,38 @@ static LPARAM async_getservbyport( struct async_query_header *query )
+ }
+ 
+ 
++/* Stained Glass OS: outstanding WSAAsyncGetXByY requests (for WSACancelAsyncRequest) and the
++ * handles of the last ones that finished (so a late cancel says WSAEALREADY, not WSAEINVAL) */
++static SRWLOCK async_lock = SRWLOCK_INIT;
++static struct list pending_queries = LIST_INIT( pending_queries );
++static ULONG completed_queries[64];
++static unsigned int completed_next;
++static LPWPUPOSTMESSAGE post_routine;
++
+ static void WINAPI async_worker( TP_CALLBACK_INSTANCE *instance, void *context )
+ {
+     struct async_query_header *query = context;
+     LPARAM lparam = query->func( query );
+-    PostMessageW( query->hWnd, query->uMsg, (WPARAM)query->handle, lparam );
++    LPWPUPOSTMESSAGE post;
++    BOOL cancelled;
++
++    AcquireSRWLockExclusive( &async_lock );
++    cancelled = query->cancelled;
++    list_remove( &query->entry );
++    if (!cancelled) completed_queries[completed_next++ % ARRAY_SIZE(completed_queries)] = HandleToUlong( query->handle );
++#ifndef SG_MUTANT_POST_IGNORED
++    post = post_routine;
++#else
++    post = NULL;
++#endif
++    ReleaseSRWLockExclusive( &async_lock );
++
++    /* a cancelled request never posts its message */
++    if (!cancelled)
++    {
++        if (post) post( query->hWnd, query->uMsg, (WPARAM)query->handle, lparam );
++        else PostMessageW( query->hWnd, query->uMsg, (WPARAM)query->handle, lparam );
++    }
+     free( query );
+ }
+ 
+@@ -272,8 +302,16 @@ static HANDLE run_query( HWND hWnd, UINT uMsg, LPARAM (*func)(struct async_query
+     query->sbuf    = sbuf;
+     query->sbuflen = sbuflen;
+ 
++    query->cancelled = FALSE;
++    AcquireSRWLockExclusive( &async_lock );
++    list_add_tail( &pending_queries, &query->entry );
++    ReleaseSRWLockExclusive( &async_lock );
++
+     if (!TrySubmitThreadpoolCallback( async_worker, query, NULL ))
+     {
++        AcquireSRWLockExclusive( &async_lock );
++        list_remove( &query->entry );
++        ReleaseSRWLockExclusive( &async_lock );
+         SetLastError( WSAEWOULDBLOCK );
+         free( query );
+         return 0;
+@@ -433,7 +471,37 @@ HANDLE WINAPI WSAAsyncGetServByPort(HWND hWnd, UINT uMsg, INT port,
+  */
+ INT WINAPI WSACancelAsyncRequest(HANDLE hAsyncTaskHandle)
+ {
+-    FIXME("(%p),stub\n", hAsyncTaskHandle);
++    struct async_query_header *query;
++    int err = WSAEINVAL;
++    unsigned int i;
++
++    TRACE( "(%p)\n", hAsyncTaskHandle );
++
++    if (hAsyncTaskHandle)
++    {
++        AcquireSRWLockExclusive( &async_lock );
++        LIST_FOR_EACH_ENTRY( query, &pending_queries, struct async_query_header, entry )
++        {
++            if (query->handle != hAsyncTaskHandle || query->cancelled) continue;
++#ifndef SG_MUTANT_CANCEL_NOFLAG
++            query->cancelled = TRUE;
++#endif
++            err = 0;
++            break;
++        }
++        if (err)
++        {
++            for (i = 0; i < ARRAY_SIZE(completed_queries); i++)
++                if (completed_queries[i] == HandleToUlong( hAsyncTaskHandle )) err = WSAEALREADY;
++        }
++        ReleaseSRWLockExclusive( &async_lock );
++    }
++
++    if (err)
++    {
++        SetLastError( err );
++        return SOCKET_ERROR;
++    }
+     return 0;
+ }
+ 
+@@ -442,21 +510,32 @@ INT WINAPI WSACancelAsyncRequest(HANDLE hAsyncTaskHandle)
+  */
+ INT WINAPI WSApSetPostRoutine(LPWPUPOSTMESSAGE lpPostRoutine)
+ {
+-    FIXME("(%p), stub !\n", lpPostRoutine);
++    TRACE( "(%p)\n", lpPostRoutine );
++
++    /* the routine that posts the completion messages of the WSAAsyncGetXByY calls */
++    AcquireSRWLockExclusive( &async_lock );
++    post_routine = lpPostRoutine;
++    ReleaseSRWLockExclusive( &async_lock );
+     return 0;
+ }
+ 
+ /***********************************************************************
+  *        WPUCompleteOverlappedRequest   (WS2_32.25)
+  */
+-WSAEVENT WINAPI WPUCompleteOverlappedRequest(SOCKET s, LPWSAOVERLAPPED overlapped,
+-                                             DWORD error, DWORD transferred, LPINT errcode)
++INT WINAPI WPUCompleteOverlappedRequest(SOCKET s, LPWSAOVERLAPPED overlapped,
++                                        DWORD error, DWORD transferred, LPINT errcode)
+ {
+-    FIXME( "socket %#Ix, overlapped %p, error %lu, transferred %lu, errcode %p, stub!\n",
++    TRACE( "socket %#Ix, overlapped %p, error %lu, transferred %lu, errcode %p\n",
+            s, overlapped, error, transferred, errcode );
+ 
+-    if (errcode)
+-        *errcode = WSAEINVAL;
+-
+-    return NULL;
++    /* Only sockets made by WPUCreateSocketHandle (layered service providers) can complete
++     * requests this way, and this ws2_32 has no service provider interface, so there is
++     * no such socket: every handle gets the documented WSAEINVAL. */
++    if (!errcode)
++    {
++        SetLastError( WSAEFAULT );
++        return SOCKET_ERROR;
++    }
++    *errcode = WSAEINVAL;
++    return SOCKET_ERROR;
+ }
+diff --git a/dlls/ws2_32/socket.c b/dlls/ws2_32/socket.c
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -1729,9 +1729,6 @@ static BOOL WINAPI WS2_DisconnectEx( SOCKET s, OVERLAPPED *overlapped, DWORD fla
+ 
+     TRACE( "socket %#Ix, overlapped %p, flags %#lx, reserved %#lx\n", s, overlapped, flags, reserved );
+ 
+-    if (flags & TF_REUSE_SOCKET)
+-        FIXME( "Reusing socket not supported yet\n" );
+-
+     if (overlapped)
+     {
+         piosb = (IO_STATUS_BLOCK *)overlapped;
+@@ -1742,7 +1739,12 @@ static BOOL WINAPI WS2_DisconnectEx( SOCKET s, OVERLAPPED *overlapped, DWORD fla
+     }
+ 
+     status = NtDeviceIoControlFile( (HANDLE)s, event, NULL, cvalue, piosb,
+-                                    IOCTL_AFD_WINE_SHUTDOWN, &how, sizeof(how), NULL, 0 );
++#ifdef SG_MUTANT_REUSE_IGNORED
++                                    IOCTL_AFD_WINE_SHUTDOWN,
++#else
++                                    (flags & TF_REUSE_SOCKET) ? IOCTL_AFD_WINE_DISCONNECT_REUSE : IOCTL_AFD_WINE_SHUTDOWN,
++#endif
++                                    &how, sizeof(how), NULL, 0 );
+     if (!status && overlapped) status = STATUS_PENDING;
+     SetLastError( NtStatusToWSAError( status ) );
+     TRACE( "status %#lx.\n", status );
+@@ -2871,11 +2873,16 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID
+ 
+     case SIO_UDP_CONNRESET:
+     {
+-        NTSTATUS status = STATUS_SUCCESS;
+         DWORD ret;
++        BOOL enable;
+ 
+-        FIXME( "SIO_UDP_CONNRESET stub\n" );
+-        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_COMPLETE_ASYNC, &status, sizeof(status),
++        if (!in_buff || in_size < sizeof(enable))
++        {
++            SetLastError( WSAEFAULT );
++            return -1;
++        }
++        enable = !!*(BOOL *)in_buff;
++        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_SET_UDP_CONNRESET, &enable, sizeof(enable),
+                                  NULL, 0, ret_size, overlapped, completion );
+         SetLastError( ret );
+         return ret ? -1 : 0;
+@@ -4270,8 +4277,116 @@ SOCKET WINAPI WSASocketW(int af, int type, int protocol,
+ SOCKET WINAPI WSAJoinLeaf( SOCKET s, const struct sockaddr *addr, int addrlen, WSABUF *caller_data,
+                            WSABUF *callee_data, QOS *socket_qos, QOS *group_qos, DWORD flags)
+ {
+-    FIXME("stub.\n");
+-    return INVALID_SOCKET;
++    /* Stained Glass OS: the multipoint session of a UDP socket is an IP multicast group. The result
++     * is another handle of s, which joins the group unless JL_SENDER_ONLY. Closing the leaf does not
++     * leave the group while s is open. Which socket gets the datagrams, and the FD_CONNECT
++     * notification of a non-blocking join, are not verified against Windows. */
++    WSAPROTOCOL_INFOW info;
++    int len, type, err;
++    SOCKET leaf;
++
++    TRACE( "socket %#Ix, addr %p, addrlen %d, caller_data %p, callee_data %p, socket_qos %p, group_qos %p, flags %#lx\n",
++           s, addr, addrlen, caller_data, callee_data, socket_qos, group_qos, flags );
++
++    if (!socket_list_find( s ))
++    {
++        SetLastError( WSAENOTSOCK );
++        return INVALID_SOCKET;
++    }
++    if (!addr || addrlen < (int)sizeof(addr->sa_family) || IsBadReadPtr( addr, addrlen ))
++    {
++        SetLastError( WSAEFAULT );
++        return INVALID_SOCKET;
++    }
++
++    len = sizeof(type);
++    if (getsockopt( s, SOL_SOCKET, SO_TYPE, (char *)&type, &len ))
++        return INVALID_SOCKET;
++    len = sizeof(info);
++    if (getsockopt( s, SOL_SOCKET, SO_PROTOCOL_INFOW, (char *)&info, &len ))
++        return INVALID_SOCKET;
++    if (type != SOCK_DGRAM || (info.iAddressFamily != AF_INET && info.iAddressFamily != AF_INET6))
++    {
++        SetLastError( WSAEOPNOTSUPP );
++        return INVALID_SOCKET;
++    }
++    if (addr->sa_family != info.iAddressFamily)
++    {
++        SetLastError( WSAEAFNOSUPPORT );
++        return INVALID_SOCKET;
++    }
++    if (addrlen < (info.iAddressFamily == AF_INET ? (int)sizeof(struct sockaddr_in) : (int)sizeof(struct sockaddr_in6)))
++    {
++        SetLastError( WSAEFAULT );
++        return INVALID_SOCKET;
++    }
++    if (flags != JL_SENDER_ONLY && flags != JL_RECEIVER_ONLY && flags != JL_BOTH)
++    {
++        SetLastError( WSAEINVAL );
++        return INVALID_SOCKET;
++    }
++    if (caller_data && caller_data->len)
++    {
++        SetLastError( WSAEPROTONOSUPPORT );  /* a datagram session has no connect data */
++        return INVALID_SOCKET;
++    }
++    if (info.iAddressFamily == AF_INET
++        ? (((const struct sockaddr_in *)addr)->sin_addr.S_un.S_un_b.s_b1 & 0xf0) != 0xe0
++        : ((const struct sockaddr_in6 *)addr)->sin6_addr.u.Byte[0] != 0xff)
++    {
++        SetLastError( WSAEADDRNOTAVAIL );
++        return INVALID_SOCKET;
++    }
++    if (callee_data) callee_data->len = 0;
++
++    /* the leaf is a second handle of the socket: it has the same local address and the same membership */
++    if (!DuplicateHandle( GetCurrentProcess(), (HANDLE)s, GetCurrentProcess(), (HANDLE *)&leaf, 0, TRUE,
++                          DUPLICATE_SAME_ACCESS ))
++    {
++        SetLastError( WSAENOBUFS );
++        return INVALID_SOCKET;
++    }
++
++#ifndef SG_MUTANT_JOIN_NO_MEMBERSHIP
++    if (flags != JL_SENDER_ONLY)
++#else
++    if (0)
++#endif
++    {
++        int ret;
++
++        if (info.iAddressFamily == AF_INET)
++        {
++            struct ip_mreq mreq;
++
++            memset( &mreq, 0, sizeof(mreq) );
++            mreq.imr_multiaddr = ((const struct sockaddr_in *)addr)->sin_addr;
++            ret = setsockopt( s, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq) );
++        }
++        else
++        {
++            struct ipv6_mreq mreq;
++
++            memset( &mreq, 0, sizeof(mreq) );
++            mreq.ipv6mr_multiaddr = ((const struct sockaddr_in6 *)addr)->sin6_addr;
++            ret = setsockopt( s, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq) );
++        }
++        if (ret)
++        {
++            err = WSAGetLastError();
++            CloseHandle( (HANDLE)leaf );
++            SetLastError( err );
++            return INVALID_SOCKET;
++        }
++    }
++    if (!socket_list_add( leaf ))
++    {
++        CloseHandle( (HANDLE)leaf );
++        SetLastError( WSAENOBUFS );
++        return INVALID_SOCKET;
++    }
++    WSASetLastError( 0 );
++    return leaf;
+ }
+ 
+ /***********************************************************************
+@@ -4479,26 +4594,35 @@ int WINAPI WSADuplicateSocketW( SOCKET s, DWORD dwProcessId, LPWSAPROTOCOL_INFOW
+  */
+ BOOL WINAPI WSAGetQOSByName( SOCKET s, WSABUF *name, QOS *qos )
+ {
+-    int type, size = sizeof(type);
+-
+     TRACE( "socket %#Ix, name %p, qos %p\n", s, name, qos );
+ 
+-#ifdef SG_MUTANT_WSAQOS
+-    return FALSE;
+-#endif
+-    if (getsockopt( s, SOL_SOCKET, SO_TYPE, (char *)&type, &size ) == SOCKET_ERROR)
++    /* Stained Glass OS: there is no QoS service provider, hence no template: the list of names is
++     * empty and a named template does not exist. What Windows' own templates contain is not known. */
++    if (!socket_list_find( s ))
++    {
++        SetLastError( WSAENOTSOCK );
++        return FALSE;
++    }
++    if (!name || !name->buf || IsBadWritePtr( name->buf, 1 ))
+     {
+-        /* getsockopt sets WSAENOTSOCK for a handle that is no socket */
++        SetLastError( WSAEFAULT );
+         return FALSE;
+     }
+-    if (!name || !qos || (name->len && !name->buf))
++    if (!name->buf[0])
++    {
++        /* the enumeration: names are listed, then an empty name ends the list */
++        if (!name->len)
++        {
++            SetLastError( WSAEFAULT );
++            return FALSE;
++        }
++        return TRUE;
++    }
++    if (!qos || IsBadWritePtr( qos, sizeof(*qos) ))
+     {
+         SetLastError( WSAEFAULT );
+         return FALSE;
+     }
+-    /* no QOS template is defined here: a zero length name lists none (an empty double-null list), any other
+-     * name is not a template (GUESS for the error) */
+-    if (!name->len) return TRUE;
+     SetLastError( WSAEINVAL );
+     return FALSE;
+ }
+diff --git a/include/wine/afd.h b/include/wine/afd.h
+--- a/include/wine/afd.h
++++ b/include/wine/afd.h
+@@ -292,6 +292,8 @@ C_ASSERT( sizeof(struct afd_get_events_params) == 56 );
+ #define IOCTL_AFD_WINE_GET_TCP_KEEPINTVL                WINE_AFD_IOC(303)
+ #define IOCTL_AFD_WINE_SET_TCP_KEEPINTVL                WINE_AFD_IOC(304)
+ #define IOCTL_AFD_WINE_SET_SO_ERROR                     WINE_AFD_IOC(305)
++#define IOCTL_AFD_WINE_SET_UDP_CONNRESET                WINE_AFD_IOC(306)
++#define IOCTL_AFD_WINE_DISCONNECT_REUSE                 WINE_AFD_IOC(307)
+ 
+ struct afd_iovec
+ {
+diff --git a/include/ws2spi.h b/include/ws2spi.h
+--- a/include/ws2spi.h
++++ b/include/ws2spi.h
+@@ -39,7 +39,7 @@ typedef enum _WSC_PROVIDER_INFO_TYPE
+     ProviderInfoAudit,
+ } WSC_PROVIDER_INFO_TYPE;
+ 
+-WSAEVENT WINAPI WPUCompleteOverlappedRequest(SOCKET,LPWSAOVERLAPPED,DWORD,DWORD,LPINT);
++INT    WINAPI WPUCompleteOverlappedRequest(SOCKET,LPWSAOVERLAPPED,DWORD,DWORD,LPINT);
+ INT      WINAPI WSCInstallProvider(const LPGUID,LPCWSTR,const LPWSAPROTOCOL_INFOW,
+                                    DWORD,LPINT);
+ INT      WINAPI WSCDeinstallProvider(LPGUID,LPINT);
+diff --git a/server/async.c b/server/async.c
+--- a/server/async.c
++++ b/server/async.c
+@@ -687,6 +687,16 @@ void async_wake_up( struct async_queue *queue, unsigned int status )
+     }
+ }
+ 
++/* Stained Glass OS: complete only the oldest request of a queue; returns whether there was one */
++int async_terminate_first( struct async_queue *queue, unsigned int status )
++{
++    struct list *ptr = list_head( &queue->queue );
++
++    if (!ptr) return 0;
++    async_terminate( LIST_ENTRY( ptr, struct async, queue_entry ), status );
++    return 1;
++}
++
+ static void iosb_dump( struct object *obj, int verbose );
+ static void iosb_destroy( struct object *obj );
+ 
+diff --git a/server/file.h b/server/file.h
+--- a/server/file.h
++++ b/server/file.h
+@@ -279,6 +279,7 @@ extern void async_request_complete( struct async *async, unsigned int status, da
+ extern void async_request_complete_alloc( struct async *async, unsigned int status, data_size_t result,
+                                           data_size_t out_size, const void *out_data );
+ extern void async_wake_up( struct async_queue *queue, unsigned int status );
++extern int async_terminate_first( struct async_queue *queue, unsigned int status );
+ extern struct completion *fd_get_completion( struct fd *fd, apc_param_t *p_key );
+ extern void fd_copy_completion( struct fd *src, struct fd *dst );
+ extern struct iosb *async_get_iosb( struct async *async );
+diff --git a/server/sock.c b/server/sock.c
+--- a/server/sock.c
++++ b/server/sock.c
+@@ -56,6 +56,9 @@
+ #include <time.h>
+ #include <unistd.h>
+ #include <limits.h>
++#ifdef linux
++# include <linux/errqueue.h>
++#endif
+ #ifdef HAVE_LINUX_FILTER_H
+ # include <linux/filter.h>
+ #endif
+@@ -285,6 +288,9 @@ struct sock
+     unsigned int        reset : 1;   /* did we get a TCP reset? */
+     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
+     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
++    unsigned int        udp_recverr : 1;      /* Stained Glass OS: IP_RECVERR is on, ICMP errors arrive in the error queue */
++    unsigned int        udp_connreset_off : 1; /* SIO_UDP_CONNRESET FALSE: port unreachable is not reported */
++    unsigned int        udp_reset_pending : 1; /* a port unreachable is waiting for the next receive */
+ };
+ 
+ static int is_tcp_socket( struct sock *sock )
+@@ -832,6 +838,76 @@ static void post_sock_messages( struct sock *sock )
+     }
+ }
+ 
++#ifdef linux
++/* Read and drop the queued ICMP errors of a UDP socket; returns the number of entries and, in
++ * *unreach, how many of them were "port unreachable". */
++static int sock_drain_errqueue( struct sock *sock, int *unreach )
++{
++    int fd = get_unix_fd( sock->fd ), total = 0;
++
++    *unreach = 0;
++    while (total < 1024)
++    {
++        char data[1], control[256];
++        struct iovec iov = { data, sizeof(data) };
++        struct msghdr hdr;
++        struct cmsghdr *cmsg;
++
++        memset( &hdr, 0, sizeof(hdr) );
++        hdr.msg_iov = &iov;
++        hdr.msg_iovlen = 1;
++        hdr.msg_control = control;
++        hdr.msg_controllen = sizeof(control);
++        if (recvmsg( fd, &hdr, MSG_ERRQUEUE | MSG_DONTWAIT ) < 0)
++        {
++            if (errno == EINTR) continue;
++            break;
++        }
++        total++;
++        for (cmsg = CMSG_FIRSTHDR( &hdr ); cmsg; cmsg = CMSG_NXTHDR( &hdr, cmsg ))
++        {
++            const struct sock_extended_err *ee;
++
++            if (!((cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVERR) ||
++                  (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_RECVERR)))
++                continue;
++            ee = (const struct sock_extended_err *)CMSG_DATA( cmsg );
++            if (ee->ee_origin == SO_EE_ORIGIN_ICMP && ee->ee_type == 3 /* destination unreachable */
++                && ee->ee_code == 3 /* port */)
++                (*unreach)++;
++            else if (ee->ee_origin == SO_EE_ORIGIN_ICMP6 && ee->ee_type == 1 && ee->ee_code == 4)
++                (*unreach)++;
++        }
++    }
++    return total;
++}
++
++/* Handle the ICMP errors of a UDP socket. Returns TRUE when the error queue had entries, so the
++ * POLLERR that announced them is fully explained. */
++static int sock_udp_check_errors( struct sock *sock )
++{
++    int unreach, total;
++
++    if (!sock->udp_recverr) return 0;
++    if (!(total = sock_drain_errqueue( sock, &unreach ))) return 0;
++#ifndef SG_MUTANT_UDP_ALWAYS_REPORT
++    if (sock->udp_connreset_off) return 1;
++#endif
++    if (unreach)
++    {
++        if (debug_level) fprintf( stderr, "socket %p: ICMP port unreachable\n", sock );
++#ifndef SG_MUTANT_UDP_NO_WAKE
++        /* one receive fails, as on Windows; with nothing waiting the next one does */
++        if (!async_terminate_first( &sock->read_q, STATUS_PORT_UNREACHABLE ))
++#endif
++            sock->udp_reset_pending = 1;
++    }
++    return 1;
++}
++#else
++static int sock_udp_check_errors( struct sock *sock ) { return 0; }
++#endif
++
+ static inline int sock_error( struct sock *sock, int *poll_event )
+ {
+     int error = 0;
+@@ -859,7 +935,8 @@ static inline int sock_error( struct sock *sock, int *poll_event )
+         break;
+ 
+     case SOCK_CONNECTIONLESS:
+-        if (error == ENETUNREACH || error == EHOSTUNREACH || error == ECONNRESET)
++        if (error == ENETUNREACH || error == EHOSTUNREACH || error == ECONNRESET ||
++            (error == ECONNREFUSED && sock->udp_recverr))
+         {
+             if (poll_event) *poll_event &= ~POLLERR;
+             return 0;
+@@ -1370,9 +1447,16 @@ static void sock_poll_event( struct fd *fd, int event )
+     if (debug_level)
+         fprintf(stderr, "socket %p select event: %x\n", sock, event);
+ 
++    if ((event & POLLERR) && sock_udp_check_errors( sock ))
++        event &= ~POLLERR;
++
+     if (event & (POLLERR | POLLHUP))
+         error = sock_error( sock, &event );
+ 
++#ifndef SG_MUTANT_UDP_NO_POLLIN
++    if (sock->udp_reset_pending) event |= POLLIN;  /* the next receive reports the port unreachable */
++#endif
++
+     switch (sock->state)
+     {
+     case SOCK_UNCONNECTED:
+@@ -1765,6 +1849,8 @@ static struct sock *create_socket(void)
+     sock->nonblocking = 0;
+     sock->bound = 0;
+     sock->reset = 0;
++    sock->udp_connreset_off = 0;
++    sock->udp_reset_pending = 0;
+     sock->reuseaddr = 0;
+     sock->exclusiveaddruse = 0;
+     sock->rcvbuf = 0;
+@@ -1964,6 +2050,21 @@ static int init_socket( struct sock *sock, int family, int type, int protocol )
+     if (!getsockopt( sockfd, SOL_SOCKET, SO_SNDBUF, &value, &len ))
+         sock->sndbuf = value;
+ 
++    sock->udp_recverr = 0;
++#ifdef linux
++    /* Windows reports an ICMP "port unreachable" on UDP sockets (SIO_UDP_CONNRESET); Linux only does so for
++     * connected sockets unless the error queue is enabled. The server reads the queue itself. */
++    if (unix_type == SOCK_DGRAM && (unix_protocol == 0 || unix_protocol == IPPROTO_UDP) &&
++        (unix_family == AF_INET || unix_family == AF_INET6))
++    {
++        value = 1;
++#ifndef SG_MUTANT_UDP_NO_RECVERR
++        if (!setsockopt( sockfd, unix_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP,
++                         unix_family == AF_INET6 ? IPV6_RECVERR : IP_RECVERR, &value, sizeof(value) ))
++            sock->udp_recverr = 1;
++#endif
++    }
++#endif
+     sock->state  = (type == WS_SOCK_STREAM ? SOCK_UNCONNECTED : SOCK_CONNECTIONLESS);
+     sock->proto  = protocol;
+     sock->type   = type;
+@@ -2762,6 +2863,55 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+         return;
+     }
+ 
++    case IOCTL_AFD_WINE_DISCONNECT_REUSE:
++    {
++        /* DisconnectEx( TF_REUSE_SOCKET ): close the connection and turn the socket into a new,
++         * unbound and unconnected one that AcceptEx or ConnectEx can use again. */
++        int family = sock->family, type = sock->type, protocol = sock->proto;
++        unsigned int i;
++
++        if (sock->state != SOCK_CONNECTED || sock->type != WS_SOCK_STREAM)
++        {
++            set_error( STATUS_INVALID_CONNECTION );
++            return;
++        }
++
++        async_wake_up( &sock->read_q, STATUS_CANCELLED );
++        async_wake_up( &sock->write_q, STATUS_CANCELLED );
++        shutdown( unix_fd, SHUT_WR );  /* the peer sees an orderly close */
++
++        for (i = 0; i < 2; ++i)
++        {
++            if (sock->bound_addr[i] && --sock->bound_addr[i]->reuse_count <= 0)
++            {
++                rb_remove( &bound_addresses_tree, &sock->bound_addr[i]->entry );
++                free( sock->bound_addr[i] );
++            }
++            sock->bound_addr[i] = NULL;
++        }
++        if (sock->deferred)
++        {
++            release_object( sock->deferred );
++            sock->deferred = NULL;
++        }
++        memset( &sock->addr, 0, sizeof(sock->addr) );
++        sock->addr_len = 0;
++        memset( &sock->peer_addr, 0, sizeof(sock->peer_addr) );
++        sock->peer_addr_len = 0;
++        sock->connect_time = 0;
++        sock->rd_shutdown = sock->wr_shutdown = sock->wr_shutdown_pending = 0;
++        sock->hangup = sock->aborted = sock->reset = 0;
++        sock->bound = 0;
++        sock->so_error = 0;
++        sock->pending_events = sock->reported_events = 0;
++        memset( sock->errors, 0, sizeof(sock->errors) );
++#ifndef SG_MUTANT_REUSE_NO_REINIT
++        init_socket( sock, family, type, protocol );
++        if (!get_error()) sock_reselect( sock );
++#endif
++        return;
++    }
++
+     case IOCTL_AFD_WINE_SHUTDOWN:
+     {
+         unsigned int how;
+@@ -3187,6 +3337,19 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+         return;
+     }
+ 
++    case IOCTL_AFD_WINE_SET_UDP_CONNRESET:
++        if (get_req_data_size() < sizeof(int))
++        {
++            set_error( STATUS_BUFFER_TOO_SMALL );
++            return;
++        }
++        if (sock->type != WS_SOCK_DGRAM) return;  /* accepted and ignored on other sockets (not verified on Windows) */
++#ifndef SG_MUTANT_UDP_IOCTL_IGNORED
++        sock->udp_connreset_off = !*(int *)get_req_data();
++#endif
++        if (sock->udp_connreset_off) sock->udp_reset_pending = 0;
++        return;
++
+     case IOCTL_AFD_WINE_SET_SO_ERROR:
+         if (get_req_data_size() < sizeof(int))
+         {
+@@ -3902,10 +4065,19 @@ DECL_HANDLER(recv_socket)
+     if (!req->force_async && !sock->nonblocking && is_fd_overlapped( fd ))
+         timeout = (timeout_t)sock->rcvtimeo * -10000;
+ 
++    if (sock->udp_recverr && check_fd_events( sock->fd, POLLERR )) sock_udp_check_errors( sock );
++
+     if (sock->rd_shutdown)
+         status = STATUS_PIPE_DISCONNECTED;
+     else if (sock->reset)
+         status = STATUS_CONNECTION_RESET;
++    else if (sock->udp_reset_pending && !async_queued( &sock->read_q ))
++    {
++#ifndef SG_MUTANT_UDP_REPEAT
++        sock->udp_reset_pending = 0;
++#endif
++        status = STATUS_PORT_UNREACHABLE;
++    }
+     else if (!async_queued( &sock->read_q ))
+     {
+         /* If read_q is not empty, we cannot really tell if the already queued
