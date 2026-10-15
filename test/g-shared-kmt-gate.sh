@@ -7,7 +7,8 @@
 #
 #   WINE=/opt/wine-sg/bin/wine test/g-shared-kmt-gate.sh
 #   WINE_INCLUDE=<wine source include dir> when the installed headers lack ddk/d3dkmthk.h
-# Mutants (win32u d3dkmt.c): SG_MUTANT_KMT_ALLOC_NOSIZE, SG_MUTANT_KMT_SHARE_COPY, SG_MUTANT_KMT_OPEN_NOCHECK,
+# Mutants (win32u d3dkmt.c): SG_MUTANT_KMT_ALLOC_NOSIZE, SG_MUTANT_KMT_GLOBAL_NONAME, SG_MUTANT_KMT_SHARE_ANY,
+# SG_MUTANT_KMT_SHARE_COPY, SG_MUTANT_KMT_OPEN_NOCHECK,
 # SG_MUTANT_KMT_DESTROY_ANY.
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
