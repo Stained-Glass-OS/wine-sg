@@ -12,4 +12,4 @@
 - shelldialogs.c test: 101 checks both arches; mutants MPROP_NOAPPLY 4, FORMAT_NOCONFIRM 3, PICKICON_NOINDEX 3, NETADDR_NOMASK 2.
 - SHFormatDrive: sg-admind "format" verb (wire format is a proposal, see patches/notes/5811.txt); tests use a regular file and a stand-in spool.
 - Triaged: wiaservc AddDeviceDlg (scanner/camera, not touched), gamingtcui ShowProfileCardUI (no Xbox service).
-- Open: rasdlg RasEntryDlgW.
+- Escalated: rasdlg RasEntryDlgW (needs the RAS phonebook backend, still a stub in this base; proposal in triage-7r4.tsv).
