@@ -115,3 +115,11 @@ Scope change from the coordinator: crypt32/bcrypt/wintrust/cryptowinrt/onlineid/
 - ntoskrnl.exe candidates now all closed (1184/1185 triaged no-ground-truth). Open next: netio.sys 1061 1062 1064 1067 1175 1176 1178;
   ntdll 1 11 55 360 361 362 367 395 405 439 443 444 446 981; ole32 460 461 493 494 499 505 506 509 517 519 869 985-989;
   rpcrt4 554-597 (23); combase 61 159 160 162 927; advapi32 123; oleaut32 547. Details in /var/tmp/fast-a/s6-STATE.md.
+
+- 2026-10-14 (Fast A): netio.sys 5096 WskControlSocket, 5097 WskDisconnect/WskConnectEx, 5098 WskSocketConnect/WskGetNameInfo,
+  5099 basic+stream sockets/WskListen, 5100 datagram sockets (1062 1064 1067 1175 1176 1178 implemented; 1061 no-ground-truth: the
+  numeric WSK_FLAG_NODELAY/WAITALL/DRAIN values are in no allowed source). ntdll 5101 placeholder compatibility mode (367), 5102
+  NtFlushProcessWriteBuffers (446), 5103 MemoryRegionInformation other process (443), 5104 SystemPowerCapabilities (55), 5105 XPRESS and
+  XPRESS_HUFF from MS-XCA (360 361 362); escalated with proposals: 1 (volume lock), 11 (job classes), 395 (volume label), 405/981
+  (cdrom ioctls), 439 (key write time), 444 (working set of other processes). ntdll full suites 64/32 vs base: no new failures (the
+  32-bit ntdll.virtual syscall-thunk test needs a prefix made with the new build).
