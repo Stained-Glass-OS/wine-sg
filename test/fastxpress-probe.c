@@ -204,9 +204,6 @@ int main(void)
 
         for (n = 3; n <= 40; ++n)
         {
-            /* XPRESS_HUFF: ntdll 5105 loses the tail of "qzzzz" (a match of offset 1, length 3 is the symbol 256 = the end);
-             * reported to the coordinator, skipped here until ntdll avoids it */
-            if (cur_alg == 4 && n == 4) continue;
             memset(buf, 'q', 1);
             memset(buf + 1, 'z', n);        /* a run: the match is n - 1 long */
             if (!roundtrip(buf, n + 1, raw, 0, NULL)) break;
@@ -214,7 +211,7 @@ int main(void)
         CHECKF(n == 41, "%s %s: runs of every length up to 40 (stopped at %Iu)", alg_name, kind, n);
 
         {
-            static const SIZE_T lens[] = { 270, 277, 278, 279, 280, 281, 300, 1000, 65534, 65535, 65536, 65537, 65538, 65540, 70000, 200000 };   /* 65539 is lost by ntdll 5105's XPRESS_HUFF (reported) */
+            static const SIZE_T lens[] = { 270, 277, 278, 279, 280, 281, 300, 1000, 65534, 65535, 65536, 65537, 65538, 65539, 65540, 70000, 200000 };
             for (i = 0; i < sizeof(lens) / sizeof(lens[0]); ++i)
             {
                 memset(buf, 0, lens[i]);
