@@ -32,3 +32,15 @@ All 467 items of gap-CLOUD.json have a row in triage-7.tsv with evidence: 102 im
 ## Round 3 (verdict fixes for triage-7.tsv)
 90 corrected lines appended to docs/stubs/triage-7.tsv (the last line per dll+function wins), each with evidence of its own: windows-matches only with a test line or a fetched docs statement; callable code no longer marked not-applicable; bookkeeping lines replaced by real verdicts; escalations carry a proposal. Items that should become code carry the interim verdict implement-pending; the code batches (patches 5600-5799, branches stubs-7c / stubs-6d) replace those lines with implemented plus the patch number.
 Source of the research: the audit docs/stubs/TRIAGE-AUDIT.md rows for this file.
+
+## Round 3/4 status (coordinator summary)
+Done and pushed:
+- Part 1 verdict fixes: stubs-5f (triage-5, 99 lines), stubs-6f (triage-6, 121), stubs-7c (triage-7, 90), stubs-6d (triage-6b, 47). Items that should become code carry the interim verdict implement-pending.
+- Part 1 code: lane C1 (core DLLs: crypt32, bcrypt, secur32, advapi32, ncrypt, ole32, ntdll, kernelbase, msvcrt, ...) on stubs-6d (see its progress-7.md); its items are in round3-work-C1-core.tsv.
+- Part 2 group 1 UIA: stubs-7d (patch 5800, 25 implemented, 2 no-ground-truth).
+- Part 2 group 2 SH-DIALOGS + SH-PROPSTORE: stubs-7e (patches 5810, 5811).
+NOT done (work lists for the next owner, each row has the docs URL and the corrected triage evidence):
+- round3-work-C2-kernel32-win32u-gdi32-wtsapi32.tsv (72 items: transacted kernel32 calls need a real ntdll transaction object first; D3DKMT validation; gdi32 Eng*/PATHOBJ exports; WTS virtual channel/remote control).
+- round3-work-C3-noncore.tsv (48 items: rtworkq MMCSS/deadlines, dpvoice, websocket, t2embed, traffic, sensapi, winmm, tools). Beware: fast-b already changed sensapi (a routing-table probe) while the docs say Vista and later always return ERROR_CALL_NOT_IMPLEMENTED; decide at integration.
+- Part 2 groups 3-6 (RE-TOM/RE-OLE/COM-OLELINK on stubs-7f, XML-PARSER + MSH-LEGACY on stubs-7g, G-D2D/G-DWRITE/G-WIC on stubs-7h, G-WINRTCOMP on stubs-7i).
+Build notes: a series-applied tree for fast-b needs prep2.sh-style skipping of fast-b 3590/3636 (they depend on fast-a 3008); tools are described in /var/tmp/d7/tools (not in the repo).
