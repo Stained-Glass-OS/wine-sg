@@ -17,7 +17,7 @@ T=$(mktemp -d /var/tmp/sg-fastie-riched.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
-TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/fastie-riched-probe.exe" "$HERE/fastie-riched-probe.c" -idirafter "${WINE_INCLUDE:-/opt/wine-sg/include/wine/windows}" -lole32 -loleaut32 -luuid -luser32 \
+TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/fastie-riched-probe.exe" "$HERE/fastie-riched-probe.c" -idirafter "${WINE_INCLUDE:-/opt/wine-sg/include/wine/windows}" -lole32 -loleaut32 -luuid -luser32 -lgdi32 \
     || { echo "FAIL  probe did not build"; exit 1; }
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
