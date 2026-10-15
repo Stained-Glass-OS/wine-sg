@@ -1,0 +1,951 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] tdh: load instrumentation manifests and answer TdhGetEventInformation (3675)
+
+tdh: load instrumentation manifests and answer TdhGetEventInformation
+
+TdhLoadManifest parses an ETW instrumentation manifest (.man) and
+TdhGetEventInformation fills a TRACE_EVENT_INFO for an event record from it:
+descriptor (level, task, opcode, channel, keywords), provider/level/channel/
+task/opcode/keyword/event/provider-message strings (resolved from the
+manifest's string table), and the template's properties with in/out types,
+maps, lengths, counts and structs. TdhUnloadManifest removes a loaded
+manifest. TdhLoadManifestFromBinary makes the documented file/resource checks.
+---
+diff --git a/dlls/tdh/Makefile.in b/dlls/tdh/Makefile.in
+index 4aa878b..373041a 100644
+--- a/dlls/tdh/Makefile.in
++++ b/dlls/tdh/Makefile.in
+@@ -1,8 +1,9 @@
+ MODULE    = tdh.dll
+-IMPORTS   = advapi32
++IMPORTS   = advapi32 ole32 xmllite
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
++	manifest.c \
+ 	tdh_main.c \
+ 	version.rc
+diff --git a/dlls/tdh/manifest.c b/dlls/tdh/manifest.c
+new file mode 100644
+index 0000000..3856c28
+--- /dev/null
++++ b/dlls/tdh/manifest.c
+@@ -0,0 +1,784 @@
++/*
++ * Event manifests for the Trace Data Helper: parses instrumentation
++ * manifests (.man) and answers TdhGetEventInformation from them.
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <stddef.h>
++#include <wchar.h>
++
++#define COBJMACROS
++#include "windef.h"
++#include "winbase.h"
++#include "winnls.h"
++#include "ole2.h"
++#include "initguid.h"
++#include "xmllite.h"
++#include "winuser.h"
++#include "wmistr.h"
++#include "evntrace.h"
++#include "evntprov.h"
++#include "evntcons.h"
++
++#include "tdh_private.h"
++
++static CRITICAL_SECTION manifest_cs;
++static CRITICAL_SECTION_DEBUG manifest_cs_debug =
++{
++    0, 0, &manifest_cs,
++    { &manifest_cs_debug.ProcessLocksList, &manifest_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": manifest_cs") }
++};
++static CRITICAL_SECTION manifest_cs = { &manifest_cs_debug, -1, 0, 0, 0, 0 };
++
++#ifdef TDH_MUT_LEVEL
++#define SG_MUT_LEVEL 1
++#else
++#define SG_MUT_LEVEL 0
++#endif
++struct named { WCHAR *name; WCHAR *message; WCHAR *id; ULONGLONG value; };
++struct data_item
++{
++    WCHAR *name, *in_type, *out_type, *count, *length, *map;
++    BOOL is_struct;
++    ULONG struct_members;       /* for a struct: the next struct_members data items are its members */
++};
++struct template { WCHAR *tid; struct data_item *items; ULONG count; };
++struct event
++{
++    USHORT id; UCHAR version, level, opcode, channel; USHORT task; ULONGLONG keywords;
++    WCHAR *message, *template_id, *level_name, *task_name, *opcode_name, *channel_name;
++    WCHAR *keyword_names;       /* double-null terminated */
++};
++struct provider
++{
++    GUID guid;
++    WCHAR *name, *message;
++    struct named *keywords; ULONG keyword_count;
++    struct named *tasks; ULONG task_count;
++    struct named *opcodes; ULONG opcode_count;
++    struct named *channels; ULONG channel_count;
++    struct named *levels; ULONG level_count;
++    struct template *templates; ULONG template_count;
++    struct event *events; ULONG event_count;
++};
++struct string_entry { WCHAR *id, *value; };
++struct manifest
++{
++    struct manifest *next;
++    WCHAR *path;
++    struct provider *providers; ULONG provider_count;
++    struct string_entry *strings; ULONG string_count;
++    ULONG first_culture_strings;   /* strings of later cultures are ignored */
++};
++
++static struct manifest *manifests;
++
++static WCHAR *dup_str(const WCHAR *s) { return s ? wcsdup(s) : NULL; }
++
++#define GROW(arr, count) \
++    ((arr) = realloc((arr), ((count) + 1) * sizeof(*(arr))), memset(&(arr)[(count)], 0, sizeof(*(arr))), &(arr)[(count)++])
++
++struct attrs { WCHAR *name[24]; WCHAR *value[24]; int count; };
++
++static const WCHAR *attr(const struct attrs *a, const WCHAR *name)
++{
++    int i;
++    for (i = 0; i < a->count; i++) if (!wcscmp(a->name[i], name)) return a->value[i];
++    return NULL;
++}
++
++static void free_attrs(struct attrs *a)
++{
++    int i;
++    for (i = 0; i < a->count; i++) { free(a->name[i]); free(a->value[i]); }
++    a->count = 0;
++}
++
++static ULONGLONG parse_number(const WCHAR *s)
++{
++    if (!s) return 0;
++    return wcstoull(s, NULL, 0);
++}
++
++/* the standard (win:) names of levels, opcodes and keywords */
++static const struct { const WCHAR *name; UCHAR value; const WCHAR *text; } std_levels[] =
++{
++    { L"win:LogAlways", 0, L"Log Always" }, { L"win:Critical", 1, L"Critical" }, { L"win:Error", 2, L"Error" },
++    { L"win:Warning", 3 + SG_MUT_LEVEL, L"Warning" }, { L"win:Informational", 4, L"Information" }, { L"win:Verbose", 5, L"Verbose" },
++};
++static const struct { const WCHAR *name; UCHAR value; const WCHAR *text; } std_opcodes[] =
++{
++    { L"win:Info", 0, L"Info" }, { L"win:Start", 1, L"Start" }, { L"win:Stop", 2, L"Stop" },
++    { L"win:DC_Start", 3, L"DCStart" }, { L"win:DC_Stop", 4, L"DCStop" }, { L"win:Extension", 5, L"Extension" },
++    { L"win:Reply", 6, L"Reply" }, { L"win:Resume", 7, L"Resume" }, { L"win:Suspend", 8, L"Suspend" },
++    { L"win:Send", 9, L"Send" }, { L"win:Receive", 240, L"Receive" },
++};
++static const struct { const WCHAR *name; ULONGLONG mask; const WCHAR *text; } std_keywords[] =
++{
++    { L"win:ResponseTime", 0x0001000000000000ull, L"ResponseTime" }, { L"win:WDIContext", 0x0002000000000000ull, L"WDI Context" },
++    { L"win:WDIDiag", 0x0004000000000000ull, L"WDI Diag" }, { L"win:SQM", 0x0008000000000000ull, L"SQM" },
++    { L"win:AuditFailure", 0x0010000000000000ull, L"Audit Failure" }, { L"win:AuditSuccess", 0x0020000000000000ull, L"Audit Success" },
++    { L"win:CorrelationHint", 0x0040000000000000ull, L"Correlation Hint" }, { L"win:EventlogClassic", 0x0080000000000000ull, L"Classic" },
++};
++
++static struct named *find_named(struct named *list, ULONG count, const WCHAR *name)
++{
++    ULONG i;
++    if (!name) return NULL;
++    for (i = 0; i < count; i++) if (list[i].name && !wcscmp(list[i].name, name)) return &list[i];
++    return NULL;
++}
++
++static const struct in_type_name { const WCHAR *name; USHORT in; USHORT out; } in_types[] =
++{
++    { L"win:UnicodeString", 1, 1 }, { L"win:AnsiString", 2, 1 }, { L"win:Int8", 3, 3 }, { L"win:UInt8", 4, 4 },
++    { L"win:Int16", 5, 5 }, { L"win:UInt16", 6, 6 }, { L"win:Int32", 7, 7 }, { L"win:UInt32", 8, 8 },
++    { L"win:Int64", 9, 9 }, { L"win:UInt64", 10, 10 }, { L"win:Float", 11, 11 }, { L"win:Double", 12, 12 },
++    { L"win:Boolean", 13, 13 }, { L"win:Binary", 14, 15 }, { L"win:GUID", 15, 14 },
++    { L"win:Pointer", 16, 0 /* by pointer size */ }, { L"win:FILETIME", 17, 2 }, { L"win:SYSTEMTIME", 18, 2 },
++    { L"win:SID", 19, 1 }, { L"win:HexInt32", 20, 18 }, { L"win:HexInt64", 21, 19 },
++    { L"win:CountedUnicodeString", 22, 1 }, { L"win:CountedAnsiString", 23, 1 }, { L"win:CountedBinary", 25, 15 },
++    { L"win:CountedString", 26, 1 }, { L"win:CountedAnsiString", 27, 1 },
++    { L"win:ReversedCountedUnicodeString", 28, 1 }, { L"win:ReversedCountedAnsiString", 29, 1 },
++    { L"win:NonNullTerminatedString", 30, 1 }, { L"win:NonNullTerminatedAnsiString", 31, 1 },
++    { L"win:UnicodeChar", 32, 1 }, { L"win:AnsiChar", 33, 1 }, { L"win:SizeT", 34, 0 },
++    { L"win:HexDump", 35, 15 }, { L"win:WbemSID", 36, 1 },
++};
++
++static const struct { const WCHAR *name; USHORT out; } out_types[] =
++{
++    { L"xs:string", 1 }, { L"xs:dateTime", 2 }, { L"xs:byte", 3 }, { L"xs:unsignedByte", 4 }, { L"xs:short", 5 },
++    { L"xs:unsignedShort", 6 }, { L"xs:int", 7 }, { L"xs:unsignedInt", 8 }, { L"xs:long", 9 }, { L"xs:unsignedLong", 10 },
++    { L"xs:float", 11 }, { L"xs:double", 12 }, { L"xs:boolean", 13 }, { L"xs:GUID", 14 }, { L"xs:hexBinary", 15 },
++    { L"win:HexInt8", 16 }, { L"win:HexInt16", 17 }, { L"win:HexInt32", 18 }, { L"win:HexInt64", 19 },
++    { L"win:PID", 20 }, { L"win:TID", 21 }, { L"win:Port", 22 }, { L"win:IPv4", 23 }, { L"win:IPv6", 24 },
++    { L"win:SocketAddress", 25 }, { L"win:CIMDateTime", 26 }, { L"win:ETWTIME", 27 }, { L"win:Xml", 28 },
++    { L"win:ErrorCode", 29 }, { L"win:Win32Error", 30 }, { L"win:NTSTATUS", 31 }, { L"win:HResult", 32 },
++    { L"win:CultureInsensitiveDateTime", 33 }, { L"win:Json", 34 }, { L"win:Utf8", 35 }, { L"win:Pkcs7WithTypeInfo", 36 },
++    { L"win:CodePointer", 37 }, { L"win:DateTimeUtc", 38 },
++};
++
++/* ---- parsing ---- */
++
++enum ctx { CTX_NONE, CTX_PROVIDER, CTX_KEYWORDS, CTX_TASKS, CTX_OPCODES, CTX_CHANNELS, CTX_LEVELS, CTX_TEMPLATES,
++           CTX_TEMPLATE, CTX_STRUCT, CTX_EVENTS, CTX_STRINGS, CTX_MAPS };
++
++struct parser
++{
++    struct manifest *m;
++    struct provider *p;
++    struct template *t;
++    int struct_open;                /* index of the open struct item in the template, or -1 */
++    BOOL in_first_resources;
++    BOOL resources_seen;
++    WCHAR *stack[32];
++    int depth;
++};
++
++static void start_element(struct parser *ps, const WCHAR *name, const struct attrs *a)
++{
++    struct manifest *m = ps->m;
++
++    if (!wcscmp(name, L"provider"))
++    {
++        const WCHAR *guid = attr(a, L"guid");
++        struct provider *p = GROW(m->providers, m->provider_count);
++        ps->p = p;
++        p->name = dup_str(attr(a, L"name"));
++        p->message = dup_str(attr(a, L"message"));
++        if (guid)
++        {
++            CLSIDFromString(guid, &p->guid);
++        }
++        /* pointers into the providers array move when it grows: re-take after each provider */
++        ps->p = &m->providers[m->provider_count - 1];
++    }
++    else if (!ps->p && wcscmp(name, L"resources") && wcscmp(name, L"string"))
++        return;
++    else if (!wcscmp(name, L"keyword") && ps->p)
++    {
++        struct named *n = GROW(ps->p->keywords, ps->p->keyword_count);
++        n->name = dup_str(attr(a, L"name")); n->message = dup_str(attr(a, L"message")); n->value = parse_number(attr(a, L"mask"));
++    }
++    else if (!wcscmp(name, L"task") && ps->p)
++    {
++        struct named *n = GROW(ps->p->tasks, ps->p->task_count);
++        n->name = dup_str(attr(a, L"name")); n->message = dup_str(attr(a, L"message")); n->value = parse_number(attr(a, L"value"));
++    }
++    else if (!wcscmp(name, L"opcode") && ps->p)
++    {
++        struct named *n = GROW(ps->p->opcodes, ps->p->opcode_count);
++        n->name = dup_str(attr(a, L"name")); n->message = dup_str(attr(a, L"message")); n->value = parse_number(attr(a, L"value"));
++    }
++    else if (!wcscmp(name, L"channel") && ps->p)
++    {
++        struct named *n = GROW(ps->p->channels, ps->p->channel_count);
++        n->name = dup_str(attr(a, L"name")); n->message = dup_str(attr(a, L"message")); n->id = dup_str(attr(a, L"chid"));
++        /* channels without a value are numbered from 16 in declaration order (GUESSED) */
++        n->value = attr(a, L"value") ? parse_number(attr(a, L"value")) : 15 + ps->p->channel_count;
++    }
++    else if (!wcscmp(name, L"level") && ps->p)
++    {
++        struct named *n = GROW(ps->p->levels, ps->p->level_count);
++        n->name = dup_str(attr(a, L"name")); n->message = dup_str(attr(a, L"message")); n->value = parse_number(attr(a, L"value"));
++    }
++    else if (!wcscmp(name, L"template") && ps->p)
++    {
++        ps->t = GROW(ps->p->templates, ps->p->template_count);
++        ps->t->tid = dup_str(attr(a, L"tid"));
++        ps->struct_open = -1;
++    }
++    else if (!wcscmp(name, L"struct") && ps->t)
++    {
++        struct data_item *d = GROW(ps->t->items, ps->t->count);
++        d->name = dup_str(attr(a, L"name")); d->count = dup_str(attr(a, L"count")); d->is_struct = TRUE;
++        ps->struct_open = ps->t->count - 1;
++    }
++    else if (!wcscmp(name, L"data") && ps->t)
++    {
++        struct data_item *d = GROW(ps->t->items, ps->t->count);
++        d->name = dup_str(attr(a, L"name")); d->in_type = dup_str(attr(a, L"inType")); d->out_type = dup_str(attr(a, L"outType"));
++        d->count = dup_str(attr(a, L"count")); d->length = dup_str(attr(a, L"length")); d->map = dup_str(attr(a, L"map"));
++        if (ps->struct_open >= 0) ps->t->items[ps->struct_open].struct_members++;
++    }
++    else if (!wcscmp(name, L"event") && ps->p)
++    {
++        struct event *e = GROW(ps->p->events, ps->p->event_count);
++        const WCHAR *v;
++        e->id = parse_number(attr(a, L"value"));
++        e->version = parse_number(attr(a, L"version"));
++        e->message = dup_str(attr(a, L"message"));
++        e->template_id = dup_str(attr(a, L"template"));
++        e->level_name = dup_str(attr(a, L"level"));
++        e->task_name = dup_str(attr(a, L"task"));
++        e->opcode_name = dup_str(attr(a, L"opcode"));
++        e->channel_name = dup_str(attr(a, L"channel"));
++        e->keyword_names = dup_str(attr(a, L"keywords"));   /* resolved after the provider is complete */
++        (void)v;
++    }
++    else if (!wcscmp(name, L"resources"))
++    {
++        /* only the first culture's strings are used (GUESSED) */
++#ifdef TDH_MUT_CULTURE
++        if (0)
++#else
++        if (ps->resources_seen)
++#endif
++            ps->in_first_resources = FALSE;
++        else { ps->resources_seen = TRUE; ps->in_first_resources = TRUE; }
++    }
++    else if (!wcscmp(name, L"string") && ps->in_first_resources)
++    {
++        struct string_entry *s = GROW(m->strings, m->string_count);
++        s->id = dup_str(attr(a, L"id")); s->value = dup_str(attr(a, L"value"));
++    }
++}
++
++static void end_element(struct parser *ps, const WCHAR *name)
++{
++    if (!wcscmp(name, L"provider")) ps->p = NULL;
++    else if (!wcscmp(name, L"template")) ps->t = NULL;
++    else if (!wcscmp(name, L"struct")) ps->struct_open = -1;
++}
++
++static void free_named(struct named *n, ULONG count)
++{
++    ULONG i;
++    for (i = 0; i < count; i++) { free(n[i].name); free(n[i].message); free(n[i].id); }
++    free(n);
++}
++
++static void free_manifest(struct manifest *m)
++{
++    ULONG i, j, k;
++
++    for (i = 0; i < m->provider_count; i++)
++    {
++        struct provider *p = &m->providers[i];
++        free(p->name); free(p->message);
++        free_named(p->keywords, p->keyword_count); free_named(p->tasks, p->task_count);
++        free_named(p->opcodes, p->opcode_count); free_named(p->channels, p->channel_count);
++        free_named(p->levels, p->level_count);
++        for (j = 0; j < p->template_count; j++)
++        {
++            for (k = 0; k < p->templates[j].count; k++)
++            {
++                struct data_item *d = &p->templates[j].items[k];
++                free(d->name); free(d->in_type); free(d->out_type); free(d->count); free(d->length); free(d->map);
++            }
++            free(p->templates[j].items); free(p->templates[j].tid);
++        }
++        free(p->templates);
++        for (j = 0; j < p->event_count; j++)
++        {
++            struct event *e = &p->events[j];
++            free(e->message); free(e->template_id); free(e->level_name); free(e->task_name);
++            free(e->opcode_name); free(e->channel_name); free(e->keyword_names);
++        }
++        free(p->events);
++    }
++    free(m->providers);
++    for (i = 0; i < m->string_count; i++) { free(m->strings[i].id); free(m->strings[i].value); }
++    free(m->strings);
++    free(m->path);
++    free(m);
++}
++
++static BOOL parse_manifest(struct manifest *m, const BYTE *data, DWORD size)
++{
++    IXmlReader *reader = NULL;
++    IStream *stream = NULL;
++    HGLOBAL mem;
++    struct parser ps = { m, NULL, NULL, -1 };
++    XmlNodeType type;
++    BOOL ok = FALSE;
++    HRESULT hr;
++    void *ptr;
++
++    if (!(mem = GlobalAlloc(GMEM_MOVEABLE, size))) return FALSE;
++    ptr = GlobalLock(mem);
++    memcpy(ptr, data, size);
++    GlobalUnlock(mem);
++    if (FAILED(CreateStreamOnHGlobal(mem, TRUE, &stream))) { GlobalFree(mem); return FALSE; }
++    if (FAILED(CreateXmlReader(&IID_IXmlReader, (void **)&reader, NULL))) goto done;
++    IXmlReader_SetProperty(reader, XmlReaderProperty_DtdProcessing, DtdProcessing_Prohibit);
++    if (FAILED(IXmlReader_SetInput(reader, (IUnknown *)stream))) goto done;
++
++    while ((hr = IXmlReader_Read(reader, &type)) == S_OK)
++    {
++        if (type == XmlNodeType_Element)
++        {
++            const WCHAR *name = NULL;
++            struct attrs a = { 0 };
++            BOOL empty = IXmlReader_IsEmptyElement(reader);
++
++            IXmlReader_GetLocalName(reader, &name, NULL);
++            if (IXmlReader_MoveToFirstAttribute(reader) == S_OK)
++            {
++                do
++                {
++                    const WCHAR *an = NULL, *av = NULL;
++                    IXmlReader_GetLocalName(reader, &an, NULL);
++                    IXmlReader_GetValue(reader, &av, NULL);
++                    if (a.count < ARRAY_SIZE(a.name) && an) { a.name[a.count] = wcsdup(an); a.value[a.count] = wcsdup(av ? av : L""); a.count++; }
++                }
++                while (IXmlReader_MoveToNextAttribute(reader) == S_OK);
++                IXmlReader_MoveToElement(reader);
++            }
++            start_element(&ps, name, &a);
++            if (empty) end_element(&ps, name);
++            else if (ps.depth < ARRAY_SIZE(ps.stack)) ps.stack[ps.depth++] = wcsdup(name);
++            free_attrs(&a);
++        }
++        else if (type == XmlNodeType_EndElement)
++        {
++            if (ps.depth)
++            {
++                end_element(&ps, ps.stack[ps.depth - 1]);
++                free(ps.stack[--ps.depth]);
++            }
++        }
++    }
++    ok = hr == S_FALSE && m->provider_count;     /* a manifest without a provider is not one */
++done:
++    while (ps.depth) free(ps.stack[--ps.depth]);
++    if (reader) IXmlReader_Release(reader);
++    IStream_Release(stream);
++    return ok;
++}
++
++/* ---- text resolution ---- */
++
++/* $(string.id) -> the localized string; NULL when it cannot be resolved */
++static const WCHAR *resolve_text(const struct manifest *m, const WCHAR *text)
++{
++    ULONG i;
++    const WCHAR *id;
++
++    if (!text) return NULL;
++    if (wcsncmp(text, L"$(string.", 9)) return NULL;
++    id = text + 9;
++    for (i = 0; i < m->string_count; i++)
++    {
++        size_t len = wcslen(m->strings[i].id);
++        if (!wcsncmp(id, m->strings[i].id, len) && id[len] == ')' && !id[len + 1]) return m->strings[i].value;
++    }
++    return NULL;
++}
++
++/* a name with an optional $(string.) message: the resolved message, else the name */
++static const WCHAR *named_text(const struct manifest *m, const struct named *n)
++{
++    const WCHAR *t;
++    if (!n) return NULL;
++    if ((t = resolve_text(m, n->message))) return t;
++    return n->name;
++}
++
++/* ---- the answer ---- */
++
++struct builder { BYTE *buf; ULONG size, cap; };
++
++static ULONG reserve(struct builder *b, ULONG bytes)
++{
++    ULONG off = b->size;
++    if (b->size + bytes > b->cap)
++    {
++        b->cap = max(b->cap * 2, b->size + bytes + 256);
++        b->buf = realloc(b->buf, b->cap);
++    }
++    memset(b->buf + b->size, 0, bytes);
++    b->size += bytes;
++    return off;
++}
++
++static ULONG add_string(struct builder *b, const WCHAR *s)
++{
++    ULONG off, len;
++    if (!s) return 0;
++    len = (wcslen(s) + 1) * sizeof(WCHAR);
++    off = reserve(b, len);
++    memcpy(b->buf + off, s, len);
++    return off;
++}
++
++static ULONG add_multi(struct builder *b, const WCHAR *multi, ULONG chars)
++{
++    ULONG off = reserve(b, chars * sizeof(WCHAR));
++    memcpy(b->buf + off, multi, chars * sizeof(WCHAR));
++    return off;
++}
++
++static struct provider *find_provider(const GUID *guid, struct manifest **mp)
++{
++    struct manifest *m;
++    ULONG i;
++    for (m = manifests; m; m = m->next)
++        for (i = 0; i < m->provider_count; i++)
++            if (IsEqualGUID(&m->providers[i].guid, guid)) { *mp = m; return &m->providers[i]; }
++    return NULL;
++}
++
++static USHORT lookup_in_type(const WCHAR *name)
++{
++    int i;
++    if (!name) return 1;    /* the schema's default is a string */
++    for (i = 0; i < ARRAY_SIZE(in_types); i++) if (!wcscmp(in_types[i].name, name)) return in_types[i].in;
++    return 1;
++}
++
++static USHORT default_out_type(USHORT in)
++{
++    int i;
++    for (i = 0; i < ARRAY_SIZE(in_types); i++) if (in_types[i].in == in) return in_types[i].out ? in_types[i].out : (sizeof(void *) == 8 ? 19 : 18);
++    return 1;
++}
++
++static USHORT lookup_out_type(const WCHAR *name, USHORT in)
++{
++    int i;
++    if (!name) return default_out_type(in);
++    for (i = 0; i < ARRAY_SIZE(out_types); i++) if (!wcscmp(out_types[i].name, name)) return out_types[i].out;
++    return default_out_type(in);
++}
++
++static int find_property_index(const struct template *t, const WCHAR *name)
++{
++    ULONG i;
++    int top = 0;
++    for (i = 0; i < t->count; i++)
++    {
++        /* indexes are into the top-level properties in declaration order */
++        if (t->items[i].name && !wcscmp(t->items[i].name, name)) return top;
++        top++;
++        if (t->items[i].is_struct) i += t->items[i].struct_members;
++    }
++    return -1;
++}
++
++ULONG tdh_get_event_info(const EVENT_RECORD *event, TRACE_EVENT_INFO_PUBLIC *out, ULONG *size)
++{
++    struct manifest *m;
++    struct provider *p;
++    struct event *e = NULL;
++    struct template *t = NULL;
++    struct builder b = { 0 };
++    TRACE_EVENT_INFO_PUBLIC *info;
++    ULONG i, ret, top_count = 0, total = 0, header, member_base, next_member;
++    const EVENT_DESCRIPTOR *desc = &event->EventHeader.EventDescriptor;
++
++    EnterCriticalSection(&manifest_cs);
++    if (!(p = find_provider(&event->EventHeader.ProviderId, &m))) { ret = ERROR_NOT_FOUND; goto done; }
++    for (i = 0; i < p->event_count; i++)
++#ifdef TDH_MUT_VERSION
++        if (p->events[i].id == desc->Id)
++#else
++        if (p->events[i].id == desc->Id && p->events[i].version == desc->Version)
++#endif
++ { e = &p->events[i]; break; }
++    if (!e) { ret = ERROR_NOT_FOUND; goto done; }
++    if (e->template_id)
++        for (i = 0; i < p->template_count; i++)
++            if (p->templates[i].tid && !wcscmp(p->templates[i].tid, e->template_id)) { t = &p->templates[i]; break; }
++
++    if (t)
++        for (i = 0; i < t->count; i++)
++        {
++            top_count++;
++            total++;
++            if (t->items[i].is_struct) { total += t->items[i].struct_members; i += t->items[i].struct_members; }
++        }
++    header = offsetof(TRACE_EVENT_INFO_PUBLIC, EventPropertyInfoArray) + (total ? total : 1) * sizeof(EVENT_PROPERTY_INFO_PUBLIC);
++    reserve(&b, header);
++    info = (TRACE_EVENT_INFO_PUBLIC *)b.buf;
++
++    /* fixed part first; strings are appended and the offsets patched through b.buf */
++#define PROP(n) (&((TRACE_EVENT_INFO_PUBLIC *)b.buf)->EventPropertyInfoArray[(n)])
++#define SETOFF(field, str) do { ULONG o_ = add_string(&b, (str)); ((TRACE_EVENT_INFO_PUBLIC *)b.buf)->field = o_; } while (0)
++    {
++        const WCHAR *level_text = NULL, *opcode_text = NULL, *task_text = NULL, *channel_text = NULL;
++        UCHAR level = 0, opcode = 0;
++        USHORT task = 0, channel = 0;
++        ULONGLONG keywords = 0;
++        WCHAR *kwlist = NULL;
++        ULONG kwchars = 0;
++
++        if (e->level_name)
++        {
++            const struct named *n = find_named(p->levels, p->level_count, e->level_name);
++            if (n) { level = n->value; level_text = named_text(m, n); }
++            else for (i = 0; i < ARRAY_SIZE(std_levels); i++)
++                if (!wcscmp(std_levels[i].name, e->level_name)) { level = std_levels[i].value; level_text = std_levels[i].text; }
++        }
++        if (e->opcode_name)
++        {
++            const struct named *n = find_named(p->opcodes, p->opcode_count, e->opcode_name);
++            if (n) { opcode = n->value; opcode_text = named_text(m, n); }
++            else for (i = 0; i < ARRAY_SIZE(std_opcodes); i++)
++                if (!wcscmp(std_opcodes[i].name, e->opcode_name)) { opcode = std_opcodes[i].value; opcode_text = std_opcodes[i].text; }
++        }
++        else opcode_text = L"Info";
++        if (e->task_name)
++        {
++            const struct named *n = find_named(p->tasks, p->task_count, e->task_name);
++            if (n) { task = n->value; task_text = named_text(m, n); }
++        }
++        if (e->channel_name)
++        {
++            const struct named *n = NULL;
++            for (i = 0; i < p->channel_count && !n; i++)
++                if (p->channels[i].id && !wcscmp(p->channels[i].id, e->channel_name)) n = &p->channels[i];
++            if (!n) n = find_named(p->channels, p->channel_count, e->channel_name);
++            if (n) { channel = n->value; channel_text = n->name; }
++        }
++        if (e->keyword_names)
++        {
++            WCHAR *copy = wcsdup(e->keyword_names), *tok, *ctx = NULL;
++            kwlist = calloc(wcslen(e->keyword_names) * 4 + 64, sizeof(WCHAR));
++            for (tok = wcstok(copy, L" \t", &ctx); tok; tok = wcstok(NULL, L" \t", &ctx))
++            {
++                const struct named *n = find_named(p->keywords, p->keyword_count, tok);
++                const WCHAR *text = NULL;
++#ifdef TDH_MUT_KEYWORDS
++                if (n) { keywords = n->value; text = named_text(m, n); }
++#else
++                if (n) { keywords |= n->value; text = named_text(m, n); }
++#endif
++                else for (i = 0; i < ARRAY_SIZE(std_keywords); i++)
++                    if (!wcscmp(std_keywords[i].name, tok)) { keywords |= std_keywords[i].mask; text = std_keywords[i].text; }
++                if (text) { wcscpy(kwlist + kwchars, text); kwchars += wcslen(text) + 1; }
++            }
++            free(copy);
++        }
++
++        info = (TRACE_EVENT_INFO_PUBLIC *)b.buf;
++        info->ProviderGuid = p->guid;
++        info->EventDescriptor.Id = e->id;
++        info->EventDescriptor.Version = e->version;
++        info->EventDescriptor.Channel = channel;
++        info->EventDescriptor.Level = level;
++        info->EventDescriptor.Opcode = opcode;
++        info->EventDescriptor.Task = task;
++        info->EventDescriptor.Keyword = keywords;
++        info->DecodingSource = 0;       /* DecodingSourceXMLFile */
++        info->Flags = 1;                /* TEMPLATE_EVENT_DATA */
++        info->PropertyCount = total;
++        info->TopLevelPropertyCount = top_count;
++
++        SETOFF(ProviderNameOffset, p->name);
++        SETOFF(LevelNameOffset, level_text);
++        SETOFF(ChannelNameOffset, channel_text);
++        if (kwchars) { ULONG o = add_multi(&b, kwlist, kwchars + 1); ((TRACE_EVENT_INFO_PUBLIC *)b.buf)->KeywordsNameOffset = o; }
++        SETOFF(TaskNameOffset, task_text);
++        SETOFF(OpcodeNameOffset, opcode_text);
++        SETOFF(EventMessageOffset, resolve_text(m, e->message));
++        SETOFF(ProviderMessageOffset, resolve_text(m, p->message));
++        free(kwlist);
++    }
++
++    /* the properties: top-level ones in order, then the members of the structs */
++    if (t)
++    {
++        ULONG top = 0;
++        member_base = top_count;
++        next_member = member_base;
++        for (i = 0; i < t->count; i++)
++        {
++            struct data_item *d = &t->items[i];
++            ULONG name_off = add_string(&b, d->name);
++            EVENT_PROPERTY_INFO_PUBLIC *prop;
++
++            PROP(top)->NameOffset = name_off;
++            PROP(top)->count = 1;
++            if (d->is_struct)
++            {
++                ULONG k;
++                PROP(top)->Flags = 0x1;      /* PropertyStruct */
++#ifdef TDH_MUT_STRUCT
++                PROP(top)->u.structType.StructStartIndex = next_member + 1;
++#else
++                PROP(top)->u.structType.StructStartIndex = next_member;
++#endif
++                PROP(top)->u.structType.NumOfStructMembers = d->struct_members;
++                for (k = 0; k < d->struct_members; k++)
++                {
++                    struct data_item *md = &t->items[i + 1 + k];
++                    ULONG mo = add_string(&b, md->name), map_off = add_string(&b, md->map);
++                    EVENT_PROPERTY_INFO_PUBLIC *mp = PROP(next_member + k);
++                    USHORT in = lookup_in_type(md->in_type);
++                    mp->NameOffset = mo;
++                    mp->u.nonStructType.InType = in;
++                    mp->u.nonStructType.OutType = lookup_out_type(md->out_type, in);
++                    mp->u.nonStructType.MapNameOffset = map_off;
++                    mp->count = 1;
++                    if (md->length && md->length[0] >= '0' && md->length[0] <= '9') { mp->length = wcstoul(md->length, NULL, 0); mp->Flags |= 0x10; }
++                    else if (md->length) { mp->Flags |= 0x2; mp->length = find_property_index(t, md->length); }
++                    if (md->count && md->count[0] >= '0' && md->count[0] <= '9') mp->count = wcstoul(md->count, NULL, 0);
++                    else if (md->count) { mp->Flags |= 0x4; mp->count = find_property_index(t, md->count); }
++                }
++                if (d->count && d->count[0] >= '0' && d->count[0] <= '9') PROP(top)->count = wcstoul(d->count, NULL, 0);
++                else if (d->count) { PROP(top)->Flags |= 0x4; PROP(top)->count = find_property_index(t, d->count); }
++                next_member += d->struct_members;
++                i += d->struct_members;
++            }
++            else
++            {
++                USHORT in = lookup_in_type(d->in_type);
++                ULONG map_off = add_string(&b, d->map);
++                prop = PROP(top);
++                prop->u.nonStructType.InType = in;
++                prop->u.nonStructType.OutType = lookup_out_type(d->out_type, in);
++                prop->u.nonStructType.MapNameOffset = map_off;
++#ifdef TDH_MUT_LENGTH
++                d->length = NULL;
++#endif
++                if (d->length && d->length[0] >= '0' && d->length[0] <= '9') { prop->length = wcstoul(d->length, NULL, 0); prop->Flags |= 0x10; }
++                else if (d->length) { prop->Flags |= 0x2; prop->length = find_property_index(t, d->length); }
++                if (d->count && d->count[0] >= '0' && d->count[0] <= '9') prop->count = wcstoul(d->count, NULL, 0);
++                else if (d->count) { prop->Flags |= 0x4; prop->count = find_property_index(t, d->count); }
++            }
++            top++;
++        }
++    }
++
++    if (b.size > *size)
++    {
++        *size = b.size;
++        ret = ERROR_INSUFFICIENT_BUFFER;
++    }
++    else
++    {
++        if (out) memcpy(out, b.buf, b.size);
++        *size = b.size;
++        ret = out ? ERROR_SUCCESS : ERROR_INSUFFICIENT_BUFFER;
++    }
++done:
++    LeaveCriticalSection(&manifest_cs);
++    free(b.buf);
++    return ret;
++}
++
++/* ---- load / unload ---- */
++
++ULONG tdh_load_manifest(const WCHAR *path)
++{
++    HANDLE file;
++    DWORD size, got;
++    BYTE *data;
++    struct manifest *m;
++    BOOL ok;
++
++    if (!path || wcslen(path) >= MAX_PATH) return ERROR_INVALID_PARAMETER;
++    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
++    if (file == INVALID_HANDLE_VALUE)
++    {
++        DWORD err = GetLastError();
++        return err == ERROR_PATH_NOT_FOUND ? ERROR_FILE_NOT_FOUND : err;
++    }
++    size = GetFileSize(file, NULL);
++    if (size == INVALID_FILE_SIZE || size > 64 * 1024 * 1024 || !(data = malloc(size + 1))) { CloseHandle(file); return ERROR_OUTOFMEMORY; }
++    ok = ReadFile(file, data, size, &got, NULL) && got == size;
++    CloseHandle(file);
++    if (!ok) { free(data); return ERROR_READ_FAULT; }
++
++    if (!(m = calloc(1, sizeof(*m)))) { free(data); return ERROR_OUTOFMEMORY; }
++    m->path = wcsdup(path);
++    ok = parse_manifest(m, data, size);
++    free(data);
++    if (!ok) { free_manifest(m); return ERROR_XML_PARSE_ERROR; }
++
++    EnterCriticalSection(&manifest_cs);
++    {
++        /* loading the same path again replaces it */
++        struct manifest **link = &manifests;
++        while (*link)
++        {
++            if (!wcsicmp((*link)->path, path)) { struct manifest *old = *link; *link = old->next; free_manifest(old); }
++            else link = &(*link)->next;
++        }
++    }
++    m->next = manifests;
++    manifests = m;
++    LeaveCriticalSection(&manifest_cs);
++    return ERROR_SUCCESS;
++}
++
++ULONG tdh_unload_manifest(const WCHAR *path)
++{
++    struct manifest **link;
++    ULONG ret = ERROR_NOT_FOUND;
++
++    if (!path) return ERROR_INVALID_PARAMETER;
++    EnterCriticalSection(&manifest_cs);
++    for (link = &manifests; *link; link = &(*link)->next)
++        if (!wcsicmp((*link)->path, path))
++        {
++            struct manifest *old = *link;
++#ifndef TDH_MUT_UNLOAD
++            *link = old->next;
++            free_manifest(old);
++#endif
++            ret = ERROR_SUCCESS;
++            break;
++        }
++    LeaveCriticalSection(&manifest_cs);
++    return ret;
++}
+diff --git a/dlls/tdh/tdh_main.c b/dlls/tdh/tdh_main.c
+index e8ab628..85409d4 100644
+--- a/dlls/tdh/tdh_main.c
++++ b/dlls/tdh/tdh_main.c
+@@ -24,7 +24,13 @@
+ #include "winbase.h"
+ #include "winternl.h"
+ #include "winreg.h"
++#include "winuser.h"
++#include "wmistr.h"
++#include "evntrace.h"
++#include "evntprov.h"
++#include "evntcons.h"
+ #include "wine/debug.h"
++#include "tdh_private.h"
+ #include <stdlib.h>
+ #include <stddef.h>
+ 
+@@ -32,14 +38,30 @@ WINE_DEFAULT_DEBUG_CHANNEL(tdh);
+ 
+ ULONG WINAPI TdhLoadManifest(LPWSTR manifest)
+ {
+-    FIXME("(%s): stub\n", debugstr_w(manifest));
+-    return STATUS_SUCCESS;
++    TRACE("(%s)\n", debugstr_w(manifest));
++    return tdh_load_manifest(manifest);
+ }
+ 
++/* The "WEVT_TEMPLATE" resource of a provider binary holds the compiled manifest.
++ * Its binary layout is not documented by Microsoft, so only the documented
++ * checks are made here: the file exists and carries the resource (see ESCALATE.md). */
+ ULONG WINAPI TdhLoadManifestFromBinary(LPWSTR binary)
+ {
+-    FIXME("(%s): stub\n", debugstr_w(binary));
+-    return STATUS_SUCCESS;
++    HMODULE module;
++    DWORD err;
++
++    TRACE("(%s)\n", debugstr_w(binary));
++
++    if (!binary || wcslen(binary) >= MAX_PATH) return ERROR_INVALID_PARAMETER;
++    if (GetFileAttributesW(binary) == INVALID_FILE_ATTRIBUTES) return ERROR_FILE_NOT_FOUND;
++    if (!(module = LoadLibraryExW(binary, NULL, LOAD_LIBRARY_AS_DATAFILE)))
++    {
++        err = GetLastError();
++        return err == ERROR_BAD_EXE_FORMAT || err == ERROR_FILE_INVALID ? ERROR_RESOURCE_NOT_FOUND : err;
++    }
++    err = FindResourceW(module, MAKEINTRESOURCEW(1), L"WEVT_TEMPLATE") ? ERROR_SUCCESS : ERROR_RESOURCE_NOT_FOUND;
++    FreeLibrary(module);
++    return err;
+ }
+ 
+ /* Structures of the Trace Data Helper API (from its published documentation). */
+@@ -96,17 +118,20 @@ ULONG WINAPI TdhCloseDecodingHandle(HANDLE handle)
+ ULONG WINAPI TdhUnloadManifest(const WCHAR *manifest)
+ {
+     TRACE("(%s)\n", debugstr_w(manifest));
+-    if (!manifest) return ERROR_INVALID_PARAMETER;
+-    return ERROR_SUCCESS;
++    return tdh_unload_manifest(manifest);
+ }
+ 
+-/* No schema for any event is known (no manifest is ever really loaded). */
+-ULONG WINAPI TdhGetEventInformation(void *event, ULONG count, void *context, void *info, ULONG *size)
++/* Event metadata comes from the loaded manifests.  WPP (trace message) and
++ * classic events need TMF/MOF data that is not available: ERROR_NOT_FOUND. */
++ULONG WINAPI TdhGetEventInformation(EVENT_RECORD *event, ULONG count, void *context, void *info, ULONG *size)
+ {
+     TRACE("(%p %lu %p %p %p)\n", event, count, context, info, size);
+ 
+-    if (!event || !size) return ERROR_INVALID_PARAMETER;
+-    return ERROR_NOT_FOUND;
++    if (!event || !size || (count && !context)) return ERROR_INVALID_PARAMETER;
++    if (*size && !info) return ERROR_INVALID_PARAMETER;
++    if (event->EventHeader.Flags & (EVENT_HEADER_FLAG_TRACE_MESSAGE | EVENT_HEADER_FLAG_CLASSIC_HEADER))
++        return ERROR_NOT_FOUND;
++    return tdh_get_event_info(event, info, size);
+ }
+ 
+ /* The providers are those that registered a publisher with the event log:
+diff --git a/dlls/tdh/tdh_private.h b/dlls/tdh/tdh_private.h
+new file mode 100644
+index 0000000..2e038e2
+--- /dev/null
++++ b/dlls/tdh/tdh_private.h
+@@ -0,0 +1,47 @@
++#ifndef __WINE_TDH_PRIVATE_H
++#define __WINE_TDH_PRIVATE_H
++
++/* the public layouts of the Trace Data Helper structures (MS documentation of TRACE_EVENT_INFO and EVENT_PROPERTY_INFO) */
++typedef struct
++{
++    ULONG Flags;
++    ULONG NameOffset;
++    union
++    {
++        struct { USHORT InType; USHORT OutType; ULONG MapNameOffset; } nonStructType;
++        struct { USHORT StructStartIndex; USHORT NumOfStructMembers; ULONG padding; } structType;
++    } u;
++    USHORT count;
++    USHORT length;
++    ULONG Reserved;
++} EVENT_PROPERTY_INFO_PUBLIC;
++
++typedef struct
++{
++    GUID ProviderGuid;
++    GUID EventGuid;
++    EVENT_DESCRIPTOR EventDescriptor;
++    ULONG DecodingSource;
++    ULONG ProviderNameOffset;
++    ULONG LevelNameOffset;
++    ULONG ChannelNameOffset;
++    ULONG KeywordsNameOffset;
++    ULONG TaskNameOffset;
++    ULONG OpcodeNameOffset;
++    ULONG EventMessageOffset;
++    ULONG ProviderMessageOffset;
++    ULONG BinaryXMLOffset;
++    ULONG BinaryXMLSize;
++    ULONG ActivityIDNameOffset;
++    ULONG RelatedActivityIDNameOffset;
++    ULONG PropertyCount;
++    ULONG TopLevelPropertyCount;
++    ULONG Flags;
++    EVENT_PROPERTY_INFO_PUBLIC EventPropertyInfoArray[1];
++} TRACE_EVENT_INFO_PUBLIC;
++
++ULONG tdh_get_event_info(const EVENT_RECORD *event, TRACE_EVENT_INFO_PUBLIC *out, ULONG *size);
++ULONG tdh_load_manifest(const WCHAR *path);
++ULONG tdh_unload_manifest(const WCHAR *path);
++
++#endif

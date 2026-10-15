@@ -1,0 +1,2377 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] windows.networking.connectivity: profiles, names, host names, cost, adapter, usage, events (3564)
+
+windows.networking.connectivity: profile lists, names, cost, adapter, usage, host names and status events
+
+NetworkInformation.GetConnectionProfiles returns one profile per connected network of the network list
+manager; profiles are keyed by their network (GetInternetConnectionProfile picks the network that reaches
+the Internet, else the machine's connectivity as before). A profile now answers ProfileName and
+GetNetworkNames (IVectorView<HSTRING>), GetNetworkConnectivityLevel per network, GetConnectionCost (the
+network list manager's cost for the connection that reaches the profile's gateway), GetDataPlanStatus (no
+plan data), NetworkAdapter (speeds and IANA type from the adapter table, NetworkItem, adapter id,
+GetConnectedProfileAsync through an operation that is complete when created), GetLocalUsage and
+GetLocalUsagePerRoamingStates (the interface's byte counters since boot) and NetworkSecuritySettings.
+GetHostNames lists the computer name and the addresses of every connected interface through the
+HostName factory, GetLanIdentifiers is empty (no link-layer discovery data on the host).
+NetworkStatusChanged keeps its handlers and tells them from iphlpapi's interface and address change
+notifications (register on the first handler, cancel on the last). One generic read-only vector
+(IVectorView/IIterable/IIterator) serves HSTRING, ConnectionProfile, LanIdentifier and HostName; the
+IIterable/IIterator ids are declared in the IDL.
+---
+diff --git a/dlls/windows.networking.connectivity/Makefile.in b/dlls/windows.networking.connectivity/Makefile.in
+index 65ea4e0..ee8a3ed 100644
+--- a/dlls/windows.networking.connectivity/Makefile.in
++++ b/dlls/windows.networking.connectivity/Makefile.in
+@@ -1,8 +1,9 @@
+ MODULE        = windows.networking.connectivity.dll
+-IMPORTS       = combase oleaut32
++IMPORTS       = combase oleaut32 iphlpapi ws2_32 ntdll
+ EXTRAIDLFLAGS = -DDO_NO_IMPORTS
+ 
+ SOURCES = \
+ 	classes.idl \
+ 	main.c \
+-	network_information.c
++	network_information.c \
++	vector.c
+diff --git a/dlls/windows.networking.connectivity/network_information.c b/dlls/windows.networking.connectivity/network_information.c
+index 70b9b56..3a3e773 100644
+--- a/dlls/windows.networking.connectivity/network_information.c
++++ b/dlls/windows.networking.connectivity/network_information.c
+@@ -19,12 +19,16 @@
+ 
+ #include "private.h"
+ #include "initguid.h"
++#include "winsock2.h"
++#include "ws2ipdef.h"
++#include "iphlpapi.h"
++#include "netioapi.h"
++#include "ip2string.h"
++#include "roapi.h"
+ #include "netlistmgr.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(connectivity);
+ 
+-static EventRegistrationToken dummy_cookie = {.value = 0xdeadbeef};
+-
+ struct network_information_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+@@ -115,39 +119,743 @@ static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HS
+     return get_class_name( RuntimeClass_Windows_Networking_Connectivity_NetworkInformation, class_name );
+ }
+ 
+-static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    return get_base_trust( trust_level );
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    TRACE( "iface %p, instance %p: NetworkInformation is a static class.\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    /* IInspectable methods */
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    factory_ActivateInstance,
++};
++
++
++/* ---- the host network, as the objects below see it ---- */
++
++struct adapter_info
++{
++    GUID id;
++    NET_LUID luid;
++    DWORD if_index;
++    DWORD if_type;
++    ULONG64 tx_speed, rx_speed;
++    IF_OPER_STATUS oper_status;
++    BOOL has_gateway;
++    SOCKADDR_IN gateway;
++};
++
++static IP_ADAPTER_ADDRESSES *get_adapters( void )
++{
++    ULONG size = 16384, flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS;
++    IP_ADAPTER_ADDRESSES *buf;
++    ULONG err, tries;
++
++    for (tries = 0; tries < 4; tries++)
++    {
++        if (!(buf = malloc( size ))) return NULL;
++        if (!(err = GetAdaptersAddresses( AF_UNSPEC, flags, NULL, buf, &size ))) return buf;
++        free( buf );
++        if (err != ERROR_BUFFER_OVERFLOW) break;
++    }
++    return NULL;
++}
++
++static void fill_adapter_info( const IP_ADAPTER_ADDRESSES *aa, struct adapter_info *info )
++{
++    IP_ADAPTER_GATEWAY_ADDRESS_LH *gw;
++
++    memset( info, 0, sizeof(*info) );
++    ConvertInterfaceLuidToGuid( &aa->Luid, &info->id );
++    info->luid = aa->Luid;
++    info->if_index = aa->IfIndex;
++    info->if_type = aa->IfType;
++    info->tx_speed = aa->TransmitLinkSpeed == ~(ULONG64)0 ? 0 : aa->TransmitLinkSpeed;
++    info->rx_speed = aa->ReceiveLinkSpeed == ~(ULONG64)0 ? 0 : aa->ReceiveLinkSpeed;
++    info->oper_status = aa->OperStatus;
++    for (gw = aa->FirstGatewayAddress; gw; gw = gw->Next)
++        if (gw->Address.lpSockaddr && gw->Address.lpSockaddr->sa_family == AF_INET)
++        {
++            info->gateway = *(SOCKADDR_IN *)gw->Address.lpSockaddr;
++            info->has_gateway = TRUE;
++            break;
++        }
++}
++
++static BOOL find_adapter( const GUID *id, struct adapter_info *info )
++{
++    IP_ADAPTER_ADDRESSES *all, *aa;
++    BOOL found = FALSE;
++    GUID guid;
++
++    if (!(all = get_adapters())) return FALSE;
++    for (aa = all; aa && !found; aa = aa->Next)
++    {
++        if (ConvertInterfaceLuidToGuid( &aa->Luid, &guid ) || !IsEqualGUID( &guid, id )) continue;
++        fill_adapter_info( aa, info );
++        found = TRUE;
++    }
++    free( all );
++    return found;
++}
++
++static NetworkConnectivityLevel connectivity_level( NLM_CONNECTIVITY connectivity )
++{
++    if (connectivity == NLM_CONNECTIVITY_DISCONNECTED) return NetworkConnectivityLevel_None;
++    if (connectivity & ( NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET ))
++        return NetworkConnectivityLevel_InternetAccess;
++    if (connectivity & ( NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV6_LOCALNETWORK |
++                         NLM_CONNECTIVITY_IPV4_NOTRAFFIC | NLM_CONNECTIVITY_IPV6_NOTRAFFIC ))
++        return NetworkConnectivityLevel_LocalAccess;
++    return NetworkConnectivityLevel_ConstrainedInternetAccess;
++}
++
++/* the class boilerplate of the single-interface objects */
++#define DEFINE_OBJECT( pfx, itype, st, member, iid, classname )                                         \
++    static inline st *pfx##_from( itype *iface ) { return CONTAINING_RECORD( iface, st, member ); }     \
++    static void pfx##_destroy( st *impl );                                                               \
++    static HRESULT WINAPI pfx##_QueryInterface( itype *iface, REFIID riid, void **out )                  \
++    {                                                                                                    \
++        st *impl = pfx##_from( iface );                                                                  \
++        TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( riid ), out );                       \
++        if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IInspectable ) ||              \
++            IsEqualGUID( riid, &IID_IAgileObject ) || IsEqualGUID( riid, iid ))                          \
++        {                                                                                                \
++            *out = &impl->member;                                                                        \
++            InterlockedIncrement( &impl->ref );                                                          \
++            return S_OK;                                                                                 \
++        }                                                                                                \
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( riid ) );                \
++        *out = NULL;                                                                                     \
++        return E_NOINTERFACE;                                                                            \
++    }                                                                                                    \
++    static ULONG WINAPI pfx##_AddRef( itype *iface )                                                     \
++    {                                                                                                    \
++        return InterlockedIncrement( &pfx##_from( iface )->ref );                                        \
++    }                                                                                                    \
++    static ULONG WINAPI pfx##_Release( itype *iface )                                                    \
++    {                                                                                                    \
++        st *impl = pfx##_from( iface );                                                                  \
++        ULONG ref = InterlockedDecrement( &impl->ref );                                                  \
++        if (!ref) pfx##_destroy( impl );                                                                 \
++        return ref;                                                                                      \
++    }                                                                                                    \
++    static HRESULT WINAPI pfx##_GetIids( itype *iface, ULONG *count, IID **iids )                        \
++    {                                                                                                    \
++        return get_one_iid( iid, count, iids );                                                          \
++    }                                                                                                    \
++    static HRESULT WINAPI pfx##_GetRuntimeClassName( itype *iface, HSTRING *name )                       \
++    {                                                                                                    \
++        return get_class_name( classname, name );                                                        \
++    }                                                                                                    \
++    static HRESULT WINAPI pfx##_GetTrustLevel( itype *iface, TrustLevel *level )                         \
++    {                                                                                                    \
++        return get_base_trust( level );                                                                  \
++    }
++
++#define OBJECT_VTBL_HEAD( pfx ) \
++    pfx##_QueryInterface, pfx##_AddRef, pfx##_Release, pfx##_GetIids, pfx##_GetRuntimeClassName, pfx##_GetTrustLevel
++
++/* ---- ConnectionCost ---- */
++
++struct connection_cost
++{
++    IConnectionCost IConnectionCost_iface;
++    LONG ref;
++    NetworkCostType type;
++    boolean roaming, over_limit, approaching_limit;
++};
++
++DEFINE_OBJECT( connection_cost, IConnectionCost, struct connection_cost, IConnectionCost_iface,
++               &IID_IConnectionCost, RuntimeClass_Windows_Networking_Connectivity_ConnectionCost )
++
++static void connection_cost_destroy( struct connection_cost *impl ) { free( impl ); }
++
++static HRESULT WINAPI connection_cost_get_NetworkCostType( IConnectionCost *iface, NetworkCostType *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = connection_cost_from( iface )->type;
++    return S_OK;
++}
++
++static HRESULT WINAPI connection_cost_get_Roaming( IConnectionCost *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = connection_cost_from( iface )->roaming;
++    return S_OK;
++}
++
++static HRESULT WINAPI connection_cost_get_OverDataLimit( IConnectionCost *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = connection_cost_from( iface )->over_limit;
++    return S_OK;
++}
++
++static HRESULT WINAPI connection_cost_get_ApproachingDataLimit( IConnectionCost *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = connection_cost_from( iface )->approaching_limit;
++    return S_OK;
++}
++
++static const IConnectionCostVtbl connection_cost_vtbl =
++{
++    OBJECT_VTBL_HEAD( connection_cost ),
++    connection_cost_get_NetworkCostType,
++    connection_cost_get_Roaming,
++    connection_cost_get_OverDataLimit,
++    connection_cost_get_ApproachingDataLimit,
++};
++
++/* ---- DataPlanStatus: a machine without a data plan reports no plan data ---- */
++
++struct data_plan_status
++{
++    IDataPlanStatus IDataPlanStatus_iface;
++    LONG ref;
++};
++
++DEFINE_OBJECT( data_plan_status, IDataPlanStatus, struct data_plan_status, IDataPlanStatus_iface,
++               &IID_IDataPlanStatus, RuntimeClass_Windows_Networking_Connectivity_DataPlanStatus )
++
++static void data_plan_status_destroy( struct data_plan_status *impl ) { free( impl ); }
++
++static HRESULT WINAPI data_plan_status_get_DataPlanUsage( IDataPlanStatus *iface, IDataPlanUsage **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI data_plan_status_get_DataLimitInMegabytes( IDataPlanStatus *iface, IReference_UINT32 **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI data_plan_status_get_InboundBitsPerSecond( IDataPlanStatus *iface, IReference_UINT64 **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI data_plan_status_get_OutboundBitsPerSecond( IDataPlanStatus *iface, IReference_UINT64 **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI data_plan_status_get_NextBillingCycle( IDataPlanStatus *iface, IReference_DateTime **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI data_plan_status_get_MaxTransferSizeInMegabytes( IDataPlanStatus *iface, IReference_UINT32 **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static const IDataPlanStatusVtbl data_plan_status_vtbl =
++{
++    OBJECT_VTBL_HEAD( data_plan_status ),
++    data_plan_status_get_DataPlanUsage,
++    data_plan_status_get_DataLimitInMegabytes,
++    data_plan_status_get_InboundBitsPerSecond,
++    data_plan_status_get_OutboundBitsPerSecond,
++    data_plan_status_get_NextBillingCycle,
++    data_plan_status_get_MaxTransferSizeInMegabytes,
++};
++
++/* ---- DataUsage ---- */
++
++struct data_usage
++{
++    IDataUsage IDataUsage_iface;
++    LONG ref;
++    UINT64 sent, received;
++};
++
++DEFINE_OBJECT( data_usage, IDataUsage, struct data_usage, IDataUsage_iface,
++               &IID_IDataUsage, RuntimeClass_Windows_Networking_Connectivity_DataUsage )
++
++static void data_usage_destroy( struct data_usage *impl ) { free( impl ); }
++
++static HRESULT WINAPI data_usage_get_BytesSent( IDataUsage *iface, UINT64 *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = data_usage_from( iface )->sent;
++    return S_OK;
++}
++
++static HRESULT WINAPI data_usage_get_BytesReceived( IDataUsage *iface, UINT64 *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = data_usage_from( iface )->received;
++    return S_OK;
++}
++
++static const IDataUsageVtbl data_usage_vtbl =
++{
++    OBJECT_VTBL_HEAD( data_usage ),
++    data_usage_get_BytesSent,
++    data_usage_get_BytesReceived,
++};
++
++/* ---- NetworkSecuritySettings ---- */
++
++struct security_settings
++{
++    INetworkSecuritySettings INetworkSecuritySettings_iface;
++    LONG ref;
++    NetworkAuthenticationType auth;
++    NetworkEncryptionType encryption;
++};
++
++DEFINE_OBJECT( security_settings, INetworkSecuritySettings, struct security_settings, INetworkSecuritySettings_iface,
++               &IID_INetworkSecuritySettings, RuntimeClass_Windows_Networking_Connectivity_NetworkSecuritySettings )
++
++static void security_settings_destroy( struct security_settings *impl ) { free( impl ); }
++
++static HRESULT WINAPI security_settings_get_NetworkAuthenticationType( INetworkSecuritySettings *iface,
++                                                                       NetworkAuthenticationType *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = security_settings_from( iface )->auth;
++    return S_OK;
++}
++
++static HRESULT WINAPI security_settings_get_NetworkEncryptionType( INetworkSecuritySettings *iface,
++                                                                   NetworkEncryptionType *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = security_settings_from( iface )->encryption;
++    return S_OK;
++}
++
++static const INetworkSecuritySettingsVtbl security_settings_vtbl =
++{
++    OBJECT_VTBL_HEAD( security_settings ),
++    security_settings_get_NetworkAuthenticationType,
++    security_settings_get_NetworkEncryptionType,
++};
++
++/* ---- NetworkItem ---- */
++
++struct network_item
++{
++    INetworkItem INetworkItem_iface;
++    LONG ref;
++    GUID network_id;
++    NetworkTypes types;
++};
++
++DEFINE_OBJECT( network_item, INetworkItem, struct network_item, INetworkItem_iface,
++               &IID_INetworkItem, RuntimeClass_Windows_Networking_Connectivity_NetworkItem )
++
++static void network_item_destroy( struct network_item *impl ) { free( impl ); }
++
++static HRESULT WINAPI network_item_get_NetworkId( INetworkItem *iface, GUID *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = network_item_from( iface )->network_id;
++    return S_OK;
++}
++
++static HRESULT WINAPI network_item_GetNetworkTypes( INetworkItem *iface, NetworkTypes *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = network_item_from( iface )->types;
++    return S_OK;
++}
++
++static const INetworkItemVtbl network_item_vtbl =
++{
++    OBJECT_VTBL_HEAD( network_item ),
++    network_item_get_NetworkId,
++    network_item_GetNetworkTypes,
++};
++
++/* ---- ConnectionProfile (declared early: NetworkAdapter hands one out) ---- */
++
++struct connection_profile
++{
++    IConnectionProfile IConnectionProfile_iface;
++    LONG ref;
++
++    INetworkListManager *network_list_manager;
++    GUID network_id;
++    BOOL has_network;  /* else: the machine's connectivity, the first connected network */
++};
++
++static HRESULT create_profile( const GUID *network_id, IConnectionProfile **out );
++
++/* ---- async operation that is complete when it is created ---- */
++
++struct profile_async
++{
++    IAsyncOperation_ConnectionProfile IAsyncOperation_ConnectionProfile_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++
++    IConnectionProfile *result;
++    IAsyncOperationCompletedHandler_ConnectionProfile *handler;
++    AsyncStatus status;
++    HRESULT error;
++    UINT32 id;
++};
++
++static inline struct profile_async *profile_async_from( IAsyncOperation_ConnectionProfile *iface )
++{
++    return CONTAINING_RECORD( iface, struct profile_async, IAsyncOperation_ConnectionProfile_iface );
++}
++
++static inline struct profile_async *profile_async_from_info( IAsyncInfo *iface )
++{
++    return CONTAINING_RECORD( iface, struct profile_async, IAsyncInfo_iface );
++}
++
++static HRESULT WINAPI profile_async_QueryInterface( IAsyncOperation_ConnectionProfile *iface, REFIID iid, void **out )
++{
++    struct profile_async *impl = profile_async_from( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncOperation_ConnectionProfile ))
++        *out = &impl->IAsyncOperation_ConnectionProfile_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++        *out = &impl->IAsyncInfo_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement( &impl->ref );
++    return S_OK;
++}
++
++static ULONG WINAPI profile_async_AddRef( IAsyncOperation_ConnectionProfile *iface )
++{
++    return InterlockedIncrement( &profile_async_from( iface )->ref );
++}
++
++static ULONG WINAPI profile_async_Release( IAsyncOperation_ConnectionProfile *iface )
++{
++    struct profile_async *impl = profile_async_from( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        if (impl->result) IConnectionProfile_Release( impl->result );
++        if (impl->handler) IAsyncOperationCompletedHandler_ConnectionProfile_Release( impl->handler );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI profile_async_GetIids( IAsyncOperation_ConnectionProfile *iface, ULONG *count, IID **iids )
++{
++    IID *list;
++
++    if (!count || !iids) return E_POINTER;
++    if (!(list = CoTaskMemAlloc( 2 * sizeof(IID) ))) return E_OUTOFMEMORY;
++    list[0] = IID_IAsyncOperation_ConnectionProfile;
++    list[1] = IID_IAsyncInfo;
++    *iids = list;
++    *count = 2;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_async_GetRuntimeClassName( IAsyncOperation_ConnectionProfile *iface, HSTRING *name )
++{
++    return get_class_name( L"Windows.Foundation.IAsyncOperation`1<Windows.Networking.Connectivity.ConnectionProfile>", name );
++}
++
++static HRESULT WINAPI profile_async_GetTrustLevel( IAsyncOperation_ConnectionProfile *iface, TrustLevel *level )
++{
++    return get_base_trust( level );
++}
++
++static HRESULT WINAPI profile_async_put_Completed( IAsyncOperation_ConnectionProfile *iface,
++                                                   IAsyncOperationCompletedHandler_ConnectionProfile *handler )
++{
++    struct profile_async *impl = profile_async_from( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    if (!handler) return S_OK;
++    IAsyncOperationCompletedHandler_ConnectionProfile_AddRef( (impl->handler = handler) );
++    /* already complete: the handler runs at once */
++    IAsyncOperationCompletedHandler_ConnectionProfile_Invoke( handler, iface, impl->status );
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_async_get_Completed( IAsyncOperation_ConnectionProfile *iface,
++                                                   IAsyncOperationCompletedHandler_ConnectionProfile **handler )
++{
++    struct profile_async *impl = profile_async_from( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    if (!handler) return E_POINTER;
++    if ((*handler = impl->handler)) IAsyncOperationCompletedHandler_ConnectionProfile_AddRef( *handler );
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_async_GetResults( IAsyncOperation_ConnectionProfile *iface, IConnectionProfile **results )
++{
++    struct profile_async *impl = profile_async_from( iface );
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++    if (!results) return E_POINTER;
++    *results = NULL;
++    if (impl->status == Error) return impl->error;
++    if ((*results = impl->result)) IConnectionProfile_AddRef( *results );
++    return S_OK;
++}
++
++static const struct IAsyncOperation_ConnectionProfileVtbl profile_async_vtbl =
++{
++    profile_async_QueryInterface,
++    profile_async_AddRef,
++    profile_async_Release,
++    profile_async_GetIids,
++    profile_async_GetRuntimeClassName,
++    profile_async_GetTrustLevel,
++    profile_async_put_Completed,
++    profile_async_get_Completed,
++    profile_async_GetResults,
++};
++
++static HRESULT WINAPI profile_async_info_QueryInterface( IAsyncInfo *iface, REFIID iid, void **out )
++{
++    return profile_async_QueryInterface( &profile_async_from_info( iface )->IAsyncOperation_ConnectionProfile_iface, iid, out );
++}
++
++static ULONG WINAPI profile_async_info_AddRef( IAsyncInfo *iface )
++{
++    return profile_async_AddRef( &profile_async_from_info( iface )->IAsyncOperation_ConnectionProfile_iface );
++}
++
++static ULONG WINAPI profile_async_info_Release( IAsyncInfo *iface )
++{
++    return profile_async_Release( &profile_async_from_info( iface )->IAsyncOperation_ConnectionProfile_iface );
++}
++
++static HRESULT WINAPI profile_async_info_GetIids( IAsyncInfo *iface, ULONG *count, IID **iids )
++{
++    return profile_async_GetIids( &profile_async_from_info( iface )->IAsyncOperation_ConnectionProfile_iface, count, iids );
++}
++
++static HRESULT WINAPI profile_async_info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *name )
++{
++    return profile_async_GetRuntimeClassName( &profile_async_from_info( iface )->IAsyncOperation_ConnectionProfile_iface, name );
++}
++
++static HRESULT WINAPI profile_async_info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level )
++{
++    return get_base_trust( level );
++}
++
++static HRESULT WINAPI profile_async_info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    if (!id) return E_POINTER;
++    *id = profile_async_from_info( iface )->id;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_async_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    if (!status) return E_POINTER;
++    *status = profile_async_from_info( iface )->status;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_async_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *code )
++{
++    if (!code) return E_POINTER;
++    *code = profile_async_from_info( iface )->error;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_async_info_Cancel( IAsyncInfo *iface )
++{
++    return S_OK;  /* complete already */
++}
++
++static HRESULT WINAPI profile_async_info_Close( IAsyncInfo *iface )
++{
++    return S_OK;
++}
++
++static const struct IAsyncInfoVtbl profile_async_info_vtbl =
++{
++    profile_async_info_QueryInterface,
++    profile_async_info_AddRef,
++    profile_async_info_Release,
++    profile_async_info_GetIids,
++    profile_async_info_GetRuntimeClassName,
++    profile_async_info_GetTrustLevel,
++    profile_async_info_get_Id,
++    profile_async_info_get_Status,
++    profile_async_info_get_ErrorCode,
++    profile_async_info_Cancel,
++    profile_async_info_Close,
++};
++
++static HRESULT profile_async_create( IConnectionProfile *result, HRESULT error, IAsyncOperation_ConnectionProfile **out )
++{
++    static LONG next_id = 1;
++    struct profile_async *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_ConnectionProfile_iface.lpVtbl = &profile_async_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &profile_async_info_vtbl;
++    impl->ref = 1;
++    impl->id = InterlockedIncrement( &next_id );
++    impl->error = error;
++    impl->status = FAILED(error) ? Error : Completed;
++    if ((impl->result = result)) IConnectionProfile_AddRef( result );
++    *out = &impl->IAsyncOperation_ConnectionProfile_iface;
++    return S_OK;
++}
++
++/* ---- NetworkAdapter ---- */
++
++struct network_adapter
++{
++    INetworkAdapter INetworkAdapter_iface;
++    LONG ref;
++
++    struct adapter_info info;
++    GUID network_id;
++    BOOL has_network_id;
++    NetworkTypes types;
++};
++
++DEFINE_OBJECT( network_adapter, INetworkAdapter, struct network_adapter, INetworkAdapter_iface,
++               &IID_INetworkAdapter, RuntimeClass_Windows_Networking_Connectivity_NetworkAdapter )
++
++static void network_adapter_destroy( struct network_adapter *impl ) { free( impl ); }
++
++static HRESULT WINAPI network_adapter_get_OutboundMaxBitsPerSecond( INetworkAdapter *iface, UINT64 *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = network_adapter_from( iface )->info.tx_speed;
++    return S_OK;
++}
++
++static HRESULT WINAPI network_adapter_get_InboundMaxBitsPerSecond( INetworkAdapter *iface, UINT64 *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = network_adapter_from( iface )->info.rx_speed;
++    return S_OK;
++}
++
++static HRESULT WINAPI network_adapter_get_IanaInterfaceType( INetworkAdapter *iface, UINT32 *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = network_adapter_from( iface )->info.if_type;
++    return S_OK;
++}
++
++static HRESULT WINAPI network_adapter_get_NetworkItem( INetworkAdapter *iface, INetworkItem **value )
+ {
+-    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
+-    return get_base_trust( trust_level );
++    struct network_adapter *impl = network_adapter_from( iface );
++    struct network_item *item;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!(item = calloc( 1, sizeof(*item) ))) return E_OUTOFMEMORY;
++    item->INetworkItem_iface.lpVtbl = &network_item_vtbl;
++    item->ref = 1;
++    item->network_id = impl->network_id;
++    item->types = impl->types;
++    *value = &item->INetworkItem_iface;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++static HRESULT WINAPI network_adapter_get_NetworkAdapterId( INetworkAdapter *iface, GUID *value )
+ {
+-    TRACE( "iface %p, instance %p: NetworkInformation is a static class.\n", iface, instance );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = network_adapter_from( iface )->info.id;
++    return S_OK;
+ }
+ 
+-static const struct IActivationFactoryVtbl factory_vtbl =
++static HRESULT WINAPI network_adapter_GetConnectedProfileAsync( INetworkAdapter *iface,
++                                                                IAsyncOperation_ConnectionProfile **value )
+ {
+-    factory_QueryInterface,
+-    factory_AddRef,
+-    factory_Release,
+-    /* IInspectable methods */
+-    factory_GetIids,
+-    factory_GetRuntimeClassName,
+-    factory_GetTrustLevel,
+-    /* IActivationFactory methods */
+-    factory_ActivateInstance,
+-};
++    struct network_adapter *impl = network_adapter_from( iface );
++    IConnectionProfile *profile = NULL;
++    HRESULT hr, error = S_OK;
+ 
+-struct connection_profile
+-{
+-    IConnectionProfile IConnectionProfile_iface;
+-    LONG ref;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    /* an adapter that is not connected has no profile: the result is empty */
++    if (impl->info.oper_status == IfOperStatusUp && impl->has_network_id)
++        error = create_profile( &impl->network_id, &profile );
++    hr = profile_async_create( profile, error, value );
++    if (profile) IConnectionProfile_Release( profile );
++    return hr;
++}
+ 
+-    INetworkListManager *network_list_manager;
++static const INetworkAdapterVtbl network_adapter_vtbl =
++{
++    OBJECT_VTBL_HEAD( network_adapter ),
++    network_adapter_get_OutboundMaxBitsPerSecond,
++    network_adapter_get_InboundMaxBitsPerSecond,
++    network_adapter_get_IanaInterfaceType,
++    network_adapter_get_NetworkItem,
++    network_adapter_get_NetworkAdapterId,
++    network_adapter_GetConnectedProfileAsync,
+ };
+ 
++/* ---- ConnectionProfile ---- */
++
+ static inline struct connection_profile *impl_from_IConnectionProfile( IConnectionProfile *iface )
+ {
+     return CONTAINING_RECORD( iface, struct connection_profile, IConnectionProfile_iface );
+@@ -215,26 +923,72 @@ static HRESULT WINAPI connection_profile_GetTrustLevel( IConnectionProfile *ifac
+     return get_base_trust( trust_level );
+ }
+ 
+-/* the name of the first connected network */
+-static HRESULT WINAPI connection_profile_get_ProfileName( IConnectionProfile *iface, HSTRING *value )
++/* the network a profile stands for */
++static HRESULT profile_get_network( struct connection_profile *impl, INetwork **network )
+ {
+-    struct connection_profile *impl = impl_from_IConnectionProfile( iface );
+     IEnumNetworks *networks;
+-    INetwork *network;
+     ULONG fetched = 0;
+-    BSTR name;
+     HRESULT hr;
+ 
+-    TRACE( "iface %p, value %p.\n", iface, value );
++    *network = NULL;
++    if (impl->has_network)
++    {
++        if (FAILED(hr = INetworkListManager_GetNetwork( impl->network_list_manager, impl->network_id, network )))
++            return hr;
++        return *network ? S_OK : HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++    }
+ 
+-    if (!value) return E_POINTER;
+-    *value = NULL;
+     if (FAILED(hr = INetworkListManager_GetNetworks( impl->network_list_manager, NLM_ENUM_NETWORK_CONNECTED, &networks )))
+         return hr;
+-    hr = IEnumNetworks_Next( networks, 1, &network, &fetched );
++    hr = IEnumNetworks_Next( networks, 1, network, &fetched );
+     IEnumNetworks_Release( networks );
+     if (hr != S_OK || !fetched) return HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++    return S_OK;
++}
++
++/* the adapter of a profile's network */
++static HRESULT profile_get_adapter( struct connection_profile *impl, struct adapter_info *info, INetwork **network_out,
++                                    NLM_CONNECTIVITY *connectivity )
++{
++    IEnumNetworkConnections *connections;
++    INetworkConnection *connection;
++    INetwork *network;
++    ULONG fetched = 0;
++    GUID adapter_id;
++    HRESULT hr;
++
++    if (FAILED(hr = profile_get_network( impl, &network ))) return hr;
++    if (connectivity && FAILED(INetwork_GetConnectivity( network, connectivity ))) *connectivity = 0;
++
++    hr = HRESULT_FROM_WIN32( ERROR_NOT_FOUND );
++    if (SUCCEEDED(INetwork_GetNetworkConnections( network, &connections )))
++    {
++        if (IEnumNetworkConnections_Next( connections, 1, &connection, &fetched ) == S_OK && fetched)
++        {
++            if (SUCCEEDED(INetworkConnection_GetAdapterId( connection, &adapter_id )) && find_adapter( &adapter_id, info ))
++                hr = S_OK;
++            INetworkConnection_Release( connection );
++        }
++        IEnumNetworkConnections_Release( connections );
++    }
++    if (network_out) *network_out = network;
++    else INetwork_Release( network );
++    return hr;
++}
++
++/* the name of the network */
++static HRESULT WINAPI connection_profile_get_ProfileName( IConnectionProfile *iface, HSTRING *value )
++{
++    struct connection_profile *impl = impl_from_IConnectionProfile( iface );
++    INetwork *network;
++    BSTR name;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
+ 
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = profile_get_network( impl, &network ))) return hr;
+     hr = INetwork_GetName( network, &name );
+     INetwork_Release( network );
+     if (FAILED(hr)) return hr;
+@@ -246,68 +1000,202 @@ static HRESULT WINAPI connection_profile_get_ProfileName( IConnectionProfile *if
+ static HRESULT WINAPI connection_profile_GetNetworkConnectivityLevel( IConnectionProfile *iface, NetworkConnectivityLevel *value )
+ {
+     struct connection_profile *impl = impl_from_IConnectionProfile( iface );
+-    NetworkConnectivityLevel network_connectivity_level;
+     NLM_CONNECTIVITY connectivity = 0xdeadbeef;
++    INetwork *network;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, value %p\n", iface, value );
+ 
+     if (!value) return E_POINTER;
+-    if (FAILED(hr = INetworkListManager_GetConnectivity( impl->network_list_manager, &connectivity ))) return hr;
+-
+-    if (connectivity == NLM_CONNECTIVITY_DISCONNECTED)
+-        network_connectivity_level = NetworkConnectivityLevel_None;
+-    else if (connectivity & ( NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET ))
+-        network_connectivity_level = NetworkConnectivityLevel_InternetAccess;
+-    else if (connectivity & ( NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV6_LOCALNETWORK | NLM_CONNECTIVITY_IPV4_NOTRAFFIC | NLM_CONNECTIVITY_IPV6_NOTRAFFIC ))
+-        network_connectivity_level = NetworkConnectivityLevel_LocalAccess;
+-    else
+-        network_connectivity_level = NetworkConnectivityLevel_ConstrainedInternetAccess;
++    if (impl->has_network)
++    {
++        if (FAILED(hr = profile_get_network( impl, &network ))) return hr;
++        hr = INetwork_GetConnectivity( network, &connectivity );
++        INetwork_Release( network );
++    }
++    else hr = INetworkListManager_GetConnectivity( impl->network_list_manager, &connectivity );
++    if (FAILED(hr)) return hr;
+ 
+-    *value = network_connectivity_level;
++    *value = connectivity_level( connectivity );
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI connection_profile_GetNetworkNames( IConnectionProfile *iface, IVectorView_HSTRING **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    HSTRING name;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = connection_profile_get_ProfileName( iface, &name ))) return hr;
++    return vector_view_create( VECTOR_HSTRING, (void **)&name, 1, (void **)value );
+ }
+ 
+ static HRESULT WINAPI connection_profile_GetConnectionCost( IConnectionProfile *iface, IConnectionCost **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct connection_profile *impl = impl_from_IConnectionProfile( iface );
++    struct connection_cost *cost;
++    INetworkCostManager *manager;
++    struct adapter_info adapter;
++    NLM_SOCKADDR dest;
++    BOOL have_dest = FALSE;
++    DWORD flags = 0;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = INetworkListManager_QueryInterface( impl->network_list_manager, &IID_INetworkCostManager,
++                                                        (void **)&manager ))) return hr;
++
++    /* the cost of the connection the profile's network is reached by */
++    memset( &dest, 0, sizeof(dest) );
++    if (SUCCEEDED(profile_get_adapter( impl, &adapter, NULL, NULL )) && adapter.has_gateway)
++    {
++        memcpy( &dest, &adapter.gateway, sizeof(adapter.gateway) );
++        have_dest = TRUE;
++    }
++    hr = INetworkCostManager_GetCost( manager, &flags, have_dest ? &dest : NULL );
++    INetworkCostManager_Release( manager );
++    if (FAILED(hr)) return hr;
++
++    if (!(cost = calloc( 1, sizeof(*cost) ))) return E_OUTOFMEMORY;
++    cost->IConnectionCost_iface.lpVtbl = &connection_cost_vtbl;
++    cost->ref = 1;
++    if (flags & NLM_CONNECTION_COST_FIXED) cost->type = NetworkCostType_Fixed;
++    else if (flags & NLM_CONNECTION_COST_VARIABLE) cost->type = NetworkCostType_Variable;
++    else if (flags & NLM_CONNECTION_COST_UNRESTRICTED) cost->type = NetworkCostType_Unrestricted;
++    else cost->type = NetworkCostType_Unknown;
++    cost->roaming = !!(flags & NLM_CONNECTION_COST_ROAMING);
++    cost->over_limit = !!(flags & NLM_CONNECTION_COST_OVERDATALIMIT);
++    cost->approaching_limit = !!(flags & NLM_CONNECTION_COST_APPROACHINGDATALIMIT);
++    *value = &cost->IConnectionCost_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI connection_profile_GetDataPlanStatus( IConnectionProfile *iface, IDataPlanStatus **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct data_plan_status *status;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!(status = calloc( 1, sizeof(*status) ))) return E_OUTOFMEMORY;
++    status->IDataPlanStatus_iface.lpVtbl = &data_plan_status_vtbl;
++    status->ref = 1;
++    *value = &status->IDataPlanStatus_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI connection_profile_get_NetworkAdapter( IConnectionProfile *iface, INetworkAdapter **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct connection_profile *impl = impl_from_IConnectionProfile( iface );
++    struct network_adapter *adapter;
++    NLM_CONNECTIVITY connectivity = 0;
++    INetwork *network;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!(adapter = calloc( 1, sizeof(*adapter) ))) return E_OUTOFMEMORY;
++    if (FAILED(hr = profile_get_adapter( impl, &adapter->info, &network, &connectivity )))
++    {
++        free( adapter );
++        return hr;
++    }
++    adapter->has_network_id = SUCCEEDED(INetwork_GetNetworkId( network, &adapter->network_id ));
++    INetwork_Release( network );
++    adapter->types = NetworkTypes_PrivateNetwork;
++    if (connectivity & ( NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET ))
++        adapter->types = NetworkTypes_Internet;
++    adapter->INetworkAdapter_iface.lpVtbl = &network_adapter_vtbl;
++    adapter->ref = 1;
++    *value = &adapter->INetworkAdapter_iface;
++    return S_OK;
++}
++
++static HRESULT get_local_usage( struct connection_profile *impl, DateTime start, DateTime end, RoamingStates states,
++                                IDataUsage **value )
++{
++    struct adapter_info adapter;
++    struct data_usage *usage;
++    MIB_IF_ROW2 row;
++    FILETIME now;
++    UINT64 boot, now64;
++    HRESULT hr;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (end.UniversalTime < start.UniversalTime) return E_INVALIDARG;
++    if (FAILED(hr = profile_get_adapter( impl, &adapter, NULL, NULL ))) return hr;
++
++    if (!(usage = calloc( 1, sizeof(*usage) ))) return E_OUTOFMEMORY;
++    usage->IDataUsage_iface.lpVtbl = &data_usage_vtbl;
++    usage->ref = 1;
++
++    /* the counters run from the boot: a period that ended before it, or one
++     * of roaming only, saw nothing on this host */
++    GetSystemTimeAsFileTime( &now );
++    now64 = ((UINT64)now.dwHighDateTime << 32) | now.dwLowDateTime;
++    boot = now64 - GetTickCount64() * 10000;
++    memset( &row, 0, sizeof(row) );
++    row.InterfaceLuid = adapter.luid;
++    if ((UINT64)end.UniversalTime >= boot && (states & RoamingStates_NotRoaming || !states) && !GetIfEntry2( &row ))
++    {
++        usage->sent = row.OutOctets;
++        usage->received = row.InOctets;
++    }
++    *value = &usage->IDataUsage_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI connection_profile_GetLocalUsage( IConnectionProfile *iface, DateTime start, DateTime end, IDataUsage **value )
+ {
+-    FIXME( "iface %p, start %I64d, end %I64d, value %p stub!\n", iface, start.UniversalTime, end.UniversalTime, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, start %I64d, end %I64d, value %p.\n", iface, start.UniversalTime, end.UniversalTime, value );
++    return get_local_usage( impl_from_IConnectionProfile( iface ), start, end, RoamingStates_NotRoaming, value );
+ }
+ 
+ static HRESULT WINAPI connection_profile_GetLocalUsagePerRoamingStates( IConnectionProfile *iface, DateTime start, DateTime end, RoamingStates states, IDataUsage **value )
+ {
+-    FIXME( "iface %p, start %I64d, end %I64d, states %u, value %p stub!\n", iface, start.UniversalTime, end.UniversalTime, states, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, start %I64d, end %I64d, states %u, value %p.\n", iface, start.UniversalTime, end.UniversalTime, states, value );
++    return get_local_usage( impl_from_IConnectionProfile( iface ), start, end, states, value );
+ }
+ 
+ static HRESULT WINAPI connection_profile_get_NetworkSecuritySettings( IConnectionProfile *iface, INetworkSecuritySettings **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct connection_profile *impl = impl_from_IConnectionProfile( iface );
++    struct security_settings *settings;
++    struct adapter_info adapter;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = profile_get_adapter( impl, &adapter, NULL, NULL ))) return hr;
++    if (!(settings = calloc( 1, sizeof(*settings) ))) return E_OUTOFMEMORY;
++    settings->INetworkSecuritySettings_iface.lpVtbl = &security_settings_vtbl;
++    settings->ref = 1;
++    /* a wired link carries no authentication or encryption of its own; the
++     * host does not tell what a wireless one uses */
++    if (adapter.if_type == IF_TYPE_IEEE80211)
++    {
++        settings->auth = NetworkAuthenticationType_Unknown;
++        settings->encryption = NetworkEncryptionType_Unknown;
++    }
++    else
++    {
++        settings->auth = NetworkAuthenticationType_None;
++        settings->encryption = NetworkEncryptionType_None;
++    }
++    *value = &settings->INetworkSecuritySettings_iface;
++    return S_OK;
+ }
+ 
+ static const struct IConnectionProfileVtbl connection_profile_vtbl =
+@@ -331,58 +1219,299 @@ static const struct IConnectionProfileVtbl connection_profile_vtbl =
+     connection_profile_get_NetworkSecuritySettings,
+ };
+ 
++static HRESULT new_profile( INetworkListManager *manager, const GUID *network_id, IConnectionProfile **out )
++{
++    struct connection_profile *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IConnectionProfile_iface.lpVtbl = &connection_profile_vtbl;
++    impl->ref = 1;
++    INetworkListManager_AddRef( (impl->network_list_manager = manager) );
++    if (network_id)
++    {
++        impl->network_id = *network_id;
++        impl->has_network = TRUE;
++    }
++    *out = &impl->IConnectionProfile_iface;
++    return S_OK;
++}
++
++static HRESULT create_profile( const GUID *network_id, IConnectionProfile **out )
++{
++    INetworkListManager *manager;
++    HRESULT hr;
++
++    if (FAILED(hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
++                                      &IID_INetworkListManager, (void **)&manager ))) return hr;
++    hr = new_profile( manager, network_id, out );
++    INetworkListManager_Release( manager );
++    return hr;
++}
++
++/* ---- network status events ---- */
++
++struct status_handler
++{
++    EventRegistrationToken token;
++    INetworkStatusChangedEventHandler *handler;
++};
++
++static CRITICAL_SECTION status_cs;
++static CRITICAL_SECTION_DEBUG status_cs_debug =
++{
++    0, 0, &status_cs,
++    { &status_cs_debug.ProcessLocksList, &status_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": status_cs") }
++};
++static CRITICAL_SECTION status_cs = { &status_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct status_handler *status_handlers;
++static UINT status_count, status_capacity;
++static INT64 status_next_token = 1;
++static HANDLE status_interface_watch, status_address_watch;
++
++/* A change of an interface or of an address tells every handler; the sender
++ * the handlers get is NULL, as it is with NetworkInformation's static event. */
++static void notify_status_changed( MIB_NOTIFICATION_TYPE type )
++{
++    INetworkStatusChangedEventHandler **copy;
++    UINT i, count;
++    HRESULT hr;
++
++    if (type == MibInitialNotification) return;
++
++    EnterCriticalSection( &status_cs );
++    count = status_count;
++    copy = count ? malloc( count * sizeof(*copy) ) : NULL;
++    for (i = 0; copy && i < count; i++)
++        INetworkStatusChangedEventHandler_AddRef( (copy[i] = status_handlers[i].handler) );
++    LeaveCriticalSection( &status_cs );
++    if (!copy) return;
++
++    hr = CoInitializeEx( NULL, COINIT_MULTITHREADED );
++    for (i = 0; i < count; i++)
++    {
++        INetworkStatusChangedEventHandler_Invoke( copy[i], NULL );
++        INetworkStatusChangedEventHandler_Release( copy[i] );
++    }
++    if (SUCCEEDED(hr)) CoUninitialize();
++    free( copy );
++}
++
++static void WINAPI interface_changed( void *context, MIB_IPINTERFACE_ROW *row, MIB_NOTIFICATION_TYPE type )
++{
++    TRACE( "interface %p, type %d.\n", row, type );
++    notify_status_changed( type );
++}
++
++static void WINAPI address_changed( void *context, MIB_UNICASTIPADDRESS_ROW *row, MIB_NOTIFICATION_TYPE type )
++{
++    TRACE( "address %p, type %d.\n", row, type );
++    notify_status_changed( type );
++}
++
++/* ---- HostName list ---- */
++
++static HRESULT create_host_name( IHostNameFactory *factory, const WCHAR *str, IHostName **out )
++{
++    HSTRING hstr;
++    HRESULT hr;
++
++    if (FAILED(hr = WindowsCreateString( str, wcslen( str ), &hstr ))) return hr;
++    hr = IHostNameFactory_CreateHostName( factory, hstr, out );
++    WindowsDeleteString( hstr );
++    return hr;
++}
++
+ DEFINE_IINSPECTABLE( network_information_statics, INetworkInformationStatics, struct network_information_statics, IActivationFactory_iface )
+ 
+ static HRESULT WINAPI network_information_statics_GetConnectionProfiles( INetworkInformationStatics *iface, IVectorView_ConnectionProfile **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    INetworkListManager *manager;
++    IEnumNetworks *networks;
++    INetwork *network;
++    IConnectionProfile **profiles = NULL;
++    UINT32 count = 0, capacity = 0;
++    ULONG fetched;
++    HRESULT hr;
++    GUID id;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER,
++                                      &IID_INetworkListManager, (void **)&manager ))) return hr;
++    if (FAILED(hr = INetworkListManager_GetNetworks( manager, NLM_ENUM_NETWORK_CONNECTED, &networks )))
++    {
++        INetworkListManager_Release( manager );
++        return hr;
++    }
++
++    while (IEnumNetworks_Next( networks, 1, &network, &fetched ) == S_OK && fetched)
++    {
++        if (count == capacity)
++        {
++            IConnectionProfile **tmp = realloc( profiles, (capacity = capacity ? capacity * 2 : 4) * sizeof(*tmp) );
++            if (!tmp) { INetwork_Release( network ); hr = E_OUTOFMEMORY; break; }
++            profiles = tmp;
++        }
++        if (SUCCEEDED(INetwork_GetNetworkId( network, &id )) && SUCCEEDED(new_profile( manager, &id, &profiles[count] )))
++            count++;
++        INetwork_Release( network );
++    }
++    IEnumNetworks_Release( networks );
++    INetworkListManager_Release( manager );
++
++    if (FAILED(hr))
++    {
++        while (count--) IConnectionProfile_Release( profiles[count] );
++        free( profiles );
++        return hr;
++    }
++    hr = vector_view_create( VECTOR_CONNECTION_PROFILE, (void **)profiles, count, (void **)value );
++    free( profiles );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI network_information_statics_GetInternetConnectionProfile( INetworkInformationStatics *iface, IConnectionProfile **value )
+ {
+     NetworkConnectivityLevel network_connectivity_level = 0xdeadbeef;
+     INetworkListManager *network_list_manager = NULL;
+-    struct connection_profile *impl;
++    IEnumNetworks *networks;
++    INetwork *network;
++    IConnectionProfile *profile = NULL;
++    NLM_CONNECTIVITY connectivity;
++    ULONG fetched;
++    GUID id;
+     HRESULT hr;
+ 
+     TRACE( "iface %p, value %p\n", iface, value );
+ 
+     *value = NULL;
+     if (FAILED(hr = CoCreateInstance( &CLSID_NetworkListManager, NULL, CLSCTX_INPROC_SERVER, &IID_INetworkListManager, (void **)&network_list_manager ))) return hr;
+-    if (!(impl = calloc( 1, sizeof( *impl ) )))
++
++    /* the connected network that reaches the Internet, else the machine's */
++    if (SUCCEEDED(INetworkListManager_GetNetworks( network_list_manager, NLM_ENUM_NETWORK_CONNECTED, &networks )))
++    {
++        while (!profile && IEnumNetworks_Next( networks, 1, &network, &fetched ) == S_OK && fetched)
++        {
++            if (SUCCEEDED(INetwork_GetConnectivity( network, &connectivity )) &&
++                (connectivity & ( NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET )) &&
++                SUCCEEDED(INetwork_GetNetworkId( network, &id )))
++                new_profile( network_list_manager, &id, &profile );
++            INetwork_Release( network );
++        }
++        IEnumNetworks_Release( networks );
++    }
++    if (!profile && FAILED(hr = new_profile( network_list_manager, NULL, &profile )))
+     {
+         INetworkListManager_Release( network_list_manager );
+-        return E_OUTOFMEMORY;
++        return hr;
+     }
++    INetworkListManager_Release( network_list_manager );
+ 
+-    impl->IConnectionProfile_iface.lpVtbl = &connection_profile_vtbl;
+-    impl->ref = 1;
+-    impl->network_list_manager = network_list_manager;
+-
+-    hr = IConnectionProfile_GetNetworkConnectivityLevel( &impl->IConnectionProfile_iface, &network_connectivity_level );
++    hr = IConnectionProfile_GetNetworkConnectivityLevel( profile, &network_connectivity_level );
+     if (FAILED(hr) || network_connectivity_level == NetworkConnectivityLevel_None)
+     {
+-        free( impl );
+-        INetworkListManager_Release( network_list_manager );
++        IConnectionProfile_Release( profile );
+         return hr;
+     }
+ 
+-    *value = &impl->IConnectionProfile_iface;
++    *value = profile;
+     TRACE( "created IConnectionProfile %p.\n", *value );
+     return hr;
+ }
+ 
++/* No link-layer discovery data reaches the host, so no LAN is identified. */
+ static HRESULT WINAPI network_information_statics_GetLanIdentifiers( INetworkInformationStatics *iface, IVectorView_LanIdentifier **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    return vector_view_create( VECTOR_LAN_IDENTIFIER, NULL, 0, (void **)value );
+ }
+ 
++/* The computer's names and the addresses of every connected interface. */
+ static HRESULT WINAPI network_information_statics_GetHostNames( INetworkInformationStatics *iface, IVectorView_HostName **value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    static const WCHAR *factory_name = L"Windows.Networking.HostName";
++    IP_ADAPTER_ADDRESSES *all, *aa;
++    IP_ADAPTER_UNICAST_ADDRESS *ua;
++    IHostNameFactory *factory;
++    IHostName **names = NULL;
++    UINT32 count = 0, capacity = 0;
++    WCHAR buf[128], name[256];
++    DWORD size;
++    HSTRING str;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (FAILED(hr = WindowsCreateString( factory_name, wcslen( factory_name ), &str ))) return hr;
++    hr = RoGetActivationFactory( str, &IID_IHostNameFactory, (void **)&factory );
++    WindowsDeleteString( str );
++    if (FAILED(hr)) return hr;
++
++#define ADD_NAME( text ) do {                                                                      \
++        if (count == capacity)                                                                     \
++        {                                                                                          \
++            IHostName **tmp = realloc( names, (capacity = capacity ? capacity * 2 : 8) * sizeof(*tmp) ); \
++            if (!tmp) { hr = E_OUTOFMEMORY; goto done; }                                           \
++            names = tmp;                                                                           \
++        }                                                                                          \
++        if (SUCCEEDED(create_host_name( factory, (text), &names[count] ))) count++;                \
++    } while (0)
++
++    size = ARRAY_SIZE(name);
++    if (GetComputerNameExW( ComputerNameDnsHostname, name, &size ) && name[0]) ADD_NAME( name );
++
++    if ((all = get_adapters()))
++    {
++        for (aa = all; aa; aa = aa->Next)
++        {
++            if (aa->OperStatus != IfOperStatusUp || aa->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
++            for (ua = aa->FirstUnicastAddress; ua; ua = ua->Next)
++            {
++                if (!ua->Address.lpSockaddr) continue;
++                if (ua->Address.lpSockaddr->sa_family == AF_INET)
++                {
++                    RtlIpv4AddressToStringW( &((SOCKADDR_IN *)ua->Address.lpSockaddr)->sin_addr, buf );
++                    ADD_NAME( buf );
++                }
++                else if (ua->Address.lpSockaddr->sa_family == AF_INET6)
++                {
++                    SOCKADDR_IN6 *a6 = (SOCKADDR_IN6 *)ua->Address.lpSockaddr;
++                    int len;
++
++                    RtlIpv6AddressToStringW( &a6->sin6_addr, buf );
++                    /* a link-local address names its interface */
++                    if (a6->sin6_scope_id && (a6->sin6_addr.u.Word[0] & 0xc0ff) == 0x80fe)
++                    {
++                        len = wcslen( buf );
++                        swprintf( buf + len, ARRAY_SIZE(buf) - len, L"%%%lu", a6->sin6_scope_id );
++                    }
++                    ADD_NAME( buf );
++                }
++            }
++        }
++        free( all );
++    }
++#undef ADD_NAME
++
++    hr = S_OK;
++done:
++    IHostNameFactory_Release( factory );
++    if (FAILED(hr))
++    {
++        while (count--) IHostName_Release( names[count] );
++        free( names );
++        return hr;
++    }
++    hr = vector_view_create( VECTOR_HOST_NAME, (void **)names, count, (void **)value );
++    free( names );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI network_information_statics_GetProxyConfigurationAsync( INetworkInformationStatics *iface, IUriRuntimeClass *uri, IAsyncOperation_ProxyConfiguration **value )
+@@ -401,14 +1530,70 @@ static HRESULT WINAPI network_information_statics_GetSortedEndpointPairs( INetwo
+ static HRESULT WINAPI network_information_statics_add_NetworkStatusChanged( INetworkInformationStatics *iface, INetworkStatusChangedEventHandler *handler,
+                                                                             EventRegistrationToken *cookie )
+ {
+-    FIXME( "iface %p, handler %p, cookie %p stub!\n", iface, handler, cookie );
+-    *cookie = dummy_cookie;
++    BOOL start;
++    DWORD err;
++
++    TRACE( "iface %p, handler %p, cookie %p.\n", iface, handler, cookie );
++
++    if (!handler || !cookie) return E_POINTER;
++
++    EnterCriticalSection( &status_cs );
++    if (status_count == status_capacity)
++    {
++        struct status_handler *tmp = realloc( status_handlers, (status_capacity ? status_capacity * 2 : 4) * sizeof(*tmp) );
++        if (!tmp)
++        {
++            LeaveCriticalSection( &status_cs );
++            return E_OUTOFMEMORY;
++        }
++        status_handlers = tmp;
++        status_capacity = status_capacity ? status_capacity * 2 : 4;
++    }
++    cookie->value = status_next_token++;
++    status_handlers[status_count].token = *cookie;
++    INetworkStatusChangedEventHandler_AddRef( (status_handlers[status_count].handler = handler) );
++    status_count++;
++    start = !status_interface_watch;
++    if (start)
++    {
++        /* the host tells when an interface or an address changes */
++        err = NotifyIpInterfaceChange( AF_UNSPEC, interface_changed, NULL, FALSE, &status_interface_watch );
++        if (!err) err = NotifyUnicastIpAddressChange( AF_UNSPEC, address_changed, NULL, FALSE, &status_address_watch );
++        if (err) WARN( "change notification failed: %lu\n", err );
++    }
++    LeaveCriticalSection( &status_cs );
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI network_information_statics_remove_NetworkStatusChanged( INetworkInformationStatics *iface, EventRegistrationToken cookie )
+ {
+-    FIXME( "iface %p, cookie %#I64x stub!\n", iface, cookie.value );
++    INetworkStatusChangedEventHandler *released = NULL;
++    HANDLE watch1 = NULL, watch2 = NULL;
++    UINT i;
++
++    TRACE( "iface %p, cookie %#I64x.\n", iface, cookie.value );
++
++    EnterCriticalSection( &status_cs );
++    for (i = 0; i < status_count; i++)
++        if (status_handlers[i].token.value == cookie.value) break;
++    if (i < status_count)
++    {
++        released = status_handlers[i].handler;
++        memmove( status_handlers + i, status_handlers + i + 1, (status_count - i - 1) * sizeof(*status_handlers) );
++        status_count--;
++        if (!status_count)
++        {
++            watch1 = status_interface_watch;
++            watch2 = status_address_watch;
++            status_interface_watch = status_address_watch = NULL;
++        }
++    }
++    LeaveCriticalSection( &status_cs );
++
++    /* a watch is ended outside the lock: it waits for a callback that may want it */
++    if (watch1) CancelMibChangeNotify2( watch1 );
++    if (watch2) CancelMibChangeNotify2( watch2 );
++    if (released) INetworkStatusChangedEventHandler_Release( released );
+     return S_OK;
+ }
+ 
+diff --git a/dlls/windows.networking.connectivity/private.h b/dlls/windows.networking.connectivity/private.h
+index 9cff12a..898adcc 100644
+--- a/dlls/windows.networking.connectivity/private.h
++++ b/dlls/windows.networking.connectivity/private.h
+@@ -41,6 +41,18 @@
+ 
+ extern IActivationFactory *network_information_factory;
+ 
++/* generic read-only vectors of HSTRINGs or interface pointers (vector.c) */
++enum vector_kind
++{
++    VECTOR_HSTRING,
++    VECTOR_CONNECTION_PROFILE,
++    VECTOR_LAN_IDENTIFIER,
++    VECTOR_HOST_NAME,
++};
++
++/* Takes over the references the elements hold (also on failure). */
++extern HRESULT vector_view_create( enum vector_kind kind, void **elements, UINT32 count, void **out );
++
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+     {                                                                                              \
+diff --git a/dlls/windows.networking.connectivity/tests/connectivity.c b/dlls/windows.networking.connectivity/tests/connectivity.c
+index cbeda9a..e79335a 100644
+--- a/dlls/windows.networking.connectivity/tests/connectivity.c
++++ b/dlls/windows.networking.connectivity/tests/connectivity.c
+@@ -23,13 +23,16 @@
+ #include "winbase.h"
+ #include "winstring.h"
+ 
++#include "initguid.h"
+ #include "roapi.h"
+ 
+ #define WIDL_using_Windows_Foundation
+ #define WIDL_using_Windows_Foundation_Collections
+ #include "windows.foundation.h"
+ #define WIDL_using_Windows_Networking_Connectivity
++#define WIDL_using_Windows_Networking
+ #include "windows.networking.connectivity.h"
++#include "windows.networking.h"
+ 
+ #include "netlistmgr.h"
+ 
+@@ -135,6 +138,322 @@ error:
+     ok( ref == 1, "got ref %ld.\n", ref );
+ }
+ 
++
++struct status_handler
++{
++    INetworkStatusChangedEventHandler INetworkStatusChangedEventHandler_iface;
++    LONG ref;
++};
++
++static HRESULT WINAPI status_handler_QueryInterface( INetworkStatusChangedEventHandler *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_INetworkStatusChangedEventHandler ))
++    {
++        *out = iface;
++        INetworkStatusChangedEventHandler_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI status_handler_AddRef( INetworkStatusChangedEventHandler *iface )
++{
++    struct status_handler *impl = CONTAINING_RECORD( iface, struct status_handler, INetworkStatusChangedEventHandler_iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI status_handler_Release( INetworkStatusChangedEventHandler *iface )
++{
++    struct status_handler *impl = CONTAINING_RECORD( iface, struct status_handler, INetworkStatusChangedEventHandler_iface );
++    return InterlockedDecrement( &impl->ref );
++}
++
++static HRESULT WINAPI status_handler_Invoke( INetworkStatusChangedEventHandler *iface, IInspectable *sender )
++{
++    return S_OK;
++}
++
++static const INetworkStatusChangedEventHandlerVtbl status_handler_vtbl =
++{
++    status_handler_QueryInterface,
++    status_handler_AddRef,
++    status_handler_Release,
++    status_handler_Invoke,
++};
++
++static BOOL is_null_guid( const GUID *guid )
++{
++    static const GUID zero;
++    return !memcmp( guid, &zero, sizeof(zero) );
++}
++
++static void test_profile( IConnectionProfile *profile )
++{
++    IVectorView_HSTRING *names;
++    IConnectionCost *cost;
++    IDataPlanStatus *plan;
++    IDataPlanUsage *usage;
++    IReference_UINT32 *ref32;
++    INetworkAdapter *adapter;
++    INetworkItem *item;
++    INetworkSecuritySettings *security;
++    IDataUsage *data_usage;
++    NetworkConnectivityLevel level;
++    NetworkCostType cost_type;
++    NetworkTypes types;
++    DateTime start = {0}, end;
++    boolean flag;
++    HSTRING name, name2;
++    GUID id, id2;
++    UINT32 size, value32;
++    UINT64 value64;
++    HRESULT hr;
++    FILETIME ft;
++
++    hr = IConnectionProfile_get_ProfileName( profile, &name );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( WindowsGetStringLen( name ) > 0, "got an empty profile name.\n" );
++
++    hr = IConnectionProfile_get_ProfileName( profile, NULL );
++    ok( hr == E_POINTER, "got hr %#lx.\n", hr );
++
++    hr = IConnectionProfile_GetNetworkConnectivityLevel( profile, &level );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( level <= NetworkConnectivityLevel_InternetAccess, "got level %d.\n", level );
++
++    hr = IConnectionProfile_GetNetworkNames( profile, &names );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IVectorView_HSTRING_get_Size( names, &size );
++    ok( hr == S_OK && size == 1, "got hr %#lx, size %u.\n", hr, size );
++    hr = IVectorView_HSTRING_GetAt( names, 0, &name2 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( !wcscmp( WindowsGetStringRawBuffer( name2, NULL ), WindowsGetStringRawBuffer( name, NULL ) ),
++        "got names %s and %s.\n", debugstr_hstring( name ), debugstr_hstring( name2 ) );
++    hr = IVectorView_HSTRING_GetAt( names, 1, &name2 );
++    ok( hr == E_BOUNDS, "got hr %#lx.\n", hr );
++    WindowsDeleteString( name2 );
++    flag = 0xff;
++    hr = IVectorView_HSTRING_IndexOf( names, name, &size, &flag );
++    ok( hr == S_OK && flag == 1 && size == 0, "got hr %#lx, found %d, index %u.\n", hr, flag, size );
++    IVectorView_HSTRING_Release( names );
++    WindowsDeleteString( name );
++
++    hr = IConnectionProfile_GetConnectionCost( profile, &cost );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IConnectionCost_get_NetworkCostType( cost, &cost_type );
++    ok( hr == S_OK && cost_type <= NetworkCostType_Variable, "got hr %#lx, type %d.\n", hr, cost_type );
++    hr = IConnectionCost_get_Roaming( cost, &flag );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IConnectionCost_get_OverDataLimit( cost, &flag );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IConnectionCost_get_ApproachingDataLimit( cost, &flag );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IConnectionCost_get_NetworkCostType( cost, NULL );
++    ok( hr == E_POINTER, "got hr %#lx.\n", hr );
++    IConnectionCost_Release( cost );
++
++    hr = IConnectionProfile_GetDataPlanStatus( profile, &plan );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDataPlanStatus_get_DataPlanUsage( plan, &usage );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (usage) IDataPlanUsage_Release( usage );
++    hr = IDataPlanStatus_get_DataLimitInMegabytes( plan, &ref32 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (ref32) IReference_UINT32_Release( ref32 );
++    IDataPlanStatus_Release( plan );
++
++    hr = IConnectionProfile_get_NetworkAdapter( profile, &adapter );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (hr == S_OK)
++    {
++        IAsyncOperation_ConnectionProfile *async;
++        IConnectionProfile *connected;
++        AsyncStatus status;
++        IAsyncInfo *info;
++
++        hr = INetworkAdapter_get_NetworkAdapterId( adapter, &id );
++        ok( hr == S_OK && !is_null_guid( &id ), "got hr %#lx, id %s.\n", hr, debugstr_guid( &id ) );
++        hr = INetworkAdapter_get_IanaInterfaceType( adapter, &value32 );
++        ok( hr == S_OK && value32 != 0, "got hr %#lx, type %u.\n", hr, value32 );
++        hr = INetworkAdapter_get_InboundMaxBitsPerSecond( adapter, &value64 );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        hr = INetworkAdapter_get_OutboundMaxBitsPerSecond( adapter, &value64 );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        hr = INetworkAdapter_get_NetworkItem( adapter, &item );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        hr = INetworkItem_get_NetworkId( item, &id2 );
++        ok( hr == S_OK && !is_null_guid( &id2 ), "got hr %#lx, id %s.\n", hr, debugstr_guid( &id2 ) );
++        hr = INetworkItem_GetNetworkTypes( item, &types );
++        ok( hr == S_OK && (types == NetworkTypes_Internet || types == NetworkTypes_PrivateNetwork),
++            "got hr %#lx, types %d.\n", hr, types );
++        INetworkItem_Release( item );
++
++        hr = INetworkAdapter_GetConnectedProfileAsync( adapter, &async );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        hr = IAsyncOperation_ConnectionProfile_QueryInterface( async, &IID_IAsyncInfo, (void **)&info );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        hr = IAsyncInfo_get_Status( info, &status );
++        ok( hr == S_OK && status == Completed, "got hr %#lx, status %d.\n", hr, status );
++        IAsyncInfo_Release( info );
++        hr = IAsyncOperation_ConnectionProfile_GetResults( async, &connected );
++        ok( hr == S_OK && connected, "got hr %#lx, profile %p.\n", hr, connected );
++        if (connected) IConnectionProfile_Release( connected );
++        IAsyncOperation_ConnectionProfile_Release( async );
++        INetworkAdapter_Release( adapter );
++    }
++
++    GetSystemTimeAsFileTime( &ft );
++    end.UniversalTime = ((INT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
++    hr = IConnectionProfile_GetLocalUsage( profile, start, end, &data_usage );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDataUsage_get_BytesSent( data_usage, &value64 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IDataUsage_get_BytesReceived( data_usage, &value64 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IDataUsage_Release( data_usage );
++    hr = IConnectionProfile_GetLocalUsage( profile, end, start, &data_usage );
++    ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
++
++    hr = IConnectionProfile_get_NetworkSecuritySettings( profile, &security );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (hr == S_OK)
++    {
++        NetworkAuthenticationType auth;
++        NetworkEncryptionType encryption;
++
++        hr = INetworkSecuritySettings_get_NetworkAuthenticationType( security, &auth );
++        ok( hr == S_OK && auth <= NetworkAuthenticationType_Ihv, "got hr %#lx, auth %d.\n", hr, auth );
++        hr = INetworkSecuritySettings_get_NetworkEncryptionType( security, &encryption );
++        ok( hr == S_OK && encryption <= NetworkEncryptionType_Ihv, "got hr %#lx, encryption %d.\n", hr, encryption );
++        INetworkSecuritySettings_Release( security );
++    }
++}
++
++static void test_lists_and_events(void)
++{
++    static const WCHAR *name = L"Windows.Networking.Connectivity.NetworkInformation";
++    INetworkInformationStatics *statics;
++    IVectorView_ConnectionProfile *profiles;
++    IIterable_ConnectionProfile *iterable;
++    IIterator_ConnectionProfile *iterator;
++    IVectorView_LanIdentifier *lans;
++    IVectorView_HostName *hosts;
++    IConnectionProfile *profile, *items[8];
++    struct status_handler handler = {{&status_handler_vtbl}, 1};
++    EventRegistrationToken token, token2;
++    UINT32 size, count, i;
++    boolean flag, has;
++    HSTRING str;
++    HRESULT hr;
++    IUnknown *unk;
++
++    WindowsCreateString( name, wcslen( name ), &str );
++    hr = RoGetActivationFactory( str, &IID_INetworkInformationStatics, (void **)&statics );
++    WindowsDeleteString( str );
++    if (FAILED(hr))
++    {
++        win_skip( "NetworkInformation not available.\n" );
++        return;
++    }
++
++    hr = INetworkInformationStatics_GetConnectionProfiles( statics, NULL );
++    ok( hr == E_POINTER, "got hr %#lx.\n", hr );
++    hr = INetworkInformationStatics_GetConnectionProfiles( statics, &profiles );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IVectorView_ConnectionProfile_get_Size( profiles, &size );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    trace( "%u connection profiles\n", size );
++
++    hr = IVectorView_ConnectionProfile_GetAt( profiles, size, &profile );
++    ok( hr == E_BOUNDS, "got hr %#lx.\n", hr );
++    ok( !profile, "got %p.\n", profile );
++
++    hr = IVectorView_ConnectionProfile_QueryInterface( profiles, &IID_IIterable_ConnectionProfile, (void **)&iterable );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IVectorView_ConnectionProfile_QueryInterface( profiles, &IID_IInspectable, (void **)&unk );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    IUnknown_Release( unk );
++    hr = IIterable_ConnectionProfile_First( iterable, &iterator );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    count = 0;
++    hr = IIterator_ConnectionProfile_get_HasCurrent( iterator, &has );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    while (has)
++    {
++        hr = IIterator_ConnectionProfile_get_Current( iterator, &profile );
++        ok( hr == S_OK && profile, "got hr %#lx.\n", hr );
++        IConnectionProfile_Release( profile );
++        count++;
++        IIterator_ConnectionProfile_MoveNext( iterator, &has );
++    }
++    ok( count == size, "iterated %u of %u.\n", count, size );
++    hr = IIterator_ConnectionProfile_get_Current( iterator, &profile );
++    ok( hr == E_BOUNDS, "got hr %#lx.\n", hr );
++    IIterator_ConnectionProfile_Release( iterator );
++    IIterable_ConnectionProfile_Release( iterable );
++
++    count = 0xdeadbeef;
++    hr = IVectorView_ConnectionProfile_GetMany( profiles, 0, ARRAY_SIZE(items), items, &count );
++    ok( hr == S_OK && count == min( size, ARRAY_SIZE(items) ), "got hr %#lx, count %u.\n", hr, count );
++    for (i = 0; i < count; i++)
++    {
++        UINT32 index = 0xdeadbeef;
++
++        hr = IVectorView_ConnectionProfile_IndexOf( profiles, items[i], &index, &flag );
++        ok( hr == S_OK && flag && index == i, "got hr %#lx, found %d, index %u (expected %u).\n", hr, flag, index, i );
++        test_profile( items[i] );
++        IConnectionProfile_Release( items[i] );
++    }
++    IVectorView_ConnectionProfile_Release( profiles );
++
++    hr = INetworkInformationStatics_GetLanIdentifiers( statics, &lans );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IVectorView_LanIdentifier_get_Size( lans, &size );
++    ok( hr == S_OK && size == 0, "got hr %#lx, size %u.\n", hr, size );
++    IVectorView_LanIdentifier_Release( lans );
++
++    hr = INetworkInformationStatics_GetHostNames( statics, &hosts );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IVectorView_HostName_get_Size( hosts, &size );
++    ok( hr == S_OK && size > 0, "got hr %#lx, size %u.\n", hr, size );
++    for (i = 0; i < size; i++)
++    {
++        IHostName *host;
++        HSTRING raw;
++
++        hr = IVectorView_HostName_GetAt( hosts, i, &host );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        hr = IHostName_get_RawName( host, &raw );
++        ok( hr == S_OK && WindowsGetStringLen( raw ) > 0, "got hr %#lx.\n", hr );
++        trace( "host name %s\n", debugstr_hstring( raw ) );
++        WindowsDeleteString( raw );
++        IHostName_Release( host );
++    }
++    IVectorView_HostName_Release( hosts );
++
++    hr = INetworkInformationStatics_add_NetworkStatusChanged( statics, NULL, &token );
++    ok( hr == E_POINTER, "got hr %#lx.\n", hr );
++    hr = INetworkInformationStatics_add_NetworkStatusChanged( statics, &handler.INetworkStatusChangedEventHandler_iface, &token );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( token.value != 0, "got token %#I64x.\n", token.value );
++    hr = INetworkInformationStatics_add_NetworkStatusChanged( statics, &handler.INetworkStatusChangedEventHandler_iface, &token2 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( token2.value != token.value, "got equal tokens.\n" );
++    ok( handler.ref == 3, "got ref %ld.\n", handler.ref );
++    hr = INetworkInformationStatics_remove_NetworkStatusChanged( statics, token );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = INetworkInformationStatics_remove_NetworkStatusChanged( statics, token );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( handler.ref == 2, "got ref %ld.\n", handler.ref );
++    hr = INetworkInformationStatics_remove_NetworkStatusChanged( statics, token2 );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( handler.ref == 1, "got ref %ld.\n", handler.ref );
++
++    INetworkInformationStatics_Release( statics );
++}
++
+ START_TEST(connectivity)
+ {
+     HRESULT hr;
+@@ -143,6 +462,7 @@ START_TEST(connectivity)
+     ok( hr == S_OK, "RoInitialize failed, hr %#lx\n", hr );
+ 
+     test_NetworkInformationStatics();
++    test_lists_and_events();
+ 
+     RoUninitialize();
+ }
+diff --git a/dlls/windows.networking.connectivity/vector.c b/dlls/windows.networking.connectivity/vector.c
+new file mode 100644
+index 0000000..70e5c09
+--- /dev/null
++++ b/dlls/windows.networking.connectivity/vector.c
+@@ -0,0 +1,452 @@
++/* WinRT Windows.Networking.Connectivity read-only vectors
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(connectivity);
++
++/* IVectorView<T>, IIterable<T> and IIterator<T> have the same method layout for
++ * every T that is one pointer (an HSTRING or an interface), so one
++ * implementation serves all of them; only the identifiers and the element
++ * copy/free differ. */
++struct kind_info
++{
++    const IID *view_iid, *iterable_iid, *iterator_iid;
++    const WCHAR *view_name, *iterable_name, *iterator_name;
++    BOOL is_string;
++};
++
++static const struct kind_info *kind_info( enum vector_kind kind )
++{
++    static const struct kind_info infos[] =
++    {
++        { &IID_IVectorView_HSTRING, &IID_IIterable_HSTRING, &IID_IIterator_HSTRING,
++          L"Windows.Foundation.Collections.IVectorView`1<String>",
++          L"Windows.Foundation.Collections.IIterable`1<String>",
++          L"Windows.Foundation.Collections.IIterator`1<String>", TRUE },
++        { &IID_IVectorView_ConnectionProfile, &IID_IIterable_ConnectionProfile, &IID_IIterator_ConnectionProfile,
++          L"Windows.Foundation.Collections.IVectorView`1<Windows.Networking.Connectivity.ConnectionProfile>",
++          L"Windows.Foundation.Collections.IIterable`1<Windows.Networking.Connectivity.ConnectionProfile>",
++          L"Windows.Foundation.Collections.IIterator`1<Windows.Networking.Connectivity.ConnectionProfile>", FALSE },
++        { &IID_IVectorView_LanIdentifier, &IID_IIterable_LanIdentifier, &IID_IIterator_LanIdentifier,
++          L"Windows.Foundation.Collections.IVectorView`1<Windows.Networking.Connectivity.LanIdentifier>",
++          L"Windows.Foundation.Collections.IIterable`1<Windows.Networking.Connectivity.LanIdentifier>",
++          L"Windows.Foundation.Collections.IIterator`1<Windows.Networking.Connectivity.LanIdentifier>", FALSE },
++        { &IID_IVectorView_HostName, &IID_IIterable_HostName, &IID_IIterator_HostName,
++          L"Windows.Foundation.Collections.IVectorView`1<Windows.Networking.HostName>",
++          L"Windows.Foundation.Collections.IIterable`1<Windows.Networking.HostName>",
++          L"Windows.Foundation.Collections.IIterator`1<Windows.Networking.HostName>", FALSE },
++    };
++    return &infos[kind];
++}
++
++/* untyped views of the three interfaces */
++typedef struct IGenericVtbl IGenericVtbl;
++typedef struct { const IGenericVtbl *lpVtbl; } IGeneric;
++struct IGenericVtbl
++{
++    HRESULT (WINAPI *QueryInterface)( IGeneric *iface, REFIID iid, void **out );
++    ULONG (WINAPI *AddRef)( IGeneric *iface );
++    ULONG (WINAPI *Release)( IGeneric *iface );
++    HRESULT (WINAPI *GetIids)( IGeneric *iface, ULONG *count, IID **iids );
++    HRESULT (WINAPI *GetRuntimeClassName)( IGeneric *iface, HSTRING *name );
++    HRESULT (WINAPI *GetTrustLevel)( IGeneric *iface, TrustLevel *level );
++    union
++    {
++        struct { HRESULT (WINAPI *GetAt)( IGeneric *iface, UINT32 index, void **value );
++                 HRESULT (WINAPI *get_Size)( IGeneric *iface, UINT32 *value );
++                 HRESULT (WINAPI *IndexOf)( IGeneric *iface, void *element, UINT32 *index, BOOLEAN *found );
++                 HRESULT (WINAPI *GetMany)( IGeneric *iface, UINT32 start, UINT32 size, void **items, UINT32 *count ); } view;
++        struct { HRESULT (WINAPI *First)( IGeneric *iface, IGeneric **value ); } iterable;
++        struct { HRESULT (WINAPI *get_Current)( IGeneric *iface, void **value );
++                 HRESULT (WINAPI *get_HasCurrent)( IGeneric *iface, boolean *value );
++                 HRESULT (WINAPI *MoveNext)( IGeneric *iface, boolean *value );
++                 HRESULT (WINAPI *GetMany)( IGeneric *iface, UINT32 size, void **items, UINT32 *count ); } iterator;
++    } u;
++};
++
++static HRESULT get_iids( const IID **iids_in, ULONG n, ULONG *count, IID **iids )
++{
++    ULONG i;
++    if (!count || !iids) return E_POINTER;
++    if (!(*iids = CoTaskMemAlloc( n * sizeof(IID) ))) return E_OUTOFMEMORY;
++    for (i = 0; i < n; i++) (*iids)[i] = *iids_in[i];
++    *count = n;
++    return S_OK;
++}
++
++static HRESULT copy_element( const struct kind_info *info, void *src, void **dst )
++{
++    if (info->is_string) return WindowsDuplicateString( src, (HSTRING *)dst );
++    *dst = src;
++    if (src) IUnknown_AddRef( (IUnknown *)src );
++    return S_OK;
++}
++
++static void free_element( const struct kind_info *info, void *element )
++{
++    if (!element) return;
++    if (info->is_string) WindowsDeleteString( element );
++    else IUnknown_Release( (IUnknown *)element );
++}
++
++struct vector_view
++{
++    IGeneric view;
++    IGeneric iterable;
++    LONG ref;
++    const struct kind_info *info;
++    UINT32 size;
++    void *elements[1];
++};
++
++static struct vector_view *view_from_view( IGeneric *iface )
++{
++    return CONTAINING_RECORD( iface, struct vector_view, view );
++}
++
++static struct vector_view *view_from_iterable( IGeneric *iface )
++{
++    return CONTAINING_RECORD( iface, struct vector_view, iterable );
++}
++
++/* IIterator */
++
++struct iterator
++{
++    IGeneric iface;
++    LONG ref;
++    struct vector_view *view;
++    UINT32 index;
++};
++
++static const IGenericVtbl iterator_vtbl;
++static const IGenericVtbl view_vtbl;
++static const IGenericVtbl iterable_vtbl;
++
++static struct iterator *iterator_from( IGeneric *iface )
++{
++    return CONTAINING_RECORD( iface, struct iterator, iface );
++}
++
++static HRESULT WINAPI iterator_QueryInterface( IGeneric *iface, REFIID iid, void **out )
++{
++    struct iterator *impl = iterator_from( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, impl->view->info->iterator_iid ))
++    {
++        *out = iface;
++        IUnknown_AddRef( (IUnknown *)iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI iterator_AddRef( IGeneric *iface )
++{
++    return InterlockedIncrement( &iterator_from( iface )->ref );
++}
++
++static ULONG WINAPI iterator_Release( IGeneric *iface )
++{
++    struct iterator *impl = iterator_from( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IUnknown_Release( (IUnknown *)&impl->view->view );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI iterator_GetIids( IGeneric *iface, ULONG *count, IID **iids )
++{
++    const IID *list[] = { iterator_from( iface )->view->info->iterator_iid };
++    return get_iids( list, 1, count, iids );
++}
++
++static HRESULT WINAPI iterator_GetRuntimeClassName( IGeneric *iface, HSTRING *name )
++{
++    const WCHAR *str = iterator_from( iface )->view->info->iterator_name;
++    if (!name) return E_POINTER;
++    return WindowsCreateString( str, wcslen( str ), name );
++}
++
++static HRESULT WINAPI view_GetTrustLevel( IGeneric *iface, TrustLevel *level )
++{
++    if (!level) return E_POINTER;
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI iterator_get_Current( IGeneric *iface, void **value )
++{
++    struct iterator *impl = iterator_from( iface );
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (impl->index >= impl->view->size) return E_BOUNDS;
++    return copy_element( impl->view->info, impl->view->elements[impl->index], value );
++}
++
++static HRESULT WINAPI iterator_get_HasCurrent( IGeneric *iface, boolean *value )
++{
++    struct iterator *impl = iterator_from( iface );
++
++    if (!value) return E_POINTER;
++    *value = impl->index < impl->view->size;
++    return S_OK;
++}
++
++static HRESULT WINAPI iterator_MoveNext( IGeneric *iface, boolean *value )
++{
++    struct iterator *impl = iterator_from( iface );
++
++    if (!value) return E_POINTER;
++    if (impl->index < impl->view->size) impl->index++;
++    *value = impl->index < impl->view->size;
++    return S_OK;
++}
++
++static HRESULT many( struct vector_view *view, UINT32 start, UINT32 size, void **items, UINT32 *count )
++{
++    UINT32 i;
++    HRESULT hr;
++
++    if (!count) return E_POINTER;
++    *count = 0;
++    if (size && !items) return E_POINTER;
++    for (i = start; i < view->size && i - start < size; i++)
++    {
++        if (FAILED(hr = copy_element( view->info, view->elements[i], &items[i - start] )))
++        {
++            while (i-- > start) free_element( view->info, items[i - start] );
++            return hr;
++        }
++    }
++    *count = i > start ? i - start : 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI iterator_GetMany( IGeneric *iface, UINT32 size, void **items, UINT32 *count )
++{
++    struct iterator *impl = iterator_from( iface );
++    HRESULT hr;
++
++    TRACE( "iface %p, size %u, items %p, count %p.\n", iface, size, items, count );
++    if (FAILED(hr = many( impl->view, impl->index, size, items, count ))) return hr;
++    impl->index += *count;
++    return S_OK;
++}
++
++static const IGenericVtbl iterator_vtbl =
++{
++    iterator_QueryInterface, iterator_AddRef, iterator_Release,
++    iterator_GetIids, iterator_GetRuntimeClassName, view_GetTrustLevel,
++    { .iterator = { iterator_get_Current, iterator_get_HasCurrent, iterator_MoveNext, iterator_GetMany } },
++};
++
++/* IVectorView */
++
++static HRESULT WINAPI view_QueryInterface( IGeneric *iface, REFIID iid, void **out )
++{
++    struct vector_view *impl = view_from_view( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, impl->info->view_iid ))
++        *out = &impl->view;
++    else if (IsEqualGUID( iid, impl->info->iterable_iid ))
++        *out = &impl->iterable;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    InterlockedIncrement( &impl->ref );
++    return S_OK;
++}
++
++static ULONG WINAPI view_AddRef( IGeneric *iface )
++{
++    return InterlockedIncrement( &view_from_view( iface )->ref );
++}
++
++static ULONG WINAPI view_Release( IGeneric *iface )
++{
++    struct vector_view *impl = view_from_view( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    UINT32 i;
++
++    if (!ref)
++    {
++        for (i = 0; i < impl->size; i++) free_element( impl->info, impl->elements[i] );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI view_GetIids( IGeneric *iface, ULONG *count, IID **iids )
++{
++    struct vector_view *impl = view_from_view( iface );
++    const IID *list[] = { impl->info->view_iid, impl->info->iterable_iid };
++    return get_iids( list, 2, count, iids );
++}
++
++static HRESULT WINAPI view_GetRuntimeClassName( IGeneric *iface, HSTRING *name )
++{
++    const WCHAR *str = view_from_view( iface )->info->view_name;
++    if (!name) return E_POINTER;
++    return WindowsCreateString( str, wcslen( str ), name );
++}
++
++static HRESULT WINAPI view_GetAt( IGeneric *iface, UINT32 index, void **value )
++{
++    struct vector_view *impl = view_from_view( iface );
++
++    TRACE( "iface %p, index %u, value %p.\n", iface, index, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (index >= impl->size) return E_BOUNDS;
++    return copy_element( impl->info, impl->elements[index], value );
++}
++
++static HRESULT WINAPI view_get_Size( IGeneric *iface, UINT32 *value )
++{
++    if (!value) return E_POINTER;
++    *value = view_from_view( iface )->size;
++    return S_OK;
++}
++
++static HRESULT WINAPI view_IndexOf( IGeneric *iface, void *element, UINT32 *index, BOOLEAN *found )
++{
++    struct vector_view *impl = view_from_view( iface );
++    UINT32 i;
++
++    TRACE( "iface %p, element %p, index %p, found %p.\n", iface, element, index, found );
++    if (!index || !found) return E_POINTER;
++    for (i = 0; i < impl->size; i++)
++    {
++        if (impl->info->is_string)
++        {
++            INT32 cmp;
++            if (SUCCEEDED(WindowsCompareStringOrdinal( impl->elements[i], element, &cmp )) && !cmp) break;
++        }
++        else if (impl->elements[i] == element) break;
++    }
++    *found = i < impl->size;
++    *index = *found ? i : 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI view_GetMany( IGeneric *iface, UINT32 start, UINT32 size, void **items, UINT32 *count )
++{
++    struct vector_view *impl = view_from_view( iface );
++
++    TRACE( "iface %p, start %u, size %u, items %p, count %p.\n", iface, start, size, items, count );
++    if (start > impl->size) return E_BOUNDS;
++    return many( impl, start, size, items, count );
++}
++
++static const IGenericVtbl view_vtbl =
++{
++    view_QueryInterface, view_AddRef, view_Release,
++    view_GetIids, view_GetRuntimeClassName, view_GetTrustLevel,
++    { .view = { view_GetAt, view_get_Size, view_IndexOf, view_GetMany } },
++};
++
++/* IIterable */
++
++static HRESULT WINAPI iterable_QueryInterface( IGeneric *iface, REFIID iid, void **out )
++{
++    return view_QueryInterface( &view_from_iterable( iface )->view, iid, out );
++}
++
++static ULONG WINAPI iterable_AddRef( IGeneric *iface )
++{
++    return view_AddRef( &view_from_iterable( iface )->view );
++}
++
++static ULONG WINAPI iterable_Release( IGeneric *iface )
++{
++    return view_Release( &view_from_iterable( iface )->view );
++}
++
++static HRESULT WINAPI iterable_GetIids( IGeneric *iface, ULONG *count, IID **iids )
++{
++    return view_GetIids( &view_from_iterable( iface )->view, count, iids );
++}
++
++static HRESULT WINAPI iterable_GetRuntimeClassName( IGeneric *iface, HSTRING *name )
++{
++    const WCHAR *str = view_from_iterable( iface )->info->iterable_name;
++    if (!name) return E_POINTER;
++    return WindowsCreateString( str, wcslen( str ), name );
++}
++
++static HRESULT WINAPI iterable_First( IGeneric *iface, IGeneric **value )
++{
++    struct vector_view *view = view_from_iterable( iface );
++    struct iterator *iter;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    if (!(iter = calloc( 1, sizeof(*iter) ))) return E_OUTOFMEMORY;
++    iter->iface.lpVtbl = &iterator_vtbl;
++    iter->ref = 1;
++    iter->view = view;
++    InterlockedIncrement( &view->ref );
++    *value = &iter->iface;
++    return S_OK;
++}
++
++static const IGenericVtbl iterable_vtbl =
++{
++    iterable_QueryInterface, iterable_AddRef, iterable_Release,
++    iterable_GetIids, iterable_GetRuntimeClassName, view_GetTrustLevel,
++    { .iterable = { iterable_First } },
++};
++
++HRESULT vector_view_create( enum vector_kind kind, void **elements, UINT32 count, void **out )
++{
++    const struct kind_info *info = kind_info( kind );
++    struct vector_view *impl;
++    UINT32 i;
++
++    if (!(impl = calloc( 1, offsetof( struct vector_view, elements[count ? count : 1] ) )))
++    {
++        for (i = 0; i < count; i++) free_element( info, elements[i] );
++        return E_OUTOFMEMORY;
++    }
++    impl->view.lpVtbl = &view_vtbl;
++    impl->iterable.lpVtbl = &iterable_vtbl;
++    impl->ref = 1;
++    impl->info = info;
++    impl->size = count;
++    if (count) memcpy( impl->elements, elements, count * sizeof(*elements) );
++    *out = &impl->view;
++    return S_OK;
++}
+diff --git a/include/windows.networking.connectivity.idl b/include/windows.networking.connectivity.idl
+index 451e67d..0f10c40 100644
+--- a/include/windows.networking.connectivity.idl
++++ b/include/windows.networking.connectivity.idl
+@@ -75,6 +75,12 @@ namespace Windows.Networking.Connectivity
+         interface Windows.Foundation.IAsyncOperation<Windows.Networking.Connectivity.ConnectionProfile *>;
+         interface Windows.Foundation.IAsyncOperation<Windows.Networking.Connectivity.ProxyConfiguration *>;
+         interface Windows.Foundation.Collections.IIterable<Windows.Networking.EndpointPair *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Networking.Connectivity.ConnectionProfile *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Networking.Connectivity.LanIdentifier *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.Networking.HostName *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Networking.Connectivity.ConnectionProfile *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Networking.Connectivity.LanIdentifier *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.Networking.HostName *>;
+         interface Windows.Foundation.Collections.IVectorView<Windows.Networking.Connectivity.ConnectionProfile *>;
+         interface Windows.Foundation.Collections.IVectorView<Windows.Networking.Connectivity.LanIdentifier *>;
+         interface Windows.Foundation.Collections.IVectorView<Windows.Networking.HostName *>;

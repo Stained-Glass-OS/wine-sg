@@ -1,0 +1,799 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] inseng: install engine state, CIF components, download/install (3650)
+
+inseng: install engine state, CIF components, download/install, installed check
+
+IInstallEngine now keeps its state (CIF, base URL, download dir, install drive,
+options, HWND, stream, callback), reads the component information file, enumerates
+install/download IDs, reports sizes, checks the installed version in the registry,
+downloads and installs components with callback notifications, supports
+Abort/Suspend/Resume and LaunchExtraCommand (INF section).
+---
+diff --git a/dlls/inseng/Makefile.in b/dlls/inseng/Makefile.in
+index 40eda55..85872db 100644
+--- a/dlls/inseng/Makefile.in
++++ b/dlls/inseng/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = inseng.dll
+-IMPORTS   = uuid ole32 advapi32
++IMPORTS   = uuid ole32 advapi32 shlwapi
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+diff --git a/dlls/inseng/inseng_main.c b/dlls/inseng/inseng_main.c
+index f7ce3f1..675717d 100644
+--- a/dlls/inseng/inseng_main.c
++++ b/dlls/inseng/inseng_main.c
+@@ -22,6 +22,9 @@
+ 
+ 
+ #include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -31,15 +34,65 @@
+ #include "initguid.h"
+ #include "inseng.h"
+ 
++#include "winreg.h"
++#include "shlwapi.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(inseng);
+ 
++/* Engine status values.  The numeric values are our own choice (guessed). */
++#define SG_ENGINE_NOTREADY    0
++#define SG_ENGINE_READY       1
++#define SG_ENGINE_DOWNLOADING 2
++#define SG_ENGINE_INSTALLING  3
++#define SG_ENGINE_SUSPENDED   4
++#define SG_ENGINE_DONE        5
++
++/* IsComponentInstalled results (guessed values) */
++#define SG_ICI_NOTINSTALLED 0
++#define SG_ICI_INSTALLED    1
++#define SG_ICI_OLDER        2
++
++/* SetAction values (guessed): anything other than 0 requests installation */
++#define SG_ACTION_NONE    0
++#define SG_ACTION_INSTALL 1
++
++struct component
++{
++    char *id;           /* CIF section name */
++    char *guid;         /* GUID= */
++    char *version;      /* Version= (comma or dot separated) */
++    char *command;      /* Command1= (first token is the program) */
++    char *url;          /* URL1= (up to the first comma) */
++    DWORD dl_size;      /* Size= first number, in bytes */
++    DWORD inst_size;    /* Size= second number, in bytes */
++    DWORD action;
++    DWORD priority;
++    BOOL downloaded;
++    char *local_path;
++};
++
+ struct InstallEngine {
+     IInstallEngine2 IInstallEngine2_iface;
+     LONG ref;
++
++    CRITICAL_SECTION cs;
++    DWORD status;
++    char *cif_path;
++    char *base_url;
++    char *download_dir;
++    char drive;
++    DWORD options;
++    HWND hwnd;
++    IStream *stream;
++    IInstallEngineCallback *callback;
++    struct component *comps;
++    unsigned int comp_count;
++    BOOL abort, suspended;
+ };
+ 
++static void free_components(InstallEngine *This);
++
+ static inline InstallEngine *impl_from_IInstallEngine2(IInstallEngine2 *iface)
+ {
+     return CONTAINING_RECORD(iface, InstallEngine, IInstallEngine2_iface);
+@@ -85,94 +138,534 @@ static ULONG WINAPI InstallEngine_Release(IInstallEngine2 *iface)
+ 
+     TRACE("(%p) ref=%ld\n", This, ref);
+ 
+-    if(!ref)
++    if(!ref) {
++        free_components(This);
++        free(This->cif_path);
++        free(This->base_url);
++        free(This->download_dir);
++        if(This->callback) IInstallEngineCallback_Release(This->callback);
++        if(This->stream) IStream_Release(This->stream);
++        DeleteCriticalSection(&This->cs);
+         free(This);
++    }
+ 
+     return ref;
+ }
+ 
++static char *dup_a(const char *s)
++{
++    char *r;
++    if (!s) return NULL;
++    r = malloc(strlen(s) + 1);
++    if (r) strcpy(r, s);
++    return r;
++}
++
++static void free_components(InstallEngine *This)
++{
++    unsigned int i;
++    for (i = 0; i < This->comp_count; i++)
++    {
++        free(This->comps[i].id);
++        free(This->comps[i].guid);
++        free(This->comps[i].version);
++        free(This->comps[i].command);
++        free(This->comps[i].url);
++        free(This->comps[i].local_path);
++    }
++    free(This->comps);
++    This->comps = NULL;
++    This->comp_count = 0;
++}
++
++static char *read_key(const char *file, const char *section, const char *key)
++{
++    char buf[1024];
++    GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), file);
++    return dup_a(buf);
++}
++
++/* Parse the INI style component information file: every section except
++ * [Version] describes one component. */
++static HRESULT load_cif(InstallEngine *This, const char *path)
++{
++    char *names, *p;
++    DWORD size = 4096, len;
++    unsigned int count = 0;
++    struct component *comps = NULL;
++
++    for (;;)
++    {
++        names = malloc(size);
++        if (!names) return E_OUTOFMEMORY;
++        len = GetPrivateProfileSectionNamesA(names, size, path);
++        if (len < size - 2) break;
++        free(names);
++        size *= 2;
++    }
++
++    for (p = names; *p; p += strlen(p) + 1)
++    {
++        struct component *c, *n;
++        char *sizes;
++
++        if (!lstrcmpiA(p, "Version")) continue;
++        n = realloc(comps, (count + 1) * sizeof(*comps));
++        if (!n) { free(names); This->comps = comps; This->comp_count = count; free_components(This); return E_OUTOFMEMORY; }
++        comps = n;
++        c = &comps[count++];
++        memset(c, 0, sizeof(*c));
++        c->id = dup_a(p);
++        c->guid = read_key(path, p, "GUID");
++        c->version = read_key(path, p, "Version");
++        c->command = read_key(path, p, "Command1");
++        c->url = read_key(path, p, "URL1");
++        if (c->url)
++        {
++            char *comma = strchr(c->url, ',');
++            if (comma) *comma = 0;
++        }
++        sizes = read_key(path, p, "Size");
++        if (sizes)
++        {
++            unsigned long a = 0, b = 0;
++            if (sscanf(sizes, "%lu,%lu", &a, &b) < 2) b = 0;
++            c->dl_size = a;
++            c->inst_size = b;
++            free(sizes);
++        }
++    }
++    free(names);
++
++    free_components(This);
++    This->comps = comps;
++    This->comp_count = count;
++    return S_OK;
++}
++
++static struct component *find_component(InstallEngine *This, const char *id)
++{
++    unsigned int i;
++    if (!id) return NULL;
++    for (i = 0; i < This->comp_count; i++)
++        if (!lstrcmpiA(This->comps[i].id, id)) return &This->comps[i];
++    return NULL;
++}
++
++#define E_COMPONENT_NOT_FOUND HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
++
++static void set_status(InstallEngine *This, DWORD status)
++{
++    This->status = status;
++    if (This->callback)
++        IInstallEngineCallback_OnEngineStatusChange(This->callback, status, 0);
++}
++
+ static HRESULT WINAPI InstallEngine_GetEngineStatus(IInstallEngine2 *iface, DWORD *status)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%p)\n", This, status);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, status);
++    if (!status) return E_INVALIDARG;
++    *status = This->status;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_SetCifFile(IInstallEngine2 *iface, const char *cab_name, const char *cif_name)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%s %s)\n", This, debugstr_a(cab_name), debugstr_a(cif_name));
+-    return E_NOTIMPL;
++    char dir[MAX_PATH], path[MAX_PATH];
++    HRESULT hr;
++
++    TRACE("(%p)->(%s %s)\n", This, debugstr_a(cab_name), debugstr_a(cif_name));
++
++    if (!cif_name || !*cif_name) return E_INVALIDARG;
++
++    if (cab_name && *cab_name)
++    {
++        HMODULE adv = LoadLibraryA("advpack.dll");
++        HRESULT (WINAPI *extract)(const char *, const char *, DWORD, const char *, void *, DWORD);
++
++        if (This->download_dir) strcpy(dir, This->download_dir);
++        else { GetTempPathA(MAX_PATH, dir); }
++        CreateDirectoryA(dir, NULL);
++        extract = adv ? (void *)GetProcAddress(adv, "ExtractFilesA") : NULL;
++        if (!extract) { if (adv) FreeLibrary(adv); return E_FAIL; }
++        hr = extract(cab_name, dir, 0, cif_name, NULL, 0);
++        FreeLibrary(adv);
++        if (FAILED(hr)) return hr;
++        PathCombineA(path, dir, cif_name);
++    }
++    else
++        lstrcpynA(path, cif_name, MAX_PATH);
++
++    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
++        return HRESULT_FROM_WIN32(GetLastError());
++
++    EnterCriticalSection(&This->cs);
++    hr = load_cif(This, path);
++    if (SUCCEEDED(hr))
++    {
++        free(This->cif_path);
++        This->cif_path = dup_a(path);
++    }
++    LeaveCriticalSection(&This->cs);
++    if (SUCCEEDED(hr)) set_status(This, SG_ENGINE_READY);
++    return hr;
++}
++
++static BOOL is_url(const char *s)
++{
++    return strstr(s, "://") != NULL;
++}
++
++/* fetch one component into the download directory */
++static HRESULT fetch_component(InstallEngine *This, struct component *c)
++{
++    char src[2 * MAX_PATH], dir[MAX_PATH], dest[MAX_PATH], *base;
++
++    if (!c->url || !*c->url) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
++    if (is_url(c->url) || (c->url[0] && c->url[1] == ':') || c->url[0] == '\\' || c->url[0] == '/')
++        lstrcpynA(src, c->url, sizeof(src));
++    else if (This->base_url && *This->base_url)
++    {
++        lstrcpynA(src, This->base_url, sizeof(src));
++        if (src[0] && src[strlen(src) - 1] != '/' && src[strlen(src) - 1] != '\\') strcat(src, "/");
++        lstrcpynA(src + strlen(src), c->url, (int)(sizeof(src) - strlen(src)));
++    }
++    else if (This->cif_path)
++    {
++        lstrcpynA(src, This->cif_path, sizeof(src));
++        PathRemoveFileSpecA(src);
++        PathAppendA(src, c->url);
++    }
++    else
++        lstrcpynA(src, c->url, sizeof(src));
++
++    if (This->download_dir) lstrcpynA(dir, This->download_dir, MAX_PATH);
++    else GetTempPathA(MAX_PATH, dir);
++    CreateDirectoryA(dir, NULL);
++    base = strrchr(c->url, '/');
++    if (!base) base = strrchr(c->url, '\\');
++    PathCombineA(dest, dir, base ? base + 1 : c->url);
++
++    if (!strncmp(src, "file://", 7))
++    {
++        memmove(src, src + 7, strlen(src + 7) + 1);
++        if (src[0] == '/' && src[1] && src[2] == ':') memmove(src, src + 1, strlen(src));
++    }
++    if (is_url(src))
++    {
++        HMODULE urlmon = LoadLibraryA("urlmon.dll");
++        HRESULT (WINAPI *dl)(IUnknown *, const char *, const char *, DWORD, void *);
++        HRESULT hr;
++        dl = urlmon ? (void *)GetProcAddress(urlmon, "URLDownloadToFileA") : NULL;
++        if (!dl) { if (urlmon) FreeLibrary(urlmon); return E_FAIL; }
++        hr = dl(NULL, src, dest, 0, NULL);
++        FreeLibrary(urlmon);
++        if (FAILED(hr)) return hr;
++    }
++    else if (!CopyFileA(src, dest, FALSE))
++        return HRESULT_FROM_WIN32(GetLastError());
++
++    free(c->local_path);
++    c->local_path = dup_a(dest);
++    c->downloaded = TRUE;
++    return S_OK;
++}
++
++static void wait_if_suspended(InstallEngine *This)
++{
++    while (This->suspended && !This->abort) Sleep(20);
++}
++
++typedef HRESULT (*component_op)(InstallEngine *, struct component *);
++
++static HRESULT run_components(InstallEngine *This, DWORD flags, DWORD running_status, component_op op, BOOL need_download)
++{
++    unsigned int i;
++    DWORD dl_total = 0, inst_total = 0;
++    HRESULT hr = S_OK;
++
++    if (!This->comps) return HRESULT_FROM_WIN32(ERROR_INVALID_STATE);
++
++    This->abort = FALSE;
++    for (i = 0; i < This->comp_count; i++)
++        if (This->comps[i].action == SG_ACTION_INSTALL)
++        {
++            dl_total += This->comps[i].dl_size;
++            inst_total += This->comps[i].inst_size;
++        }
++    set_status(This, running_status);
++    if (This->callback) IInstallEngineCallback_OnStartInstall(This->callback, dl_total, inst_total);
++
++    for (i = 0; i < This->comp_count && SUCCEEDED(hr); i++)
++    {
++        struct component *c = &This->comps[i];
++        if (c->action != SG_ACTION_INSTALL) continue;
++        if (need_download && c->downloaded && !(flags & 1)) continue;
++        wait_if_suspended(This);
++#ifndef SG_MUTANT_INSENG_ABORT
++        if (This->abort) { hr = E_ABORT; break; }
++#endif
++        if (This->callback)
++            IInstallEngineCallback_OnStartComponent(This->callback, c->id, c->dl_size, c->inst_size, c->id);
++        hr = op(This, c);
++#ifdef SG_MUTANT_INSENG_CB
++        if (0)
++#else
++        if (This->callback)
++#endif
++            IInstallEngineCallback_OnStopComponent(This->callback, c->id, hr, 0, NULL, 0);
++    }
++
++    if (This->callback)
++        IInstallEngineCallback_OnStopInstall(This->callback, hr, NULL, 0);
++    set_status(This, SUCCEEDED(hr) ? SG_ENGINE_DONE : SG_ENGINE_READY);
++    return hr;
++}
++
++static HRESULT download_op(InstallEngine *This, struct component *c)
++{
++    return fetch_component(This, c);
++}
++
++static HRESULT install_op(InstallEngine *This, struct component *c)
++{
++    char cmd[2 * MAX_PATH];
++    STARTUPINFOA si = { sizeof(si) };
++    PROCESS_INFORMATION pi;
++    DWORD code = 0;
++
++    if (c->command && *c->command)
++    {
++        if (c->local_path)
++        {
++            char dir[MAX_PATH];
++            lstrcpynA(dir, c->local_path, MAX_PATH);
++            PathRemoveFileSpecA(dir);
++            snprintf(cmd, sizeof(cmd), "\"%s\\%s\"", dir, c->command);
++            if (GetFileAttributesA(cmd + 1) == INVALID_FILE_ATTRIBUTES)
++                lstrcpynA(cmd, c->command, sizeof(cmd));
++        }
++        else
++            lstrcpynA(cmd, c->command, sizeof(cmd));
++    }
++    else if (c->local_path)
++        snprintf(cmd, sizeof(cmd), "\"%s\"", c->local_path);
++    else
++        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
++
++    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
++        return HRESULT_FROM_WIN32(GetLastError());
++    WaitForSingleObject(pi.hProcess, INFINITE);
++    GetExitCodeProcess(pi.hProcess, &code);
++    CloseHandle(pi.hThread);
++    CloseHandle(pi.hProcess);
++    return code ? HRESULT_FROM_WIN32(code) : S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_DownloadComponents(IInstallEngine2 *iface, DWORD flags)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%lx)\n", This, flags);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%lx)\n", This, flags);
++    return run_components(This, flags, SG_ENGINE_DOWNLOADING, download_op, TRUE);
+ }
+ 
+ static HRESULT WINAPI InstallEngine_InstallComponents(IInstallEngine2 *iface, DWORD flags)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%lx)\n", This, flags);
+-    return E_NOTIMPL;
++    unsigned int i;
++    HRESULT hr;
++
++    TRACE("(%p)->(%lx)\n", This, flags);
++    /* fetch whatever has not been downloaded yet, then run the commands */
++    for (i = 0; i < This->comp_count; i++)
++        if (This->comps[i].action == SG_ACTION_INSTALL && !This->comps[i].downloaded
++                && This->comps[i].url && *This->comps[i].url)
++        {
++            hr = run_components(This, flags, SG_ENGINE_DOWNLOADING, download_op, TRUE);
++            if (FAILED(hr)) return hr;
++            break;
++        }
++    return run_components(This, flags, SG_ENGINE_INSTALLING, install_op, FALSE);
++}
++
++static HRESULT enum_ids(InstallEngine *This, UINT index, char **id, BOOL downloads)
++{
++    unsigned int i, n = 0;
++
++    if (!id) return E_INVALIDARG;
++    *id = NULL;
++    for (i = 0; i < This->comp_count; i++)
++    {
++        struct component *c = &This->comps[i];
++#ifndef SG_MUTANT_INSENG_ACTION
++        if (c->action != SG_ACTION_INSTALL) continue;
++#endif
++        if (downloads && c->downloaded) continue;
++        if (n++ == index)
++        {
++            *id = CoTaskMemAlloc(strlen(c->id) + 1);
++            if (!*id) return E_OUTOFMEMORY;
++            strcpy(*id, c->id);
++            return S_OK;
++        }
++    }
++    return HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS);
+ }
+ 
+ static HRESULT WINAPI InstallEngine_EnumInstallIDs(IInstallEngine2 *iface, UINT index, char **id)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%d %p)\n", This, index, id);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%d %p)\n", This, index, id);
++    return enum_ids(This, index, id, FALSE);
+ }
+ 
+ static HRESULT WINAPI InstallEngine_EnumDownloadIDs(IInstallEngine2 *iface, UINT index, char **id)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%d %p)\n", This, index, id);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%d %p)\n", This, index, id);
++    return enum_ids(This, index, id, TRUE);
++}
++
++static int parse_version(const char *s, unsigned int v[4])
++{
++    int n = 0;
++    memset(v, 0, 4 * sizeof(*v));
++    while (*s && n < 4)
++    {
++        v[n++] = strtoul(s, (char **)&s, 10);
++        if (*s == ',' || *s == '.') s++; else break;
++    }
++    return n;
++}
++
++static int cmp_version(const char *a, const char *b)
++{
++    unsigned int va[4], vb[4];
++    int i;
++    parse_version(a, va);
++    parse_version(b, vb);
++    for (i = 0; i < 4; i++)
++        if (va[i] != vb[i]) return va[i] < vb[i] ? -1 : 1;
++    return 0;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_IsComponentInstalled(IInstallEngine2 *iface, const char *id, DWORD *status)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%s %p)\n", This, debugstr_a(id), status);
+-    return E_NOTIMPL;
++    struct component *c;
++    char key[256], ver[64];
++    DWORD size = sizeof(ver);
++    HKEY hkey;
++
++    TRACE("(%p)->(%s %p)\n", This, debugstr_a(id), status);
++
++    if (!status) return E_INVALIDARG;
++    c = find_component(This, id);
++    if (!c) return E_COMPONENT_NOT_FOUND;
++
++    *status = SG_ICI_NOTINSTALLED;
++    if (!c->guid || !*c->guid) return S_OK;
++
++    snprintf(key, sizeof(key), "Software\\Microsoft\\Active Setup\\Installed Components\\%s", c->guid);
++    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &hkey)) return S_OK;
++    ver[0] = 0;
++    if (RegQueryValueExA(hkey, "Version", NULL, NULL, (BYTE *)ver, &size))
++        ver[0] = 0;
++    RegCloseKey(hkey);
++    ver[sizeof(ver) - 1] = 0;
++#ifdef SG_MUTANT_INSENG_VER
++    if (c->version && *c->version && cmp_version(ver, c->version) > 0)
++#else
++    if (c->version && *c->version && cmp_version(ver, c->version) < 0)
++#endif
++        *status = SG_ICI_OLDER;
++    else
++        *status = SG_ICI_INSTALLED;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_RegisterInstallEngineCallback(IInstallEngine2 *iface, IInstallEngineCallback *callback)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%p)\n", This, callback);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, callback);
++    if (!callback) return E_INVALIDARG;
++    IInstallEngineCallback_AddRef(callback);
++    if (This->callback) IInstallEngineCallback_Release(This->callback);
++    This->callback = callback;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_UnregisterInstallEngineCallback(IInstallEngine2 *iface)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++    TRACE("(%p)\n", This);
++    if (This->callback) IInstallEngineCallback_Release(This->callback);
++    This->callback = NULL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_SetAction(IInstallEngine2 *iface, const char *id, DWORD action, DWORD priority)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%s %ld %ld)\n", This, debugstr_a(id), action, priority);
+-    return E_NOTIMPL;
++    struct component *c;
++    TRACE("(%p)->(%s %ld %ld)\n", This, debugstr_a(id), action, priority);
++    c = find_component(This, id);
++    if (!c) return E_COMPONENT_NOT_FOUND;
++    c->action = action;
++    c->priority = priority;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_GetSizes(IInstallEngine2 *iface, const char *id, COMPONENT_SIZES *sizes)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%s %p)\n", This, debugstr_a(id), sizes);
+-    return E_NOTIMPL;
++    struct component *c;
++    char win[MAX_PATH];
++
++    TRACE("(%p)->(%s %p)\n", This, debugstr_a(id), sizes);
++
++    if (!sizes || sizes->cbSize != sizeof(*sizes)) return E_INVALIDARG;
++    c = find_component(This, id);
++    if (!c) return E_COMPONENT_NOT_FOUND;
++
++    GetWindowsDirectoryA(win, MAX_PATH);
++    memset((char *)sizes + sizeof(sizes->cbSize), 0, sizeof(*sizes) - sizeof(sizes->cbSize));
++#ifdef SG_MUTANT_INSENG_SIZES
++    sizes->dwInstallSize = c->dl_size;
++#else
++    sizes->dwInstallSize = c->inst_size;
++#endif
++    sizes->dwDownloadSize = c->downloaded ? 0 : c->dl_size;
++    sizes->dwTotalDownloadSize = c->downloaded ? 0 : c->dl_size;
++    sizes->dwInstallDriveReq = c->inst_size;
++    sizes->dwDownloadDriveReq = sizes->dwDownloadSize;
++    sizes->chWinDrive = win[0];
++    sizes->chInstallDrive = This->drive ? This->drive : win[0];
++    sizes->chDownloadDrive = (This->download_dir && This->download_dir[1] == ':') ? This->download_dir[0] : win[0];
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_LaunchExtraCommand(IInstallEngine2 *iface, const char *inf_name, const char *section)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%s %s)\n", This, debugstr_a(inf_name), debugstr_a(section));
+-    return E_NOTIMPL;
++    HMODULE setupapi;
++    void (WINAPI *install)(HWND, HINSTANCE, const char *, int);
++    char cmd[2 * MAX_PATH];
++
++    TRACE("(%p)->(%s %s)\n", This, debugstr_a(inf_name), debugstr_a(section));
++
++    if (!inf_name || !section) return E_INVALIDARG;
++    if (GetFileAttributesA(inf_name) == INVALID_FILE_ATTRIBUTES)
++        return HRESULT_FROM_WIN32(GetLastError());
++    setupapi = LoadLibraryA("setupapi.dll");
++    install = setupapi ? (void *)GetProcAddress(setupapi, "InstallHinfSectionA") : NULL;
++    if (!install) { if (setupapi) FreeLibrary(setupapi); return E_FAIL; }
++    snprintf(cmd, sizeof(cmd), "%s 128 %s", section, inf_name);
++    install(This->hwnd, GetModuleHandleA(NULL), cmd, 0);
++    FreeLibrary(setupapi);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_GetDisplayName(IInstallEngine2 *iface, const char *id, const char *name)
+@@ -182,74 +675,103 @@ static HRESULT WINAPI InstallEngine_GetDisplayName(IInstallEngine2 *iface, const
+     return E_NOTIMPL;
+ }
+ 
++static HRESULT set_string(char **dst, const char *src)
++{
++    char *copy = NULL;
++    if (src && !(copy = dup_a(src))) return E_OUTOFMEMORY;
++    free(*dst);
++    *dst = copy;
++    return S_OK;
++}
++
+ static HRESULT WINAPI InstallEngine_SetBaseUrl(IInstallEngine2 *iface, const char *base_name)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%s)\n", This, debugstr_a(base_name));
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%s)\n", This, debugstr_a(base_name));
++    return set_string(&This->base_url, base_name);
+ }
+ 
+ static HRESULT WINAPI InstallEngine_SetDownloadDir(IInstallEngine2 *iface, const char *download_dir)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%s)\n", This, debugstr_a(download_dir));
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%s)\n", This, debugstr_a(download_dir));
++    return set_string(&This->download_dir, download_dir);
+ }
+ 
+ static HRESULT WINAPI InstallEngine_SetInstallDrive(IInstallEngine2 *iface, char drive)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%c)\n", This, drive);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%c)\n", This, drive);
++    if (!((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z'))) return E_INVALIDARG;
++    This->drive = drive;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_SetInstallOptions(IInstallEngine2 *iface, DWORD flags)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%lx)\n", This, flags);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%lx)\n", This, flags);
++    This->options = flags;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_SetHWND(IInstallEngine2 *iface, HWND hwnd)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%p)\n", This, hwnd);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, hwnd);
++    This->hwnd = hwnd;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_SetIStream(IInstallEngine2 *iface, IStream *stream)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%p)\n", This, stream);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, stream);
++    if (stream) IStream_AddRef(stream);
++    if (This->stream) IStream_Release(This->stream);
++    This->stream = stream;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_Abort(IInstallEngine2 *iface, DWORD flags)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%lx)\n", This, flags);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%lx)\n", This, flags);
++    This->abort = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_Suspend(IInstallEngine2 *iface)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++    TRACE("(%p)\n", This);
++    This->suspended = TRUE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine_Resume(IInstallEngine2 *iface)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++    TRACE("(%p)\n", This);
++    This->suspended = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI InstallEngine2_SetLocalCif(IInstallEngine2 *iface, const char *cif)
+ {
+     InstallEngine *This = impl_from_IInstallEngine2(iface);
+-    FIXME("(%p)->(%s)\n", This, debugstr_a(cif));
+-    return E_NOTIMPL;
++    HRESULT hr;
++    TRACE("(%p)->(%s)\n", This, debugstr_a(cif));
++    if (!cif || !*cif) return E_INVALIDARG;
++    if (GetFileAttributesA(cif) == INVALID_FILE_ATTRIBUTES)
++        return HRESULT_FROM_WIN32(GetLastError());
++    hr = load_cif(This, cif);
++    if (SUCCEEDED(hr))
++    {
++        set_string(&This->cif_path, cif);
++        set_status(This, SG_ENGINE_READY);
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI InstallEngine2_GetICifFile(IInstallEngine2 *iface, ICifFile **cif_file)
+@@ -333,9 +855,11 @@ static HRESULT WINAPI InstallEngineCF_CreateInstance(IClassFactory *iface, IUnkn
+ 
+     TRACE("(%p %s %p)\n", outer, debugstr_guid(riid), ppv);
+ 
+-    engine = malloc(sizeof(*engine));
++    engine = calloc(1, sizeof(*engine));
+     if(!engine)
+         return E_OUTOFMEMORY;
++    InitializeCriticalSection(&engine->cs);
++    engine->status = SG_ENGINE_NOTREADY;
+ 
+     engine->IInstallEngine2_iface.lpVtbl = &InstallEngine2Vtbl;
+     engine->ref = 1;

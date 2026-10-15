@@ -1,0 +1,215 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] mf: the audio renderer is not kept alive by its queued wait item (3763)
+
+mf: the audio renderer is not kept alive by its queued wait item
+
+MFCreateAudioRenderer's sink queues a waiting work item for the audio client's
+buffer event whose callback was the renderer itself. The work queue gives the
+item's reference back from one of its own threads, some time after the item is
+cancelled, and a render callback blocked on the renderer's lock held another
+one: a Release right after Shutdown could return 1 (mf.c:4564, "Release
+returned 1", failing on every run since 2873 added IMFRateSupport and the
+test's call sequence changed, passing with a Sleep before the Release).
+
+The wait item now has its own callback object (own reference count, own lock).
+Shutdown and the last Release detach it from the renderer, which also waits
+for a callback that is running; a callback that runs later does nothing. No
+reference to the renderer is held by the queue any more.
+CORE review: media.
+---
+diff --git a/dlls/mf/sar.c b/dlls/mf/sar.c
+index e531356..b93543c 100644
+--- a/dlls/mf/sar.c
++++ b/dlls/mf/sar.c
+@@ -70,6 +70,18 @@ struct queued_object
+     } u;
+ };
+ 
++/* The wait item for the audio client's buffer event is queued with this callback object, not with the
++ * renderer: the queue gives the item's reference back from one of its own threads after the item is
++ * cancelled, and a reference held for the renderer would still be out when Shutdown and a Release have
++ * returned. The renderer reference is only taken while a callback runs. */
++struct render_callback
++{
++    IMFAsyncCallback IMFAsyncCallback_iface;
++    LONG refcount;
++    CRITICAL_SECTION cs;
++    struct audio_renderer *renderer;
++};
++
+ struct audio_renderer
+ {
+     IMFMediaSink IMFMediaSink_iface;
+@@ -83,7 +95,7 @@ struct audio_renderer
+     IMFSimpleAudioVolume IMFSimpleAudioVolume_iface;
+     IMFAudioStreamVolume IMFAudioStreamVolume_iface;
+     IMFAudioPolicy IMFAudioPolicy_iface;
+-    IMFAsyncCallback render_callback;
++    struct render_callback *render_callback;
+     LONG refcount;
+     IMFMediaEventQueue *event_queue;
+     IMFMediaEventQueue *stream_event_queue;
+@@ -188,9 +200,22 @@ static struct audio_renderer *impl_from_IMFMediaTypeHandler(IMFMediaTypeHandler
+     return CONTAINING_RECORD(iface, struct audio_renderer, IMFMediaTypeHandler_iface);
+ }
+ 
+-static struct audio_renderer *impl_from_render_callback_IMFAsyncCallback(IMFAsyncCallback *iface)
++static struct render_callback *impl_from_render_callback_IMFAsyncCallback(IMFAsyncCallback *iface)
++{
++    return CONTAINING_RECORD(iface, struct render_callback, IMFAsyncCallback_iface);
++}
++
++/* Detach the callback from the renderer: a callback still queued does nothing any more, and one that is
++ * running has ended when this returns. */
++static void audio_renderer_detach_callback(struct audio_renderer *renderer)
+ {
+-    return CONTAINING_RECORD(iface, struct audio_renderer, render_callback);
++    struct render_callback *callback = renderer->render_callback;
++
++    if (!callback)
++        return;
++    EnterCriticalSection(&callback->cs);
++    callback->renderer = NULL;
++    LeaveCriticalSection(&callback->cs);
+ }
+ 
+ static HRESULT WINAPI audio_renderer_sink_QueryInterface(IMFMediaSink *iface, REFIID riid, void **obj)
+@@ -296,6 +321,9 @@ static ULONG WINAPI audio_renderer_sink_Release(IMFMediaSink *iface)
+         if (renderer->current_media_type)
+             IMFMediaType_Release(renderer->current_media_type);
+         audio_renderer_release_audio_client(renderer);
++        audio_renderer_detach_callback(renderer);
++        if (renderer->render_callback)
++            IMFAsyncCallback_Release(&renderer->render_callback->IMFAsyncCallback_iface);
+         free(renderer->policy.display_name);
+         free(renderer->policy.icon_path);
+         CloseHandle(renderer->buffer_ready_event);
+@@ -483,6 +511,7 @@ static HRESULT WINAPI audio_renderer_sink_GetPresentationClock(IMFMediaSink *ifa
+ static HRESULT WINAPI audio_renderer_sink_Shutdown(IMFMediaSink *iface)
+ {
+     struct audio_renderer *renderer = impl_from_IMFMediaSink(iface);
++    BOOL detach = FALSE;
+     HRESULT hr = S_OK;
+ 
+     TRACE("%p.\n", iface);
+@@ -498,10 +527,17 @@ static HRESULT WINAPI audio_renderer_sink_Shutdown(IMFMediaSink *iface)
+         IMFMediaEventQueue_Shutdown(renderer->stream_event_queue);
+         audio_renderer_set_presentation_clock(renderer, NULL);
+         audio_renderer_release_audio_client(renderer);
++        detach = TRUE;
+     }
+ 
+     LeaveCriticalSection(&renderer->cs);
+ 
++    /* Without the renderer's lock: a callback waiting for it ends first. */
++#ifndef SG_MUTANT_SAR_CB_SINKREF
++    if (detach)
++        audio_renderer_detach_callback(renderer);
++#endif
++
+     return hr;
+ }
+ 
+@@ -1945,7 +1981,7 @@ static HRESULT audio_renderer_create_audio_client(struct audio_renderer *rendere
+ 
+     audio_renderer_apply_policy(renderer);
+ 
+-    if (SUCCEEDED(hr = MFCreateAsyncResult(NULL, &renderer->render_callback, NULL, &result)))
++    if (SUCCEEDED(hr = MFCreateAsyncResult(NULL, &renderer->render_callback->IMFAsyncCallback_iface, NULL, &result)))
+     {
+         if (FAILED(hr = MFPutWaitingWorkItem(renderer->buffer_ready_event, 0, result, &renderer->buffer_ready_key)))
+             WARN("Failed to submit wait item, hr %#lx.\n", hr);
+@@ -2099,14 +2135,29 @@ static HRESULT WINAPI audio_renderer_render_callback_QueryInterface(IMFAsyncCall
+ 
+ static ULONG WINAPI audio_renderer_render_callback_AddRef(IMFAsyncCallback *iface)
+ {
+-    struct audio_renderer *renderer = impl_from_render_callback_IMFAsyncCallback(iface);
+-    return IMFMediaSink_AddRef(&renderer->IMFMediaSink_iface);
++    struct render_callback *callback = impl_from_render_callback_IMFAsyncCallback(iface);
++#ifdef SG_MUTANT_SAR_CB_SINKREF
++    if (callback->renderer)
++        return IMFMediaSink_AddRef(&callback->renderer->IMFMediaSink_iface);
++#endif
++    return InterlockedIncrement(&callback->refcount);
+ }
+ 
+ static ULONG WINAPI audio_renderer_render_callback_Release(IMFAsyncCallback *iface)
+ {
+-    struct audio_renderer *renderer = impl_from_render_callback_IMFAsyncCallback(iface);
+-    return IMFMediaSink_Release(&renderer->IMFMediaSink_iface);
++    struct render_callback *callback = impl_from_render_callback_IMFAsyncCallback(iface);
++    ULONG refcount;
++
++#ifdef SG_MUTANT_SAR_CB_SINKREF
++    if (callback->renderer)
++        return IMFMediaSink_Release(&callback->renderer->IMFMediaSink_iface);
++#endif
++    if (!(refcount = InterlockedDecrement(&callback->refcount)))
++    {
++        DeleteCriticalSection(&callback->cs);
++        free(callback);
++    }
++    return refcount;
+ }
+ 
+ static HRESULT WINAPI audio_renderer_render_callback_GetParameters(IMFAsyncCallback *iface, DWORD *flags, DWORD *queue)
+@@ -2187,12 +2238,31 @@ static void audio_renderer_render(struct audio_renderer *renderer, IMFAsyncResul
+ 
+ static HRESULT WINAPI audio_renderer_render_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+ {
+-    struct audio_renderer *renderer = impl_from_render_callback_IMFAsyncCallback(iface);
++    struct render_callback *callback = impl_from_render_callback_IMFAsyncCallback(iface);
++    struct audio_renderer *renderer;
+ 
+-    EnterCriticalSection(&renderer->cs);
+-    if (!(renderer->flags & SAR_SHUT_DOWN))
+-        audio_renderer_render(renderer, result);
+-    LeaveCriticalSection(&renderer->cs);
++    /* The callback's lock keeps the renderer from going away (Shutdown and the last Release detach it
++     * first), so no reference to the renderer is held while this waits for the renderer's lock. */
++    EnterCriticalSection(&callback->cs);
++    if ((renderer = callback->renderer))
++    {
++#ifdef SG_MUTANT_SAR_CB_INVOKEREF
++        /* the renderer kept alive while a callback waits: Release can return 1 after Shutdown */
++        LeaveCriticalSection(&callback->cs);
++        IMFMediaSink_AddRef(&renderer->IMFMediaSink_iface);
++        EnterCriticalSection(&renderer->cs);
++        if (!(renderer->flags & SAR_SHUT_DOWN))
++            audio_renderer_render(renderer, result);
++        LeaveCriticalSection(&renderer->cs);
++        IMFMediaSink_Release(&renderer->IMFMediaSink_iface);
++        return S_OK;
++#endif
++        EnterCriticalSection(&renderer->cs);
++        if (!(renderer->flags & SAR_SHUT_DOWN))
++            audio_renderer_render(renderer, result);
++        LeaveCriticalSection(&renderer->cs);
++    }
++    LeaveCriticalSection(&callback->cs);
+ 
+     return S_OK;
+ }
+@@ -2227,12 +2297,21 @@ static HRESULT sar_create_object(IMFAttributes *attributes, void *user_context,
+     renderer->IMFSimpleAudioVolume_iface.lpVtbl = &audio_renderer_simple_volume_vtbl;
+     renderer->IMFAudioStreamVolume_iface.lpVtbl = &audio_renderer_stream_volume_vtbl;
+     renderer->IMFAudioPolicy_iface.lpVtbl = &audio_renderer_policy_vtbl;
+-    renderer->render_callback.lpVtbl = &audio_renderer_render_callback_vtbl;
+     renderer->refcount = 1;
+     InitializeCriticalSection(&renderer->cs);
+     renderer->buffer_ready_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+     list_init(&renderer->queue);
+ 
++    if (!(renderer->render_callback = calloc(1, sizeof(*renderer->render_callback))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto failed;
++    }
++    renderer->render_callback->IMFAsyncCallback_iface.lpVtbl = &audio_renderer_render_callback_vtbl;
++    renderer->render_callback->refcount = 1;
++    renderer->render_callback->renderer = renderer;
++    InitializeCriticalSection(&renderer->render_callback->cs);
++
+     if (FAILED(hr = MFCreateEventQueue(&renderer->event_queue)))
+         goto failed;
+ 

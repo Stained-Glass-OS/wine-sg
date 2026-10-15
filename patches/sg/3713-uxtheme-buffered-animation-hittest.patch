@@ -1,0 +1,434 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] uxtheme: buffered animations, HitTestThemeBackground, IsCompositionActive (3713)
+
+uxtheme: buffered animations, HitTestThemeBackground, IsCompositionActive
+
+BeginBufferedAnimation, EndBufferedAnimation, BufferedPaintRenderAnimation
+and BufferedPaintStopAllAnimations were stubs, so Explorer-style controls
+that cross-fade their states never animated. An animation is two paint
+buffers cross-faded over the duration (linear, cubic or sine) by a thread
+timer that invalidates the area and the program's WM_PAINT; a zero
+duration is a plain buffered paint. HitTestThemeBackground answers
+HTNOWHERE/HTCLIENT for the rectangle or region and the sizing-border codes
+for the HTTB_* options. IsCompositionActive reports DwmIsCompositionEnabled.
+---
+diff --git a/dlls/uxtheme/Makefile.in b/dlls/uxtheme/Makefile.in
+index 900803f..7ca2bcf 100644
+--- a/dlls/uxtheme/Makefile.in
++++ b/dlls/uxtheme/Makefile.in
+@@ -2,7 +2,7 @@ EXTRADEFS = -D_UXTHEME_
+ MODULE    = uxtheme.dll
+ IMPORTLIB = uxtheme
+ IMPORTS   = user32 gdi32 advapi32
+-DELAYIMPORTS = msimg32
++DELAYIMPORTS = msimg32 dwmapi
+ 
+ SOURCES = \
+ 	buffer.c \
+diff --git a/dlls/uxtheme/buffer.c b/dlls/uxtheme/buffer.c
+index 6910ffa..418023c 100644
+--- a/dlls/uxtheme/buffer.c
++++ b/dlls/uxtheme/buffer.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <stdlib.h>
++#include <math.h>
+ #include <stdarg.h>
+ 
+ #include "windef.h"
+@@ -30,6 +31,7 @@
+ #include "uxtheme.h"
+ 
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(uxtheme);
+ 
+@@ -366,16 +368,209 @@ HRESULT WINAPI GetBufferedPaintTargetRect(HPAINTBUFFER bufferhandle, RECT *rect)
+ 
+ /***********************************************************************
+  *      BeginBufferedAnimation                             (UXTHEME.@)
++ *
++ * An animation is two paint buffers, the state it starts from and the one it
++ * ends in, cross-faded in the window over the duration.  EndBufferedAnimation
++ * paints the first frame and starts a timer of the thread whose callback
++ * invalidates the animated area, so the program's WM_PAINT calls
++ * BufferedPaintRenderAnimation, which paints the frame for the time.
+  */
++#define ANIMATION_MAGIC 0x414e4d42
++
++struct animation
++{
++    struct list entry;
++    DWORD magic;
++    HWND hwnd;
++    HDC targetdc;
++    RECT rect;
++    HPAINTBUFFER from, to;      /* from is NULL for a zero duration */
++    DWORD duration;
++    BP_ANIMATIONSTYLE style;
++    DWORD start;
++    BOOL running;
++    UINT_PTR timer;
++    DWORD thread;
++};
++
++static struct list animations = LIST_INIT(animations);
++static CRITICAL_SECTION animation_cs;
++static CRITICAL_SECTION_DEBUG animation_cs_debug =
++{
++    0, 0, &animation_cs,
++    { &animation_cs_debug.ProcessLocksList, &animation_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": animation_cs") }
++};
++static CRITICAL_SECTION animation_cs = { &animation_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct animation *find_animation(HANIMATIONBUFFER handle)
++{
++    struct animation *anim;
++
++    LIST_FOR_EACH_ENTRY(anim, &animations, struct animation, entry)
++        if (anim == handle) return anim;
++    return NULL;
++}
++
++static void free_animation(struct animation *anim)
++{
++    list_remove(&anim->entry);
++    if (anim->from) EndBufferedPaint(anim->from, FALSE);
++    if (anim->to) EndBufferedPaint(anim->to, FALSE);
++    anim->magic = 0;
++    free(anim);
++}
++
++/* the thread's timer: ask for a repaint of what is animating */
++static VOID CALLBACK animation_timer(HWND timer_hwnd, UINT msg, UINT_PTR id, DWORD time)
++{
++    struct animation *anim;
++    BOOL any = FALSE;
++
++    EnterCriticalSection(&animation_cs);
++    LIST_FOR_EACH_ENTRY(anim, &animations, struct animation, entry)
++    {
++        if (!anim->running || anim->thread != GetCurrentThreadId()) continue;
++        any = TRUE;
++        if (IsWindow(anim->hwnd)) InvalidateRect(anim->hwnd, &anim->rect, FALSE);
++    }
++    if (!any) KillTimer(NULL, id);
++    LeaveCriticalSection(&animation_cs);
++}
++
++static double animation_progress(const struct animation *anim, DWORD now)
++{
++    double p;
++
++#ifdef SG_MUTANT_UX_ANIM_JUMP
++    return 1.0;
++#endif
++    if (!anim->duration) return 1.0;
++    p = (double)(now - anim->start) / anim->duration;
++    if (p < 0) p = 0;
++    if (p > 1) p = 1;
++    switch (anim->style)
++    {
++    case BPAS_CUBIC:  /* slow, fast, slow */
++        return p < 0.5 ? 4 * p * p * p : 1 - (-2 * p + 2) * (-2 * p + 2) * (-2 * p + 2) / 2;
++    case BPAS_SINE:
++        return (1 - cos(M_PI * p)) / 2;
++    default:
++        return p;
++    }
++}
++
+ HANIMATIONBUFFER WINAPI BeginBufferedAnimation(HWND hwnd, HDC hdcTarget, const RECT *rcTarget,
+                                                BP_BUFFERFORMAT dwFormat, BP_PAINTPARAMS *pPaintParams,
+                                                BP_ANIMATIONPARAMS *pAnimationParams, HDC *phdcFrom,
+                                                HDC *phdcTo)
+ {
+-    FIXME("Stub (%p %p %p %u %p %p %p %p)\n", hwnd, hdcTarget, rcTarget, dwFormat,
++    struct animation *anim;
++    HDC from_dc, to_dc;
++
++    TRACE("(%p %p %s %u %p %p %p %p)\n", hwnd, hdcTarget, wine_dbgstr_rect(rcTarget), dwFormat,
+           pPaintParams, pAnimationParams, phdcFrom, phdcTo);
+ 
+-    return NULL;
++    if (phdcFrom) *phdcFrom = NULL;
++    if (phdcTo) *phdcTo = NULL;
++    if (!hwnd || !IsWindow(hwnd) || !hdcTarget || !rcTarget || IsRectEmpty(rcTarget) || !pAnimationParams ||
++        pAnimationParams->cbSize < sizeof(*pAnimationParams) || pAnimationParams->style > BPAS_SINE)
++        return NULL;
++
++    if (!(anim = calloc(1, sizeof(*anim)))) return NULL;
++    anim->magic = ANIMATION_MAGIC;
++    anim->hwnd = hwnd;
++    anim->targetdc = hdcTarget;
++    anim->rect = *rcTarget;
++    anim->duration = pAnimationParams->style == BPAS_NONE ? 0 : pAnimationParams->dwDuration;
++    anim->style = pAnimationParams->style;
++    anim->thread = GetCurrentThreadId();
++
++    if (!(anim->to = BeginBufferedPaint(hdcTarget, rcTarget, dwFormat, pPaintParams, &to_dc)))
++    {
++        free(anim);
++        return NULL;
++    }
++    /* a zero duration is a plain buffered paint: only the final state */
++    if (anim->duration)
++    {
++        if (!(anim->from = BeginBufferedPaint(hdcTarget, rcTarget, dwFormat, pPaintParams, &from_dc)))
++        {
++            EndBufferedPaint(anim->to, FALSE);
++            free(anim);
++            return NULL;
++        }
++        if (phdcFrom) *phdcFrom = from_dc;
++    }
++    if (phdcTo) *phdcTo = to_dc;
++
++    EnterCriticalSection(&animation_cs);
++    list_add_tail(&animations, &anim->entry);
++    LeaveCriticalSection(&animation_cs);
++    return (HANIMATIONBUFFER)anim;
++}
++
++/* paint the animation at a time: the from buffer, the to buffer blended over it */
++static void draw_animation(struct animation *anim, HDC hdc, double progress)
++{
++    int w = anim->rect.right - anim->rect.left, h = anim->rect.bottom - anim->rect.top;
++    HDC from = anim->from ? GetBufferedPaintDC(anim->from) : NULL, to = GetBufferedPaintDC(anim->to);
++
++    if (!from || progress >= 1.0)
++    {
++        BitBlt(hdc, anim->rect.left, anim->rect.top, w, h, to, anim->rect.left, anim->rect.top, SRCCOPY);
++        return;
++    }
++    BitBlt(hdc, anim->rect.left, anim->rect.top, w, h, from, anim->rect.left, anim->rect.top, SRCCOPY);
++    if (progress > 0.0)
++    {
++        BLENDFUNCTION blend = { AC_SRC_OVER, 0, (BYTE)(progress * 255.0 + 0.5), 0 };
++        GdiAlphaBlend(hdc, anim->rect.left, anim->rect.top, w, h, to, anim->rect.left, anim->rect.top, w, h, blend);
++    }
++}
++
++HRESULT WINAPI EndBufferedAnimation(HANIMATIONBUFFER hbpAnimation, BOOL fUpdateTarget)
++{
++    struct animation *anim;
++    HRESULT hr = E_INVALIDARG;
++
++    TRACE("(%p %u)\n", hbpAnimation, fUpdateTarget);
++
++    EnterCriticalSection(&animation_cs);
++    if ((anim = find_animation(hbpAnimation)))
++    {
++        hr = S_OK;
++        if (!fUpdateTarget)
++        {
++#ifdef SG_MUTANT_UX_END_FALSE_DRAWS
++            draw_animation(anim, anim->targetdc, 1.0);
++#endif
++            free_animation(anim);
++        }
++        else if (!anim->duration)
++        {
++            /* no animation: the final state, as EndBufferedPaint does */
++            draw_animation(anim, anim->targetdc, 1.0);
++            free_animation(anim);
++        }
++        else
++        {
++            /* an animation of the window replaces one still running there */
++            struct animation *other, *next;
++
++            LIST_FOR_EACH_ENTRY_SAFE(other, next, &animations, struct animation, entry)
++                if (other != anim && other->hwnd == anim->hwnd && other->running) free_animation(other);
++            anim->start = GetTickCount();
++            anim->running = TRUE;
++            draw_animation(anim, anim->targetdc, 0.0);
++#ifndef SG_MUTANT_UX_ANIM_NOTIMER
++            if (!(anim->timer = SetTimer(NULL, 0, 15, animation_timer)))
++                WARN("no timer for the animation\n");
++#endif
++        }
++    }
++    LeaveCriticalSection(&animation_cs);
++    return hr;
+ }
+ 
+ /***********************************************************************
+@@ -383,9 +578,29 @@ HANIMATIONBUFFER WINAPI BeginBufferedAnimation(HWND hwnd, HDC hdcTarget, const R
+  */
+ BOOL WINAPI BufferedPaintRenderAnimation(HWND hwnd, HDC hdcTarget)
+ {
+-    FIXME("Stub (%p %p)\n", hwnd, hdcTarget);
++    struct animation *anim, *found = NULL;
++    BOOL ret = FALSE;
++
++    TRACE("(%p %p)\n", hwnd, hdcTarget);
++
++    if (!hwnd || !hdcTarget) return FALSE;
++    EnterCriticalSection(&animation_cs);
++    LIST_FOR_EACH_ENTRY(anim, &animations, struct animation, entry)
++        if (anim->hwnd == hwnd && anim->running) { found = anim; break; }
++    if (found)
++    {
++        double progress = animation_progress(found, GetTickCount());
+ 
+-    return FALSE;
++        draw_animation(found, hdcTarget, progress);
++        if (progress >= 1.0)
++        {
++            if (found->timer) KillTimer(NULL, found->timer);
++            free_animation(found);
++        }
++        ret = TRUE;
++    }
++    LeaveCriticalSection(&animation_cs);
++    return ret;
+ }
+ 
+ /***********************************************************************
+@@ -393,17 +608,21 @@ BOOL WINAPI BufferedPaintRenderAnimation(HWND hwnd, HDC hdcTarget)
+  */
+ HRESULT WINAPI BufferedPaintStopAllAnimations(HWND hwnd)
+ {
+-    FIXME("Stub (%p)\n", hwnd);
+-
+-    return E_NOTIMPL;
+-}
++    struct animation *anim, *next;
+ 
+-/***********************************************************************
+- *      EndBufferedAnimation                               (UXTHEME.@)
+- */
+-HRESULT WINAPI EndBufferedAnimation(HANIMATIONBUFFER hbpAnimation, BOOL fUpdateTarget)
+-{
+-    FIXME("Stub (%p %u)\n", hbpAnimation, fUpdateTarget);
++    TRACE("(%p)\n", hwnd);
+ 
+-    return E_NOTIMPL;
++    if (!hwnd) return E_INVALIDARG;
++    EnterCriticalSection(&animation_cs);
++    LIST_FOR_EACH_ENTRY_SAFE(anim, next, &animations, struct animation, entry)
++    {
++#ifdef SG_MUTANT_UX_STOP_NOOP
++        break;
++#endif
++        if (anim->hwnd != hwnd || !anim->running) continue;
++        if (anim->timer) KillTimer(NULL, anim->timer);
++        free_animation(anim);
++    }
++    LeaveCriticalSection(&animation_cs);
++    return S_OK;
+ }
+diff --git a/dlls/uxtheme/system.c b/dlls/uxtheme/system.c
+index 891b62f..166e151 100644
+--- a/dlls/uxtheme/system.c
++++ b/dlls/uxtheme/system.c
+@@ -29,6 +29,7 @@
+ #include "vfwmsgs.h"
+ #include "uxtheme.h"
+ #include "vssym32.h"
++#include "dwmapi.h"
+ 
+ #include "uxthemedll.h"
+ #include "msstyles.h"
+@@ -737,11 +738,18 @@ BOOL WINAPI IsThemeActive(void)
+ */
+ BOOL WINAPI IsCompositionActive(void)
+ {
+-    FIXME(": stub\n");
++    BOOL enabled = FALSE;
+ 
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
++    TRACE("()\n");
+ 
+-    return FALSE;
++    /* the window manager's composition, as DwmIsCompositionEnabled reports it */
++    if (FAILED(DwmIsCompositionEnabled(&enabled)))
++        enabled = FALSE;
++#ifdef SG_MUTANT_UX_COMPOSITION_FALSE
++    enabled = FALSE;
++#endif
++    SetLastError(ERROR_SUCCESS);
++    return enabled;
+ }
+ 
+ /***********************************************************************
+@@ -1013,10 +1021,72 @@ HRESULT WINAPI HitTestThemeBackground(HTHEME hTheme, HDC hdc, int iPartId,
+                                      const RECT *pRect, HRGN hrgn,
+                                      POINT ptTest, WORD *pwHitTestCode)
+ {
+-    FIXME("%d %d 0x%08lx: stub\n", iPartId, iStateId, dwOptions);
+-    if(!hTheme)
++    BOOL inside;
++    WORD code;
++
++    TRACE("(%p %p %d %d 0x%08lx %p %p %ld,%ld %p)\n", hTheme, hdc, iPartId, iStateId, dwOptions,
++          pRect, hrgn, ptTest.x, ptTest.y, pwHitTestCode);
++
++    if (!hTheme)
+         return E_HANDLE;
+-    return E_NOTIMPL;
++    if (!pRect || !pwHitTestCode)
++        return E_POINTER;
++
++    /* the area is the region when one is given, else the rectangle */
++#ifdef SG_MUTANT_UX_HIT_NOREGION
++    hrgn = NULL;
++#endif
++    inside = hrgn ? PtInRegion(hrgn, ptTest.x, ptTest.y) : PtInRect(pRect, ptTest);
++    if (!inside)
++    {
++        *pwHitTestCode = HTNOWHERE;
++        return S_OK;
++    }
++
++    code = HTCLIENT;
++    if (dwOptions & (HTTB_RESIZINGBORDER | HTTB_CAPTION | HTTB_FIXEDBORDER))
++    {
++        /* the borders of a sizing template are as wide as its sizing margins
++         * (or the system's, with HTTB_SYSTEMSIZINGMARGINS) */
++        MARGINS m = { 0 };
++        BOOL left, right, top, bottom;
++
++        if (dwOptions & HTTB_SYSTEMSIZINGMARGINS)
++        {
++            m.cxLeftWidth = m.cxRightWidth = GetSystemMetrics(SM_CXSIZEFRAME);
++            m.cyTopHeight = m.cyBottomHeight = GetSystemMetrics(SM_CYSIZEFRAME);
++        }
++        else
++        {
++            RECT rect = *pRect;
++            if (FAILED(GetThemeMargins(hTheme, hdc, iPartId, iStateId, 3601 /* TMT_SIZINGMARGINS */, &rect, &m)))
++                memset(&m, 0, sizeof(m));
++        }
++#ifdef SG_MUTANT_UX_HIT_NOBORDERFLAGS
++        dwOptions |= HTTB_RESIZINGBORDER;
++#endif
++        left = (dwOptions & HTTB_RESIZINGBORDER_LEFT) && ptTest.x < pRect->left + m.cxLeftWidth;
++        right = (dwOptions & HTTB_RESIZINGBORDER_RIGHT) && ptTest.x >= pRect->right - m.cxRightWidth;
++        top = (dwOptions & HTTB_RESIZINGBORDER_TOP) && ptTest.y < pRect->top + m.cyTopHeight;
++        bottom = (dwOptions & HTTB_RESIZINGBORDER_BOTTOM) && ptTest.y >= pRect->bottom - m.cyBottomHeight;
++        if (top && left) code = HTTOPLEFT;
++        else if (top && right) code = HTTOPRIGHT;
++        else if (bottom && left) code = HTBOTTOMLEFT;
++        else if (bottom && right) code = HTBOTTOMRIGHT;
++        else if (left) code = HTLEFT;
++        else if (right) code = HTRIGHT;
++        else if (top) code = HTTOP;
++        else if (bottom) code = HTBOTTOM;
++        else if ((dwOptions & HTTB_CAPTION) && ptTest.y < pRect->top + m.cyTopHeight) code = HTCAPTION;
++        else if (dwOptions & HTTB_FIXEDBORDER)
++        {
++            if (ptTest.x < pRect->left + m.cxLeftWidth || ptTest.x >= pRect->right - m.cxRightWidth ||
++                ptTest.y < pRect->top + m.cyTopHeight || ptTest.y >= pRect->bottom - m.cyBottomHeight)
++                code = HTBORDER;
++        }
++    }
++    *pwHitTestCode = code;
++    return S_OK;
+ }
+ 
+ /***********************************************************************
