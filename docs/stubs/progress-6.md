@@ -127,3 +127,12 @@ Scope change from the coordinator: crypt32/bcrypt/wintrust/cryptowinrt/onlineid/
   (493 869 987 988 989; 494 no-ground-truth), 5108 STGM_CONVERT (499), 5109 StgOpenStorageEx riid (505), 5110 OleConvertIStorageToOLESTREAMEx (506),
   5111 data cache GetColorSet (509), 5112 OleCreateStaticFromData render options (519; 517 OleSetMenuDescriptor no-ground-truth), 5113 file moniker
   ParseDisplayName + anti-moniker GetDisplayName (460 461). ole32 full suites 64/32: 0 failures after each patch.
+- 2026-10-14 (Fast A, rpcrt4/combase/oleaut32/advapi32): rpcrt4 5114 RpcMgmtSet/InqComTimeout (554), 5115 RpcServerUnregisterIfEx waits + context-handle rundown (588),
+  5116 RpcMgmtInqIfIds local + RpcIfIdVectorFree (594), 5117 NdrConformantStructMemorySize + NdrContextHandleSize (571 582), 5118 RpcAsyncGetCallStatus (556; widl
+  async stubs gate), 5119 RTS command types of RPC-over-HTTP packets from MS-RPCH (584 585). Triaged: 568 and 572-581 no-ground-truth (no wire layout in MS-RPCE, no
+  docs page, no tests); escalated with proposals: 557 558 587 (server-side async completion/abort/cancel need deferred replies), 597 (call threads are pool workers).
+  combase 5120 CoGetStandardMarshal with NULL object (160), 5121 standard marshaler DisconnectObject (159), 5122 CoIsHandlerConnected for proxies (927; escalated for the
+  cross-process case), 61 CoRegisterSurrogate escalated (no consumer of ISurrogate, SCM pid check), 162 RoGetServerActivatableClasses no-ground-truth (undocumented).
+  oleaut32 5123 OleCreatePropertyFrameIndirect dispidInitialProperty (547). advapi32 123 NotifyBootConfigStatus escalated (SC_MANAGER_MODIFY_BOOT_CONFIG access check, no
+  last-known-good control set). Suites 64/32: rpcrt4 = base (9 env failures, authn service 1747, in both), ole32 0, oleaut32 0, combase only the known roapi.c:125. Series 5114-5123
+  applies to a tarball+series tree and gives the same files. All queue items of Fast A are closed.
