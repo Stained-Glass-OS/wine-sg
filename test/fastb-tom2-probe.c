@@ -1,4 +1,4 @@
-/* riched20 TOM text ranges by line, screen, window, character/paragraph format, table and object (patch 3698) */
+/* riched20: ITextDocument2Old / ITextDocument2 accessors (patch 3731) */
 #define COBJMACROS
 #include <windows.h>
 #include <richedit.h>
@@ -7,386 +7,320 @@
 #include <stdio.h>
 #include <string.h>
 
-static const GUID IID_ITextDocument_ = {0x8cc497c0, 0xa1df, 0x11ce, {0x80, 0x98, 0x00, 0xaa, 0x00, 0x47, 0xbe, 0x5d}};
-#define IID_ITextDocument IID_ITextDocument_
-static int failed;
-#define CHECK(c, ...) do { if (!(c)) { failed++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+static int f;
+#define CHECK(c, ...) do { if (!(c)) { f++; printf("FAIL line %d: %s: ", __LINE__, #c); printf(__VA_ARGS__); printf("\n"); } } while (0)
+#define HR(x) ((unsigned)(x))
 
-static ITextDocument *doc;
-static IRichEditOle *ole;
-static HWND hwnd;
+/* ITextDocument2Old is not in the mingw headers: call through the vtable. Slots follow ITextDocument (26 with IUnknown/IDispatch). */
+static const GUID IID_Doc2 = {0xc241f5e0, 0x7206, 0x11d8, {0xa2, 0xc7, 0x00, 0xa0, 0xd1, 0xd6, 0xc6, 0xb3}};
+static const GUID IID_Doc1 = {0x8cc497c0, 0xa1df, 0x11ce, {0x80, 0x98, 0x00, 0xaa, 0x00, 0x47, 0xbe, 0x5d}};
+static const GUID IID_Old = {0x01c25500, 0x4268, 0x11d1, {0x88, 0x3a, 0x3c, 0x8b, 0x00, 0xc1, 0x00, 0x00}};
+#define SLOT(o, n) ((*(void ***)(o))[n])
+#define D2_GETCARET 26
+#define D2_SETNOTIF 37
+#define D2_GETNOTIF 36
+#define D2_GETVERSION 41
+#define D2_GETWINDOW 42
+#define D2_CHECKLIMIT 44
+#define D2_CLIENTRECT 46
+#define D2_GETEFFECT 47
+#define D2_GETIMM 48
+#define D2_GETPROP 50
+#define D2_RELIMM 56
+#define D2_SETEFFECT 57
+#define D2_SETPROP 58
+#define OLD_ATTACH 26
+#define OLD_SETEFFECT 27
+#define OLD_GETEFFECT 28
+#define OLD_GETCARET 29
+#define OLD_SETCARET 30
+#define OLD_GETIMM 31
+#define OLD_RELIMM 32
+#define OLD_GETNOTIF 34
+#define OLD_SETNOTIF 35
+#define OLD_CLIENTRECT 36
+#define OLD_SELEX 37
+#define OLD_GETWINDOW 38
+#define OLD_FEFLAGS 39
+#define OLD_UPDATEWINDOW 40
+#define OLD_CHECKLIMIT 41
+#define OLD_IMEPROG 42
+#define OLD_SYSBEEP 43
+#define OLD_UPDATE 44
+#define OLD_NOTIFY 45
+#define OLD_TAB_GET 13
+#define OLD_TAB_SET 14
+#define OLD_STORYCOUNT 9
+#define OLD_STORYRANGES 10
+#define OLD_BEGINEDIT 20
+#define OLD_ENDEDIT 21
+#define OLD_RANGEFROMPOINT 25
+typedef HRESULT (WINAPI *p0)(void *);
+typedef HRESULT (WINAPI *p1)(void *, void *);
+typedef HRESULT (WINAPI *pl)(void *, LONG);
+typedef HRESULT (WINAPI *pll)(void *, LONG, LONG);
+typedef HRESULT (WINAPI *plp)(void *, LONG, void *);
+typedef HRESULT (WINAPI *pf)(void *, float);
 
-static ITextRange *range(LONG a, LONG b)
+#define C0(o, n) ((p0)SLOT(o, n))(o)
+#define C1(o, n, a) ((p1)SLOT(o, n))(o, (void *)(a))
+#define CL(o, n, a) ((pl)SLOT(o, n))(o, a)
+#define CLP(o, n, a, b) ((plp)SLOT(o, n))(o, a, (void *)(b))
+#define CLL(o, n, a, b) ((pll)SLOT(o, n))(o, a, b)
+
+static HWND make_edit(HWND parent)
 {
-    ITextRange *r = NULL;
-    ITextDocument_Range(doc, a, b, &r);
-    return r;
-}
-
-static void expect(ITextRange *r, LONG s, LONG e, const char *what)
-{
-    LONG a = -1, b = -1;
-    ITextRange_GetStart(r, &a);
-    ITextRange_GetEnd(r, &b);
-    CHECK(a == s && b == e, "%s: [%ld,%ld] want [%ld,%ld]", what, a, b, s, e);
-}
-
-static void open_edit(const WCHAR *cls, int w, int h, const WCHAR *text)
-{
-    if (doc) { ITextDocument_Release(doc); doc = NULL; }
-    if (ole) { ole->lpVtbl->Release(ole); ole = NULL; }
-    if (hwnd) DestroyWindow(hwnd);
-    hwnd = CreateWindowExW(0, cls, NULL, WS_POPUP | WS_VISIBLE | ES_MULTILINE, 0, 0, w, h, NULL, NULL, NULL, NULL);
-    SetWindowTextW(hwnd, text);
-    SendMessageW(hwnd, EM_GETOLEINTERFACE, 0, (LPARAM)&ole);
-    ole->lpVtbl->QueryInterface(ole, &IID_ITextDocument, (void **)&doc);
-}
-
-/* a narrow control that wraps the text into several lines */
-static void test_lines(void)
-{
-    LONG a, b, i, n, d;
-    ITextRange *r, *r2;
-    HRESULT hr;
-    int lines;
-
-    open_edit(L"RichEdit20W", 80, 400, L"alpha beta gamma delta epsilon zeta eta theta\rshort\rlast line of the text here");
-    lines = SendMessageW(hwnd, EM_GETLINECOUNT, 0, 0);
-    CHECK(lines >= 5, "wrapped into %d lines", lines);
-    /* every line start from the control must be a line boundary of the unit */
-    r = range(0, 0);
-    n = 0;
-    for (i = 0; i < lines; i++)
-    {
-        LONG ofs = SendMessageW(hwnd, EM_LINEINDEX, i, 0), len = SendMessageW(hwnd, EM_LINELENGTH, ofs, 0);
-
-        r2 = range(ofs + (len > 2 ? 2 : 0), ofs + (len > 2 ? 2 : 0));
-        d = 99;
-        hr = ITextRange_Expand(r2, tomLine, &d);
-        ITextRange_GetStart(r2, &a);
-        ITextRange_GetEnd(r2, &b);
-        CHECK(hr == S_OK && a == ofs, "line %ld: Expand hr %#lx start %ld want %ld", i, hr, a, ofs);
-        if (i + 1 < lines) CHECK(b == SendMessageW(hwnd, EM_LINEINDEX, i + 1, 0), "line %ld: end %ld", i, b);
-        ITextRange_Release(r2);
-        n++;
-    }
-    /* Move by lines */
-    d = 99;
-    hr = ITextRange_Move(r, tomLine, 1, &d);
-    CHECK(hr == S_OK && d == 1, "Move line hr %#lx d %ld", hr, d);
-    expect(r, SendMessageW(hwnd, EM_LINEINDEX, 1, 0), SendMessageW(hwnd, EM_LINEINDEX, 1, 0), "Move line 1");
-    hr = ITextRange_Move(r, tomLine, 2, &d);
-    CHECK(d == 2, "Move line 2: %ld", d);
-    expect(r, SendMessageW(hwnd, EM_LINEINDEX, 3, 0), SendMessageW(hwnd, EM_LINEINDEX, 3, 0), "Move line 3");
-    hr = ITextRange_Move(r, tomLine, -3, &d);
-    CHECK(d == -3, "Move line -3: %ld", d);
-    expect(r, 0, 0, "Move line back");
-    hr = ITextRange_Move(r, tomLine, -1, &d);
-    CHECK(hr == S_FALSE && d == 0, "Move line before the start %#lx %ld", hr, d);
-    ITextRange_Release(r);
-
-    /* StartOf, EndOf, MoveEnd */
-    r = range(7, 7);
-    hr = ITextRange_StartOf(r, tomLine, tomExtend, &d);
-    a = SendMessageW(hwnd, EM_LINEINDEX, SendMessageW(hwnd, EM_LINEFROMCHAR, 7, 0), 0);
-    CHECK(hr == S_OK && d == a - 7, "StartOf line extend hr %#lx d %ld", hr, d);
-    expect(r, a, 7, "StartOf line extend");
-    hr = ITextRange_EndOf(r, tomLine, tomExtend, &d);
-    b = SendMessageW(hwnd, EM_LINEINDEX, SendMessageW(hwnd, EM_LINEFROMCHAR, 7, 0) + 1, 0);
-    expect(r, a, b, "EndOf line extend");
-    ITextRange_MoveEnd(r, tomLine, 1, &d);
-    CHECK(d == 1, "MoveEnd line %ld", d);
-    ITextRange_Release(r);
-    r = range(0, 3);
-    ITextRange_MoveStart(r, tomLine, 1, &d);
-    b = SendMessageW(hwnd, EM_LINEINDEX, 1, 0);
-    CHECK(d == 1, "MoveStart line %ld", d);
-    expect(r, b, b, "MoveStart past the end drags the end");
-    ITextRange_Release(r);
-
-    /* GetIndex of a line */
-    r = range(0, 0);
-    ITextRange_SetIndex(r, tomLine, 3, 0);
-    a = SendMessageW(hwnd, EM_LINEINDEX, 2, 0);
-    ITextRange_GetStart(r, &b);
-    CHECK(b == a, "SetIndex line 3 at %ld want %ld", b, a);
-    ITextRange_GetIndex(r, tomLine, &d);
-    CHECK(d == 3, "GetIndex line %ld", d);
-    ITextRange_Release(r);
-}
-
-static void test_formats(void)
-{
-    ITextRange *r, *r2;
-    ITextPara *para;
-    LONG a, b, d;
-    HRESULT hr;
-
-    open_edit(L"RichEdit20W", 300, 200, L"plain bold more plain\rsecond\rthird\rfourth");
-    {
-        CHARFORMAT2W cf = { sizeof(cf) };
-
-        cf.dwMask = cf.dwEffects = CFM_ITALIC;
-        SendMessageW(hwnd, EM_SETSEL, 6, 10);
-        SendMessageW(hwnd, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-    }
-
-    r = range(7, 7);
-    d = 99;
-    hr = ITextRange_Expand(r, tomCharFormat, &d);
-    CHECK(hr == S_OK && d == 4, "Expand char format hr %#lx d %ld", hr, d);
-    expect(r, 6, 10, "Expand char format");
-    hr = ITextRange_Expand(r, tomCharFormat, &d);
-    CHECK(hr == S_FALSE && d == 0, "Expand char format again %#lx %ld", hr, d);
-    ITextRange_Release(r);
-
-    r = range(2, 2);
-    ITextRange_EndOf(r, tomCharFormat, tomExtend, &d);
-    CHECK(d == 4, "EndOf char format d %ld", d);
-    expect(r, 2, 6, "EndOf char format extend");
-    ITextRange_Move(r, tomCharFormat, 1, &d);
-    CHECK(d == 1, "Move char format %ld", d);
-    expect(r, 10, 10, "Move char format");
-    ITextRange_Move(r, tomCharFormat, -2, &d);
-    CHECK(d == -2, "Move char format back %ld", d);
-    expect(r, 0, 0, "Move char format back");
-    ITextRange_Release(r);
-    r = range(7, 7);
-    ITextRange_StartOf(r, tomCharFormat, tomMove, &d);
-    expect(r, 6, 6, "StartOf char format");
-    ITextRange_MoveEnd(r, tomCharFormat, 1, &d);
-    CHECK(d == 1, "MoveEnd char format %ld", d);
-    expect(r, 6, 10, "MoveEnd char format");
-    ITextRange_Release(r);
-
-    /* paragraph formats: the second and third paragraph are centred */
-    r = range(22, 22);
-    ITextRange_GetPara(r, &para);
-    ITextPara_SetAlignment(para, tomAlignCenter);
-    ITextPara_Release(para);
-    r2 = range(30, 30);
-    ITextRange_GetPara(r2, &para);
-    ITextPara_SetAlignment(para, tomAlignCenter);
-    ITextPara_Release(para);
-    ITextRange_Release(r2);
-    ITextRange_Expand(r, tomParaFormat, &d);
-    a = b = -1;
-    ITextRange_GetStart(r, &a); ITextRange_GetEnd(r, &b);
-    CHECK(a == 22 && b == 35, "Expand para format [%ld,%ld]", a, b);
-    ITextRange_Release(r);
-    r = range(0, 0);
-    ITextRange_Move(r, tomParaFormat, 1, &d);
-    CHECK(d == 1, "Move para format %ld", d);
-    expect(r, 22, 22, "Move para format");
-    ITextRange_Release(r);
-}
-
-static void test_screen_window(void)
-{
-    ITextRange *r;
-    LONG a, b, d, first;
-    HRESULT hr;
-    int i;
-    WCHAR text[1200] = L"";
-
-    for (i = 0; i < 60; i++) wcscat(text, i < 59 ? L"line of text\r" : L"end");
-    open_edit(L"RichEdit20W", 200, 100, text);
-    SendMessageW(hwnd, EM_LINESCROLL, 0, 0);
-    r = range(0, 0);
-    d = 99;
-    hr = ITextRange_Expand(r, tomScreen, &d);
-    ITextRange_GetStart(r, &a);
-    ITextRange_GetEnd(r, &b);
-    CHECK(hr == S_OK && a == 0 && b > 13 && b < 13 * 20, "Expand screen hr %#lx [%ld,%ld]", hr, a, b);
-    first = b;
-    ITextRange_Release(r);
-    r = range(0, 0);
-    hr = ITextRange_Move(r, tomScreen, 1, &d);
-    CHECK(hr == S_OK && d == 1, "Move screen %#lx %ld", hr, d);
-    expect(r, first, first, "Move screen 1");
-    ITextRange_Move(r, tomScreen, -1, &d);
-    CHECK(d == -1, "Move screen back %ld", d);
-    expect(r, 0, 0, "Move screen back");
-    ITextRange_Move(r, tomScreen, 1000, &d);
-    CHECK(d > 1 && d < 60, "Move many screens %ld", d);
-    ITextRange_Release(r);
-
-    /* the window is what shows: scrolled down, StartOf goes to the first visible line */
-    SendMessageW(hwnd, EM_LINESCROLL, 0, 20);
-    r = range(0, 0);
-    hr = ITextRange_StartOf(r, tomWindow, tomMove, &d);
-    ITextRange_GetStart(r, &a);
-    CHECK(hr == S_FALSE || a == 0, "window start before scrolled text");
-    ITextRange_Release(r);
-    r = range(20 * 13 + 3, 20 * 13 + 3);
-    hr = ITextRange_StartOf(r, tomWindow, tomMove, &d);
-    ITextRange_GetStart(r, &a);
-    first = SendMessageW(hwnd, EM_LINEINDEX, SendMessageW(hwnd, EM_GETFIRSTVISIBLELINE, 0, 0), 0);
-    CHECK(hr == S_OK && a == first, "StartOf window %ld want %ld (hr %#lx)", a, first, hr);
-    ITextRange_EndOf(r, tomWindow, tomExtend, &d);
-    ITextRange_GetEnd(r, &b);
-    CHECK(b > first && b < first + 13 * 20, "EndOf window %ld", b);
-    ITextRange_Release(r);
-}
-
-
-struct rtf_src { const char *p; };
-static DWORD CALLBACK rtf_cb(DWORD_PTR cookie, LPBYTE buf, LONG cb, LONG *pcb)
-{
-    struct rtf_src *src = (struct rtf_src *)cookie;
-    LONG n = (LONG)strlen(src->p);
-
-    if (n > cb) n = cb;
-    memcpy(buf, src->p, n);
-    src->p += n;
-    *pcb = n;
-    return 0;
-}
-
-static void test_table(void)
-{
-    static const char rtf[] = "{\\rtf1 before\\par "
-        "\\trowd \\cellx1000\\cellx2000 \\intbl a1\\cell b1\\cell\\row "
-        "\\trowd \\cellx1000\\cellx2000 \\intbl a2\\cell b2\\cell\\row "
-        "after\\par}";
-    struct rtf_src src = { rtf };
-    EDITSTREAM es = { (DWORD_PTR)&src, 0, rtf_cb };
-    ITextRange *r;
-    LONG d, len;
-    HRESULT hr;
-
-    open_edit(L"RICHEDIT50W", 400, 200, L"");
-    SendMessageW(hwnd, EM_STREAMIN, SF_RTF, (LPARAM)&es);
-    ITextRange_GetStoryLength((r = range(0, 0)), &len);
-    CHECK(len == 28, "table story length %ld", len);
-    ITextRange_Release(r);
-
-    r = range(12, 12);
-    ITextRange_Expand(r, tomRow, &d); expect(r, 7, 17, "Expand row");
-    ITextRange_Release(r);
-    r = range(20, 20);
-    ITextRange_Expand(r, tomRow, &d); expect(r, 17, 27, "Expand second row");
-    ITextRange_Release(r);
-    r = range(12, 12);
-    d = 99;
-    hr = ITextRange_Expand(r, tomCell, &d);
-    CHECK(hr == S_OK && d == 3, "Expand cell hr %#lx d %ld", hr, d);
-    expect(r, 12, 15, "Expand cell");
-    ITextRange_Release(r);
-    r = range(20, 20);
-    ITextRange_Expand(r, tomTable, &d); expect(r, 7, 27, "Expand table");
-    ITextRange_Release(r);
-    r = range(3, 3);
-    ITextRange_Expand(r, tomTable, &d); expect(r, 0, 7, "no table before it");
-    ITextRange_Release(r);
-    r = range(0, 0);
-    hr = ITextRange_Move(r, tomTable, 1, &d);
-    CHECK(d == 1, "Move table %ld", d); expect(r, 7, 7, "Move table");
-    ITextRange_Move(r, tomTable, 1, &d); expect(r, 27, 27, "Move table past the end of the table");
-    ITextRange_Move(r, tomRow, -1, &d);
-    CHECK(d == -1, "Move row back %ld", d); expect(r, 17, 17, "Move row back");
-    ITextRange_Move(r, tomCell, 1, &d);
-    CHECK(d == 1, "Move cell %ld", d); { LONG s0; ITextRange_GetStart(r, &s0); CHECK(s0 > 17 && s0 < 27, "Move cell to %ld", s0); }
-    ITextRange_SetStart(r, 12); ITextRange_SetEnd(r, 12);
-    ITextRange_EndOf(r, tomCell, tomExtend, &d); expect(r, 12, 15, "EndOf cell extend");
-    ITextRange_StartOf(r, tomRow, tomExtend, &d); expect(r, 7, 15, "StartOf row extend");
-    ITextRange_Release(r);
-}
-
-static void test_objects(void)
-{
-    IOleClientSite *site = NULL;
-    REOBJECT reo = { sizeof(reo) };
-    ITextRange *r;
-    LONG d, o1, o2;
-    HRESULT hr;
-
-    open_edit(L"RichEdit20W", 300, 200, L"abc def ghi jkl");
-    hr = ole->lpVtbl->GetClientSite(ole, &site);
-    CHECK(hr == S_OK, "GetClientSite %#lx", hr);
-    reo.cp = 3;
-    reo.polesite = site;
-    reo.sizel.cx = reo.sizel.cy = 10;
-    reo.dvaspect = DVASPECT_CONTENT;
-    hr = ole->lpVtbl->InsertObject(ole, &reo);
-    CHECK(hr == S_OK, "InsertObject %#lx", hr);
-    reo.cp = 9;
-    hr = ole->lpVtbl->InsertObject(ole, &reo);
-    CHECK(hr == S_OK, "InsertObject 2 %#lx", hr);
-    IOleClientSite_Release(site);
-    {
-        REOBJECT got = { sizeof(got) };
-
-        CHECK(ole->lpVtbl->GetObjectCount(ole) == 2, "object count");
-        hr = ole->lpVtbl->GetObject(ole, 0, &got, REO_GETOBJ_NO_INTERFACES);
-        o1 = hr == S_OK ? got.cp : -1;
-        hr = ole->lpVtbl->GetObject(ole, 1, &got, REO_GETOBJ_NO_INTERFACES);
-        o2 = hr == S_OK ? got.cp : -1;
-    }
-    CHECK(o1 == 3 && o2 == 9, "objects at %ld and %ld", o1, o2);
-
-    r = range(o1, o1);
-    d = 99;
-    hr = ITextRange_Expand(r, tomObject, &d);
-    CHECK(hr == S_OK && d == 1, "Expand object hr %#lx d %ld", hr, d);
-    expect(r, o1, o1 + 1, "Expand object");
-    hr = ITextRange_Expand(r, tomObject, &d);
-    CHECK(hr == S_FALSE && d == 0, "Expand object again %#lx %ld", hr, d);
-    ITextRange_Release(r);
-    r = range(5, 5);
-    hr = ITextRange_Expand(r, tomObject, &d);
-    CHECK(hr == S_FALSE && d == 0, "Expand object between objects %#lx %ld", hr, d);
-    expect(r, 5, 5, "no object at 5");
-    ITextRange_Release(r);
-
-    r = range(0, 0);
-    hr = ITextRange_Move(r, tomObject, 1, &d);
-    CHECK(hr == S_OK && d == 1, "Move object %#lx %ld", hr, d); expect(r, o1, o1, "Move object 1");
-    ITextRange_Move(r, tomObject, 1, &d);
-    CHECK(d == 1, "Move object 2 %ld", d); expect(r, o2, o2, "Move object 2");
-    hr = ITextRange_Move(r, tomObject, 1, &d);
-    CHECK(hr == S_FALSE && d == 0, "no object after the last %#lx %ld", hr, d); expect(r, o2, o2, "Move object stays");
-    ITextRange_Move(r, tomObject, -5, &d);
-    CHECK(d == -1, "Move object back past the first %ld", d); expect(r, o1, o1, "Move back to the first");
-    ITextRange_Move(r, tomObject, 7, &d);
-    CHECK(d == 1, "Move object forward past the last %ld", d); expect(r, o2, o2, "Move forward to the last");
-    ITextRange_Move(r, tomObject, -5, &d);
-    ITextRange_SetStart(r, 0); ITextRange_SetEnd(r, 0);
-    ITextRange_Move(r, tomObject, 2, &d);
-    CHECK(d == 2, "Move 2 objects %ld", d); expect(r, o2, o2, "Move 2 objects");
-    ITextRange_Move(r, tomObject, -5, &d);
-    CHECK(d == -1, "Move object back %ld", d); expect(r, o1, o1, "Move object back to the first");
-    ITextRange_Release(r);
-
-    r = range(0, 0);
-    hr = ITextRange_EndOf(r, tomObject, tomExtend, &d);
-    CHECK(hr == S_OK && d == o1 + 1, "EndOf object %#lx %ld", hr, d); expect(r, 0, o1 + 1, "EndOf object extend");
-    ITextRange_Release(r);
-    r = range(o2 + 4, o2 + 4);
-    hr = ITextRange_StartOf(r, tomObject, tomMove, &d);
-    CHECK(hr == S_OK && d == o2 - (o2 + 4), "StartOf object %#lx %ld", hr, d); expect(r, o2, o2, "StartOf object");
-    ITextRange_Release(r);
-    r = range(0, 1);
-    ITextRange_MoveEnd(r, tomObject, 1, &d);
-    CHECK(d == 1, "MoveEnd object %ld", d); expect(r, 0, o1, "MoveEnd object");
-    ITextRange_MoveStart(r, tomObject, 1, &d);
-    CHECK(d == 1, "MoveStart object %ld", d); expect(r, o1, o1, "MoveStart object drags the end");
-    ITextRange_Release(r);
+    HWND e = CreateWindowExW(0, L"RichEdit20W", L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL,
+            10, 20, 300, 150, parent, NULL, GetModuleHandleW(NULL), NULL);
+    return e;
 }
 
 int main(void)
 {
-    LoadLibraryA("riched20.dll");
-    LoadLibraryA("msftedit.dll");
-    OleInitialize(NULL);
-    test_lines();
-    test_formats();
-    test_screen_window();
-    test_table();
-    test_objects();
-    if (doc) ITextDocument_Release(doc);
-    if (ole) ole->lpVtbl->Release(ole);
-    if (hwnd) DestroyWindow(hwnd);
-    printf(failed ? "RESULT: FAIL (%d)\n" : "RESULT: PASS\n", failed);
-    return failed != 0;
+    HWND top, edit;
+    IUnknown *ole = NULL;
+    void *old = NULL;
+    void *doc2 = NULL;
+    ITextDocument *doc = NULL;
+    HRESULT hr;
+    LONG l, t, r, b, v;
+    float fl;
+    COLORREF cr;
+    RECT rc;
+    POINT pt;
+    INT64 w64;
+    int xa, xb;
+    ITextSelection *sel1 = NULL, *sel2 = NULL;
+    ITextRange *range = NULL;
+    LRESULT lr;
+    int i;
+
+    LoadLibraryW(L"riched20.dll");
+    top = CreateWindowExW(0, L"static", L"top", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 50, 60, 400, 300, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    edit = make_edit(top);
+    CHECK(edit != NULL, "no richedit window");
+    if (!edit) { printf("RESULT: FAIL\n"); return 1; }
+    SendMessageW(edit, EM_SETEVENTMASK, 0, 0);
+    SetWindowTextW(edit, L"a\tb Hello world");
+    lr = SendMessageW(edit, EM_GETOLEINTERFACE, 0, (LPARAM)&ole);
+    CHECK(lr && ole, "EM_GETOLEINTERFACE");
+    hr = IUnknown_QueryInterface(ole, &IID_Old, &old);
+    CHECK(hr == S_OK && old, "ITextDocument2Old %#x", HR(hr));
+    hr = IUnknown_QueryInterface(ole, &IID_Doc2, &doc2);
+    CHECK(hr == S_OK && doc2, "ITextDocument2 %#x", HR(hr));
+    hr = IUnknown_QueryInterface(ole, &IID_Doc1, (void **)&doc);
+    if (!old || !doc2 || !doc) { printf("RESULT: FAIL\n"); return 1; }
+
+    /* ---- default tab stop, also seen in the layout */
+    fl = 0; hr = (CLP(old, OLD_TAB_GET, 0, 0), 0);
+    hr = ((p1)SLOT(old, OLD_TAB_GET))(old, &fl);
+    CHECK(hr == S_OK && fl == 36.0f, "default tab %f hr %#x", fl, HR(hr));
+    CHECK(((p1)SLOT(old, OLD_TAB_GET))(old, NULL) == E_INVALIDARG, "tab NULL");
+    {
+        POINTL p;
+        SendMessageW(edit, EM_POSFROMCHAR, (WPARAM)&p, 2);
+        xb = p.x;
+        SendMessageW(edit, EM_POSFROMCHAR, (WPARAM)&p, 0);
+        xa = p.x;
+        CHECK(xb > xa, "tab did not move text: %d %d", xa, xb);
+        hr = ((pf)SLOT(old, OLD_TAB_SET))(old, 100.0f);
+        CHECK(hr == S_OK, "set tab %#x", HR(hr));
+        fl = 0; ((p1)SLOT(old, OLD_TAB_GET))(old, &fl);
+        CHECK(fl == 100.0f, "tab get %f", fl);
+        SendMessageW(edit, EM_POSFROMCHAR, (WPARAM)&p, 2);
+        CHECK(p.x - xa > xb - xa + 30, "tab layout unchanged: %d vs %d", p.x - xa, xb - xa);
+        CHECK(((pf)SLOT(old, OLD_TAB_SET))(old, 0.0f) == E_INVALIDARG, "tab 0");
+        CHECK(((pf)SLOT(old, OLD_TAB_SET))(old, -3.0f) == E_INVALIDARG, "tab negative");
+        ((pf)SLOT(old, OLD_TAB_SET))(old, 36.0f);
+        SendMessageW(edit, EM_POSFROMCHAR, (WPARAM)&p, 2);
+        CHECK(p.x == xb, "tab restore: %d vs %d", (int)p.x, xb);
+        hr = ((p1)SLOT(doc2, OLD_TAB_GET))(doc2, &fl);
+        CHECK(hr == S_OK && fl == 36.0f, "doc2 tab");
+    }
+
+    /* ---- effect colours */
+    hr = ((plp)SLOT(old, OLD_GETEFFECT))(old, 2, &cr);
+    CHECK(hr == S_OK && cr == RGB(0, 0, 255), "effect 2 default %#lx", (unsigned long)cr);
+    hr = ((plp)SLOT(old, OLD_GETEFFECT))(old, 16, &cr);
+    CHECK(hr == S_OK && cr == RGB(192, 192, 192), "effect 16 default %#lx", (unsigned long)cr);
+    hr = ((plp)SLOT(old, OLD_GETEFFECT))(old, 0, &cr);
+    CHECK(hr == S_OK && cr == GetSysColor(COLOR_WINDOWTEXT), "effect 0 default %#lx", (unsigned long)cr);
+    hr = ((pll)SLOT(old, OLD_SETEFFECT))(old, 3, RGB(1, 2, 3));
+    CHECK(hr == S_OK, "set effect");
+    ((plp)SLOT(old, OLD_GETEFFECT))(old, 3, &cr);
+    CHECK(cr == RGB(1, 2, 3), "effect 3 %#lx", (unsigned long)cr);
+    hr = ((plp)SLOT(doc2, D2_GETEFFECT))(doc2, 3, &cr);
+    CHECK(hr == S_OK && cr == RGB(1, 2, 3), "doc2 effect 3");
+    hr = ((pll)SLOT(doc2, D2_SETEFFECT))(doc2, 4, RGB(9, 8, 7));
+    ((plp)SLOT(old, OLD_GETEFFECT))(old, 4, &cr);
+    CHECK(hr == S_OK && cr == RGB(9, 8, 7), "set via doc2");
+    ((plp)SLOT(old, OLD_GETEFFECT))(old, 5, &cr);
+    CHECK(cr == RGB(255, 0, 255), "effect 5 not default after others set");
+    CHECK(((plp)SLOT(old, OLD_GETEFFECT))(old, 17, &cr) == E_INVALIDARG, "effect 17");
+    CHECK(((plp)SLOT(old, OLD_GETEFFECT))(old, -1, &cr) == E_INVALIDARG, "effect -1");
+    CHECK(((plp)SLOT(old, OLD_GETEFFECT))(old, 1, NULL) == E_INVALIDARG, "effect NULL");
+    CHECK(((pll)SLOT(old, OLD_SETEFFECT))(old, 17, 0) == E_INVALIDARG, "set effect 17");
+
+    /* ---- caret type / notification mode are shared by both interfaces */
+    CHECK(((pl)SLOT(old, OLD_SETCARET))(old, tomKoreanBlockCaret) == S_OK, "set caret");
+    hr = ((p1)SLOT(doc2, D2_GETCARET))(doc2, &v);
+    CHECK(hr == S_OK && v == tomKoreanBlockCaret, "caret via doc2 %ld", v);
+    v = -5; hr = ((p1)SLOT(old, OLD_GETCARET))(old, &v);
+    CHECK(hr == S_OK && v == tomKoreanBlockCaret, "caret via old %ld", v);
+    CHECK(((p1)SLOT(old, OLD_GETCARET))(old, NULL) == E_INVALIDARG, "caret NULL");
+    ((pl)SLOT(doc2, D2_SETNOTIF))(doc2, 0x15);
+    v = 0; hr = ((p1)SLOT(old, OLD_GETNOTIF))(old, &v);
+    CHECK(hr == S_OK && v == 0x15, "notification via old %#lx", v);
+    CHECK(((pl)SLOT(old, OLD_SETNOTIF))(old, 7) == S_OK, "set notif");
+    ((p1)SLOT(doc2, D2_GETNOTIF))(doc2, &v);
+    CHECK(v == 7, "notification via doc2 %ld", v);
+
+    /* ---- client rectangle and window */
+    GetClientRect(edit, &rc);
+    {
+        LONG a[4];
+        typedef HRESULT (WINAPI *pcr)(void *, LONG, LONG *, LONG *, LONG *, LONG *);
+        hr = ((pcr)SLOT(old, OLD_CLIENTRECT))(old, tomClientCoord, &a[0], &a[1], &a[2], &a[3]);
+        CHECK(hr == S_OK && a[0] - rc.left >= 0 && a[0] - rc.left <= 2 && a[1] == rc.top && rc.right - a[2] >= 0 && rc.right - a[2] <= 2 && a[3] == rc.bottom,
+                "client rect %ld %ld %ld %ld vs %ld %ld %ld %ld", a[0], a[1], a[2], a[3], rc.left, rc.top, rc.right, rc.bottom);
+        pt.x = a[0]; pt.y = a[1]; ClientToScreen(edit, &pt);
+        hr = ((pcr)SLOT(old, OLD_CLIENTRECT))(old, 0, &l, &t, &r, &b);
+        CHECK(hr == S_OK && l == pt.x && t == pt.y, "screen rect %ld %ld vs %ld %ld", l, t, (long)pt.x, (long)pt.y);
+        CHECK(r - l == a[2] - a[0] && b - t == a[3] - a[1], "screen rect size");
+        hr = ((HRESULT (WINAPI *)(void *, LONG, LONG *, LONG *, LONG *, LONG *))SLOT(doc2, D2_CLIENTRECT))(doc2, tomClientCoord, &l, &t, &r, &b);
+        CHECK(hr == S_OK && l == a[0] && r == a[2] && b == a[3], "doc2 client rect");
+        CHECK(((pcr)SLOT(old, OLD_CLIENTRECT))(old, 0, NULL, &a[1], &a[2], &a[3]) == E_INVALIDARG, "client rect NULL");
+    }
+    w64 = 0; hr = ((p1)SLOT(doc2, D2_GETWINDOW))(doc2, &w64);
+    CHECK(hr == S_OK && (HWND)(ULONG_PTR)w64 == edit, "doc2 window %p vs %p", (void *)(ULONG_PTR)w64, edit);
+    v = 0; hr = ((p1)SLOT(old, OLD_GETWINDOW))(old, &v);
+    CHECK(hr == S_OK && (HWND)(LONG_PTR)v == edit, "old window");
+    CHECK(((p1)SLOT(old, OLD_GETWINDOW))(old, NULL) == E_INVALIDARG, "window NULL");
+    v = 5; hr = ((p1)SLOT(old, OLD_FEFLAGS))(old, &v);
+    CHECK(hr == S_OK && v == 0, "FE flags");
+
+    /* ---- text limit */
+    SendMessageW(edit, EM_EXLIMITTEXT, 0, 30);
+    SetWindowTextW(edit, L"0123456789");
+    v = -1; hr = ((plp)SLOT(old, OLD_CHECKLIMIT))(old, 5, &v);
+    CHECK(hr == S_OK && v == 0, "limit 5: %ld", v);
+    v = -1; hr = ((plp)SLOT(old, OLD_CHECKLIMIT))(old, 25, &v);
+    CHECK(hr == S_OK && v == 5, "limit 25: %ld", v);
+    hr = ((plp)SLOT(doc2, D2_CHECKLIMIT))(doc2, 25, &v);
+    CHECK(hr == S_OK && v == 5, "doc2 limit");
+    CHECK(((plp)SLOT(old, OLD_CHECKLIMIT))(old, 1, NULL) == E_INVALIDARG, "limit NULL");
+
+    /* ---- small calls */
+    CHECK(((pl)SLOT(old, OLD_IMEPROG))(old, tomTrue) == S_OK, "IMEInProgress");
+    CHECK(C0(old, OLD_SYSBEEP) == S_OK, "SysBeep");
+    CHECK(CL(old, OLD_UPDATE, tomTrue) == S_OK, "Update");
+    CHECK(C0(old, OLD_UPDATEWINDOW) == S_OK, "UpdateWindow");
+    CHECK(CL(old, OLD_NOTIFY, 1) == S_OK, "Notify");
+    v = -1; hr = ((p1)SLOT(old, OLD_GETIMM))(old, &v);
+    CHECK(hr == S_OK, "GetImmContext %#x", HR(hr));
+    if (hr == S_OK) CHECK(CL(old, OLD_RELIMM, v) == S_OK, "ReleaseImmContext");
+    {
+        INT64 ctx = -1;
+        hr = ((p1)SLOT(doc2, D2_GETIMM))(doc2, &ctx);
+        CHECK(hr == S_OK, "doc2 GetImmContext %#x", HR(hr));
+        if (hr == S_OK) ((HRESULT (WINAPI *)(void *, INT64))SLOT(doc2, D2_RELIMM))(doc2, ctx);
+    }
+
+    /* ---- stories */
+    v = 0; hr = ITextDocument_GetStoryCount(doc, &v);
+    CHECK(hr == S_OK && v == 1, "story count %ld", v);
+    CHECK(ITextDocument_GetStoryCount(doc, NULL) == E_INVALIDARG, "story count NULL");
+    {
+        ITextStoryRanges *sr = (ITextStoryRanges *)1;
+        hr = ITextDocument_GetStoryRanges(doc, &sr);
+        CHECK(hr == E_NOTIMPL, "story ranges %#x", HR(hr));
+    }
+    hr = ITextDocument_GetSelection(doc, &sel1);
+    hr = ((p1)SLOT(old, OLD_SELEX))(old, &sel2);
+    CHECK(hr == S_OK && sel1 && sel1 == sel2, "GetSelectionEx %p %p", sel1, sel2);
+    if (sel1) ITextSelection_Release(sel1);
+    if (sel2) ITextSelection_Release(sel2);
+
+    /* ---- range from a screen point */
+    SetWindowTextW(edit, L"0123456789");
+    {
+        POINTL p;
+        SendMessageW(edit, EM_POSFROMCHAR, (WPARAM)&p, 6);
+        pt.x = p.x + 1; pt.y = p.y + 3;
+        ClientToScreen(edit, &pt);
+        hr = ITextDocument_RangeFromPoint(doc, pt.x, pt.y, &range);
+        CHECK(hr == S_OK && range, "RangeFromPoint %#x", HR(hr));
+        if (range)
+        {
+            ITextRange_GetStart(range, &l); ITextRange_GetEnd(range, &r);
+            CHECK(l == 6 && r == 6, "range from point %ld %ld", l, r);
+            ITextRange_Release(range);
+        }
+        CHECK(ITextDocument_RangeFromPoint(doc, 1, 1, NULL) == E_INVALIDARG, "RangeFromPoint NULL");
+    }
+
+    /* ---- edit collection: undo grouping */
+    SetWindowTextW(edit, L"");
+    SendMessageW(edit, EM_EMPTYUNDOBUFFER, 0, 0);
+    SendMessageW(edit, EM_REPLACESEL, TRUE, (LPARAM)L"A");
+    SendMessageW(edit, EM_REPLACESEL, TRUE, (LPARAM)L"B");
+    SendMessageW(edit, EM_UNDO, 0, 0);
+    CHECK(GetWindowTextLengthW(edit) == 1, "without a collection one undo removes one edit: len %d", GetWindowTextLengthW(edit));
+    SendMessageW(edit, EM_EMPTYUNDOBUFFER, 0, 0);
+    SetWindowTextW(edit, L"");
+    SendMessageW(edit, EM_EMPTYUNDOBUFFER, 0, 0);
+    hr = C0(old, OLD_BEGINEDIT);
+    CHECK(hr == S_OK, "BeginEditCollection %#x", HR(hr));
+    hr = C0(old, OLD_BEGINEDIT);
+    CHECK(hr == S_OK, "nested BeginEditCollection");
+    SendMessageW(edit, EM_REPLACESEL, TRUE, (LPARAM)L"A");
+    SendMessageW(edit, EM_REPLACESEL, TRUE, (LPARAM)L"B");
+    SendMessageW(edit, EM_REPLACESEL, TRUE, (LPARAM)L"C");
+    CHECK(C0(old, OLD_ENDEDIT) == S_OK, "inner EndEditCollection");
+    SendMessageW(edit, EM_REPLACESEL, TRUE, (LPARAM)L"D");
+    CHECK(C0(old, OLD_ENDEDIT) == S_OK, "outer EndEditCollection");
+    CHECK(C0(old, OLD_ENDEDIT) == S_FALSE, "unmatched EndEditCollection");
+    SendMessageW(edit, EM_UNDO, 0, 0);
+    CHECK(GetWindowTextLengthW(edit) == 0, "one undo removes the whole collection: len %d", GetWindowTextLengthW(edit));
+
+    /* ---- properties */
+    SetWindowTextW(edit, L"hello");
+    SendMessageW(edit, EM_EMPTYUNDOBUFFER, 0, 0);
+    SendMessageW(edit, EM_SETSEL, 0, 0);
+    hr = ((plp)SLOT(doc2, D2_GETPROP))(doc2, 0x89, &v);
+    CHECK(hr == S_OK && v == tomFalse, "CanCopy without selection %ld", v);
+    SendMessageW(edit, EM_SETSEL, 0, 3);
+    hr = ((plp)SLOT(doc2, D2_GETPROP))(doc2, 0x89, &v);
+    CHECK(hr == S_OK && v == tomTrue, "CanCopy with selection %ld", v);
+    hr = ((plp)SLOT(doc2, D2_GETPROP))(doc2, 0x8b, &v);
+    CHECK(hr == S_OK && v == tomFalse, "CanUndo empty %ld", v);
+    SendMessageW(edit, EM_REPLACESEL, TRUE, (LPARAM)L"X");
+    hr = ((plp)SLOT(doc2, D2_GETPROP))(doc2, 0x8b, &v);
+    CHECK(hr == S_OK && v == tomTrue, "CanUndo after edit %ld", v);
+    hr = ((plp)SLOT(doc2, D2_GETPROP))(doc2, 0x8a, &v);
+    CHECK(hr == S_OK && v == tomFalse, "CanRedo %ld", v);
+    SendMessageW(edit, EM_UNDO, 0, 0);
+    hr = ((plp)SLOT(doc2, D2_GETPROP))(doc2, 0x8a, &v);
+    CHECK(hr == S_OK && v == tomTrue, "CanRedo after undo %ld", v);
+    hr = ((pll)SLOT(doc2, D2_SETPROP))(doc2, 0x8c, 17);
+    CHECK(hr == S_OK, "set undo limit %#x", HR(hr));
+    hr = ((plp)SLOT(doc2, D2_GETPROP))(doc2, 0x8c, &v);
+    CHECK(hr == S_OK && v == 17, "undo limit %ld", v);
+    CHECK(((pll)SLOT(doc2, D2_SETPROP))(doc2, 0x89, 1) == E_INVALIDARG, "set CanCopy");
+    CHECK(((plp)SLOT(doc2, D2_GETPROP))(doc2, 0x89, NULL) == E_INVALIDARG, "property NULL");
+    CHECK(FAILED(((plp)SLOT(doc2, D2_GETPROP))(doc2, 0x7777, &v)), "unknown property");
+
+    /* ---- version */
+    hr = ((p1)SLOT(doc2, D2_GETVERSION))(doc2, &v);
+    CHECK(hr == S_OK && ((v >> 24) & 0xff) == 4, "version %#lx", (unsigned long)v);
+    CHECK(((p1)SLOT(doc2, D2_GETVERSION))(doc2, NULL) == E_INVALIDARG, "version NULL");
+
+    ITextDocument_Release(doc);
+    ((ULONG (WINAPI *)(void *))SLOT(doc2, 2))(doc2);
+    ((ULONG (WINAPI *)(void *))SLOT(old, 2))(old);
+    IUnknown_Release(ole);
+    DestroyWindow(top);
+    (void)i; (void)l; (void)t;
+    printf("RESULT: %s\n", f ? "FAIL" : "PASS");
+    return f ? 1 : 0;
 }

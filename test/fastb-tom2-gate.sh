@@ -1,38 +1,50 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# riched20 TOM units: line, screen, window, character and paragraph format, cell, row, table, object (patch 3698)
-#
+# tom2: riched20 ITextDocument2Old and ITextDocument2 accessors (patch 3731)
 #   WINE=/opt/wine-sg/bin/wine test/fastb-tom2-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
-#   SG_XVFB_N=260 to name the display
 set -u
-HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 [ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
-command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW not installed"; exit 77; }
-command -v xvfb-run >/dev/null || { echo "SKIP: needs xvfb-run"; exit 77; }
+DPY="${FASTBTOM2_DPY:-264}"
+while [ -e "/tmp/.X${DPY}-lock" ] || [ -e "/tmp/.X11-unix/X${DPY}" ]; do DPY=$((DPY + 1)); done
+XP=""
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+for need in Xvfb xdpyinfo "$MINGW"; do command -v "$need" >/dev/null || { echo "SKIP: $need missing"; exit 77; }; done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
+
 T=$(mktemp -d /var/tmp/sg-fastb-tom2.XXXXXX)
-export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
-cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
+cleanup() {
+    [ -n "$XP" ] && kill "$XP" 2>/dev/null
+    rm -f "/tmp/.X${DPY}-lock"
+    WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null
+    rm -rf "$T"
+}
 trap cleanup EXIT INT TERM
-TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/fastb-tom2-probe.c" -lole32 -luuid -loleaut32 -lgdi32 -luser32 \
-    || { echo "FAIL  probe did not build"; exit 1; }
-mkdir -p "$WINEPREFIX"
-timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
+
+built=
+for inc in "" "-I$(dirname "$WINE")/include" "-I$HERE/../../obj/include" "-I/opt/wine-sg/include/wine/windows"; do
+    TMPDIR=/var/tmp "$MINGW" -O2 -mwindows $inc -o "$T/fastb-tom2-probe.exe" "$HERE/fastb-tom2-probe.c" \
+        -lole32 -loleaut32 -luuid 2>/dev/null && { built=1; break; }
+done
+[ -n "$built" ] || { echo "FAIL  the probe did not build"; exit 1; }
+
+Xvfb ":$DPY" -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 & XP=$!
+mkdir -p "$T/home" "$T/prefix"
+export HOME="$T/home" WINEPREFIX="$T/prefix" WINEDEBUG=${GATE_DEBUG:--all} WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
+unset WAYLAND_DISPLAY; export DISPLAY=":$DPY"
+i=0; while ! xdpyinfo >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
+timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
-cp "$T/probe.exe" "$WINEPREFIX/drive_c/"
-cat > "$T/run.sh" <<EOS
-#!/bin/sh
-cd "$WINEPREFIX/drive_c"
-timeout -s KILL 180 "$WINE" probe.exe 2>/dev/null </dev/null | tr -d '\r' > "$T/probe.out"
-EOS
-chmod +x "$T/run.sh"
-XN=${SG_XVFB_N:+-n $SG_XVFB_N}
-[ -n "$XN" ] || XN=-a
-timeout -s KILL 300 xvfb-run $XN -s '-screen 0 1024x768x24' "$T/run.sh"
-cat "$T/probe.out"
-grep -qx 'RESULT: PASS' "$T/probe.out" && exit 0
+
+# a crashed probe leaves wine helpers holding a pipe: go through a file
+timeout -s KILL 60 "$WINE" "$T/fastb-tom2-probe.exe" >"$T/out.raw" 2>/dev/null </dev/null
+tr -d '\r' <"$T/out.raw" >"$T/out"
+cat "$T/out"
+grep -qx 'RESULT: PASS' "$T/out" && ! grep -q '^FAIL' "$T/out" && exit 0
+grep -q '^RESULT:' "$T/out" || echo "RESULT: FAIL (the probe gave no result)"
 exit 1
+
