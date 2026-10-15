@@ -1,0 +1,1814 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Thu, 15 Oct 2026 08:24:31 -0700
+Subject: [PATCH] win32u, wow64win: D3DKMT shared resources: allocations,
+ ShareObjects, OpenResource, QueryResourceInfo (3321)
+
+CORE review: graphics. D3DKMTCreateAllocation(2), DestroyAllocation(2),
+ShareObjects, OpenResource(2), OpenResourceFromNtHandle, QueryResourceInfo and
+QueryResourceInfoFromNtHandle were stubs. A resource is now a block of system
+memory in a section: a header, the private runtime and driver data of the
+resource and its allocations, and the content of every allocation. A global
+share handle names the section in the session's namespace (D3DKMTOpenResource,
+QueryResourceInfo), D3DKMTShareObjects hands out NT handles of it (inheritable,
+duplicable, optionally named), D3DKMTOpenResourceFromNtHandle and
+QueryResourceInfoFromNtHandle open it, in this process or another.
+
+There is no kernel-mode driver, so the conventions a driver would define are in
+include/wine/kmtshare.h: the private driver data of an allocation starts with
+its content size, and a D3DKMTEscape (DRIVERPRIVATE) maps an allocation, giving
+the runtime a section handle and the content's offset and size.
+
+wow64win: the thunks of CreateAllocation(2) and OpenResource(2/FromNtHandle)
+read the allocation arrays with the wrong size and stride, never returned the
+handles, and CreateAllocation2 called CreateAllocation; rewritten.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+
+diff --git a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+index ea63056..b35690f 100644
+--- a/dlls/win32u/d3dkmt.c
++++ b/dlls/win32u/d3dkmt.c
+@@ -29,6 +29,7 @@
+ #include "ntgdi_private.h"
+ #include "win32u_private.h"
+ #include "ntuser_private.h"
++#include "wine/kmtshare.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
+ 
+@@ -56,6 +57,7 @@ struct d3dkmt_vidpn_source
+ };
+ 
+ static pthread_mutex_t d3dkmt_lock = PTHREAD_MUTEX_INITIALIZER;
++static void kmt_free_device_objects( D3DKMT_HANDLE device );
+ static struct list d3dkmt_adapters = LIST_INIT( d3dkmt_adapters );
+ static struct list d3dkmt_devices = LIST_INIT( d3dkmt_devices );
+ static struct list d3dkmt_vidpn_sources = LIST_INIT( d3dkmt_vidpn_sources );   /* VidPN source information list */
+@@ -167,6 +169,8 @@ NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromHdc( D3DKMT_OPENADAPTERFROMHDC *desc )
+ /******************************************************************************
+  *           NtGdiDdDDIEscape    (win32u.@)
+  */
++static NTSTATUS kmt_escape( struct wine_kmt_escape *escape );
++
+ NTSTATUS WINAPI NtGdiDdDDIEscape( const D3DKMT_ESCAPE *desc )
+ {
+     BOOL known;
+@@ -188,6 +192,12 @@ NTSTATUS WINAPI NtGdiDdDDIEscape( const D3DKMT_ESCAPE *desc )
+ #endif
+     if (!known) return STATUS_INVALID_PARAMETER;
+ 
++    /* the private escapes of the runtime, see wine/kmtshare.h */
++    if (desc->Type == D3DKMT_ESCAPE_DRIVERPRIVATE && desc->pPrivateDriverData
++        && desc->PrivateDriverDataSize >= sizeof(struct wine_kmt_escape)
++        && ((struct wine_kmt_escape *)desc->pPrivateDriverData)->magic == WINE_KMT_ESCAPE_MAGIC)
++        return kmt_escape( desc->pPrivateDriverData );
++
+     return STATUS_NOT_SUPPORTED;
+ }
+ 
+@@ -377,6 +387,7 @@ NTSTATUS WINAPI NtGdiDdDDIDestroyDevice( const D3DKMT_DESTROYDEVICE *desc )
+         if (device->handle == desc->hDevice)
+         {
+             list_remove( &device->entry );
++            kmt_free_device_objects( device->handle );
+             found = device;
+             break;
+         }
+@@ -818,14 +829,561 @@ void free_vulkan_gpu( struct vulkan_gpu *gpu )
+     free( gpu );
+ }
+ 
+-/******************************************************************************
+- *           NtGdiDdDDIShareObjects    (win32u.@)
+- */
+-NTSTATUS WINAPI NtGdiDdDDIShareObjects( UINT count, const D3DKMT_HANDLE *handles, OBJECT_ATTRIBUTES *attr,
+-                                        UINT access, HANDLE *handle )
++/* ---- shared graphics objects ----
++ *
++ * There is no kernel-mode driver behind these functions, so a resource is a
++ * block of system memory: a header, the private data the runtime attached to
++ * the resource and its allocations, and the allocations' content. A block that
++ * is shared lives in a section, which is also what an NT handle made by
++ * D3DKMTShareObjects is, and what a global (legacy) share handle names. See
++ * wine/kmtshare.h for the conventions the runtime follows. */
++
++#define KMT_SHARE_MAGIC     0x4d4b4753   /* "SGKM" */
++#define KMT_SHARE_VERSION   1
++#define KMT_SHARE_RESOURCE  0x1
++#define KMT_SHARE_MUTEX     0x2
++#define KMT_SHARE_SYNC      0x4
++#define KMT_MAX_CONTENT     0x40000000
++#define KMT_MAX_PRIVATE     0x100000
++#define KMT_MAX_ALLOCS      0x1000
++
++struct kmt_share_alloc
+ {
+-    FIXME( "count %u, handles %p, attr %p, access %#x, handle %p stub!\n", count, handles, attr, access, handle );
+-    return STATUS_NOT_IMPLEMENTED;
++    UINT   private_size, private_off;
++    UINT64 content_size, content_off;
++};
++
++#define KMT_MUTEX_RUNTIME_MAX 256
++
++struct kmt_share_header
++{
++    UINT   magic, version, flags, global_id;
++    UINT64 total_size;
++    UINT   runtime_size, runtime_off;       /* private runtime data of the resource */
++    UINT   driver_size, driver_off;         /* private driver data of the resource */
++    UINT   alloc_count, alloc_off;          /* struct kmt_share_alloc[] */
++    UINT   mutex_runtime_size, sync_type;
++    UINT   sync_flags, pad0;
++    UINT64 sync_max;
++    /* what every process that has the block mapped sees */
++    UINT64 mutex_key;
++    LONG64 mutex_owner;
++    LONG   mutex_abandoned, pad1;
++    UINT64 sync_value;
++    BYTE   mutex_runtime[KMT_MUTEX_RUNTIME_MAX];    /* private runtime data of the keyed mutex */
++};
++
++enum kmt_type { KMT_RESOURCE = 1, KMT_ALLOCATION, KMT_KEYEDMUTEX, KMT_SYNC };
++
++#define KMT_MAX_OLD_VIEWS 4
++
++struct kmt_block
++{
++    LONG ref;
++    struct kmt_share_header *hdr;
++    SIZE_T size;
++    HANDLE section;
++    /* A block that is given a name moves to a section of that name. What a thread that is waiting on
++     * the block has mapped stays, so that it does not read freed memory. */
++    struct { struct kmt_share_header *hdr; HANDLE section; } old[KMT_MAX_OLD_VIEWS];
++    UINT old_count;
++};
++
++struct kmt_object
++{
++    struct list entry;
++    D3DKMT_HANDLE handle, device;
++    enum kmt_type type;
++    struct kmt_block *block;
++    D3DKMT_HANDLE resource;             /* allocation: the resource it belongs to, or 0 */
++    UINT index;                         /* allocation: its index in the block */
++    BOOL nt_sharing;                    /* resource: made for NT handle sharing */
++};
++
++static struct list kmt_objects = LIST_INIT( kmt_objects );     /* d3dkmt_lock */
++static LONG kmt_next_handle = 0x40000000;
++static LONG *kmt_counter;
++
++static inline UINT64 kmt_align( UINT64 value, UINT64 alignment ) { return (value + alignment - 1) & ~(alignment - 1); }
++
++static inline BOOL kmt_in_range( UINT64 off, UINT64 size, UINT64 total )
++{
++    return off <= total && size <= total - off;
++}
++
++static D3DKMT_HANDLE kmt_new_handle(void)
++{
++    return __atomic_add_fetch( &kmt_next_handle, 1, __ATOMIC_SEQ_CST );
++}
++
++/* d3dkmt_lock must be held */
++static BOOL kmt_device_exists( D3DKMT_HANDLE handle )
++{
++    struct d3dkmt_device *device;
++    if (!handle) return FALSE;
++    LIST_FOR_EACH_ENTRY( device, &d3dkmt_devices, struct d3dkmt_device, entry )
++        if (device->handle == handle) return TRUE;
++    return FALSE;
++}
++
++/* d3dkmt_lock must be held */
++static struct kmt_object *kmt_find( D3DKMT_HANDLE handle, enum kmt_type type )
++{
++    struct kmt_object *object;
++    if (!handle) return NULL;
++    LIST_FOR_EACH_ENTRY( object, &kmt_objects, struct kmt_object, entry )
++        if (object->handle == handle && object->type == type) return object;
++    return NULL;
++}
++
++static void kmt_block_unref( struct kmt_block *block )
++{
++    UINT i;
++
++    if (--block->ref) return;
++    NtUnmapViewOfSection( NtCurrentProcess(), block->hdr );
++    NtClose( block->section );
++    for (i = 0; i < block->old_count; i++)
++    {
++        NtUnmapViewOfSection( NtCurrentProcess(), block->old[i].hdr );
++        NtClose( block->old[i].section );
++    }
++    free( block );
++}
++
++/* d3dkmt_lock must be held */
++static void kmt_object_free( struct kmt_object *object )
++{
++    list_remove( &object->entry );
++    kmt_block_unref( object->block );
++    free( object );
++}
++
++/* d3dkmt_lock must be held */
++static void kmt_free_device_objects( D3DKMT_HANDLE device )
++{
++    struct kmt_object *object, *next;
++    LIST_FOR_EACH_ENTRY_SAFE( object, next, &kmt_objects, struct kmt_object, entry )
++        if (object->device == device) kmt_object_free( object );
++}
++
++/* The name of a global object: in the session's namespace, so every process of the session sees it. */
++static void kmt_object_name( const char *prefix, UINT id, UNICODE_STRING *name, WCHAR *buffer )
++{
++    char text[128];
++    unsigned int i;
++
++    snprintf( text, sizeof(text), "\\Sessions\\%u\\BaseNamedObjects\\%s%08x",
++              (unsigned int)NtCurrentTeb()->Peb->SessionId, prefix, id );
++    for (i = 0; text[i]; i++) buffer[i] = (unsigned char)text[i];
++    buffer[i] = 0;
++    name->Buffer = buffer;
++    name->Length = i * sizeof(WCHAR);
++    name->MaximumLength = (i + 1) * sizeof(WCHAR);
++}
++
++/* d3dkmt_lock must be held. The numbers of global share handles, shared by every process of the session. */
++static UINT kmt_next_global_id(void)
++{
++    if (!kmt_counter)
++    {
++        OBJECT_ATTRIBUTES attr;
++        UNICODE_STRING name;
++        WCHAR buffer[128];
++        LARGE_INTEGER size;
++        SIZE_T view = 0;
++        HANDLE section;
++        void *base = NULL;
++
++        kmt_object_name( "SGKMT_counter", 0, &name, buffer );
++        InitializeObjectAttributes( &attr, &name, OBJ_OPENIF, 0, NULL );
++        size.QuadPart = 0x1000;
++        if (NtCreateSection( &section, SECTION_ALL_ACCESS, &attr, &size, PAGE_READWRITE, SEC_COMMIT, 0 )) return 0;
++        if (NtMapViewOfSection( section, NtCurrentProcess(), &base, 0, 0, NULL, &view, ViewShare, 0, PAGE_READWRITE ))
++        {
++            NtClose( section );
++            return 0;
++        }
++        kmt_counter = base;   /* the section handle stays open: the counter lives as long as any process has it */
++    }
++    return 0x40000000 | ((UINT)__atomic_add_fetch( kmt_counter, 1, __ATOMIC_SEQ_CST ) << 2);
++}
++
++/* A new section of a size, mapped. attr names it, or is NULL. */
++static NTSTATUS kmt_section_create( SIZE_T total, OBJECT_ATTRIBUTES *attr, HANDLE *section,
++                                    struct kmt_share_header **hdr )
++{
++    LARGE_INTEGER size;
++    SIZE_T view = 0;
++    void *base = NULL;
++    NTSTATUS status;
++
++    size.QuadPart = total;
++    if ((status = NtCreateSection( section, SECTION_ALL_ACCESS, attr, &size, PAGE_READWRITE, SEC_COMMIT, 0 )))
++        return status;
++    if ((status = NtMapViewOfSection( *section, NtCurrentProcess(), &base, 0, 0, NULL, &view, ViewShare, 0,
++                                      PAGE_READWRITE )))
++    {
++        NtClose( *section );
++        return status;
++    }
++    *hdr = base;
++    return STATUS_SUCCESS;
++}
++
++/* Moves a block to a section that has the name of attr, which is the NT name of a shared object.
++ * d3dkmt_lock must be held. */
++static NTSTATUS kmt_block_rebind( struct kmt_block *block, OBJECT_ATTRIBUTES *attr )
++{
++    struct kmt_share_header *hdr;
++    HANDLE section;
++    NTSTATUS status;
++
++    if (block->old_count == KMT_MAX_OLD_VIEWS) return STATUS_NOT_SUPPORTED;
++    if ((status = kmt_section_create( block->size, attr, &section, &hdr ))) return status;
++    memcpy( hdr, block->hdr, block->size );
++    block->old[block->old_count].hdr = block->hdr;
++    block->old[block->old_count++].section = block->section;
++    block->hdr = hdr;
++    block->section = section;
++    return STATUS_SUCCESS;
++}
++
++/* The block of a section, from an NT handle or a global name. d3dkmt_lock need not be held. */
++static NTSTATUS kmt_block_open( HANDLE section, struct kmt_block **ret )
++{
++    struct kmt_share_header *hdr;
++    struct kmt_share_alloc *allocs;
++    struct kmt_block *block;
++    SIZE_T view = 0;
++    void *base = NULL;
++    HANDLE copy;
++    NTSTATUS status;
++    UINT i;
++
++    if ((status = NtMapViewOfSection( section, NtCurrentProcess(), &base, 0, 0, NULL, &view, ViewShare, 0,
++                                      PAGE_READWRITE )))
++        return status;
++    hdr = base;
++    if (view < sizeof(*hdr) || hdr->magic != KMT_SHARE_MAGIC || hdr->version != KMT_SHARE_VERSION
++        || hdr->total_size < sizeof(*hdr) || hdr->total_size > view)
++        goto invalid;
++    if (hdr->flags & KMT_SHARE_RESOURCE)
++    {
++        if (hdr->alloc_count > KMT_MAX_ALLOCS
++            || !kmt_in_range( hdr->runtime_off, hdr->runtime_size, hdr->total_size )
++            || !kmt_in_range( hdr->driver_off, hdr->driver_size, hdr->total_size )
++            || !kmt_in_range( hdr->alloc_off, (UINT64)hdr->alloc_count * sizeof(*allocs), hdr->total_size ))
++            goto invalid;
++        allocs = (struct kmt_share_alloc *)((char *)hdr + hdr->alloc_off);
++        for (i = 0; i < hdr->alloc_count; i++)
++            if (!kmt_in_range( allocs[i].private_off, allocs[i].private_size, hdr->total_size )
++                || !kmt_in_range( allocs[i].content_off, allocs[i].content_size, hdr->total_size ))
++                goto invalid;
++    }
++    if ((hdr->flags & KMT_SHARE_MUTEX) && hdr->mutex_runtime_size > KMT_MUTEX_RUNTIME_MAX) goto invalid;
++
++    if (NtDuplicateObject( NtCurrentProcess(), section, NtCurrentProcess(), &copy, 0, 0, DUPLICATE_SAME_ACCESS ))
++        goto invalid;
++    if (!(block = calloc( 1, sizeof(*block) )))
++    {
++        NtClose( copy );
++        NtUnmapViewOfSection( NtCurrentProcess(), base );
++        return STATUS_NO_MEMORY;
++    }
++    block->ref = 1;
++    block->hdr = hdr;
++    block->size = hdr->total_size;
++    block->section = copy;
++    *ret = block;
++    return STATUS_SUCCESS;
++
++invalid:
++    NtUnmapViewOfSection( NtCurrentProcess(), base );
++    return STATUS_INVALID_PARAMETER;
++}
++
++static NTSTATUS kmt_block_open_global( UINT id, struct kmt_block **ret )
++{
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING name;
++    WCHAR buffer[128];
++    HANDLE section;
++    NTSTATUS status;
++
++    if (!id) return STATUS_INVALID_PARAMETER;
++    kmt_object_name( "SGKMT_", id, &name, buffer );
++    InitializeObjectAttributes( &attr, &name, 0, 0, NULL );
++    if ((status = NtOpenSection( &section, SECTION_ALL_ACCESS, &attr ))) return STATUS_INVALID_PARAMETER;
++    status = kmt_block_open( section, ret );
++    NtClose( section );
++    return status;
++}
++
++/* A block for a resource, or for an allocation that has no resource. */
++static NTSTATUS kmt_block_create( UINT flags, const void *runtime, UINT runtime_size, const void *driver,
++                                  UINT driver_size, UINT count, const void *const *alloc_data,
++                                  const UINT *alloc_data_size, UINT *global, struct kmt_block **ret )
++{
++    struct kmt_share_header *hdr;
++    struct kmt_share_alloc *allocs;
++    struct kmt_block *block;
++    UINT64 off, total, content;
++    NTSTATUS status;
++    UINT i;
++
++    if (runtime_size > KMT_MAX_PRIVATE || driver_size > KMT_MAX_PRIVATE || count > KMT_MAX_ALLOCS)
++        return STATUS_INVALID_PARAMETER;
++
++    off = kmt_align( sizeof(*hdr), 64 );
++    total = off + kmt_align( runtime_size, 8 ) + kmt_align( driver_size, 8 ) + count * sizeof(*allocs);
++    for (i = 0; i < count; i++)
++    {
++        content = 0;
++        if (alloc_data_size[i] > KMT_MAX_PRIVATE) return STATUS_INVALID_PARAMETER;
++        if (alloc_data_size[i] >= sizeof(struct wine_kmt_alloc_data))
++            content = ((const struct wine_kmt_alloc_data *)alloc_data[i])->size;
++        if (content > KMT_MAX_CONTENT) return STATUS_INVALID_PARAMETER;
++        total += kmt_align( alloc_data_size[i], 8 );
++    }
++    total = kmt_align( total, 64 );
++    for (i = 0; i < count; i++)
++    {
++        content = 0;
++        if (alloc_data_size[i] >= sizeof(struct wine_kmt_alloc_data))
++            content = ((const struct wine_kmt_alloc_data *)alloc_data[i])->size;
++        total += kmt_align( content, 64 );
++        if (total > KMT_MAX_CONTENT) return STATUS_INVALID_PARAMETER;
++    }
++
++    if (!(block = calloc( 1, sizeof(*block) ))) return STATUS_NO_MEMORY;
++    if (global)
++    {
++        /* a global share handle names the section */
++        OBJECT_ATTRIBUTES attr;
++        UNICODE_STRING name;
++        WCHAR buffer[128];
++        int tries;
++
++        for (tries = 0, status = STATUS_NO_MEMORY; tries < 8 && status; tries++)
++        {
++            if (!(*global = kmt_next_global_id())) break;
++            kmt_object_name( "SGKMT_", *global, &name, buffer );
++            InitializeObjectAttributes( &attr, &name, 0, 0, NULL );
++#ifdef SG_MUTANT_KMT_GLOBAL_NONAME
++            status = kmt_section_create( total, NULL, &block->section, &hdr );
++#else
++            status = kmt_section_create( total, &attr, &block->section, &hdr );
++#endif
++        }
++    }
++    else status = kmt_section_create( total, NULL, &block->section, &hdr );
++    if (status)
++    {
++        free( block );
++        return status;
++    }
++    if (global) hdr->global_id = *global;
++    block->ref = 1;
++    block->hdr = hdr;
++    block->size = total;
++
++    hdr->magic = KMT_SHARE_MAGIC;
++    hdr->version = KMT_SHARE_VERSION;
++    hdr->flags = flags;
++    hdr->total_size = total;
++
++    off = kmt_align( sizeof(*hdr), 64 );
++    hdr->runtime_size = runtime_size;
++    hdr->runtime_off = off;
++    if (runtime_size) memcpy( (char *)hdr + off, runtime, runtime_size );
++    off += kmt_align( runtime_size, 8 );
++    hdr->driver_size = driver_size;
++    hdr->driver_off = off;
++    if (driver_size) memcpy( (char *)hdr + off, driver, driver_size );
++    off += kmt_align( driver_size, 8 );
++    hdr->alloc_count = count;
++    hdr->alloc_off = off;
++    allocs = (struct kmt_share_alloc *)((char *)hdr + off);
++    off += count * sizeof(*allocs);
++    for (i = 0; i < count; i++)
++    {
++        allocs[i].private_size = alloc_data_size[i];
++        allocs[i].private_off = off;
++        if (alloc_data_size[i]) memcpy( (char *)hdr + off, alloc_data[i], alloc_data_size[i] );
++        off += kmt_align( alloc_data_size[i], 8 );
++    }
++    off = kmt_align( off, 64 );
++    for (i = 0; i < count; i++)
++    {
++        content = 0;
++        if (alloc_data_size[i] >= sizeof(struct wine_kmt_alloc_data))
++            content = ((const struct wine_kmt_alloc_data *)alloc_data[i])->size;
++#ifdef SG_MUTANT_KMT_ALLOC_NOSIZE
++        content = 0;
++#endif
++        allocs[i].content_size = content;
++        allocs[i].content_off = off;
++        off += kmt_align( content, 64 );
++    }
++    *ret = block;
++    return STATUS_SUCCESS;
++}
++
++/* The objects of a block: the resource and its allocations. d3dkmt_lock must be held, the block's
++ * reference is the caller's and stays with it. */
++static NTSTATUS kmt_objects_create( D3DKMT_HANDLE device, struct kmt_block *block, BOOL nt_sharing,
++                                    struct kmt_object **res, struct kmt_object **allocs_out )
++{
++    struct kmt_object *resource, *alloc;
++    UINT i;
++
++    if (!(resource = calloc( 1, sizeof(*resource) ))) return STATUS_NO_MEMORY;
++    resource->handle = kmt_new_handle();
++    resource->device = device;
++    resource->type = KMT_RESOURCE;
++    resource->block = block;
++    block->ref++;
++    resource->nt_sharing = nt_sharing;
++    list_add_tail( &kmt_objects, &resource->entry );
++
++    for (i = 0; i < block->hdr->alloc_count; i++)
++    {
++        if (!(alloc = calloc( 1, sizeof(*alloc) )))
++        {
++            kmt_object_free( resource );
++            return STATUS_NO_MEMORY;
++        }
++        alloc->handle = kmt_new_handle();
++        alloc->device = device;
++        alloc->type = KMT_ALLOCATION;
++        alloc->block = block;
++        block->ref++;
++        alloc->resource = resource->handle;
++        alloc->index = i;
++        list_add_tail( &kmt_objects, &alloc->entry );
++        allocs_out[i] = alloc;
++    }
++    *res = resource;
++    return STATUS_SUCCESS;
++}
++
++/* d3dkmt_lock must be held. Removes a resource with its allocations. */
++static void kmt_resource_free( struct kmt_object *resource )
++{
++    struct kmt_object *object, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( object, next, &kmt_objects, struct kmt_object, entry )
++        if (object->type == KMT_ALLOCATION && object->resource == resource->handle) kmt_object_free( object );
++    kmt_object_free( resource );
++}
++
++static NTSTATUS kmt_create_allocation( D3DKMT_CREATEALLOCATION *params, BOOL info2 )
++{
++    D3DKMT_CREATEALLOCATIONFLAGS flags;
++    const void *alloc_data[KMT_MAX_ALLOCS];
++    UINT alloc_size[KMT_MAX_ALLOCS];
++    struct kmt_object *resource = NULL, *objects[KMT_MAX_ALLOCS];
++    struct kmt_block *block;
++    NTSTATUS status;
++    UINT i, global_id = 0;
++
++    if (!params || !params->NumAllocations || params->NumAllocations > KMT_MAX_ALLOCS
++        || !params->pAllocationInfo)
++        return STATUS_INVALID_PARAMETER;
++    flags = params->Flags;
++    if (flags.StandardAllocation || flags.ExistingSysMem || flags.ExistingSection || flags.CrossAdapter
++        || flags.OpenCrossAdapter || flags.PartialSharedCreation)
++    {
++        FIXME( "flags %#x not supported\n", (unsigned int)*(UINT *)&flags );
++        return STATUS_NOT_SUPPORTED;
++    }
++    if ((flags.CreateShared && !flags.CreateResource) || (flags.NtSecuritySharing && !flags.CreateShared))
++        return STATUS_INVALID_PARAMETER;
++    if (!flags.CreateResource && params->hResource) return STATUS_NOT_SUPPORTED;
++    if ((params->PrivateRuntimeDataSize && !params->pPrivateRuntimeData)
++        || (params->PrivateDriverDataSize && !params->pPrivateDriverData))
++        return STATUS_INVALID_PARAMETER;
++    for (i = 0; i < params->NumAllocations; i++)
++    {
++        if (info2)
++        {
++            alloc_data[i] = params->pAllocationInfo2[i].pPrivateDriverData;
++            alloc_size[i] = params->pAllocationInfo2[i].PrivateDriverDataSize;
++        }
++        else
++        {
++            alloc_data[i] = params->pAllocationInfo[i].pPrivateDriverData;
++            alloc_size[i] = params->pAllocationInfo[i].PrivateDriverDataSize;
++        }
++        if (alloc_size[i] && !alloc_data[i]) return STATUS_INVALID_PARAMETER;
++    }
++
++    pthread_mutex_lock( &d3dkmt_lock );
++    if (!kmt_device_exists( params->hDevice ))
++    {
++        pthread_mutex_unlock( &d3dkmt_lock );
++        return STATUS_INVALID_PARAMETER;
++    }
++
++    if (flags.CreateResource)
++    {
++        global_id = 0;
++        if ((status = kmt_block_create( KMT_SHARE_RESOURCE, params->pPrivateRuntimeData,
++                                        params->PrivateRuntimeDataSize, params->pPrivateDriverData,
++                                        params->PrivateDriverDataSize, params->NumAllocations, alloc_data,
++                                        alloc_size, (flags.CreateShared && !flags.NtSecuritySharing) ? &global_id : NULL,
++                                        &block )))
++            goto done;
++        status = kmt_objects_create( params->hDevice, block, flags.NtSecuritySharing, &resource, objects );
++        kmt_block_unref( block );
++        if (status) goto done;
++        params->hResource = resource->handle;
++        params->hGlobalShare = global_id;
++        for (i = 0; i < params->NumAllocations; i++)
++        {
++            if (info2) params->pAllocationInfo2[i].hAllocation = objects[i]->handle;
++            else params->pAllocationInfo[i].hAllocation = objects[i]->handle;
++        }
++    }
++    else
++    {
++        /* allocations without a resource: each has a block of its own, which cannot be shared */
++        UINT created = 0;
++
++        status = STATUS_SUCCESS;
++        for (i = 0; i < params->NumAllocations && !status; i++)
++        {
++            struct kmt_object *dummy;
++
++            if ((status = kmt_block_create( KMT_SHARE_RESOURCE, NULL, 0, NULL, 0, 1, &alloc_data[i],
++                                            &alloc_size[i], NULL, &block )))
++                break;
++            status = kmt_objects_create( params->hDevice, block, FALSE, &dummy, &objects[i] );
++            kmt_block_unref( block );
++            if (status) break;
++            /* the resource made along with it is not there for the caller */
++            objects[i]->resource = 0;
++            kmt_object_free( dummy );
++            created++;
++        }
++        if (status)
++        {
++            while (created) kmt_object_free( objects[--created] );
++        }
++        else
++        {
++            for (i = 0; i < params->NumAllocations; i++)
++            {
++                if (info2) params->pAllocationInfo2[i].hAllocation = objects[i]->handle;
++                else params->pAllocationInfo[i].hAllocation = objects[i]->handle;
++            }
++        }
++    }
++
++done:
++    pthread_mutex_unlock( &d3dkmt_lock );
++    return status;
+ }
+ 
+ /******************************************************************************
+@@ -833,8 +1391,8 @@ NTSTATUS WINAPI NtGdiDdDDIShareObjects( UINT count, const D3DKMT_HANDLE *handles
+  */
+ NTSTATUS WINAPI NtGdiDdDDICreateAllocation2( D3DKMT_CREATEALLOCATION *params )
+ {
+-    FIXME( "params %p stub!\n", params );
+-    return STATUS_NOT_IMPLEMENTED;
++    TRACE( "params %p\n", params );
++    return kmt_create_allocation( params, TRUE );
+ }
+ 
+ /******************************************************************************
+@@ -842,8 +1400,41 @@ NTSTATUS WINAPI NtGdiDdDDICreateAllocation2( D3DKMT_CREATEALLOCATION *params )
+  */
+ NTSTATUS WINAPI NtGdiDdDDICreateAllocation( D3DKMT_CREATEALLOCATION *params )
+ {
+-    FIXME( "params %p stub!\n", params );
+-    return STATUS_NOT_IMPLEMENTED;
++    TRACE( "params %p\n", params );
++    return kmt_create_allocation( params, FALSE );
++}
++
++static NTSTATUS kmt_destroy_allocation( D3DKMT_HANDLE device, D3DKMT_HANDLE hresource,
++                                        const D3DKMT_HANDLE *list, UINT count )
++{
++    struct kmt_object *object;
++    NTSTATUS status = STATUS_SUCCESS;
++    UINT i;
++
++    pthread_mutex_lock( &d3dkmt_lock );
++    if (!kmt_device_exists( device ) || (hresource && (list || count)) || (!hresource && (!list || !count)))
++    {
++        pthread_mutex_unlock( &d3dkmt_lock );
++        return STATUS_INVALID_PARAMETER;
++    }
++    if (hresource)
++    {
++        if (!(object = kmt_find( hresource, KMT_RESOURCE )) || object->device != device) status = STATUS_INVALID_PARAMETER;
++        else kmt_resource_free( object );
++    }
++    else
++    {
++        /* all of them have to be there before one is destroyed */
++#ifndef SG_MUTANT_KMT_DESTROY_ANY
++        for (i = 0; i < count; i++)
++            if (!(object = kmt_find( list[i], KMT_ALLOCATION )) || object->device != device)
++                status = STATUS_INVALID_PARAMETER;
++#endif
++        for (i = 0; !status && i < count; i++)
++            if ((object = kmt_find( list[i], KMT_ALLOCATION ))) kmt_object_free( object );
++    }
++    pthread_mutex_unlock( &d3dkmt_lock );
++    return status;
+ }
+ 
+ /******************************************************************************
+@@ -851,8 +1442,10 @@ NTSTATUS WINAPI NtGdiDdDDICreateAllocation( D3DKMT_CREATEALLOCATION *params )
+  */
+ NTSTATUS WINAPI NtGdiDdDDIDestroyAllocation2( const D3DKMT_DESTROYALLOCATION2 *params )
+ {
+-    FIXME( "params %p stub!\n", params );
+-    return STATUS_NOT_IMPLEMENTED;
++    TRACE( "params %p\n", params );
++    if (!params) return STATUS_INVALID_PARAMETER;
++    return kmt_destroy_allocation( params->hDevice, params->hResource, params->phAllocationList,
++                                   params->AllocationCount );
+ }
+ 
+ /******************************************************************************
+@@ -860,8 +1453,184 @@ NTSTATUS WINAPI NtGdiDdDDIDestroyAllocation2( const D3DKMT_DESTROYALLOCATION2 *p
+  */
+ NTSTATUS WINAPI NtGdiDdDDIDestroyAllocation( const D3DKMT_DESTROYALLOCATION *params )
+ {
+-    FIXME( "params %p stub!\n", params );
+-    return STATUS_NOT_IMPLEMENTED;
++    TRACE( "params %p\n", params );
++    if (!params) return STATUS_INVALID_PARAMETER;
++    return kmt_destroy_allocation( params->hDevice, params->hResource, params->phAllocationList,
++                                   params->AllocationCount );
++}
++
++/******************************************************************************
++ *           NtGdiDdDDIShareObjects    (win32u.@)
++ */
++NTSTATUS WINAPI NtGdiDdDDIShareObjects( UINT count, const D3DKMT_HANDLE *handles, OBJECT_ATTRIBUTES *attr,
++                                        UINT access, HANDLE *handle )
++{
++    struct kmt_object *resource = NULL;
++    struct kmt_block *block;
++    NTSTATUS status;
++    UINT i;
++
++    TRACE( "count %u, handles %p, attr %p, access %#x, handle %p\n", count, handles, attr, access, handle );
++
++    if (!count || !handles || !handle) return STATUS_INVALID_PARAMETER;
++    *handle = NULL;
++
++    pthread_mutex_lock( &d3dkmt_lock );
++    for (i = 0; i < count; i++)
++    {
++        struct kmt_object *object;
++
++        if ((object = kmt_find( handles[i], KMT_RESOURCE )) && !resource) resource = object;
++        else
++        {
++            pthread_mutex_unlock( &d3dkmt_lock );
++            return STATUS_INVALID_PARAMETER;
++        }
++    }
++#ifndef SG_MUTANT_KMT_SHARE_ANY
++    if (!resource->nt_sharing)
++#else
++    if (FALSE)
++#endif
++    {
++        pthread_mutex_unlock( &d3dkmt_lock );
++        return STATUS_INVALID_PARAMETER;
++    }
++
++    block = resource->block;
++    /* a name makes a section of its own, the block moves to it */
++    if (attr && attr->ObjectName) status = kmt_block_rebind( block, attr );
++    else status = STATUS_SUCCESS;
++#ifdef SG_MUTANT_KMT_SHARE_COPY
++    if (!status)
++    {
++        /* a copy of the pixels, not the resource's own */
++        struct kmt_share_header *copy;
++        HANDLE csection;
++        if (!(status = kmt_section_create( block->size, NULL, &csection, &copy )))
++        {
++            memcpy( copy, block->hdr, block->size );
++            NtUnmapViewOfSection( NtCurrentProcess(), copy );
++            status = NtDuplicateObject( NtCurrentProcess(), csection, NtCurrentProcess(), handle, access, 0,
++                                        access ? 0 : DUPLICATE_SAME_ACCESS );
++            NtClose( csection );
++        }
++    }
++#else
++    if (!status)
++        status = NtDuplicateObject( NtCurrentProcess(), block->section, NtCurrentProcess(), handle, access,
++                                    (attr && (attr->Attributes & OBJ_INHERIT)) ? OBJ_INHERIT : 0,
++                                    access ? 0 : DUPLICATE_SAME_ACCESS );
++#endif
++    pthread_mutex_unlock( &d3dkmt_lock );
++    return status;
++}
++
++/* The runtime data and the driver data of the resource of a block, and the sizes to ask for. */
++static NTSTATUS kmt_resource_info( struct kmt_share_header *hdr, void *runtime, UINT *runtime_size,
++                                   UINT *total_driver_size, UINT *resource_driver_size, UINT *alloc_count )
++{
++    struct kmt_share_alloc *allocs = (struct kmt_share_alloc *)((char *)hdr + hdr->alloc_off);
++    UINT i, total = hdr->driver_size;
++
++    if (!(hdr->flags & KMT_SHARE_RESOURCE)) return STATUS_INVALID_PARAMETER;
++    for (i = 0; i < hdr->alloc_count; i++) total += allocs[i].private_size;
++    if (runtime && *runtime_size < hdr->runtime_size) return STATUS_BUFFER_TOO_SMALL;
++    if (runtime) memcpy( runtime, (char *)hdr + hdr->runtime_off, hdr->runtime_size );
++    *runtime_size = hdr->runtime_size;
++    *total_driver_size = total;
++    *resource_driver_size = hdr->driver_size;
++    *alloc_count = hdr->alloc_count;
++    return STATUS_SUCCESS;
++}
++
++/* Opens the resource of a block for a device: the objects, and what the runtime asked to be told.
++ * The block's reference stays with the caller. */
++static NTSTATUS kmt_resource_open( D3DKMT_HANDLE device, struct kmt_block *block, UINT count, void *infos,
++                                   BOOL info2, void *runtime, UINT runtime_size, void *resource_driver,
++                                   UINT resource_driver_size, void *total, UINT total_size,
++                                   D3DKMT_HANDLE *hresource )
++{
++    struct kmt_share_header *hdr = block->hdr;
++    struct kmt_share_alloc *allocs = (struct kmt_share_alloc *)((char *)hdr + hdr->alloc_off);
++    struct kmt_object *resource, *objects[KMT_MAX_ALLOCS];
++    UINT i, needed = hdr->driver_size, off;
++    NTSTATUS status;
++
++    if (!(hdr->flags & KMT_SHARE_RESOURCE) || count != hdr->alloc_count || (count && !infos))
++        return STATUS_INVALID_PARAMETER;
++    for (i = 0; i < count; i++) needed += allocs[i].private_size;
++#ifndef SG_MUTANT_KMT_OPEN_NOCHECK
++    if ((runtime && runtime_size < hdr->runtime_size)
++        || (resource_driver && resource_driver_size < hdr->driver_size)
++        || (total && total_size < needed))
++        return STATUS_BUFFER_TOO_SMALL;
++#endif
++
++    pthread_mutex_lock( &d3dkmt_lock );
++    if (!kmt_device_exists( device )) status = STATUS_INVALID_PARAMETER;
++    else status = kmt_objects_create( device, block, TRUE, &resource, objects );
++    if (status)
++    {
++        pthread_mutex_unlock( &d3dkmt_lock );
++        return status;
++    }
++
++    if (runtime) memcpy( runtime, (char *)hdr + hdr->runtime_off, hdr->runtime_size );
++    if (resource_driver) memcpy( resource_driver, (char *)hdr + hdr->driver_off, hdr->driver_size );
++    if (total) memcpy( total, (char *)hdr + hdr->driver_off, hdr->driver_size );
++    off = hdr->driver_size;
++    for (i = 0; i < count; i++)
++    {
++        D3DKMT_HANDLE *handle;
++        const void **driver_data;
++        UINT *driver_size;
++
++        if (info2)
++        {
++            D3DDDI_OPENALLOCATIONINFO2 *info = (D3DDDI_OPENALLOCATIONINFO2 *)infos + i;
++            handle = &info->hAllocation;
++            driver_data = &info->pPrivateDriverData;
++            driver_size = &info->PrivateDriverDataSize;
++        }
++        else
++        {
++            D3DDDI_OPENALLOCATIONINFO *info = (D3DDDI_OPENALLOCATIONINFO *)infos + i;
++            handle = &info->hAllocation;
++            driver_data = &info->pPrivateDriverData;
++            driver_size = &info->PrivateDriverDataSize;
++        }
++        *handle = objects[i]->handle;
++        *driver_size = allocs[i].private_size;
++        if (total)
++        {
++            memcpy( (char *)total + off, (char *)hdr + allocs[i].private_off, allocs[i].private_size );
++            *driver_data = (char *)total + off;
++        }
++        off += allocs[i].private_size;
++    }
++    *hresource = resource->handle;
++    pthread_mutex_unlock( &d3dkmt_lock );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS kmt_open_resource( D3DKMT_OPENRESOURCE *params, BOOL info2 )
++{
++    struct kmt_block *block;
++    NTSTATUS status;
++
++    if (!params) return STATUS_INVALID_PARAMETER;
++    if ((status = kmt_block_open_global( params->hGlobalShare, &block ))) return status;
++    status = kmt_resource_open( params->hDevice, block, params->NumAllocations, params->pOpenAllocationInfo,
++                                info2, params->pPrivateRuntimeData, params->PrivateRuntimeDataSize,
++                                params->pResourcePrivateDriverData, params->ResourcePrivateDriverDataSize,
++                                params->pTotalPrivateDriverDataBuffer, params->TotalPrivateDriverDataBufferSize,
++                                &params->hResource );
++    if (!status) params->PrivateRuntimeDataSize = block->hdr->runtime_size;
++    pthread_mutex_lock( &d3dkmt_lock );
++    kmt_block_unref( block );
++    pthread_mutex_unlock( &d3dkmt_lock );
++    return status;
+ }
+ 
+ /******************************************************************************
+@@ -869,8 +1638,8 @@ NTSTATUS WINAPI NtGdiDdDDIDestroyAllocation( const D3DKMT_DESTROYALLOCATION *par
+  */
+ NTSTATUS WINAPI NtGdiDdDDIOpenResource( D3DKMT_OPENRESOURCE *params )
+ {
+-    FIXME( "params %p stub!\n", params );
+-    return STATUS_NOT_IMPLEMENTED;
++    TRACE( "params %p\n", params );
++    return kmt_open_resource( params, FALSE );
+ }
+ 
+ /******************************************************************************
+@@ -878,8 +1647,8 @@ NTSTATUS WINAPI NtGdiDdDDIOpenResource( D3DKMT_OPENRESOURCE *params )
+  */
+ NTSTATUS WINAPI NtGdiDdDDIOpenResource2( D3DKMT_OPENRESOURCE *params )
+ {
+-    FIXME( "params %p stub!\n", params );
+-    return STATUS_NOT_IMPLEMENTED;
++    TRACE( "params %p\n", params );
++    return kmt_open_resource( params, TRUE );
+ }
+ 
+ /******************************************************************************
+@@ -887,8 +1656,23 @@ NTSTATUS WINAPI NtGdiDdDDIOpenResource2( D3DKMT_OPENRESOURCE *params )
+  */
+ NTSTATUS WINAPI NtGdiDdDDIOpenResourceFromNtHandle( D3DKMT_OPENRESOURCEFROMNTHANDLE *params )
+ {
+-    FIXME( "params %p stub!\n", params );
+-    return STATUS_NOT_IMPLEMENTED;
++    struct kmt_block *block;
++    NTSTATUS status;
++
++    TRACE( "params %p\n", params );
++
++    if (!params || !params->hNtHandle) return STATUS_INVALID_PARAMETER;
++    if ((status = kmt_block_open( params->hNtHandle, &block ))) return status;
++    status = kmt_resource_open( params->hDevice, block, params->NumAllocations, params->pOpenAllocationInfo2,
++                                TRUE, params->pPrivateRuntimeData, params->PrivateRuntimeDataSize,
++                                params->pResourcePrivateDriverData, params->ResourcePrivateDriverDataSize,
++                                params->pTotalPrivateDriverDataBuffer, params->TotalPrivateDriverDataBufferSize,
++                                &params->hResource );
++    if (!status) params->PrivateRuntimeDataSize = block->hdr->runtime_size;
++    pthread_mutex_lock( &d3dkmt_lock );
++    kmt_block_unref( block );
++    pthread_mutex_unlock( &d3dkmt_lock );
++    return status;
+ }
+ 
+ /******************************************************************************
+@@ -896,8 +1680,25 @@ NTSTATUS WINAPI NtGdiDdDDIOpenResourceFromNtHandle( D3DKMT_OPENRESOURCEFROMNTHAN
+  */
+ NTSTATUS WINAPI NtGdiDdDDIQueryResourceInfo( D3DKMT_QUERYRESOURCEINFO *params )
+ {
+-    FIXME( "params %p stub!\n", params );
+-    return STATUS_NOT_IMPLEMENTED;
++    struct kmt_block *block;
++    NTSTATUS status;
++    BOOL exists;
++
++    TRACE( "params %p\n", params );
++
++    if (!params) return STATUS_INVALID_PARAMETER;
++    pthread_mutex_lock( &d3dkmt_lock );
++    exists = kmt_device_exists( params->hDevice );
++    pthread_mutex_unlock( &d3dkmt_lock );
++    if (!exists) return STATUS_INVALID_PARAMETER;
++    if ((status = kmt_block_open_global( params->hGlobalShare, &block ))) return status;
++    status = kmt_resource_info( block->hdr, params->pPrivateRuntimeData, &params->PrivateRuntimeDataSize,
++                                &params->TotalPrivateDriverDataSize, &params->ResourcePrivateDriverDataSize,
++                                &params->NumAllocations );
++    pthread_mutex_lock( &d3dkmt_lock );
++    kmt_block_unref( block );
++    pthread_mutex_unlock( &d3dkmt_lock );
++    return status;
+ }
+ 
+ /******************************************************************************
+@@ -905,10 +1706,60 @@ NTSTATUS WINAPI NtGdiDdDDIQueryResourceInfo( D3DKMT_QUERYRESOURCEINFO *params )
+  */
+ NTSTATUS WINAPI NtGdiDdDDIQueryResourceInfoFromNtHandle( D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE *params )
+ {
+-    FIXME( "params %p stub!\n", params );
+-    return STATUS_NOT_IMPLEMENTED;
++    struct kmt_block *block;
++    NTSTATUS status;
++    BOOL exists;
++
++    TRACE( "params %p\n", params );
++
++    if (!params || !params->hNtHandle) return STATUS_INVALID_PARAMETER;
++    pthread_mutex_lock( &d3dkmt_lock );
++    exists = kmt_device_exists( params->hDevice );
++    pthread_mutex_unlock( &d3dkmt_lock );
++    if (!exists) return STATUS_INVALID_PARAMETER;
++    if ((status = kmt_block_open( params->hNtHandle, &block ))) return status;
++    status = kmt_resource_info( block->hdr, params->pPrivateRuntimeData, &params->PrivateRuntimeDataSize,
++                                &params->TotalPrivateDriverDataSize, &params->ResourcePrivateDriverDataSize,
++                                &params->NumAllocations );
++    pthread_mutex_lock( &d3dkmt_lock );
++    kmt_block_unref( block );
++    pthread_mutex_unlock( &d3dkmt_lock );
++    return status;
+ }
+ 
++/* D3DKMTEscape of the runtime: a section handle for the content of an allocation. */
++static NTSTATUS kmt_escape( struct wine_kmt_escape *escape )
++{
++    struct kmt_object *object;
++    struct kmt_share_alloc *alloc;
++    struct kmt_block *block;
++    NTSTATUS status;
++    HANDLE section;
++    UINT index = 0;
++
++    if (escape->command != WINE_KMT_ESCAPE_MAP_ALLOCATION) return STATUS_NOT_SUPPORTED;
++
++    pthread_mutex_lock( &d3dkmt_lock );
++    if ((object = kmt_find( escape->handle, KMT_ALLOCATION ))) index = object->index;
++    else if (!(object = kmt_find( escape->handle, KMT_RESOURCE ))) object = NULL;
++    if (!object || index >= object->block->hdr->alloc_count)
++    {
++        pthread_mutex_unlock( &d3dkmt_lock );
++        return STATUS_INVALID_PARAMETER;
++    }
++    block = object->block;
++    status = NtDuplicateObject( NtCurrentProcess(), block->section, NtCurrentProcess(), &section, 0, 0,
++                                    DUPLICATE_SAME_ACCESS );
++    if (!status)
++    {
++        alloc = (struct kmt_share_alloc *)((char *)block->hdr + block->hdr->alloc_off) + index;
++        escape->section = (UINT64)(ULONG_PTR)section;
++        escape->offset = alloc->content_off;
++        escape->size = alloc->content_size;
++    }
++    pthread_mutex_unlock( &d3dkmt_lock );
++    return status;
++}
+ 
+ /******************************************************************************
+  *           NtGdiDdDDICreateKeyedMutex2    (win32u.@)
+diff --git a/dlls/wow64win/gdi.c b/dlls/wow64win/gdi.c
+index bcd430b..83a358c 100644
+--- a/dlls/wow64win/gdi.c
++++ b/dlls/wow64win/gdi.c
+@@ -417,214 +417,357 @@ NTSTATUS WINAPI wow64_NtGdiDdDDICloseAdapter( UINT *args )
+     return NtGdiDdDDICloseAdapter( desc );
+ }
+ 
+-NTSTATUS WINAPI wow64_NtGdiDdDDICreateAllocation( UINT *args )
+-{
+-    struct
++/* the 32-bit layouts of D3DDDI_ALLOCATIONINFO, D3DDDI_ALLOCATIONINFO2, D3DDDI_OPENALLOCATIONINFO and
++ * D3DDDI_OPENALLOCATIONINFO2 */
++struct kmt_allocation_info32
++{
++    D3DKMT_HANDLE hAllocation;
++    ULONG pSystemMem;
++    ULONG pPrivateDriverData;
++    UINT PrivateDriverDataSize;
++    D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId;
++    UINT Flags;
++};
++
++struct kmt_allocation_info2_32
++{
++    D3DKMT_HANDLE hAllocation;
++    ULONG pSystemMem;
++    ULONG pPrivateDriverData;
++    UINT PrivateDriverDataSize;
++    D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId;
++    UINT Flags;
++    D3DGPU_VIRTUAL_ADDRESS GpuVirtualAddress;
++    ULONG Priority;
++    ULONG Reserved[5];
++};
++
++struct kmt_open_allocation_info32
++{
++    D3DKMT_HANDLE hAllocation;
++    ULONG pPrivateDriverData;
++    UINT PrivateDriverDataSize;
++};
++
++struct kmt_open_allocation_info2_32
++{
++    D3DKMT_HANDLE hAllocation;
++    ULONG pPrivateDriverData;
++    UINT PrivateDriverDataSize;
++    D3DGPU_VIRTUAL_ADDRESS GpuVirtualAddress;
++    ULONG Reserved[6];
++};
++
++struct kmt_create_allocation32
++{
++    D3DKMT_HANDLE hDevice;
++    D3DKMT_HANDLE hResource;
++    D3DKMT_HANDLE hGlobalShare;
++    ULONG pPrivateRuntimeData;
++    UINT PrivateRuntimeDataSize;
++    union
+     {
+-        D3DKMT_HANDLE hAllocation;
+-        ULONG pSystemMem;
++        ULONG pStandardAllocation;
+         ULONG pPrivateDriverData;
+-        UINT PrivateDriverDataSize;
+-        D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId;
+-        union
+-        {
+-            struct
+-            {
+-                UINT Primary : 1;
+-                UINT Stereo : 1;
+-                UINT Reserved : 30;
+-            };
+-            UINT Value;
+-        } Flags;
+-    } *allocs32;
++    };
++    UINT PrivateDriverDataSize;
++    UINT NumAllocations;
++    ULONG pAllocationInfo;
++    D3DKMT_CREATEALLOCATIONFLAGS Flags;
++    ULONG hPrivateRuntimeResourceHandle;
++};
++
++static NTSTATUS kmt_create_allocation_32to64( struct kmt_create_allocation32 *desc32, BOOL info2,
++                                              D3DKMT_CREATESTANDARDALLOCATION *standard,
++                                              D3DKMT_CREATEALLOCATION *desc )
++{
+     typedef struct
+-    {
+-        ULONG Size;
+-    } D3DKMT_STANDARDALLOCATION_EXISTINGHEAP32;
+-    struct
+     {
+         D3DKMT_STANDARDALLOCATIONTYPE Type;
+-        union
+-        {
+-            D3DKMT_STANDARDALLOCATION_EXISTINGHEAP32 ExistingHeapData;
+-        };
++        ULONG Size;
+         D3DKMT_CREATESTANDARDALLOCATIONFLAGS Flags;
+-    } *standard32;
+-    struct
+-    {
+-        D3DKMT_HANDLE hDevice;
+-        D3DKMT_HANDLE hResource;
+-        D3DKMT_HANDLE hGlobalShare;
+-        ULONG pPrivateRuntimeData;
+-        UINT PrivateRuntimeDataSize;
+-        union
+-        {
+-            ULONG pStandardAllocation;
+-            ULONG pPrivateDriverData;
+-        };
+-        UINT PrivateDriverDataSize;
+-        UINT NumAllocations;
+-        ULONG pAllocationInfo;
+-        D3DKMT_CREATEALLOCATIONFLAGS Flags;
+-        HANDLE hPrivateRuntimeResourceHandle;
+-    } *desc32 = get_ptr( &args );
+-    D3DKMT_CREATESTANDARDALLOCATION standard;
+-    D3DKMT_CREATEALLOCATION desc;
+-    NTSTATUS status;
++    } standard32_t;
+     UINT i;
+ 
+-    desc.hDevice = desc32->hDevice;
+-    desc.hResource = desc32->hResource;
+-    desc.pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
+-    desc.PrivateRuntimeDataSize = desc32->PrivateRuntimeDataSize;
++    memset( desc, 0, sizeof(*desc) );
++    desc->hDevice = desc32->hDevice;
++    desc->hResource = desc32->hResource;
++    desc->hGlobalShare = desc32->hGlobalShare;
++    desc->pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
++    desc->PrivateRuntimeDataSize = desc32->PrivateRuntimeDataSize;
+     if (!desc32->Flags.StandardAllocation)
+     {
+-        desc.pPrivateDriverData = UlongToPtr( desc32->pPrivateDriverData );
+-        desc.PrivateDriverDataSize = desc32->PrivateDriverDataSize;
++        desc->pPrivateDriverData = UlongToPtr( desc32->pPrivateDriverData );
++        desc->PrivateDriverDataSize = desc32->PrivateDriverDataSize;
+     }
+     else
+     {
+-        standard32 = UlongToPtr( desc32->pStandardAllocation );
+-        standard.Type = standard32->Type;
+-        standard.ExistingHeapData.Size = standard32->ExistingHeapData.Size;
+-        standard.Flags = standard32->Flags;
++        standard32_t *standard32 = UlongToPtr( desc32->pStandardAllocation );
+ 
+-        desc.pStandardAllocation = &standard;
+-        desc.PrivateDriverDataSize = sizeof(standard);
++        memset( standard, 0, sizeof(*standard) );
++        if (standard32)
++        {
++            standard->Type = standard32->Type;
++            standard->ExistingHeapData.Size = standard32->Size;
++            standard->Flags = standard32->Flags;
++        }
++        desc->pStandardAllocation = standard;
++        desc->PrivateDriverDataSize = sizeof(*standard);
+     }
+-    desc.NumAllocations = desc32->NumAllocations;
+-    desc.pAllocationInfo = NULL;
+-    if (desc32->pAllocationInfo && desc32->NumAllocations)
++    desc->NumAllocations = desc32->NumAllocations;
++    desc->Flags = desc32->Flags;
++    desc->hPrivateRuntimeResourceHandle = ULongToHandle( desc32->hPrivateRuntimeResourceHandle );
++    if (!desc32->pAllocationInfo || !desc32->NumAllocations) return STATUS_SUCCESS;
++
++    if (info2)
+     {
+-        if (!(desc.pAllocationInfo = Wow64AllocateTemp( desc32->NumAllocations + sizeof(*desc.pAllocationInfo) )))
++        struct kmt_allocation_info2_32 *allocs32 = UlongToPtr( desc32->pAllocationInfo );
++
++        if (!(desc->pAllocationInfo2 = Wow64AllocateTemp( desc32->NumAllocations * sizeof(*desc->pAllocationInfo2) )))
+             return STATUS_NO_MEMORY;
++        for (i = 0; i < desc32->NumAllocations; i++)
++        {
++            desc->pAllocationInfo2[i].hAllocation = allocs32[i].hAllocation;
++            desc->pAllocationInfo2[i].pSystemMem = UlongToPtr( allocs32[i].pSystemMem );
++            desc->pAllocationInfo2[i].pPrivateDriverData = UlongToPtr( allocs32[i].pPrivateDriverData );
++            desc->pAllocationInfo2[i].PrivateDriverDataSize = allocs32[i].PrivateDriverDataSize;
++            desc->pAllocationInfo2[i].VidPnSourceId = allocs32[i].VidPnSourceId;
++            desc->pAllocationInfo2[i].Flags.Value = allocs32[i].Flags;
++            desc->pAllocationInfo2[i].GpuVirtualAddress = allocs32[i].GpuVirtualAddress;
++            desc->pAllocationInfo2[i].Priority = allocs32[i].Priority;
++        }
++    }
++    else
++    {
++        struct kmt_allocation_info32 *allocs32 = UlongToPtr( desc32->pAllocationInfo );
+ 
+-        allocs32 = UlongToPtr( desc32->pAllocationInfo );
++        if (!(desc->pAllocationInfo = Wow64AllocateTemp( desc32->NumAllocations * sizeof(*desc->pAllocationInfo) )))
++            return STATUS_NO_MEMORY;
+         for (i = 0; i < desc32->NumAllocations; i++)
+         {
+-            desc.pAllocationInfo[i].hAllocation = allocs32->hAllocation;
+-            desc.pAllocationInfo[i].pSystemMem = UlongToPtr( allocs32->pSystemMem );
+-            desc.pAllocationInfo[i].pPrivateDriverData = UlongToPtr( allocs32->pPrivateDriverData );
+-            desc.pAllocationInfo[i].PrivateDriverDataSize = allocs32->PrivateDriverDataSize;
+-            desc.pAllocationInfo[i].VidPnSourceId = allocs32->VidPnSourceId;
+-            desc.pAllocationInfo[i].Flags.Value = allocs32->Flags.Value;
++            desc->pAllocationInfo[i].hAllocation = allocs32[i].hAllocation;
++            desc->pAllocationInfo[i].pSystemMem = UlongToPtr( allocs32[i].pSystemMem );
++            desc->pAllocationInfo[i].pPrivateDriverData = UlongToPtr( allocs32[i].pPrivateDriverData );
++            desc->pAllocationInfo[i].PrivateDriverDataSize = allocs32[i].PrivateDriverDataSize;
++            desc->pAllocationInfo[i].VidPnSourceId = allocs32[i].VidPnSourceId;
++            desc->pAllocationInfo[i].Flags.Value = allocs32[i].Flags;
+         }
+     }
+-    desc.Flags = desc32->Flags;
+-    desc.hPrivateRuntimeResourceHandle = desc32->hPrivateRuntimeResourceHandle;
++    return STATUS_SUCCESS;
++}
++
++static void kmt_create_allocation_64to32( struct kmt_create_allocation32 *desc32, BOOL info2,
++                                          const D3DKMT_CREATEALLOCATION *desc )
++{
++    UINT i;
++
++    desc32->hResource = desc->hResource;
++    desc32->hGlobalShare = desc->hGlobalShare;
++    if (!desc32->pAllocationInfo || !desc32->NumAllocations) return;
++    for (i = 0; i < desc32->NumAllocations; i++)
++    {
++        if (info2)
++        {
++            struct kmt_allocation_info2_32 *allocs32 = UlongToPtr( desc32->pAllocationInfo );
++            allocs32[i].hAllocation = desc->pAllocationInfo2[i].hAllocation;
++            allocs32[i].GpuVirtualAddress = desc->pAllocationInfo2[i].GpuVirtualAddress;
++        }
++        else
++        {
++            struct kmt_allocation_info32 *allocs32 = UlongToPtr( desc32->pAllocationInfo );
++            allocs32[i].hAllocation = desc->pAllocationInfo[i].hAllocation;
++        }
++    }
++}
+ 
++NTSTATUS WINAPI wow64_NtGdiDdDDICreateAllocation( UINT *args )
++{
++    struct kmt_create_allocation32 *desc32 = get_ptr( &args );
++    D3DKMT_CREATESTANDARDALLOCATION standard;
++    D3DKMT_CREATEALLOCATION desc;
++    NTSTATUS status;
++
++    if (!desc32) return STATUS_INVALID_PARAMETER;
++    if ((status = kmt_create_allocation_32to64( desc32, FALSE, &standard, &desc ))) return status;
+     status = NtGdiDdDDICreateAllocation( &desc );
+-    desc.hResource = desc32->hResource;
+-    desc.hGlobalShare = desc32->hGlobalShare;
++    kmt_create_allocation_64to32( desc32, FALSE, &desc );
+     return status;
+ }
+ 
+ NTSTATUS WINAPI wow64_NtGdiDdDDICreateAllocation2( UINT *args )
+ {
+-    struct
+-    {
+-        D3DKMT_HANDLE hAllocation;
+-        ULONG pSystemMem;
+-        ULONG pPrivateDriverData;
+-        UINT PrivateDriverDataSize;
+-        D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId;
+-        union
+-        {
+-            struct
+-            {
+-                UINT Primary : 1;
+-                UINT Stereo : 1;
+-                UINT OverridePriority : 1;
+-                UINT Reserved : 29;
+-            };
+-            UINT Value;
+-        } Flags;
+-        D3DGPU_VIRTUAL_ADDRESS GpuVirtualAddress;
+-        ULONG Priority;
+-        ULONG Reserved[5];
+-    } *allocs32 = NULL;
+-    typedef struct
+-    {
+-        ULONG Size;
+-    } D3DKMT_STANDARDALLOCATION_EXISTINGHEAP32;
+-    struct
+-    {
+-        D3DKMT_STANDARDALLOCATIONTYPE Type;
+-        union
+-        {
+-            D3DKMT_STANDARDALLOCATION_EXISTINGHEAP32 ExistingHeapData;
+-        };
+-        D3DKMT_CREATESTANDARDALLOCATIONFLAGS Flags;
+-    } *standard32;
++    struct kmt_create_allocation32 *desc32 = get_ptr( &args );
++    D3DKMT_CREATESTANDARDALLOCATION standard;
++    D3DKMT_CREATEALLOCATION desc;
++    NTSTATUS status;
++
++    if (!desc32) return STATUS_INVALID_PARAMETER;
++    if ((status = kmt_create_allocation_32to64( desc32, TRUE, &standard, &desc ))) return status;
++    status = NtGdiDdDDICreateAllocation2( &desc );
++    kmt_create_allocation_64to32( desc32, TRUE, &desc );
++    return status;
++}
++
++/* D3DKMTOpenResource and D3DKMTOpenResource2 */
++static NTSTATUS kmt_open_resource_32( UINT *args, BOOL info2 )
++{
+     struct
+     {
+         D3DKMT_HANDLE hDevice;
+-        D3DKMT_HANDLE hResource;
+         D3DKMT_HANDLE hGlobalShare;
++        UINT NumAllocations;
++        ULONG pOpenAllocationInfo;
+         ULONG pPrivateRuntimeData;
+         UINT PrivateRuntimeDataSize;
+-        union
+-        {
+-            ULONG pStandardAllocation;
+-            ULONG pPrivateDriverData;
+-        };
+-        UINT PrivateDriverDataSize;
+-        UINT NumAllocations;
+-        ULONG pAllocationInfo2;
+-        D3DKMT_CREATEALLOCATIONFLAGS Flags;
+-        HANDLE hPrivateRuntimeResourceHandle;
++        ULONG pResourcePrivateDriverData;
++        UINT ResourcePrivateDriverDataSize;
++        ULONG pTotalPrivateDriverDataBuffer;
++        UINT TotalPrivateDriverDataBufferSize;
++        D3DKMT_HANDLE hResource;
+     } *desc32 = get_ptr( &args );
+-    D3DKMT_CREATESTANDARDALLOCATION standard;
+-    D3DKMT_CREATEALLOCATION desc;
++    D3DKMT_OPENRESOURCE desc;
+     NTSTATUS status;
+     UINT i;
+ 
++    if (!desc32) return STATUS_INVALID_PARAMETER;
++    memset( &desc, 0, sizeof(desc) );
+     desc.hDevice = desc32->hDevice;
+-    desc.hResource = desc32->hResource;
+-    desc.pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
++    desc.hGlobalShare = desc32->hGlobalShare;
++    desc.NumAllocations = desc32->NumAllocations;
++    if (desc32->pOpenAllocationInfo && desc32->NumAllocations)
++    {
++        if (info2)
++        {
++            struct kmt_open_allocation_info2_32 *allocs32 = UlongToPtr( desc32->pOpenAllocationInfo );
++
++            if (!(desc.pOpenAllocationInfo2 = Wow64AllocateTemp( desc32->NumAllocations * sizeof(*desc.pOpenAllocationInfo2) )))
++                return STATUS_NO_MEMORY;
++            for (i = 0; i < desc32->NumAllocations; i++)
++            {
++                desc.pOpenAllocationInfo2[i].hAllocation = allocs32[i].hAllocation;
++                desc.pOpenAllocationInfo2[i].pPrivateDriverData = UlongToPtr( allocs32[i].pPrivateDriverData );
++                desc.pOpenAllocationInfo2[i].PrivateDriverDataSize = allocs32[i].PrivateDriverDataSize;
++            }
++        }
++        else
++        {
++            struct kmt_open_allocation_info32 *allocs32 = UlongToPtr( desc32->pOpenAllocationInfo );
++
++            if (!(desc.pOpenAllocationInfo = Wow64AllocateTemp( desc32->NumAllocations * sizeof(*desc.pOpenAllocationInfo) )))
++                return STATUS_NO_MEMORY;
++            for (i = 0; i < desc32->NumAllocations; i++)
++            {
++                desc.pOpenAllocationInfo[i].hAllocation = allocs32[i].hAllocation;
++                desc.pOpenAllocationInfo[i].pPrivateDriverData = UlongToPtr( allocs32[i].pPrivateDriverData );
++                desc.pOpenAllocationInfo[i].PrivateDriverDataSize = allocs32[i].PrivateDriverDataSize;
++            }
++        }
++    }
+     desc.PrivateRuntimeDataSize = desc32->PrivateRuntimeDataSize;
+-    if (!desc32->Flags.StandardAllocation)
++    desc.pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
++    desc.ResourcePrivateDriverDataSize = desc32->ResourcePrivateDriverDataSize;
++    desc.pResourcePrivateDriverData = UlongToPtr( desc32->pResourcePrivateDriverData );
++    desc.TotalPrivateDriverDataBufferSize = desc32->TotalPrivateDriverDataBufferSize;
++    desc.pTotalPrivateDriverDataBuffer = UlongToPtr( desc32->pTotalPrivateDriverDataBuffer );
++
++    status = info2 ? NtGdiDdDDIOpenResource2( &desc ) : NtGdiDdDDIOpenResource( &desc );
++    desc32->PrivateRuntimeDataSize = desc.PrivateRuntimeDataSize;
++    desc32->hResource = desc.hResource;
++    for (i = 0; desc32->pOpenAllocationInfo && i < desc32->NumAllocations; i++)
+     {
+-        desc.pPrivateDriverData = UlongToPtr( desc32->pPrivateDriverData );
+-        desc.PrivateDriverDataSize = desc32->PrivateDriverDataSize;
++        if (info2)
++        {
++            struct kmt_open_allocation_info2_32 *allocs32 = UlongToPtr( desc32->pOpenAllocationInfo );
++            allocs32[i].hAllocation = desc.pOpenAllocationInfo2[i].hAllocation;
++            allocs32[i].pPrivateDriverData = PtrToUlong( desc.pOpenAllocationInfo2[i].pPrivateDriverData );
++            allocs32[i].PrivateDriverDataSize = desc.pOpenAllocationInfo2[i].PrivateDriverDataSize;
++            allocs32[i].GpuVirtualAddress = desc.pOpenAllocationInfo2[i].GpuVirtualAddress;
++        }
++        else
++        {
++            struct kmt_open_allocation_info32 *allocs32 = UlongToPtr( desc32->pOpenAllocationInfo );
++            allocs32[i].hAllocation = desc.pOpenAllocationInfo[i].hAllocation;
++            allocs32[i].pPrivateDriverData = PtrToUlong( desc.pOpenAllocationInfo[i].pPrivateDriverData );
++            allocs32[i].PrivateDriverDataSize = desc.pOpenAllocationInfo[i].PrivateDriverDataSize;
++        }
+     }
+-    else
++    return status;
++}
++
++NTSTATUS WINAPI wow64_NtGdiDdDDIOpenResource( UINT *args )
++{
++    return kmt_open_resource_32( args, FALSE );
++}
++
++NTSTATUS WINAPI wow64_NtGdiDdDDIOpenResource2( UINT *args )
++{
++    return kmt_open_resource_32( args, TRUE );
++}
++
++NTSTATUS WINAPI wow64_NtGdiDdDDIOpenResourceFromNtHandle( UINT *args )
++{
++    struct
+     {
+-        standard32 = UlongToPtr( desc32->pStandardAllocation );
+-        standard.Type = standard32->Type;
+-        standard.ExistingHeapData.Size = standard32->ExistingHeapData.Size;
+-        standard.Flags = standard32->Flags;
++        D3DKMT_HANDLE hDevice;
++        ULONG hNtHandle;
++        UINT NumAllocations;
++        ULONG pOpenAllocationInfo2;
++        UINT PrivateRuntimeDataSize;
++        ULONG pPrivateRuntimeData;
++        UINT ResourcePrivateDriverDataSize;
++        ULONG pResourcePrivateDriverData;
++        UINT TotalPrivateDriverDataBufferSize;
++        ULONG pTotalPrivateDriverDataBuffer;
++        D3DKMT_HANDLE hResource;
++        D3DKMT_HANDLE hKeyedMutex;
++        ULONG pKeyedMutexPrivateRuntimeData;
++        UINT KeyedMutexPrivateRuntimeDataSize;
++        D3DKMT_HANDLE hSyncObject;
++    } *desc32 = get_ptr( &args );
++    struct kmt_open_allocation_info2_32 *allocs32;
++    D3DKMT_OPENRESOURCEFROMNTHANDLE desc;
++    NTSTATUS status;
++    UINT i;
+ 
+-        desc.pStandardAllocation = &standard;
+-        desc.PrivateDriverDataSize = sizeof(standard);
+-    }
++    if (!desc32) return STATUS_INVALID_PARAMETER;
++    memset( &desc, 0, sizeof(desc) );
++    desc.hDevice = desc32->hDevice;
++    desc.hNtHandle = UlongToHandle( desc32->hNtHandle );
+     desc.NumAllocations = desc32->NumAllocations;
+-    desc.pAllocationInfo2 = NULL;
+-    if (desc32->pAllocationInfo2 && desc32->NumAllocations)
++    allocs32 = UlongToPtr( desc32->pOpenAllocationInfo2 );
++    if (allocs32 && desc32->NumAllocations)
+     {
+-        if (!(desc.pAllocationInfo2 = Wow64AllocateTemp( desc32->NumAllocations + sizeof(*desc.pAllocationInfo2) )))
++        if (!(desc.pOpenAllocationInfo2 = Wow64AllocateTemp( desc32->NumAllocations * sizeof(*desc.pOpenAllocationInfo2) )))
+             return STATUS_NO_MEMORY;
+-
+-        allocs32 = UlongToPtr( desc32->pAllocationInfo2 );
+         for (i = 0; i < desc32->NumAllocations; i++)
+         {
+-            desc.pAllocationInfo2[i].hAllocation = allocs32->hAllocation;
+-            desc.pAllocationInfo2[i].pSystemMem = UlongToPtr( allocs32->pSystemMem );
+-            desc.pAllocationInfo2[i].pPrivateDriverData = UlongToPtr( allocs32->pPrivateDriverData );
+-            desc.pAllocationInfo2[i].PrivateDriverDataSize = allocs32->PrivateDriverDataSize;
+-            desc.pAllocationInfo2[i].VidPnSourceId = allocs32->VidPnSourceId;
+-            desc.pAllocationInfo2[i].Flags.Value = allocs32->Flags.Value;
+-            desc.pAllocationInfo2[i].Priority = allocs32->Priority;
++            desc.pOpenAllocationInfo2[i].hAllocation = allocs32[i].hAllocation;
++            desc.pOpenAllocationInfo2[i].pPrivateDriverData = UlongToPtr( allocs32[i].pPrivateDriverData );
++            desc.pOpenAllocationInfo2[i].PrivateDriverDataSize = allocs32[i].PrivateDriverDataSize;
+         }
+     }
+-    desc.Flags = desc32->Flags;
+-    desc.hPrivateRuntimeResourceHandle = desc32->hPrivateRuntimeResourceHandle;
++    desc.PrivateRuntimeDataSize = desc32->PrivateRuntimeDataSize;
++    desc.pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
++    desc.ResourcePrivateDriverDataSize = desc32->ResourcePrivateDriverDataSize;
++    desc.pResourcePrivateDriverData = UlongToPtr( desc32->pResourcePrivateDriverData );
++    desc.TotalPrivateDriverDataBufferSize = desc32->TotalPrivateDriverDataBufferSize;
++    desc.pTotalPrivateDriverDataBuffer = UlongToPtr( desc32->pTotalPrivateDriverDataBuffer );
++    desc.pKeyedMutexPrivateRuntimeData = UlongToPtr( desc32->pKeyedMutexPrivateRuntimeData );
++    desc.KeyedMutexPrivateRuntimeDataSize = desc32->KeyedMutexPrivateRuntimeDataSize;
+ 
+-    status = NtGdiDdDDICreateAllocation( &desc );
+-    desc.hResource = desc32->hResource;
+-    desc.hGlobalShare = desc32->hGlobalShare;
+-    for (i = 0; desc32->pAllocationInfo2 && i < desc32->NumAllocations; i++)
+-        allocs32->GpuVirtualAddress = desc.pAllocationInfo2[i].GpuVirtualAddress;
++    status = NtGdiDdDDIOpenResourceFromNtHandle( &desc );
++    desc32->PrivateRuntimeDataSize = desc.PrivateRuntimeDataSize;
++    desc32->KeyedMutexPrivateRuntimeDataSize = desc.KeyedMutexPrivateRuntimeDataSize;
++    desc32->hResource = desc.hResource;
++    desc32->hKeyedMutex = desc.hKeyedMutex;
++    desc32->hSyncObject = desc.hSyncObject;
++    for (i = 0; allocs32 && i < desc32->NumAllocations; i++)
++    {
++        allocs32[i].hAllocation = desc.pOpenAllocationInfo2[i].hAllocation;
++        allocs32[i].pPrivateDriverData = PtrToUlong( desc.pOpenAllocationInfo2[i].pPrivateDriverData );
++        allocs32[i].PrivateDriverDataSize = desc.pOpenAllocationInfo2[i].PrivateDriverDataSize;
++        allocs32[i].GpuVirtualAddress = desc.pOpenAllocationInfo2[i].GpuVirtualAddress;
++    }
+     return status;
+ }
+ 
+@@ -971,190 +1114,6 @@ NTSTATUS WINAPI wow64_NtGdiDdDDIOpenKeyedMutexFromNtHandle( UINT *args )
+     return status;
+ }
+ 
+-NTSTATUS WINAPI wow64_NtGdiDdDDIOpenResource( UINT *args )
+-{
+-    struct
+-    {
+-        D3DKMT_HANDLE hAllocation;
+-        ULONG pPrivateDriverData;
+-        UINT PrivateDriverDataSize;
+-    } *allocs32;
+-    struct
+-    {
+-        D3DKMT_HANDLE hDevice;
+-        D3DKMT_HANDLE hGlobalShare;
+-        UINT NumAllocations;
+-        ULONG pOpenAllocationInfo;
+-        ULONG pPrivateRuntimeData;
+-        UINT PrivateRuntimeDataSize;
+-        ULONG pResourcePrivateDriverData;
+-        UINT ResourcePrivateDriverDataSize;
+-        ULONG pTotalPrivateDriverDataBuffer;
+-        UINT TotalPrivateDriverDataBufferSize;
+-        D3DKMT_HANDLE hResource;
+-    } *desc32 = get_ptr( &args );
+-    D3DKMT_OPENRESOURCE desc;
+-    NTSTATUS status;
+-    UINT i;
+-
+-    desc.hDevice = desc32->hDevice;
+-    desc.hGlobalShare = desc32->hGlobalShare;
+-    desc.NumAllocations = desc32->NumAllocations;
+-    desc.pOpenAllocationInfo = NULL;
+-    if (desc32->pOpenAllocationInfo && desc32->NumAllocations)
+-    {
+-        if (!(desc.pOpenAllocationInfo = Wow64AllocateTemp( desc32->NumAllocations + sizeof(*desc.pOpenAllocationInfo) )))
+-            return STATUS_NO_MEMORY;
+-
+-        allocs32 = UlongToPtr( desc32->pOpenAllocationInfo );
+-        for (i = 0; i < desc32->NumAllocations; i++)
+-        {
+-            desc.pOpenAllocationInfo[i].hAllocation = allocs32->hAllocation;
+-            desc.pOpenAllocationInfo[i].pPrivateDriverData = UlongToPtr( allocs32->pPrivateDriverData );
+-            desc.pOpenAllocationInfo[i].PrivateDriverDataSize = allocs32->PrivateDriverDataSize;
+-        }
+-    }
+-    desc.PrivateRuntimeDataSize = desc32->PrivateRuntimeDataSize;
+-    desc.pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
+-    desc.ResourcePrivateDriverDataSize = desc32->ResourcePrivateDriverDataSize;
+-    desc.pResourcePrivateDriverData = UlongToPtr( desc32->pResourcePrivateDriverData );
+-    desc.TotalPrivateDriverDataBufferSize = desc32->TotalPrivateDriverDataBufferSize;
+-    desc.pTotalPrivateDriverDataBuffer = UlongToPtr( desc32->pTotalPrivateDriverDataBuffer );
+-
+-    status = NtGdiDdDDIOpenResource( &desc );
+-    desc32->TotalPrivateDriverDataBufferSize = desc.TotalPrivateDriverDataBufferSize;
+-    desc32->hResource = desc.hResource;
+-    return status;
+-}
+-
+-NTSTATUS WINAPI wow64_NtGdiDdDDIOpenResource2( UINT *args )
+-{
+-    struct
+-    {
+-        D3DKMT_HANDLE hAllocation;
+-        ULONG pPrivateDriverData;
+-        UINT PrivateDriverDataSize;
+-        D3DGPU_VIRTUAL_ADDRESS GpuVirtualAddress;
+-        ULONG Reserved[6];
+-    } *allocs32 = NULL;
+-    struct
+-    {
+-        D3DKMT_HANDLE hDevice;
+-        D3DKMT_HANDLE hGlobalShare;
+-        UINT NumAllocations;
+-        ULONG pOpenAllocationInfo2;
+-        ULONG pPrivateRuntimeData;
+-        UINT PrivateRuntimeDataSize;
+-        ULONG pResourcePrivateDriverData;
+-        UINT ResourcePrivateDriverDataSize;
+-        ULONG pTotalPrivateDriverDataBuffer;
+-        UINT TotalPrivateDriverDataBufferSize;
+-        D3DKMT_HANDLE hResource;
+-    } *desc32 = get_ptr( &args );
+-    D3DKMT_OPENRESOURCE desc;
+-    NTSTATUS status;
+-    UINT i;
+-
+-    desc.hDevice = desc32->hDevice;
+-    desc.hGlobalShare = desc32->hGlobalShare;
+-    desc.NumAllocations = desc32->NumAllocations;
+-    desc.pOpenAllocationInfo2 = NULL;
+-    if (desc32->pOpenAllocationInfo2 && desc32->NumAllocations)
+-    {
+-        if (!(desc.pOpenAllocationInfo2 = Wow64AllocateTemp( desc32->NumAllocations + sizeof(*desc.pOpenAllocationInfo2) )))
+-            return STATUS_NO_MEMORY;
+-
+-        allocs32 = UlongToPtr( desc32->pOpenAllocationInfo2 );
+-        for (i = 0; i < desc32->NumAllocations; i++)
+-        {
+-            desc.pOpenAllocationInfo2[i].hAllocation = allocs32->hAllocation;
+-            desc.pOpenAllocationInfo2[i].pPrivateDriverData = UlongToPtr( allocs32->pPrivateDriverData );
+-            desc.pOpenAllocationInfo2[i].PrivateDriverDataSize = allocs32->PrivateDriverDataSize;
+-        }
+-    }
+-    desc.PrivateRuntimeDataSize = desc32->PrivateRuntimeDataSize;
+-    desc.pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
+-    desc.ResourcePrivateDriverDataSize = desc32->ResourcePrivateDriverDataSize;
+-    desc.pResourcePrivateDriverData = UlongToPtr( desc32->pResourcePrivateDriverData );
+-    desc.TotalPrivateDriverDataBufferSize = desc32->TotalPrivateDriverDataBufferSize;
+-    desc.pTotalPrivateDriverDataBuffer = UlongToPtr( desc32->pTotalPrivateDriverDataBuffer );
+-
+-    status = NtGdiDdDDIOpenResource2( &desc );
+-    desc32->TotalPrivateDriverDataBufferSize = desc.TotalPrivateDriverDataBufferSize;
+-    desc32->hResource = desc.hResource;
+-    for (i = 0; desc32->pOpenAllocationInfo2 && i < desc32->NumAllocations; i++)
+-        allocs32->GpuVirtualAddress = desc.pOpenAllocationInfo2[i].GpuVirtualAddress;
+-    return status;
+-}
+-
+-NTSTATUS WINAPI wow64_NtGdiDdDDIOpenResourceFromNtHandle( UINT *args )
+-{
+-    struct
+-    {
+-        D3DKMT_HANDLE hAllocation;
+-        ULONG pPrivateDriverData;
+-        UINT PrivateDriverDataSize;
+-        D3DGPU_VIRTUAL_ADDRESS GpuVirtualAddress;
+-        ULONG Reserved[6];
+-    } *allocs32 = NULL;
+-    struct
+-    {
+-        D3DKMT_HANDLE hDevice;
+-        ULONG hNtHandle;
+-        UINT NumAllocations;
+-        ULONG pOpenAllocationInfo2;
+-        UINT PrivateRuntimeDataSize;
+-        ULONG pPrivateRuntimeData;
+-        UINT ResourcePrivateDriverDataSize;
+-        ULONG pResourcePrivateDriverData;
+-        UINT TotalPrivateDriverDataBufferSize;
+-        ULONG pTotalPrivateDriverDataBuffer;
+-        D3DKMT_HANDLE hResource;
+-        D3DKMT_HANDLE hKeyedMutex;
+-        ULONG pKeyedMutexPrivateRuntimeData;
+-        UINT KeyedMutexPrivateRuntimeDataSize;
+-        D3DKMT_HANDLE hSyncObject;
+-    } *desc32 = get_ptr( &args );
+-    D3DKMT_OPENRESOURCEFROMNTHANDLE desc;
+-    NTSTATUS status;
+-    UINT i;
+-
+-    desc.hDevice = desc32->hDevice;
+-    desc.hNtHandle = UlongToHandle( desc32->hNtHandle );
+-    desc.NumAllocations = desc32->NumAllocations;
+-    desc.pOpenAllocationInfo2 = NULL;
+-    if (desc32->pOpenAllocationInfo2 && desc32->NumAllocations)
+-    {
+-        if (!(desc.pOpenAllocationInfo2 = Wow64AllocateTemp( desc32->NumAllocations + sizeof(*desc.pOpenAllocationInfo2) )))
+-            return STATUS_NO_MEMORY;
+-
+-        allocs32 = UlongToPtr( desc32->pOpenAllocationInfo2 );
+-        for (i = 0; i < desc32->NumAllocations; i++)
+-        {
+-            desc.pOpenAllocationInfo2[i].hAllocation = allocs32->hAllocation;
+-            desc.pOpenAllocationInfo2[i].pPrivateDriverData = UlongToPtr( allocs32->pPrivateDriverData );
+-            desc.pOpenAllocationInfo2[i].PrivateDriverDataSize = allocs32->PrivateDriverDataSize;
+-        }
+-    }
+-    desc.PrivateRuntimeDataSize = desc32->PrivateRuntimeDataSize;
+-    desc.pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
+-    desc.ResourcePrivateDriverDataSize = desc32->ResourcePrivateDriverDataSize;
+-    desc.pResourcePrivateDriverData = UlongToPtr( desc32->pResourcePrivateDriverData );
+-    desc.TotalPrivateDriverDataBufferSize = desc32->TotalPrivateDriverDataBufferSize;
+-    desc.pTotalPrivateDriverDataBuffer = UlongToPtr( desc32->pTotalPrivateDriverDataBuffer );
+-    desc.pKeyedMutexPrivateRuntimeData = UlongToPtr( desc32->pKeyedMutexPrivateRuntimeData );
+-    desc.KeyedMutexPrivateRuntimeDataSize = desc32->KeyedMutexPrivateRuntimeDataSize;
+-
+-    status = NtGdiDdDDIOpenResourceFromNtHandle( &desc );
+-    desc32->TotalPrivateDriverDataBufferSize = desc.TotalPrivateDriverDataBufferSize;
+-    desc32->hResource = desc.hResource;
+-    desc32->hKeyedMutex = desc.hKeyedMutex;
+-    desc32->hSyncObject = desc.hSyncObject;
+-    for (i = 0; desc32->pOpenAllocationInfo2 && i < desc32->NumAllocations; i++)
+-        allocs32->GpuVirtualAddress = desc.pOpenAllocationInfo2[i].GpuVirtualAddress;
+-    return status;
+-}
+-
+ NTSTATUS WINAPI wow64_NtGdiDdDDIOpenSyncObjectFromNtHandle( UINT *args )
+ {
+     struct
+diff --git a/include/wine/kmtshare.h b/include/wine/kmtshare.h
+new file mode 100644
+index 0000000..6a4ca2e
+--- /dev/null
++++ b/include/wine/kmtshare.h
+@@ -0,0 +1,59 @@
++/*
++ * Stained Glass OS: the private interface between a user-mode D3D runtime and
++ * win32u's D3DKMT layer.
++ *
++ * There is no kernel-mode display driver behind win32u's D3DKMT functions.
++ * Allocations live in system memory (sections, so they can be shared between
++ * processes), and the usual driver conventions are defined here:
++ *
++ * - the private driver data of an allocation starts with a struct
++ *   wine_kmt_alloc_data, which says how many bytes of content the allocation
++ *   has; the rest of the data is kept for the opener, as a driver would;
++ * - a D3DKMTEscape of type D3DKMT_ESCAPE_DRIVERPRIVATE whose private data is a
++ *   struct wine_kmt_escape maps an allocation: the runtime gets a section
++ *   handle, and the offset and size of the allocation's content in it.
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_KMTSHARE_H
++#define __WINE_KMTSHARE_H
++
++#define WINE_KMT_ESCAPE_MAGIC 0x53474b4d
++
++enum wine_kmt_escape_command
++{
++    WINE_KMT_ESCAPE_MAP_ALLOCATION = 1,
++};
++
++struct wine_kmt_alloc_data
++{
++    UINT64 size;                /* bytes of content */
++};
++
++struct wine_kmt_escape
++{
++    UINT magic;                 /* WINE_KMT_ESCAPE_MAGIC */
++    UINT command;               /* enum wine_kmt_escape_command */
++    D3DKMT_HANDLE handle;       /* an allocation, or a resource (its first allocation) */
++    UINT reserved;
++    UINT64 section;             /* out: a section handle of the calling process, NtClose it when done */
++    UINT64 offset;              /* out: offset of the content in the section */
++    UINT64 size;                /* out: bytes of content */
++};
++
++#endif /* __WINE_KMTSHARE_H */
