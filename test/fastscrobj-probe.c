@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 static int fails;
+#include <ocidl.h>
 static const GUID libid = {0x1e1d9d0c, 0x3b33, 0x4c1a, {0x93, 0xc2, 0x8f, 0x4f, 0x9b, 0x2a, 0x0e, 0x11}};
 static const GUID clsid = {0x6b5c0d7e, 0x5a1f, 0x4c7e, {0x8d, 0x2b, 0x0b, 0x8c, 0x6d, 0x3a, 0x9e, 0x11}};
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -93,6 +94,89 @@ int main(void)
         ITypeInfo_Release(ti);
     }
     ITypeLib_Release(lib);
+
+    /* the instance's connection points and connections are enumerable */
+    {
+        IUnknown *obj = NULL;
+        IConnectionPointContainer *cpc = NULL;
+        IEnumConnectionPoints *ecp = NULL, *ecp2 = NULL;
+        IEnumConnections *ec = NULL;
+        IConnectionPoint *cp = NULL, *found = NULL;
+        CONNECTDATA cd;
+        ULONG got;
+        IID iid;
+        DWORD cookie = 0;
+        static IDispatch sink;      /* a sink that only needs to be a distinct, callable IDispatch */
+
+        hr = CoCreateInstance(&clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&obj);
+        CHECK(hr == S_OK && obj, "create the component %08lx", hr);
+        if (obj) hr = IUnknown_QueryInterface(obj, &IID_IConnectionPointContainer, (void **)&cpc);
+        CHECK(cpc != NULL, "IConnectionPointContainer");
+        if (cpc)
+        {
+            hr = IConnectionPointContainer_EnumConnectionPoints(cpc, &ecp);
+            CHECK(hr == S_OK && ecp, "EnumConnectionPoints %08lx", hr);
+            if (ecp)
+            {
+                got = 0; hr = IEnumConnectionPoints_Next(ecp, 1, &cp, &got);
+                CHECK(hr == S_OK && got == 1 && cp, "Next gives the connection point %08lx", hr);
+                if (cp)
+                {
+                    hr = IConnectionPoint_GetConnectionInterface(cp, &iid);
+                    CHECK(hr == S_OK, "GetConnectionInterface");
+                    hr = IConnectionPointContainer_FindConnectionPoint(cpc, &iid, &found);
+                    CHECK(hr == S_OK && found == cp, "it is the one FindConnectionPoint gives");
+                    if (found) IConnectionPoint_Release(found);
+                }
+                got = 7; hr = IEnumConnectionPoints_Next(ecp, 1, &found, &got);
+                CHECK(hr == S_FALSE && got == 0, "only one connection point %08lx", hr);
+                IEnumConnectionPoints_Reset(ecp);
+                hr = IEnumConnectionPoints_Clone(ecp, &ecp2);
+                CHECK(hr == S_OK && ecp2, "Clone");
+                if (ecp2) IEnumConnectionPoints_Release(ecp2);
+                IEnumConnectionPoints_Release(ecp);
+            }
+            if (cp)
+            {
+                hr = IConnectionPoint_EnumConnections(cp, &ec);
+                CHECK(hr == S_OK && ec, "EnumConnections with no sink %08lx", hr);
+                if (ec)
+                {
+                    got = 5; hr = IEnumConnections_Next(ec, 1, &cd, &got);
+                    CHECK(hr == S_FALSE && got == 0, "no connection yet");
+                    IEnumConnections_Release(ec);
+                }
+                {
+                    /* a sink: an object that is an IDispatch for the connection point's QueryInterface */
+                }
+                {
+                    IDispatch *disp = NULL;
+                    hr = CoCreateInstance(&clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IDispatch, (void **)&disp);
+                    if (disp)
+                    {
+                        hr = IConnectionPoint_Advise(cp, (IUnknown *)disp, &cookie);
+                        CHECK(hr == S_OK && cookie, "Advise %08lx", hr);
+                        hr = IConnectionPoint_EnumConnections(cp, &ec);
+                        got = 0; cd.pUnk = NULL;
+                        hr = ec ? IEnumConnections_Next(ec, 1, &cd, &got) : E_FAIL;
+                        CHECK(hr == S_OK && got == 1 && cd.pUnk && cd.dwCookie == cookie, "the sink is enumerated with its cookie %08lx", hr);
+                        if (cd.pUnk) IUnknown_Release(cd.pUnk);
+                        if (ec) IEnumConnections_Release(ec);
+                        IConnectionPoint_Unadvise(cp, cookie);
+                        hr = IConnectionPoint_EnumConnections(cp, &ec);
+                        got = 3; hr = ec ? IEnumConnections_Next(ec, 1, &cd, &got) : E_FAIL;
+                        CHECK(hr == S_FALSE && got == 0, "gone after Unadvise");
+                        if (ec) IEnumConnections_Release(ec);
+                        IDispatch_Release(disp);
+                    }
+                }
+                IConnectionPoint_Release(cp);
+            }
+            IConnectionPointContainer_Release(cpc);
+        }
+        if (obj) IUnknown_Release(obj);
+        (void)sink;
+    }
     printf("RESULT: %s\n", fails ? "FAIL" : "PASS");
     return fails;
 }
