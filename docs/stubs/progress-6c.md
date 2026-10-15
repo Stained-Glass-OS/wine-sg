@@ -24,14 +24,16 @@ Suites (gdi32 win32u user32 usp10, 64 and 32, vs the unmodified series-applied b
 (Base failures are environment ones on Xvfb: user32 input 67, monitor 35, sysparams 8, gdi32 dc 3 / font 6 / metafile 2, usp10 2.)
 
 ## 2026-10-14, batch 2: patches 5208-5214
-- 5208 user32 RegisterTouchHitTestingWindow (651): validation and record; WM_TOUCHHITTESTING itself is not sent.
-- 5209 user32 SetDisplayConfig (659): SDC_* flag validation, source modes through ChangeDisplaySettingsEx, topology requests.
+- 5208 user32 RegisterTouchHitTestingWindow (651): validation and record; WM_TOUCHHITTESTING itself is not sent -> PARTIAL, escalated (not counted implemented).
+- 5209 user32 SetDisplayConfig (659): SDC_* flag validation, source modes through ChangeDisplaySettingsEx, topology requests. CORE review: display (changes real modes; gate on Xvfb only).
 - 5210 user32/sechost device events for ANSI windows (656): DBT_DEVTYP_PORT W to A, string-less structures pass through; sechost empty-filter over-read fixed.
 - 5211 user32 DdeQueryConvInfo on partner handles (662); DDEML no longer dereferences foreign conversation handles.
 - 5212 win32u MNS_AUTODISMISS (713).
-- 5213 user32 WINNLSEnableIME / WINNLSGetEnableStatus (645, 646; state only, see notes).
+- 5213 user32 WINNLSEnableIME / WINNLSGetEnableStatus (645, 646): state only, IME-window effect missing -> PARTIAL, escalated (not counted implemented).
 - 5214 win32u D3DKMTEscape (669).
 Suites (user32 win32u, 64 and 32 vs the series-applied base): no new failures (user32 143 base failures on Xvfb, win32u 0).
+
+- 5215 win32u FlashWindowEx timers (47). 5216 win32u/wow64win accessibility SPI sets (66).
 
 ## Still open (see /var/tmp/fast-b/s6c-STATE.md)
 gdi32: 40 (remaining EMR types: GLS, DRAWESCAPE, EXTESCAPE, NAMEDESCAPE, STARTDOC, COLORCORRECTPALETTE, SETLINKEDUFI, COLORMATCHTOTARGETW), 232/233 UpdateICMRegKey, 237-240 + 838 OpenType (GSUB/GPOS formats, alternate glyphs, feature filtering), 938/939/965 umpd Eng*.
