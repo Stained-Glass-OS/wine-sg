@@ -13,11 +13,12 @@ while [ -e "/tmp/.X${DPY}-lock" ] || [ -e "/tmp/.X11-unix/X${DPY}" ]; do DPY=$((
 XP=""
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
-for need in Xvfb xdpyinfo "$MINGW"; do command -v "$need" >/dev/null || { echo "SKIP: $need missing"; exit 77; }; done
+for need in Xvfb xdpyinfo xdotool "$MINGW"; do command -v "$need" >/dev/null || { echo "SKIP: $need missing"; exit 77; }; done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 
 T=$(mktemp -d /var/tmp/sg-fastb-sysproto.XXXXXX)
 cleanup() {
+    [ -n "${KP:-}" ] && kill "$KP" 2>/dev/null
     [ -n "$XP" ] && kill "$XP" 2>/dev/null
     rm -f "/tmp/.X${DPY}-lock"
     WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null
@@ -39,6 +40,10 @@ unset WAYLAND_DISPLAY; export DISPLAY=":$DPY"
 i=0; while ! xdpyinfo >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
+
+# the physical keys: a typist for the BlockInput checks (killed by the trap)
+# no window manager: the X focus is PointerRoot, so the pointer sits on the probe window (0,0 200x200)
+( while :; do xdotool mousemove 100 100 key a; sleep 0.6; xdotool key b; sleep 0.6; done ) >/dev/null 2>&1 & KP=$!
 
 # a crashed probe leaves wine helpers holding a pipe: go through a file
 cd "$T" && timeout -s KILL 60 "$WINE" "$T/fastb-sysproto-probe.exe" >"$T/out.raw" 2>/dev/null </dev/null
