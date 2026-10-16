@@ -1,0 +1,213 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] rtworkq: RtwqJoinWorkQueue and RtwqUnjoinWorkQueue (3761)
+
+RtwqJoinWorkQueue and RtwqUnjoinWorkQueue returned E_NOTIMPL. A file handle
+opened for overlapped I/O can now be joined to a work queue: when an I/O that
+was started with the OVERLAPPED of an RTWQASYNCRESULT completes, its status and
+byte count are stored in the result and its callback is invoked on that work
+queue. The join keeps the queue alive until it is undone. CORE review
+(patches/notes/3761.txt).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+
+Rebased at integration (integ-2026-10) onto 4583 (stubs-5): at platform shutdown the ShutdownStart notification (4583) comes first, then the joins are undone (3761).
+---
+diff --git a/dlls/rtworkq/queue.c b/dlls/rtworkq/queue.c
+--- a/dlls/rtworkq/queue.c
++++ b/dlls/rtworkq/queue.c
+@@ -1264,6 +1264,8 @@ HRESULT WINAPI RtwqStartup(void)
+     return S_OK;
+ }
+ 
++static void shutdown_joins(void);
++
+ static void shutdown_system_queues(void)
+ {
+     unsigned int i;
+@@ -1292,6 +1294,7 @@ HRESULT WINAPI RtwqShutdown(void)
+ #ifndef SG_MUTANT_RTWQ_NO_SHUTDOWN_START
+         notify_platform_events(PLATFORM_SHUTDOWN_START);
+ #endif
++        shutdown_joins();
+         shutdown_system_queues();
+         notify_platform_events(PLATFORM_SHUTDOWN_COMPLETE);
+     }
+@@ -1671,18 +1674,173 @@ HRESULT WINAPI RtwqAllocateSerialWorkQueue(DWORD target_queue, DWORD *queue)
+     return alloc_user_queue(&desc, queue);
+ }
+ 
++/* Stained Glass OS: RtwqJoinWorkQueue.  A file handle opened for overlapped I/O is associated with a
++ * completion port of ours, one port and one thread for all joins.  The OVERLAPPED an I/O is started with is
++ * the one of an RTWQASYNCRESULT (RtwqCreateAsyncResult: its "overlapped" member); when the I/O completes the
++ * thread stores the status and the byte count in the result and puts it on the work queue the handle was joined
++ * to, where its callback is invoked.  The cookie names the join.  A handle can not be taken out of a completion
++ * port again, so after RtwqUnjoinWorkQueue its completions are dropped. */
++struct join
++{
++    struct list entry;
++    DWORD       queue;
++    ULONG_PTR   id;      /* the completion key and the cookie */
++    HANDLE      file;
++};
++
++static struct list joins = LIST_INIT(joins);   /* queues_section */
++static HANDLE join_port, join_thread;
++static ULONG_PTR next_join_id;
++
++#define JOIN_QUIT ((ULONG_PTR)~0)
++
++static DWORD WINAPI join_thread_proc(void *param)
++{
++    for (;;)
++    {
++        DWORD bytes, error = ERROR_SUCCESS;
++        ULONG_PTR key;
++        OVERLAPPED *overlapped;
++        struct join *join;
++        DWORD queue = 0;
++        BOOL found = FALSE;
++
++        if (!GetQueuedCompletionStatus(join_port, &bytes, &key, &overlapped, INFINITE))
++        {
++            error = GetLastError();
++            if (!overlapped) continue;   /* the wait itself failed */
++        }
++        if (key == JOIN_QUIT && !overlapped) break;
++        if (!overlapped) continue;
++
++        EnterCriticalSection(&queues_section);
++        LIST_FOR_EACH_ENTRY(join, &joins, struct join, entry)
++        {
++            if (join->id != key) continue;
++            queue = join->queue;
++            found = TRUE;
++            break;
++        }
++        LeaveCriticalSection(&queues_section);
++
++        if (found)
++        {
++            RTWQASYNCRESULT *result = CONTAINING_RECORD(overlapped, RTWQASYNCRESULT, overlapped);
++
++            result->hrStatusResult = error ? HRESULT_FROM_WIN32(error) : S_OK;
++            result->dwBytesTransferred = bytes;
++            TRACE("I/O completed, %lu bytes, result %p, queue %#lx.\n", bytes, result, queue);
++            queue_put_work_item(queue, 0, &result->AsyncResult);
++        }
++    }
++    return 0;
++}
++
++static void shutdown_joins(void)
++{
++    struct join *join, *next;
++    HANDLE thread = NULL, port = NULL;
++
++    EnterCriticalSection(&queues_section);
++    LIST_FOR_EACH_ENTRY_SAFE(join, next, &joins, struct join, entry)
++    {
++        list_remove(&join->entry);
++        free(join);
++    }
++    thread = join_thread;
++    port = join_port;
++    join_thread = join_port = NULL;
++    LeaveCriticalSection(&queues_section);
++
++    if (!port) return;
++    PostQueuedCompletionStatus(port, 0, JOIN_QUIT, NULL);
++    if (thread)
++    {
++        WaitForSingleObject(thread, 5000);
++        CloseHandle(thread);
++    }
++    CloseHandle(port);
++}
++
+ HRESULT WINAPI RtwqJoinWorkQueue(DWORD queue, HANDLE hFile, HANDLE *cookie)
+ {
+-    FIXME("%#lx, %p, %p.\n", queue, hFile, cookie);
++    struct join *join;
++    struct queue *obj;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%#lx, %p, %p.\n", queue, hFile, cookie);
++
++    if (!cookie) return E_POINTER;
++    *cookie = NULL;
++    if (!hFile || hFile == INVALID_HANDLE_VALUE) return E_INVALIDARG;
++
++    if (FAILED(hr = lock_user_queue(queue))) return hr;   /* the join keeps the queue alive */
++    if (FAILED(hr = grab_queue(queue, &obj)))
++    {
++        unlock_user_queue(queue);
++        return hr;
++    }
++
++    if (!(join = calloc(1, sizeof(*join))))
++    {
++        unlock_user_queue(queue);
++        return E_OUTOFMEMORY;
++    }
++    join->queue = queue;
++    join->file = hFile;
++
++    EnterCriticalSection(&queues_section);
++    if (!join_port)
++    {
++        if (!(join_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0)) ||
++                !(join_thread = CreateThread(NULL, 0, join_thread_proc, NULL, 0, NULL)))
++        {
++            hr = HRESULT_FROM_WIN32(GetLastError());
++            if (join_port) CloseHandle(join_port);
++            join_port = NULL;
++        }
++    }
++    if (SUCCEEDED(hr))
++    {
++        join->id = ++next_join_id;
++        if (!CreateIoCompletionPort(hFile, join_port, join->id, 0))
++            hr = HRESULT_FROM_WIN32(GetLastError());   /* not opened for overlapped I/O, or joined already */
++        else
++            list_add_tail(&joins, &join->entry);
++    }
++    LeaveCriticalSection(&queues_section);
++
++    if (FAILED(hr))
++    {
++        free(join);
++        unlock_user_queue(queue);
++        return hr;
++    }
++    *cookie = (HANDLE)join->id;
++    return S_OK;
+ }
+ 
+ HRESULT WINAPI RtwqUnjoinWorkQueue(DWORD queue, HANDLE cookie)
+ {
+-    FIXME("%#lx, %p.\n", queue, cookie);
++    struct join *join;
++    BOOL found = FALSE;
+ 
+-    return E_NOTIMPL;
++    TRACE("%#lx, %p.\n", queue, cookie);
++
++    EnterCriticalSection(&queues_section);
++    LIST_FOR_EACH_ENTRY(join, &joins, struct join, entry)
++    {
++        if (join->id != (ULONG_PTR)cookie || join->queue != queue) continue;
++        list_remove(&join->entry);
++        free(join);
++        found = TRUE;
++        break;
++    }
++    LeaveCriticalSection(&queues_section);
++
++    if (!found) return E_INVALIDARG;
++    unlock_user_queue(queue);
++    return S_OK;
+ }
+ 
+ /* Stained Glass OS: the MMCSS association of a work queue.  A queue remembers the class, the task id and the

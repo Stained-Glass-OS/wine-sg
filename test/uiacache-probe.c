@@ -207,7 +207,10 @@ int main(void)
     set_req(&req, TreeScope_Parent, NULL, 0);
     sa = NULL; tree = NULL;
     hr = UiaGetUpdatedCache(node, &req, NormalizeState_None, NULL, &sa, &tree);
-    check(hr == E_NOTIMPL, "the parent scope = %#lx", hr);
+    /* 5800 (integ-2026-10): a parent/ancestors scope is an invalid argument, as
+     * IUIAutomationCacheRequest::put_TreeScope answers it on Windows (Wine's
+     * uiautomation tests); it was E_NOTIMPL, "not supported here" */
+    check(hr == E_INVALIDARG, "the parent scope = %#lx", hr);
     SysFreeString(tree);
 
     UiaNodeRelease(node);

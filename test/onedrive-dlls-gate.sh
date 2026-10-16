@@ -45,8 +45,10 @@ else
 fi
 [ "$(v xmlclose)" = "00000000" ] && pass "CryptXmlClose of no document succeeds" \
     || fail "xmlclose: $(v xmlclose) (expected 00000000)"
-[ "$(v register)" = "80004001" ] && pass "CfRegisterSyncRoot fails cleanly (E_NOTIMPL), not a false success" \
-    || fail "register: $(v register) (expected 80004001)"
+# no registration given: a clean failure, never a false success (E_NOTIMPL before cldapi validated its
+# arguments; E_INVALIDARG with the cldapi work of this integration)
+case "$(v register)" in 80004001|80070057) pass "CfRegisterSyncRoot without a registration fails cleanly, not a false success" ;;
+    *) fail "register: $(v register) (expected 80004001 or 80070057)" ;; esac
 
 echo
 [ "$RC" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"

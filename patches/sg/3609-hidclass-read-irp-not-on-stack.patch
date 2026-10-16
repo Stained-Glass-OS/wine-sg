@@ -1,0 +1,124 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] hidclass: the device thread's read IRP does not point at its own stack (3609)
+
+hidclass: the device thread's read IRP does not point at its own stack
+
+hid_device_thread built each IOCTL_HID_READ_REPORT IRP with its status block
+and completion event on the thread's stack. When the device is removed the
+thread stops (halt event) with the IRP still pending in the bus driver, which
+completes it with STATUS_DELETE_PENDING when it removes its own device -- after
+the thread and its stack are gone, so IoCompleteRequest's write through
+UserIosb faulted ("Unhandled page fault" in winedevice, ntoskrnl.c
+IoCompleteRequest, 15-20% of short sessions). Stock Wine never ran that path
+at shutdown (its services are killed); since 2223 services are told to shut
+down and winedevice removes its devices. The status block and event now live
+in a heap block that is kept when the IRP may still be pending at thread exit.
+
+Gate: test/fastb-hidstack-gate.sh (40 short sessions: 0 faults; with the old
+code 8 of 40; mutant SG_MUTANT_HID_STACK_IO).
+---
+diff --git a/dlls/hidclass.sys/device.c b/dlls/hidclass.sys/device.c
+index 8725ca7..dd195d4 100644
+--- a/dlls/hidclass.sys/device.c
++++ b/dlls/hidclass.sys/device.c
+@@ -320,11 +320,25 @@ DWORD CALLBACK hid_device_thread(void *args)
+     HIDP_REPORT_IDS *report;
+     HID_XFER_PACKET *packet;
+     HIDP_DEVICE_DESC *desc;
+-    IO_STATUS_BLOCK io;
++    /* The read IRP's status block and event are not on this thread's stack:
++     * when the device is removed the thread stops with the IRP still pending in
++     * the bus driver, which completes it (STATUS_DELETE_PENDING) after the thread,
++     * and its stack, is gone -- the write through UserIosb then faulted in
++     * IoCompleteRequest. They are kept (a few bytes) if the IRP may still be
++     * pending when the thread ends. */
++    struct { IO_STATUS_BLOCK io; KEVENT event; } *ctx = calloc( 1, sizeof(*ctx) );
++    BOOL irp_pending = FALSE;
+     NTSTATUS status;
+     BYTE *buffer;
+     IRP *irp;
+ 
++#ifdef SG_MUTANT_HID_STACK_IO
++    IO_STATUS_BLOCK stack_io;
++    KEVENT stack_event;
++#endif
++
++    if (!ctx) return 1;
++
+     for (i = 0; i < ext->u.fdo.device_desc.CollectionDescLength; i++)
+     {
+         HIDP_COLLECTION_DESC *desc = ext->u.fdo.device_desc.CollectionDesc + i;
+@@ -342,7 +356,6 @@ DWORD CALLBACK hid_device_thread(void *args)
+     do
+     {
+         LARGE_INTEGER delay = {.QuadPart = (LONGLONG)ext->u.fdo.poll_interval * -10000};
+-        KEVENT irp_event;
+ 
+         packet->reportId = buffer[0] = report_id;
+         packet->reportBuffer = buffer;
+@@ -354,23 +367,41 @@ DWORD CALLBACK hid_device_thread(void *args)
+             packet->reportBufferLen--;
+         }
+ 
+-        KeInitializeEvent( &irp_event, NotificationEvent, FALSE );
++        KeInitializeEvent( &ctx->event, NotificationEvent, FALSE );
++#ifdef SG_MUTANT_HID_STACK_IO
++        KeInitializeEvent( &stack_event, NotificationEvent, FALSE );
+         irp = IoBuildDeviceIoControlRequest( IOCTL_HID_READ_REPORT, device, NULL, 0, packet->reportBuffer,
+-                                             packet->reportBufferLen, TRUE, &irp_event, &io );
++                                             packet->reportBufferLen, TRUE, &stack_event, &stack_io );
++        irp_pending = FALSE;
+         if (IoCallDriver( device, irp ) == STATUS_PENDING)
+         {
+-            void *events[2] = {&irp_event, &ext->u.fdo.halt_event};
++            void *events[2] = {&stack_event, &ext->u.fdo.halt_event};
+             status = KeWaitForMultipleObjects( 2, events, WaitAny, Executive, KernelMode, FALSE, NULL, NULL );
+             if (status) break;
+         }
++        ctx->io = stack_io;
++#else
++        irp = IoBuildDeviceIoControlRequest( IOCTL_HID_READ_REPORT, device, NULL, 0, packet->reportBuffer,
++                                             packet->reportBufferLen, TRUE, &ctx->event, &ctx->io );
++        if (IoCallDriver( device, irp ) == STATUS_PENDING)
++        {
++            void *events[2] = {&ctx->event, &ext->u.fdo.halt_event};
++            status = KeWaitForMultipleObjects( 2, events, WaitAny, Executive, KernelMode, FALSE, NULL, NULL );
++            if (status)
++            {
++                irp_pending = TRUE;  /* completed later by the bus driver */
++                break;
++            }
++        }
++#endif
+ 
+-        if (io.Status == STATUS_SUCCESS)
++        if (ctx->io.Status == STATUS_SUCCESS)
+         {
+-            if (!report_id) io.Information++;
++            if (!report_id) ctx->io.Information++;
+             if (!(report = find_report_with_type_and_id( desc, 0, HidP_Input, buffer[0], FALSE )))
+                 ERR( "dropping unknown input id %u\n", buffer[0] );
+-            else if (!ext->u.fdo.poll_interval && io.Information < report->InputLength)
+-                ERR( "dropping short report, len %Iu expected %u\n", io.Information, report->InputLength );
++            else if (!ext->u.fdo.poll_interval && ctx->io.Information < report->InputLength)
++                ERR( "dropping short report, len %Iu expected %u\n", ctx->io.Information, report->InputLength );
+             else if (!report->CollectionNumber || report->CollectionNumber > ext->u.fdo.child_count)
+                 ERR( "dropping report for unknown child %u\n", report->CollectionNumber );
+             else
+@@ -378,7 +409,7 @@ DWORD CALLBACK hid_device_thread(void *args)
+                 DEVICE_OBJECT *pdo = ext->u.fdo.child_pdos[report->CollectionNumber - 1];
+                 packet->reportId = buffer[0];
+                 packet->reportBuffer = buffer;
+-                packet->reportBufferLen = io.Information;
++                packet->reportBufferLen = ctx->io.Information;
+                 hid_device_queue_input( pdo, packet, !!ext->u.fdo.poll_interval );
+             }
+         }
+@@ -388,6 +419,7 @@ DWORD CALLBACK hid_device_thread(void *args)
+ 
+     if (status) WARN( "device thread exiting with status %#lx\n", status );
+     else TRACE( "device thread exiting\n" );
++    if (!irp_pending) free( ctx );
+     return 1;
+ }
+ 

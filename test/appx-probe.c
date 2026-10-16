@@ -4,6 +4,7 @@
  *   appx-probe info PACKAGE                identity, properties, files
  *   appx-probe extract PACKAGE NAME OUT    write a payload file to OUT
  *   appx-probe bundle PACKAGE              what CreateBundleReader says
+ *   appx-probe bundlemanifest XML          IAppxBundleFactory::CreateBundleManifestReader
  *
  * Prints KEY=VALUE lines; HRESULTs as hex. The interfaces are declared here
  * from their published IIDs so the probe needs no SDK headers.
@@ -19,7 +20,13 @@
 typedef struct { HRESULT (WINAPI *QI)(void *, REFIID, void **); ULONG (WINAPI *AddRef)(void *); ULONG (WINAPI *Release)(void *); } UnkVtbl;
 typedef struct { UnkVtbl u; void *CreatePackageWriter; HRESULT (WINAPI *CreatePackageReader)(void *, IStream *, void **);
                  HRESULT (WINAPI *CreateManifestReader)(void *, IStream *, void **); } FactoryVtbl;
-typedef struct { UnkVtbl u; void *CreateBundleWriter; HRESULT (WINAPI *CreateBundleReader)(void *, IStream *, void **); } BundleFactoryVtbl;
+typedef struct { UnkVtbl u; void *CreateBundleWriter; HRESULT (WINAPI *CreateBundleReader)(void *, IStream *, void **);
+                 HRESULT (WINAPI *CreateBundleManifestReader)(void *, IStream *, void **); } BundleFactoryVtbl;
+typedef struct { UnkVtbl u; HRESULT (WINAPI *GetPackageId)(void *, void **); HRESULT (WINAPI *GetPackageInfoItems)(void *, void **);
+                 HRESULT (WINAPI *GetStream)(void *, IStream **); } BundleManifestVtbl;
+typedef struct { UnkVtbl u; HRESULT (WINAPI *GetPackageType)(void *, int *); HRESULT (WINAPI *GetPackageId)(void *, void **);
+                 HRESULT (WINAPI *GetFileName)(void *, WCHAR **); HRESULT (WINAPI *GetOffset)(void *, UINT64 *);
+                 HRESULT (WINAPI *GetSize)(void *, UINT64 *); HRESULT (WINAPI *GetResources)(void *, void **); } BundlePackageInfoVtbl;
 typedef struct { UnkVtbl u; void *GetBlockMap; HRESULT (WINAPI *GetFootprintFile)(void *, int, void **);
                  HRESULT (WINAPI *GetPayloadFile)(void *, const WCHAR *, void **); HRESULT (WINAPI *GetPayloadFiles)(void *, void **);
                  HRESULT (WINAPI *GetManifest)(void *, void **); } ReaderVtbl;
@@ -75,6 +82,48 @@ int main( int argc, char **argv )
     CoInitializeEx( NULL, COINIT_MULTITHREADED );
     if (argc < 3) return 2;
     if (!(input = open_file( argv[2], FALSE ))) { printf( "open=ERROR\n" ); return 1; }
+
+    if (!strcmp( argv[1], "bundlemanifest" ))
+    {
+        void *bm = NULL, *id, *items;
+        STATSTG stat;
+        IStream *st;
+        WCHAR *s;
+        UINT64 v;
+        BOOL has;
+        int count = 0;
+
+        if (FAILED(hr = CoCreateInstance( &CLSID_AppxBundleFactory_, NULL, CLSCTX_INPROC_SERVER, &IID_IAppxBundleFactory_, &factory )))
+        { printf( "bundlefactory=ERROR %#lx\n", hr ); return 1; }
+        hr = VT(factory, BundleFactoryVtbl)->CreateBundleManifestReader( factory, input, &bm );
+        printf( "CreateBundleManifestReader=%#lx\n", hr );
+        if (FAILED(hr)) return 0;
+        VT(bm, BundleManifestVtbl)->GetPackageId( bm, &id );
+        VT(id, IdVtbl)->GetName( id, &s ); printw( "Name", s );
+        VT(id, IdVtbl)->GetPublisher( id, &s ); printw( "Publisher", s );
+        VT(id, IdVtbl)->GetVersion( id, &v );
+        printf( "Version=%u.%u.%u.%u\n", (UINT)(v >> 48), (UINT)(v >> 32) & 0xffff, (UINT)(v >> 16) & 0xffff, (UINT)v & 0xffff );
+        VT(bm, BundleManifestVtbl)->GetPackageInfoItems( bm, &items );
+        for (VT(items, EnumVtbl)->GetHasCurrent( items, &has ); has; VT(items, EnumVtbl)->MoveNext( items, &has ))
+        {
+            void *info;
+            UINT64 offset, size;
+            int type;
+
+            VT(items, EnumVtbl)->GetCurrent( items, &info );
+            VT(info, BundlePackageInfoVtbl)->GetFileName( info, &s );
+            VT(info, BundlePackageInfoVtbl)->GetPackageType( info, &type );
+            VT(info, BundlePackageInfoVtbl)->GetOffset( info, &offset );
+            VT(info, BundlePackageInfoVtbl)->GetSize( info, &size );
+            printf( "Item%d=%ls type=%d offset=%llu size=%llu\n", count, s, type, (unsigned long long)offset, (unsigned long long)size );
+            count++;
+        }
+        printf( "ItemCount=%d\n", count );
+        VT(bm, BundleManifestVtbl)->GetStream( bm, &st );
+        IStream_Stat( st, &stat, STATFLAG_NONAME );
+        printf( "StreamSize=%lu\n", stat.cbSize.LowPart );
+        return 0;
+    }
 
     if (!strcmp( argv[1], "bundle" ))
     {

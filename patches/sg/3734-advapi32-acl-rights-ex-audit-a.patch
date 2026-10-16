@@ -1,0 +1,1042 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] advapi32: ACL evaluation, trustee wrappers, GetSecurityInfoEx, audit alarm A forms (3734)
+
+advapi32: ACL evaluation, trustee wrappers, GetSecurityInfoEx, audit alarm A forms
+
+GetEffectiveRightsFromAcl and GetAuditedPermissionsFromAcl evaluate the ACL
+for a trustee (name, SID or objects-and-SID/name form): allow and deny ACEs in
+order, Everyone applies to everybody, inherit-only ACEs are skipped, an
+inherited deny ACE makes the ACL invalid (documented). BuildSecurityDescriptorA
+converts its trustees and entries and calls the W function. The audit alarm A
+forms (ObjectOpen/Close/Privilege/PrivilegedService) convert their strings and
+call the W functions. LookupSecurityDescriptorParts(A/W) return the owner,
+group and the DACL and SACL entries with their trustees named.
+GetSecurityInfoEx and GetNamedSecurityInfoEx (A/W) fill ACTRL_ACCESS /
+ACTRL_AUDIT lists and account names for the Windows provider (others give
+ERROR_BAD_PROVIDER). WmiOpenBlock answers ERROR_WMI_GUID_NOT_FOUND.
+
+Rebased at integration (integ-2026-10) onto earlier integration patches: clean 3-way merge.
+---
+diff --git a/dlls/advapi32/security.c b/dlls/advapi32/security.c
+--- a/dlls/advapi32/security.c
++++ b/dlls/advapi32/security.c
+@@ -50,6 +50,8 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(advapi);
+ 
+ static DWORD trustee_to_sid(DWORD nDestinationSidLength, PSID pDestinationSid, PTRUSTEEW pTrustee);
++static DWORD trustee_name_A_to_W(TRUSTEE_FORM form, char *trustee_nameA, WCHAR **ptrustee_nameW);
++static void free_trustee_name(TRUSTEE_FORM form, WCHAR *trustee_nameW);
+ 
+ typedef struct _MAX_SID
+ {
+@@ -267,21 +269,185 @@ BOOL ADVAPI_GetComputerSid(PSID sid)
+     return TRUE;
+ }
+ 
+-DWORD WINAPI
+-GetEffectiveRightsFromAclA( PACL pacl, PTRUSTEEA pTrustee, PACCESS_MASK pAccessRights )
++/* Stained Glass OS: the trustee-in-an-ACL evaluators. Windows evaluates the ACEs of the trustee and of the
++ * groups it belongs to; the group part here is only known for the user of the calling token (GUESS). */
++static DWORD rights_trustee_sid( const TRUSTEEW *trustee, BYTE *buf, PSID *sid )
+ {
+-    FIXME("%p %p %p - stub\n", pacl, pTrustee, pAccessRights);
++    TRUSTEEW tmp;
++    DWORD err;
++
++    if (!trustee) return ERROR_INVALID_PARAMETER;
++    switch (trustee->TrusteeForm)
++    {
++    case TRUSTEE_IS_OBJECTS_AND_SID:
++    {
++        OBJECTS_AND_SID *os = (OBJECTS_AND_SID *)trustee->ptstrName;
++        if (!os || !os->pSid || !IsValidSid( os->pSid )) return ERROR_INVALID_PARAMETER;
++        *sid = os->pSid;
++        return ERROR_SUCCESS;
++    }
++    case TRUSTEE_IS_OBJECTS_AND_NAME:
++    {
++        OBJECTS_AND_NAME_W *on = (OBJECTS_AND_NAME_W *)trustee->ptstrName;
++        if (!on || !on->ptstrName) return ERROR_INVALID_PARAMETER;
++        tmp = *trustee;
++        tmp.TrusteeForm = TRUSTEE_IS_NAME;
++        tmp.ptstrName = on->ptstrName;
++        trustee = &tmp;
++        break;
++    }
++    case TRUSTEE_IS_SID:
++        if (!trustee->ptstrName || !IsValidSid( (PSID)trustee->ptstrName )) return ERROR_INVALID_PARAMETER;
++        break;
++    case TRUSTEE_IS_NAME:
++        if (!trustee->ptstrName) return ERROR_INVALID_PARAMETER;
++        break;
++    default:
++        return ERROR_INVALID_PARAMETER;
++    }
++    if ((err = trustee_to_sid( sizeof(MAX_SID), buf, (PTRUSTEEW)trustee ))) return err;
++    *sid = buf;
++    return ERROR_SUCCESS;
++}
++
++static BOOL trustee_is_current_user( PSID sid )
++{
++    BYTE buf[sizeof(TOKEN_USER) + sizeof(MAX_SID)];
++    HANDLE token;
++    DWORD len;
++    BOOL ret = FALSE;
++
++    if (!OpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &token )) return FALSE;
++    if (GetTokenInformation( token, TokenUser, buf, sizeof(buf), &len ))
++        ret = EqualSid( ((TOKEN_USER *)buf)->User.Sid, sid );
++    CloseHandle( token );
++    return ret;
++}
++
++/* does an ACE for ace_sid apply to the trustee? */
++static BOOL ace_sid_applies( PSID ace_sid, PSID trustee, BOOL is_current )
++{
++    static const SID_IDENTIFIER_AUTHORITY world = { SECURITY_WORLD_SID_AUTHORITY };
++    BOOL member;
++
++    if (EqualSid( ace_sid, trustee )) return TRUE;
++    if (*GetSidSubAuthorityCount( ace_sid ) == 1 && *GetSidSubAuthority( ace_sid, 0 ) == SECURITY_WORLD_RID &&
++        !memcmp( GetSidIdentifierAuthority( ace_sid ), &world, sizeof(world) ))
++        return TRUE;
++    if (is_current && CheckTokenMembership( NULL, ace_sid, &member )) return member;
++    return FALSE;
++}
++
++DWORD WINAPI GetEffectiveRightsFromAclW( PACL pacl, PTRUSTEEW pTrustee, PACCESS_MASK pAccessRights )
++{
++    ACL_SIZE_INFORMATION info;
++    BYTE sidbuf[sizeof(MAX_SID)];
++    ACCESS_MASK granted = 0, denied = 0;
++    PSID sid;
++    BOOL current;
++    DWORD err, i;
++
++    TRACE( "%p %p %p\n", pacl, pTrustee, pAccessRights );
++
++    if (!pacl || !pTrustee || !pAccessRights) return ERROR_INVALID_PARAMETER;
++    if (!RtlValidAcl( pacl )) return ERROR_INVALID_ACL;
++    if ((err = rights_trustee_sid( pTrustee, sidbuf, &sid ))) return err;
++    if (RtlQueryInformationAcl( pacl, &info, sizeof(info), AclSizeInformation )) return ERROR_INVALID_ACL;
++    current = trustee_is_current_user( sid );
++
++    /* an inherited access-denied ACE makes the ACL unusable for this function (documented) */
++    for (i = 0; i < info.AceCount; i++)
++    {
++        ACE_HEADER *ace;
++        if (RtlGetAce( pacl, i, (void **)&ace )) return ERROR_INVALID_ACL;
++        if (ace->AceType == ACCESS_DENIED_ACE_TYPE && (ace->AceFlags & INHERITED_ACE)) return ERROR_INVALID_ACL;
++    }
++
++    for (i = 0; i < info.AceCount; i++)
++    {
++        ACE_HEADER *ace;
++        ACCESS_MASK mask;
+ 
+-    *pAccessRights = STANDARD_RIGHTS_ALL | SPECIFIC_RIGHTS_ALL;
+-    return 0;
++        RtlGetAce( pacl, i, (void **)&ace );
++        if (ace->AceType != ACCESS_ALLOWED_ACE_TYPE && ace->AceType != ACCESS_DENIED_ACE_TYPE) continue;
++        if (ace->AceFlags & INHERIT_ONLY_ACE) continue;
++        if (!ace_sid_applies( (PSID)&((ACCESS_ALLOWED_ACE *)ace)->SidStart, sid, current )) continue;
++        mask = ((ACCESS_ALLOWED_ACE *)ace)->Mask;
++        if (ace->AceType == ACCESS_ALLOWED_ACE_TYPE) granted |= mask & ~denied;
++        else denied |= mask & ~granted;
++    }
++    *pAccessRights = granted;
++    return ERROR_SUCCESS;
+ }
+ 
+-DWORD WINAPI
+-GetEffectiveRightsFromAclW( PACL pacl, PTRUSTEEW pTrustee, PACCESS_MASK pAccessRights )
++static DWORD trustee_A_to_W( const TRUSTEEA *a, TRUSTEEW *w )
+ {
+-    FIXME("%p %p %p - stub\n", pacl, pTrustee, pAccessRights);
++    memset( w, 0, sizeof(*w) );
++    w->MultipleTrusteeOperation = a->MultipleTrusteeOperation;
++    w->TrusteeForm = a->TrusteeForm;
++    w->TrusteeType = a->TrusteeType;
++    return trustee_name_A_to_W( a->TrusteeForm, a->ptstrName, &w->ptstrName );
++}
+ 
+-    return 1;
++DWORD WINAPI GetEffectiveRightsFromAclA( PACL pacl, PTRUSTEEA pTrustee, PACCESS_MASK pAccessRights )
++{
++    TRUSTEEW w;
++    DWORD err;
++
++    TRACE( "%p %p %p\n", pacl, pTrustee, pAccessRights );
++    if (!pTrustee) return ERROR_INVALID_PARAMETER;
++    if ((err = trustee_A_to_W( pTrustee, &w ))) return err;
++    err = GetEffectiveRightsFromAclW( pacl, &w, pAccessRights );
++    free_trustee_name( w.TrusteeForm, w.ptstrName );
++    return err;
++}
++
++DWORD WINAPI GetAuditedPermissionsFromAclW( PACL pacl, PTRUSTEEW pTrustee, PACCESS_MASK pSuccessfulAuditedRights,
++                                            PACCESS_MASK pFailedAuditRights )
++{
++    ACL_SIZE_INFORMATION info;
++    BYTE sidbuf[sizeof(MAX_SID)];
++    ACCESS_MASK success = 0, failure = 0;
++    PSID sid;
++    BOOL current;
++    DWORD err, i;
++
++    TRACE( "%p %p %p %p\n", pacl, pTrustee, pSuccessfulAuditedRights, pFailedAuditRights );
++
++    if (!pacl || !pTrustee || !pSuccessfulAuditedRights || !pFailedAuditRights) return ERROR_INVALID_PARAMETER;
++    if (!RtlValidAcl( pacl )) return ERROR_INVALID_ACL;
++    if ((err = rights_trustee_sid( pTrustee, sidbuf, &sid ))) return err;
++    if (RtlQueryInformationAcl( pacl, &info, sizeof(info), AclSizeInformation )) return ERROR_INVALID_ACL;
++    current = trustee_is_current_user( sid );
++
++    for (i = 0; i < info.AceCount; i++)
++    {
++        ACE_HEADER *ace;
++
++        if (RtlGetAce( pacl, i, (void **)&ace )) return ERROR_INVALID_ACL;
++        if (ace->AceType != SYSTEM_AUDIT_ACE_TYPE) continue;
++        if (ace->AceFlags & INHERIT_ONLY_ACE) continue;
++        if (!ace_sid_applies( (PSID)&((SYSTEM_AUDIT_ACE *)ace)->SidStart, sid, current )) continue;
++        if (ace->AceFlags & SUCCESSFUL_ACCESS_ACE_FLAG) success |= ((SYSTEM_AUDIT_ACE *)ace)->Mask;
++        if (ace->AceFlags & FAILED_ACCESS_ACE_FLAG) failure |= ((SYSTEM_AUDIT_ACE *)ace)->Mask;
++    }
++    *pSuccessfulAuditedRights = success;
++    *pFailedAuditRights = failure;
++    return ERROR_SUCCESS;
++}
++
++DWORD WINAPI GetAuditedPermissionsFromAclA( PACL pacl, PTRUSTEEA pTrustee, PACCESS_MASK pSuccessfulAuditedRights,
++                                            PACCESS_MASK pFailedAuditRights )
++{
++    TRUSTEEW w;
++    DWORD err;
++
++    TRACE( "%p %p %p %p\n", pacl, pTrustee, pSuccessfulAuditedRights, pFailedAuditRights );
++    if (!pTrustee) return ERROR_INVALID_PARAMETER;
++    if ((err = trustee_A_to_W( pTrustee, &w ))) return err;
++    err = GetAuditedPermissionsFromAclW( pacl, &w, pSuccessfulAuditedRights, pFailedAuditRights );
++    free_trustee_name( w.TrusteeForm, w.ptstrName );
++    return err;
+ }
+ 
+ /*	##############################################
+@@ -326,6 +492,37 @@ BOOL WINAPI AddConditionalAce( PACL acl, DWORD revision, DWORD flags, UCHAR type
+     return FALSE;
+ }
+ 
++static void free_explicit_A_to_W( EXPLICIT_ACCESSW *list, ULONG count )
++{
++    ULONG i;
++    for (i = 0; i < count; i++) free_trustee_name( list[i].Trustee.TrusteeForm, list[i].Trustee.ptstrName );
++    free( list );
++}
++
++static DWORD explicit_A_to_W( const EXPLICIT_ACCESSA *in, ULONG count, EXPLICIT_ACCESSW **out )
++{
++    EXPLICIT_ACCESSW *w;
++    ULONG i;
++    DWORD err;
++
++    *out = NULL;
++    if (!in) return ERROR_SUCCESS;
++    if (!(w = calloc( count ? count : 1, sizeof(*w) ))) return ERROR_NOT_ENOUGH_MEMORY;
++    for (i = 0; i < count; i++)
++    {
++        w[i].grfAccessPermissions = in[i].grfAccessPermissions;
++        w[i].grfAccessMode = in[i].grfAccessMode;
++        w[i].grfInheritance = in[i].grfInheritance;
++        if ((err = trustee_A_to_W( &in[i].Trustee, &w[i].Trustee )))
++        {
++            free_explicit_A_to_W( w, i );
++            return err;
++        }
++    }
++    *out = w;
++    return ERROR_SUCCESS;
++}
++
+ DWORD WINAPI BuildSecurityDescriptorA(
+     IN PTRUSTEEA pOwner,
+     IN PTRUSTEEA pGroup,
+@@ -336,14 +533,38 @@ DWORD WINAPI BuildSecurityDescriptorA(
+     IN PSECURITY_DESCRIPTOR pOldSD,
+     IN OUT PULONG lpdwBufferLength,
+     OUT PSECURITY_DESCRIPTOR* pNewSD)
+-{ 
+-    FIXME("(%p,%p,%ld,%p,%ld,%p,%p,%p,%p) stub!\n",pOwner,pGroup,
+-          cCountOfAccessEntries,pListOfAccessEntries,cCountOfAuditEntries,
+-          pListofAuditEntries,pOldSD,lpdwBufferLength,pNewSD);
+- 
+-    return ERROR_CALL_NOT_IMPLEMENTED;
+-} 
+- 
++{
++    TRUSTEEW owner, group;
++    EXPLICIT_ACCESSW *access = NULL, *audit = NULL;
++    BOOL have_owner = FALSE, have_group = FALSE;
++    DWORD err;
++
++    TRACE("(%p,%p,%ld,%p,%ld,%p,%p,%p,%p)\n", pOwner, pGroup, cCountOfAccessEntries, pListOfAccessEntries,
++          cCountOfAuditEntries, pListofAuditEntries, pOldSD, lpdwBufferLength, pNewSD);
++
++    if (pOwner)
++    {
++        if ((err = trustee_A_to_W( pOwner, &owner ))) goto done;
++        have_owner = TRUE;
++    }
++    if (pGroup)
++    {
++        if ((err = trustee_A_to_W( pGroup, &group ))) goto done;
++        have_group = TRUE;
++    }
++    if ((err = explicit_A_to_W( pListOfAccessEntries, cCountOfAccessEntries, &access ))) goto done;
++    if ((err = explicit_A_to_W( pListofAuditEntries, cCountOfAuditEntries, &audit ))) goto done;
++
++    err = BuildSecurityDescriptorW( have_owner ? &owner : NULL, have_group ? &group : NULL, cCountOfAccessEntries,
++                                    access, cCountOfAuditEntries, audit, pOldSD, lpdwBufferLength, pNewSD );
++done:
++    if (have_owner) free_trustee_name( owner.TrusteeForm, owner.ptstrName );
++    if (have_group) free_trustee_name( group.TrusteeForm, group.ptstrName );
++    if (access) free_explicit_A_to_W( access, cCountOfAccessEntries );
++    if (audit) free_explicit_A_to_W( audit, cCountOfAuditEntries );
++    return err;
++}
++
+ /******************************************************************************
+  * BuildSecurityDescriptorW [ADVAPI32.@]
+  *
+@@ -1725,11 +1946,17 @@ BOOL WINAPI AccessCheckAndAuditAlarmA(LPCSTR Subsystem, LPVOID HandleId, LPSTR O
+ 	return TRUE;
+ }
+ 
++/* the A forms convert their strings and take the W path, which checks SeAuditPrivilege */
+ BOOL WINAPI ObjectCloseAuditAlarmA(LPCSTR SubsystemName, LPVOID HandleId, BOOL GenerateOnClose)
+ {
+-    FIXME("stub (%s,%p,%x)\n", debugstr_a(SubsystemName), HandleId, GenerateOnClose);
++    WCHAR *subsystem = strdupAW( SubsystemName );
++    BOOL ret;
+ 
+-    return TRUE;
++    TRACE("(%s,%p,%x)\n", debugstr_a(SubsystemName), HandleId, GenerateOnClose);
++    if (SubsystemName && !subsystem) return FALSE;
++    ret = ObjectCloseAuditAlarmW( subsystem, HandleId, GenerateOnClose );
++    free( subsystem );
++    return ret;
+ }
+ 
+ BOOL WINAPI ObjectOpenAuditAlarmA(LPCSTR SubsystemName, LPVOID HandleId, LPSTR ObjectTypeName,
+@@ -1737,30 +1964,50 @@ BOOL WINAPI ObjectOpenAuditAlarmA(LPCSTR SubsystemName, LPVOID HandleId, LPSTR O
+   DWORD GrantedAccess, PPRIVILEGE_SET Privileges, BOOL ObjectCreation, BOOL AccessGranted,
+   LPBOOL GenerateOnClose)
+ {
+-	FIXME("stub (%s,%p,%s,%s,%p,%p,0x%08lx,0x%08lx,%p,%x,%x,%p)\n", debugstr_a(SubsystemName),
+-		HandleId, debugstr_a(ObjectTypeName), debugstr_a(ObjectName), pSecurityDescriptor,
+-        ClientToken, DesiredAccess, GrantedAccess, Privileges, ObjectCreation, AccessGranted,
+-        GenerateOnClose);
++    WCHAR *subsystem = strdupAW( SubsystemName ), *type = strdupAW( ObjectTypeName ), *name = strdupAW( ObjectName );
++    BOOL ret = FALSE;
+ 
+-    return TRUE;
++    TRACE("(%s,%p,%s,%s,%p,%p,0x%08lx,0x%08lx,%p,%x,%x,%p)\n", debugstr_a(SubsystemName), HandleId,
++          debugstr_a(ObjectTypeName), debugstr_a(ObjectName), pSecurityDescriptor, ClientToken, DesiredAccess,
++          GrantedAccess, Privileges, ObjectCreation, AccessGranted, GenerateOnClose);
++
++    if ((!SubsystemName || subsystem) && (!ObjectTypeName || type) && (!ObjectName || name))
++        ret = ObjectOpenAuditAlarmW( subsystem, HandleId, type, name, pSecurityDescriptor, ClientToken,
++                                     DesiredAccess, GrantedAccess, Privileges, ObjectCreation, AccessGranted,
++                                     GenerateOnClose );
++    free( subsystem );
++    free( type );
++    free( name );
++    return ret;
+ }
+ 
+ BOOL WINAPI ObjectPrivilegeAuditAlarmA( LPCSTR SubsystemName, LPVOID HandleId, HANDLE ClientToken,
+   DWORD DesiredAccess, PPRIVILEGE_SET Privileges, BOOL AccessGranted)
+ {
+-    FIXME("stub (%s,%p,%p,0x%08lx,%p,%x)\n", debugstr_a(SubsystemName), HandleId, ClientToken,
+-          DesiredAccess, Privileges, AccessGranted);
++    WCHAR *subsystem = strdupAW( SubsystemName );
++    BOOL ret;
+ 
+-    return TRUE;
++    TRACE("(%s,%p,%p,0x%08lx,%p,%x)\n", debugstr_a(SubsystemName), HandleId, ClientToken,
++          DesiredAccess, Privileges, AccessGranted);
++    if (SubsystemName && !subsystem) return FALSE;
++    ret = ObjectPrivilegeAuditAlarmW( subsystem, HandleId, ClientToken, DesiredAccess, Privileges, AccessGranted );
++    free( subsystem );
++    return ret;
+ }
+ 
+ BOOL WINAPI PrivilegedServiceAuditAlarmA( LPCSTR SubsystemName, LPCSTR ServiceName, HANDLE ClientToken,
+                                    PPRIVILEGE_SET Privileges, BOOL AccessGranted)
+ {
+-    FIXME("stub (%s,%s,%p,%p,%x)\n", debugstr_a(SubsystemName), debugstr_a(ServiceName),
+-          ClientToken, Privileges, AccessGranted);
++    WCHAR *subsystem = strdupAW( SubsystemName ), *service = strdupAW( ServiceName );
++    BOOL ret = FALSE;
+ 
+-    return TRUE;
++    TRACE("(%s,%s,%p,%p,%x)\n", debugstr_a(SubsystemName), debugstr_a(ServiceName),
++          ClientToken, Privileges, AccessGranted);
++    if ((!SubsystemName || subsystem) && (!ServiceName || service))
++        ret = PrivilegedServiceAuditAlarmW( subsystem, service, ClientToken, Privileges, AccessGranted );
++    free( subsystem );
++    free( service );
++    return ret;
+ }
+ 
+ #define HKEY_SPECIAL_ROOT_FIRST   HKEY_CLASSES_ROOT
+@@ -1920,33 +2167,7 @@ DWORD WINAPI GetSecurityInfo( HANDLE handle, SE_OBJECT_TYPE type, SECURITY_INFOR
+     return ERROR_SUCCESS;
+ }
+ 
+-/******************************************************************************
+- * GetSecurityInfoExA [ADVAPI32.@]
+- */
+-DWORD WINAPI GetSecurityInfoExA(
+-	HANDLE hObject, SE_OBJECT_TYPE ObjectType,
+-	SECURITY_INFORMATION SecurityInfo, LPCSTR lpProvider,
+-	LPCSTR lpProperty, PACTRL_ACCESSA *ppAccessList,
+-	PACTRL_AUDITA *ppAuditList, LPSTR *lppOwner, LPSTR *lppGroup
+-)
+-{
+-  FIXME("stub!\n");
+-  return ERROR_BAD_PROVIDER;
+-}
+ 
+-/******************************************************************************
+- * GetSecurityInfoExW [ADVAPI32.@]
+- */
+-DWORD WINAPI GetSecurityInfoExW(
+-	HANDLE hObject, SE_OBJECT_TYPE ObjectType, 
+-	SECURITY_INFORMATION SecurityInfo, LPCWSTR lpProvider,
+-	LPCWSTR lpProperty, PACTRL_ACCESSW *ppAccessList, 
+-	PACTRL_AUDITW *ppAuditList, LPWSTR *lppOwner, LPWSTR *lppGroup
+-)
+-{
+-  FIXME("stub!\n");
+-  return ERROR_BAD_PROVIDER; 
+-}
+ 
+ /******************************************************************************
+  * BuildExplicitAccessWithNameA [ADVAPI32.@]
+@@ -2991,28 +3212,6 @@ error:
+     return RtlNtStatusToDosError(status);
+ }
+ 
+-/******************************************************************************
+- * GetAuditedPermissionsFromAclA [ADVAPI32.@]
+- */
+-DWORD WINAPI GetAuditedPermissionsFromAclA( PACL pacl, PTRUSTEEA pTrustee, PACCESS_MASK pSuccessfulAuditedRights,
+-        PACCESS_MASK pFailedAuditRights)
+-{
+-    FIXME("%p %p %p %p\n",pacl, pTrustee, pSuccessfulAuditedRights, pFailedAuditRights);
+-    return ERROR_CALL_NOT_IMPLEMENTED;
+-
+-}
+-
+-/******************************************************************************
+- * GetAuditedPermissionsFromAclW [ADVAPI32.@]
+- */
+-DWORD WINAPI GetAuditedPermissionsFromAclW( PACL pacl, PTRUSTEEW pTrustee, PACCESS_MASK pSuccessfulAuditedRights,
+-        PACCESS_MASK pFailedAuditRights)
+-{
+-    FIXME("%p %p %p %p\n",pacl, pTrustee, pSuccessfulAuditedRights, pFailedAuditRights);
+-    return ERROR_CALL_NOT_IMPLEMENTED;
+-
+-}
+-
+ /******************************************************************************
+  * ConvertStringSecurityDescriptorToSecurityDescriptorA [ADVAPI32.@]
+  */
+@@ -3433,29 +3632,7 @@ DWORD WINAPI GetNamedSecurityInfoW( const WCHAR *name, SE_OBJECT_TYPE type,
+     return err;
+ }
+ 
+-/******************************************************************************
+- * GetNamedSecurityInfoExW [ADVAPI32.@]
+- */
+-DWORD WINAPI GetNamedSecurityInfoExW( LPCWSTR object, SE_OBJECT_TYPE type,
+-    SECURITY_INFORMATION info, LPCWSTR provider, LPCWSTR property,
+-    PACTRL_ACCESSW* access_list, PACTRL_AUDITW* audit_list, LPWSTR* owner, LPWSTR* group )
+-{
+-    FIXME("(%s, %d, %ld, %s, %s, %p, %p, %p, %p) stub\n", debugstr_w(object), type, info,
+-        debugstr_w(provider), debugstr_w(property), access_list, audit_list, owner, group);
+-    return ERROR_CALL_NOT_IMPLEMENTED;
+-}
+ 
+-/******************************************************************************
+- * GetNamedSecurityInfoExA [ADVAPI32.@]
+- */
+-DWORD WINAPI GetNamedSecurityInfoExA( LPCSTR object, SE_OBJECT_TYPE type,
+-    SECURITY_INFORMATION info, LPCSTR provider, LPCSTR property,
+-    PACTRL_ACCESSA* access_list, PACTRL_AUDITA* audit_list, LPSTR* owner, LPSTR* group )
+-{
+-    FIXME("(%s, %d, %ld, %s, %s, %p, %p, %p, %p) stub\n", debugstr_a(object), type, info,
+-        debugstr_a(provider), debugstr_a(property), access_list, audit_list, owner, group);
+-    return ERROR_CALL_NOT_IMPLEMENTED;
+-}
+ 
+ /* Unix file systems have no EFS: no file is ever encrypted. */
+ 
+@@ -4504,26 +4681,523 @@ BOOL WINAPI SaferSetLevelInformation(SAFER_LEVEL_HANDLE handle, SAFER_OBJECT_INF
+     return FALSE;
+ }
+ 
++/* the account name of a SID as the ACL helpers show it: "DOMAIN\name", or the SID string when it has no account
++ * (GUESS: Windows fails when the name cannot be resolved). The result is malloc'ed. */
++static WCHAR *sid_to_account_string( PSID sid, TRUSTEE_TYPE *type )
++{
++    WCHAR name[256], domain[256], *ret, *str;
++    DWORD nlen = ARRAY_SIZE(name), dlen = ARRAY_SIZE(domain);
++    SID_NAME_USE use;
++
++    *type = TRUSTEE_IS_UNKNOWN;
++    if (LookupAccountSidW( NULL, sid, name, &nlen, domain, &dlen, &use ))
++    {
++        switch (use)
++        {
++        case SidTypeUser: *type = TRUSTEE_IS_USER; break;
++        case SidTypeGroup: *type = TRUSTEE_IS_GROUP; break;
++        case SidTypeDomain: *type = TRUSTEE_IS_DOMAIN; break;
++        case SidTypeAlias: *type = TRUSTEE_IS_ALIAS; break;
++        case SidTypeWellKnownGroup: *type = TRUSTEE_IS_WELL_KNOWN_GROUP; break;
++        case SidTypeDeletedAccount: *type = TRUSTEE_IS_DELETED; break;
++        case SidTypeInvalid: *type = TRUSTEE_IS_INVALID; break;
++        default: break;
++        }
++        if (!(ret = malloc( (dlen + 1 + nlen + 1) * sizeof(WCHAR) ))) return NULL;
++        if (dlen) swprintf( ret, dlen + 1 + nlen + 1, L"%s\\%s", domain, name );
++        else lstrcpyW( ret, name );
++        return ret;
++    }
++    if (!ConvertSidToStringSidW( sid, &str )) return NULL;
++    ret = wcsdup( str );
++    LocalFree( str );
++    return ret;
++}
++
++/* the DACL (or SACL) as one LocalAlloc block: the EXPLICIT_ACCESS array, then the trustee names */
++static DWORD acl_to_named_entries( PACL acl, BOOL audit, ULONG *count, EXPLICIT_ACCESSW **list )
++{
++    ACL_SIZE_INFORMATION info;
++    EXPLICIT_ACCESSW *tmp, *out;
++    WCHAR **names;
++    ULONG i, n = 0, chars = 0;
++    DWORD err = ERROR_SUCCESS;
++    WCHAR *pos;
++
++    *count = 0;
++    *list = NULL;
++    if (!acl) return ERROR_SUCCESS;
++    if (RtlQueryInformationAcl( acl, &info, sizeof(info), AclSizeInformation )) return ERROR_INVALID_ACL;
++    if (!info.AceCount) return ERROR_SUCCESS;
++    tmp = calloc( info.AceCount * 2, sizeof(*tmp) );
++    names = calloc( info.AceCount * 2, sizeof(*names) );
++    if (!tmp || !names) { free( tmp ); free( names ); return ERROR_NOT_ENOUGH_MEMORY; }
++
++    for (i = 0; i < info.AceCount; i++)
++    {
++        ACE_HEADER *ace;
++        ACCESS_MODE modes[2];
++        int nm = 0, k;
++        TRUSTEE_TYPE type;
++        WCHAR *name;
++
++        RtlGetAce( acl, i, (void **)&ace );
++        if (!audit && ace->AceType == ACCESS_ALLOWED_ACE_TYPE) modes[nm++] = GRANT_ACCESS;
++        else if (!audit && ace->AceType == ACCESS_DENIED_ACE_TYPE) modes[nm++] = DENY_ACCESS;
++        else if (audit && ace->AceType == SYSTEM_AUDIT_ACE_TYPE)
++        {
++            if (ace->AceFlags & SUCCESSFUL_ACCESS_ACE_FLAG) modes[nm++] = SET_AUDIT_SUCCESS;
++            if (ace->AceFlags & FAILED_ACCESS_ACE_FLAG) modes[nm++] = SET_AUDIT_FAILURE;
++        }
++        if (!nm) continue;
++        if (!(name = sid_to_account_string( (PSID)&((ACCESS_ALLOWED_ACE *)ace)->SidStart, &type )))
++        {
++            err = ERROR_NOT_ENOUGH_MEMORY;
++            goto done;
++        }
++        for (k = 0; k < nm; k++)
++        {
++            tmp[n].grfAccessPermissions = ((ACCESS_ALLOWED_ACE *)ace)->Mask;
++            tmp[n].grfAccessMode = modes[k];
++            tmp[n].grfInheritance = ace->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE |
++                                                     NO_PROPAGATE_INHERIT_ACE | INHERIT_ONLY_ACE);
++            tmp[n].Trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
++            tmp[n].Trustee.TrusteeForm = TRUSTEE_IS_NAME;
++            tmp[n].Trustee.TrusteeType = type;
++            names[n] = k ? wcsdup( name ) : name;
++            chars += lstrlenW( name ) + 1;
++            n++;
++        }
++        if (nm == 0) free( name );
++    }
++    if (n)
++    {
++        if (!(out = LocalAlloc( LMEM_FIXED | LMEM_ZEROINIT, n * sizeof(*out) + chars * sizeof(WCHAR) )))
++        {
++            err = ERROR_NOT_ENOUGH_MEMORY;
++            goto done;
++        }
++        pos = (WCHAR *)(out + n);
++        for (i = 0; i < n; i++)
++        {
++            out[i] = tmp[i];
++            out[i].Trustee.ptstrName = pos;
++            lstrcpyW( pos, names[i] );
++            pos += lstrlenW( names[i] ) + 1;
++        }
++        *list = out;
++        *count = n;
++    }
++done:
++    for (i = 0; i < info.AceCount * 2; i++) free( names[i] );
++    free( tmp );
++    free( names );
++    return err;
++}
++
+ /******************************************************************************
+- * LookupSecurityDescriptorPartsA   [ADVAPI32.@]
++ * LookupSecurityDescriptorPartsW   [ADVAPI32.@]
++ *
++ * Stained Glass OS: the owner, the group and the explicit entries of the DACL and the SACL of a self-relative
++ * descriptor, with their trustees named. Every output is one LocalAlloc block.
+  */
+-DWORD WINAPI LookupSecurityDescriptorPartsA(TRUSTEEA *owner, TRUSTEEA *group, ULONG *access_count,
+-                                            EXPLICIT_ACCESSA *access_list, ULONG *audit_count,
+-                                            EXPLICIT_ACCESSA *audit_list, SECURITY_DESCRIPTOR *descriptor)
++DWORD WINAPI LookupSecurityDescriptorPartsW( TRUSTEEW **owner, TRUSTEEW **group, ULONG *access_count,
++                                             EXPLICIT_ACCESSW **access_list, ULONG *audit_count,
++                                             EXPLICIT_ACCESSW **audit_list, SECURITY_DESCRIPTOR *descriptor )
+ {
+-    FIXME("(%p %p %p %p %p %p %p) stub\n", owner, group, access_count,
+-          access_list, audit_count, audit_list, descriptor);
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    SECURITY_DESCRIPTOR_CONTROL control;
++    DWORD revision, err = ERROR_SUCCESS;
++    BOOLEAN present, defaulted;
++    TRUSTEEW *o = NULL, *g = NULL;
++    EXPLICIT_ACCESSW *al = NULL, *ul = NULL;
++    ULONG ac = 0, uc = 0;
++    PACL acl;
++    PSID sid;
++    int i;
++
++    TRACE( "%p %p %p %p %p %p %p\n", owner, group, access_count, access_list, audit_count, audit_list, descriptor );
++
++    if (!descriptor || RtlGetControlSecurityDescriptor( descriptor, &control, &revision )) return ERROR_INVALID_SECURITY_DESCR;
++    if (!(control & SE_SELF_RELATIVE)) return ERROR_INVALID_SECURITY_DESCR;
++    if ((access_list && !access_count) || (!access_list && access_count)) return ERROR_INVALID_PARAMETER;
++    if ((audit_list && !audit_count) || (!audit_list && audit_count)) return ERROR_INVALID_PARAMETER;
++
++    for (i = 0; i < 2 && !err; i++)
++    {
++        TRUSTEEW **want = i ? group : owner, *t;
++        TRUSTEE_TYPE type;
++        WCHAR *name;
++
++        if (!want) continue;
++        sid = NULL;
++        if (i) RtlGetGroupSecurityDescriptor( descriptor, &sid, &defaulted );
++        else RtlGetOwnerSecurityDescriptor( descriptor, &sid, &defaulted );
++        if (!sid) continue;
++        if (!(name = sid_to_account_string( sid, &type ))) { err = ERROR_NOT_ENOUGH_MEMORY; break; }
++        if (!(t = LocalAlloc( LMEM_FIXED | LMEM_ZEROINIT, sizeof(*t) + (lstrlenW( name ) + 1) * sizeof(WCHAR) )))
++            err = ERROR_NOT_ENOUGH_MEMORY;
++        else
++        {
++            t->MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
++            t->TrusteeForm = TRUSTEE_IS_NAME;
++            t->TrusteeType = type;
++            t->ptstrName = (WCHAR *)(t + 1);
++            lstrcpyW( t->ptstrName, name );
++            if (i) g = t; else o = t;
++        }
++        free( name );
++    }
++    if (!err && access_list)
++    {
++        RtlGetDaclSecurityDescriptor( descriptor, &present, &acl, &defaulted );
++        err = acl_to_named_entries( present ? acl : NULL, FALSE, &ac, &al );
++    }
++    if (!err && audit_list)
++    {
++        RtlGetSaclSecurityDescriptor( descriptor, &present, &acl, &defaulted );
++        err = acl_to_named_entries( present ? acl : NULL, TRUE, &uc, &ul );
++    }
++    if (err)
++    {
++        LocalFree( o ); LocalFree( g ); LocalFree( al ); LocalFree( ul );
++        return err;
++    }
++    if (owner) *owner = o;
++    if (group) *group = g;
++    if (access_list) { *access_list = al; *access_count = ac; }
++    if (audit_list) { *audit_list = ul; *audit_count = uc; }
++    return ERROR_SUCCESS;
+ }
+ 
+ /******************************************************************************
+- * LookupSecurityDescriptorPartsW   [ADVAPI32.@]
++ * LookupSecurityDescriptorPartsA   [ADVAPI32.@]
++ *
++ * The A form gives the names in the ANSI code page, in the same single blocks.
+  */
+-DWORD WINAPI LookupSecurityDescriptorPartsW(TRUSTEEW *owner, TRUSTEEW *group, ULONG *access_count,
+-                                            EXPLICIT_ACCESSW *access_list, ULONG *audit_count,
+-                                            EXPLICIT_ACCESSW *audit_list, SECURITY_DESCRIPTOR *descriptor)
++DWORD WINAPI LookupSecurityDescriptorPartsA( TRUSTEEA **owner, TRUSTEEA **group, ULONG *access_count,
++                                             EXPLICIT_ACCESSA **access_list, ULONG *audit_count,
++                                             EXPLICIT_ACCESSA **audit_list, SECURITY_DESCRIPTOR *descriptor )
+ {
+-    FIXME("(%p %p %p %p %p %p %p) stub\n", owner, group, access_count,
+-          access_list, audit_count, audit_list, descriptor);
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    TRUSTEEW *ow = NULL, *gw = NULL;
++    EXPLICIT_ACCESSW *aw = NULL, *uw = NULL;
++    TRUSTEEA *oa = NULL, *ga = NULL;
++    EXPLICIT_ACCESSA *aa = NULL, *ua = NULL;
++    ULONG ac = 0, uc = 0, i;
++    DWORD err;
++
++    err = LookupSecurityDescriptorPartsW( owner ? &ow : NULL, group ? &gw : NULL, access_count ? &ac : NULL,
++                                          access_list ? &aw : NULL, audit_count ? &uc : NULL,
++                                          audit_list ? &uw : NULL, descriptor );
++    if (err) return err;
++
++    /* each block: structures then the names, converted in place of the W names (a W name needs at most
++     * as many bytes as the A name needs chars times two; reserve 3 bytes per char for MBCS) */
++#define CONV_TRUSTEE( dst, src ) do { \
++        if (src) { \
++            int len = WideCharToMultiByte( CP_ACP, 0, (src)->ptstrName, -1, NULL, 0, NULL, NULL ); \
++            (dst) = LocalAlloc( LMEM_FIXED | LMEM_ZEROINIT, sizeof(*(dst)) + len ); \
++            if (!(dst)) { err = ERROR_NOT_ENOUGH_MEMORY; goto fail; } \
++            (dst)->MultipleTrusteeOperation = (src)->MultipleTrusteeOperation; \
++            (dst)->TrusteeForm = (src)->TrusteeForm; \
++            (dst)->TrusteeType = (src)->TrusteeType; \
++            (dst)->ptstrName = (char *)((dst) + 1); \
++            WideCharToMultiByte( CP_ACP, 0, (src)->ptstrName, -1, (dst)->ptstrName, len, NULL, NULL ); \
++        } } while (0)
++#define CONV_LIST( dst, src, n ) do { \
++        if (src) { \
++            ULONG total = 0, k; \
++            char *p; \
++            for (k = 0; k < (n); k++) total += WideCharToMultiByte( CP_ACP, 0, (src)[k].Trustee.ptstrName, -1, NULL, 0, NULL, NULL ); \
++            (dst) = LocalAlloc( LMEM_FIXED | LMEM_ZEROINIT, ((n) ? (n) : 1) * sizeof(*(dst)) + total ); \
++            if (!(dst)) { err = ERROR_NOT_ENOUGH_MEMORY; goto fail; } \
++            p = (char *)((dst) + ((n) ? (n) : 1)); \
++            for (k = 0; k < (n); k++) { \
++                int len = WideCharToMultiByte( CP_ACP, 0, (src)[k].Trustee.ptstrName, -1, p, total, NULL, NULL ); \
++                (dst)[k].grfAccessPermissions = (src)[k].grfAccessPermissions; \
++                (dst)[k].grfAccessMode = (src)[k].grfAccessMode; \
++                (dst)[k].grfInheritance = (src)[k].grfInheritance; \
++                (dst)[k].Trustee.MultipleTrusteeOperation = (src)[k].Trustee.MultipleTrusteeOperation; \
++                (dst)[k].Trustee.TrusteeForm = (src)[k].Trustee.TrusteeForm; \
++                (dst)[k].Trustee.TrusteeType = (src)[k].Trustee.TrusteeType; \
++                (dst)[k].Trustee.ptstrName = p; \
++                p += len; \
++            } \
++        } } while (0)
++    CONV_TRUSTEE( oa, ow );
++    CONV_TRUSTEE( ga, gw );
++    CONV_LIST( aa, aw, ac );
++    CONV_LIST( ua, uw, uc );
++#undef CONV_TRUSTEE
++#undef CONV_LIST
++    LocalFree( ow ); LocalFree( gw ); LocalFree( aw ); LocalFree( uw );
++    if (owner) *owner = oa;
++    if (group) *group = ga;
++    if (access_list) { *access_list = aa; *access_count = ac; }
++    if (audit_list) { *audit_list = ua; *audit_count = uc; }
++    return ERROR_SUCCESS;
++fail:
++    LocalFree( ow ); LocalFree( gw ); LocalFree( aw ); LocalFree( uw );
++    LocalFree( oa ); LocalFree( ga ); LocalFree( aa ); LocalFree( ua );
++    (void)i;
++    return err;
++}
++
++/* Stained Glass OS: GetSecurityInfoEx / GetNamedSecurityInfoEx for the Windows provider (the only one).
++ * The DACL and the SACL come back as ACTRL_ACCESS / ACTRL_AUDIT lists (one property entry, the object itself,
++ * with one entry per ACE, the trustees named), the owner and group as account names; every output is one
++ * LocalAlloc block. How Windows fills ProvSpecificAccess is not documented: it is 0 here (GUESS). */
++static DWORD named_entries_to_actrl( const EXPLICIT_ACCESSW *e, ULONG n, ACTRL_ACCESSW **out )
++{
++    ACTRL_ACCESSW *list;
++    ACTRL_PROPERTY_ENTRYW *prop;
++    ACTRL_ACCESS_ENTRY_LISTW *elist;
++    ACTRL_ACCESS_ENTRYW *entries;
++    WCHAR *pos;
++    ULONG i, chars = 0;
++
++    for (i = 0; i < n; i++) chars += lstrlenW( e[i].Trustee.ptstrName ) + 1;
++    if (!(list = LocalAlloc( LMEM_FIXED | LMEM_ZEROINIT, sizeof(*list) + sizeof(*prop) + sizeof(*elist) +
++                             n * sizeof(*entries) + chars * sizeof(WCHAR) )))
++        return ERROR_NOT_ENOUGH_MEMORY;
++    prop = (ACTRL_PROPERTY_ENTRYW *)(list + 1);
++    elist = (ACTRL_ACCESS_ENTRY_LISTW *)(prop + 1);
++    entries = (ACTRL_ACCESS_ENTRYW *)(elist + 1);
++    pos = (WCHAR *)(entries + n);
++    list->cEntries = 1;
++    list->pPropertyAccessList = prop;
++    prop->lpProperty = NULL;
++    prop->pAccessEntryList = elist;
++    elist->cEntries = n;
++    elist->pAccessList = entries;
++    for (i = 0; i < n; i++)
++    {
++        entries[i].Trustee = e[i].Trustee;
++        entries[i].Trustee.ptstrName = pos;
++        lstrcpyW( pos, e[i].Trustee.ptstrName );
++        pos += lstrlenW( pos ) + 1;
++        switch (e[i].grfAccessMode)
++        {
++        case GRANT_ACCESS: entries[i].fAccessFlags = ACTRL_ACCESS_ALLOWED; break;
++        case DENY_ACCESS: entries[i].fAccessFlags = ACTRL_ACCESS_DENIED; break;
++        case SET_AUDIT_SUCCESS: entries[i].fAccessFlags = ACTRL_AUDIT_SUCCESS; break;
++        case SET_AUDIT_FAILURE: entries[i].fAccessFlags = ACTRL_AUDIT_FAILURE; break;
++        default: break;
++        }
++        entries[i].Access = e[i].grfAccessPermissions;
++        entries[i].Inheritance = e[i].grfInheritance;
++    }
++    *out = list;
++    return ERROR_SUCCESS;
++}
++
++static DWORD fill_security_info_ex( PSECURITY_DESCRIPTOR sd, SECURITY_INFORMATION info, ACTRL_ACCESSW **access,
++                                    ACTRL_ACCESSW **audit, WCHAR **owner, WCHAR **group )
++{
++    BOOLEAN present, defaulted;
++    EXPLICIT_ACCESSW *list;
++    PACL acl;
++    PSID sid;
++    ULONG n;
++    DWORD err = ERROR_SUCCESS;
++    int i;
++
++    if (access && (info & DACL_SECURITY_INFORMATION))
++    {
++        RtlGetDaclSecurityDescriptor( sd, &present, &acl, &defaulted );
++        if (present && acl)
++        {
++            if (!(err = acl_to_named_entries( acl, FALSE, &n, &list )))
++            {
++                err = named_entries_to_actrl( list, n, access );
++                LocalFree( list );
++            }
++        }
++    }
++    if (!err && audit && (info & SACL_SECURITY_INFORMATION))
++    {
++        RtlGetSaclSecurityDescriptor( sd, &present, &acl, &defaulted );
++        if (present && acl)
++        {
++            if (!(err = acl_to_named_entries( acl, TRUE, &n, &list )))
++            {
++                err = named_entries_to_actrl( list, n, audit );
++                LocalFree( list );
++            }
++        }
++    }
++    for (i = 0; i < 2 && !err; i++)
++    {
++        WCHAR **dst = i ? group : owner, *name, *copy;
++        TRUSTEE_TYPE type;
++
++        if (!dst || !(info & (i ? GROUP_SECURITY_INFORMATION : OWNER_SECURITY_INFORMATION))) continue;
++        if (i) RtlGetGroupSecurityDescriptor( sd, &sid, &defaulted );
++        else RtlGetOwnerSecurityDescriptor( sd, &sid, &defaulted );
++        if (!sid) continue;
++        if (!(name = sid_to_account_string( sid, &type ))) { err = ERROR_NOT_ENOUGH_MEMORY; break; }
++        if ((copy = LocalAlloc( LMEM_FIXED, (lstrlenW( name ) + 1) * sizeof(WCHAR) ))) { lstrcpyW( copy, name ); *dst = copy; }
++        else err = ERROR_NOT_ENOUGH_MEMORY;
++        free( name );
++    }
++    if (err)
++    {
++        if (access) { LocalFree( *access ); *access = NULL; }
++        if (audit) { LocalFree( *audit ); *audit = NULL; }
++        if (owner) { LocalFree( *owner ); *owner = NULL; }
++        if (group) { LocalFree( *group ); *group = NULL; }
++    }
++    return err;
++}
++
++static BOOL is_windows_provider( const WCHAR *provider )
++{
++    return !provider || !wcsicmp( provider, L"Windows Provider" );
++}
++
++DWORD WINAPI GetSecurityInfoExW( HANDLE handle, SE_OBJECT_TYPE type, SECURITY_INFORMATION info, LPCWSTR provider,
++                                 LPCWSTR property, PACTRL_ACCESSW *access, PACTRL_AUDITW *audit, LPWSTR *owner, LPWSTR *group )
++{
++    PSECURITY_DESCRIPTOR sd;
++    DWORD err;
++
++    TRACE( "%p %d %#lx %s %s %p %p %p %p\n", handle, type, info, debugstr_w(provider), debugstr_w(property),
++           access, audit, owner, group );
++
++    if (!is_windows_provider( provider )) return ERROR_BAD_PROVIDER;
++    if (property) return ERROR_INVALID_PARAMETER;  /* GUESS: the Windows provider has no properties */
++    if (access) *access = NULL;
++    if (audit) *audit = NULL;
++    if (owner) *owner = NULL;
++    if (group) *group = NULL;
++    if ((err = GetSecurityInfo( handle, type, info, NULL, NULL, NULL, NULL, &sd ))) return err;
++    err = fill_security_info_ex( sd, info, access, audit, owner, group );
++    LocalFree( sd );
++    return err;
++}
++
++DWORD WINAPI GetNamedSecurityInfoExW( LPCWSTR object, SE_OBJECT_TYPE type, SECURITY_INFORMATION info, LPCWSTR provider,
++                                      LPCWSTR property, PACTRL_ACCESSW *access, PACTRL_AUDITW *audit, LPWSTR *owner, LPWSTR *group )
++{
++    PSECURITY_DESCRIPTOR sd;
++    DWORD err;
++
++    TRACE( "%s %d %#lx %s %s %p %p %p %p\n", debugstr_w(object), type, info, debugstr_w(provider),
++           debugstr_w(property), access, audit, owner, group );
++
++    if (!is_windows_provider( provider )) return ERROR_BAD_PROVIDER;
++    if (!object || property) return ERROR_INVALID_PARAMETER;
++    if (access) *access = NULL;
++    if (audit) *audit = NULL;
++    if (owner) *owner = NULL;
++    if (group) *group = NULL;
++    if ((err = GetNamedSecurityInfoW( object, type, info, NULL, NULL, NULL, NULL, &sd ))) return err;
++    err = fill_security_info_ex( sd, info, access, audit, owner, group );
++    LocalFree( sd );
++    return err;
++}
++
++/* the A forms: the same blocks with the trustee names and the owner and group in the ANSI page */
++static DWORD actrl_W_to_A( ACTRL_ACCESSW *w, ACTRL_ACCESSA **out )
++{
++    ACTRL_ACCESSA *a;
++    ACTRL_PROPERTY_ENTRYA *prop;
++    ACTRL_ACCESS_ENTRY_LISTA *elist;
++    ACTRL_ACCESS_ENTRYA *entries;
++    ULONG i, n, bytes = 0;
++    char *pos;
++
++    n = w->pPropertyAccessList->pAccessEntryList->cEntries;
++    for (i = 0; i < n; i++)
++        bytes += WideCharToMultiByte( CP_ACP, 0, w->pPropertyAccessList->pAccessEntryList->pAccessList[i].Trustee.ptstrName,
++                                      -1, NULL, 0, NULL, NULL );
++    if (!(a = LocalAlloc( LMEM_FIXED | LMEM_ZEROINIT, sizeof(*a) + sizeof(*prop) + sizeof(*elist) + n * sizeof(*entries) + bytes )))
++        return ERROR_NOT_ENOUGH_MEMORY;
++    prop = (ACTRL_PROPERTY_ENTRYA *)(a + 1);
++    elist = (ACTRL_ACCESS_ENTRY_LISTA *)(prop + 1);
++    entries = (ACTRL_ACCESS_ENTRYA *)(elist + 1);
++    pos = (char *)(entries + n);
++    a->cEntries = 1;
++    a->pPropertyAccessList = prop;
++    prop->pAccessEntryList = elist;
++    elist->cEntries = n;
++    elist->pAccessList = entries;
++    for (i = 0; i < n; i++)
++    {
++        ACTRL_ACCESS_ENTRYW *src = &w->pPropertyAccessList->pAccessEntryList->pAccessList[i];
++        int len = WideCharToMultiByte( CP_ACP, 0, src->Trustee.ptstrName, -1, pos, bytes, NULL, NULL );
++
++        entries[i].Trustee.MultipleTrusteeOperation = src->Trustee.MultipleTrusteeOperation;
++        entries[i].Trustee.TrusteeForm = src->Trustee.TrusteeForm;
++        entries[i].Trustee.TrusteeType = src->Trustee.TrusteeType;
++        entries[i].Trustee.ptstrName = pos;
++        pos += len;
++        entries[i].fAccessFlags = src->fAccessFlags;
++        entries[i].Access = src->Access;
++        entries[i].ProvSpecificAccess = src->ProvSpecificAccess;
++        entries[i].Inheritance = src->Inheritance;
++    }
++    *out = a;
++    return ERROR_SUCCESS;
++}
++
++static DWORD ex_W_to_A( ACTRL_ACCESSW *accessW, ACTRL_ACCESSW *auditW, WCHAR *ownerW, WCHAR *groupW,
++                        ACTRL_ACCESSA **access, ACTRL_ACCESSA **audit, char **owner, char **group )
++{
++    DWORD err = ERROR_SUCCESS;
++    int i;
++
++    if (access && accessW) err = actrl_W_to_A( accessW, access );
++    if (!err && audit && auditW) err = actrl_W_to_A( auditW, audit );
++    for (i = 0; i < 2 && !err; i++)
++    {
++        WCHAR *src = i ? groupW : ownerW;
++        char **dst = i ? group : owner;
++        int len;
++
++        if (!dst || !src) continue;
++        len = WideCharToMultiByte( CP_ACP, 0, src, -1, NULL, 0, NULL, NULL );
++        if (!(*dst = LocalAlloc( LMEM_FIXED, len ))) { err = ERROR_NOT_ENOUGH_MEMORY; break; }
++        WideCharToMultiByte( CP_ACP, 0, src, -1, *dst, len, NULL, NULL );
++    }
++    if (err)
++    {
++        if (access) { LocalFree( *access ); *access = NULL; }
++        if (audit) { LocalFree( *audit ); *audit = NULL; }
++        if (owner) { LocalFree( *owner ); *owner = NULL; }
++        if (group) { LocalFree( *group ); *group = NULL; }
++    }
++    return err;
++}
++
++DWORD WINAPI GetSecurityInfoExA( HANDLE handle, SE_OBJECT_TYPE type, SECURITY_INFORMATION info, LPCSTR provider,
++                                 LPCSTR property, PACTRL_ACCESSA *access, PACTRL_AUDITA *audit, LPSTR *owner, LPSTR *group )
++{
++    WCHAR *providerW = provider ? strdupAW( provider ) : NULL, *propertyW = property ? strdupAW( property ) : NULL;
++    ACTRL_ACCESSW *accessW = NULL, *auditW = NULL;
++    WCHAR *ownerW = NULL, *groupW = NULL;
++    DWORD err;
++
++    err = GetSecurityInfoExW( handle, type, info, providerW, propertyW, access ? &accessW : NULL, audit ? &auditW : NULL,
++                              owner ? &ownerW : NULL, group ? &groupW : NULL );
++    if (!err) err = ex_W_to_A( accessW, auditW, ownerW, groupW, access, audit, owner, group );
++    LocalFree( accessW ); LocalFree( auditW ); LocalFree( ownerW ); LocalFree( groupW );
++    free( providerW ); free( propertyW );
++    return err;
++}
++
++DWORD WINAPI GetNamedSecurityInfoExA( LPCSTR object, SE_OBJECT_TYPE type, SECURITY_INFORMATION info, LPCSTR provider,
++                                      LPCSTR property, PACTRL_ACCESSA *access, PACTRL_AUDITA *audit, LPSTR *owner, LPSTR *group )
++{
++    WCHAR *objectW = object ? strdupAW( object ) : NULL, *providerW = provider ? strdupAW( provider ) : NULL;
++    WCHAR *propertyW = property ? strdupAW( property ) : NULL;
++    ACTRL_ACCESSW *accessW = NULL, *auditW = NULL;
++    WCHAR *ownerW = NULL, *groupW = NULL;
++    DWORD err;
++
++    err = GetNamedSecurityInfoExW( objectW, type, info, providerW, propertyW, access ? &accessW : NULL,
++                                   audit ? &auditW : NULL, owner ? &ownerW : NULL, group ? &groupW : NULL );
++    if (!err) err = ex_W_to_A( accessW, auditW, ownerW, groupW, access, audit, owner, group );
++    LocalFree( accessW ); LocalFree( auditW ); LocalFree( ownerW ); LocalFree( groupW );
++    free( objectW ); free( providerW ); free( propertyW );
++    return err;
+ }
+diff --git a/dlls/advapi32/wmi.c b/dlls/advapi32/wmi.c
+--- a/dlls/advapi32/wmi.c
++++ b/dlls/advapi32/wmi.c
+@@ -108,8 +108,12 @@ ULONG WMIAPI WmiNotificationRegistrationW(GUID *guid, BOOLEAN enable, void *info
+  */
+ ULONG WINAPI WmiOpenBlock(GUID *guid, ULONG access, WMIHANDLE *handle)
+ {
+-    FIXME("%s %lu %p: stub\n", debugstr_guid(guid), access, handle);
+-    return ERROR_SUCCESS;
++    TRACE("%s %lu %p\n", debugstr_guid(guid), access, handle);
++
++    /* no WMI data provider is registered, so no GUID can be opened */
++    if (!guid || !handle) return ERROR_INVALID_PARAMETER;
++    *handle = NULL;
++    return ERROR_WMI_GUID_NOT_FOUND;
+ }
+ 
+ /******************************************************************************

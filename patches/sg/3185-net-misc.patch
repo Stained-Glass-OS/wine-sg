@@ -1,0 +1,481 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Tue, 13 Oct 2026 11:03:23 -0700
+Subject: [PATCH] iphlpapi, netapi32: CreateSortedAddressPairs,
+ NetUserModalsGet levels 0/1/3, NetUseAdd/NetUseDel
+
+CreateSortedAddressPairs now accepts native IPv6 destinations and a source list, picks a source address per destination (route-aware for IPv4, scope and longest prefix otherwise) and sorts the pairs by RFC 6724 rules. NetUserModalsGet answers the stand-alone defaults for levels 0, 1 and 3. NetUseAdd maps to WNetAddConnection2 and NetUseDel to WNetCancelConnection2 instead of reporting success.
+
+diff --git a/dlls/iphlpapi/iphlpapi_main.c b/dlls/iphlpapi/iphlpapi_main.c
+index 32e9d74..6311386 100644
+--- a/dlls/iphlpapi/iphlpapi_main.c
++++ b/dlls/iphlpapi/iphlpapi_main.c
+@@ -242,35 +242,6 @@ DWORD WINAPI CreateProxyArpEntry(DWORD dwAddress, DWORD dwMask, DWORD dwIfIndex)
+   return net_create_proxy_arp(dwAddress, dwMask, dwIfIndex);
+ }
+ 
+-static char *debugstr_ipv6(const struct sockaddr_in6 *sin, char *buf)
+-{
+-    const IN6_ADDR *addr = &sin->sin6_addr;
+-    char *p = buf;
+-    int i;
+-    BOOL in_zero = FALSE;
+-
+-    for (i = 0; i < 7; i++)
+-    {
+-        if (!addr->u.Word[i])
+-        {
+-            if (i == 0)
+-                *p++ = ':';
+-            if (!in_zero)
+-            {
+-                *p++ = ':';
+-                in_zero = TRUE;
+-            }
+-        }
+-        else
+-        {
+-            p += sprintf(p, "%x:", ntohs(addr->u.Word[i]));
+-            in_zero = FALSE;
+-        }
+-    }
+-    sprintf(p, "%x", ntohs(addr->u.Word[7]));
+-    return buf;
+-}
+-
+ static BOOL map_address_6to4( const SOCKADDR_IN6 *addr6, SOCKADDR_IN *addr4 )
+ {
+     ULONG i;
+@@ -319,63 +290,222 @@ static BOOL find_src_address( MIB_IPADDRTABLE *table, const SOCKADDR_IN *dst, SO
+ /******************************************************************
+  *    CreateSortedAddressPairs (IPHLPAPI.@)
+  */
++/* RFC 6724 address scopes, precedence and source selection are used to pick a source address for each
++   destination and to sort the pairs. IPv4 addresses are handled as v4-mapped IPv6 addresses. */
++static BOOL is_v4mapped( const IN6_ADDR *a )
++{
++    return !a->u.Word[0] && !a->u.Word[1] && !a->u.Word[2] && !a->u.Word[3] && !a->u.Word[4] && a->u.Word[5] == 0xffff;
++}
++
++static int addr_scope( const IN6_ADDR *a )
++{
++    if (a->u.Byte[0] == 0xff) return a->u.Byte[1] & 0xf;
++    if (is_v4mapped( a ))
++    {
++        if (a->u.Byte[12] == 127 || (a->u.Byte[12] == 169 && a->u.Byte[13] == 254)) return 2;
++        return 0xe;
++    }
++    if (IN6_IS_ADDR_LOOPBACK( a )) return 2;
++    if (a->u.Byte[0] == 0xfe && (a->u.Byte[1] & 0xc0) == 0x80) return 2;
++    if (a->u.Byte[0] == 0xfe && (a->u.Byte[1] & 0xc0) == 0xc0) return 5;
++    return 0xe;
++}
++
++static int addr_precedence( const IN6_ADDR *a )
++{
++    if (IN6_IS_ADDR_LOOPBACK( a )) return 50;
++    if (is_v4mapped( a )) return 35;
++    if (a->u.Word[0] == 0x0220) return 30;                               /* 2002::/16 */
++    if (a->u.Word[0] == 0x0120 && !a->u.Word[1]) return 5;               /* 2001::/32 */
++    if ((a->u.Byte[0] & 0xfe) == 0xfc) return 3;                         /* fc00::/7 */
++    if (a->u.Byte[0] == 0xfe && (a->u.Byte[1] & 0xc0) == 0xc0) return 1; /* fec0::/10 */
++    if (a->u.Byte[0] == 0x3f && a->u.Byte[1] == 0xfe) return 1;          /* 3ffe::/16 */
++    if (!a->u.Word[0] && !a->u.Word[1] && !a->u.Word[2] && !a->u.Word[3] && !a->u.Word[4] && !a->u.Word[5]) return 1;
++    return 40;
++}
++
++static int common_prefix_len( const IN6_ADDR *a, const IN6_ADDR *b )
++{
++    int i, bit;
++
++    for (i = 0; i < 16; i++)
++    {
++        BYTE x = a->u.Byte[i] ^ b->u.Byte[i];
++        if (!x) continue;
++        for (bit = 0; bit < 8; bit++) if (x & (0x80 >> bit)) return i * 8 + bit;
++    }
++    return 128;
++}
++
++struct sort_pair
++{
++    SOCKADDR_IN6 dst, src;
++    BOOL has_src;
++    DWORD index;
++};
++
++static int sort_pair_cmp( const void *pa, const void *pb )
++{
++    const struct sort_pair *a = pa, *b = pb;
++    int sa, sb, da, db, v;
++
++    if (a->has_src != b->has_src) return a->has_src ? -1 : 1;                              /* rule 1 */
++    if (a->has_src)
++    {
++        sa = addr_scope( &a->src.sin6_addr ) == addr_scope( &a->dst.sin6_addr );
++        sb = addr_scope( &b->src.sin6_addr ) == addr_scope( &b->dst.sin6_addr );
++        if (sa != sb) return sa ? -1 : 1;                                                  /* rule 2 */
++    }
++    da = addr_precedence( &a->dst.sin6_addr );
++    db = addr_precedence( &b->dst.sin6_addr );
++    if (da != db) return da > db ? -1 : 1;                                                 /* rule 6 */
++    da = addr_scope( &a->dst.sin6_addr );
++    db = addr_scope( &b->dst.sin6_addr );
++    if (da != db) return da < db ? -1 : 1;                                                 /* rule 8 */
++    if (a->has_src)
++    {
++        v = common_prefix_len( &a->src.sin6_addr, &a->dst.sin6_addr ) -
++            common_prefix_len( &b->src.sin6_addr, &b->dst.sin6_addr );
++        if (v) return v > 0 ? -1 : 1;                                                      /* rule 9 */
++    }
++    return a->index < b->index ? -1 : a->index > b->index;                                 /* keep the order */
++}
++
++static void map_address_4to6( DWORD addr, SOCKADDR_IN6 *out )
++{
++    memset( out, 0, sizeof(*out) );
++    out->sin6_family = AF_INET6;
++    out->sin6_addr.u.Word[5] = 0xffff;
++    out->sin6_addr.u.Word[6] = addr & 0xffff;
++    out->sin6_addr.u.Word[7] = addr >> 16;
++}
++
+ DWORD WINAPI CreateSortedAddressPairs( const PSOCKADDR_IN6 src_list, DWORD src_count,
+                                        const PSOCKADDR_IN6 dst_list, DWORD dst_count,
+                                        DWORD options, PSOCKADDR_IN6_PAIR *pair_list,
+                                        DWORD *pair_count )
+ {
+-    DWORD i, size, ret;
++    DWORD i, j, size, ret, cand_count = 0;
++    SOCKADDR_IN6 *cands = NULL, *ptr;
+     SOCKADDR_IN6_PAIR *pairs;
+-    SOCKADDR_IN6 *ptr;
+-    SOCKADDR_IN addr4;
+-    MIB_IPADDRTABLE *table;
++    struct sort_pair *sp;
++    MIB_UNICASTIPADDRESS_TABLE *utable = NULL;
++    MIB_IPADDRTABLE *v4table = NULL;
+ 
+-    FIXME( "(src_list %p src_count %lu dst_list %p dst_count %lu options %lx pair_list %p pair_count %p): stub\n",
++    TRACE( "(src_list %p src_count %lu dst_list %p dst_count %lu options %lx pair_list %p pair_count %p)\n",
+            src_list, src_count, dst_list, dst_count, options, pair_list, pair_count );
+ 
+-    if (src_list || src_count || !dst_list || !pair_list || !pair_count || dst_count > 500)
++    if ((src_list == NULL) != (src_count == 0) || !dst_list || !dst_count || !pair_list || !pair_count ||
++        dst_count > 500)
+         return ERROR_INVALID_PARAMETER;
+-
+     for (i = 0; i < dst_count; i++)
++        if (dst_list[i].sin6_family != AF_INET6) return ERROR_INVALID_PARAMETER;
++
++    if (src_list)
++    {
++        for (i = 0; i < src_count; i++)
++            if (src_list[i].sin6_family != AF_INET6) return ERROR_INVALID_PARAMETER;
++        cands = src_list;
++        cand_count = src_count;
++    }
++    else if (!GetUnicastIpAddressTable( AF_UNSPEC, &utable ))
+     {
+-        if (!map_address_6to4( &dst_list[i], &addr4 ))
++        if ((cands = HeapAlloc( GetProcessHeap(), 0, max( utable->NumEntries, 1 ) * sizeof(*cands) )))
+         {
+-            FIXME("only mapped IPv4 addresses are supported\n");
+-            return ERROR_NOT_SUPPORTED;
++            for (i = 0; i < utable->NumEntries; i++)
++            {
++                const MIB_UNICASTIPADDRESS_ROW *row = &utable->Table[i];
++                if (row->DadState != IpDadStatePreferred) continue;
++                if (row->Address.si_family == AF_INET)
++                    map_address_4to6( row->Address.Ipv4.sin_addr.S_un.S_addr, &cands[cand_count++] );
++                else if (row->Address.si_family == AF_INET6)
++                {
++                    cands[cand_count] = row->Address.Ipv6;
++                    cands[cand_count++].sin6_port = 0;
++                }
++            }
+         }
+     }
+ 
+-    size = dst_count * sizeof(*pairs);
+-    size += dst_count * sizeof(SOCKADDR_IN6) * 2; /* source address + destination address */
+-    if (!(pairs = HeapAlloc( GetProcessHeap(), 0, size ))) return ERROR_NOT_ENOUGH_MEMORY;
+-    ptr = (SOCKADDR_IN6 *)&pairs[dst_count];
++    if (!src_list && AllocateAndGetIpAddrTableFromStack( &v4table, FALSE, GetProcessHeap(), 0 )) v4table = NULL;
+ 
+-    if ((ret = AllocateAndGetIpAddrTableFromStack( &table, FALSE, GetProcessHeap(), 0 )))
++    if (!(sp = HeapAlloc( GetProcessHeap(), 0, dst_count * sizeof(*sp) )))
+     {
+-        HeapFree( GetProcessHeap(), 0, pairs );
+-        return ret;
++        HeapFree( GetProcessHeap(), 0, v4table );
++        if (cands != src_list) HeapFree( GetProcessHeap(), 0, cands );
++        FreeMibTable( utable );
++        return ERROR_NOT_ENOUGH_MEMORY;
+     }
+ 
+     for (i = 0; i < dst_count; i++)
+     {
+-        pairs[i].SourceAddress = ptr++;
+-        if (!map_address_6to4( &dst_list[i], &addr4 ) ||
+-            !find_src_address( table, &addr4, pairs[i].SourceAddress ))
++        int best = -1, best_score = -1;
++
++        sp[i].dst = dst_list[i];
++        sp[i].index = i;
++        memset( &sp[i].src, 0, sizeof(sp[i].src) );
++        sp[i].src.sin6_family = AF_INET6;
++        sp[i].has_src = FALSE;
++
++        if (v4table)
++        {
++            SOCKADDR_IN addr4;
++            /* IPv4: the source is the address of the interface the best route leaves through */
++            if (map_address_6to4( &dst_list[i], &addr4 ) && find_src_address( v4table, &addr4, &sp[i].src ))
++            {
++                sp[i].has_src = TRUE;
++                continue;
++            }
++        }
++
++        for (j = 0; j < cand_count; j++)
+         {
+-            char buf[46];
+-            FIXME( "source address for %s not found\n", debugstr_ipv6(&dst_list[i], buf) );
+-            memset( pairs[i].SourceAddress, 0, sizeof(*pairs[i].SourceAddress) );
+-            pairs[i].SourceAddress->sin6_family = AF_INET6;
++            int score;
++            /* a v4-mapped destination needs an IPv4 source and the other way round */
++            if (is_v4mapped( &cands[j].sin6_addr ) != is_v4mapped( &dst_list[i].sin6_addr )) continue;
++            if (IN6_IS_ADDR_UNSPECIFIED( &cands[j].sin6_addr )) continue;
++            if (!memcmp( &cands[j].sin6_addr, &dst_list[i].sin6_addr, sizeof(IN6_ADDR) )) { best = j; best_score = 1000; break; }
++            score = (addr_scope( &cands[j].sin6_addr ) == addr_scope( &dst_list[i].sin6_addr ) ? 256 : 0) +
++                    common_prefix_len( &cands[j].sin6_addr, &dst_list[i].sin6_addr );
++            if (score > best_score) { best = j; best_score = score; }
+         }
++        if (best >= 0)
++        {
++            sp[i].src = cands[best];
++            sp[i].src.sin6_port = 0;
++            sp[i].has_src = TRUE;
++        }
++    }
++
++#ifndef SG_MUTANT_B3_SORT
++    qsort( sp, dst_count, sizeof(*sp), sort_pair_cmp );
++#endif
+ 
+-        pairs[i].DestinationAddress = ptr++;
+-        memcpy( pairs[i].DestinationAddress, &dst_list[i], sizeof(*pairs[i].DestinationAddress) );
++    size = dst_count * (sizeof(*pairs) + 2 * sizeof(SOCKADDR_IN6));
++    if (!(pairs = HeapAlloc( GetProcessHeap(), 0, size )))
++    {
++        ret = ERROR_NOT_ENOUGH_MEMORY;
++    }
++    else
++    {
++        ptr = (SOCKADDR_IN6 *)&pairs[dst_count];
++        for (i = 0; i < dst_count; i++)
++        {
++            pairs[i].SourceAddress = ptr++;
++            *pairs[i].SourceAddress = sp[i].src;
++            pairs[i].DestinationAddress = ptr++;
++            *pairs[i].DestinationAddress = sp[i].dst;
++        }
++        *pair_list = pairs;
++        *pair_count = dst_count;
++        ret = NO_ERROR;
+     }
+-    *pair_list = pairs;
+-    *pair_count = dst_count;
+ 
+-    HeapFree( GetProcessHeap(), 0, table );
+-    return NO_ERROR;
++    HeapFree( GetProcessHeap(), 0, sp );
++    HeapFree( GetProcessHeap(), 0, v4table );
++    if (cands != src_list) HeapFree( GetProcessHeap(), 0, cands );
++    FreeMibTable( utable );
++    return ret;
+ }
+ 
+ 
+diff --git a/dlls/netapi32/netapi32.c b/dlls/netapi32/netapi32.c
+index 091c194..2a0d5a0 100644
+--- a/dlls/netapi32/netapi32.c
++++ b/dlls/netapi32/netapi32.c
+@@ -2400,6 +2400,11 @@ NET_API_STATUS WINAPI NetGroupGetInfo(LPCWSTR servername, LPCWSTR groupname, DWO
+  *     ERROR_ACCESS_DENIED - the user does not have access to the info.
+  *     NERR_InvalidComputer - computer name is invalid.
+  */
++#ifndef TIMEQ_FOREVER
++#define TIMEQ_FOREVER ((DWORD)-1)
++#endif
++#define UAS_ROLE_STANDALONE 0   /* lmaccess.h: STANDALONE 0, MEMBER 1, BACKUP 2, PRIMARY 3 */
++
+ NET_API_STATUS WINAPI NetUserModalsGet(
+     LPCWSTR szServer, DWORD level, LPBYTE *pbuffer)
+ {
+@@ -2408,15 +2413,42 @@ NET_API_STATUS WINAPI NetUserModalsGet(
+     switch (level)
+     {
+         case 0:
+-            /* return global passwords parameters */
+-            FIXME("level 0 not implemented!\n");
+-            *pbuffer = NULL;
++        {
++            /* global password parameters: the defaults of a stand-alone computer (NET ACCOUNTS):
++               no minimum length or age, 42 days maximum age, no history, never force logoff */
++            USER_MODALS_INFO_0 *umi;
++            NET_API_STATUS status;
++
++            if (!pbuffer) return ERROR_INVALID_PARAMETER;
++#ifdef SG_MUTANT_B3_MODALS
+             return NERR_InternalError;
++#endif
++            status = NetApiBufferAllocate(sizeof(*umi), (LPVOID *)pbuffer);
++            if (status != NERR_Success) return status;
++            umi = (USER_MODALS_INFO_0 *)*pbuffer;
++            umi->usrmod0_min_passwd_len = 0;
++            umi->usrmod0_max_passwd_age = 42 * 24 * 60 * 60;
++            umi->usrmod0_min_passwd_age = 0;
++            umi->usrmod0_force_logoff = TIMEQ_FOREVER;
++            umi->usrmod0_password_hist_len = 0;
++            break;
++        }
+         case 1:
+-            /* return logon server and domain controller info */
+-            FIXME("level 1 not implemented!\n");
+-            *pbuffer = NULL;
+-            return NERR_InternalError;
++        {
++            /* logon server role: this machine is not part of a domain, so it is a stand-alone server
++               and has no primary domain controller */
++            USER_MODALS_INFO_1 *umi;
++            NET_API_STATUS status;
++
++            if (!pbuffer) return ERROR_INVALID_PARAMETER;
++            status = NetApiBufferAllocate(sizeof(*umi) + sizeof(WCHAR), (LPVOID *)pbuffer);
++            if (status != NERR_Success) return status;
++            umi = (USER_MODALS_INFO_1 *)*pbuffer;
++            umi->usrmod1_role = UAS_ROLE_STANDALONE;
++            umi->usrmod1_primary = (LPWSTR)(umi + 1);
++            umi->usrmod1_primary[0] = 0;
++            break;
++        }
+         case 2:
+         {
+             /* return domain name and identifier */
+@@ -2484,10 +2516,21 @@ NET_API_STATUS WINAPI NetUserModalsGet(
+             break;
+         }
+         case 3:
+-            /* return lockout information */
+-            FIXME("level 3 not implemented!\n");
+-            *pbuffer = NULL;
+-            return NERR_InternalError;
++        {
++            /* lockout policy: the default of a stand-alone computer is no lockout (threshold 0) with
++               30 minute duration and observation window */
++            USER_MODALS_INFO_3 *umi;
++            NET_API_STATUS status;
++
++            if (!pbuffer) return ERROR_INVALID_PARAMETER;
++            status = NetApiBufferAllocate(sizeof(*umi), (LPVOID *)pbuffer);
++            if (status != NERR_Success) return status;
++            umi = (USER_MODALS_INFO_3 *)*pbuffer;
++            umi->usrmod3_lockout_duration = 30 * 60;
++            umi->usrmod3_lockout_observation_window = 30 * 60;
++            umi->usrmod3_lockout_threshold = 0;
++            break;
++        }
+         default:
+             TRACE("Invalid level %ld is specified\n", level);
+             *pbuffer = NULL;
+@@ -2542,14 +2585,84 @@ NET_API_STATUS WINAPI NetUserChangePassword(LPCWSTR domainname, LPCWSTR username
+ 
+ NET_API_STATUS WINAPI NetUseAdd(LMSTR servername, DWORD level, LPBYTE bufptr, LPDWORD parm_err)
+ {
+-    FIXME("%s %ld %p %p stub\n", debugstr_w(servername), level, bufptr, parm_err);
+-    return NERR_Success;
++    NETRESOURCEW nr;
++    const WCHAR *local, *remote, *password, *user = NULL, *domain = NULL;
++    WCHAR *account = NULL;
++    DWORD type, ret;
++
++    TRACE("%s %ld %p %p\n", debugstr_w(servername), level, bufptr, parm_err);
++
++    if (servername && servername[0] && !NETAPI_IsLocalComputer(servername)) return ERROR_NOT_SUPPORTED;
++    if (!bufptr) return ERROR_INVALID_PARAMETER;
++    if (parm_err) *parm_err = 0;
++
++    switch (level)
++    {
++    case 1:
++    {
++        USE_INFO_1 *ui = (USE_INFO_1 *)bufptr;
++        local = ui->ui1_local; remote = ui->ui1_remote; password = ui->ui1_password; type = ui->ui1_asg_type;
++        break;
++    }
++    case 2:
++    {
++        USE_INFO_2 *ui = (USE_INFO_2 *)bufptr;
++        local = ui->ui2_local; remote = ui->ui2_remote; password = ui->ui2_password; type = ui->ui2_asg_type;
++        user = ui->ui2_username; domain = ui->ui2_domainname;
++        break;
++    }
++    default:
++        return ERROR_INVALID_LEVEL;
++    }
++
++    if (!remote || !remote[0])
++    {
++        if (parm_err) *parm_err = USE_REMOTE_PARMNUM;
++        return ERROR_INVALID_PARAMETER;
++    }
++
++    memset(&nr, 0, sizeof(nr));
++    switch (type)
++    {
++    case USE_DISKDEV: nr.dwType = RESOURCETYPE_DISK; break;
++    case USE_SPOOLDEV: nr.dwType = RESOURCETYPE_PRINT; break;
++    case USE_CHARDEV:
++    case USE_WILDCARD: nr.dwType = RESOURCETYPE_ANY; break;
++    default:
++        if (parm_err) *parm_err = USE_ASGTYPE_PARMNUM;
++        return ERROR_INVALID_PARAMETER;
++    }
++    nr.lpLocalName = (local && local[0]) ? (WCHAR *)local : NULL;
++    nr.lpRemoteName = (WCHAR *)remote;
++
++    if (user && user[0] && domain && domain[0])
++    {
++        if (!(account = malloc((wcslen(domain) + wcslen(user) + 2) * sizeof(WCHAR)))) return ERROR_NOT_ENOUGH_MEMORY;
++        swprintf(account, wcslen(domain) + wcslen(user) + 2, L"%s\\%s", domain, user);
++        user = account;
++    }
++
++    ret = WNetAddConnection2W(&nr, password, (user && user[0]) ? user : NULL, 0);
++    free(account);
++    return ret;
+ }
+ 
+ NET_API_STATUS WINAPI NetUseDel(LMSTR servername, LMSTR usename, DWORD forcecond)
+ {
+-    FIXME("%s %s %ld stub\n", debugstr_w(servername), debugstr_w(usename), forcecond);
++    DWORD ret;
++
++    TRACE("%s %s %ld\n", debugstr_w(servername), debugstr_w(usename), forcecond);
++
++    if (servername && servername[0] && !NETAPI_IsLocalComputer(servername)) return ERROR_NOT_SUPPORTED;
++    if (!usename || !usename[0]) return ERROR_INVALID_PARAMETER;
++    if (forcecond > USE_LOTS_OF_FORCE) return ERROR_INVALID_PARAMETER;
++
++#ifdef SG_MUTANT_B3_USEDEL
+     return NERR_Success;
++#endif
++    ret = WNetCancelConnection2W(usename, 0, forcecond != USE_NOFORCE);
++    if (ret == ERROR_NOT_CONNECTED) return NERR_UseNotFound;
++    return ret;
+ }
+ 
+ /************************************************************

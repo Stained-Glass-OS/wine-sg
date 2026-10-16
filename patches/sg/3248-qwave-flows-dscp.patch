@@ -1,0 +1,413 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 13:49:28 -0700
+Subject: [PATCH] qwave: QOS handles, flows and DSCP marking (3248)
+
+QOSCreateHandle returns a real handle (an event that can be waited on or put
+on a completion port) and QOSCloseHandle releases it and its flows, with the
+results the conformance tests record (todo_wine removed). QOSAddSocketToFlow
+creates or extends a flow (several sockets only for non-adaptive flows) and
+reports the documented errors; non-adaptive flows mark their sockets with the
+DSCP value of the traffic type (QOS_TRAFFIC_TYPE documentation). New:
+QOSRemoveSocketFromFlow and QOSSetFlow (traffic type, explicit DSCP value;
+outgoing-rate shaping needs the qWAVE service and answers
+ERROR_NOT_SUPPORTED). The Socket parameters in the spec are pointer-sized.
+
+diff --git a/dlls/qwave/Makefile.in b/dlls/qwave/Makefile.in
+index 6ae6d18..18bcafb 100644
+--- a/dlls/qwave/Makefile.in
++++ b/dlls/qwave/Makefile.in
+@@ -1,5 +1,6 @@
+ MODULE    = qwave.dll
+ IMPORTLIB = qwave
++IMPORTS   = ws2_32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+diff --git a/dlls/qwave/main.c b/dlls/qwave/main.c
+index e29b19b..8533cfa 100644
+--- a/dlls/qwave/main.c
++++ b/dlls/qwave/main.c
+@@ -18,34 +18,312 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winsock2.h"
++#include "ws2ipdef.h"
+ #include "qos2.h"
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(qwave);
+ 
++#ifndef IPV6_TCLASS
++#define IPV6_TCLASS 39
++#endif
++
++/* A QOS handle: an event handle that can be waited on or put on a completion port, with
++ * the flows that were added through it. */
++struct qos_handle
++{
++    struct list entry;
++    HANDLE event;
++    struct list flows;
++    QOS_FLOWID next_flow;
++};
++
++struct qos_flow
++{
++    struct list entry;
++    QOS_FLOWID id;
++    QOS_TRAFFIC_TYPE type;
++    BOOL non_adaptive;
++    SOCKET *sockets;
++    unsigned int count;
++};
++
++static struct list handles = LIST_INIT(handles);
++static CRITICAL_SECTION qos_cs;
++static CRITICAL_SECTION_DEBUG qos_cs_debug =
++{
++    0, 0, &qos_cs,
++    { &qos_cs_debug.ProcessLocksList, &qos_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": qos_cs") }
++};
++static CRITICAL_SECTION qos_cs = { &qos_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct qos_handle *find_handle(HANDLE h)
++{
++    struct qos_handle *q;
++
++    LIST_FOR_EACH_ENTRY(q, &handles, struct qos_handle, entry)
++        if (q->event == h) return q;
++    return NULL;
++}
++
++static struct qos_flow *find_flow(struct qos_handle *q, QOS_FLOWID id)
++{
++    struct qos_flow *f;
++
++    LIST_FOR_EACH_ENTRY(f, &q->flows, struct qos_flow, entry)
++        if (f->id == id) return f;
++    return NULL;
++}
++
++static void free_flow(struct qos_flow *f)
++{
++    list_remove(&f->entry);
++    free(f->sockets);
++    free(f);
++}
++
++/* DSCP marks of the traffic types (QOS_TRAFFIC_TYPE documentation) */
++static int traffic_dscp(QOS_TRAFFIC_TYPE type)
++{
++    #ifdef SG_MUTANT_QOS_TABLE
++    static const int dscp[] = { 0, 0x08, 0x28, 0x28, 0x28, 0x38 };
++#else
++    static const int dscp[] = { 0, 0x08, 0x28, 0x28, 0x38, 0x38 };
++#endif
++    return dscp[type];
++}
++
++static void mark_socket(SOCKET s, int dscp)
++{
++    int tos = dscp << 2;
++
++    if (setsockopt(s, IPPROTO_IP, IP_TOS, (const char *)&tos, sizeof(tos)))
++        setsockopt(s, IPPROTO_IPV6, IPV6_TCLASS, (const char *)&tos, sizeof(tos));
++}
++
+ BOOL WINAPI QOSCreateHandle(PQOS_VERSION version, PHANDLE handle)
+ {
+-    FIXME("%p %p stub!\n", version, handle);
++    struct qos_handle *q;
++
++    TRACE("%p %p\n", version, handle);
++
+     if (!version || !((version->MajorVersion == 1) && (version->MinorVersion == 0)) || !handle)
++    {
+         SetLastError(ERROR_INVALID_PARAMETER);
+-    else
+-        SetLastError(ERROR_SERVICE_ALREADY_RUNNING);
+-    return FALSE;
++        return FALSE;
++    }
++    if (!(q = calloc(1, sizeof(*q))))
++    {
++        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++        return FALSE;
++    }
++    if (!(q->event = CreateEventW(NULL, FALSE, FALSE, NULL)))
++    {
++        free(q);
++        return FALSE;
++    }
++    list_init(&q->flows);
++    q->next_flow = 1;
++    EnterCriticalSection(&qos_cs);
++    list_add_tail(&handles, &q->entry);
++    LeaveCriticalSection(&qos_cs);
++    *handle = q->event;
++    return TRUE;
+ }
+ 
+ BOOL WINAPI QOSAddSocketToFlow(HANDLE handle, SOCKET socket, PSOCKADDR addr,
+                                QOS_TRAFFIC_TYPE traffictype, DWORD flags, PQOS_FLOWID flowid)
+ {
+-    FIXME("%p, %Ix, %p, %d, 0x%08lx, %p stub!\n", handle, socket, addr, traffictype, flags, flowid);
+-    SetLastError(ERROR_NOT_SUPPORTED);
++    struct qos_handle *q;
++    struct qos_flow *f = NULL;
++    SOCKET *sockets;
++    int type, len = sizeof(type);
++
++    TRACE("%p, %Ix, %p, %d, 0x%08lx, %p\n", handle, socket, addr, traffictype, flags, flowid);
++
++    EnterCriticalSection(&qos_cs);
++    if (!(q = find_handle(handle)))
++    {
++        LeaveCriticalSection(&qos_cs);
++        SetLastError(ERROR_INVALID_HANDLE);
++        return FALSE;
++    }
++    if (!flowid || traffictype > QOSTrafficTypeControl || (flags & ~QOS_NON_ADAPTIVE_FLOW)
++            || (addr && addr->sa_family != AF_INET && addr->sa_family != AF_INET6)
++            || getsockopt(socket, SOL_SOCKET, SO_TYPE, (char *)&type, &len))
++        goto invalid;
++
++    if (*flowid)
++    {
++        /* only non-adaptive flows take several sockets */
++#ifdef SG_MUTANT_QOS_MULTI
++        if (!(f = find_flow(q, *flowid)))
++#else
++        if (!(f = find_flow(q, *flowid)) || !f->non_adaptive || !(flags & QOS_NON_ADAPTIVE_FLOW))
++#endif
++            goto invalid;
++    }
++    else
++    {
++        if (!(f = calloc(1, sizeof(*f))))
++        {
++            LeaveCriticalSection(&qos_cs);
++            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++            return FALSE;
++        }
++        f->id = q->next_flow++;
++        f->type = traffictype;
++        f->non_adaptive = !!(flags & QOS_NON_ADAPTIVE_FLOW);
++        list_add_tail(&q->flows, &f->entry);
++        *flowid = f->id;
++    }
++
++    if (!(sockets = realloc(f->sockets, (f->count + 1) * sizeof(*sockets))))
++    {
++        LeaveCriticalSection(&qos_cs);
++        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++        return FALSE;
++    }
++    f->sockets = sockets;
++    f->sockets[f->count++] = socket;
++
++    /* adding a socket alone leaves its traffic alone for an adaptive flow */
++#ifdef SG_MUTANT_QOS_ADAPTIVEMARK
++    if (f->type != QOSTrafficTypeBestEffort)
++#else
++    if (f->non_adaptive && f->type != QOSTrafficTypeBestEffort)
++#endif
++        mark_socket(socket, traffic_dscp(f->type));
++    LeaveCriticalSection(&qos_cs);
++    return TRUE;
++
++invalid:
++    LeaveCriticalSection(&qos_cs);
++    SetLastError(ERROR_INVALID_PARAMETER);
+     return FALSE;
+ }
+ 
+-BOOL WINAPI QOSCloseHandle(HANDLE handle)
++BOOL WINAPI QOSRemoveSocketFromFlow(HANDLE handle, SOCKET socket, QOS_FLOWID flowid, DWORD flags)
++{
++    struct qos_handle *q;
++    struct qos_flow *f;
++    unsigned int i;
++
++    TRACE("%p, %Ix, %lu, 0x%08lx\n", handle, socket, flowid, flags);
++
++    EnterCriticalSection(&qos_cs);
++    if (!(q = find_handle(handle)))
++    {
++        LeaveCriticalSection(&qos_cs);
++        SetLastError(ERROR_INVALID_HANDLE);
++        return FALSE;
++    }
++    if (!(f = find_flow(q, flowid)))
++    {
++        LeaveCriticalSection(&qos_cs);
++        SetLastError(ERROR_NOT_FOUND);
++        return FALSE;
++    }
++    if (socket && socket != INVALID_SOCKET)
++    {
++        for (i = 0; i < f->count; i++) if (f->sockets[i] == socket) break;
++        if (i == f->count)
++        {
++            LeaveCriticalSection(&qos_cs);
++            SetLastError(ERROR_NOT_FOUND);
++            return FALSE;
++        }
++        memmove(&f->sockets[i], &f->sockets[i + 1], (f->count - i - 1) * sizeof(*f->sockets));
++        if (--f->count) goto done;
++    }
++    free_flow(f);
++done:
++    LeaveCriticalSection(&qos_cs);
++    return TRUE;
++}
++
++BOOL WINAPI QOSSetFlow(HANDLE handle, QOS_FLOWID flowid, QOS_SET_FLOW op, ULONG size,
++                       PVOID buffer, DWORD flags, LPOVERLAPPED overlap)
+ {
+-    FIXME("%p stub!\n", handle);
++    struct qos_handle *q;
++    struct qos_flow *f;
++    int dscp;
++    unsigned int i;
++
++    TRACE("%p, %lu, %d, %lu, %p, 0x%08lx, %p\n", handle, flowid, op, size, buffer, flags, overlap);
++
++    EnterCriticalSection(&qos_cs);
++    if (!(q = find_handle(handle)))
++    {
++        LeaveCriticalSection(&qos_cs);
++        SetLastError(ERROR_INVALID_HANDLE);
++        return FALSE;
++    }
++    if (flags || !(f = find_flow(q, flowid)) || !buffer)
++    {
++        LeaveCriticalSection(&qos_cs);
++        SetLastError(flags || !buffer ? ERROR_INVALID_PARAMETER : ERROR_NOT_FOUND);
++        return FALSE;
++    }
++
++    switch (op)
++    {
++    case QOSSetTrafficType:
++        if (size != sizeof(QOS_TRAFFIC_TYPE) || *(QOS_TRAFFIC_TYPE *)buffer > QOSTrafficTypeControl) goto invalid;
++        f->type = *(QOS_TRAFFIC_TYPE *)buffer;
++        dscp = traffic_dscp(f->type);
++        break;
++    case QOSSetOutgoingDSCPValue:
++        if (size != sizeof(DWORD) || *(DWORD *)buffer > 63) goto invalid;
++        dscp = *(DWORD *)buffer;
++        break;
++    case QOSSetOutgoingRate:
++        /* shaping needs the qWAVE service */
++        LeaveCriticalSection(&qos_cs);
++        SetLastError(ERROR_NOT_SUPPORTED);
++        return FALSE;
++    default:
++        goto invalid;
++    }
++#ifdef SG_MUTANT_QOS_FIRSTONLY
++    if (f->count) mark_socket(f->sockets[0], dscp);
++#else
++    for (i = 0; i < f->count; i++) mark_socket(f->sockets[i], dscp);
++#endif
++    LeaveCriticalSection(&qos_cs);
++    return TRUE;
++
++invalid:
++    LeaveCriticalSection(&qos_cs);
++    SetLastError(ERROR_INVALID_PARAMETER);
+     return FALSE;
+ }
++
++BOOL WINAPI QOSCloseHandle(HANDLE handle)
++{
++    struct qos_handle *q;
++
++    TRACE("%p\n", handle);
++
++    EnterCriticalSection(&qos_cs);
++    if (!(q = find_handle(handle)))
++    {
++        LeaveCriticalSection(&qos_cs);
++        SetLastError(ERROR_INVALID_HANDLE);
++        return FALSE;
++    }
++    list_remove(&q->entry);
++    LeaveCriticalSection(&qos_cs);
++
++    while (!list_empty(&q->flows)) free_flow(LIST_ENTRY(list_head(&q->flows), struct qos_flow, entry));
++    CloseHandle(q->event);
++    free(q);
++    return TRUE;
++}
+diff --git a/dlls/qwave/qwave.spec b/dlls/qwave/qwave.spec
+index ff2994d..de0c167 100644
+--- a/dlls/qwave/qwave.spec
++++ b/dlls/qwave/qwave.spec
+@@ -1,14 +1,14 @@
+ @ stub QDLHPathDiagnostics
+ @ stub QDLHStartDiagnosingPath
+-@ stdcall QOSAddSocketToFlow(ptr long ptr long long ptr)
++@ stdcall QOSAddSocketToFlow(ptr ptr ptr long long ptr)
+ @ stub QOSCancel
+ @ stdcall QOSCloseHandle(ptr)
+ @ stdcall QOSCreateHandle(ptr ptr)
+ @ stub QOSEnumerateFlows
+ @ stub QOSNotifyFlow
+ @ stub QOSQueryFlow
+-@ stub QOSRemoveSocketFromFlow
+-@ stub QOSSetFlow
++@ stdcall QOSRemoveSocketFromFlow(ptr ptr long long)
++@ stdcall QOSSetFlow(ptr long long long ptr long ptr)
+ @ stub QOSStartTrackingClient
+ @ stub QOSStopTrackingClient
+ @ stub ServiceMain
+diff --git a/dlls/qwave/tests/qos.c b/dlls/qwave/tests/qos.c
+index 1815784..c460518 100644
+--- a/dlls/qwave/tests/qos.c
++++ b/dlls/qwave/tests/qos.c
+@@ -47,7 +47,7 @@ static void test_QOSCreateHandle(void)
+     ver.MajorVersion = 1;
+     ver.MinorVersion = 0;
+     ret = QOSCreateHandle(&ver, &h);
+-    todo_wine ok(ret == TRUE, "Expected TRUE, got %d\n", ret);
++    ok(ret == TRUE, "Expected TRUE, got %d\n", ret);
+ 
+     SetLastError(0xdeadbeef);
+     ver.MajorVersion = 1;
+@@ -73,22 +73,22 @@ static void test_QOSCloseHandle(void)
+     SetLastError(0xdeadbeef);
+     ret = QOSCloseHandle(NULL);
+     ok(ret == FALSE, "Expected FALSE, got %d\n", ret);
+-    todo_wine ok(GetLastError() == ERROR_INVALID_HANDLE, "Expected ERROR_INVALID_HANDLE, got %ld\n", GetLastError());
++    ok(GetLastError() == ERROR_INVALID_HANDLE, "Expected ERROR_INVALID_HANDLE, got %ld\n", GetLastError());
+ 
+     ver.MajorVersion = 1;
+     ver.MinorVersion = 0;
+     ret = QOSCreateHandle(&ver, &h);
+-    todo_wine ok(ret == TRUE, "Expected TRUE, got %d\n", ret);
++    ok(ret == TRUE, "Expected TRUE, got %d\n", ret);
+ 
+     SetLastError(0xdeadbeef);
+     ret = QOSCloseHandle(h);
+-    todo_wine ok(ret == TRUE, "Expected TRUE, got %d\n", ret);
++    ok(ret == TRUE, "Expected TRUE, got %d\n", ret);
+     ok(GetLastError() == 0xdeadbeef, "Expected 0xdeadbeef, got %ld\n", GetLastError());
+ 
+     SetLastError(0xdeadbeef);
+     ret = QOSCloseHandle((HANDLE)0xdeadbeef);
+     ok(ret == FALSE, "Expected FALSE, got %d\n", ret);
+-    todo_wine ok(GetLastError() == ERROR_INVALID_HANDLE, "Expected ERROR_INVALID_HANDLE, got %ld\n", GetLastError());
++    ok(GetLastError() == ERROR_INVALID_HANDLE, "Expected ERROR_INVALID_HANDLE, got %ld\n", GetLastError());
+ }
+ 
+ START_TEST(qos)

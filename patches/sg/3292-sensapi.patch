@@ -1,0 +1,243 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Thu, 15 Oct 2026 00:00:43 -0700
+Subject: [PATCH] sensapi: real network state for IsNetworkAlive and
+ IsDestinationReachable (3292)
+
+IsNetworkAlive now reports the real state: connected when an interface is up,
+not loopback, and holds an address that is not unset / link-local; flags are
+NETWORK_ALIVE_LAN or _WAN by interface type. IsDestinationReachable resolves
+the name, asks the routing table for a route (no packets sent), and fills
+QOCINFO (connection type and link speeds of the interface that routes it);
+bad arguments set ERROR_INVALID_PARAMETER.
+
+diff --git a/dlls/sensapi/Makefile.in b/dlls/sensapi/Makefile.in
+index 4fbcecf..ad53c54 100644
+--- a/dlls/sensapi/Makefile.in
++++ b/dlls/sensapi/Makefile.in
+@@ -1,5 +1,6 @@
+ MODULE    = sensapi.dll
+ IMPORTLIB = sensapi
++IMPORTS   = ws2_32 iphlpapi
+ 
+ SOURCES = \
+ 	sensapi.c
+diff --git a/dlls/sensapi/sensapi.c b/dlls/sensapi/sensapi.c
+index 7305227..8073040 100644
+--- a/dlls/sensapi/sensapi.c
++++ b/dlls/sensapi/sensapi.c
+@@ -19,14 +19,21 @@
+  *
+  * Notes:
+  * The System Event Notification Service reports the status of network
+- * connections. For Wine we just report that we are always connected.
++ * connections. Connectivity is derived from the network interfaces and the
++ * routing table; no packets are sent.
+  */
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
+ 
+ #define COBJMACROS
+ 
+ #include "windef.h"
++#include "winbase.h"
++#include "winerror.h"
++#include "winsock2.h"
++#include "ws2tcpip.h"
++#include "iphlpapi.h"
+ #include "sensevts.h"
+ #include "sensapi.h"
+ 
+@@ -34,21 +41,184 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(sensapi);
+ 
++/* PPP, SLIP, ISDN, X.25 and frame relay interfaces are wide area connections, the rest are LAN */
++static BOOL is_wan_type( DWORD type )
++{
++    switch (type)
++    {
++    case IF_TYPE_PPP: case IF_TYPE_SLIP: case IF_TYPE_ISDN: case IF_TYPE_FRAMERELAY:
++    case IF_TYPE_RS232:
++        return TRUE;
++    default:
++        return FALSE;
++    }
++}
++
++static BOOL has_usable_address( const IP_ADAPTER_ADDRESSES *aa )
++{
++    const IP_ADAPTER_UNICAST_ADDRESS *ua;
++
++    for (ua = aa->FirstUnicastAddress; ua; ua = ua->Next)
++    {
++        const SOCKADDR *sa = ua->Address.lpSockaddr;
++        if (!sa) continue;
++        if (sa->sa_family == AF_INET)
++        {
++            const BYTE *b = (const BYTE *)&((const SOCKADDR_IN *)sa)->sin_addr;
++            if (b[0] == 0 || (b[0] == 169 && b[1] == 254)) continue;   /* unset, link-local autoconfiguration */
++            return TRUE;
++        }
++        if (sa->sa_family == AF_INET6)
++        {
++            const BYTE *b = ((const SOCKADDR_IN6 *)sa)->sin6_addr.s6_addr;
++            if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) continue;       /* link-local */
++            return TRUE;
++        }
++    }
++    return FALSE;
++}
++
++static IP_ADAPTER_ADDRESSES *get_adapters(void)
++{
++    ULONG size = 16384, ret, flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
++    IP_ADAPTER_ADDRESSES *aa = NULL;
++    int tries;
++
++    for (tries = 0; tries < 4; tries++)
++    {
++        free( aa );
++        if (!(aa = malloc( size ))) return NULL;
++        ret = GetAdaptersAddresses( AF_UNSPEC, flags, NULL, aa, &size );
++        if (ret == ERROR_SUCCESS) return aa;
++        if (ret != ERROR_BUFFER_OVERFLOW) break;
++    }
++    free( aa );
++    return NULL;
++}
++
++/* Is an interface connected: up, not loopback, with an address that can reach beyond the link. */
++static BOOL adapter_connected( const IP_ADAPTER_ADDRESSES *aa )
++{
++    return aa->OperStatus == IfOperStatusUp && aa->IfType != IF_TYPE_SOFTWARE_LOOPBACK && has_usable_address( aa );
++}
++
++static DWORD clip_speed( ULONG64 speed ) { return speed > 0xffffffff ? 0xffffffff : (DWORD)speed; }
++
+ BOOL WINAPI IsDestinationReachableA(LPCSTR lpszDestination, LPQOCINFO lpQOCInfo)
+ {
+-    FIXME("%s,%p\n", lpszDestination, lpQOCInfo);
+-    return TRUE;
++    WCHAR *wide = NULL;
++    BOOL ret;
++    int len;
++
++    TRACE("%s,%p\n", debugstr_a(lpszDestination), lpQOCInfo);
++
++    if (!lpszDestination)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    len = MultiByteToWideChar( CP_ACP, 0, lpszDestination, -1, NULL, 0 );
++    if (!len || !(wide = malloc( len * sizeof(WCHAR) )))
++    {
++        SetLastError( len ? ERROR_OUTOFMEMORY : ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    MultiByteToWideChar( CP_ACP, 0, lpszDestination, -1, wide, len );
++    ret = IsDestinationReachableW( wide, lpQOCInfo );
++    free( wide );
++    return ret;
+ }
++
+ BOOL WINAPI IsDestinationReachableW(LPCWSTR lpszDestination, LPQOCINFO lpQOCInfo)
+ {
+-    FIXME("%s,%p\n", debugstr_w(lpszDestination), lpQOCInfo);
++    ADDRINFOW hints = {0}, *res = NULL;
++    IP_ADAPTER_ADDRESSES *adapters;
++    const IP_ADAPTER_ADDRESSES *aa, *best = NULL;
++    WSADATA wsa;
++    DWORD index = 0;
++    BOOL ret = FALSE;
++    DWORD err;
++
++    TRACE("%s,%p\n", debugstr_w(lpszDestination), lpQOCInfo);
++
++#ifdef SG_MUTANT_SENS_SIZE
++    if (!lpszDestination || !*lpszDestination)
++#else
++    if (!lpszDestination || !*lpszDestination || (lpQOCInfo && lpQOCInfo->dwSize != sizeof(*lpQOCInfo)))
++#endif
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    if ((err = WSAStartup( MAKEWORD(2, 2), &wsa ))) { SetLastError( err ); return FALSE; }
++    hints.ai_family = AF_UNSPEC;
++    hints.ai_socktype = SOCK_STREAM;
++    if ((err = GetAddrInfoW( lpszDestination, NULL, &hints, &res )))
++    {
++        WSACleanup();
++        SetLastError( ERROR_HOST_UNREACHABLE );
++        return FALSE;
++    }
++    /* reachable when a route leads to any of the addresses */
++    {
++        ADDRINFOW *ai;
++        for (ai = res; ai && !ret; ai = ai->ai_next)
++            if (GetBestInterfaceEx( ai->ai_addr, &index ) == NO_ERROR) ret = TRUE;
++    }
++    FreeAddrInfoW( res );
++    WSACleanup();
++    if (!ret)
++    {
++        SetLastError( ERROR_NETWORK_UNREACHABLE );
++        return FALSE;
++    }
++
++#ifdef SG_MUTANT_SENS_QOC
++    if (0)
++#else
++    if (lpQOCInfo)
++#endif
++    {
++        lpQOCInfo->dwFlags = 0;
++        lpQOCInfo->dwInSpeed = lpQOCInfo->dwOutSpeed = 0;
++        if ((adapters = get_adapters()))
++        {
++            for (aa = adapters; aa; aa = aa->Next)
++                if (aa->IfIndex == index || aa->Ipv6IfIndex == index) { best = aa; break; }
++            if (best)
++            {
++                lpQOCInfo->dwFlags = is_wan_type( best->IfType ) ? NETWORK_ALIVE_WAN : NETWORK_ALIVE_LAN;
++                lpQOCInfo->dwInSpeed = clip_speed( best->ReceiveLinkSpeed );
++                lpQOCInfo->dwOutSpeed = clip_speed( best->TransmitLinkSpeed );
++            }
++            free( adapters );
++        }
++    }
+     return TRUE;
+ }
+ 
+ BOOL WINAPI IsNetworkAlive(LPDWORD lpdwFlags)
+ {
+-    TRACE("yes, using LAN type network.\n");
+-    if (lpdwFlags)
+-       *lpdwFlags = NETWORK_ALIVE_LAN;
+-    return TRUE;
++    IP_ADAPTER_ADDRESSES *adapters, *aa;
++    DWORD flags = 0;
++
++    TRACE("%p\n", lpdwFlags);
++
++    if ((adapters = get_adapters()))
++    {
++        for (aa = adapters; aa; aa = aa->Next)
++        {
++            if (!adapter_connected( aa )) continue;
++#ifdef SG_MUTANT_SENS_FLAGS
++            flags |= is_wan_type( aa->IfType ) ? NETWORK_ALIVE_LAN : NETWORK_ALIVE_WAN;
++#else
++            flags |= is_wan_type( aa->IfType ) ? NETWORK_ALIVE_WAN : NETWORK_ALIVE_LAN;
++#endif
++        }
++        free( adapters );
++    }
++    if (lpdwFlags) *lpdwFlags = flags;
++    SetLastError( ERROR_SUCCESS );
++    return !!flags;
+ }

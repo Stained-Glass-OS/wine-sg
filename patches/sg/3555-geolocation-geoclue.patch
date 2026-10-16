@@ -1,0 +1,2534 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] geolocation: positions from GeoClue2, consent, events (3555)
+
+geolocation: Geolocator positions from GeoClue2, consent and events
+
+GetGeopositionAsync (with and without age/timeout), PositionChanged and StatusChanged, and
+Geolocator.RequestAccessAsync (new IGeolocatorStatics) are backed by GeoClue2 on the system D-Bus.
+The unix side (geolocation.so, libdbus loaded with dlopen like powrprof/mountmgr) creates a GeoClue
+client with DesktopId "wine" and the requested accuracy, starts it, reads Location (or waits for
+LocationUpdated) and stops it. Geoposition/Geocoordinate/IReference<double>/event argument classes
+are new; the async operations run on the thread pool.
+
+Consent is the capability access ConsentStore "location" Value: HKLM (device), HKCU (user) and
+HKCU\...\NonPackaged (desktop apps); Deny in any of them makes RequestAccessAsync return Denied,
+GetGeopositionAsync fail with E_ACCESSDENIED, LocationStatus report Disabled, and GeoClue is never
+contacted. It is read at every request. No GeoClue: status NotAvailable and the operation fails with
+the timeout error. WINE_SG_GEOCLUE_BUS_ADDRESS redirects the bus for tests.
+---
+--- a/include/windows.devices.geolocation.idl
++++ b/include/windows.devices.geolocation.idl
+@@ -32,8 +32,10 @@
+ 
+     typedef enum PositionAccuracy PositionAccuracy;
+     typedef enum PositionStatus PositionStatus;
++    typedef enum GeolocationAccessStatus GeolocationAccessStatus;
+ 
+     interface IGeolocator;
++    interface IGeolocatorStatics;
+     interface IGeoposition;
+     interface IGeocoordinate;
+     interface IPositionChangedEventArgs;
+@@ -48,6 +50,8 @@
+     runtimeclass CivicAddress;
+ 
+     declare {
++        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Devices.Geolocation.GeolocationAccessStatus>;
++        interface Windows.Foundation.IAsyncOperation<Windows.Devices.Geolocation.GeolocationAccessStatus>;
+         interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Devices.Geolocation.Geoposition*>;
+         interface Windows.Foundation.IAsyncOperation<Windows.Devices.Geolocation.Geoposition*>;
+         interface Windows.Foundation.TypedEventHandler<Windows.Devices.Geolocation.Geolocator*, Windows.Devices.Geolocation.PositionChangedEventArgs*>;
+@@ -72,11 +76,29 @@
+         NotAvailable   = 5,
+     };
+ 
++    [contract(Windows.Foundation.UniversalApiContract, 1.0)]
++    enum GeolocationAccessStatus
++    {
++        Unspecified = 0,
++        Allowed     = 1,
++        Denied      = 2,
++    };
++
+     /* Interfaces */
+ 
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         exclusiveto(Windows.Devices.Geolocation.Geolocator),
++        uuid(9a8e7571-2df5-4591-9f87-eb5fd894e9b7)
++    ]
++    interface IGeolocatorStatics : IInspectable
++    {
++        HRESULT RequestAccessAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Geolocation.GeolocationAccessStatus> **value);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Devices.Geolocation.Geolocator),
+         uuid(a9c3bf62-4524-4989-8aa9-de019d2e551f)
+     ]
+     interface IGeolocator : IInspectable
+@@ -173,6 +195,7 @@
+         activatable(Windows.Foundation.UniversalApiContract, 1.0),
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         marshaling_behavior(agile),
++        static(Windows.Devices.Geolocation.IGeolocatorStatics, Windows.Foundation.UniversalApiContract, 1.0),
+         threading(both)
+     ]
+     runtimeclass Geolocator
+--- a/dlls/geolocation/Makefile.in
++++ b/dlls/geolocation/Makefile.in
+@@ -1,6 +1,11 @@
+ MODULE = geolocation.dll
+-IMPORTS = combase uuid
++UNIXLIB = geolocation.so
++UNIX_CFLAGS = $(DBUS_CFLAGS)
++IMPORTS = combase uuid advapi32
+ 
+ SOURCES = \
++	async.c \
+ 	classes.idl \
+-	main.c
++	main.c \
++	position.c \
++	unixlib.c
+--- /dev/null
++++ b/dlls/geolocation/async.c
+@@ -0,0 +1,552 @@
++/*
++ * IAsyncOperation<Geoposition> and IAsyncOperation<GeolocationAccessStatus>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(geolocator);
++
++#define STATUS_CLOSED 4
++#define HANDLER_NOT_SET ((void *)~(ULONG_PTR)0)
++
++enum async_kind { ASYNC_POSITION, ASYNC_ACCESS };
++
++struct async_op
++{
++    IAsyncOperation_Geoposition position_iface;
++    IAsyncOperation_GeolocationAccessStatus access_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    enum async_kind kind;
++
++    async_callback callback;
++    void *param;
++    TP_WORK *work;
++
++    CRITICAL_SECTION cs;
++    IUnknown *handler;
++    AsyncStatus status;
++    HRESULT hr;
++    IUnknown *object;
++    INT32 value;
++};
++
++static inline struct async_op *impl_from_position( IAsyncOperation_Geoposition *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_op, position_iface );
++}
++
++static inline struct async_op *impl_from_access( IAsyncOperation_GeolocationAccessStatus *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_op, access_iface );
++}
++
++static inline struct async_op *impl_from_info( IAsyncInfo *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_op, IAsyncInfo_iface );
++}
++
++static IInspectable *op_iface( struct async_op *op )
++{
++    return op->kind == ASYNC_POSITION ? (IInspectable *)&op->position_iface : (IInspectable *)&op->access_iface;
++}
++
++static void invoke_handler( struct async_op *op, IUnknown *handler, AsyncStatus status )
++{
++    if (op->kind == ASYNC_POSITION)
++        IAsyncOperationCompletedHandler_Geoposition_Invoke( (IAsyncOperationCompletedHandler_Geoposition *)handler,
++                                                            &op->position_iface, status );
++    else
++        IAsyncOperationCompletedHandler_GeolocationAccessStatus_Invoke(
++            (IAsyncOperationCompletedHandler_GeolocationAccessStatus *)handler, &op->access_iface, status );
++}
++
++static HRESULT op_query_interface( struct async_op *op, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ))
++    {
++        IInspectable_AddRef( (*out = op_iface( op )) );
++        return S_OK;
++    }
++    if (op->kind == ASYNC_POSITION && IsEqualGUID( iid, &IID_IAsyncOperation_Geoposition ))
++    {
++        IInspectable_AddRef( (*out = &op->position_iface) );
++        return S_OK;
++    }
++    if (op->kind == ASYNC_ACCESS && IsEqualGUID( iid, &IID_IAsyncOperation_GeolocationAccessStatus ))
++    {
++        IInspectable_AddRef( (*out = &op->access_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++    {
++        IAsyncInfo_AddRef( (*out = &op->IAsyncInfo_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG op_add_ref( struct async_op *op )
++{
++    return InterlockedIncrement( &op->ref );
++}
++
++static ULONG op_release( struct async_op *op )
++{
++    ULONG ref = InterlockedDecrement( &op->ref );
++
++    if (!ref)
++    {
++        if (op->handler && op->handler != HANDLER_NOT_SET) IUnknown_Release( op->handler );
++        if (op->work) CloseThreadpoolWork( op->work );
++        if (op->object) IUnknown_Release( op->object );
++        op->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &op->cs );
++        free( op );
++    }
++    return ref;
++}
++
++static HRESULT op_put_completed( struct async_op *op, IUnknown *handler )
++{
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &op->cs );
++    if (op->status == STATUS_CLOSED) hr = E_ILLEGAL_METHOD_CALL;
++    else if (op->handler != HANDLER_NOT_SET) hr = E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    else if ((op->handler = handler))
++    {
++        IUnknown_AddRef( handler );
++
++        if (op->status > Started)
++        {
++            AsyncStatus status = op->status;
++            op->handler = NULL; /* prevent a concurrent invoke */
++            LeaveCriticalSection( &op->cs );
++
++            invoke_handler( op, handler, status );
++            IUnknown_Release( handler );
++            return S_OK;
++        }
++    }
++    LeaveCriticalSection( &op->cs );
++    return hr;
++}
++
++static HRESULT op_get_completed( struct async_op *op, IUnknown **handler )
++{
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &op->cs );
++    if (op->status == STATUS_CLOSED) hr = E_ILLEGAL_METHOD_CALL;
++    if (op->handler == NULL || op->handler == HANDLER_NOT_SET) *handler = NULL;
++    else
++    {
++        *handler = op->handler;
++        IUnknown_AddRef( *handler );
++    }
++    LeaveCriticalSection( &op->cs );
++    return hr;
++}
++
++static HRESULT op_results( struct async_op *op, IUnknown **object, INT32 *value )
++{
++    HRESULT hr = E_ILLEGAL_METHOD_CALL;
++
++    EnterCriticalSection( &op->cs );
++    if (op->status == Completed || op->status == Error)
++    {
++        hr = op->hr;
++        if (SUCCEEDED(hr))
++        {
++            if (object && (*object = op->object)) IUnknown_AddRef( *object );
++            if (value) *value = op->value;
++        }
++    }
++    else if (op->status == Canceled) hr = E_ILLEGAL_METHOD_CALL;
++    LeaveCriticalSection( &op->cs );
++    return hr;
++}
++
++/* IAsyncOperation<Geoposition> */
++
++static HRESULT WINAPI position_QueryInterface( IAsyncOperation_Geoposition *iface, REFIID iid, void **out )
++{
++    return op_query_interface( impl_from_position( iface ), iid, out );
++}
++
++static ULONG WINAPI position_AddRef( IAsyncOperation_Geoposition *iface )
++{
++    return op_add_ref( impl_from_position( iface ) );
++}
++
++static ULONG WINAPI position_Release( IAsyncOperation_Geoposition *iface )
++{
++    return op_release( impl_from_position( iface ) );
++}
++
++static HRESULT WINAPI position_GetIids( IAsyncOperation_Geoposition *iface, ULONG *count, IID **iids )
++{
++    if (!count || !iids) return E_POINTER;
++    if (!(*iids = CoTaskMemAlloc( sizeof(IID) ))) return E_OUTOFMEMORY;
++    **iids = IID_IAsyncOperation_Geoposition;
++    *count = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI position_GetRuntimeClassName( IAsyncOperation_Geoposition *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.Foundation.IAsyncOperation`1<Windows.Devices.Geolocation.Geoposition>";
++    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
++}
++
++static HRESULT WINAPI position_GetTrustLevel( IAsyncOperation_Geoposition *iface, TrustLevel *level )
++{
++    if (!level) return E_POINTER;
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI position_put_Completed( IAsyncOperation_Geoposition *iface,
++                                              IAsyncOperationCompletedHandler_Geoposition *handler )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return op_put_completed( impl_from_position( iface ), (IUnknown *)handler );
++}
++
++static HRESULT WINAPI position_get_Completed( IAsyncOperation_Geoposition *iface,
++                                              IAsyncOperationCompletedHandler_Geoposition **handler )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return op_get_completed( impl_from_position( iface ), (IUnknown **)handler );
++}
++
++static HRESULT WINAPI position_GetResults( IAsyncOperation_Geoposition *iface, IGeoposition **results )
++{
++    IUnknown *object = NULL;
++    HRESULT hr;
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    if (!results) return E_POINTER;
++    *results = NULL;
++    if (SUCCEEDED(hr = op_results( impl_from_position( iface ), &object, NULL )) && object)
++    {
++        hr = IUnknown_QueryInterface( object, &IID_IGeoposition, (void **)results );
++        IUnknown_Release( object );
++    }
++    return hr;
++}
++
++static const IAsyncOperation_GeopositionVtbl position_vtbl =
++{
++    position_QueryInterface,
++    position_AddRef,
++    position_Release,
++    position_GetIids,
++    position_GetRuntimeClassName,
++    position_GetTrustLevel,
++    position_put_Completed,
++    position_get_Completed,
++    position_GetResults,
++};
++
++/* IAsyncOperation<GeolocationAccessStatus> */
++
++static HRESULT WINAPI access_QueryInterface( IAsyncOperation_GeolocationAccessStatus *iface, REFIID iid, void **out )
++{
++    return op_query_interface( impl_from_access( iface ), iid, out );
++}
++
++static ULONG WINAPI access_AddRef( IAsyncOperation_GeolocationAccessStatus *iface )
++{
++    return op_add_ref( impl_from_access( iface ) );
++}
++
++static ULONG WINAPI access_Release( IAsyncOperation_GeolocationAccessStatus *iface )
++{
++    return op_release( impl_from_access( iface ) );
++}
++
++static HRESULT WINAPI access_GetIids( IAsyncOperation_GeolocationAccessStatus *iface, ULONG *count, IID **iids )
++{
++    if (!count || !iids) return E_POINTER;
++    if (!(*iids = CoTaskMemAlloc( sizeof(IID) ))) return E_OUTOFMEMORY;
++    **iids = IID_IAsyncOperation_GeolocationAccessStatus;
++    *count = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI access_GetRuntimeClassName( IAsyncOperation_GeolocationAccessStatus *iface, HSTRING *name )
++{
++    static const WCHAR class_name[] = L"Windows.Foundation.IAsyncOperation`1<Windows.Devices.Geolocation.GeolocationAccessStatus>";
++    return WindowsCreateString( class_name, ARRAY_SIZE(class_name) - 1, name );
++}
++
++static HRESULT WINAPI access_GetTrustLevel( IAsyncOperation_GeolocationAccessStatus *iface, TrustLevel *level )
++{
++    if (!level) return E_POINTER;
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI access_put_Completed( IAsyncOperation_GeolocationAccessStatus *iface,
++                                            IAsyncOperationCompletedHandler_GeolocationAccessStatus *handler )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return op_put_completed( impl_from_access( iface ), (IUnknown *)handler );
++}
++
++static HRESULT WINAPI access_get_Completed( IAsyncOperation_GeolocationAccessStatus *iface,
++                                            IAsyncOperationCompletedHandler_GeolocationAccessStatus **handler )
++{
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return op_get_completed( impl_from_access( iface ), (IUnknown **)handler );
++}
++
++static HRESULT WINAPI access_GetResults( IAsyncOperation_GeolocationAccessStatus *iface, GeolocationAccessStatus *results )
++{
++    INT32 value = 0;
++    HRESULT hr;
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    if (!results) return E_POINTER;
++    hr = op_results( impl_from_access( iface ), NULL, &value );
++    *results = SUCCEEDED(hr) ? value : GeolocationAccessStatus_Unspecified;
++    return hr;
++}
++
++static const IAsyncOperation_GeolocationAccessStatusVtbl access_vtbl =
++{
++    access_QueryInterface,
++    access_AddRef,
++    access_Release,
++    access_GetIids,
++    access_GetRuntimeClassName,
++    access_GetTrustLevel,
++    access_put_Completed,
++    access_get_Completed,
++    access_GetResults,
++};
++
++/* IAsyncInfo */
++
++static HRESULT WINAPI info_QueryInterface( IAsyncInfo *iface, REFIID iid, void **out )
++{
++    return op_query_interface( impl_from_info( iface ), iid, out );
++}
++
++static ULONG WINAPI info_AddRef( IAsyncInfo *iface )
++{
++    return op_add_ref( impl_from_info( iface ) );
++}
++
++static ULONG WINAPI info_Release( IAsyncInfo *iface )
++{
++    return op_release( impl_from_info( iface ) );
++}
++
++static HRESULT WINAPI info_GetIids( IAsyncInfo *iface, ULONG *count, IID **iids )
++{
++    if (!count || !iids) return E_POINTER;
++    if (!(*iids = CoTaskMemAlloc( sizeof(IID) ))) return E_OUTOFMEMORY;
++    **iids = IID_IAsyncInfo;
++    *count = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *name )
++{
++    return impl_from_info( iface )->kind == ASYNC_POSITION
++        ? position_GetRuntimeClassName( &impl_from_info( iface )->position_iface, name )
++        : access_GetRuntimeClassName( &impl_from_info( iface )->access_iface, name );
++}
++
++static HRESULT WINAPI info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level )
++{
++    if (!level) return E_POINTER;
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    struct async_op *op = impl_from_info( iface );
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &op->cs );
++    if (op->status == STATUS_CLOSED) hr = E_ILLEGAL_METHOD_CALL;
++    *id = 1;
++    LeaveCriticalSection( &op->cs );
++    return hr;
++}
++
++static HRESULT WINAPI info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    struct async_op *op = impl_from_info( iface );
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &op->cs );
++    if (op->status == STATUS_CLOSED) hr = E_ILLEGAL_METHOD_CALL;
++    *status = op->status;
++    LeaveCriticalSection( &op->cs );
++    return hr;
++}
++
++static HRESULT WINAPI info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
++{
++    struct async_op *op = impl_from_info( iface );
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &op->cs );
++    if (op->status == STATUS_CLOSED) *error_code = hr = E_ILLEGAL_METHOD_CALL;
++    else *error_code = op->hr;
++    LeaveCriticalSection( &op->cs );
++    return hr;
++}
++
++static HRESULT WINAPI info_Cancel( IAsyncInfo *iface )
++{
++    struct async_op *op = impl_from_info( iface );
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &op->cs );
++    if (op->status == STATUS_CLOSED) hr = E_ILLEGAL_METHOD_CALL;
++    else if (op->status == Started) op->status = Canceled;
++    LeaveCriticalSection( &op->cs );
++    return hr;
++}
++
++static HRESULT WINAPI info_Close( IAsyncInfo *iface )
++{
++    struct async_op *op = impl_from_info( iface );
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &op->cs );
++    if (op->status == Started) hr = E_ILLEGAL_STATE_CHANGE;
++    else op->status = STATUS_CLOSED;
++    LeaveCriticalSection( &op->cs );
++    return hr;
++}
++
++static const IAsyncInfoVtbl info_vtbl =
++{
++    info_QueryInterface,
++    info_AddRef,
++    info_Release,
++    info_GetIids,
++    info_GetRuntimeClassName,
++    info_GetTrustLevel,
++    info_get_Id,
++    info_get_Status,
++    info_get_ErrorCode,
++    info_Cancel,
++    info_Close,
++};
++
++static void CALLBACK async_callback_proc( TP_CALLBACK_INSTANCE *instance, void *context, TP_WORK *work )
++{
++    struct async_op *op = context;
++    IUnknown *object = NULL;
++    INT32 value = 0;
++    HRESULT hr;
++
++    hr = op->callback( op->param, &object, &value );
++    free( op->param );
++    op->param = NULL;
++
++    EnterCriticalSection( &op->cs );
++    if (op->status == Started) op->status = FAILED(hr) ? Error : Completed;
++    op->hr = hr;
++    op->object = object;
++    op->value = value;
++
++    if (op->handler && op->handler != HANDLER_NOT_SET)
++    {
++        IUnknown *handler = op->handler;
++        AsyncStatus status = op->status;
++
++        op->handler = NULL; /* prevent a concurrent invoke */
++        LeaveCriticalSection( &op->cs );
++        invoke_handler( op, handler, status );
++        IUnknown_Release( handler );
++    }
++    else LeaveCriticalSection( &op->cs );
++
++    /* the reference taken when the work was submitted */
++    op_release( op );
++}
++
++static HRESULT async_create( enum async_kind kind, async_callback callback, void *param, struct async_op **out )
++{
++    struct async_op *op;
++
++    *out = NULL;
++    if (!(op = calloc( 1, sizeof(*op) ))) return E_OUTOFMEMORY;
++    op->position_iface.lpVtbl = &position_vtbl;
++    op->access_iface.lpVtbl = &access_vtbl;
++    op->IAsyncInfo_iface.lpVtbl = &info_vtbl;
++    op->kind = kind;
++    op->ref = 1;
++    op->callback = callback;
++    op->param = param;
++    op->handler = HANDLER_NOT_SET;
++    op->status = Started;
++    InitializeCriticalSectionEx( &op->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    op->cs.DebugInfo->Spare[0] = (DWORD_PTR)( __FILE__ ": async_op.cs" );
++    if (!(op->work = CreateThreadpoolWork( async_callback_proc, op, NULL )))
++    {
++        HRESULT hr = HRESULT_FROM_WIN32( GetLastError() );
++        op->param = NULL;   /* still owned by the caller on failure */
++        op->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &op->cs );
++        free( op );
++        return hr;
++    }
++
++    op_add_ref( op );   /* kept by the running work */
++    SubmitThreadpoolWork( op->work );
++    *out = op;
++    return S_OK;
++}
++
++HRESULT async_geoposition_create( async_callback callback, void *param, IAsyncOperation_Geoposition **out )
++{
++    struct async_op *op;
++    HRESULT hr;
++
++    if (FAILED(hr = async_create( ASYNC_POSITION, callback, param, &op ))) return hr;
++    *out = &op->position_iface;
++    return S_OK;
++}
++
++HRESULT async_access_create( async_callback callback, void *param, IAsyncOperation_GeolocationAccessStatus **out )
++{
++    struct async_op *op;
++    HRESULT hr;
++
++    if (FAILED(hr = async_create( ASYNC_ACCESS, callback, param, &op ))) return hr;
++    *out = &op->access_iface;
++    return S_OK;
++}
+--- a/dlls/geolocation/main.c
++++ b/dlls/geolocation/main.c
+@@ -17,8 +17,15 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <math.h>
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "initguid.h"
+ #include "private.h"
++#include "winreg.h"
++#include "winternl.h"
++#include "wine/unixlib.h"
++#include "unixlib.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -27,9 +34,16 @@
+ struct geolocator_statics
+ {
+     IActivationFactory IActivationFactory_iface;
++    IGeolocatorStatics IGeolocatorStatics_iface;
+     LONG ref;
+ };
+ 
++struct handler
++{
++    EventRegistrationToken token;
++    IUnknown *handler;
++};
++
+ struct geolocator
+ {
+     IGeolocator IGeolocator_iface;
+@@ -42,8 +56,60 @@
+     DOUBLE threshold;
+     UINT32 interval;
+     LONGLONG next_token;
++
++    CRITICAL_SECTION cs;
++    PositionStatus status;
++    BOOL has_cache;
++    struct location cache;
++    ULONGLONG cache_tick;
++    struct handler *position_handlers; ULONG position_count, position_cap;
++    struct handler *status_handlers; ULONG status_count, status_cap;
++    LONG watch_gen;      /* a watcher thread runs while its generation is current */
++    BOOL watching;
+ };
+ 
++#define DEFAULT_TIMEOUT_MS  30000
++#define POLL_INTERVAL_MS     5000
++
++/* ---- consent: the capability access store written by Settings and first-run setup ---- */
++
++static BOOL consent_value_denied( HKEY root, const WCHAR *subkey )
++{
++    WCHAR value[16];
++    DWORD size = sizeof(value), type;
++    HKEY key;
++    BOOL denied = FALSE;
++    static const WCHAR base[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\location";
++    WCHAR path[256];
++
++    wcscpy( path, base );
++    if (subkey) { wcscat( path, L"\\" ); wcscat( path, subkey ); }
++
++    if (RegOpenKeyExW( root, path, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key )) return FALSE;
++    if (!RegQueryValueExW( key, L"Value", NULL, &type, (BYTE *)value, &size ) && type == REG_SZ)
++    {
++        value[ARRAY_SIZE(value) - 1] = 0;
++        denied = !wcsicmp( value, L"Deny" );
++    }
++    RegCloseKey( key );
++    return denied;
++}
++
++/* Allow unless the device-wide switch, the user's switch or the desktop apps switch says Deny.
++ * Read at every request: Settings can change it while an app runs. */
++static BOOL location_denied(void)
++{
++#ifdef SG_MUTANT_GEO_NOHKLM
++    if (0)
++#endif
++    if (consent_value_denied( HKEY_LOCAL_MACHINE, NULL )) return TRUE;
++    if (consent_value_denied( HKEY_CURRENT_USER, NULL )) return TRUE;
++#ifndef SG_MUTANT_GEO_NONPACKAGED
++    if (consent_value_denied( HKEY_CURRENT_USER, L"NonPackaged" )) return TRUE;
++#endif
++    return FALSE;
++}
++
+ static HRESULT get_one_iid(const GUID *iid, ULONG *iid_count, IID **iids)
+ {
+     if (!iid_count || !iids) return E_POINTER;
+@@ -201,61 +267,433 @@
+     return S_OK;
+ }
+ 
++static HRESULT WINAPI geolocator_QueryInterface(IGeolocator *iface, REFIID iid, void **out);
++
++static void fire_status_changed(struct geolocator *impl, PositionStatus status)
++{
++    struct handler *copy = NULL;
++    ULONG i, count;
++
++    EnterCriticalSection(&impl->cs);
++    count = impl->status_count;
++    if (count && (copy = malloc(count * sizeof(*copy))))
++    {
++        memcpy(copy, impl->status_handlers, count * sizeof(*copy));
++        for (i = 0; i < count; i++) IUnknown_AddRef(copy[i].handler);
++    }
++    LeaveCriticalSection(&impl->cs);
++    if (!copy) return;
++
++    for (i = 0; i < count; i++)
++    {
++        IStatusChangedEventArgs *args;
++
++        if (SUCCEEDED(status_changed_args_create(status, &args)))
++        {
++            ITypedEventHandler_Geolocator_StatusChangedEventArgs_Invoke(
++                (ITypedEventHandler_Geolocator_StatusChangedEventArgs *)copy[i].handler, &impl->IGeolocator_iface, args);
++            IStatusChangedEventArgs_Release(args);
++        }
++        IUnknown_Release(copy[i].handler);
++    }
++    free(copy);
++}
++
++static void set_status(struct geolocator *impl, PositionStatus status)
++{
++    BOOL changed;
++
++    EnterCriticalSection(&impl->cs);
++    changed = impl->status != status;
++    impl->status = status;
++    LeaveCriticalSection(&impl->cs);
++    if (changed) fire_status_changed(impl, status);
++}
++
++static void fire_position_changed(struct geolocator *impl, IGeoposition *position)
++{
++    struct handler *copy = NULL;
++    ULONG i, count;
++
++    EnterCriticalSection(&impl->cs);
++    count = impl->position_count;
++    if (count && (copy = malloc(count * sizeof(*copy))))
++    {
++        memcpy(copy, impl->position_handlers, count * sizeof(*copy));
++        for (i = 0; i < count; i++) IUnknown_AddRef(copy[i].handler);
++    }
++    LeaveCriticalSection(&impl->cs);
++    if (!copy) return;
++
++    for (i = 0; i < count; i++)
++    {
++        IPositionChangedEventArgs *args;
++
++        if (SUCCEEDED(position_changed_args_create(position, &args)))
++        {
++            ITypedEventHandler_Geolocator_PositionChangedEventArgs_Invoke(
++                (ITypedEventHandler_Geolocator_PositionChangedEventArgs *)copy[i].handler, &impl->IGeolocator_iface, args);
++            IPositionChangedEventArgs_Release(args);
++        }
++        IUnknown_Release(copy[i].handler);
++    }
++    free(copy);
++}
++
++/* Ask GeoClue for the position.  Consent is checked first: with location denied nothing is sent anywhere. */
++static HRESULT fetch_location(struct geolocator *impl, int timeout_ms, struct location *loc)
++{
++    struct get_location_params params = {0};
++    PositionAccuracy accuracy;
++    HRESULT hr;
++
++    if (location_denied())
++    {
++#ifndef SG_MUTANT_GEO_CALL_WHEN_DENIED
++        set_status(impl, PositionStatus_Disabled);
++        return E_ACCESSDENIED;
++#endif
++    }
++
++    EnterCriticalSection(&impl->cs);
++    accuracy = impl->accuracy;
++    LeaveCriticalSection(&impl->cs);
++
++    set_status(impl, PositionStatus_Initializing);
++
++    params.high_accuracy = accuracy == PositionAccuracy_High;
++    params.timeout_ms = timeout_ms;
++    params.result = LOCATION_UNAVAILABLE;
++    if (__wine_init_unix_call() || WINE_UNIX_CALL(unix_get_location, &params))
++        params.result = LOCATION_UNAVAILABLE;
++
++    switch (params.result)
++    {
++    case LOCATION_OK:
++        loc->latitude = params.latitude;
++        loc->longitude = params.longitude;
++        loc->accuracy = params.accuracy;
++        loc->altitude = params.altitude;
++        loc->speed = params.speed;
++        loc->heading = params.heading;
++        loc->has_altitude = !!(params.flags & LOCATION_HAS_ALTITUDE);
++        loc->has_speed = !!(params.flags & LOCATION_HAS_SPEED);
++        loc->has_heading = !!(params.flags & LOCATION_HAS_HEADING);
++        loc->timestamp = (LONGLONG)params.time_sec * 10000000 + params.time_usec * 10 + 116444736000000000ll;
++        EnterCriticalSection(&impl->cs);
++        impl->cache = *loc;
++        impl->has_cache = TRUE;
++        impl->cache_tick = GetTickCount64();
++        LeaveCriticalSection(&impl->cs);
++        set_status(impl, PositionStatus_Ready);
++        return S_OK;
++    case LOCATION_DENIED:
++        set_status(impl, PositionStatus_Disabled);
++        return E_ACCESSDENIED;
++    case LOCATION_UNAVAILABLE:
++        /* no location service: Windows without a source reports its timeout error */
++        set_status(impl, PositionStatus_NotAvailable);
++        return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
++    case LOCATION_TIMEOUT:
++        set_status(impl, PositionStatus_NoData);
++        return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
++    default:
++        set_status(impl, PositionStatus_NoData);
++        hr = E_FAIL;
++        return hr;
++    }
++}
++
+ HRESULT WINAPI geolocator_LocationStatus(IGeolocator *iface, PositionStatus *value)
+ {
++    struct geolocator *impl = impl_from_IGeolocator(iface);
++
+     TRACE("iface %p, value %p.\n", iface, value);
+ 
+     if (!value) return E_POINTER;
+-    /* there is no location source behind this class */
+-    *value = PositionStatus_NotAvailable;
++    if (location_denied())
++    {
++        *value = PositionStatus_Disabled;
++        return S_OK;
++    }
++    EnterCriticalSection(&impl->cs);
++    /* consent was given back since the last request: Disabled no longer applies */
++    if (impl->status == PositionStatus_Disabled) impl->status = PositionStatus_NotInitialized;
++    *value = impl->status;
++    LeaveCriticalSection(&impl->cs);
+     return S_OK;
+ }
+ 
++struct get_position_params
++{
++    IGeolocator *geolocator;
++    LONGLONG maximum_age_ms;
++    int timeout_ms;
++};
++
++static HRESULT get_position_callback(void *context, IUnknown **object, INT32 *value)
++{
++    struct get_position_params *params = context;
++    struct geolocator *impl = impl_from_IGeolocator(params->geolocator);
++    struct location loc;
++    HRESULT hr = S_OK;
++    BOOL cached = FALSE;
++
++    if (location_denied())
++    {
++#ifndef SG_MUTANT_GEO_CALL_WHEN_DENIED
++        set_status(impl, PositionStatus_Disabled);
++        hr = E_ACCESSDENIED;
++        goto done;
++#endif
++    }
++
++    EnterCriticalSection(&impl->cs);
++    if (impl->has_cache && (LONGLONG)(GetTickCount64() - impl->cache_tick) <= params->maximum_age_ms)
++    {
++        loc = impl->cache;
++        cached = TRUE;
++    }
++    LeaveCriticalSection(&impl->cs);
++
++    if (!cached) hr = fetch_location(impl, params->timeout_ms, &loc);
++    if (SUCCEEDED(hr))
++    {
++        IGeoposition *position;
++
++        if (SUCCEEDED(hr = geoposition_create(&loc, &position))) *object = (IUnknown *)position;
++    }
++done:
++    IGeolocator_Release(params->geolocator);
++    return hr;
++}
++
++static HRESULT start_get_position(IGeolocator *iface, LONGLONG maximum_age_ms, LONGLONG timeout_ms,
++        IAsyncOperation_Geoposition **value)
++{
++    struct get_position_params *params;
++    HRESULT hr;
++
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (!(params = malloc(sizeof(*params)))) return E_OUTOFMEMORY;
++    IGeolocator_AddRef((params->geolocator = iface));
++    params->maximum_age_ms = maximum_age_ms;
++    params->timeout_ms = timeout_ms > 600000 ? 600000 : timeout_ms;
++    if (FAILED(hr = async_geoposition_create(get_position_callback, params, value)))
++    {
++        IGeolocator_Release(iface);
++        free(params);
++    }
++    return hr;
++}
++
+ HRESULT WINAPI geolocator_GetGeopositionAsync(IGeolocator *iface, IAsyncOperation_Geoposition **value)
+ {
+-    FIXME("iface %p, value %p stub.\n", iface, value);
+-    return E_NOTIMPL;
++    TRACE("iface %p, value %p.\n", iface, value);
++    return start_get_position(iface, 0, DEFAULT_TIMEOUT_MS, value);
+ }
+ 
+ HRESULT WINAPI geolocator_GetGeopositionAsyncWithAgeAndTimeout(IGeolocator *iface, TimeSpan maximum_age, TimeSpan timeout, IAsyncOperation_Geoposition **value)
+ {
+-    FIXME("iface %p, maximum_age %#I64x, timeout %#I64x, value %p stub.\n", iface, maximum_age.Duration, timeout.Duration, value);
+-    return E_NOTIMPL;
++    TRACE("iface %p, maximum_age %#I64x, timeout %#I64x, value %p.\n", iface, maximum_age.Duration, timeout.Duration, value);
++
++    if (maximum_age.Duration < 0 || timeout.Duration < 0) return E_INVALIDARG;
++    return start_get_position(iface, maximum_age.Duration / 10000, max(timeout.Duration / 10000, 1000), value);
++}
++
++/* PositionChanged / StatusChanged: a watcher thread polls GeoClue while handlers are registered */
++
++static double distance_meters(const struct location *a, const struct location *b)
++{
++    const double rad = 3.14159265358979323846 / 180.0;
++    double dlat = (b->latitude - a->latitude) * rad, dlon = (b->longitude - a->longitude) * rad;
++    double x = dlon * cos((a->latitude + b->latitude) * rad / 2), y = dlat;
++    return 6371000.0 * sqrt(x * x + y * y);
++}
++
++static DWORD WINAPI watcher_thread(void *context)
++{
++    struct geolocator *impl = context;
++    IGeolocator *iface = &impl->IGeolocator_iface;
++    LONG my_gen = impl->watch_gen;
++    struct location last, loc;
++    BOOL have_last = FALSE;
++    ULONGLONG last_report = 0;
++
++    for (;;)
++    {
++        ULONG waited = 0, period;
++        LONG ref;
++        HRESULT hr;
++
++        /* run only while somebody still holds the geolocator */
++        do
++        {
++            if (!(ref = ReadNoFence(&impl->ref_public))) goto out;
++        } while (ref != InterlockedCompareExchange(&impl->ref_public, ref + 1, ref));
++        IWeakReference_AddRef(&impl->IWeakReference_iface);
++
++        EnterCriticalSection(&impl->cs);
++        period = impl->interval;
++        LeaveCriticalSection(&impl->cs);
++        if (impl->watch_gen != my_gen) { geolocator_Release(iface); goto out; }
++
++        hr = fetch_location(impl, 15000, &loc);
++        if (SUCCEEDED(hr))
++        {
++            double threshold;
++            ULONGLONG now = GetTickCount64();
++
++            EnterCriticalSection(&impl->cs);
++            threshold = impl->threshold;
++            LeaveCriticalSection(&impl->cs);
++
++            if (!have_last || (distance_meters(&last, &loc) >= max(threshold, 0.5) && now - last_report >= period))
++            {
++                IGeoposition *position;
++
++                if (SUCCEEDED(geoposition_create(&loc, &position)))
++                {
++                    fire_position_changed(impl, position);
++                    IGeoposition_Release(position);
++                }
++                last = loc;
++                have_last = TRUE;
++                last_report = now;
++            }
++        }
++        geolocator_Release(iface);
++
++        period = max(period, POLL_INTERVAL_MS);
++        while (waited < period)
++        {
++            Sleep(200);
++            waited += 200;
++            if (impl->watch_gen != my_gen) goto out;
++        }
++    }
++out:
++    IWeakReference_Release(&impl->IWeakReference_iface);
++    return 0;
++}
++
++static void start_watcher(struct geolocator *impl)
++{
++    HANDLE thread;
++
++    if (impl->watching) return;
++    impl->watching = TRUE;
++    InterlockedIncrement(&impl->watch_gen);
++    IWeakReference_AddRef(&impl->IWeakReference_iface);   /* kept by the thread */
++    if (!(thread = CreateThread(NULL, 0, watcher_thread, impl, 0, NULL)))
++    {
++        impl->watching = FALSE;
++        IWeakReference_Release(&impl->IWeakReference_iface);
++        return;
++    }
++    CloseHandle(thread);
++}
++
++static void stop_watcher_if_idle(struct geolocator *impl)
++{
++    if (impl->watching && !impl->position_count && !impl->status_count)
++    {
++        impl->watching = FALSE;
++        InterlockedIncrement(&impl->watch_gen);
++    }
++}
++
++static HRESULT add_handler(struct geolocator *impl, struct handler **list, ULONG *count, ULONG *cap,
++        IUnknown *handler, EventRegistrationToken *token)
++{
++    if (*count == *cap)
++    {
++        ULONG new_cap = *cap ? *cap * 2 : 4;
++        struct handler *p = realloc(*list, new_cap * sizeof(*p));
++        if (!p) return E_OUTOFMEMORY;
++        *list = p;
++        *cap = new_cap;
++    }
++    IUnknown_AddRef(handler);
++    (*list)[*count].handler = handler;
++    (*list)[*count].token.value = token->value = InterlockedIncrement64(&impl->next_token);
++    (*count)++;
++    return S_OK;
++}
++
++static HRESULT remove_handler(struct geolocator *impl, struct handler *list, ULONG *count, EventRegistrationToken token)
++{
++    ULONG i;
++
++    for (i = 0; i < *count; i++)
++    {
++        if (list[i].token.value != token.value) continue;
++        IUnknown_Release(list[i].handler);
++        memmove(&list[i], &list[i + 1], (*count - i - 1) * sizeof(*list));
++        (*count)--;
++        break;
++    }
++    stop_watcher_if_idle(impl);
++    return S_OK;
+ }
+ 
+-/* handlers are accepted and never called: without a location source there is no position or status to report */
+ HRESULT WINAPI geolocator_add_PositionChanged(IGeolocator *iface, ITypedEventHandler_Geolocator_PositionChangedEventArgs *handler, EventRegistrationToken *token)
+ {
+     struct geolocator *impl = impl_from_IGeolocator(iface);
++    HRESULT hr;
+ 
+     TRACE("iface %p, handler %p, token %p.\n", iface, handler, token);
+ 
+     if (!handler || !token) return E_POINTER;
+-    token->value = InterlockedIncrement64(&impl->next_token);
+-    return S_OK;
++    EnterCriticalSection(&impl->cs);
++    if (SUCCEEDED(hr = add_handler(impl, &impl->position_handlers, &impl->position_count, &impl->position_cap,
++                                   (IUnknown *)handler, token)))
++        start_watcher(impl);
++    LeaveCriticalSection(&impl->cs);
++    return hr;
+ }
+ 
+ HRESULT WINAPI geolocator_remove_PositionChanged(IGeolocator *iface, EventRegistrationToken token)
+ {
++    struct geolocator *impl = impl_from_IGeolocator(iface);
++    HRESULT hr;
++
+     TRACE("iface %p, token %#I64x.\n", iface, token.value);
+-    return S_OK;
++
++    EnterCriticalSection(&impl->cs);
++    hr = remove_handler(impl, impl->position_handlers, &impl->position_count, token);
++    LeaveCriticalSection(&impl->cs);
++    return hr;
+ }
+ 
+ HRESULT WINAPI geolocator_add_StatusChanged(IGeolocator *iface, ITypedEventHandler_Geolocator_StatusChangedEventArgs *handler, EventRegistrationToken *token)
+ {
+     struct geolocator *impl = impl_from_IGeolocator(iface);
++    HRESULT hr;
+ 
+     TRACE("iface %p, handler %p, token %p.\n", iface, handler, token);
+ 
+     if (!handler || !token) return E_POINTER;
+-    token->value = InterlockedIncrement64(&impl->next_token);
+-    return S_OK;
++    EnterCriticalSection(&impl->cs);
++    if (SUCCEEDED(hr = add_handler(impl, &impl->status_handlers, &impl->status_count, &impl->status_cap,
++                                   (IUnknown *)handler, token)))
++        start_watcher(impl);
++    LeaveCriticalSection(&impl->cs);
++    return hr;
+ }
+ 
+ HRESULT WINAPI geolocator_remove_StatusChanged(IGeolocator *iface, EventRegistrationToken token)
+ {
++    struct geolocator *impl = impl_from_IGeolocator(iface);
++    HRESULT hr;
++
+     TRACE("iface %p, token %#I64x.\n", iface, token.value);
+-    return S_OK;
++
++    EnterCriticalSection(&impl->cs);
++    hr = remove_handler(impl, impl->status_handlers, &impl->status_count, token);
++    LeaveCriticalSection(&impl->cs);
++    return hr;
+ }
+ 
+ static const struct IGeolocatorVtbl geolocator_vtbl =
+@@ -320,7 +758,17 @@
+     struct geolocator *impl = impl_from_IWeakReference(iface);
+     ULONG ref = InterlockedDecrement(&impl->ref_weak);
+     if (!ref)
++    {
++        ULONG i;
++
++        for (i = 0; i < impl->position_count; i++) IUnknown_Release(impl->position_handlers[i].handler);
++        for (i = 0; i < impl->status_count; i++) IUnknown_Release(impl->status_handlers[i].handler);
++        free(impl->position_handlers);
++        free(impl->status_handlers);
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection(&impl->cs);
+         free(impl);
++    }
+     return ref;
+ }
+ 
+@@ -417,6 +865,13 @@
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID(iid, &IID_IGeolocatorStatics))
++    {
++        *out = &impl->IGeolocatorStatics_iface;
++        IInspectable_AddRef(*out);
++        return S_OK;
++    }
++
+     FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -475,6 +930,9 @@
+     impl->IWeakReference_iface.lpVtbl = &weak_reference_vtbl;
+     impl->ref_public = 1;
+     impl->ref_weak = 1;
++    impl->status = PositionStatus_NotInitialized;
++    InitializeCriticalSectionEx(&impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": geolocator.cs");
+ 
+     *instance = (IInspectable *)&impl->IGeolocator_iface;
+     return S_OK;
+@@ -493,9 +951,71 @@
+     factory_ActivateInstance,
+ };
+ 
++static inline struct geolocator_statics *impl_from_IGeolocatorStatics(IGeolocatorStatics *iface)
++{
++    return CONTAINING_RECORD(iface, struct geolocator_statics, IGeolocatorStatics_iface);
++}
++
++static HRESULT WINAPI statics_QueryInterface(IGeolocatorStatics *iface, REFIID iid, void **out)
++{
++    return factory_QueryInterface(&impl_from_IGeolocatorStatics(iface)->IActivationFactory_iface, iid, out);
++}
++
++static ULONG WINAPI statics_AddRef(IGeolocatorStatics *iface)
++{
++    return factory_AddRef(&impl_from_IGeolocatorStatics(iface)->IActivationFactory_iface);
++}
++
++static ULONG WINAPI statics_Release(IGeolocatorStatics *iface)
++{
++    return factory_Release(&impl_from_IGeolocatorStatics(iface)->IActivationFactory_iface);
++}
++
++static HRESULT WINAPI statics_GetIids(IGeolocatorStatics *iface, ULONG *iid_count, IID **iids)
++{
++    return get_one_iid(&IID_IGeolocatorStatics, iid_count, iids);
++}
++
++static HRESULT WINAPI statics_GetRuntimeClassName(IGeolocatorStatics *iface, HSTRING *class_name)
++{
++    return get_class_name(class_name);
++}
++
++static HRESULT WINAPI statics_GetTrustLevel(IGeolocatorStatics *iface, TrustLevel *trust_level)
++{
++    return get_base_trust(trust_level);
++}
++
++static HRESULT access_callback(void *param, IUnknown **object, INT32 *value)
++{
++    /* Settings' location switches decide; apps are asked nothing here */
++    *value = location_denied() ? GeolocationAccessStatus_Denied : GeolocationAccessStatus_Allowed;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_RequestAccessAsync(IGeolocatorStatics *iface, IAsyncOperation_GeolocationAccessStatus **value)
++{
++    TRACE("iface %p, value %p.\n", iface, value);
++
++    if (!value) return E_POINTER;
++    return async_access_create(access_callback, NULL, value);
++}
++
++static const IGeolocatorStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface,
++    statics_AddRef,
++    statics_Release,
++    statics_GetIids,
++    statics_GetRuntimeClassName,
++    statics_GetTrustLevel,
++    statics_RequestAccessAsync,
++};
++
+ static struct geolocator_statics geolocator_statics =
+ {
+     {&factory_vtbl},
++    {&statics_vtbl},
+     1,
+ };
+ 
+--- /dev/null
++++ b/dlls/geolocation/position.c
+@@ -0,0 +1,564 @@
++/*
++ * Geoposition, Geocoordinate and the event argument classes
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(geolocator);
++
++static HRESULT one_iid( const GUID *iid, ULONG *count, IID **iids )
++{
++    if (!count || !iids) return E_POINTER;
++    if (!(*iids = CoTaskMemAlloc( sizeof(IID) ))) return E_OUTOFMEMORY;
++    **iids = *iid;
++    *count = 1;
++    return S_OK;
++}
++
++static HRESULT class_name( const WCHAR *name, HSTRING *out )
++{
++    if (!out) return E_POINTER;
++    return WindowsCreateString( name, wcslen( name ), out );
++}
++
++/* IReference<DOUBLE> */
++
++struct double_ref
++{
++    IReference_DOUBLE IReference_DOUBLE_iface;
++    LONG ref;
++    DOUBLE value;
++};
++
++static inline struct double_ref *impl_from_double_ref( IReference_DOUBLE *iface )
++{
++    return CONTAINING_RECORD( iface, struct double_ref, IReference_DOUBLE_iface );
++}
++
++static HRESULT WINAPI double_ref_QueryInterface( IReference_DOUBLE *iface, REFIID iid, void **out )
++{
++    struct double_ref *impl = impl_from_double_ref( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IReference_DOUBLE ))
++    {
++        IReference_DOUBLE_AddRef( (*out = &impl->IReference_DOUBLE_iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI double_ref_AddRef( IReference_DOUBLE *iface )
++{
++    return InterlockedIncrement( &impl_from_double_ref( iface )->ref );
++}
++
++static ULONG WINAPI double_ref_Release( IReference_DOUBLE *iface )
++{
++    struct double_ref *impl = impl_from_double_ref( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI double_ref_GetIids( IReference_DOUBLE *iface, ULONG *count, IID **iids )
++{
++    return one_iid( &IID_IReference_DOUBLE, count, iids );
++}
++
++static HRESULT WINAPI double_ref_GetRuntimeClassName( IReference_DOUBLE *iface, HSTRING *name )
++{
++    return class_name( L"Windows.Foundation.IReference`1<Double>", name );
++}
++
++static HRESULT WINAPI double_ref_GetTrustLevel( IReference_DOUBLE *iface, TrustLevel *level )
++{
++    if (!level) return E_POINTER;
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI double_ref_get_Value( IReference_DOUBLE *iface, DOUBLE *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_double_ref( iface )->value;
++    return S_OK;
++}
++
++static const IReference_DOUBLEVtbl double_ref_vtbl =
++{
++    double_ref_QueryInterface,
++    double_ref_AddRef,
++    double_ref_Release,
++    double_ref_GetIids,
++    double_ref_GetRuntimeClassName,
++    double_ref_GetTrustLevel,
++    double_ref_get_Value,
++};
++
++static HRESULT double_ref_create( DOUBLE value, IReference_DOUBLE **out )
++{
++    struct double_ref *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IReference_DOUBLE_iface.lpVtbl = &double_ref_vtbl;
++    impl->ref = 1;
++    impl->value = value;
++    *out = &impl->IReference_DOUBLE_iface;
++    return S_OK;
++}
++
++/* Geocoordinate */
++
++struct geocoordinate
++{
++    IGeocoordinate IGeocoordinate_iface;
++    LONG ref;
++    struct location loc;
++};
++
++static inline struct geocoordinate *impl_from_IGeocoordinate( IGeocoordinate *iface )
++{
++    return CONTAINING_RECORD( iface, struct geocoordinate, IGeocoordinate_iface );
++}
++
++static HRESULT WINAPI coordinate_QueryInterface( IGeocoordinate *iface, REFIID iid, void **out )
++{
++    struct geocoordinate *impl = impl_from_IGeocoordinate( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IGeocoordinate ))
++    {
++        IGeocoordinate_AddRef( (*out = &impl->IGeocoordinate_iface) );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI coordinate_AddRef( IGeocoordinate *iface )
++{
++    return InterlockedIncrement( &impl_from_IGeocoordinate( iface )->ref );
++}
++
++static ULONG WINAPI coordinate_Release( IGeocoordinate *iface )
++{
++    struct geocoordinate *impl = impl_from_IGeocoordinate( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI coordinate_GetIids( IGeocoordinate *iface, ULONG *count, IID **iids )
++{
++    return one_iid( &IID_IGeocoordinate, count, iids );
++}
++
++static HRESULT WINAPI coordinate_GetRuntimeClassName( IGeocoordinate *iface, HSTRING *name )
++{
++    return class_name( RuntimeClass_Windows_Devices_Geolocation_Geocoordinate, name );
++}
++
++static HRESULT WINAPI coordinate_GetTrustLevel( IGeocoordinate *iface, TrustLevel *level )
++{
++    if (!level) return E_POINTER;
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI coordinate_get_Latitude( IGeocoordinate *iface, DOUBLE *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IGeocoordinate( iface )->loc.latitude;
++    return S_OK;
++}
++
++static HRESULT WINAPI coordinate_get_Longitude( IGeocoordinate *iface, DOUBLE *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IGeocoordinate( iface )->loc.longitude;
++    return S_OK;
++}
++
++static HRESULT optional_double( int present, DOUBLE value, IReference_DOUBLE **out )
++{
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (!present) return S_OK;   /* a null IReference */
++    return double_ref_create( value, out );
++}
++
++static HRESULT WINAPI coordinate_get_Altitude( IGeocoordinate *iface, IReference_DOUBLE **value )
++{
++    struct geocoordinate *impl = impl_from_IGeocoordinate( iface );
++    return optional_double( impl->loc.has_altitude, impl->loc.altitude, value );
++}
++
++static HRESULT WINAPI coordinate_get_Accuracy( IGeocoordinate *iface, DOUBLE *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IGeocoordinate( iface )->loc.accuracy;
++    return S_OK;
++}
++
++static HRESULT WINAPI coordinate_get_AltitudeAccuracy( IGeocoordinate *iface, IReference_DOUBLE **value )
++{
++    /* GeoClue does not report a vertical accuracy */
++    return optional_double( 0, 0, value );
++}
++
++static HRESULT WINAPI coordinate_get_Heading( IGeocoordinate *iface, IReference_DOUBLE **value )
++{
++    struct geocoordinate *impl = impl_from_IGeocoordinate( iface );
++    return optional_double( impl->loc.has_heading, impl->loc.heading, value );
++}
++
++static HRESULT WINAPI coordinate_get_Speed( IGeocoordinate *iface, IReference_DOUBLE **value )
++{
++    struct geocoordinate *impl = impl_from_IGeocoordinate( iface );
++    return optional_double( impl->loc.has_speed, impl->loc.speed, value );
++}
++
++static HRESULT WINAPI coordinate_get_Timestamp( IGeocoordinate *iface, DateTime *value )
++{
++    if (!value) return E_POINTER;
++    value->UniversalTime = impl_from_IGeocoordinate( iface )->loc.timestamp;
++    return S_OK;
++}
++
++static const IGeocoordinateVtbl coordinate_vtbl =
++{
++    coordinate_QueryInterface,
++    coordinate_AddRef,
++    coordinate_Release,
++    coordinate_GetIids,
++    coordinate_GetRuntimeClassName,
++    coordinate_GetTrustLevel,
++    coordinate_get_Latitude,
++    coordinate_get_Longitude,
++    coordinate_get_Altitude,
++    coordinate_get_Accuracy,
++    coordinate_get_AltitudeAccuracy,
++    coordinate_get_Heading,
++    coordinate_get_Speed,
++    coordinate_get_Timestamp,
++};
++
++/* Geoposition */
++
++struct geoposition
++{
++    IGeoposition IGeoposition_iface;
++    LONG ref;
++    IGeocoordinate *coordinate;
++};
++
++static inline struct geoposition *impl_from_IGeoposition( IGeoposition *iface )
++{
++    return CONTAINING_RECORD( iface, struct geoposition, IGeoposition_iface );
++}
++
++static HRESULT WINAPI position_QueryInterface( IGeoposition *iface, REFIID iid, void **out )
++{
++    struct geoposition *impl = impl_from_IGeoposition( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IGeoposition ))
++    {
++        IGeoposition_AddRef( (*out = &impl->IGeoposition_iface) );
++        return S_OK;
++    }
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI position_AddRef( IGeoposition *iface )
++{
++    return InterlockedIncrement( &impl_from_IGeoposition( iface )->ref );
++}
++
++static ULONG WINAPI position_Release( IGeoposition *iface )
++{
++    struct geoposition *impl = impl_from_IGeoposition( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IGeocoordinate_Release( impl->coordinate );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI position_GetIids( IGeoposition *iface, ULONG *count, IID **iids )
++{
++    return one_iid( &IID_IGeoposition, count, iids );
++}
++
++static HRESULT WINAPI position_GetRuntimeClassName( IGeoposition *iface, HSTRING *name )
++{
++    return class_name( RuntimeClass_Windows_Devices_Geolocation_Geoposition, name );
++}
++
++static HRESULT WINAPI position_GetTrustLevel( IGeoposition *iface, TrustLevel *level )
++{
++    if (!level) return E_POINTER;
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI position_get_Coordinate( IGeoposition *iface, IGeocoordinate **value )
++{
++    struct geoposition *impl = impl_from_IGeoposition( iface );
++
++    if (!value) return E_POINTER;
++    IGeocoordinate_AddRef( (*value = impl->coordinate) );
++    return S_OK;
++}
++
++static HRESULT WINAPI position_get_CivicAddress( IGeoposition *iface, ICivicAddress **value )
++{
++    /* GeoClue gives coordinates only, like a machine without a civic address provider */
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return S_OK;
++}
++
++static const IGeopositionVtbl position_vtbl =
++{
++    position_QueryInterface,
++    position_AddRef,
++    position_Release,
++    position_GetIids,
++    position_GetRuntimeClassName,
++    position_GetTrustLevel,
++    position_get_Coordinate,
++    position_get_CivicAddress,
++};
++
++HRESULT geoposition_create( const struct location *loc, IGeoposition **out )
++{
++    struct geoposition *position;
++    struct geocoordinate *coordinate;
++
++    *out = NULL;
++    if (!(coordinate = calloc( 1, sizeof(*coordinate) ))) return E_OUTOFMEMORY;
++    coordinate->IGeocoordinate_iface.lpVtbl = &coordinate_vtbl;
++    coordinate->ref = 1;
++    coordinate->loc = *loc;
++
++    if (!(position = calloc( 1, sizeof(*position) )))
++    {
++        free( coordinate );
++        return E_OUTOFMEMORY;
++    }
++    position->IGeoposition_iface.lpVtbl = &position_vtbl;
++    position->ref = 1;
++    position->coordinate = &coordinate->IGeocoordinate_iface;
++    *out = &position->IGeoposition_iface;
++    return S_OK;
++}
++
++/* PositionChangedEventArgs */
++
++struct position_args
++{
++    IPositionChangedEventArgs IPositionChangedEventArgs_iface;
++    LONG ref;
++    IGeoposition *position;
++};
++
++static inline struct position_args *impl_from_IPositionChangedEventArgs( IPositionChangedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct position_args, IPositionChangedEventArgs_iface );
++}
++
++static HRESULT WINAPI pargs_QueryInterface( IPositionChangedEventArgs *iface, REFIID iid, void **out )
++{
++    struct position_args *impl = impl_from_IPositionChangedEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IPositionChangedEventArgs ))
++    {
++        IPositionChangedEventArgs_AddRef( (*out = &impl->IPositionChangedEventArgs_iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI pargs_AddRef( IPositionChangedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IPositionChangedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI pargs_Release( IPositionChangedEventArgs *iface )
++{
++    struct position_args *impl = impl_from_IPositionChangedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IGeoposition_Release( impl->position );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI pargs_GetIids( IPositionChangedEventArgs *iface, ULONG *count, IID **iids )
++{
++    return one_iid( &IID_IPositionChangedEventArgs, count, iids );
++}
++
++static HRESULT WINAPI pargs_GetRuntimeClassName( IPositionChangedEventArgs *iface, HSTRING *name )
++{
++    return class_name( RuntimeClass_Windows_Devices_Geolocation_PositionChangedEventArgs, name );
++}
++
++static HRESULT WINAPI pargs_GetTrustLevel( IPositionChangedEventArgs *iface, TrustLevel *level )
++{
++    if (!level) return E_POINTER;
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI pargs_get_Position( IPositionChangedEventArgs *iface, IGeoposition **value )
++{
++    struct position_args *impl = impl_from_IPositionChangedEventArgs( iface );
++
++    if (!value) return E_POINTER;
++    IGeoposition_AddRef( (*value = impl->position) );
++    return S_OK;
++}
++
++static const IPositionChangedEventArgsVtbl pargs_vtbl =
++{
++    pargs_QueryInterface,
++    pargs_AddRef,
++    pargs_Release,
++    pargs_GetIids,
++    pargs_GetRuntimeClassName,
++    pargs_GetTrustLevel,
++    pargs_get_Position,
++};
++
++HRESULT position_changed_args_create( IGeoposition *position, IPositionChangedEventArgs **out )
++{
++    struct position_args *impl;
++
++    *out = NULL;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IPositionChangedEventArgs_iface.lpVtbl = &pargs_vtbl;
++    impl->ref = 1;
++    IGeoposition_AddRef( (impl->position = position) );
++    *out = &impl->IPositionChangedEventArgs_iface;
++    return S_OK;
++}
++
++/* StatusChangedEventArgs */
++
++struct status_args
++{
++    IStatusChangedEventArgs IStatusChangedEventArgs_iface;
++    LONG ref;
++    PositionStatus status;
++};
++
++static inline struct status_args *impl_from_IStatusChangedEventArgs( IStatusChangedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct status_args, IStatusChangedEventArgs_iface );
++}
++
++static HRESULT WINAPI sargs_QueryInterface( IStatusChangedEventArgs *iface, REFIID iid, void **out )
++{
++    struct status_args *impl = impl_from_IStatusChangedEventArgs( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IStatusChangedEventArgs ))
++    {
++        IStatusChangedEventArgs_AddRef( (*out = &impl->IStatusChangedEventArgs_iface) );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI sargs_AddRef( IStatusChangedEventArgs *iface )
++{
++    return InterlockedIncrement( &impl_from_IStatusChangedEventArgs( iface )->ref );
++}
++
++static ULONG WINAPI sargs_Release( IStatusChangedEventArgs *iface )
++{
++    struct status_args *impl = impl_from_IStatusChangedEventArgs( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI sargs_GetIids( IStatusChangedEventArgs *iface, ULONG *count, IID **iids )
++{
++    return one_iid( &IID_IStatusChangedEventArgs, count, iids );
++}
++
++static HRESULT WINAPI sargs_GetRuntimeClassName( IStatusChangedEventArgs *iface, HSTRING *name )
++{
++    return class_name( RuntimeClass_Windows_Devices_Geolocation_StatusChangedEventArgs, name );
++}
++
++static HRESULT WINAPI sargs_GetTrustLevel( IStatusChangedEventArgs *iface, TrustLevel *level )
++{
++    if (!level) return E_POINTER;
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI sargs_get_Status( IStatusChangedEventArgs *iface, PositionStatus *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IStatusChangedEventArgs( iface )->status;
++    return S_OK;
++}
++
++static const IStatusChangedEventArgsVtbl sargs_vtbl =
++{
++    sargs_QueryInterface,
++    sargs_AddRef,
++    sargs_Release,
++    sargs_GetIids,
++    sargs_GetRuntimeClassName,
++    sargs_GetTrustLevel,
++    sargs_get_Status,
++};
++
++HRESULT status_changed_args_create( PositionStatus status, IStatusChangedEventArgs **out )
++{
++    struct status_args *impl;
++
++    *out = NULL;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IStatusChangedEventArgs_iface.lpVtbl = &sargs_vtbl;
++    impl->ref = 1;
++    impl->status = status;
++    *out = &impl->IStatusChangedEventArgs_iface;
++    return S_OK;
++}
+--- a/dlls/geolocation/private.h
++++ b/dlls/geolocation/private.h
+@@ -1,6 +1,5 @@
+-/* WinRT Windows.Devices.Geolocation.Geolocator Implementation
+- *
+- * Copyright 2023 Fabian Maurer
++/*
++ * Geolocation private header
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -36,4 +35,21 @@
+ #define WIDL_using_Windows_Devices_Geolocation
+ #include "windows.devices.geolocation.h"
+ 
++struct location
++{
++    DOUBLE latitude, longitude, accuracy, altitude, speed, heading;
++    int has_altitude, has_speed, has_heading;
++    LONGLONG timestamp;   /* 100ns since 1601 */
++};
++
++/* position.c */
++HRESULT geoposition_create( const struct location *loc, IGeoposition **out );
++HRESULT position_changed_args_create( IGeoposition *position, IPositionChangedEventArgs **out );
++HRESULT status_changed_args_create( PositionStatus status, IStatusChangedEventArgs **out );
++
++/* async.c: the callback runs on a thread pool thread and frees nothing; "param" is free()d afterwards */
++typedef HRESULT (*async_callback)( void *param, IUnknown **object, INT32 *value );
++HRESULT async_geoposition_create( async_callback callback, void *param, IAsyncOperation_Geoposition **out );
++HRESULT async_access_create( async_callback callback, void *param, IAsyncOperation_GeolocationAccessStatus **out );
++
+ #endif
+--- /dev/null
++++ b/dlls/geolocation/unixlib.c
+@@ -0,0 +1,416 @@
++/*
++ * Geolocation: GeoClue2 client over the system D-Bus (libdbus loaded with dlopen)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <string.h>
++#include <stdlib.h>
++#include <stdarg.h>
++#include <dlfcn.h>
++#include <time.h>
++#include <float.h>
++#ifdef SONAME_LIBDBUS_1
++# include <dbus/dbus.h>
++#endif
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "unixlib.h"
++
++#ifdef SONAME_LIBDBUS_1
++
++#define DBUS_FUNCS \
++    DO_FUNC(dbus_bus_add_match); \
++    DO_FUNC(dbus_bus_get_private); \
++    DO_FUNC(dbus_bus_register); \
++    DO_FUNC(dbus_connection_close); \
++    DO_FUNC(dbus_connection_open_private); \
++    DO_FUNC(dbus_connection_pop_message); \
++    DO_FUNC(dbus_connection_read_write_dispatch); \
++    DO_FUNC(dbus_connection_send_with_reply_and_block); \
++    DO_FUNC(dbus_connection_set_exit_on_disconnect); \
++    DO_FUNC(dbus_connection_unref); \
++    DO_FUNC(dbus_error_free); \
++    DO_FUNC(dbus_error_init); \
++    DO_FUNC(dbus_error_is_set); \
++    DO_FUNC(dbus_message_get_args); \
++    DO_FUNC(dbus_message_is_signal); \
++    DO_FUNC(dbus_message_iter_append_basic); \
++    DO_FUNC(dbus_message_iter_close_container); \
++    DO_FUNC(dbus_message_iter_get_arg_type); \
++    DO_FUNC(dbus_message_iter_get_basic); \
++    DO_FUNC(dbus_message_iter_init); \
++    DO_FUNC(dbus_message_iter_init_append); \
++    DO_FUNC(dbus_message_iter_next); \
++    DO_FUNC(dbus_message_iter_open_container); \
++    DO_FUNC(dbus_message_iter_recurse); \
++    DO_FUNC(dbus_message_new_method_call); \
++    DO_FUNC(dbus_message_unref)
++
++#define DO_FUNC(f) static typeof(f) * p_##f
++DBUS_FUNCS;
++#undef DO_FUNC
++
++static BOOL load_dbus(void)
++{
++    static int loaded = -1;
++    void *handle;
++
++    if (loaded != -1) return loaded;
++    loaded = 0;
++    if (!(handle = dlopen( SONAME_LIBDBUS_1, RTLD_NOW ))) return FALSE;
++#define DO_FUNC(f) if (!(p_##f = dlsym( handle, #f ))) return FALSE
++    DBUS_FUNCS;
++#undef DO_FUNC
++    loaded = 1;
++    return TRUE;
++}
++
++#define GEOCLUE_NAME        "org.freedesktop.GeoClue2"
++#define GEOCLUE_MANAGER     "/org/freedesktop/GeoClue2/Manager"
++#define GEOCLUE_MANAGER_IF  "org.freedesktop.GeoClue2.Manager"
++#define GEOCLUE_CLIENT_IF   "org.freedesktop.GeoClue2.Client"
++#define GEOCLUE_LOCATION_IF "org.freedesktop.GeoClue2.Location"
++#define PROPERTIES_IF       "org.freedesktop.DBus.Properties"
++
++/* GeoClue's GClueAccuracyLevel */
++#define ACCURACY_NEIGHBORHOOD 5
++#define ACCURACY_EXACT        8
++
++/* test-only: a private bus instead of the system bus */
++#define TEST_BUS_ENV "WINE_SG_GEOCLUE_BUS_ADDRESS"
++
++static int error_result( DBusError *err )
++{
++    if (!err->name) return LOCATION_FAILED;
++    if (!strcmp( err->name, DBUS_ERROR_ACCESS_DENIED ) ||
++        !strcmp( err->name, "org.freedesktop.DBus.Error.AuthFailed" ))
++        return LOCATION_DENIED;
++    if (!strcmp( err->name, DBUS_ERROR_SERVICE_UNKNOWN ) || !strcmp( err->name, DBUS_ERROR_NAME_HAS_NO_OWNER ) ||
++        !strcmp( err->name, DBUS_ERROR_NO_SERVER ) || !strcmp( err->name, DBUS_ERROR_DISCONNECTED ) ||
++        !strcmp( err->name, DBUS_ERROR_NO_REPLY ) || !strcmp( err->name, DBUS_ERROR_TIMED_OUT ))
++        return LOCATION_UNAVAILABLE;
++    return LOCATION_FAILED;
++}
++
++static DBusConnection *connect_bus( DBusError *err )
++{
++    const char *address = getenv( TEST_BUS_ENV );
++    DBusConnection *conn;
++
++    if (address && *address)
++    {
++        if (!(conn = p_dbus_connection_open_private( address, err ))) return NULL;
++        if (!p_dbus_bus_register( conn, err ))
++        {
++            p_dbus_connection_close( conn );
++            p_dbus_connection_unref( conn );
++            return NULL;
++        }
++        return conn;
++    }
++    return p_dbus_bus_get_private( DBUS_BUS_SYSTEM, err );
++}
++
++static DBusMessage *call( DBusConnection *conn, const char *path, const char *iface, const char *method,
++                          DBusError *err )
++{
++    DBusMessage *msg, *reply;
++
++    if (!(msg = p_dbus_message_new_method_call( GEOCLUE_NAME, path, iface, method ))) return NULL;
++    reply = p_dbus_connection_send_with_reply_and_block( conn, msg, 10000, err );
++    p_dbus_message_unref( msg );
++    return reply;
++}
++
++/* Properties.Set( iface, name, variant ) with a string or uint32 value */
++static BOOL set_property( DBusConnection *conn, const char *path, const char *name, int type, const void *value,
++                          DBusError *err )
++{
++    DBusMessage *msg, *reply;
++    DBusMessageIter iter, var;
++    const char *iface = GEOCLUE_CLIENT_IF;
++    const char *sig = type == DBUS_TYPE_STRING ? "s" : "u";
++
++    if (!(msg = p_dbus_message_new_method_call( GEOCLUE_NAME, path, PROPERTIES_IF, "Set" ))) return FALSE;
++    p_dbus_message_iter_init_append( msg, &iter );
++    p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &iface );
++    p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &name );
++    p_dbus_message_iter_open_container( &iter, DBUS_TYPE_VARIANT, sig, &var );
++    p_dbus_message_iter_append_basic( &var, type, value );
++    p_dbus_message_iter_close_container( &iter, &var );
++    reply = p_dbus_connection_send_with_reply_and_block( conn, msg, 10000, err );
++    p_dbus_message_unref( msg );
++    if (!reply) return FALSE;
++    p_dbus_message_unref( reply );
++    return TRUE;
++}
++
++/* Properties.Get( iface, name ): positions the iterator inside the variant */
++static DBusMessage *get_property( DBusConnection *conn, const char *path, const char *iface, const char *name,
++                                  DBusMessageIter *value, DBusError *err )
++{
++    DBusMessage *msg, *reply;
++    DBusMessageIter iter;
++
++    if (!(msg = p_dbus_message_new_method_call( GEOCLUE_NAME, path, PROPERTIES_IF, "Get" ))) return NULL;
++    p_dbus_message_iter_init_append( msg, &iter );
++    p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &iface );
++    p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_STRING, &name );
++    reply = p_dbus_connection_send_with_reply_and_block( conn, msg, 10000, err );
++    p_dbus_message_unref( msg );
++    if (!reply) return NULL;
++    if (!p_dbus_message_iter_init( reply, &iter ) || p_dbus_message_iter_get_arg_type( &iter ) != DBUS_TYPE_VARIANT)
++    {
++        p_dbus_message_unref( reply );
++        return NULL;
++    }
++    p_dbus_message_iter_recurse( &iter, value );
++    return reply;
++}
++
++static BOOL get_double( DBusConnection *conn, const char *path, const char *name, double *ret )
++{
++    DBusMessageIter value;
++    DBusMessage *reply;
++    BOOL ok = FALSE;
++
++    if (!(reply = get_property( conn, path, GEOCLUE_LOCATION_IF, name, &value, NULL ))) return FALSE;
++    if (p_dbus_message_iter_get_arg_type( &value ) == DBUS_TYPE_DOUBLE)
++    {
++        p_dbus_message_iter_get_basic( &value, ret );
++        ok = TRUE;
++    }
++    p_dbus_message_unref( reply );
++    return ok;
++}
++
++static BOOL read_location( DBusConnection *conn, const char *path, struct get_location_params *params )
++{
++    double altitude, speed, heading;
++    DBusMessageIter value, st;
++    DBusMessage *reply;
++
++    if (!get_double( conn, path, "Latitude", &params->latitude ) ||
++        !get_double( conn, path, "Longitude", &params->longitude ) ||
++        !get_double( conn, path, "Accuracy", &params->accuracy ))
++        return FALSE;
++
++    params->flags = 0;
++    /* GeoClue reports "unknown" as the most negative double (altitude) or -1 (speed, heading) */
++    if (get_double( conn, path, "Altitude", &altitude ) && altitude > -1e300)
++    {
++        params->altitude = altitude;
++        params->flags |= LOCATION_HAS_ALTITUDE;
++    }
++    if (get_double( conn, path, "Speed", &speed ) && speed >= 0)
++    {
++        params->speed = speed;
++        params->flags |= LOCATION_HAS_SPEED;
++    }
++    if (get_double( conn, path, "Heading", &heading ) && heading >= 0)
++    {
++        params->heading = heading;
++        params->flags |= LOCATION_HAS_HEADING;
++    }
++
++    params->time_sec = time( NULL );
++    params->time_usec = 0;
++    if ((reply = get_property( conn, path, GEOCLUE_LOCATION_IF, "Timestamp", &value, NULL )))
++    {
++        if (p_dbus_message_iter_get_arg_type( &value ) == DBUS_TYPE_STRUCT)
++        {
++            dbus_uint64_t sec = 0, usec = 0;
++
++            p_dbus_message_iter_recurse( &value, &st );
++            p_dbus_message_iter_get_basic( &st, &sec );
++            p_dbus_message_iter_next( &st );
++            p_dbus_message_iter_get_basic( &st, &usec );
++            if (sec) { params->time_sec = sec; params->time_usec = usec; }
++        }
++        p_dbus_message_unref( reply );
++    }
++    return TRUE;
++}
++
++/* Location property of a client: the object path, "/" while there is no fix */
++static BOOL client_location( DBusConnection *conn, const char *client, char *out, size_t size )
++{
++    DBusMessageIter value;
++    DBusMessage *reply;
++    const char *path;
++    BOOL ok = FALSE;
++
++    if (!(reply = get_property( conn, client, GEOCLUE_CLIENT_IF, "Location", &value, NULL ))) return FALSE;
++    if (p_dbus_message_iter_get_arg_type( &value ) == DBUS_TYPE_OBJECT_PATH)
++    {
++        p_dbus_message_iter_get_basic( &value, &path );
++        if (strlen( path ) < size) { strcpy( out, path ); ok = TRUE; }
++    }
++    p_dbus_message_unref( reply );
++    return ok;
++}
++
++/* waits for LocationUpdated; returns the new location path or NULL on timeout */
++static BOOL wait_location_updated( DBusConnection *conn, int timeout_ms, char *out, size_t size )
++{
++    time_t end = time( NULL ) + (timeout_ms + 999) / 1000;
++
++    while (time( NULL ) < end)
++    {
++        DBusMessage *msg;
++
++        while ((msg = p_dbus_connection_pop_message( conn )))
++        {
++            if (p_dbus_message_is_signal( msg, GEOCLUE_CLIENT_IF, "LocationUpdated" ))
++            {
++                const char *old = NULL, *new = NULL;
++
++                if (p_dbus_message_get_args( msg, NULL, DBUS_TYPE_OBJECT_PATH, &old, DBUS_TYPE_OBJECT_PATH, &new,
++                                             DBUS_TYPE_INVALID ) && new && strcmp( new, "/" ) && strlen( new ) < size)
++                {
++                    strcpy( out, new );
++                    p_dbus_message_unref( msg );
++                    return TRUE;
++                }
++            }
++            p_dbus_message_unref( msg );
++        }
++        if (!p_dbus_connection_read_write_dispatch( conn, 500 )) break;
++    }
++    return FALSE;
++}
++
++
++static int do_get_location( struct get_location_params *params )
++{
++    DBusConnection *conn;
++    DBusMessage *reply;
++    DBusError err;
++    char client[256], location[256];
++    const char *path, *desktop_id = "wine";
++    dbus_uint32_t level = params->high_accuracy ? ACCURACY_EXACT : ACCURACY_NEIGHBORHOOD;
++    int result;
++
++    if (!load_dbus()) return LOCATION_UNAVAILABLE;
++    p_dbus_error_init( &err );
++    if (!(conn = connect_bus( &err )))
++    {
++        p_dbus_error_free( &err );
++        return LOCATION_UNAVAILABLE;
++    }
++    p_dbus_connection_set_exit_on_disconnect( conn, FALSE );
++
++    if (!(reply = call( conn, GEOCLUE_MANAGER, GEOCLUE_MANAGER_IF, "GetClient", &err )))
++    {
++        result = error_result( &err );
++        goto done;
++    }
++    if (!p_dbus_message_get_args( reply, NULL, DBUS_TYPE_OBJECT_PATH, &path, DBUS_TYPE_INVALID ) || strlen( path ) >= sizeof(client))
++    {
++        p_dbus_message_unref( reply );
++        result = LOCATION_FAILED;
++        goto done;
++    }
++    strcpy( client, path );
++    p_dbus_message_unref( reply );
++
++    if (!set_property( conn, client, "DesktopId", DBUS_TYPE_STRING, &desktop_id, &err ) ||
++        !set_property( conn, client, "RequestedAccuracyLevel", DBUS_TYPE_UINT32, &level, &err ))
++    {
++        result = error_result( &err );
++        goto done;
++    }
++
++    p_dbus_bus_add_match( conn, "type='signal',interface='" GEOCLUE_CLIENT_IF "',member='LocationUpdated'", NULL );
++    if (!(reply = call( conn, client, GEOCLUE_CLIENT_IF, "Start", &err )))
++    {
++        result = error_result( &err );
++        goto done;
++    }
++    p_dbus_message_unref( reply );
++
++    location[0] = 0;
++    if (!client_location( conn, client, location, sizeof(location) ) || !strcmp( location, "/" ))
++    {
++        if (!wait_location_updated( conn, params->timeout_ms, location, sizeof(location) ))
++        {
++            result = LOCATION_TIMEOUT;
++            goto stop;
++        }
++    }
++
++    if (read_location( conn, location, params ))
++    {
++        result = LOCATION_OK;
++#ifdef SG_MUTANT_GEO_SWAP
++        {
++            double tmp = params->latitude;
++            params->latitude = params->longitude;
++            params->longitude = tmp;
++        }
++#endif
++    }
++    else result = LOCATION_FAILED;
++
++stop:
++    if ((reply = call( conn, client, GEOCLUE_CLIENT_IF, "Stop", NULL ))) p_dbus_message_unref( reply );
++done:
++    if (p_dbus_error_is_set( &err )) p_dbus_error_free( &err );
++    p_dbus_connection_close( conn );
++    p_dbus_connection_unref( conn );
++    return result;
++}
++
++#endif /* SONAME_LIBDBUS_1 */
++
++static NTSTATUS get_location( void *args )
++{
++    struct get_location_params *params = args;
++
++#ifdef SONAME_LIBDBUS_1
++    params->result = do_get_location( params );
++#else
++    params->result = LOCATION_UNAVAILABLE;
++#endif
++    return STATUS_SUCCESS;
++}
++
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    get_location,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
++
++#ifdef _WIN64
++
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    get_location,
++};
++
++C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
++
++#endif
+--- /dev/null
++++ b/dlls/geolocation/unixlib.h
+@@ -0,0 +1,56 @@
++/*
++ * Geolocation unix library interface (GeoClue2 over D-Bus)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "wine/unixlib.h"
++
++enum location_result
++{
++    LOCATION_OK,
++    LOCATION_UNAVAILABLE,   /* no libdbus, no bus, or GeoClue is not installed / masked */
++    LOCATION_DENIED,        /* GeoClue refuses this client */
++    LOCATION_TIMEOUT,       /* no fix within the timeout */
++    LOCATION_FAILED,        /* any other error */
++};
++
++#define LOCATION_HAS_ALTITUDE 0x01
++#define LOCATION_HAS_SPEED    0x02
++#define LOCATION_HAS_HEADING  0x04
++
++/* no pointers: the same for 32- and 64-bit callers */
++struct get_location_params
++{
++    int high_accuracy;   /* in: PositionAccuracy_High */
++    int timeout_ms;      /* in */
++    int result;          /* out: enum location_result */
++    int flags;           /* out: LOCATION_HAS_* */
++    double latitude;
++    double longitude;
++    double accuracy;     /* meters */
++    double altitude;
++    double speed;        /* meters per second */
++    double heading;      /* degrees from true north */
++    long long time_sec;  /* seconds since 1970 */
++    int time_usec;
++    int pad;
++};
++
++enum geolocation_funcs
++{
++    unix_get_location,
++    unix_funcs_count
++};
+--- a/dlls/geolocation/tests/geolocator.c
++++ b/dlls/geolocation/tests/geolocator.c
+@@ -48,6 +48,55 @@
+         IUnknown_Release(unk);
+ }
+ 
++struct test_handler
++{
++    ITypedEventHandler_Geolocator_PositionChangedEventArgs position_iface;
++    ITypedEventHandler_Geolocator_StatusChangedEventArgs status_iface;
++    LONG ref;
++};
++
++static HRESULT WINAPI handler_QueryInterface(IUnknown *iface, REFIID iid, void **out)
++{
++    *out = iface;
++    IUnknown_AddRef(iface);
++    return S_OK;
++}
++
++static ULONG WINAPI handler_AddRef(IUnknown *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI handler_Release(IUnknown *iface)
++{
++    return 1;
++}
++
++static HRESULT WINAPI position_handler_Invoke(ITypedEventHandler_Geolocator_PositionChangedEventArgs *iface,
++        IGeolocator *sender, IPositionChangedEventArgs *args)
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI status_handler_Invoke(ITypedEventHandler_Geolocator_StatusChangedEventArgs *iface,
++        IGeolocator *sender, IStatusChangedEventArgs *args)
++{
++    return S_OK;
++}
++
++static const ITypedEventHandler_Geolocator_PositionChangedEventArgsVtbl position_handler_vtbl =
++{
++    (void *)handler_QueryInterface, (void *)handler_AddRef, (void *)handler_Release, position_handler_Invoke,
++};
++
++static const ITypedEventHandler_Geolocator_StatusChangedEventArgsVtbl status_handler_vtbl =
++{
++    (void *)handler_QueryInterface, (void *)handler_AddRef, (void *)handler_Release, status_handler_Invoke,
++};
++
++static ITypedEventHandler_Geolocator_PositionChangedEventArgs position_handler = { &position_handler_vtbl };
++static ITypedEventHandler_Geolocator_StatusChangedEventArgs status_handler = { &status_handler_vtbl };
++
+ void test_basic(void)
+ {
+     static const WCHAR *geolocator_name = L"Windows.Devices.Geolocation.Geolocator";
+@@ -131,7 +180,8 @@
+         ok(hr == S_OK && interval == 3000, "got hr %#lx, interval %u.\n", hr, interval);
+ 
+         hr = IGeolocator_get_LocationStatus(geolocator, &status);
+-        ok(hr == S_OK && status == PositionStatus_NotAvailable, "got hr %#lx, status %d.\n", hr, status);
++        ok(hr == S_OK && (status == PositionStatus_NotInitialized || status == PositionStatus_Disabled),
++           "got hr %#lx, status %d.\n", hr, status);
+ 
+         hr = IGeolocator_GetIids(geolocator, &count, &iids);
+         ok(hr == S_OK && count == 1 && IsEqualGUID(&iids[0], &IID_IGeolocator), "got hr %#lx, count %lu.\n", hr, count);
+@@ -143,9 +193,9 @@
+         hr = IGeolocator_GetTrustLevel(geolocator, &trust);
+         ok(hr == S_OK && trust == BaseTrust, "got hr %#lx, trust %d.\n", hr, trust);
+ 
+-        hr = IGeolocator_add_PositionChanged(geolocator, (void *)0xdead, &token);
++        hr = IGeolocator_add_PositionChanged(geolocator, &position_handler, &token);
+         ok(hr == S_OK, "got hr %#lx.\n", hr);
+-        hr = IGeolocator_add_StatusChanged(geolocator, (void *)0xdead, &token2);
++        hr = IGeolocator_add_StatusChanged(geolocator, &status_handler, &token2);
+         ok(hr == S_OK && token2.value != token.value, "got hr %#lx.\n", hr);
+         hr = IGeolocator_remove_PositionChanged(geolocator, token);
+         ok(hr == S_OK, "got hr %#lx.\n", hr);
+@@ -199,6 +249,61 @@
+     IActivationFactory_Release(factory);
+ }
+ 
++static void test_statics(void)
++{
++    static const WCHAR *name = L"Windows.Devices.Geolocation.Geolocator";
++    IAsyncOperation_GeolocationAccessStatus *operation;
++    IGeolocatorStatics *statics;
++    GeolocationAccessStatus access;
++    IActivationFactory *factory;
++    AsyncStatus async_status;
++    IAsyncInfo *info;
++    HSTRING str;
++    HRESULT hr;
++    int i;
++
++    WindowsCreateString(name, wcslen(name), &str);
++    hr = RoGetActivationFactory(str, &IID_IActivationFactory, (void **)&factory);
++    WindowsDeleteString(str);
++    if (hr == REGDB_E_CLASSNOTREG) return;
++    ok(hr == S_OK, "got hr %#lx.\n", hr);
++
++    hr = IActivationFactory_QueryInterface(factory, &IID_IGeolocatorStatics, (void **)&statics);
++    ok(hr == S_OK || broken(hr == E_NOINTERFACE), "got hr %#lx.\n", hr);
++    if (hr != S_OK)
++    {
++        IActivationFactory_Release(factory);
++        return;
++    }
++
++    hr = IGeolocatorStatics_RequestAccessAsync(statics, NULL);
++    ok(hr == E_POINTER, "got hr %#lx.\n", hr);
++    hr = IGeolocatorStatics_RequestAccessAsync(statics, &operation);
++    ok(hr == S_OK, "got hr %#lx.\n", hr);
++
++    hr = IAsyncOperation_GeolocationAccessStatus_QueryInterface(operation, &IID_IAsyncInfo, (void **)&info);
++    ok(hr == S_OK, "got hr %#lx.\n", hr);
++    async_status = Started;
++    for (i = 0; i < 100 && async_status == Started; i++)
++    {
++        hr = IAsyncInfo_get_Status(info, &async_status);
++        ok(hr == S_OK, "got hr %#lx.\n", hr);
++        if (async_status == Started) Sleep(50);
++    }
++    ok(async_status == Completed, "got status %d.\n", async_status);
++    IAsyncInfo_Release(info);
++
++    access = 0xdeadbeef;
++    hr = IAsyncOperation_GeolocationAccessStatus_GetResults(operation, &access);
++    ok(hr == S_OK, "got hr %#lx.\n", hr);
++    ok(access == GeolocationAccessStatus_Allowed || access == GeolocationAccessStatus_Denied ||
++       access == GeolocationAccessStatus_Unspecified, "got access %d.\n", access);
++    IAsyncOperation_GeolocationAccessStatus_Release(operation);
++
++    IGeolocatorStatics_Release(statics);
++    IActivationFactory_Release(factory);
++}
++
+ START_TEST(geolocator)
+ {
+     HRESULT hr;
+@@ -207,6 +312,7 @@
+     ok(hr == S_OK, "RoInitialize failed, hr %#lx\n", hr);
+ 
+     test_basic();
++    test_statics();
+ 
+     RoUninitialize();
+ }

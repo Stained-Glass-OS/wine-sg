@@ -1,0 +1,803 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 12:00:00 +0000
+Subject: [PATCH] ntdll: XPRESS and XPRESS_HUFF compression (patch 5105)
+
+Plain LZ77 and LZ77+Huffman per MS-XCA in RtlCompressBuffer,
+RtlDecompressBuffer and RtlDecompressFragment; gap-CORE items 360-362. Gate
+with the spec examples and five mutants.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+---
+
+diff --git a/dlls/ntdll/rtl.c b/dlls/ntdll/rtl.c
+--- a/dlls/ntdll/rtl.c
++++ b/dlls/ntdll/rtl.c
+@@ -793,15 +793,17 @@
+ NTSTATUS WINAPI RtlGetCompressionWorkSpaceSize(USHORT format, PULONG compress_workspace,
+                                                PULONG decompress_workspace)
+ {
+-    FIXME("0x%04x, %p, %p: semi-stub\n", format, compress_workspace, decompress_workspace);
++    TRACE("0x%04x, %p, %p\n", format, compress_workspace, decompress_workspace);
+ 
+     switch (format & COMPRESSION_FORMAT_MASK)
+     {
+         case COMPRESSION_FORMAT_LZNT1:
++        case COMPRESSION_FORMAT_XPRESS:
++        case COMPRESSION_FORMAT_XPRESS_HUFF:
+             if (compress_workspace)
+             {
+-                /* FIXME: The current implementation of RtlCompressBuffer does not use a
+-                 * workspace buffer, but Windows applications might expect a nonzero value. */
++                /* The implementation of RtlCompressBuffer keeps its tables in memory of its own, but
++                 * programs expect a size to allocate. */
+                 *compress_workspace = 16;
+             }
+             if (decompress_workspace)
+@@ -813,7 +815,7 @@
+             return STATUS_INVALID_PARAMETER;
+ 
+         default:
+-            FIXME("format %u not implemented\n", format);
++            WARN("format %u not supported\n", format);
+             return STATUS_UNSUPPORTED_COMPRESSION;
+     }
+ }
+@@ -964,6 +966,9 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS xpress_compress( USHORT format, const UCHAR *src, ULONG src_size, UCHAR *dst, ULONG dst_size,
++                                 ULONG *final_size );
++
+ /******************************************************************************
+  *  RtlCompressBuffer		[NTDLL.@]
+  */
+@@ -971,7 +976,7 @@
+                                   PUCHAR compressed, ULONG compressed_size, ULONG chunk_size,
+                                   PULONG final_size, PVOID workspace)
+ {
+-    FIXME("0x%04x, %p, %lu, %p, %lu, %lu, %p, %p: semi-stub\n", format, uncompressed,
++    TRACE("0x%04x, %p, %lu, %p, %lu, %lu, %p, %p\n", format, uncompressed,
+           uncompressed_size, compressed, compressed_size, chunk_size, final_size, workspace);
+ 
+     switch (format & COMPRESSION_FORMAT_MASK)
+@@ -980,12 +985,17 @@
+             return lznt1_compress(uncompressed, uncompressed_size, compressed,
+                                   compressed_size, chunk_size, final_size, workspace);
+ 
++        case COMPRESSION_FORMAT_XPRESS:
++        case COMPRESSION_FORMAT_XPRESS_HUFF:
++            return xpress_compress(format, uncompressed, uncompressed_size, compressed, compressed_size,
++                                   final_size);
++
+         case COMPRESSION_FORMAT_NONE:
+         case COMPRESSION_FORMAT_DEFAULT:
+             return STATUS_INVALID_PARAMETER;
+ 
+         default:
+-            FIXME("format %u not implemented\n", format);
++            WARN("format %u not supported\n", format);
+             return STATUS_UNSUPPORTED_COMPRESSION;
+     }
+ }
+@@ -1196,6 +1206,697 @@
+ 
+ }
+ 
++/* XPRESS compression, from the open specification [MS-XCA]: "Plain LZ77" (COMPRESSION_FORMAT_XPRESS)
++ * and "LZ77+Huffman" (COMPRESSION_FORMAT_XPRESS_HUFF).  Both are whole streams: the Huffman form
++ * works on blocks of 64K of input, each with its own table of 512 code lengths. */
++static void *xpress_alloc( SIZE_T size ) { return RtlAllocateHeap( GetProcessHeap(), 0, size ); }
++static void xpress_free( void *ptr ) { if (ptr) RtlFreeHeap( GetProcessHeap(), 0, ptr ); }
++
++#define XPRESS_HASH_BITS 15
++#define XPRESS_HASH_SIZE (1u << XPRESS_HASH_BITS)
++#define XPRESS_NIL 0xffffffffu
++
++struct xpress_matcher
++{
++    const UCHAR *src;
++    ULONG size;
++    ULONG window;       /* the farthest distance a match may have */
++    ULONG max_chain;
++    ULONG *head;        /* per hash: the latest position */
++    ULONG *prev;        /* per position: the earlier one with the same hash */
++};
++
++static inline ULONG xpress_hash( const UCHAR *p )
++{
++    return ((p[0] | (p[1] << 8) | (p[2] << 16)) * 2654435761u) >> (32 - XPRESS_HASH_BITS);
++}
++
++static BOOL xpress_matcher_init( struct xpress_matcher *m, const UCHAR *src, ULONG size, ULONG window, ULONG max_chain )
++{
++    ULONG i;
++
++    m->src = src;
++    m->size = size;
++    m->window = window;
++    m->max_chain = max_chain;
++    m->head = xpress_alloc( XPRESS_HASH_SIZE * sizeof(*m->head) );
++    m->prev = xpress_alloc( (size_t)(size ? size : 1) * sizeof(*m->prev) );
++    if (!m->head || !m->prev)
++    {
++        xpress_free( m->head );
++        xpress_free( m->prev );
++        return FALSE;
++    }
++    for (i = 0; i < XPRESS_HASH_SIZE; i++) m->head[i] = XPRESS_NIL;
++    return TRUE;
++}
++
++static void xpress_matcher_free( struct xpress_matcher *m )
++{
++    xpress_free( m->head );
++    xpress_free( m->prev );
++}
++
++static void xpress_matcher_insert( struct xpress_matcher *m, ULONG pos )
++{
++    ULONG h;
++
++    if (pos + 3 > m->size) return;
++    h = xpress_hash( m->src + pos );
++    m->prev[pos] = m->head[h];
++    m->head[h] = pos;
++}
++
++/* the longest earlier match for the bytes at pos that ends by limit; 0 if shorter than 3 */
++static ULONG xpress_find_match( struct xpress_matcher *m, ULONG pos, ULONG limit, ULONG *distance )
++{
++    ULONG cand, best = 0, chain = m->max_chain, len;
++
++    if (pos + 3 > limit) return 0;
++    cand = m->head[xpress_hash( m->src + pos )];
++    while (cand != XPRESS_NIL && chain--)
++    {
++        if (pos - cand > m->window) break;
++        if (m->src[cand + best] == m->src[pos + best] || best == 0)
++        {
++            len = 0;
++            while (pos + len < limit && m->src[cand + len] == m->src[pos + len]) len++;
++            if (len > best)
++            {
++                best = len;
++                *distance = pos - cand;
++                if (pos + best >= limit) break;
++            }
++        }
++        cand = m->prev[cand];
++    }
++    return best >= 3 ? best : 0;
++}
++
++/* Plain LZ77: flag words of 32 bits, literals as bytes, matches as 16 bits (13 of distance, 3 of
++ * length) with longer lengths in a nibble, a byte, two bytes or four bytes after it */
++static NTSTATUS xpress_plain_compress( const UCHAR *src, ULONG src_size, UCHAR *out, ULONG *out_size, ULONG chain )
++{
++    struct xpress_matcher m;
++    ULONG flags = 0, flag_count = 0, flag_pos = 0, pos = 4, in = 0, last_half = 0;
++
++    if (!xpress_matcher_init( &m, src, src_size, 8192, chain )) return STATUS_NO_MEMORY;
++
++#define PLAIN_FLAG(bit) do { flags = (flags << 1) | (bit); if (++flag_count == 32) { \
++        memcpy( out + flag_pos, &flags, 4 ); flag_count = 0; flags = 0; flag_pos = pos; pos += 4; } } while (0)
++
++    while (in < src_size)
++    {
++        ULONG dist = 0, len = 0;
++
++        if (in + 3 <= src_size) len = xpress_find_match( &m, in, src_size, &dist );
++        if (!len)
++        {
++            xpress_matcher_insert( &m, in );
++            out[pos++] = src[in++];
++            PLAIN_FLAG( 0 );
++        }
++        else
++        {
++            ULONG count = len, code = (dist - 1) << 3, extra;
++
++            len -= 3;
++            if (len < 7)
++            {
++                code += len;
++                out[pos++] = code; out[pos++] = code >> 8;
++            }
++            else
++            {
++                code |= 7;
++                out[pos++] = code; out[pos++] = code >> 8;
++                len -= 7;
++                if (!last_half)
++                {
++                    last_half = pos;
++                    if (len < 15) { out[pos++] = len; goto done_len; }
++                    out[pos++] = 15;
++                }
++                else
++                {
++                    if (len < 15) { out[last_half] |= len << 4; last_half = 0; goto done_len; }
++                    out[last_half] |= 15 << 4;
++                    last_half = 0;
++                }
++                len -= 15;
++                if (len < 255) out[pos++] = len;
++                else
++                {
++                    out[pos++] = 255;
++                    extra = len + 7 + 15;
++                    if (extra < 65536) { out[pos++] = extra; out[pos++] = extra >> 8; }
++                    else
++                    {
++                        out[pos++] = 0; out[pos++] = 0;
++                        memcpy( out + pos, &extra, 4 );
++                        pos += 4;
++                    }
++                }
++            }
++        done_len:
++            PLAIN_FLAG( 1 );
++            while (count--) xpress_matcher_insert( &m, in++ );
++        }
++    }
++#undef PLAIN_FLAG
++    /* the unused flags are ones: they tell the decoder where the data stops */
++    flags = (ULONG)(((unsigned long long)flags << (32 - flag_count)) | ((1ull << (32 - flag_count)) - 1));
++    memcpy( out + flag_pos, &flags, 4 );
++    *out_size = pos;
++    xpress_matcher_free( &m );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS xpress_plain_decompress( const UCHAR *src, ULONG src_size, UCHAR *dst, ULONG dst_size, ULONG *final_size )
++{
++    ULONG flags = 0, flag_count = 0, in = 0, out = 0, last_half = 0;
++
++    for (;;)
++    {
++        if (!flag_count)
++        {
++            if (in == src_size) break;  /* no flag word left: the stream is over */
++            if (src_size - in < 4) return STATUS_BAD_COMPRESSION_BUFFER;
++            memcpy( &flags, src + in, 4 );
++            in += 4;
++            flag_count = 32;
++        }
++        flag_count--;
++        if (!(flags & (1u << flag_count)))
++        {
++            if (in >= src_size || out >= dst_size) break;  /* no more data */
++            dst[out++] = src[in++];
++        }
++        else
++        {
++            ULONG match, length, offset;
++
++            if (in == src_size) break;  /* the padding ones of the last flag word */
++            if (src_size - in < 2) return STATUS_BAD_COMPRESSION_BUFFER;
++            match = src[in] | (src[in + 1] << 8);
++            in += 2;
++            length = match & 7;
++            offset = (match >> 3) + 1;
++#ifdef SG_MUTANT_XPRESS_OFFSET
++            offset--;
++#endif
++            if (length == 7)
++            {
++                if (!last_half)
++                {
++                    if (in >= src_size) return STATUS_BAD_COMPRESSION_BUFFER;
++                    length = src[in] & 15;
++                    last_half = in + 1;  /* kept plus one: position 0 is no position */
++                    in++;
++                }
++                else
++                {
++#ifdef SG_MUTANT_XPRESS_NIBBLE
++                    length = src[last_half - 1] & 15;
++#else
++                    length = src[last_half - 1] >> 4;
++#endif
++                    last_half = 0;
++                }
++                if (length == 15)
++                {
++                    if (in >= src_size) return STATUS_BAD_COMPRESSION_BUFFER;
++                    length = src[in++];
++                    if (length == 255)
++                    {
++                        if (src_size - in < 2) return STATUS_BAD_COMPRESSION_BUFFER;
++                        length = src[in] | (src[in + 1] << 8);
++                        in += 2;
++                        if (!length)
++                        {
++                            if (src_size - in < 4) return STATUS_BAD_COMPRESSION_BUFFER;
++                            memcpy( &length, src + in, 4 );
++                            in += 4;
++                        }
++                        if (length < 15 + 7) return STATUS_BAD_COMPRESSION_BUFFER;
++                        length -= 15 + 7;
++                    }
++                    length += 15;
++                }
++                length += 7;
++            }
++            length += 3;
++            if (offset > out) return STATUS_BAD_COMPRESSION_BUFFER;
++            while (length-- && out < dst_size)
++            {
++                dst[out] = dst[out - offset];
++                out++;
++            }
++            if (out >= dst_size) break;
++        }
++    }
++    *final_size = out;
++    return STATUS_SUCCESS;
++}
++
++/* ---- LZ77+Huffman ---- */
++
++struct xpress_item
++{
++    ULONG length;   /* of a match, 0 for a literal */
++    USHORT distance;
++    UCHAR literal;
++};
++
++static ULONG xpress_high_bit( ULONG v )
++{
++    ULONG n = 0;
++    while (v >>= 1) n++;
++    return n;
++}
++
++static ULONG xpress_symbol( ULONG length, ULONG distance )
++{
++    return 256 + min( length - 3, 15 ) + 16 * xpress_high_bit( distance );
++}
++
++struct xpress_node { ULONG freq; int left, right; };
++
++static int xpress_compare_symbols( const void *a, const void *b, void *freq_ )
++{
++    const ULONG *freq = freq_;
++    int x = *(const int *)a, y = *(const int *)b;
++
++    if (freq[x] != freq[y]) return freq[x] < freq[y] ? -1 : 1;
++    return x - y;
++}
++
++/* canonical Huffman code lengths, at most 15 bits, for the symbols with a non-zero count (at least
++ * two of them); counts are halved until the code fits */
++static void xpress_code_lengths( const ULONG *count, UCHAR *length )
++{
++    ULONG freq[512];
++    int used[512], n, i;
++
++    for (i = 0, n = 0; i < 512; i++)
++    {
++        freq[i] = count[i];
++        if (freq[i]) used[n++] = i;
++    }
++    for (;;)
++    {
++        struct xpress_node nodes[1024];
++        int order[512], next_leaf = 0, next_node = 0, total = n, j, root, depth[1024], max_depth = 0;
++
++        memcpy( order, used, n * sizeof(*order) );
++        {
++            /* a simple insertion sort by (frequency, symbol) */
++            for (i = 1; i < n; i++)
++            {
++                int key = order[i];
++                j = i - 1;
++                while (j >= 0 && xpress_compare_symbols( &order[j], &key, freq ) > 0) { order[j + 1] = order[j]; j--; }
++                order[j + 1] = key;
++            }
++        }
++        for (i = 0; i < n; i++) { nodes[i].freq = freq[order[i]]; nodes[i].left = nodes[i].right = -1; }
++        /* two queues: the sorted leaves, and the merged nodes (which come out sorted too) */
++        next_node = n;
++        for (i = 0; i < n - 1; i++)
++        {
++            int pick[2];
++            for (j = 0; j < 2; j++)
++            {
++                if (next_leaf < n && (next_node >= total || nodes[next_leaf].freq <= nodes[next_node].freq))
++                    pick[j] = next_leaf++;
++                else
++                    pick[j] = next_node++;
++            }
++            nodes[total].freq = nodes[pick[0]].freq + nodes[pick[1]].freq;
++            nodes[total].left = pick[0];
++            nodes[total].right = pick[1];
++            total++;
++        }
++        root = total - 1;
++        depth[root] = 0;
++        for (i = root; i >= 0; i--)
++        {
++            if (nodes[i].left >= 0)
++            {
++                depth[nodes[i].left] = depth[i] + 1;
++                depth[nodes[i].right] = depth[i] + 1;
++            }
++        }
++        for (i = 0; i < n; i++) max_depth = max( max_depth, depth[i] );
++        if (max_depth <= 15)
++        {
++            memset( length, 0, 512 );
++            for (i = 0; i < n; i++) length[order[i]] = depth[i];
++            return;
++        }
++        for (i = 0; i < n; i++) freq[used[i]] = (freq[used[i]] + 1) / 2;
++    }
++}
++
++struct xpress_bits
++{
++    UCHAR *out;
++    ULONG pos1, pos2, pos;
++    ULONG free_bits;
++    ULONG next_word;
++};
++
++static void xpress_put16( UCHAR *p, ULONG v ) { p[0] = v; p[1] = v >> 8; }
++
++static void xpress_write_bits( struct xpress_bits *b, ULONG n, ULONG bits )
++{
++    if (b->free_bits >= n)
++    {
++        b->free_bits -= n;
++        b->next_word = (b->next_word << n) + bits;
++    }
++    else
++    {
++        b->next_word <<= b->free_bits;
++        b->next_word += bits >> (n - b->free_bits);
++        b->free_bits = b->free_bits + 16 - n;
++        xpress_put16( b->out + b->pos1, b->next_word );
++        b->pos1 = b->pos2;
++        b->pos2 = b->pos;
++        b->pos += 2;
++        b->next_word = bits;
++    }
++}
++
++static void xpress_flush_bits( struct xpress_bits *b )
++{
++    b->next_word <<= b->free_bits;
++    xpress_put16( b->out + b->pos1, b->next_word );
++    xpress_put16( b->out + b->pos2, 0 );
++}
++
++static NTSTATUS xpress_huff_compress( const UCHAR *src, ULONG src_size, UCHAR *out, ULONG *out_size, ULONG chain )
++{
++    struct xpress_matcher m;
++    struct xpress_item *items;
++    ULONG block, out_pos = 0;
++
++    if (!(items = xpress_alloc( 65536 * sizeof(*items) ))) return STATUS_NO_MEMORY;
++    if (!xpress_matcher_init( &m, src, src_size, 65535, chain ))
++    {
++        xpress_free( items );
++        return STATUS_NO_MEMORY;
++    }
++
++    for (block = 0; block < src_size || !block; block += 65536)
++    {
++        ULONG end = min( block + 65536, src_size ), pos = block, count = 0, i, code_count[512];
++        UCHAR lengths[512];
++        USHORT codes[512];
++        struct xpress_bits b;
++        BOOL last = end >= src_size;
++
++        memset( code_count, 0, sizeof(code_count) );
++        while (pos < end)
++        {
++            ULONG dist = 0, len = xpress_find_match( &m, pos, end, &dist );
++
++            if (!len)
++            {
++                items[count].length = 0;
++                items[count].literal = src[pos];
++                code_count[src[pos]]++;
++                xpress_matcher_insert( &m, pos++ );
++            }
++            else
++            {
++                items[count].length = len;
++                items[count].distance = dist;
++                code_count[xpress_symbol( len, dist )]++;
++                for (i = 0; i < len; i++) xpress_matcher_insert( &m, pos++ );
++            }
++            count++;
++        }
++        /* the end symbol of the stream; a table needs two symbols to be a complete code */
++        if (last) code_count[256]++;
++        {
++            ULONG used = 0;
++            for (i = 0; i < 512; i++) if (code_count[i]) used++;
++            for (i = 0; used < 2; i++)
++                if (!code_count[i]) { code_count[i] = 1; used++; }
++        }
++        xpress_code_lengths( code_count, lengths );
++
++        {
++            /* canonical codes: by length, then by symbol */
++            ULONG length_count[16] = {0}, next_code[16], code = 0;
++            for (i = 0; i < 512; i++) length_count[lengths[i]]++;
++            length_count[0] = 0;
++            for (i = 1; i < 16; i++)
++            {
++                code = (code + length_count[i - 1]) << 1;
++                next_code[i] = code;
++            }
++            for (i = 0; i < 512; i++) codes[i] = lengths[i] ? next_code[lengths[i]]++ : 0;
++        }
++
++        for (i = 0; i < 256; i++) out[out_pos + i] = lengths[2 * i] | (lengths[2 * i + 1] << 4);
++        b.out = out;
++        b.pos1 = out_pos + 256;
++        b.pos2 = out_pos + 258;
++        b.pos = out_pos + 260;
++        b.free_bits = 16;
++        b.next_word = 0;
++        for (i = 0; i < count; i++)
++        {
++            if (!items[i].length)
++                xpress_write_bits( &b, lengths[items[i].literal], codes[items[i].literal] );
++            else
++            {
++                ULONG len = items[i].length, dist = items[i].distance, sym = xpress_symbol( len, dist );
++                ULONG high = xpress_high_bit( dist );
++
++                xpress_write_bits( &b, lengths[sym], codes[sym] );
++                len -= 3;
++                if (len >= 15)
++                {
++                    len -= 15;
++                    if (len < 255) out[b.pos++] = len;
++                    else
++                    {
++                        out[b.pos++] = 255;
++                        len += 15;
++                        if (len < 65536) { xpress_put16( out + b.pos, len ); b.pos += 2; }
++                        else
++                        {
++                            xpress_put16( out + b.pos, 0 );
++                            memcpy( out + b.pos + 2, &len, 4 );
++                            b.pos += 6;
++                        }
++                    }
++                }
++                xpress_write_bits( &b, high, dist - (1u << high) );
++            }
++        }
++        if (last) xpress_write_bits( &b, lengths[256], codes[256] );
++        xpress_flush_bits( &b );
++        out_pos = b.pos;
++        if (last) break;
++    }
++    *out_size = out_pos;
++    xpress_matcher_free( &m );
++    xpress_free( items );
++    return STATUS_SUCCESS;
++}
++
++static inline ULONG xpress_read16( const UCHAR *src, ULONG size, ULONG pos )
++{
++    if (pos + 2 > size) return 0;
++    return src[pos] | (src[pos + 1] << 8);
++}
++
++static NTSTATUS xpress_huff_decompress( const UCHAR *src, ULONG src_size, UCHAR *dst, ULONG dst_size, ULONG *final_size )
++{
++    USHORT *table;
++    ULONG in = 0, out = 0;
++    NTSTATUS status = STATUS_SUCCESS;
++
++    if (!(table = xpress_alloc( 32768 * sizeof(*table) ))) return STATUS_NO_MEMORY;
++
++    for (;;)
++    {
++        UCHAR lengths[512];
++        ULONG entry = 0, bit_length, symbol, cur, next_bits, block_end;
++        int extra_bits;
++
++        if (src_size - in < 256) break;  /* what is left is the end of the stream */
++        for (symbol = 0; symbol < 256; symbol++)
++        {
++            lengths[2 * symbol] = src[in + symbol] & 15;
++            lengths[2 * symbol + 1] = src[in + symbol] >> 4;
++        }
++        for (bit_length = 1; bit_length <= 15; bit_length++)
++        {
++            for (symbol = 0; symbol < 512; symbol++)
++            {
++                ULONG n, count;
++
++                if (lengths[symbol] != bit_length) continue;
++                count = 1u << (15 - bit_length);
++                if (entry + count > 32768) { status = STATUS_BAD_COMPRESSION_BUFFER; goto done; }
++                for (n = 0; n < count; n++) table[entry++] = symbol;
++            }
++        }
++        if (entry != 32768) { status = STATUS_BAD_COMPRESSION_BUFFER; goto done; }
++
++        cur = 256;
++        next_bits = xpress_read16( src + in, src_size - in, cur ) << 16;
++        cur += 2;
++        next_bits |= xpress_read16( src + in, src_size - in, cur );
++        cur += 2;
++        extra_bits = 16;
++#ifdef SG_MUTANT_XPRESS_HUFF_BLOCK
++        block_end = out + 32768;
++#else
++        block_end = out + 65536;
++#endif
++
++        while (out < block_end && out < dst_size)
++        {
++            ULONG length, offset_bits, offset;
++
++            symbol = table[next_bits >> 17];
++            bit_length = lengths[symbol];
++            next_bits <<= bit_length;
++            extra_bits -= bit_length;
++            if (extra_bits < 0)
++            {
++                next_bits |= xpress_read16( src + in, src_size - in, cur ) << -extra_bits;
++                extra_bits += 16;
++                cur += 2;
++            }
++            if (symbol < 256)
++            {
++                dst[out++] = symbol;
++                continue;
++            }
++#ifndef SG_MUTANT_XPRESS_HUFF_EOF
++            if (symbol == 256 && in + cur >= src_size) goto done;  /* the end of the data */
++#endif
++            symbol -= 256;
++            length = symbol % 16;
++            offset_bits = symbol / 16;
++            if (length == 15)
++            {
++                if (in + cur >= src_size) { status = STATUS_BAD_COMPRESSION_BUFFER; goto done; }
++                length = src[in + cur++];
++                if (length == 255)
++                {
++                    if (in + cur + 2 > src_size) { status = STATUS_BAD_COMPRESSION_BUFFER; goto done; }
++                    length = xpress_read16( src + in, src_size - in, cur );
++                    cur += 2;
++                    if (!length)
++                    {
++                        if (in + cur + 4 > src_size) { status = STATUS_BAD_COMPRESSION_BUFFER; goto done; }
++                        memcpy( &length, src + in + cur, 4 );
++                        cur += 4;
++                    }
++                    if (length < 15) { status = STATUS_BAD_COMPRESSION_BUFFER; goto done; }
++                    length -= 15;
++                }
++                length += 15;
++            }
++            length += 3;
++#ifdef SG_MUTANT_XPRESS_HUFF_DIST
++            offset = 0;
++#else
++            offset = offset_bits ? next_bits >> (32 - offset_bits) : 0;
++#endif
++            offset += 1u << offset_bits;
++            next_bits <<= offset_bits;
++            extra_bits -= offset_bits;
++            if (extra_bits < 0)
++            {
++                next_bits |= xpress_read16( src + in, src_size - in, cur ) << -extra_bits;
++                extra_bits += 16;
++                cur += 2;
++            }
++            if (offset > out) { status = STATUS_BAD_COMPRESSION_BUFFER; goto done; }
++            while (length-- && out < dst_size)
++            {
++                dst[out] = dst[out - offset];
++                out++;
++            }
++        }
++        if (out >= dst_size) goto done;
++        in += cur;
++    }
++done:
++    xpress_free( table );
++    if (!status) *final_size = out;
++    return status;
++}
++
++/* RtlCompressBuffer for the XPRESS formats: the stream is built in a buffer of the worst case size
++ * and handed over if it fits */
++static NTSTATUS xpress_compress( USHORT format, const UCHAR *src, ULONG src_size, UCHAR *dst, ULONG dst_size,
++                                 ULONG *final_size )
++{
++    ULONG chain = (format & COMPRESSION_ENGINE_MAXIMUM) ? 256 : 24, size = 0;
++    ULONG max = src_size * 2 + (src_size / 65536 + 1) * 600 + 1024;
++    NTSTATUS status;
++    UCHAR *tmp;
++
++    if (!(tmp = xpress_alloc( max ))) return STATUS_NO_MEMORY;
++    if ((format & COMPRESSION_FORMAT_MASK) == COMPRESSION_FORMAT_XPRESS)
++        status = xpress_plain_compress( src, src_size, tmp, &size, chain );
++    else
++        status = xpress_huff_compress( src, src_size, tmp, &size, chain );
++    if (!status)
++    {
++        if (size > dst_size) status = STATUS_BUFFER_TOO_SMALL;
++        else
++        {
++            memcpy( dst, tmp, size );
++            if (final_size) *final_size = size;
++        }
++    }
++    xpress_free( tmp );
++    return status;
++}
++
++/* RtlDecompressBuffer / RtlDecompressFragment for the XPRESS formats: the stream has no chunks
++ * to skip, so a fragment is cut from the whole decompressed data */
++static NTSTATUS xpress_decompress( USHORT format, UCHAR *dst, ULONG dst_size, const UCHAR *src, ULONG src_size,
++                                   ULONG offset, ULONG *final_size )
++{
++    ULONG size = 0, want;
++    NTSTATUS status;
++    UCHAR *tmp = dst;
++
++    if (offset)
++    {
++        want = offset + dst_size;
++        if (want < offset) return STATUS_INVALID_PARAMETER;
++        if (!(tmp = xpress_alloc( want ? want : 1 ))) return STATUS_NO_MEMORY;
++    }
++    else want = dst_size;
++
++    if ((format & COMPRESSION_FORMAT_MASK) == COMPRESSION_FORMAT_XPRESS)
++        status = xpress_plain_decompress( src, src_size, tmp, want, &size );
++    else
++        status = xpress_huff_decompress( src, src_size, tmp, want, &size );
++
++    if (offset)
++    {
++        if (!status && size > offset) memcpy( dst, tmp + offset, size - offset );
++        xpress_free( tmp );
++        size = size > offset ? size - offset : 0;
++    }
++    if (!status && final_size) *final_size = size;
++    return status;
++}
++
+ static NTSTATUS decompress( USHORT format, PUCHAR uncompressed, ULONG uncompressed_size,
+                             PUCHAR compressed, ULONG compressed_size, ULONG offset,
+                             PULONG final_size, PVOID workspace, BOOL fragment )
+@@ -1206,12 +1907,17 @@
+             return lznt1_decompress(uncompressed, uncompressed_size, compressed,
+                                     compressed_size, offset, final_size, workspace, fragment);
+ 
++        case COMPRESSION_FORMAT_XPRESS:
++        case COMPRESSION_FORMAT_XPRESS_HUFF:
++            return xpress_decompress(format, uncompressed, uncompressed_size, compressed, compressed_size,
++                                     offset, final_size);
++
+         case COMPRESSION_FORMAT_NONE:
+         case COMPRESSION_FORMAT_DEFAULT:
+             return STATUS_INVALID_PARAMETER;
+ 
+         default:
+-            FIXME("format %u not implemented\n", format);
++            WARN("format %u not supported\n", format);
+             return STATUS_UNSUPPORTED_COMPRESSION;
+     }
+ }
+-- 
+2.47.0

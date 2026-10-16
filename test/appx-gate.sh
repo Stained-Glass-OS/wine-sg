@@ -121,6 +121,48 @@ expect "$out" CreateBundleReader 0x80080203 "a package is not a bundle"
 out=$(run appx-probe.exe bundle 'C:\unsigned.msixbundle')
 expect "$out" CreateBundleReader 0 "a bundle opens with the bundle reader"
 
+# IAppxBundleFactory::CreateBundleManifestReader (5505): a manifest read from a stream
+cat > "$C/bm-good.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<Bundle xmlns="http://schemas.microsoft.com/appx/2013/bundle" SchemaVersion="5.0.0.0">
+  <Identity Name="Sg.Test.Bundle" Publisher="CN=Stained Glass Test" Version="1.2.3.4"/>
+  <Packages>
+    <Package Type="application" Version="1.2.3.4" Architecture="x64" FileName="app_x64.msix" Offset="100" Size="2000"/>
+    <Package Type="resource" Version="1.2.3.4" ResourceId="de" FileName="app_de.msix" Offset="2100" Size="300">
+      <Resources><Resource Language="de"/></Resources>
+    </Package>
+  </Packages>
+</Bundle>
+XML
+printf 'this is not xml' > "$C/bm-notxml.xml"
+cat > "$C/bm-noidentity.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<Bundle xmlns="http://schemas.microsoft.com/appx/2013/bundle"><Packages>
+  <Package Type="application" Version="1.0.0.0" FileName="a.msix" Offset="1" Size="2"/></Packages></Bundle>
+XML
+cat > "$C/bm-badversion.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<Bundle xmlns="http://schemas.microsoft.com/appx/2013/bundle">
+  <Identity Name="Sg.Test.Bundle" Publisher="CN=Stained Glass Test" Version="one.two"/>
+  <Packages><Package Type="application" Version="1.0.0.0" FileName="a.msix" Offset="1" Size="2"/></Packages></Bundle>
+XML
+size=$(wc -c < "$C/bm-good.xml")
+out=$(run appx-probe.exe bundlemanifest 'C:\bm-good.xml')
+expect "$out" CreateBundleManifestReader 0 "a bundle manifest is read from a stream"
+expect "$out" Name "Sg.Test.Bundle" "... its identity: name"
+expect "$out" Publisher "CN=Stained Glass Test" "... publisher"
+expect "$out" Version "1.2.3.4" "... version"
+expect "$out" ItemCount 2 "... both payload packages are listed"
+expect "$out" Item0 "app_x64.msix type=0 offset=100 size=2000" "... the application package: file, type, offset, size"
+expect "$out" Item1 "app_de.msix type=1 offset=2100 size=300" "... the resource package"
+expect "$out" StreamSize "$size" "... GetStream gives the manifest's XML"
+out=$(run appx-probe.exe bundlemanifest 'C:\bm-notxml.xml')
+expect "$out" CreateBundleManifestReader 0x80080204 "text that is not XML: APPX_E_INVALID_MANIFEST"
+out=$(run appx-probe.exe bundlemanifest 'C:\bm-noidentity.xml')
+expect "$out" CreateBundleManifestReader 0x80080204 "no Identity: APPX_E_INVALID_MANIFEST"
+out=$(run appx-probe.exe bundlemanifest 'C:\bm-badversion.xml')
+expect "$out" CreateBundleManifestReader 0x80080204 "a version that is not four numbers: APPX_E_INVALID_MANIFEST"
+
 out=$(run pkgname-probe.exe)
 expect "$out" FamilyFromFull "Microsoft.Winget.Source_8wekyb3d8bbwe" "PackageFamilyNameFromFullName"
 expect "$out" FullFromId "Microsoft.Winget.Source_2026.924.610.8_neutral__8wekyb3d8bbwe" \

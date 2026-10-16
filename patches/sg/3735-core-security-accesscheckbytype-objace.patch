@@ -1,0 +1,670 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll, kernelbase: AccessCheckByType, object ACEs, private object security, audit alarms (3735)
+
+ntdll, kernelbase: AccessCheckByType, object ACEs, private object security, audit alarms
+
+AccessCheckByType no longer answers "denied with success": the object ACEs
+and PRINCIPAL_SELF of the DACL are resolved for the root of the object type
+list and the plain check runs on the result. RtlAdd{AccessAllowed,
+AccessDenied,AuditAccess}ObjectAce build the documented object ACE layouts.
+RtlDefaultNpAcl returns the documented named pipe default DACL.
+RtlSetInformationAcl (revision), RtlSetSecurityObject(Ex) are implemented, so
+SetAclInformation and SetPrivateObjectSecurity(Ex) work.
+GetWindowsAccountDomainSid fails for SIDs that are not S-1-5-21 accounts.
+The audit alarm W functions require SeAuditPrivilege and report
+GenerateOnClose from the SACL.
+
+Rebased at integration (integ-2026-10) onto earlier integration patches: clean 3-way merge.
+---
+diff --git a/dlls/kernelbase/security.c b/dlls/kernelbase/security.c
+--- a/dlls/kernelbase/security.c
++++ b/dlls/kernelbase/security.c
+@@ -386,6 +386,14 @@ BOOL WINAPI GetWindowsAccountDomainSid( PSID sid, PSID domain_sid, DWORD *size )
+         return FALSE;
+     }
+ 
++    /* only the SIDs of a domain or machine account (S-1-5-21-...) have a domain SID */
++    if (memcmp( GetSidIdentifierAuthority( sid ), &domain_ident, sizeof(domain_ident) ) ||
++        !*GetSidSubAuthorityCount( sid ) || *GetSidSubAuthority( sid, 0 ) != SECURITY_NT_NON_UNIQUE)
++    {
++        SetLastError( ERROR_NON_ACCOUNT_SID );
++        return FALSE;
++    }
++
+     if (*GetSidSubAuthorityCount( sid ) < 4)
+     {
+         SetLastError( ERROR_INVALID_SID );
+@@ -1307,8 +1315,7 @@ BOOL WINAPI SetPrivateObjectSecurity( SECURITY_INFORMATION info, PSECURITY_DESCR
+                                       PSECURITY_DESCRIPTOR *obj_descr, PGENERIC_MAPPING mapping,
+                                       HANDLE token )
+ {
+-    FIXME( "0x%08lx %p %p %p %p - stub\n", info, descr, obj_descr, mapping, token );
+-    return TRUE;
++    return set_ntstatus( RtlSetSecurityObject( info, descr, obj_descr, mapping, token ));
+ }
+ 
+ /*************************************************************************
+@@ -1318,8 +1325,7 @@ BOOL WINAPI SetPrivateObjectSecurityEx( SECURITY_INFORMATION info, PSECURITY_DES
+                                         PSECURITY_DESCRIPTOR *obj_descr, ULONG flags,
+                                         PGENERIC_MAPPING mapping, HANDLE token )
+ {
+-    FIXME( "0x%08lx %p %p %lu %p %p - stub\n", info, descr, obj_descr, flags, mapping, token );
+-    return TRUE;
++    return set_ntstatus( RtlSetSecurityObjectEx( info, descr, obj_descr, flags, mapping, token ));
+ }
+ 
+ /******************************************************************************
+@@ -1399,13 +1405,146 @@ BOOL WINAPI AccessCheckAndAuditAlarmW( LPCWSTR subsystem, LPVOID id, LPWSTR type
+ /******************************************************************************
+  * AccessCheckByType    (kernelbase.@)
+  */
++/* Stained Glass OS: AccessCheckByType. The server evaluates plain ACLs (AccessCheck), so the object ACEs and
++ * PRINCIPAL_SELF of the DACL are resolved first, for the root of the object type list, into a plain DACL that
++ * the same check then runs on:
++ *  - an allow ACE for an object type applies to the root only when it names the root type (it grants that
++ *    element and its children, never its parents);
++ *  - a deny ACE for any type in the list applies (a deny on a child removes the right from the parents);
++ *  - without a list an allow object ACE grants nothing and a deny object ACE still denies (GUESS: the
++ *    conservative reading);
++ *  - an ACE for the PRINCIPAL_SELF SID (S-1-5-10) is made one for the sid argument;
++ *  - ACEs of other kinds (audit, callback) take no part. */
++static BOOL access_check_by_type_acl( const ACL *orig, PSID self, const OBJECT_TYPE_LIST *types, DWORD types_len,
++                                      PACL *ret )
++{
++    static const SID_IDENTIFIER_AUTHORITY nt = { SECURITY_NT_AUTHORITY };
++    ACL_SIZE_INFORMATION info;
++    PACL acl;
++    DWORD i, size;
++
++    if (RtlQueryInformationAcl( (PACL)orig, &info, sizeof(info), AclSizeInformation )) return FALSE;
++    size = orig->AclSize + info.AceCount * (self ? GetLengthSid( self ) : 0) + 64;
++    if (!(acl = LocalAlloc( LMEM_FIXED, size ))) { SetLastError( ERROR_NOT_ENOUGH_MEMORY ); return FALSE; }
++    if (!InitializeAcl( acl, size, ACL_REVISION ))
++    {
++        LocalFree( acl );
++        return FALSE;
++    }
++
++    for (i = 0; i < info.AceCount; i++)
++    {
++        ACE_HEADER *ace;
++        PSID sid;
++        DWORD mask, flags = 0, ace_flags;
++        const GUID *object = NULL;
++        BYTE *pos;
++        BOOL allow, ok = TRUE;
++
++        if (RtlGetAce( (PACL)orig, i, (void **)&ace )) continue;
++        ace_flags = ace->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | NO_PROPAGATE_INHERIT_ACE |
++                                     INHERIT_ONLY_ACE);
++        switch (ace->AceType)
++        {
++        case ACCESS_ALLOWED_ACE_TYPE:
++        case ACCESS_DENIED_ACE_TYPE:
++            mask = ((ACCESS_ALLOWED_ACE *)ace)->Mask;
++            sid = (PSID)&((ACCESS_ALLOWED_ACE *)ace)->SidStart;
++            allow = ace->AceType == ACCESS_ALLOWED_ACE_TYPE;
++            break;
++        case ACCESS_ALLOWED_OBJECT_ACE_TYPE:
++        case ACCESS_DENIED_OBJECT_ACE_TYPE:
++            mask = ((ACCESS_ALLOWED_OBJECT_ACE *)ace)->Mask;
++            flags = ((ACCESS_ALLOWED_OBJECT_ACE *)ace)->Flags;
++            pos = (BYTE *)&((ACCESS_ALLOWED_OBJECT_ACE *)ace)->ObjectType;
++            if (flags & ACE_OBJECT_TYPE_PRESENT) { object = (const GUID *)pos; pos += sizeof(GUID); }
++            if (flags & ACE_INHERITED_OBJECT_TYPE_PRESENT) pos += sizeof(GUID);
++            sid = (PSID)pos;
++            allow = ace->AceType == ACCESS_ALLOWED_OBJECT_ACE_TYPE;
++            if (object)
++            {
++                if (allow)
++                    ok = types && !memcmp( object, types[0].ObjectType, sizeof(GUID) );
++                else if (types)
++                {
++                    DWORD k;
++                    ok = FALSE;
++                    for (k = 0; k < types_len && !ok; k++) ok = !memcmp( object, types[k].ObjectType, sizeof(GUID) );
++                }
++            }
++            break;
++        default:
++            continue;
++        }
++        if (!ok) continue;
++        if (self && *GetSidSubAuthorityCount( sid ) == 1 && *GetSidSubAuthority( sid, 0 ) == SECURITY_PRINCIPAL_SELF_RID &&
++            !memcmp( GetSidIdentifierAuthority( sid ), &nt, sizeof(nt) ))
++            sid = self;
++        if (!(allow ? AddAccessAllowedAceEx( acl, ACL_REVISION, ace_flags, mask, sid )
++                    : AddAccessDeniedAceEx( acl, ACL_REVISION, ace_flags, mask, sid )))
++        {
++            LocalFree( acl );
++            return FALSE;
++        }
++    }
++    *ret = acl;
++    return TRUE;
++}
++
+ BOOL WINAPI AccessCheckByType( PSECURITY_DESCRIPTOR descr, PSID sid, HANDLE token, DWORD access,
+                                POBJECT_TYPE_LIST types, DWORD types_len, PGENERIC_MAPPING mapping,
+                                PPRIVILEGE_SET priv, LPDWORD priv_len, LPDWORD granted, LPBOOL status )
+ {
+-    FIXME("stub\n");
+-    *status = TRUE;
+-    return !*status;
++    SECURITY_DESCRIPTOR filtered;
++    BOOL present, defaulted, ret;
++    PACL dacl, plain = NULL;
++    PSID owner, group;
++    DWORD i;
++
++    TRACE( "%p %p %p %#lx %p %lu %p %p %p %p %p\n", descr, sid, token, access, types, types_len, mapping,
++           priv, priv_len, granted, status );
++
++    if (!descr || !granted || !status || !mapping)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if ((types != NULL) != (types_len != 0))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (sid && !IsValidSid( sid ))
++    {
++        SetLastError( ERROR_INVALID_SID );
++        return FALSE;
++    }
++    /* the list is a tree in depth-first order: level 0 first and only once, a level at most one deeper
++     * than the one before */
++    for (i = 0; i < types_len; i++)
++    {
++        if (!types[i].ObjectType || (i == 0 ? types[i].Level != 0 : (!types[i].Level || types[i].Level > types[i - 1].Level + 1)))
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++    }
++
++    if (!GetSecurityDescriptorDacl( descr, &present, &dacl, &defaulted ))
++        return FALSE;
++    if (!present || !dacl)  /* no DACL: nothing to resolve */
++        return AccessCheck( descr, token, access, mapping, priv, priv_len, granted, status );
++
++    if (!access_check_by_type_acl( dacl, sid, types, types_len, &plain )) return FALSE;
++    GetSecurityDescriptorOwner( descr, &owner, &defaulted );
++    GetSecurityDescriptorGroup( descr, &group, &defaulted );
++    InitializeSecurityDescriptor( &filtered, SECURITY_DESCRIPTOR_REVISION );
++    if (owner) SetSecurityDescriptorOwner( &filtered, owner, FALSE );
++    if (group) SetSecurityDescriptorGroup( &filtered, group, FALSE );
++    SetSecurityDescriptorDacl( &filtered, TRUE, plain, FALSE );
++    ret = AccessCheck( &filtered, token, access, mapping, priv, priv_len, granted, status );
++    LocalFree( plain );
++    return ret;
+ }
+ 
+ /******************************************************************************
+@@ -1574,55 +1713,105 @@ void WINAPI MapGenericMask( PDWORD access, PGENERIC_MAPPING mapping )
+     RtlMapGenericMask( access, mapping );
+ }
+ 
++/* Stained Glass OS: the audit alarm functions. They need SeAuditPrivilege enabled in the calling token
++ * (ERROR_PRIVILEGE_NOT_HELD otherwise). Nothing is written to an audit log: the security event log is not
++ * kept, so the calls validate and report what would be generated. */
++static BOOL audit_privilege_held(void)
++{
++    PRIVILEGE_SET set;
++    HANDLE token;
++    BOOL result = FALSE, ok;
++
++    if (!OpenThreadToken( GetCurrentThread(), TOKEN_QUERY, TRUE, &token ) &&
++        !OpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &token ))
++        return FALSE;
++    set.PrivilegeCount = 1;
++    set.Control = PRIVILEGE_SET_ALL_NECESSARY;
++    set.Privilege[0].Luid.LowPart = 21; /* SE_AUDIT_PRIVILEGE */
++    set.Privilege[0].Luid.HighPart = 0;
++    set.Privilege[0].Attributes = 0;
++    ok = PrivilegeCheck( token, &set, &result );
++    CloseHandle( token );
++    return ok && result;
++}
++
++static BOOL require_audit_privilege(void)
++{
++    if (audit_privilege_held()) return TRUE;
++    SetLastError( ERROR_PRIVILEGE_NOT_HELD );
++    return FALSE;
++}
++
++/* is an audit ACE of the SACL for a user or group of the client, for this access and this outcome? */
++static BOOL sacl_audits_access( PSECURITY_DESCRIPTOR descr, HANDLE client, DWORD access, BOOL granted_access )
++{
++    ACL_SIZE_INFORMATION info;
++    BOOL present, defaulted, ret = FALSE;
++    HANDLE imp = NULL;
++    PACL sacl;
++    DWORD i;
++
++    if (!descr || !GetSecurityDescriptorSacl( descr, &present, &sacl, &defaulted ) || !present || !sacl) return FALSE;
++    if (RtlQueryInformationAcl( sacl, &info, sizeof(info), AclSizeInformation )) return FALSE;
++    if (client && !DuplicateTokenEx( client, TOKEN_QUERY | TOKEN_DUPLICATE, NULL, SecurityImpersonation,
++                                     TokenImpersonation, &imp ))
++        imp = NULL;
++    for (i = 0; i < info.AceCount && !ret; i++)
++    {
++        SYSTEM_AUDIT_ACE *ace;
++        BOOL member;
++
++        if (RtlGetAce( sacl, i, (void **)&ace ) || ace->Header.AceType != SYSTEM_AUDIT_ACE_TYPE) continue;
++        if (ace->Header.AceFlags & INHERIT_ONLY_ACE) continue;
++        if (!(ace->Header.AceFlags & (granted_access ? SUCCESSFUL_ACCESS_ACE_FLAG : FAILED_ACCESS_ACE_FLAG))) continue;
++        if (!(ace->Mask & access)) continue;
++        if (CheckTokenMembership( imp, (PSID)&ace->SidStart, &member ) && member) ret = TRUE;
++    }
++    if (imp) CloseHandle( imp );
++    return ret;
++}
++
+ /******************************************************************************
+  * ObjectCloseAuditAlarmW    (kernelbase.@)
+  */
+ BOOL WINAPI ObjectCloseAuditAlarmW( LPCWSTR subsystem, LPVOID id, BOOL on_close )
+ {
+-    FIXME( "stub (%s,%p,%x)\n", debugstr_w(subsystem), id, on_close );
+-    return TRUE;
++    TRACE( "(%s,%p,%x)\n", debugstr_w(subsystem), id, on_close );
++    return require_audit_privilege();
+ }
+ 
+-/******************************************************************************
+- * ObjectDeleteAuditAlarmW    (kernelbase.@)
+- */
+ BOOL WINAPI ObjectDeleteAuditAlarmW( LPCWSTR subsystem, LPVOID id, BOOL on_close )
+ {
+-    FIXME( "stub (%s,%p,%x)\n", debugstr_w(subsystem), id, on_close );
+-    return TRUE;
++    TRACE( "(%s,%p,%x)\n", debugstr_w(subsystem), id, on_close );
++    return require_audit_privilege();
+ }
+ 
+-/******************************************************************************
+- * ObjectOpenAuditAlarmW    (kernelbase.@)
+- */
+ BOOL WINAPI ObjectOpenAuditAlarmW( LPCWSTR subsystem, LPVOID id, LPWSTR type, LPWSTR name,
+                                    PSECURITY_DESCRIPTOR descr, HANDLE token, DWORD desired,
+                                    DWORD granted, PPRIVILEGE_SET privs, BOOL creation,
+                                    BOOL access, LPBOOL on_close )
+ {
+-    FIXME( "stub (%s,%p,%s,%s,%p,%p,0x%08lx,0x%08lx,%p,%x,%x,%p)\n", debugstr_w(subsystem),
++    TRACE( "(%s,%p,%s,%s,%p,%p,0x%08lx,0x%08lx,%p,%x,%x,%p)\n", debugstr_w(subsystem),
+            id, debugstr_w(type), debugstr_w(name), descr, token, desired, granted,
+            privs, creation, access, on_close );
++    if (!require_audit_privilege()) return FALSE;
++    if (on_close) *on_close = access && sacl_audits_access( descr, token, granted ? granted : desired, TRUE );
+     return TRUE;
+ }
+ 
+-/******************************************************************************
+- * ObjectPrivilegeAuditAlarmW    (kernelbase.@)
+- */
+ BOOL WINAPI ObjectPrivilegeAuditAlarmW( LPCWSTR subsystem, LPVOID id, HANDLE token,
+                                         DWORD desired, PPRIVILEGE_SET privs, BOOL granted )
+ {
+-    FIXME( "stub (%s,%p,%p,0x%08lx,%p,%x)\n", debugstr_w(subsystem), id, token, desired, privs, granted );
++    TRACE( "(%s,%p,%p,0x%08lx,%p,%x)\n", debugstr_w(subsystem), id, token, desired, privs, granted );
++    if (!require_audit_privilege()) return FALSE;
+     return TRUE;
+ }
+ 
+-/******************************************************************************
+- * PrivilegedServiceAuditAlarmW    (kernelbase.@)
+- */
+ BOOL WINAPI PrivilegedServiceAuditAlarmW( LPCWSTR subsystem, LPCWSTR service, HANDLE token,
+                                           PPRIVILEGE_SET privs, BOOL granted )
+ {
+-    FIXME( "stub %s,%s,%p,%p,%x)\n", debugstr_w(subsystem), debugstr_w(service), token, privs, granted );
++    TRACE( "%s,%s,%p,%p,%x)\n", debugstr_w(subsystem), debugstr_w(service), token, privs, granted );
++    if (!require_audit_privilege()) return FALSE;
+     return TRUE;
+ }
+ 
+@@ -1631,8 +1820,7 @@ BOOL WINAPI PrivilegedServiceAuditAlarmW( LPCWSTR subsystem, LPCWSTR service, HA
+  */
+ BOOL WINAPI SetAclInformation( PACL acl, LPVOID info, DWORD len, ACL_INFORMATION_CLASS class )
+ {
+-    FIXME( "%p %p 0x%08lx 0x%08x - stub\n", acl, info, len, class );
+-    return TRUE;
++    return set_ntstatus( RtlSetInformationAcl( acl, info, len, class ));
+ }
+ 
+ /******************************************************************************
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1021,7 +1021,7 @@
+ @ stdcall RtlSetExtendedFeaturesMask(ptr int64)
+ @ stdcall RtlSetGroupSecurityDescriptor(ptr ptr long)
+ @ stdcall RtlSetHeapInformation(long long ptr long)
+-@ stub RtlSetInformationAcl
++@ stdcall RtlSetInformationAcl(ptr ptr long long)
+ @ stdcall RtlSetIoCompletionCallback(long ptr long)
+ @ stdcall RtlSetLastWin32Error(long)
+ @ stdcall RtlSetLastWin32ErrorAndNtStatusFromNtStatus(long)
+@@ -1037,8 +1037,8 @@
+ @ stdcall RtlSetSaclSecurityDescriptor(ptr long ptr long)
+ @ stdcall RtlSetSearchPathMode(long)
+ # @ stub RtlSetSecurityDescriptorRMControl
+-@ stub RtlSetSecurityObject
+-# @ stub RtlSetSecurityObjectEx
++@ stdcall RtlSetSecurityObject(long ptr ptr ptr long)
++@ stdcall RtlSetSecurityObjectEx(long ptr ptr long ptr long)
+ @ stdcall RtlSetThreadErrorMode(long ptr)
+ # @ stub RtlSetThreadIsCritical
+ @ stdcall RtlSetThreadPlaceholderCompatibilityMode(long)
+diff --git a/dlls/ntdll/sec.c b/dlls/ntdll/sec.c
+--- a/dlls/ntdll/sec.c
++++ b/dlls/ntdll/sec.c
+@@ -1211,7 +1211,7 @@ NTSTATUS WINAPI RtlNewSecurityObjectWithMultipleInheritance(PSECURITY_DESCRIPTOR
+  */
+ NTSTATUS WINAPI RtlDeleteSecurityObject( PSECURITY_DESCRIPTOR *descr )
+ {
+-    FIXME("%p stub.\n", descr);
++    TRACE("%p\n", descr);
+     RtlFreeHeap( GetProcessHeap(), 0, *descr );
+     return STATUS_SUCCESS;
+ }
+@@ -1365,6 +1365,43 @@ NTSTATUS WINAPI RtlAddAccessAllowedAceEx(
+                           AccessMask, pSid, ACCESS_ALLOWED_ACE_TYPE);
+ }
+ 
++/* Stained Glass OS: the object ACEs (ACCESS_ALLOWED_OBJECT_ACE and friends). The layout is documented:
++ * header, mask, flags, the object type GUID if flag 1, the inherited object type GUID if flag 2, then the
++ * SID. A GUID that is absent takes no room. They need an ACL of revision 4 (ACL_REVISION_DS). */
++static NTSTATUS add_object_ace( PACL acl, DWORD revision, DWORD ace_flags, DWORD mask, const GUID *object_type,
++                                const GUID *inherited_type, PSID sid, DWORD ace_type )
++{
++    ACE_HEADER *header;
++    DWORD size, flags = 0, *p;
++    BYTE *pos;
++
++    if (!RtlValidSid( sid )) return STATUS_INVALID_SID;
++    if (revision != 4 /* ACL_REVISION_DS */ || acl->AclRevision > MAX_ACL_REVISION) return STATUS_REVISION_MISMATCH;
++    if (!RtlValidAcl( acl )) return STATUS_INVALID_ACL;
++    if (!RtlFirstFreeAce( acl, &header )) return STATUS_INVALID_ACL;
++    if (!header) return STATUS_ALLOTTED_SPACE_EXCEEDED;
++
++    size = sizeof(ACE_HEADER) + 2 * sizeof(DWORD) + RtlLengthSid( sid );
++    if (object_type) { flags |= ACE_OBJECT_TYPE_PRESENT; size += sizeof(GUID); }
++    if (inherited_type) { flags |= ACE_INHERITED_OBJECT_TYPE_PRESENT; size += sizeof(GUID); }
++    if ((char *)header + size > (char *)acl + acl->AclSize) return STATUS_ALLOTTED_SPACE_EXCEEDED;
++
++    header->AceType = ace_type;
++    header->AceFlags = ace_flags;
++    header->AceSize = size;
++    p = (DWORD *)(header + 1);
++    p[0] = mask;
++    p[1] = flags;
++    pos = (BYTE *)(p + 2);
++    if (object_type) { memcpy( pos, object_type, sizeof(GUID) ); pos += sizeof(GUID); }
++    if (inherited_type) { memcpy( pos, inherited_type, sizeof(GUID) ); pos += sizeof(GUID); }
++    RtlCopySid( RtlLengthSid( sid ), pos, sid );
++
++    acl->AclRevision = max( acl->AclRevision, revision );
++    acl->AceCount++;
++    return STATUS_SUCCESS;
++}
++
+ /******************************************************************************
+  *  RtlAddAccessAllowedObjectAce		[NTDLL.@]
+  */
+@@ -1377,9 +1414,10 @@ NTSTATUS WINAPI RtlAddAccessAllowedObjectAce(
+     IN GUID* pInheritedObjectTypeGuid,
+     IN PSID pSid)
+ {
+-    FIXME("%p %lx %lx %lx %p %p %p - stub\n", pAcl, dwAceRevision, dwAceFlags, dwAccessMask,
++    TRACE("%p %lx %lx %lx %p %p %p\n", pAcl, dwAceRevision, dwAceFlags, dwAccessMask,
+           pObjectTypeGuid, pInheritedObjectTypeGuid, pSid);
+-    return STATUS_NOT_IMPLEMENTED;
++    return add_object_ace( pAcl, dwAceRevision, dwAceFlags, dwAccessMask, pObjectTypeGuid,
++                           pInheritedObjectTypeGuid, pSid, ACCESS_ALLOWED_OBJECT_ACE_TYPE );
+ }
+ 
+ /******************************************************************************
+@@ -1422,9 +1460,10 @@ NTSTATUS WINAPI RtlAddAccessDeniedObjectAce(
+     IN GUID* pInheritedObjectTypeGuid,
+     IN PSID pSid)
+ {
+-    FIXME("%p %lx %lx %lx %p %p %p - stub\n", pAcl, dwAceRevision, dwAceFlags, dwAccessMask,
++    TRACE("%p %lx %lx %lx %p %p %p\n", pAcl, dwAceRevision, dwAceFlags, dwAccessMask,
+           pObjectTypeGuid, pInheritedObjectTypeGuid, pSid);
+-    return STATUS_NOT_IMPLEMENTED;
++    return add_object_ace( pAcl, dwAceRevision, dwAceFlags, dwAccessMask, pObjectTypeGuid,
++                           pInheritedObjectTypeGuid, pSid, ACCESS_DENIED_OBJECT_ACE_TYPE );
+ }
+ 
+ /************************************************************************** 
+@@ -1480,9 +1519,12 @@ NTSTATUS WINAPI RtlAddAuditAccessObjectAce(
+     IN BOOL bAuditSuccess,
+     IN BOOL bAuditFailure)
+ {
+-    FIXME("%p %lx %lx %lx %p %p %p %d %d - stub\n", pAcl, dwAceRevision, dwAceFlags, dwAccessMask,
++    TRACE("%p %lx %lx %lx %p %p %p %d %d\n", pAcl, dwAceRevision, dwAceFlags, dwAccessMask,
+           pObjectTypeGuid, pInheritedObjectTypeGuid, pSid, bAuditSuccess, bAuditFailure);
+-    return STATUS_NOT_IMPLEMENTED;
++    if (bAuditSuccess) dwAceFlags |= SUCCESSFUL_ACCESS_ACE_FLAG;
++    if (bAuditFailure) dwAceFlags |= FAILED_ACCESS_ACE_FLAG;
++    return add_object_ace( pAcl, dwAceRevision, dwAceFlags, dwAccessMask, pObjectTypeGuid,
++                           pInheritedObjectTypeGuid, pSid, 7 /* SYSTEM_AUDIT_OBJECT_ACE_TYPE */ );
+ }
+ 
+ /**************************************************************************
+@@ -1886,6 +1928,138 @@ NTSTATUS WINAPI RtlQueryInformationAcl(
+     return status;
+ }
+ 
++/******************************************************************************
++ * RtlSetInformationAcl (NTDLL.@)
++ *
++ * Only the revision of an ACL can be set, and not below the one it has.
++ */
++NTSTATUS WINAPI RtlSetInformationAcl( PACL acl, void *info, DWORD len, ACL_INFORMATION_CLASS class )
++{
++    TRACE( "%p %p %lu %d\n", acl, info, len, class );
++
++    if (!RtlValidAcl( acl )) return STATUS_INVALID_ACL;
++    switch (class)
++    {
++    case AclRevisionInformation:
++    {
++        ACL_REVISION_INFORMATION *rev = info;
++
++        if (len < sizeof(*rev)) return STATUS_INVALID_PARAMETER;
++        if (rev->AclRevision < MIN_ACL_REVISION || rev->AclRevision > MAX_ACL_REVISION ||
++            rev->AclRevision < acl->AclRevision)
++            return STATUS_INVALID_PARAMETER;
++        acl->AclRevision = rev->AclRevision;
++        return STATUS_SUCCESS;
++    }
++    default:
++        return STATUS_INVALID_INFO_CLASS;
++    }
++}
++
++/******************************************************************************
++ * RtlSetSecurityObjectEx (NTDLL.@)
++ *
++ * Replace the parts of a private object's self-relative security descriptor selected by info with those of the
++ * modification descriptor; the result is a new self-relative descriptor on the process heap and the old one is
++ * freed. The token is not consulted (the owner and privilege checks of Windows are not made: GUESS).
++ */
++NTSTATUS WINAPI RtlSetSecurityObjectEx( SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR mod,
++                                        PSECURITY_DESCRIPTOR *object, ULONG flags,
++                                        const GENERIC_MAPPING *mapping, HANDLE token )
++{
++    SECURITY_DESCRIPTOR_CONTROL old_control, mod_control, control;
++    SECURITY_DESCRIPTOR_RELATIVE *rel;
++    PSID owner = NULL, group = NULL, sid;
++    PACL dacl = NULL, sacl = NULL, acl;
++    BOOLEAN present, defaulted;
++    ULONG rev, size, owner_len = 0, group_len = 0, dacl_len = 0, sacl_len = 0, off;
++    BYTE *buffer;
++    NTSTATUS status;
++
++    TRACE( "%#lx %p %p %#lx %p %p\n", info, mod, object, flags, mapping, token );
++
++    if (!mod || !object || !*object) return STATUS_INVALID_PARAMETER;
++
++    if (!RtlValidSecurityDescriptor( mod )) return STATUS_INVALID_SECURITY_DESCR;
++    if (!RtlValidSecurityDescriptor( *object )) return STATUS_INVALID_SECURITY_DESCR;
++    if ((status = RtlGetControlSecurityDescriptor( *object, &old_control, &rev ))) return status;
++    if (!(old_control & SE_SELF_RELATIVE)) return STATUS_INVALID_SECURITY_DESCR;
++    RtlGetControlSecurityDescriptor( mod, &mod_control, &rev );
++
++    /* start from the old parts */
++    RtlGetOwnerSecurityDescriptor( *object, &owner, &defaulted );
++    RtlGetGroupSecurityDescriptor( *object, &group, &defaulted );
++    RtlGetDaclSecurityDescriptor( *object, &present, &dacl, &defaulted );
++    if (!present) dacl = NULL;
++    RtlGetSaclSecurityDescriptor( *object, &present, &sacl, &defaulted );
++    if (!present) sacl = NULL;
++    control = old_control & (SE_DACL_PRESENT | SE_SACL_PRESENT | SE_DACL_AUTO_INHERITED | SE_SACL_AUTO_INHERITED |
++                             SE_DACL_PROTECTED | SE_SACL_PROTECTED | SE_SELF_RELATIVE);
++
++    if (info & OWNER_SECURITY_INFORMATION)
++    {
++        RtlGetOwnerSecurityDescriptor( mod, &sid, &defaulted );
++        if (!sid) return STATUS_INVALID_OWNER;
++        owner = sid;
++    }
++    if (info & GROUP_SECURITY_INFORMATION)
++    {
++        RtlGetGroupSecurityDescriptor( mod, &sid, &defaulted );
++        if (!sid) return STATUS_INVALID_PRIMARY_GROUP;
++        group = sid;
++    }
++    if (info & DACL_SECURITY_INFORMATION)
++    {
++        RtlGetDaclSecurityDescriptor( mod, &present, &acl, &defaulted );
++        dacl = present ? acl : NULL;            /* no DACL in the modification: a NULL DACL */
++        control |= SE_DACL_PRESENT;
++        control &= ~(SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED);
++        control |= mod_control & SE_DACL_PROTECTED;
++        if (flags & 1 /* SEF_DACL_AUTO_INHERIT */) control |= SE_DACL_AUTO_INHERITED;
++    }
++    if (info & SACL_SECURITY_INFORMATION)
++    {
++        RtlGetSaclSecurityDescriptor( mod, &present, &acl, &defaulted );
++        sacl = present ? acl : NULL;
++        control |= SE_SACL_PRESENT;
++        control &= ~(SE_SACL_PROTECTED | SE_SACL_AUTO_INHERITED);
++        control |= mod_control & SE_SACL_PROTECTED;
++        if (flags & 2 /* SEF_SACL_AUTO_INHERIT */) control |= SE_SACL_AUTO_INHERITED;
++    }
++    if (info & 0x80000000 /* PROTECTED_DACL_SECURITY_INFORMATION */) control |= SE_DACL_PROTECTED;
++    if (info & 0x20000000 /* UNPROTECTED_DACL_SECURITY_INFORMATION */) control &= ~SE_DACL_PROTECTED;
++    if (info & 0x40000000 /* PROTECTED_SACL_SECURITY_INFORMATION */) control |= SE_SACL_PROTECTED;
++    if (info & 0x10000000 /* UNPROTECTED_SACL_SECURITY_INFORMATION */) control &= ~SE_SACL_PROTECTED;
++
++    size = sizeof(SECURITY_DESCRIPTOR_RELATIVE);
++    if (owner) size += owner_len = RtlLengthSid( owner );
++    if (group) size += group_len = RtlLengthSid( group );
++    if (dacl && (control & SE_DACL_PRESENT)) size += dacl_len = dacl->AclSize;
++    if (sacl && (control & SE_SACL_PRESENT)) size += sacl_len = sacl->AclSize;
++    if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0, size ))) return STATUS_NO_MEMORY;
++    rel = (SECURITY_DESCRIPTOR_RELATIVE *)buffer;
++    RtlCreateSecurityDescriptor( rel, SECURITY_DESCRIPTOR_REVISION );
++    rel->Control = control | SE_SELF_RELATIVE;
++    off = sizeof(*rel);
++    if (owner_len) { memcpy( buffer + off, owner, owner_len ); rel->Owner = off; off += owner_len; }
++    if (group_len) { memcpy( buffer + off, group, group_len ); rel->Group = off; off += group_len; }
++    if (dacl_len) { memcpy( buffer + off, dacl, dacl_len ); rel->Dacl = off; off += dacl_len; }
++    if (sacl_len) { memcpy( buffer + off, sacl, sacl_len ); rel->Sacl = off; off += sacl_len; }
++
++    RtlFreeHeap( GetProcessHeap(), 0, *object );
++    *object = rel;
++    return STATUS_SUCCESS;
++}
++
++/******************************************************************************
++ * RtlSetSecurityObject (NTDLL.@)
++ */
++NTSTATUS WINAPI RtlSetSecurityObject( SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR mod,
++                                      PSECURITY_DESCRIPTOR *object, PGENERIC_MAPPING mapping, HANDLE token )
++{
++    return RtlSetSecurityObjectEx( info, mod, object, 0, mapping, token );
++}
++
+ NTSTATUS WINAPI RtlConvertToAutoInheritSecurityObject(
+         PSECURITY_DESCRIPTOR pdesc,
+         PSECURITY_DESCRIPTOR cdesc,
+@@ -1904,8 +2078,55 @@ NTSTATUS WINAPI RtlConvertToAutoInheritSecurityObject(
+  */
+ NTSTATUS WINAPI RtlDefaultNpAcl(PACL *pAcl)
+ {
+-    FIXME("%p - stub\n", pAcl);
++    /* the documented default of a named pipe: full control for LocalSystem, the administrators and the
++     * creator (the user of the token), read access for Everyone and the anonymous logon */
++    SID_IDENTIFIER_AUTHORITY nt = { SECURITY_NT_AUTHORITY };
++    SID_IDENTIFIER_AUTHORITY world = { SECURITY_WORLD_SID_AUTHORITY };
++    BYTE system_sid[SECURITY_MAX_SID_SIZE], admins_sid[SECURITY_MAX_SID_SIZE];
++    BYTE world_sid_buf[SECURITY_MAX_SID_SIZE], anon_sid[SECURITY_MAX_SID_SIZE];
++    BYTE buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
++    TOKEN_USER *user = (TOKEN_USER *)buf;
++    HANDLE token;
++    ULONG len, size;
++    NTSTATUS status;
++    ACL *acl;
++
++    TRACE( "%p\n", pAcl );
+ 
++    if (!pAcl) return STATUS_INVALID_PARAMETER;
+     *pAcl = NULL;
++
++    RtlInitializeSid( system_sid, &nt, 1 );
++    *RtlSubAuthoritySid( system_sid, 0 ) = SECURITY_LOCAL_SYSTEM_RID;
++    RtlInitializeSid( admins_sid, &nt, 2 );
++    *RtlSubAuthoritySid( admins_sid, 0 ) = SECURITY_BUILTIN_DOMAIN_RID;
++    *RtlSubAuthoritySid( admins_sid, 1 ) = DOMAIN_ALIAS_RID_ADMINS;
++    RtlInitializeSid( world_sid_buf, &world, 1 );
++    *RtlSubAuthoritySid( world_sid_buf, 0 ) = SECURITY_WORLD_RID;
++    RtlInitializeSid( anon_sid, &nt, 1 );
++    *RtlSubAuthoritySid( anon_sid, 0 ) = SECURITY_ANONYMOUS_LOGON_RID;
++
++    if ((status = NtOpenThreadToken( GetCurrentThread(), TOKEN_QUERY, TRUE, &token )))
++        status = NtOpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &token );
++    if (status) return status;
++    status = NtQueryInformationToken( token, TokenUser, buf, sizeof(buf), &len );
++    NtClose( token );
++    if (status) return status;
++
++    size = sizeof(ACL) + 5 * (offsetof( ACCESS_ALLOWED_ACE, SidStart )) + RtlLengthSid( system_sid ) +
++           RtlLengthSid( admins_sid ) + RtlLengthSid( user->User.Sid ) + RtlLengthSid( world_sid_buf ) +
++           RtlLengthSid( anon_sid );
++    if (!(acl = RtlAllocateHeap( GetProcessHeap(), 0, size ))) return STATUS_NO_MEMORY;
++    RtlCreateAcl( acl, size, ACL_REVISION );
++    if ((status = RtlAddAccessAllowedAce( acl, ACL_REVISION, GENERIC_ALL, system_sid )) ||
++        (status = RtlAddAccessAllowedAce( acl, ACL_REVISION, GENERIC_ALL, admins_sid )) ||
++        (status = RtlAddAccessAllowedAce( acl, ACL_REVISION, GENERIC_ALL, user->User.Sid )) ||
++        (status = RtlAddAccessAllowedAce( acl, ACL_REVISION, GENERIC_READ, world_sid_buf )) ||
++        (status = RtlAddAccessAllowedAce( acl, ACL_REVISION, GENERIC_READ, anon_sid )))
++    {
++        RtlFreeHeap( GetProcessHeap(), 0, acl );
++        return status;
++    }
++    *pAcl = acl;
+     return STATUS_SUCCESS;
+ }
+diff --git a/include/winternl.h b/include/winternl.h
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -5192,6 +5192,9 @@ NTSYSAPI NTSTATUS  WINAPI RtlQueryEnvironmentVariable(WCHAR*,const WCHAR*,SIZE_T
+ NTSYSAPI NTSTATUS  WINAPI RtlQueryEnvironmentVariable_U(PWSTR,PUNICODE_STRING,PUNICODE_STRING);
+ NTSYSAPI NTSTATUS  WINAPI RtlQueryHeapInformation(HANDLE,HEAP_INFORMATION_CLASS,PVOID,SIZE_T,PSIZE_T);
+ NTSYSAPI NTSTATUS  WINAPI RtlQueryInformationAcl(PACL,LPVOID,DWORD,ACL_INFORMATION_CLASS);
++NTSYSAPI NTSTATUS  WINAPI RtlSetInformationAcl(PACL,void*,DWORD,ACL_INFORMATION_CLASS);
++NTSYSAPI NTSTATUS  WINAPI RtlSetSecurityObject(SECURITY_INFORMATION,PSECURITY_DESCRIPTOR,PSECURITY_DESCRIPTOR*,PGENERIC_MAPPING,HANDLE);
++NTSYSAPI NTSTATUS  WINAPI RtlSetSecurityObjectEx(SECURITY_INFORMATION,PSECURITY_DESCRIPTOR,PSECURITY_DESCRIPTOR*,ULONG,const GENERIC_MAPPING*,HANDLE);
+ NTSYSAPI NTSTATUS  WINAPI RtlQueryInformationActivationContext(ULONG,HANDLE,PVOID,ULONG,PVOID,SIZE_T,SIZE_T*);
+ NTSYSAPI NTSTATUS  WINAPI RtlQueryPackageIdentity(HANDLE,WCHAR*,SIZE_T*,WCHAR*,SIZE_T*,BOOLEAN*);
+ NTSYSAPI BOOL      WINAPI RtlQueryPerformanceCounter(LARGE_INTEGER*);

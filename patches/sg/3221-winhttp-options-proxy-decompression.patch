@@ -1,0 +1,3290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Wed, 14 Oct 2026 07:56:14 -0700
+Subject: [PATCH] 3221 winhttp: options, proxy, decompression, bounds, times
+ and statistics, IWinHttpRequest options and stream
+
+The option handlers of sessions, connections and requests were FIXME stubs for
+most options. Now (from the "Option flags" table of the WinHTTP documentation):
+- stored options of the session handed down to its requests (CONNECT_RETRIES,
+  MAX_HTTP_AUTOMATIC_REDIRECTS, MAX_HTTP_STATUS_CONTINUE, MAX_RESPONSE_HEADER_SIZE,
+  MAX_RESPONSE_DRAIN_SIZE, MAX_CONNS_PER_SERVER / _1_0_SERVER, CODEPAGE,
+  ENCODE_EXTRA, DECOMPRESSION, ENABLE_HTTP_PROTOCOL, ... ), HANDLE_TYPE, CALLBACK,
+  PARENT_HANDLE, SECURE_PROTOCOLS (the policy default), USER_AGENT, EXTENDED_ERROR,
+  HTTP_PROTOCOL_USED, and the NULL-handle options (PROXY, HTTP_VERSION,
+  ENABLETRACING, WORKER_THREAD_COUNT once, GLOBAL_PROXY/SERVER_CREDS behind the
+  ShareCredsWithWinHttp policy);
+- WINHTTP_OPTION_PROXY on sessions and requests (the request's proxy re-points
+  its connection), IS_PROXY_CONNECT_RESPONSE / RECEIVE_PROXY_CONNECT_RESPONSE;
+- behaviours: 1xx answers skipped up to MAX_HTTP_STATUS_CONTINUE, header block
+  bound (ERROR_WINHTTP_HEADER_SIZE_OVERFLOW), drain bound, EXPIRE_CONNECTION,
+  per-server connection limit that makes requests wait, CONNECT_RETRIES and
+  IPV6_FAST_FALLBACK trying the other addresses of a host, gzip/deflate
+  decompression (Accept-Encoding set, inflated reads and data-available counts),
+  URL code page, REQUEST_TIMES and REQUEST_STATS, SERVER_CERT_CHAIN_CONTEXT,
+  server/proxy SPN, shared credentials;
+- WinHttpQueryHeaders: the table was misaligned past 70 and lacked the legacy
+  names (Content-Description, Link, Forwarded, From, Refresh, Content-Disposition,
+  Proxy-Support, Authentication-Info);
+- websocket CLOSE_TIMEOUT; IWinHttpRequest::Option for all documented options,
+  SetClientCertificate / SelectCertificate ("location\store\subject"), and the
+  response stream (read-only, CopyTo, Stat, Clone, lock errors).
+Also: a request closes its connection when it goes away; todo_wine of Invoke removed.
+
+diff --git a/dlls/winhttp/Makefile.in b/dlls/winhttp/Makefile.in
+index 995587a..c635bc1 100644
+--- a/dlls/winhttp/Makefile.in
++++ b/dlls/winhttp/Makefile.in
+@@ -1,7 +1,8 @@
+ EXTRADEFS = -D_WINHTTP_INTERNAL_
+ MODULE    = winhttp.dll
+ IMPORTLIB = winhttp
+-IMPORTS   = uuid jsproxy user32 advapi32 ws2_32
++IMPORTS   = $(ZLIB_PE_LIBS) uuid jsproxy user32 advapi32 ws2_32
++EXTRAINCL = $(ZLIB_PE_CFLAGS)
+ DELAYIMPORTS = oleaut32 crypt32 secur32 iphlpapi dhcpcsvc
+ 
+ SOURCES = \
+diff --git a/dlls/winhttp/cookie.c b/dlls/winhttp/cookie.c
+index e1f7563..8b44a93 100644
+--- a/dlls/winhttp/cookie.c
++++ b/dlls/winhttp/cookie.c
+@@ -117,6 +117,18 @@ static void delete_domain( struct domain *domain )
+     free( domain );
+ }
+ 
++/* drop the cookies of the domains that host belongs to (the caller holds the session lock) */
++void clear_cookies_for_host( struct session *session, const WCHAR *host )
++{
++    struct list *item, *next;
++
++    LIST_FOR_EACH_SAFE( item, next, &session->cookie_cache )
++    {
++        struct domain *domain = LIST_ENTRY( item, struct domain, entry );
++        if (wcsstr( host, domain->name )) delete_domain( domain );
++    }
++}
++
+ void destroy_cookies( struct session *session )
+ {
+     struct list *item, *next;
+diff --git a/dlls/winhttp/main.c b/dlls/winhttp/main.c
+index e444936..11ffd9f 100644
+--- a/dlls/winhttp/main.c
++++ b/dlls/winhttp/main.c
+@@ -32,6 +32,20 @@
+ 
+ HINSTANCE winhttp_instance;
+ 
++/* WINHTTP_OPTION_EXTENDED_ERROR: the Winsock error behind the last ERROR_WINHTTP_* of this thread */
++static DWORD extended_error_tls = TLS_OUT_OF_INDEXES;
++
++void set_extended_error( DWORD err )
++{
++    if (extended_error_tls != TLS_OUT_OF_INDEXES) TlsSetValue( extended_error_tls, (void *)(DWORD_PTR)err );
++}
++
++DWORD get_extended_error(void)
++{
++    if (extended_error_tls == TLS_OUT_OF_INDEXES) return 0;
++    return (DWORD)(DWORD_PTR)TlsGetValue( extended_error_tls );
++}
++
+ WINE_DEFAULT_DEBUG_CHANNEL(winhttp);
+ 
+ /******************************************************************
+@@ -43,12 +57,14 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpv)
+     {
+     case DLL_PROCESS_ATTACH:
+         winhttp_instance = hInstDLL;
++        extended_error_tls = TlsAlloc();
+         DisableThreadLibraryCalls(hInstDLL);
+         break;
+     case DLL_PROCESS_DETACH:
+         if (lpv) break;
+         netconn_unload();
+         release_typelib();
++        if (extended_error_tls != TLS_OUT_OF_INDEXES) TlsFree( extended_error_tls );
+         break;
+     }
+     return TRUE;
+diff --git a/dlls/winhttp/net.c b/dlls/winhttp/net.c
+index e46f202..7657680 100644
+--- a/dlls/winhttp/net.c
++++ b/dlls/winhttp/net.c
+@@ -261,7 +261,14 @@ DWORD netconn_create( struct hostdata *host, const struct sockaddr_storage *sock
+             if ((res = select( conn->socket + 1, NULL, &set_read, &set_error, &timeval )) > 0)
+             {
+                 if (FD_ISSET(conn->socket, &set_read)) ret = ERROR_SUCCESS;
+-                else                                   assert( FD_ISSET(conn->socket, &set_error) );
++                else
++                {
++                    int so_error = 0, so_len = sizeof(so_error);
++
++                    assert( FD_ISSET(conn->socket, &set_error) );
++                    if (!getsockopt( conn->socket, SOL_SOCKET, SO_ERROR, (char *)&so_error, &so_len ) && so_error)
++                        ret = so_error;
++                }
+             }
+             else if (!res) ret = ERROR_WINHTTP_TIMEOUT;
+         }
+@@ -272,6 +279,9 @@ DWORD netconn_create( struct hostdata *host, const struct sockaddr_storage *sock
+     if (ret)
+     {
+         WARN( "unable to connect to host (%lu)\n", ret );
++#ifndef SG_MUTANT_WH_EXTERR
++        set_extended_error( ret == ERROR_WINHTTP_TIMEOUT ? WSAETIMEDOUT : ret );
++#endif
+         closesocket( conn->socket );
+         free( conn );
+         return ret == ERROR_WINHTTP_TIMEOUT ? ERROR_WINHTTP_TIMEOUT : ERROR_WINHTTP_CANNOT_CONNECT;
+@@ -281,6 +291,76 @@ DWORD netconn_create( struct hostdata *host, const struct sockaddr_storage *sock
+     return ERROR_SUCCESS;
+ }
+ 
++static BOOL same_address( const struct sockaddr_storage *a, const struct sockaddr_storage *b )
++{
++    if (a->ss_family != b->ss_family) return FALSE;
++    if (a->ss_family == AF_INET)
++        return ((const struct sockaddr_in *)a)->sin_addr.s_addr == ((const struct sockaddr_in *)b)->sin_addr.s_addr;
++    return !memcmp( &((const struct sockaddr_in6 *)a)->sin6_addr, &((const struct sockaddr_in6 *)b)->sin6_addr,
++                    sizeof(struct in6_addr) );
++}
++
++#define MAX_HOST_ADDRESSES 32
++
++/* Try the addresses of a host one after the other, at most max_attempts connections in all (the one
++ * that is already known to have failed counts). With ipv6_fast the order is the IPv6 fast fallback one:
++ * the first IPv6 address with a short timeout, then the first IPv4 address, then the first IPv6 address
++ * again, then the others. */
++DWORD netconn_connect_multi( struct hostdata *host, INTERNET_PORT port, const struct sockaddr_storage *tried,
++                             DWORD max_attempts, BOOL ipv6_fast, int timeout, struct netconn **ret_conn )
++{
++    struct sockaddr_storage v4[MAX_HOST_ADDRESSES], v6[MAX_HOST_ADDRESSES];
++    struct { const struct sockaddr_storage *addr; int timeout; } order[2 * MAX_HOST_ADDRESSES + 2];
++    unsigned int n4 = 0, n6 = 0, count = 0, i;
++    DWORD attempts = tried ? 1 : 0, err = ERROR_WINHTTP_CANNOT_CONNECT;
++    ADDRINFOW *res, *ptr, hints;
++
++    winsock_init();
++    memset( &hints, 0, sizeof(hints) );
++    hints.ai_family = AF_UNSPEC;
++    if (GetAddrInfoW( host->hostname, NULL, &hints, &res )) return ERROR_WINHTTP_NAME_NOT_RESOLVED;
++    for (ptr = res; ptr; ptr = ptr->ai_next)
++    {
++        if (ptr->ai_family == AF_INET && n4 < MAX_HOST_ADDRESSES)
++        {
++            memset( &v4[n4], 0, sizeof(v4[n4]) );
++            memcpy( &v4[n4], ptr->ai_addr, min( ptr->ai_addrlen, sizeof(struct sockaddr_in) ) );
++            ((struct sockaddr_in *)&v4[n4])->sin_port = htons( port );
++            n4++;
++        }
++        else if (ptr->ai_family == AF_INET6 && n6 < MAX_HOST_ADDRESSES)
++        {
++            memset( &v6[n6], 0, sizeof(v6[n6]) );
++            memcpy( &v6[n6], ptr->ai_addr, min( ptr->ai_addrlen, sizeof(struct sockaddr_in6) ) );
++            ((struct sockaddr_in6 *)&v6[n6])->sin6_port = htons( port );
++            n6++;
++        }
++    }
++    FreeAddrInfoW( res );
++
++    if (ipv6_fast && n4 && n6)
++    {
++        order[count].addr = &v6[0]; order[count++].timeout = 300;
++        order[count].addr = &v4[0]; order[count++].timeout = timeout;
++        order[count].addr = &v6[0]; order[count++].timeout = timeout;
++        for (i = 1; i < n4; i++) { order[count].addr = &v4[i]; order[count++].timeout = timeout; }
++        for (i = 1; i < n6; i++) { order[count].addr = &v6[i]; order[count++].timeout = timeout; }
++    }
++    else
++    {
++        for (i = 0; i < n4; i++) { order[count].addr = &v4[i]; order[count++].timeout = timeout; }
++        for (i = 0; i < n6; i++) { order[count].addr = &v6[i]; order[count++].timeout = timeout; }
++    }
++
++    for (i = 0; i < count && attempts < max_attempts; i++)
++    {
++        if (tried && same_address( order[i].addr, tried )) continue;
++        attempts++;
++        if (!(err = netconn_create( host, order[i].addr, order[i].timeout, ret_conn ))) return ERROR_SUCCESS;
++    }
++    return err;
++}
++
+ void netconn_addref( struct netconn *conn )
+ {
+     InterlockedIncrement( &conn->refs );
+@@ -300,6 +380,7 @@ void netconn_release( struct netconn *conn )
+     }
+     if (conn->socket != -1)
+         closesocket( conn->socket );
++    if (conn->slot_held) release_slot( conn->host );
+     release_host( conn->host );
+     if (conn->port)
+         CloseHandle( conn->port );
+@@ -743,6 +824,7 @@ static DWORD resolve_hostname( const WCHAR *name, INTERNET_PORT port, struct soc
+         if (ret != 0)
+         {
+             TRACE("failed to get address of %s\n", debugstr_w(name));
++            set_extended_error( ret );
+             return ERROR_WINHTTP_NAME_NOT_RESOLVED;
+         }
+     }
+diff --git a/dlls/winhttp/request.c b/dlls/winhttp/request.c
+index 21762f7..7d9fb6d 100644
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -35,6 +35,7 @@
+ #include "winhttp.h"
+ #include "ntsecapi.h"
+ #include "winternl.h"
++#include <zlib.h>
+ 
+ #include "wine/debug.h"
+ #include "winhttp_private.h"
+@@ -57,7 +58,11 @@ static const WCHAR *attribute_table[] =
+     L"Content-Type"  ,              /* WINHTTP_QUERY_CONTENT_TYPE               = 1  */
+     L"Content-Transfer-Encoding",   /* WINHTTP_QUERY_CONTENT_TRANSFER_ENCODING  = 2  */
+     L"Content-ID",                  /* WINHTTP_QUERY_CONTENT_ID                 = 3  */
+-    NULL,                           /* WINHTTP_QUERY_CONTENT_DESCRIPTION        = 4  */
++#ifdef SG_MUTANT_WH_HDRNAMES
++    NULL,
++#else
++    L"Content-Description",         /* WINHTTP_QUERY_CONTENT_DESCRIPTION        = 4  */
++#endif
+     L"Content-Length",              /* WINHTTP_QUERY_CONTENT_LENGTH             = 5  */
+     L"Content-Language",            /* WINHTTP_QUERY_CONTENT_LANGUAGE           = 6  */
+     L"Allow",                       /* WINHTTP_QUERY_ALLOW                      = 7  */
+@@ -69,7 +74,7 @@ static const WCHAR *attribute_table[] =
+     L"URI",                         /* WINHTTP_QUERY_URI                        = 13 */
+     L"From",                        /* WINHTTP_QUERY_DERIVED_FROM               = 14 */
+     NULL,                           /* WINHTTP_QUERY_COST                       = 15 */
+-    NULL,                           /* WINHTTP_QUERY_LINK                       = 16 */
++    L"Link",                        /* WINHTTP_QUERY_LINK                       = 16 */
+     L"Pragma",                      /* WINHTTP_QUERY_PRAGMA                     = 17 */
+     NULL,                           /* WINHTTP_QUERY_VERSION                    = 18 */
+     L"Status",                      /* WINHTTP_QUERY_STATUS_CODE                = 19 */
+@@ -83,8 +88,8 @@ static const WCHAR *attribute_table[] =
+     L"Accept-Language",             /* WINHTTP_QUERY_ACCEPT_LANGUAGE            = 27 */
+     L"Authorization",               /* WINHTTP_QUERY_AUTHORIZATION              = 28 */
+     L"Content-Encoding",            /* WINHTTP_QUERY_CONTENT_ENCODING           = 29 */
+-    NULL,                           /* WINHTTP_QUERY_FORWARDED                  = 30 */
+-    NULL,                           /* WINHTTP_QUERY_FROM                       = 31 */
++    L"Forwarded",                   /* WINHTTP_QUERY_FORWARDED                  = 30 */
++    L"From",                        /* WINHTTP_QUERY_FROM                       = 31 */
+     L"If-Modified-Since",           /* WINHTTP_QUERY_IF_MODIFIED_SINCE          = 32 */
+     L"Location",                    /* WINHTTP_QUERY_LOCATION                   = 33 */
+     NULL,                           /* WINHTTP_QUERY_ORIG_URI                   = 34 */
+@@ -99,8 +104,8 @@ static const WCHAR *attribute_table[] =
+     L"Set-Cookie",                  /* WINHTTP_QUERY_SET_COOKIE                 = 43 */
+     L"Cookie",                      /* WINHTTP_QUERY_COOKIE                     = 44 */
+     NULL,                           /* WINHTTP_QUERY_REQUEST_METHOD             = 45 */
+-    NULL,                           /* WINHTTP_QUERY_REFRESH                    = 46 */
+-    NULL,                           /* WINHTTP_QUERY_CONTENT_DISPOSITION        = 47 */
++    L"Refresh",                     /* WINHTTP_QUERY_REFRESH                    = 46 */
++    L"Content-Disposition",         /* WINHTTP_QUERY_CONTENT_DISPOSITION        = 47 */
+     L"Age",                         /* WINHTTP_QUERY_AGE                        = 48 */
+     L"Cache-Control",               /* WINHTTP_QUERY_CACHE_CONTROL              = 49 */
+     L"Content-Base",                /* WINHTTP_QUERY_CONTENT_BASE               = 50 */
+@@ -124,8 +129,12 @@ static const WCHAR *attribute_table[] =
+     L"Expect",                      /* WINHTTP_QUERY_EXPECT                     = 68 */
+     L"Proxy-Connection",            /* WINHTTP_QUERY_PROXY_CONNECTION           = 69 */
+     L"Unless-Modified-Since",       /* WINHTTP_QUERY_UNLESS_MODIFIED_SINCE      = 70 */
+-    NULL,                           /* WINHTTP_QUERY_PROXY_SUPPORT              = 75 */
+-    NULL,                           /* WINHTTP_QUERY_AUTHENTICATION_INFO        = 76 */
++    NULL,                           /* 71 (undocumented) */
++    NULL,                           /* 72 (undocumented) */
++    NULL,                           /* 73 (undocumented) */
++    NULL,                           /* 74 (undocumented) */
++    L"Proxy-Support",               /* WINHTTP_QUERY_PROXY_SUPPORT              = 75 */
++    L"Authentication-Info",         /* WINHTTP_QUERY_AUTHENTICATION_INFO        = 76 */
+     NULL,                           /* WINHTTP_QUERY_PASSPORT_URLS              = 77 */
+     NULL                            /* WINHTTP_QUERY_PASSPORT_CONFIG            = 78 */
+ };
+@@ -746,7 +755,9 @@ static DWORD query_headers( struct request *request, DWORD level, const WCHAR *n
+         if (attr >= ARRAY_SIZE(attribute_table)) return ERROR_INVALID_PARAMETER;
+         if (!attribute_table[attr])
+         {
+-            FIXME( "attribute %lu not implemented\n", attr );
++            /* COST, DERIVED_FROM, MESSAGE_ID, ORIG_URI, TITLE, REQUEST_METHOD-less names and the
++             * passport entries have no header to look up */
++            WARN( "attribute %lu has no header to retrieve\n", attr );
+             return ERROR_WINHTTP_HEADER_NOT_FOUND;
+         }
+         TRACE("attribute %s\n", debugstr_w(attribute_table[attr]));
+@@ -1115,6 +1126,9 @@ static BOOL get_authvalue( struct request *request, DWORD level, DWORD scheme, W
+     return TRUE;
+ }
+ 
++static DWORD set_credentials( struct request *request, DWORD target, DWORD scheme_flag, const WCHAR *username,
++                              const WCHAR *password );
++
+ static BOOL do_authorization( struct request *request, DWORD target, DWORD scheme_flag )
+ {
+     struct authinfo *authinfo, **auth_ptr;
+@@ -1126,6 +1140,33 @@ static BOOL do_authorization( struct request *request, DWORD target, DWORD schem
+ 
+     if (scheme == SCHEME_INVALID) return FALSE;
+ 
++    /* no credentials on the handle: use the ones WinINet shared (WINHTTP_OPTION_GLOBAL_*_CREDS) */
++    if (target == WINHTTP_AUTH_TARGET_SERVER && !request->creds[TARGET_SERVER][scheme].username && !request->username &&
++#ifdef SG_MUTANT_WH_GLOBALCREDS
++        0 &&
++#endif
++        global_server_creds_allowed( request ))
++    {
++        WCHAR *user, *pass;
++        if (find_global_creds( FALSE, request->connect->hostname, request->connect->hostport, scheme_flag, &user, &pass ))
++        {
++            set_credentials( request, target, scheme_flag, user, pass );
++            free( user );
++            free( pass );
++        }
++    }
++    else if (target == WINHTTP_AUTH_TARGET_PROXY && !request->creds[TARGET_PROXY][scheme].username &&
++             !request->connect->session->proxy_username)
++    {
++        WCHAR *user, *pass;
++        if (find_global_creds( TRUE, request->connect->servername, request->connect->serverport, scheme_flag, &user, &pass ))
++        {
++            set_credentials( request, target, scheme_flag, user, pass );
++            free( user );
++            free( pass );
++        }
++    }
++
+     switch (target)
+     {
+     case WINHTTP_AUTH_TARGET_SERVER:
+@@ -1294,8 +1335,27 @@ static BOOL do_authorization( struct request *request, DWORD target, DWORD schem
+         out_desc.cBuffers  = 1;
+         out_desc.pBuffers  = &out;
+ 
++        if (first)
++        {
++            WCHAR **spn = target == WINHTTP_AUTH_TARGET_PROXY ? &request->proxy_spn : &request->server_spn;
++            const WCHAR *host = target == WINHTTP_AUTH_TARGET_PROXY ? request->connect->servername :
++                                                                        request->connect->hostname;
++            INTERNET_PORT port = target == WINHTTP_AUTH_TARGET_PROXY ? request->connect->serverport :
++                                                                         request->connect->hostport;
++            WCHAR *name = malloc( (lstrlenW( host ) + 12) * sizeof(WCHAR) );
++
++            /* HTTP/host, with the port when WINHTTP_OPTION_SPN asked for it */
++            if (name)
++            {
++                if (request->opts.spn & WINHTTP_ENABLE_SPN_SERVER_PORT && port) swprintf( name, lstrlenW( host ) + 12, L"HTTP/%s:%u", host, port );
++                else swprintf( name, lstrlenW( host ) + 12, L"HTTP/%s", host );
++                free( *spn );
++                *spn = name;
++            }
++        }
+         status = InitializeSecurityContextW( first ? &authinfo->cred : NULL, first ? NULL : &authinfo->ctx,
+-                                             first ? request->connect->servername : NULL, flags, 0,
++                                             first ? (target == WINHTTP_AUTH_TARGET_PROXY ? request->proxy_spn :
++                                                      request->server_spn) : NULL, flags, 0,
+                                              SECURITY_NETWORK_DREP, in.pvBuffer ? &in_desc : NULL, 0,
+                                              &authinfo->ctx, &out_desc, &authinfo->attr, &authinfo->exp );
+         free( in.pvBuffer );
+@@ -1390,6 +1450,8 @@ static WCHAR *build_proxy_connect_string( struct request *request )
+ 
+ static DWORD read_reply( struct request *request );
+ 
++static void set_content_length( struct request *request, DWORD status );
++
+ static DWORD secure_proxy_connect( struct request *request )
+ {
+     WCHAR *str;
+@@ -1406,6 +1468,20 @@ static DWORD secure_proxy_connect( struct request *request )
+     ret = netconn_send( request->netconn, strA, len, &bytes_sent, NULL );
+     free( strA );
+     if (!ret) ret = read_reply( request );
++    if (!ret && request->opts.receive_proxy_connect_response)
++    {
++        DWORD status, size = sizeof(status);
++
++        /* anything but a success is the proxy's answer to the request, with its entity */
++        if (!query_headers( request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &size, NULL ) &&
++            (status < 200 || status > 299))
++        {
++            set_content_length( request, status );
++#ifndef SG_MUTANT_WH_PROXYCONNECT
++            request->proxy_connect_response = TRUE;
++#endif
++        }
++    }
+ 
+     return ret;
+ }
+@@ -1496,12 +1572,21 @@ static void CALLBACK connection_collector( TP_CALLBACK_INSTANCE *instance, void
+     FreeLibraryWhenCallbackReturns( instance, winhttp_instance );
+ }
+ 
++static CONDITION_VARIABLE connection_slot_cv = CONDITION_VARIABLE_INIT;
++
+ static void cache_connection( struct netconn *netconn )
+ {
+     TRACE( "caching connection %p\n", netconn );
+ 
+     EnterCriticalSection( &connection_pool_cs );
+ 
++    if (netconn->slot_held)
++    {
++        netconn->slot_held = FALSE;
++        netconn->host->active--;
++        WakeAllConditionVariable( &connection_slot_cv );
++    }
++
+     netconn->keep_until = GetTickCount64() + DEFAULT_KEEP_ALIVE_TIMEOUT;
+     list_add_head( &netconn->host->connections, &netconn->entry );
+ 
+@@ -1526,6 +1611,7 @@ static DWORD map_secure_protocols( DWORD mask )
+     if (mask & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1) ret |= SP_PROT_TLS1_CLIENT;
+     if (mask & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1) ret |= SP_PROT_TLS1_1_CLIENT;
+     if (mask & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2) ret |= SP_PROT_TLS1_2_CLIENT;
++    if (mask & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3) ret |= SP_PROT_TLS1_3_CLIENT;
+     return ret;
+ }
+ 
+@@ -1560,6 +1646,58 @@ static DWORD ensure_cred_handle( struct request *request )
+     return ERROR_SUCCESS;
+ }
+ 
++static void mark_time( struct request *request, unsigned int index )
++{
++    LARGE_INTEGER counter;
++
++    QueryPerformanceCounter( &counter );
++#ifndef SG_MUTANT_WH_TIMES
++    request->times[index] = counter.QuadPart;
++#endif
++}
++
++/* a connection that is in use counts against WINHTTP_OPTION_MAX_CONNS_PER_SERVER; waits for a free slot */
++static DWORD reserve_connection_slot( struct request *request, struct hostdata *host )
++{
++    struct session *session = request->connect->session;
++    DWORD limit, timeout = request->connect_timeout > 0 ? request->connect_timeout : INFINITE;
++    ULONGLONG end = GetTickCount64() + timeout;
++
++    EnterCriticalSection( &connection_pool_cs );
++    for (;;)
++    {
++#ifdef SG_MUTANT_WH_MAXCONNS
++        break;
++#endif
++        limit = host->http10 ? session->opts.max_conns_per_1_0_server : session->opts.max_conns_per_server;
++        if (host->active < limit) break;
++        if (timeout == INFINITE) SleepConditionVariableCS( &connection_slot_cv, &connection_pool_cs, INFINITE );
++        else
++        {
++            ULONGLONG now = GetTickCount64();
++            if (now >= end || !SleepConditionVariableCS( &connection_slot_cv, &connection_pool_cs, end - now ))
++            {
++                LeaveCriticalSection( &connection_pool_cs );
++                return ERROR_WINHTTP_TIMEOUT;
++            }
++        }
++    }
++    host->active++;
++    LeaveCriticalSection( &connection_pool_cs );
++    return ERROR_SUCCESS;
++#ifdef SG_MUTANT_WH_MAXCONNS
++    /* dead */
++#endif
++}
++
++void release_slot( struct hostdata *host )
++{
++    EnterCriticalSection( &connection_pool_cs );
++    host->active--;
++    LeaveCriticalSection( &connection_pool_cs );
++    WakeAllConditionVariable( &connection_slot_cv );
++}
++
+ static DWORD open_connection( struct request *request )
+ {
+     BOOL is_secure = request->hdr.flags & WINHTTP_FLAG_SECURE;
+@@ -1575,6 +1713,7 @@ static DWORD open_connection( struct request *request )
+     connect = request->connect;
+     port = connect->serverport ? connect->serverport : (request->hdr.flags & WINHTTP_FLAG_SECURE ? 443 : 80);
+ 
++    mark_time( request, WinHttpConnectionAcquireStart );
+     EnterCriticalSection( &connection_pool_cs );
+ 
+     LIST_FOR_EACH_ENTRY( iter, &connection_pool, struct hostdata, entry )
+@@ -1589,7 +1728,7 @@ static DWORD open_connection( struct request *request )
+ 
+     if (!host)
+     {
+-        if ((host = malloc( sizeof(*host) )))
++        if ((host = calloc( 1, sizeof(*host) )))
+         {
+             host->ref = 1;
+             host->secure = is_secure;
+@@ -1611,6 +1750,13 @@ static DWORD open_connection( struct request *request )
+ 
+     if (!host) return ERROR_OUTOFMEMORY;
+ 
++    if ((ret = reserve_connection_slot( request, host )))
++    {
++        release_host( host );
++        return ret;
++    }
++    mark_time( request, WinHttpConnectionAcquireWaitEnd );
++
+     for (;;)
+     {
+         EnterCriticalSection( &connection_pool_cs );
+@@ -1627,6 +1773,7 @@ static DWORD open_connection( struct request *request )
+         netconn_release( netconn );
+         netconn = NULL;
+     }
++    if (netconn) netconn->slot_held = TRUE;
+ 
+     if (!connect->resolved && netconn)
+     {
+@@ -1639,15 +1786,19 @@ static DWORD open_connection( struct request *request )
+         len = lstrlenW( host->hostname ) + 1;
+         send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_RESOLVING_NAME, host->hostname, len );
+ 
++        mark_time( request, WinHttpNameResolutionStart );
+         if ((ret = netconn_resolve( host->hostname, port, &connect->sockaddr, request->resolve_timeout )))
+         {
++            release_slot( host );
+             release_host( host );
+             return ret;
+         }
++        mark_time( request, WinHttpNameResolutionEnd );
+         connect->resolved = TRUE;
+ 
+         if (!(addressW = addr_to_str( &connect->sockaddr )))
+         {
++            release_slot( host );
+             release_host( host );
+             return ERROR_OUTOFMEMORY;
+         }
+@@ -1659,6 +1810,7 @@ static DWORD open_connection( struct request *request )
+     {
+         if (!addressW && !(addressW = addr_to_str( &connect->sockaddr )))
+         {
++            release_slot( host );
+             release_host( host );
+             return ERROR_OUTOFMEMORY;
+         }
+@@ -1668,21 +1820,41 @@ static DWORD open_connection( struct request *request )
+         len = lstrlenW( addressW ) + 1;
+         send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER, addressW, len );
+ 
+-        if ((ret = netconn_create( host, &connect->sockaddr, request->connect_timeout, &netconn )))
++        mark_time( request, WinHttpConnectionEstablishmentStart );
++        /* WINHTTP_OPTION_IPV6_FAST_FALLBACK picks the order itself; otherwise the address found first is tried
++         * first, and the others of the host as long as WINHTTP_OPTION_CONNECT_RETRIES allows */
++        if (connect->session->opts.ipv6_fast_fallback)
++            ret = netconn_connect_multi( host, port, NULL, request->opts.connect_retries, TRUE, request->connect_timeout,
++                                         &netconn );
++        else if ((ret = netconn_create( host, &connect->sockaddr, request->connect_timeout, &netconn )) &&
++#ifdef SG_MUTANT_WH_RETRIES
++                 0 &&
++#endif
++                 request->opts.connect_retries > 1)
++            ret = netconn_connect_multi( host, port, &connect->sockaddr, request->opts.connect_retries, FALSE,
++                                         request->connect_timeout, &netconn );
++        if (ret)
+         {
+             free( addressW );
++            release_slot( host );
+             release_host( host );
+             return ret;
+         }
++        netconn->slot_held = TRUE;
++        connect->sockaddr = netconn->sockaddr;
++        mark_time( request, WinHttpConnectionEstablishmentEnd );
+         netconn_set_timeout( netconn, TRUE, request->send_timeout );
+         netconn_set_timeout( netconn, FALSE, request_receive_response_timeout( request ));
+ 
+         request->netconn = netconn;
++        request->stat_flags |= WINHTTP_REQUEST_STAT_FLAG_FIRST_REQUEST;
+ 
+         if (is_secure)
+         {
+-            if (connect->session->proxy_server && wcsicmp( connect->hostname, connect->servername ))
++            if (wcsicmp( connect->hostname, connect->servername ))
+             {
++                mark_time( request, WinHttpProxyTunnelStart );
++                request->proxy_connect_response = FALSE;
+                 if ((ret = secure_proxy_connect( request )))
+                 {
+                     request->netconn = NULL;
+@@ -1690,11 +1862,19 @@ static DWORD open_connection( struct request *request )
+                     netconn_release( netconn );
+                     return ret;
+                 }
++                mark_time( request, WinHttpProxyTunnelEnd );
++                if (request->proxy_connect_response)
++                {
++                    /* the proxy refused the tunnel and the application asked to see its answer */
++                    free( addressW );
++                    return ERROR_SUCCESS;
++                }
+             }
+ 
+             CertFreeCertificateContext( request->server_cert );
+             request->server_cert = NULL;
+ 
++            mark_time( request, WinHttpTlsHandshakeClientLeg1Start );
+             if ((ret = ensure_cred_handle( request )) ||
+                 (ret = netconn_secure_connect( netconn, connect->hostname, request->security_flags,
+                                                &request->cred_handle, request->check_revocation )))
+@@ -1704,6 +1884,7 @@ static DWORD open_connection( struct request *request )
+                 netconn_release( netconn );
+                 return ret;
+             }
++            mark_time( request, WinHttpTlsHandshakeClientLeg3End );
+         }
+ 
+         send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER, addressW, lstrlenW(addressW) + 1 );
+@@ -1716,6 +1897,9 @@ static DWORD open_connection( struct request *request )
+         netconn_set_timeout( netconn, FALSE, request_receive_response_timeout( request ));
+         request->netconn = netconn;
+     }
++    mark_time( request, WinHttpConnectionAcquireEnd );
++    request->stat_index = netconn->requests++;
++    if (request->stat_index) request->stat_flags &= ~WINHTTP_REQUEST_STAT_FLAG_FIRST_REQUEST;
+ 
+     if (netconn->secure && !(request->server_cert = netconn_get_certificate( netconn )))
+     {
+@@ -1938,6 +2122,9 @@ static void finished_reading( struct request *request )
+     if (!request->netconn) return;
+ 
+     if (request->netconn->socket == -1) close = TRUE;
++#ifndef SG_MUTANT_WH_EXPIRE
++    else if (request->expire_connection) close = TRUE;
++#endif
+     else if (request->hdr.disable_flags & WINHTTP_DISABLE_KEEP_ALIVE) close = TRUE;
+     else if (!query_headers( request, WINHTTP_QUERY_CONNECTION, NULL, connection, &size, NULL ) ||
+              !query_headers( request, WINHTTP_QUERY_PROXY_CONNECTION, NULL, connection, &size, NULL ))
+@@ -1982,7 +2169,8 @@ static BOOL end_of_read_data( struct request *request )
+     return (request->content_length == request->content_read);
+ }
+ 
+-static DWORD read_data( struct request *request, void *buffer, DWORD size, DWORD *read, BOOL async )
++static DWORD read_data_raw( struct request *request, void *buffer, DWORD size, DWORD *read, BOOL async,
++                            BOOL callbacks )
+ {
+     int count, bytes_read = 0;
+     DWORD ret = ERROR_SUCCESS;
+@@ -2013,7 +2201,7 @@ static DWORD read_data( struct request *request, void *buffer, DWORD size, DWORD
+ done:
+     TRACE( "retrieved %u bytes (%lu/%lu)\n", bytes_read, request->content_read, request->content_length );
+     if (end_of_read_data( request )) finished_reading( request );
+-    if (async)
++    if (async && callbacks)
+     {
+         if (!ret) send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_READ_COMPLETE, buffer, bytes_read );
+         else
+@@ -2029,20 +2217,243 @@ done:
+     return ret;
+ }
+ 
++static void *zalloc( void *opaque, unsigned int items, unsigned int size )
++{
++    return calloc( items, size );
++}
++
++static void zfree( void *opaque, void *ptr )
++{
++    free( ptr );
++}
++
++/* WINHTTP_OPTION_DECOMPRESSION: the body of a gzip or deflate response, inflated on its way out */
++struct decomp
++{
++    z_stream zs;
++    BOOL inited;
++    BOOL eof;
++    BYTE in[4096];
++    DWORD in_len;
++    BYTE out[16384];
++    DWORD out_pos, out_len;
++};
++
++void free_decomp( struct request *request )
++{
++    struct decomp *d = request->decomp;
++
++    if (!d) return;
++    if (d->inited) inflateEnd( &d->zs );
++    free( d );
++    request->decomp = NULL;
++}
++
++/* does the response carry a Content-Encoding the session asked to be decoded? */
++static DWORD get_decomp_window_bits( struct request *request )
++{
++    WCHAR encoding[32];
++    DWORD size = sizeof(encoding), flags = request->opts.decompression;
++    WCHAR *p = encoding;
++
++    if (!flags || query_headers( request, WINHTTP_QUERY_CONTENT_ENCODING, NULL, encoding, &size, NULL )) return 0;
++    while (*p == ' ') p++;
++    if ((flags & WINHTTP_DECOMPRESSION_FLAG_GZIP) && (!wcsicmp( p, L"gzip" ) || !wcsicmp( p, L"x-gzip" ))) return 15 + 16;
++    /* "deflate" is a zlib stream; some servers send the bare deflate data instead, told apart at the first bytes */
++    if ((flags & WINHTTP_DECOMPRESSION_FLAG_DEFLATE) && !wcsicmp( p, L"deflate" )) return 15;
++    return 0;
++}
++
++static void setup_decomp( struct request *request )
++{
++    struct decomp *d;
++    DWORD bits;
++
++    free_decomp( request );
++#ifdef SG_MUTANT_WH_DECOMP
++    return;
++#endif
++    if (end_of_read_data( request ) || !(bits = get_decomp_window_bits( request ))) return;
++    if (!(d = calloc( 1, sizeof(*d) ))) return;
++    d->zs.zalloc = zalloc;
++    d->zs.zfree = zfree;
++    d->zs.avail_in = 0;
++    d->zs.next_in = d->in;
++    d->in_len = bits; /* the window size to use, until the first bytes were seen */
++    request->decomp = d;
++}
++
++static DWORD decomp_fill_input( struct request *request, struct decomp *d, BOOL async )
++{
++    DWORD got, ret;
++
++    if (d->zs.avail_in) return ERROR_SUCCESS;
++    if ((ret = read_data_raw( request, d->in, sizeof(d->in), &got, async, FALSE ))) return ret;
++    request->stats[WinHttpResponseBodyCompressedSize] += got;
++    if (!got)
++    {
++        d->eof = TRUE;
++        return ERROR_SUCCESS;
++    }
++    d->zs.next_in = d->in;
++    d->zs.avail_in = got;
++    return ERROR_SUCCESS;
++}
++
++/* inflate up to size bytes into buffer; stops at the end of the stream or when the input ran out */
++static DWORD decomp_inflate( struct request *request, struct decomp *d, BYTE *buffer, DWORD size, DWORD *ret_len,
++                             BOOL async )
++{
++    DWORD ret = ERROR_SUCCESS;
++    int zret;
++
++    d->zs.next_out = buffer;
++    d->zs.avail_out = size;
++    while (d->zs.avail_out && !d->eof)
++    {
++        if ((ret = decomp_fill_input( request, d, async ))) break;
++        if (d->eof) break;
++        if (!d->inited)
++        {
++            int bits = d->in_len;
++
++            if (bits == 15 && !(d->zs.avail_in >= 2 && (d->in[0] & 0x0f) == 8 && ((d->in[0] << 8) | d->in[1]) % 31 == 0))
++                bits = -15; /* no zlib header: raw deflate data */
++            {
++                Bytef *next_in = d->zs.next_in, *next_out = d->zs.next_out;
++                uInt avail_in = d->zs.avail_in, avail_out = d->zs.avail_out;
++
++                if (inflateInit2( &d->zs, bits ) != Z_OK)
++                {
++                    ret = ERROR_NOT_ENOUGH_MEMORY;
++                    break;
++                }
++                d->zs.next_in = next_in; d->zs.avail_in = avail_in;
++                d->zs.next_out = next_out; d->zs.avail_out = avail_out;
++            }
++            d->inited = TRUE;
++        }
++        zret = inflate( &d->zs, Z_NO_FLUSH );
++        if (zret == Z_STREAM_END)
++        {
++            d->eof = TRUE;
++            break;
++        }
++        if (zret != Z_OK && zret != Z_BUF_ERROR)
++        {
++            WARN( "inflate failed %d: %s\n", zret, debugstr_a(d->zs.msg) );
++            ret = ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
++            break;
++        }
++    }
++    *ret_len = size - d->zs.avail_out;
++    return ret;
++}
++
++/* bytes of the inflated body that can be read at once; produces some if there are none yet */
++static DWORD decomp_available( struct request *request, DWORD *count, BOOL async )
++{
++    struct decomp *d = request->decomp;
++    DWORD ret = ERROR_SUCCESS, len;
++
++    if (d->out_pos == d->out_len && !d->eof)
++    {
++        d->out_pos = d->out_len = 0;
++        ret = decomp_inflate( request, d, d->out, sizeof(d->out), &len, async );
++        d->out_len = len;
++    }
++    *count = d->out_len - d->out_pos;
++    return ret;
++}
++
++static DWORD decomp_read( struct request *request, void *buffer, DWORD size, DWORD *read, BOOL async )
++{
++    struct decomp *d = request->decomp;
++    DWORD ret = ERROR_SUCCESS, count = 0, len;
++    BYTE *dst = buffer;
++
++    while (size)
++    {
++        if (d->out_pos < d->out_len)
++        {
++            len = min( size, d->out_len - d->out_pos );
++            memcpy( dst, d->out + d->out_pos, len );
++            d->out_pos += len;
++        }
++        else
++        {
++            if (d->eof) break;
++            if ((ret = decomp_inflate( request, d, dst, size, &len, async ))) break;
++        }
++        dst += len;
++        size -= len;
++        count += len;
++        if (!len && d->eof) break;
++    }
++    request->stats[WinHttpResponseBodySize] += count;
++    *read = count;
++    return ret;
++}
++
++static DWORD read_data( struct request *request, void *buffer, DWORD size, DWORD *read, BOOL async )
++{
++    DWORD ret, count = 0;
++
++    if (!request->decomp)
++    {
++        ret = read_data_raw( request, buffer, size, &count, async, TRUE );
++        request->stats[WinHttpResponseBodySize] += count;
++        if (!ret && read) *read = count;
++        return ret;
++    }
++
++    ret = decomp_read( request, buffer, size, &count, async );
++    if (async)
++    {
++        if (!ret) send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_READ_COMPLETE, buffer, count );
++        else
++        {
++            WINHTTP_ASYNC_RESULT result;
++            result.dwResult = API_READ_DATA;
++            result.dwError  = ret;
++            send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_REQUEST_ERROR, &result, sizeof(result) );
++        }
++    }
++    if (!ret && read) *read = count;
++    return ret;
++}
++
+ /* read any content returned by the server so that the connection can be reused */
+ static void drain_content( struct request *request )
+ {
+     DWORD size, bytes_read, bytes_total = 0, bytes_left = request->content_length - request->content_read;
+     char buffer[2048];
+ 
++    /* a body that is known to be larger than the drain bound is not worth reading to reuse the connection */
++#ifdef SG_MUTANT_WH_DRAIN
++    if (0)
++#else
++    if (!request->read_chunked && request->content_length != ~0u && bytes_left > request->opts.max_drain_size)
++#endif
++    {
++        close_connection( request );
++        return;
++    }
+     refill_buffer( request, FALSE );
+     for (;;)
+     {
+         if (request->read_chunked) size = sizeof(buffer);
+         else size = min( sizeof(buffer), bytes_left - bytes_total );
+ 
+-        if (read_data( request, buffer, size, &bytes_read, FALSE ) || !bytes_read) return;
++        if (read_data_raw( request, buffer, size, &bytes_read, FALSE, FALSE ) || !bytes_read) return;
+         bytes_total += bytes_read;
++#ifndef SG_MUTANT_WH_DRAIN
++        if (bytes_total > request->opts.max_drain_size)
++        {
++            close_connection( request );
++            return;
++        }
++#endif
+     }
+ }
+ 
+@@ -2107,28 +2518,34 @@ static DWORD escape_string( const char *src, DWORD len, char *dst, enum escape_f
+     return ret;
+ }
+ 
+-static DWORD str_to_wire( const WCHAR *src, int src_len, char *dst, enum escape_flags flags )
++static DWORD str_to_wire_cp( UINT codepage, const WCHAR *src, int src_len, char *dst, enum escape_flags flags )
+ {
+     DWORD len;
+     char *utf8;
+ 
+     if (src_len < 0) src_len = lstrlenW( src );
+-    len = WideCharToMultiByte( CP_UTF8, 0, src, src_len, NULL, 0, NULL, NULL );
++    len = WideCharToMultiByte( codepage, 0, src, src_len, NULL, 0, NULL, NULL );
+     if (!(utf8 = malloc( len ))) return 0;
+ 
+-    WideCharToMultiByte( CP_UTF8, 0, src, -1, utf8, len, NULL, NULL );
++    WideCharToMultiByte( codepage, 0, src, -1, utf8, len, NULL, NULL );
+     len = escape_string( utf8, len, dst, flags );
+     free( utf8 );
+ 
+     return len;
+ }
+ 
++static DWORD str_to_wire( const WCHAR *src, int src_len, char *dst, enum escape_flags flags )
++{
++    return str_to_wire_cp( CP_UTF8, src, src_len, dst, flags );
++}
++
+ static char *build_wire_path( struct request *request, DWORD *ret_len )
+ {
+     WCHAR *full_path;
+     const WCHAR *start, *path, *query = NULL;
+     DWORD len, len_path = 0, len_query = 0;
+     enum escape_flags path_flags, query_flags;
++    UINT cp;
+     char *ret;
+ 
+     if (!wcsicmp( request->connect->hostname, request->connect->servername )) start = full_path = request->path;
+@@ -2147,20 +2564,25 @@ static char *build_wire_path( struct request *request, DWORD *ret_len )
+ 
+     if (request->hdr.flags & WINHTTP_FLAG_ESCAPE_DISABLE) path_flags = ESCAPE_MASK_DISABLE;
+     else if (request->hdr.flags & WINHTTP_FLAG_ESCAPE_PERCENT) path_flags = ESCAPE_MASK_PERCENT;
++    else if (request->opts.encode_extra) path_flags = ESCAPE_MASK_PERCENT;
+     else path_flags = ESCAPE_MASK_DEFAULT;
+ 
+     if (request->hdr.flags & WINHTTP_FLAG_ESCAPE_DISABLE_QUERY) query_flags = ESCAPE_MASK_DISABLE;
+     else query_flags = path_flags;
+ 
++    cp = request->opts.codepage;
++#ifdef SG_MUTANT_WH_CODEPAGE
++    cp = CP_UTF8;
++#endif
+     *ret_len = str_to_wire( full_path, len - len_path - len_query, NULL, 0 );
+-    if (path) *ret_len += str_to_wire( path, len_path, NULL, path_flags );
+-    if (query) *ret_len += str_to_wire( query, len_query, NULL, query_flags );
++    if (path) *ret_len += str_to_wire_cp( cp, path, len_path, NULL, path_flags );
++    if (query) *ret_len += str_to_wire_cp( cp, query, len_query, NULL, query_flags );
+ 
+     if ((ret = malloc( *ret_len + 1 )))
+     {
+         len = str_to_wire( full_path, len - len_path - len_query, ret, 0 );
+-        if (path) len += str_to_wire( path, len_path, ret + len, path_flags );
+-        if (query) str_to_wire( query, len_query, ret + len, query_flags );
++        if (path) len += str_to_wire_cp( cp, path, len_path, ret + len, path_flags );
++        if (query) str_to_wire_cp( cp, query, len_query, ret + len, query_flags );
+     }
+ 
+     if (full_path != request->path) free( full_path );
+@@ -2261,10 +2683,24 @@ static DWORD send_request( struct request *request, const WCHAR *headers, DWORD
+     }
+ 
+     drain_content( request );
++    free_decomp( request );
+     clear_response_headers( request );
++    if (request->opts.decompression)
++    {
++        DWORD flags = request->opts.decompression;
++        const WCHAR *value = flags == WINHTTP_DECOMPRESSION_FLAG_GZIP ? L"gzip" :
++                             flags == WINHTTP_DECOMPRESSION_FLAG_DEFLATE ? L"deflate" : L"gzip, deflate";
++
++#ifdef SG_MUTANT_WH_ACCEPTENC
++        value = L"identity";
++#endif
++        process_header( request, L"Accept-Encoding", value, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE, TRUE );
++    }
+ 
++    EnterCriticalSection( &session->cs );
+     if (session->agent)
+         process_header( request, L"User-Agent", session->agent, WINHTTP_ADDREQ_FLAG_ADD_IF_NEW, TRUE );
++    LeaveCriticalSection( &session->cs );
+ 
+     if (connect->hostname)
+         add_host_header( request, WINHTTP_ADDREQ_FLAG_ADD_IF_NEW );
+@@ -2313,7 +2749,24 @@ static DWORD send_request( struct request *request, const WCHAR *headers, DWORD
+ 
+     if (context) request->hdr.context = context;
+ 
++    /* a server name of the form user:password@host is what the option rejects */
++    if (request->opts.reject_userpwd_in_url && wcschr( connect->hostname, '@' ))
++    {
++        ret = ERROR_WINHTTP_INVALID_URL;
++        goto end;
++    }
++    memset( request->times, 0, sizeof(request->times) );
++    memset( request->stats, 0, sizeof(request->stats) );
++    request->stat_flags = 0;
++    mark_time( request, WinHttpSendRequestStart );
+     if ((ret = open_connection( request ))) goto end;
++    if (request->proxy_connect_response)
++    {
++        /* what the proxy said to the CONNECT is the response */
++        request->read_reply_status = ERROR_SUCCESS;
++        request->state = REQUEST_RESPONSE_STATE_REPLY_RECEIVED;
++        goto end;
++    }
+     if (!(wire_req = build_wire_request( request, &len )))
+     {
+         ret = ERROR_OUTOFMEMORY;
+@@ -2324,8 +2777,12 @@ static DWORD send_request( struct request *request, const WCHAR *headers, DWORD
+     request->state = REQUEST_RESPONSE_STATE_SENDING_REQUEST;
+     send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_SENDING_REQUEST, NULL, 0 );
+ 
++#ifndef SG_MUTANT_WH_STATS
++    request->stats[WinHttpRequestHeadersSize] = len;
++#endif
+     ret = netconn_send( request->netconn, wire_req, len, &bytes_sent, NULL );
+     free( wire_req );
++    mark_time( request, WinHttpSendRequestHeadersEnd );
+     if (ret) goto end;
+ 
+     if (optional_len)
+@@ -2336,6 +2793,7 @@ static DWORD send_request( struct request *request, const WCHAR *headers, DWORD
+         len += optional_len;
+     }
+     send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_REQUEST_SENT, &len, sizeof(len) );
++    mark_time( request, WinHttpSendRequestEnd );
+ 
+     buflen = sizeof(content_length);
+     if (query_headers( request, WINHTTP_QUERY_FLAG_REQUEST_HEADERS | WINHTTP_QUERY_CONTENT_LENGTH
+@@ -2345,6 +2803,7 @@ static DWORD send_request( struct request *request, const WCHAR *headers, DWORD
+     if (!chunked && content_length <= optional_len)
+     {
+         netconn_set_timeout( request->netconn, FALSE, request_receive_response_timeout( request ));
++        mark_time( request, WinHttpReceiveResponseStart );
+         request->read_reply_status = read_reply( request );
+         if (request->state == REQUEST_RESPONSE_STATE_READ_RESPONSE_QUEUED)
+             request->state = REQUEST_RESPONSE_STATE_READ_RESPONSE_QUEUED_REPLY_RECEIVED;
+@@ -2625,13 +3084,15 @@ static DWORD read_reply( struct request *request )
+     char *status_code, *status_text;
+     WCHAR *versionW, *status_textW, *raw_headers;
+     WCHAR status_codeW[4]; /* sizeof("nnn") */
++    DWORD informational = 0, header_size;
+ 
+     if (!request->netconn) return ERROR_WINHTTP_INCORRECT_HANDLE_STATE;
+ 
+-    do
++    for (;;)
+     {
+         buflen = MAX_REPLY_LEN;
+         if ((ret = read_line( request, buffer, &buflen ))) return ret;
++        header_size = buflen;
+ 
+         /* first line should look like 'HTTP/1.x nnn OK' where nnn is the status code */
+         if (!(status_code = strchr( buffer, ' ' ))) return ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
+@@ -2645,7 +3106,23 @@ static DWORD read_reply( struct request *request )
+               debugstr_an(status_code, len),
+               debugstr_a(status_text));
+ 
+-    } while (!memcmp( status_code, "100", len )); /* ignore "100 Continue" responses */
++        /* 100-199 responses (but not the 101 of a protocol switch) are skipped, up to
++         * WINHTTP_OPTION_MAX_HTTP_STATUS_CONTINUE of them, headers and all */
++#ifdef SG_MUTANT_WH_CONT
++        if (status_code[0] != '1' || !memcmp( status_code, "101", len )) break;
++#else
++        if (status_code[0] != '1' || !memcmp( status_code, "101", len ) ||
++            informational >= request->opts.max_status_continue) break;
++#endif
++        informational++;
++        for (;;)
++        {
++            buflen = MAX_REPLY_LEN;
++            if ((ret = read_line( request, buffer, &buflen ))) return ret;
++            if (!*buffer) break;
++        }
++    }
++    request->stats[WinHttpResponseHeadersSize] = 0;
+ 
+     /*  we rely on the fact that the protocol is ascii */
+     MultiByteToWideChar( CP_ACP, 0, status_code, len, status_codeW, len );
+@@ -2660,6 +3137,7 @@ static DWORD read_reply( struct request *request )
+ 
+     free( request->version );
+     request->version = versionW;
++    if (!wcscmp( versionW, L"HTTP/1.0" ) && request->netconn) request->netconn->host->http10 = TRUE;
+ 
+     len = buflen - (status_text - buffer);
+     if (!(status_textW = malloc( len * sizeof(WCHAR) ))) return ERROR_OUTOFMEMORY;
+@@ -2684,6 +3162,10 @@ static DWORD read_reply( struct request *request )
+ 
+         buflen = MAX_REPLY_LEN;
+         if (read_line( request, buffer, &buflen )) return ERROR_SUCCESS;
++        header_size += buflen + crlf_len;
++#ifndef SG_MUTANT_WH_HDRSIZE
++        if (header_size > request->opts.max_header_size) return ERROR_WINHTTP_HEADER_SIZE_OVERFLOW;
++#endif
+         if (!*buffer) buflen = 1;
+ 
+         while (len - offset < buflen + crlf_len)
+@@ -2731,6 +3213,7 @@ static DWORD read_reply( struct request *request )
+         free_header( header );
+     }
+ 
++    request->stats[WinHttpResponseHeadersSize] = header_size;
+     TRACE("raw headers: %s\n", debugstr_w(raw_headers));
+     return ret;
+ }
+@@ -2843,7 +3326,7 @@ static DWORD handle_redirect( struct request *request, DWORD status )
+             free( connect->hostname );
+             connect->hostname = hostname;
+             connect->hostport = port;
+-            if (!set_server_for_hostname( connect, hostname, port ))
++            if (!set_server_for_request( request, hostname, port ))
+             {
+                 ret = ERROR_OUTOFMEMORY;
+                 goto end;
+@@ -2899,6 +3382,57 @@ static BOOL is_passport_request( struct request *request )
+     return FALSE;
+ }
+ 
++/* the value of name=value in a comma separated challenge, percent decoded */
++static WCHAR *get_challenge_param( const WCHAR *challenge, const WCHAR *name )
++{
++    size_t len = wcslen( name );
++    const WCHAR *p = challenge, *end;
++    WCHAR *ret, *dst;
++
++    while (*p)
++    {
++        while (*p == ' ' || *p == ',') p++;
++        if (!wcsnicmp( p, name, len ) && p[len] == '=')
++        {
++            p += len + 1;
++            if (*p == '"') p++;
++            for (end = p; *end && *end != ',' && *end != '"'; end++) ;
++            if (!(ret = malloc( (end - p + 1) * sizeof(WCHAR) ))) return NULL;
++            for (dst = ret; p < end; p++)
++            {
++                if (*p == '%' && p + 2 < end && iswxdigit( p[1] ) && iswxdigit( p[2] ))
++                {
++                    WCHAR hex[3] = { p[1], p[2], 0 };
++                    *dst++ = wcstoul( hex, NULL, 16 );
++                    p += 2;
++                }
++                else *dst++ = *p;
++            }
++            *dst = 0;
++            return ret;
++        }
++        while (*p && *p != ',') p++;
++    }
++    return NULL;
++}
++
++/* keep what the Passport challenge tells for WINHTTP_OPTION_PASSPORT_RETURN_URL, _COBRANDING_TEXT and _COBRANDING_URL
++ * (parameter names ru, cbtxt and cburl: from the Passport 1.4 challenge as remembered, not from a document) */
++static void update_passport_info( struct request *request )
++{
++    WCHAR buf[2048];
++    DWORD len = sizeof(buf);
++
++    free( request->passport_return_url );
++    free( request->passport_cbtext );
++    free( request->passport_cburl );
++    request->passport_return_url = request->passport_cbtext = request->passport_cburl = NULL;
++    if (query_headers( request, WINHTTP_QUERY_WWW_AUTHENTICATE, NULL, buf, &len, NULL )) return;
++    request->passport_return_url = get_challenge_param( buf, L"ru" );
++    request->passport_cbtext = get_challenge_param( buf, L"cbtxt" );
++    request->passport_cburl = get_challenge_param( buf, L"cburl" );
++}
++
+ static DWORD handle_passport_redirect( struct request *request )
+ {
+     DWORD ret, flags = WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE;
+@@ -2935,7 +3469,7 @@ static DWORD queue_receive_response( struct request *request )
+ static DWORD receive_response( struct request *request )
+ {
+     BOOL async_mode = request->connect->hdr.flags & WINHTTP_FLAG_ASYNC;
+-    DWORD ret, size, query, status;
++    DWORD ret, size, query, status = 0;
+ 
+     TRACE( "request state %d.\n", request->state );
+ 
+@@ -2959,6 +3493,7 @@ static DWORD receive_response( struct request *request )
+ 
+ 
+     case REQUEST_RESPONSE_STATE_REQUEST_SENT:
++        mark_time( request, WinHttpReceiveResponseStart );
+         send_callback( &request->hdr, WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE, NULL, 0 );
+         if (async_mode)
+         {
+@@ -2993,10 +3528,12 @@ static DWORD receive_response( struct request *request )
+     query = WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER;
+     if ((ret = query_headers( request, query, NULL, &status, &size, NULL ))) goto done;
+ 
+-    set_content_length( request, status );
++    mark_time( request, WinHttpReceiveResponseHeadersEnd );
++    if (!request->proxy_connect_response) set_content_length( request, status );
+ 
+     if (!(request->hdr.disable_flags & WINHTTP_DISABLE_COOKIES)) record_cookies( request );
+ 
++    if (is_passport_request( request )) update_passport_info( request );
+     if (status == HTTP_STATUS_REDIRECT && is_passport_request( request ))
+     {
+         ret = handle_passport_redirect( request );
+@@ -3007,7 +3544,7 @@ static DWORD receive_response( struct request *request )
+         if (request->hdr.disable_flags & WINHTTP_DISABLE_REDIRECTS ||
+             request->hdr.redirect_policy == WINHTTP_OPTION_REDIRECT_POLICY_NEVER) goto done;
+ 
+-        if (++request->redirect_count > request->max_redirects)
++        if (++request->redirect_count > request->opts.max_redirects)
+         {
+             ret = ERROR_WINHTTP_REDIRECT_FAILED;
+             goto done;
+@@ -3031,6 +3568,8 @@ done:
+     {
+         request->state = REQUEST_RESPONSE_STATE_RESPONSE_RECEIVED;
+         if (request->netconn) netconn_set_timeout( request->netconn, FALSE, request->receive_timeout );
++        if (request->opts.decompression && status != HTTP_STATUS_SWITCH_PROTOCOLS) setup_decomp( request );
++        mark_time( request, WinHttpReceiveResponseEnd );
+     }
+     if (async_mode)
+     {
+@@ -3099,6 +3638,13 @@ static DWORD query_data_ready( struct request *request )
+ 
+ static BOOL skip_async_queue( struct request *request, BOOL *wont_block, DWORD to_read )
+ {
++    if (request->decomp)
++    {
++        struct decomp *d = request->decomp;
++
++        *wont_block = d->eof || d->out_pos < d->out_len;
++        return request->hdr.recursion_count < 3 && *wont_block;
++    }
+     if (!request->read_chunked)
+         to_read = min( to_read, request->content_length - request->content_read );
+     *wont_block = end_of_read_data( request ) || query_data_ready( request ) >= to_read;
+@@ -3117,6 +3663,11 @@ static DWORD query_data_available( struct request *request, DWORD *available, BO
+         goto done;
+     }
+ #endif
++    if (request->decomp)
++    {
++        ret = decomp_available( request, &count, async );
++        goto done;
++    }
+     if (end_of_read_data( request )) goto done;
+ 
+     if (!(count = query_data_ready( request )))
+@@ -3432,6 +3983,7 @@ static BOOL socket_query_option( struct object_header *hdr, DWORD option, void *
+     switch (option)
+     {
+         case WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL:
++        case WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT:
+             SetLastError( ERROR_INVALID_PARAMETER );
+             return FALSE;
+ #ifndef SG_MUTANT_WS_SOCKET_OPTIONS
+@@ -3443,7 +3995,7 @@ static BOOL socket_query_option( struct object_header *hdr, DWORD option, void *
+ #endif
+     }
+ 
+-    FIXME( "unimplemented option %lu\n", option );
++    WARN( "option %lu cannot be queried on a socket\n", option );
+     SetLastError( ERROR_WINHTTP_INVALID_OPTION );
+     return FALSE;
+ }
+@@ -3485,6 +4037,17 @@ static BOOL socket_set_option( struct object_header *hdr, DWORD option, void *bu
+         TRACE( "WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL %lu.\n", interval);
+         return TRUE;
+     }
++    case WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT:
++        /* how long WinHttpWebSocketClose waits for the close handshake to complete */
++        if (buflen != sizeof(DWORD))
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        socket->close_timeout = *(DWORD *)buffer;
++        SetLastError( ERROR_SUCCESS );
++        return TRUE;
++
+ #ifndef SG_MUTANT_WS_SOCKET_OPTIONS
+     case WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE:
+     case WINHTTP_OPTION_WEB_SOCKET_SEND_BUFFER_SIZE:
+@@ -3493,7 +4056,7 @@ static BOOL socket_set_option( struct object_header *hdr, DWORD option, void *bu
+ #endif
+     }
+ 
+-    FIXME( "unimplemented option %lu\n", option );
++    WARN( "option %lu cannot be set on a socket\n", option );
+     SetLastError( ERROR_WINHTTP_INVALID_OPTION );
+     return FALSE;
+ }
+@@ -3538,6 +4101,7 @@ HINTERNET WINAPI WinHttpWebSocketCompleteUpgrade( HINTERNET hrequest, DWORD_PTR
+     socket->hdr.context = context;
+     socket->hdr.flags = request->connect->hdr.flags & WINHTTP_FLAG_ASYNC;
+     socket->keepalive_interval = 30000;
++    socket->close_timeout = 10000;
+     socket->send_buffer_size = request->websocket_send_buffer_size;
+     if (request->read_size)
+     {
+@@ -4462,6 +5026,7 @@ static DWORD socket_close( struct socket *socket )
+ 
+     if (socket->close_frame_received) return socket->close_frame_receive_err;
+ 
++    netconn_set_timeout( socket->netconn, FALSE, socket->close_timeout );
+     if ((ret = socket_drain( socket ))) return ret;
+ 
+     while (1)
+@@ -4650,6 +5215,19 @@ struct winhttp_request
+     BOOL async;
+     UINT url_codepage;
+     DWORD security_flags;
++    WCHAR *user_agent;
++    DWORD secure_protocols;
++    BOOL secure_protocols_set;
++    BOOL escape_percent, url_escape_disable, url_escape_disable_query; /* stored as given, see put_Option */
++    BOOL revert_impersonation;
++    BOOL https_to_http_redirects;
++    BOOL passport_auth;
++    DWORD max_redirects;
++    DWORD max_header_size;
++    DWORD max_drain_size;
++    BOOL enable_http11;
++    BOOL revocation_check;
++    WCHAR *client_cert;   /* WinHttpRequestOption_SelectCertificate / SetClientCertificate */
+ };
+ 
+ static inline struct winhttp_request *impl_from_IWinHttpRequest( IWinHttpRequest *iface )
+@@ -4695,6 +5273,8 @@ static void free_request( struct winhttp_request *request )
+     free( request->proxy.lpszProxyBypass );
+     free( request->buffer );
+     free( request->verb );
++    free( request->user_agent );
++    free( request->client_cert );
+     VariantClear( &request->data );
+ }
+ 
+@@ -4905,8 +5485,8 @@ static HRESULT WINAPI winhttp_request_Invoke(
+             return hr;
+         }
+ 
+-        FIXME("unsupported flags %x\n", flags);
+-        return E_NOTIMPL;
++        WARN("unsupported flags %x\n", flags);
++        return DISP_E_MEMBERNOTFOUND;
+     }
+ 
+     /* fallback to standard implementation */
+@@ -5022,6 +5602,12 @@ static void initialize_request( struct winhttp_request *request )
+     request->send_timeout    = 30000;
+     request->receive_timeout = 30000;
+     request->url_codepage = CP_UTF8;
++    request->escape_percent = request->url_escape_disable = request->url_escape_disable_query = TRUE;
++    request->revert_impersonation = TRUE;
++    request->max_redirects = 10;
++    request->max_header_size = 64 * 1024;
++    request->max_drain_size = 1024 * 1024;
++    request->enable_http11 = TRUE;
+     VariantInit( &request->data );
+     request->state = REQUEST_STATE_INITIALIZED;
+ }
+@@ -5100,8 +5686,8 @@ static HRESULT WINAPI winhttp_request_Open(
+ 
+     if (!request->hsession)
+     {
+-        if (!(request->hsession = WinHttpOpen( user_agentW, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL,
+-                                               WINHTTP_FLAG_ASYNC )))
++        if (!(request->hsession = WinHttpOpen( request->user_agent ? request->user_agent : user_agentW,
++                                               WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, WINHTTP_FLAG_ASYNC )))
+         {
+             err = GetLastError();
+             goto error;
+@@ -5125,7 +5711,11 @@ static HRESULT WINAPI winhttp_request_Open(
+     {
+         flags |= WINHTTP_FLAG_SECURE;
+     }
+-    if (!(request->hrequest = WinHttpOpenRequest( request->hconnect, method, path, NULL, NULL, acceptW, flags )))
++    WinHttpSetOption( request->hsession, WINHTTP_OPTION_CODEPAGE, &request->url_codepage, sizeof(DWORD) );
++    if (request->secure_protocols_set)
++        WinHttpSetOption( request->hsession, WINHTTP_OPTION_SECURE_PROTOCOLS, &request->secure_protocols, sizeof(DWORD) );
++    if (!(request->hrequest = WinHttpOpenRequest( request->hconnect, method, path, request->enable_http11 ? NULL : L"HTTP/1.0",
++                                                  NULL, acceptW, flags )))
+     {
+         err = GetLastError();
+         goto error;
+@@ -5403,6 +5993,32 @@ static DWORD request_set_parameters( struct winhttp_request *request )
+     if (!WinHttpSetOption( request->hrequest, WINHTTP_OPTION_SECURITY_FLAGS, &request->security_flags,
+                            sizeof(request->security_flags) )) return GetLastError();
+ 
++    if (request->max_redirects != 10 &&
++        !WinHttpSetOption( request->hrequest, WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS, &request->max_redirects,
++                           sizeof(request->max_redirects) )) return GetLastError();
++    if (request->max_header_size != 64 * 1024 &&
++        !WinHttpSetOption( request->hrequest, WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE, &request->max_header_size,
++                           sizeof(request->max_header_size) )) return GetLastError();
++    if (request->max_drain_size != 1024 * 1024 &&
++        !WinHttpSetOption( request->hrequest, WINHTTP_OPTION_MAX_RESPONSE_DRAIN_SIZE, &request->max_drain_size,
++                           sizeof(request->max_drain_size) )) return GetLastError();
++    if (request->https_to_http_redirects)
++    {
++        DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
++        if (!WinHttpSetOption( request->hrequest, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy) ))
++            return GetLastError();
++    }
++    if (request->revocation_check)
++    {
++        DWORD feature = WINHTTP_ENABLE_SSL_REVOCATION;
++        if (!WinHttpSetOption( request->hrequest, WINHTTP_OPTION_ENABLE_FEATURE, &feature, sizeof(feature) ))
++            return GetLastError();
++    }
++    if (request->passport_auth)
++    {
++        DWORD flags = WINHTTP_ENABLE_PASSPORT_AUTH;
++        WinHttpSetOption( request->hsession, WINHTTP_OPTION_CONFIGURE_PASSPORT_AUTH, &flags, sizeof(flags) );
++    }
+     if (!WinHttpSetTimeouts( request->hrequest,
+                              request->resolve_timeout,
+                              request->connect_timeout,
+@@ -5744,6 +6360,8 @@ done:
+     return HRESULT_FROM_WIN32( err );
+ }
+ 
++static const IStreamVtbl stream_vtbl;
++
+ struct stream
+ {
+     IStream IStream_iface;
+@@ -5763,7 +6381,8 @@ static HRESULT WINAPI stream_QueryInterface( IStream *iface, REFIID riid, void *
+ 
+     TRACE("%p, %s, %p\n", stream, debugstr_guid(riid), obj);
+ 
+-    if (IsEqualGUID( riid, &IID_IStream ) || IsEqualGUID( riid, &IID_IUnknown ))
++    if (IsEqualGUID( riid, &IID_IStream ) || IsEqualGUID( riid, &IID_ISequentialStream ) ||
++        IsEqualGUID( riid, &IID_IUnknown ))
+     {
+         *obj = iface;
+     }
+@@ -5813,10 +6432,14 @@ static HRESULT WINAPI stream_Read( IStream *iface, void *buf, ULONG len, ULONG *
+     return S_OK;
+ }
+ 
++/* the response stream is a read-only copy of the response body */
+ static HRESULT WINAPI stream_Write( IStream *iface, const void *buf, ULONG len, ULONG *written )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    if (written) *written = 0;
++#ifdef SG_MUTANT_WH_STREAMWRITE
++    return S_OK;
++#endif
++    return STG_E_ACCESSDENIED;
+ }
+ 
+ static HRESULT WINAPI stream_Seek( IStream *iface, LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *newpos )
+@@ -5836,51 +6459,88 @@ static HRESULT WINAPI stream_Seek( IStream *iface, LARGE_INTEGER move, DWORD ori
+ 
+ static HRESULT WINAPI stream_SetSize( IStream *iface, ULARGE_INTEGER newsize )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    return STG_E_ACCESSDENIED;
+ }
+ 
+-static HRESULT WINAPI stream_CopyTo( IStream *iface, IStream *stream, ULARGE_INTEGER len, ULARGE_INTEGER *read,
++static HRESULT WINAPI stream_CopyTo( IStream *iface, IStream *dest, ULARGE_INTEGER len, ULARGE_INTEGER *read,
+                                      ULARGE_INTEGER *written )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    struct stream *stream = impl_from_IStream( iface );
++    ULONGLONG count = 0, total = 0;
++    HRESULT hr = S_OK;
++
++    if (read) read->QuadPart = 0;
++    if (written) written->QuadPart = 0;
++    if (!dest) return STG_E_INVALIDPOINTER;
++
++    if (stream->pos.QuadPart < stream->size.QuadPart)
++        count = min( stream->size.QuadPart - stream->pos.QuadPart, len.QuadPart );
++    while (count)
++    {
++        ULONG chunk = min( count, 0x10000 ), done = 0;
++
++        hr = IStream_Write( dest, stream->data + stream->pos.QuadPart, chunk, &done );
++        stream->pos.QuadPart += done;
++        total += done;
++        count -= done;
++        if (FAILED(hr) || done != chunk) break;
++    }
++    if (read) read->QuadPart = total;
++    if (written) written->QuadPart = total;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI stream_Commit( IStream *iface, DWORD flags )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    return S_OK; /* there is nothing to commit, the stream is neither writable nor transacted */
+ }
+ 
+ static HRESULT WINAPI stream_Revert( IStream *iface )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI stream_LockRegion( IStream *iface, ULARGE_INTEGER offset, ULARGE_INTEGER len, DWORD locktype )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    return STG_E_INVALIDFUNCTION; /* region locking is not supported */
+ }
+ 
+ static HRESULT WINAPI stream_UnlockRegion( IStream *iface, ULARGE_INTEGER offset, ULARGE_INTEGER len, DWORD locktype )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    return STG_E_INVALIDFUNCTION;
+ }
+ 
+ static HRESULT WINAPI stream_Stat( IStream *iface, STATSTG *stg, DWORD flag )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    struct stream *stream = impl_from_IStream( iface );
++
++    if (!stg) return STG_E_INVALIDPOINTER;
++    memset( stg, 0, sizeof(*stg) );
++    stg->type = STGTY_STREAM;
++    stg->cbSize = stream->size;
++    stg->grfMode = STGM_READ;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI stream_Clone( IStream *iface, IStream **stream )
++static HRESULT WINAPI stream_Clone( IStream *iface, IStream **ret )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    struct stream *stream = impl_from_IStream( iface ), *clone;
++
++    if (!ret) return STG_E_INVALIDPOINTER;
++    *ret = NULL;
++    if (!(clone = malloc( sizeof(*clone) ))) return E_OUTOFMEMORY;
++    clone->IStream_iface.lpVtbl = &stream_vtbl;
++    clone->refs = 1;
++    if (!(clone->data = malloc( max( stream->size.QuadPart, 1 ) )))
++    {
++        free( clone );
++        return E_OUTOFMEMORY;
++    }
++    memcpy( clone->data, stream->data, stream->size.QuadPart );
++    clone->pos = stream->pos;
++    clone->size = stream->size;
++    *ret = &clone->IStream_iface;
++    return S_OK;
+ }
+ 
+ static const IStreamVtbl stream_vtbl =
+@@ -5943,6 +6603,113 @@ done:
+     return HRESULT_FROM_WIN32( err );
+ }
+ 
++static HRESULT variant_to_bool( const VARIANT *value, BOOL *ret )
++{
++    VARIANT tmp;
++    HRESULT hr;
++
++    VariantInit( &tmp );
++    if (FAILED(hr = VariantChangeType( &tmp, (VARIANT *)value, 0, VT_BOOL ))) return hr;
++    *ret = V_BOOL( &tmp ) != VARIANT_FALSE;
++    return S_OK;
++}
++
++static HRESULT variant_to_dword( const VARIANT *value, DWORD *ret )
++{
++    VARIANT tmp;
++    HRESULT hr;
++
++    VariantInit( &tmp );
++    if (FAILED(hr = VariantChangeType( &tmp, (VARIANT *)value, 0, VT_UI4 ))) return hr;
++    *ret = V_UI4( &tmp );
++    return S_OK;
++}
++
++static void set_variant_bool( VARIANT *value, BOOL b )
++{
++    V_VT( value ) = VT_BOOL;
++    V_BOOL( value ) = b ? VARIANT_TRUE : VARIANT_FALSE;
++}
++
++static void set_variant_i4( VARIANT *value, LONG l )
++{
++    V_VT( value ) = VT_I4;
++    V_I4( value ) = l;
++}
++
++static HRESULT select_client_certificate( struct winhttp_request *request, const WCHAR *certificate );
++
++/* "[location\\[store\\]]subject": location CURRENT_USER (default) or LOCAL_MACHINE, store "MY" (default, also
++ * called Personal), a blank subject picks the first certificate of the store */
++static HRESULT select_client_certificate( struct winhttp_request *request, const WCHAR *certificate )
++{
++    WCHAR *copy, *parts[3], *p;
++    unsigned int count = 0;
++    const WCHAR *store_name = L"MY", *subject;
++    DWORD location = CERT_SYSTEM_STORE_CURRENT_USER;
++    HCERTSTORE store;
++    const CERT_CONTEXT *cert;
++    HRESULT hr = S_OK;
++
++    if (!request->hrequest) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CALL_BEFORE_OPEN );
++    if (!(copy = wcsdup( certificate ))) return E_OUTOFMEMORY;
++
++    for (p = copy; p && count < 3; )
++    {
++        parts[count++] = p;
++        if ((p = wcschr( p, '\\' ))) *p++ = 0;
++    }
++    if (p) /* the subject itself may contain backslashes */
++    {
++        p[-1] = '\\';
++    }
++    subject = parts[count - 1];
++    if (count > 1)
++    {
++        if (!wcsicmp( parts[0], L"LOCAL_MACHINE" )) location = CERT_SYSTEM_STORE_LOCAL_MACHINE;
++        else if (wcsicmp( parts[0], L"CURRENT_USER" ))
++        {
++            free( copy );
++            return E_INVALIDARG;
++        }
++#ifdef SG_MUTANT_WH_CERTSTORE
++        if (count > 2) store_name = parts[1];
++#else
++        if (count > 2) store_name = wcsicmp( parts[1], L"Personal" ) ? parts[1] : L"MY";
++#endif
++    }
++
++    if (!(store = CertOpenStore( CERT_STORE_PROV_SYSTEM_W, 0, 0, location | CERT_STORE_OPEN_EXISTING_FLAG |
++                                 CERT_STORE_READONLY_FLAG, store_name )))
++    {
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++        free( copy );
++        return hr;
++    }
++#ifdef SG_MUTANT_WH_CERTSUBJECT
++    if (1) cert = CertEnumCertificatesInStore( store, NULL );
++#else
++    if (!*subject) cert = CertEnumCertificatesInStore( store, NULL );
++#endif
++    else cert = CertFindCertificateInStore( store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_SUBJECT_STR_W,
++                                            subject, NULL );
++    if (!cert) hr = HRESULT_FROM_WIN32( GetLastError() ? GetLastError() : (DWORD)CRYPT_E_NOT_FOUND );
++    else
++    {
++        if (!WinHttpSetOption( request->hrequest, WINHTTP_OPTION_CLIENT_CERT_CONTEXT, (void *)cert, sizeof(*cert) ))
++            hr = HRESULT_FROM_WIN32( GetLastError() );
++        CertFreeCertificateContext( cert );
++    }
++    CertCloseStore( store, 0 );
++    if (SUCCEEDED(hr))
++    {
++        free( request->client_cert );
++        request->client_cert = wcsdup( certificate );
++    }
++    free( copy );
++    return hr;
++}
++
+ static HRESULT WINAPI winhttp_request_get_Option(
+     IWinHttpRequest *iface,
+     WinHttpRequestOption option,
+@@ -5953,22 +6720,108 @@ static HRESULT WINAPI winhttp_request_get_Option(
+ 
+     TRACE("%p, %u, %p\n", request, option, value);
+ 
++    if (!value) return E_INVALIDARG;
++
+     EnterCriticalSection( &request->cs );
+     switch (option)
+     {
++    case WinHttpRequestOption_UserAgentString:
++        V_VT( value ) = VT_BSTR;
++        if (!(V_BSTR( value ) = SysAllocString( request->user_agent ? request->user_agent : L"Mozilla/4.0 (compatible; Win32; WinHttp.WinHttpRequest.5)" )))
++            hr = E_OUTOFMEMORY;
++        break;
++    case WinHttpRequestOption_URL:
++    {
++        WCHAR *url = NULL;
++        DWORD size = 0;
++
++        if (request->state < REQUEST_STATE_OPEN)
++        {
++            hr = HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CALL_BEFORE_OPEN );
++            break;
++        }
++        WinHttpQueryOption( request->hrequest, WINHTTP_OPTION_URL, NULL, &size );
++        if (!(url = malloc( size + sizeof(WCHAR) )))
++        {
++            hr = E_OUTOFMEMORY;
++            break;
++        }
++        if (WinHttpQueryOption( request->hrequest, WINHTTP_OPTION_URL, url, &size ))
++        {
++            V_VT( value ) = VT_BSTR;
++            V_BSTR( value ) = SysAllocString( url );
++            if (!V_BSTR( value )) hr = E_OUTOFMEMORY;
++        }
++        else hr = HRESULT_FROM_WIN32( GetLastError() );
++        free( url );
++        break;
++    }
+     case WinHttpRequestOption_URLCodePage:
+         V_VT( value ) = VT_I4;
+         V_I4( value ) = request->url_codepage;
+         break;
++    case WinHttpRequestOption_EscapePercentInURL:
++        set_variant_bool( value, request->escape_percent );
++        break;
+     case WinHttpRequestOption_SslErrorIgnoreFlags:
+     {
+         V_VT( value ) = VT_I4;
+         V_I4( value ) = request->security_flags;
+         break;
+     }
++    case WinHttpRequestOption_SelectCertificate:
++        /* write-only */
++        hr = HRESULT_FROM_WIN32( ERROR_WINHTTP_INVALID_OPTION );
++        break;
++    case WinHttpRequestOption_EnableRedirects:
++        set_variant_bool( value, !(request->disable_feature & WINHTTP_DISABLE_REDIRECTS) );
++        break;
++    case WinHttpRequestOption_UrlEscapeDisable:
++        set_variant_bool( value, request->url_escape_disable );
++        break;
++    case WinHttpRequestOption_UrlEscapeDisableQuery:
++        set_variant_bool( value, request->url_escape_disable_query );
++        break;
++    case WinHttpRequestOption_SecureProtocols:
++        /* the default of the WinHttpRequest object, as documented, until one is set */
++        set_variant_i4( value, request->secure_protocols_set ? request->secure_protocols :
++                        WINHTTP_FLAG_SECURE_PROTOCOL_SSL2 | WINHTTP_FLAG_SECURE_PROTOCOL_SSL3 );
++        break;
++    case WinHttpRequestOption_EnableTracing:
++    {
++        DWORD enabled = 0, size = sizeof(enabled);
++
++        WinHttpQueryOption( NULL, WINHTTP_OPTION_ENABLETRACING, &enabled, &size );
++        set_variant_bool( value, enabled );
++        break;
++    }
++    case WinHttpRequestOption_RevertImpersonationOverSsl:
++        set_variant_bool( value, request->revert_impersonation );
++        break;
++    case WinHttpRequestOption_EnableHttpsToHttpRedirects:
++        set_variant_bool( value, request->https_to_http_redirects );
++        break;
++    case WinHttpRequestOption_EnablePassportAuthentication:
++        set_variant_bool( value, request->passport_auth );
++        break;
++    case WinHttpRequestOption_MaxAutomaticRedirects:
++        set_variant_i4( value, request->max_redirects );
++        break;
++    case WinHttpRequestOption_MaxResponseHeaderSize:
++        set_variant_i4( value, request->max_header_size );
++        break;
++    case WinHttpRequestOption_MaxResponseDrainSize:
++        set_variant_i4( value, request->max_drain_size );
++        break;
++    case WinHttpRequestOption_EnableHttp1_1:
++        set_variant_bool( value, request->enable_http11 );
++        break;
++    case WinHttpRequestOption_EnableCertificateRevocationCheck:
++        set_variant_bool( value, request->revocation_check );
++        break;
+     default:
+-        FIXME("unimplemented option %u\n", option);
+-        hr = E_NOTIMPL;
++        WARN("unknown option %u\n", option);
++        hr = HRESULT_FROM_WIN32( ERROR_WINHTTP_INVALID_OPTION );
+         break;
+     }
+     LeaveCriticalSection( &request->cs );
+@@ -5982,12 +6835,48 @@ static HRESULT WINAPI winhttp_request_put_Option(
+ {
+     struct winhttp_request *request = impl_from_IWinHttpRequest( iface );
+     HRESULT hr = S_OK;
++    BOOL b;
++    DWORD dw;
+ 
+     TRACE("%p, %u, %s\n", request, option, debugstr_variant(&value));
+ 
+     EnterCriticalSection( &request->cs );
+     switch (option)
+     {
++    case WinHttpRequestOption_UserAgentString:
++    {
++        VARIANT str;
++        WCHAR *ua;
++
++        VariantInit( &str );
++        if (FAILED(hr = VariantChangeType( &str, &value, 0, VT_BSTR ))) break;
++        if (!(ua = wcsdup( V_BSTR( &str ) ))) hr = E_OUTOFMEMORY;
++        else
++        {
++            free( request->user_agent );
++            request->user_agent = ua;
++            if (request->hsession)
++                WinHttpSetOption( request->hsession, WINHTTP_OPTION_USER_AGENT, ua, lstrlenW( ua ) );
++        }
++        VariantClear( &str );
++        break;
++    }
++    case WinHttpRequestOption_URL:
++        hr = HRESULT_FROM_WIN32( ERROR_WINHTTP_OPTION_NOT_SETTABLE ); /* read-only */
++        break;
++    case WinHttpRequestOption_EscapePercentInURL:
++        if (SUCCEEDED(hr = variant_to_bool( &value, &b ))) request->escape_percent = b;
++        break;
++    case WinHttpRequestOption_SelectCertificate:
++    {
++        VARIANT str;
++
++        VariantInit( &str );
++        if (FAILED(hr = VariantChangeType( &str, &value, 0, VT_BSTR ))) break;
++        hr = select_client_certificate( request, V_BSTR( &str ) );
++        VariantClear( &str );
++        break;
++    }
+     case WinHttpRequestOption_EnableRedirects:
+     {
+         if (V_BOOL( &value ))
+@@ -6030,9 +6919,55 @@ static HRESULT WINAPI winhttp_request_put_Option(
+             request->security_flags = flags;
+         break;
+     }
++    case WinHttpRequestOption_UrlEscapeDisable:
++        if (SUCCEEDED(hr = variant_to_bool( &value, &b ))) request->url_escape_disable = b;
++        break;
++    case WinHttpRequestOption_UrlEscapeDisableQuery:
++        if (SUCCEEDED(hr = variant_to_bool( &value, &b ))) request->url_escape_disable_query = b;
++        break;
++    case WinHttpRequestOption_SecureProtocols:
++        if (SUCCEEDED(hr = variant_to_dword( &value, &dw )))
++        {
++            request->secure_protocols = dw;
++            request->secure_protocols_set = TRUE;
++            if (request->hsession) WinHttpSetOption( request->hsession, WINHTTP_OPTION_SECURE_PROTOCOLS, &dw, sizeof(dw) );
++        }
++        break;
++    case WinHttpRequestOption_EnableTracing:
++        if (SUCCEEDED(hr = variant_to_bool( &value, &b )))
++        {
++            dw = b;
++            if (!WinHttpSetOption( NULL, WINHTTP_OPTION_ENABLETRACING, &dw, sizeof(dw) ))
++                hr = HRESULT_FROM_WIN32( GetLastError() );
++        }
++        break;
++    case WinHttpRequestOption_RevertImpersonationOverSsl:
++        if (SUCCEEDED(hr = variant_to_bool( &value, &b ))) request->revert_impersonation = b;
++        break;
++    case WinHttpRequestOption_EnableHttpsToHttpRedirects:
++        if (SUCCEEDED(hr = variant_to_bool( &value, &b ))) request->https_to_http_redirects = b;
++        break;
++    case WinHttpRequestOption_EnablePassportAuthentication:
++        if (SUCCEEDED(hr = variant_to_bool( &value, &b ))) request->passport_auth = b;
++        break;
++    case WinHttpRequestOption_MaxAutomaticRedirects:
++        if (SUCCEEDED(hr = variant_to_dword( &value, &dw ))) request->max_redirects = dw;
++        break;
++    case WinHttpRequestOption_MaxResponseHeaderSize:
++        if (SUCCEEDED(hr = variant_to_dword( &value, &dw ))) request->max_header_size = dw;
++        break;
++    case WinHttpRequestOption_MaxResponseDrainSize:
++        if (SUCCEEDED(hr = variant_to_dword( &value, &dw ))) request->max_drain_size = dw;
++        break;
++    case WinHttpRequestOption_EnableHttp1_1:
++        if (SUCCEEDED(hr = variant_to_bool( &value, &b ))) request->enable_http11 = b;
++        break;
++    case WinHttpRequestOption_EnableCertificateRevocationCheck:
++        if (SUCCEEDED(hr = variant_to_bool( &value, &b ))) request->revocation_check = b;
++        break;
+     default:
+-        FIXME("unimplemented option %u\n", option);
+-        hr = E_NOTIMPL;
++        WARN("unknown option %u\n", option);
++        hr = HRESULT_FROM_WIN32( ERROR_WINHTTP_INVALID_OPTION );
+         break;
+     }
+     LeaveCriticalSection( &request->cs );
+@@ -6107,8 +7042,17 @@ static HRESULT WINAPI winhttp_request_SetClientCertificate(
+     IWinHttpRequest *iface,
+     BSTR certificate )
+ {
+-    FIXME("\n");
+-    return E_NOTIMPL;
++    struct winhttp_request *request = impl_from_IWinHttpRequest( iface );
++    HRESULT hr;
++
++    TRACE( "%p, %s\n", request, debugstr_w(certificate) );
++
++    if (!certificate) return E_INVALIDARG;
++
++    EnterCriticalSection( &request->cs );
++    hr = select_client_certificate( request, certificate );
++    LeaveCriticalSection( &request->cs );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI winhttp_request_SetAutoLogonPolicy(
+diff --git a/dlls/winhttp/session.c b/dlls/winhttp/session.c
+index cfc893d..466f826 100644
+--- a/dlls/winhttp/session.c
++++ b/dlls/winhttp/session.c
+@@ -124,6 +124,272 @@ static void set_option_error( DWORD option, BOOL set )
+     else SetLastError( set ? ERROR_WINHTTP_INVALID_OPTION : ERROR_INVALID_PARAMETER );
+ }
+ 
++
++#define OPT_SESSION 0x01 /* valid on a session handle */
++#define OPT_REQUEST 0x02 /* valid on a request handle */
++#define OPT_QUERY   0x04
++#define OPT_SET     0x08
++#define OPT_BOOL    0x10 /* BOOL: stored as 0 or 1 */
++#define OPT_CREDS   0x20 /* needs the ShareCredsWithWinHttp policy */
++
++#define SR  (OPT_SESSION | OPT_REQUEST)
++#define QS  (OPT_QUERY | OPT_SET)
++
++/* options that are plain values kept in struct http_opts, per the option table in the
++ * "Option flags" page of the WinHTTP documentation */
++static const struct dword_option
++{
++    DWORD option;
++    unsigned int offset;
++    DWORD flags;
++} dword_options[] =
++{
++#define DWORD_OPTION(name, field, flags) { WINHTTP_OPTION_##name, offsetof(struct http_opts, field), flags }
++    DWORD_OPTION( CONNECT_RETRIES,                  connect_retries,                 SR | QS ),
++    DWORD_OPTION( MAX_HTTP_AUTOMATIC_REDIRECTS,     max_redirects,                   SR | QS ),
++    DWORD_OPTION( MAX_HTTP_STATUS_CONTINUE,         max_status_continue,             SR | QS ),
++    DWORD_OPTION( MAX_RESPONSE_DRAIN_SIZE,          max_drain_size,                  SR | QS ),
++    DWORD_OPTION( MAX_RESPONSE_HEADER_SIZE,         max_header_size,                 SR | QS ),
++    DWORD_OPTION( CODEPAGE,                         codepage,                        OPT_SESSION | OPT_SET ),
++    DWORD_OPTION( DECOMPRESSION,                    decompression,                   SR | OPT_SET ),
++    DWORD_OPTION( ENCODE_EXTRA,                     encode_extra,                    SR | OPT_SET | OPT_BOOL ),
++    DWORD_OPTION( ENABLE_HTTP_PROTOCOL,             enable_http_protocol,            SR | OPT_SET ),
++    DWORD_OPTION( HTTP_PROTOCOL_REQUIRED,           http_protocol_required,          SR | OPT_SET | OPT_BOOL ),
++    DWORD_OPTION( DISABLE_STREAM_QUEUE,             disable_stream_queue,            SR | OPT_SET | OPT_BOOL ),
++    DWORD_OPTION( RECEIVE_PROXY_CONNECT_RESPONSE,   receive_proxy_connect_response,  SR | OPT_SET | OPT_BOOL ),
++    DWORD_OPTION( REJECT_USERPWD_IN_URL,            reject_userpwd_in_url,           OPT_REQUEST | OPT_SET | OPT_BOOL ),
++    DWORD_OPTION( SPN,                              spn,                             OPT_REQUEST | OPT_SET ),
++    DWORD_OPTION( UNSAFE_HEADER_PARSING,            unsafe_header_parsing,           OPT_REQUEST | OPT_SET ),
++    DWORD_OPTION( USE_GLOBAL_SERVER_CREDENTIALS,    use_global_server_creds,         SR | OPT_SET | OPT_BOOL | OPT_CREDS ),
++    DWORD_OPTION( REQUEST_PRIORITY,                 request_priority,                OPT_REQUEST | QS ),
++    DWORD_OPTION( READ_BUFFER_SIZE,                 read_buffer_size,                OPT_REQUEST | QS ),
++    DWORD_OPTION( WRITE_BUFFER_SIZE,                write_buffer_size,               OPT_REQUEST | QS ),
++    DWORD_OPTION( ASSURED_NON_BLOCKING_CALLBACKS,   assured_non_blocking_callbacks,  OPT_SESSION | OPT_SET | OPT_BOOL ),
++    DWORD_OPTION( DISABLE_SECURE_PROTOCOL_FALLBACK, disable_secure_protocol_fallback, OPT_SESSION | OPT_SET | OPT_BOOL ),
++    DWORD_OPTION( IPV6_FAST_FALLBACK,               ipv6_fast_fallback,              OPT_SESSION | OPT_SET | OPT_BOOL ),
++    DWORD_OPTION( MAX_CONNS_PER_SERVER,             max_conns_per_server,            OPT_SESSION | QS ),
++    DWORD_OPTION( MAX_CONNS_PER_1_0_SERVER,         max_conns_per_1_0_server,        OPT_SESSION | QS ),
++    DWORD_OPTION( TCP_PRIORITY_HINT,                tcp_priority_hint,               SR | OPT_SET ),
++#undef DWORD_OPTION
++};
++
++static const struct dword_option *find_dword_option( DWORD option )
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(dword_options); i++)
++        if (dword_options[i].option == option) return &dword_options[i];
++    return NULL;
++}
++
++static BOOL shared_creds_enabled(void)
++{
++    DWORD value = 0, size = sizeof(value);
++
++    return !RegGetValueW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
++                          L"ShareCredsWithWinHttp", RRF_RT_REG_DWORD, NULL, &value, &size ) && value;
++}
++
++static void init_http_opts( struct http_opts *opts )
++{
++    memset( opts, 0, sizeof(*opts) );
++#ifdef SG_MUTANT_WH_NODEFAULTS
++    return;
++#endif
++    opts->connect_retries = 5;
++    opts->max_redirects = 10;
++    opts->max_status_continue = 10;
++    opts->max_header_size = 64 * 1024;
++    opts->max_drain_size = 1024 * 1024;
++    opts->codepage = CP_UTF8;
++    opts->max_conns_per_server = INFINITE;
++    opts->max_conns_per_1_0_server = INFINITE;
++}
++
++/* Query a stored option. Returns FALSE if the option is not one of the stored ones, with *handled FALSE. */
++static BOOL query_dword_option( struct http_opts *opts, DWORD handle_flag, DWORD option, void *buffer, DWORD *buflen,
++                                BOOL *handled )
++{
++    const struct dword_option *opt = find_dword_option( option );
++
++    *handled = opt != NULL;
++    if (!opt) return FALSE;
++    /* an option that is not for this kind of handle, or not to be queried, is ERROR_INVALID_PARAMETER (on a
++     * connection ERROR_WINHTTP_INCORRECT_HANDLE_TYPE), like the options of the websocket ones in the tests */
++    if (!(opt->flags & handle_flag) || !(opt->flags & OPT_QUERY))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
++    *(DWORD *)buffer = *(DWORD *)((char *)opts + opt->offset);
++    *buflen = sizeof(DWORD);
++    return TRUE;
++}
++
++static BOOL set_dword_option( struct http_opts *opts, DWORD handle_flag, DWORD option, void *buffer, DWORD buflen,
++                              BOOL *handled )
++{
++    const struct dword_option *opt = find_dword_option( option );
++    DWORD value;
++
++    *handled = opt != NULL;
++    if (!opt) return FALSE;
++#ifndef SG_MUTANT_WH_HANDLEKIND
++    if (!(opt->flags & handle_flag) || !(opt->flags & OPT_SET))
++    {
++        set_option_error( option, TRUE );
++        return FALSE;
++    }
++#endif
++    if (buflen != sizeof(DWORD))
++    {
++        SetLastError( option == WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS || option == WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
++                      ? ERROR_INVALID_PARAMETER : ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    value = *(DWORD *)buffer;
++
++    if (opt->flags & OPT_CREDS)
++    {
++        if (!shared_creds_enabled())
++        {
++            SetLastError( ERROR_WINHTTP_INVALID_OPTION );
++            return FALSE;
++        }
++    }
++    switch (option)
++    {
++    case WINHTTP_OPTION_DECOMPRESSION:
++        if (value & ~WINHTTP_DECOMPRESSION_FLAG_ALL) goto invalid;
++        break;
++    case WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL:
++        if (value & ~WINHTTP_PROTOCOL_MASK) goto invalid;
++        break;
++    case WINHTTP_OPTION_SPN:
++        if (value & ~WINHTTP_OPTION_SPN_MASK) goto invalid;
++        break;
++    case WINHTTP_OPTION_MAX_CONNS_PER_SERVER:
++#ifndef SG_MUTANT_WH_CONNS0
++        if (!value) value = 2;
++#endif
++        break;
++    }
++    if (opt->flags & OPT_BOOL) value = !!value;
++    *(DWORD *)((char *)opts + opt->offset) = value;
++    TRACE( "option %lu = %#lx\n", option, value );
++    return TRUE;
++
++invalid:
++    SetLastError( ERROR_INVALID_PARAMETER );
++    return FALSE;
++}
++
++/* the default value a session reports for WINHTTP_OPTION_SECURE_PROTOCOLS: the
++ * DefaultSecureProtocols policy value if there is one, else what the documentation lists for Windows 10 */
++static DWORD default_secure_protocols(void)
++{
++    DWORD value = 0, size = sizeof(value);
++
++    if (!RegGetValueW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\WinHttp",
++                       L"DefaultSecureProtocols", RRF_RT_REG_DWORD, NULL, &value, &size )) return value;
++    return WINHTTP_FLAG_SECURE_PROTOCOL_SSL3 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 |
++           WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
++}
++
++static void free_proxy_info( WINHTTP_PROXY_INFO *info )
++{
++    GlobalFree( info->lpszProxy );
++    GlobalFree( info->lpszProxyBypass );
++}
++
++/* WINHTTP_OPTION_PROXY query: the strings go to the caller in the buffer's tail, a WINHTTP_PROXY_INFO is written
++ * first; the documentation says they are GlobalAlloc'ed, so those are what the caller gets */
++static BOOL return_proxy_option( DWORD access, const WCHAR *server, const WCHAR *bypass, void *buffer, DWORD *buflen )
++{
++    WINHTTP_PROXY_INFO *info = buffer;
++
++    if (!validate_buffer( buffer, buflen, sizeof(*info) )) return FALSE;
++    info->dwAccessType = access;
++    info->lpszProxy = info->lpszProxyBypass = NULL;
++    if (server && !(info->lpszProxy = GlobalAlloc( GPTR, (lstrlenW( server ) + 1) * sizeof(WCHAR) ))) return FALSE;
++    if (bypass && !(info->lpszProxyBypass = GlobalAlloc( GPTR, (lstrlenW( bypass ) + 1) * sizeof(WCHAR) )))
++    {
++        free_proxy_info( info );
++        return FALSE;
++    }
++    if (server) lstrcpyW( info->lpszProxy, server );
++    if (bypass) lstrcpyW( info->lpszProxyBypass, bypass );
++    *buflen = sizeof(*info);
++    return TRUE;
++}
++
++/* check a WINHTTP_PROXY_INFO given to WinHttpSetOption and duplicate its strings */
++static BOOL parse_proxy_option( void *buffer, DWORD buflen, DWORD *access, WCHAR **server, WCHAR **bypass )
++{
++    WINHTTP_PROXY_INFO *info = buffer;
++
++    *server = *bypass = NULL;
++    if (buflen < sizeof(*info))
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    if (info->dwAccessType == WINHTTP_ACCESS_TYPE_DEFAULT_PROXY)
++    {
++        /* the system's default configuration: a named proxy if there is one, else none */
++        WINHTTP_PROXY_INFO def;
++
++        if (!WinHttpGetDefaultProxyConfiguration( &def )) return FALSE;
++        *access = def.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY && def.lpszProxy ? def.dwAccessType :
++                  WINHTTP_ACCESS_TYPE_NO_PROXY;
++        if (*access == WINHTTP_ACCESS_TYPE_NAMED_PROXY)
++        {
++            *server = wcsdup( def.lpszProxy );
++            if (def.lpszProxyBypass) *bypass = wcsdup( def.lpszProxyBypass );
++        }
++        free_proxy_info( &def );
++        if (*access == WINHTTP_ACCESS_TYPE_NAMED_PROXY && !*server)
++        {
++            free( *bypass );
++            *bypass = NULL;
++            SetLastError( ERROR_OUTOFMEMORY );
++            return FALSE;
++        }
++        return TRUE;
++    }
++    switch (info->dwAccessType)
++    {
++    case WINHTTP_ACCESS_TYPE_NO_PROXY:
++    case WINHTTP_ACCESS_TYPE_NAMED_PROXY:
++        break;
++    default:
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (info->dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY && !info->lpszProxy)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    *access = info->dwAccessType;
++    if (info->dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY)
++    {
++        if (!(*server = wcsdup( info->lpszProxy )) || (info->lpszProxyBypass && !(*bypass = wcsdup( info->lpszProxyBypass ))))
++        {
++            free( *server );
++            *server = NULL;
++            SetLastError( ERROR_OUTOFMEMORY );
++            return FALSE;
++        }
++    }
++    return TRUE;
++}
++
++static WCHAR *buffer_to_str( WCHAR *buffer, DWORD buflen );
++static BOOL return_string_option( WCHAR *buffer, const WCHAR *str, LPDWORD buflen );
++
++
+ static BOOL session_query_option( struct object_header *hdr, DWORD option, void *buffer, DWORD *buflen )
+ {
+     struct session *session = (struct session *)hdr;
+@@ -187,11 +453,57 @@ static BOOL session_query_option( struct object_header *hdr, DWORD option, void
+         *buflen = sizeof(DWORD);
+         return TRUE;
+ 
++    case WINHTTP_OPTION_PARENT_HANDLE:
++        /* a session has no parent */
++        if (!validate_buffer( buffer, buflen, sizeof(HINTERNET) )) return FALSE;
++
++        *(HINTERNET *)buffer = NULL;
++        *buflen = sizeof(HINTERNET);
++        return TRUE;
++
++    case WINHTTP_OPTION_SECURE_PROTOCOLS:
++        if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
++
++        EnterCriticalSection( &session->cs );
++        *(DWORD *)buffer = session->secure_protocols_set ? session->secure_protocols : default_secure_protocols();
++#ifdef SG_MUTANT_WH_SECDEF
++        if (!session->secure_protocols_set) *(DWORD *)buffer = 0;
++#endif
++        LeaveCriticalSection( &session->cs );
++        *buflen = sizeof(DWORD);
++        return TRUE;
++
++    case WINHTTP_OPTION_USER_AGENT:
++    {
++        BOOL ret;
++
++        EnterCriticalSection( &session->cs );
++        ret = return_string_option( buffer, session->agent, buflen );
++        LeaveCriticalSection( &session->cs );
++        return ret;
++    }
++    case WINHTTP_OPTION_PROXY:
++    {
++        BOOL ret;
++
++        EnterCriticalSection( &session->cs );
++        ret = return_proxy_option( session->access == WINHTTP_ACCESS_TYPE_NAMED_PROXY ? session->access :
++                                   WINHTTP_ACCESS_TYPE_NO_PROXY, session->proxy_server, session->proxy_bypass,
++                                   buffer, buflen );
++        LeaveCriticalSection( &session->cs );
++        return ret;
++    }
+     default:
+-        FIXME( "unimplemented option %lu\n", option );
++    {
++        BOOL handled, ret;
++
++        ret = query_dword_option( &session->opts, OPT_SESSION, option, buffer, buflen, &handled );
++        if (handled) return ret;
++        WARN( "option %lu cannot be queried on a session\n", option );
+         SetLastError( ERROR_INVALID_PARAMETER );
+         return FALSE;
+     }
++    }
+ }
+ 
+ static BOOL session_set_option( struct object_header *hdr, DWORD option, void *buffer, DWORD buflen )
+@@ -202,9 +514,19 @@ static BOOL session_set_option( struct object_header *hdr, DWORD option, void *b
+     {
+     case WINHTTP_OPTION_PROXY:
+     {
+-        WINHTTP_PROXY_INFO *pi = buffer;
++        DWORD access;
++        WCHAR *server, *bypass;
++
++        if (!parse_proxy_option( buffer, buflen, &access, &server, &bypass )) return FALSE;
+ 
+-        FIXME( "%lu %s %s\n", pi->dwAccessType, debugstr_w(pi->lpszProxy), debugstr_w(pi->lpszProxyBypass) );
++        EnterCriticalSection( &session->cs );
++        free( session->proxy_server );
++        free( session->proxy_bypass );
++        session->proxy_server = server;
++        session->proxy_bypass = bypass;
++        session->access = access;
++        LeaveCriticalSection( &session->cs );
++        TRACE( "%lu %s %s\n", access, debugstr_w(server), debugstr_w(bypass) );
+         return TRUE;
+     }
+     case WINHTTP_OPTION_REDIRECT_POLICY:
+@@ -222,6 +544,61 @@ static BOOL session_set_option( struct object_header *hdr, DWORD option, void *b
+         hdr->redirect_policy = policy;
+         return TRUE;
+     }
++    case WINHTTP_OPTION_USER_AGENT:
++    {
++        WCHAR *agent;
++
++        if (!(agent = buffer_to_str( buffer, buflen ))) return FALSE;
++        EnterCriticalSection( &session->cs );
++        free( session->agent );
++        session->agent = agent;
++        LeaveCriticalSection( &session->cs );
++        return TRUE;
++    }
++    case WINHTTP_OPTION_ENABLE_FEATURE:
++        /* the only feature that can be enabled on a session */
++        if (buflen == sizeof(DWORD) && *(DWORD *)buffer == WINHTTP_ENABLE_SSL_REVERT_IMPERSONATION)
++        {
++            session->opts.revert_impersonation = TRUE;
++            return TRUE;
++        }
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++
++    case WINHTTP_OPTION_PASSPORT_SIGN_OUT:
++    {
++        WCHAR *url;
++        URL_COMPONENTS uc;
++        BOOL ret = FALSE;
++
++        if (!buffer || !buflen)
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        /* the return URL; the cookies of its host are dropped */
++        if (!(url = buffer_to_str( buffer, buflen / sizeof(WCHAR) ))) return FALSE;
++        memset( &uc, 0, sizeof(uc) );
++        uc.dwStructSize = sizeof(uc);
++        uc.dwHostNameLength = ~0u;
++        if (WinHttpCrackUrl( url, 0, 0, &uc ) && uc.dwHostNameLength)
++        {
++            WCHAR *host = malloc( (uc.dwHostNameLength + 1) * sizeof(WCHAR) );
++            if (host)
++            {
++                memcpy( host, uc.lpszHostName, uc.dwHostNameLength * sizeof(WCHAR) );
++                host[uc.dwHostNameLength] = 0;
++                EnterCriticalSection( &session->cs );
++                clear_cookies_for_host( session, host );
++                LeaveCriticalSection( &session->cs );
++                free( host );
++                ret = TRUE;
++            }
++        }
++        else SetLastError( ERROR_WINHTTP_INVALID_URL );
++        free( url );
++        return ret;
++    }
+     case WINHTTP_OPTION_SECURE_PROTOCOLS:
+     {
+         if (buflen != sizeof(session->secure_protocols))
+@@ -231,6 +608,7 @@ static BOOL session_set_option( struct object_header *hdr, DWORD option, void *b
+         }
+         EnterCriticalSection( &session->cs );
+         session->secure_protocols = *(DWORD *)buffer;
++        session->secure_protocols_set = TRUE;
+         LeaveCriticalSection( &session->cs );
+         TRACE( "%#lx\n", session->secure_protocols );
+         return TRUE;
+@@ -268,14 +646,6 @@ static BOOL session_set_option( struct object_header *hdr, DWORD option, void *b
+         session->unload_event = *(HANDLE *)buffer;
+         return TRUE;
+ 
+-    case WINHTTP_OPTION_MAX_CONNS_PER_SERVER:
+-        FIXME( "WINHTTP_OPTION_MAX_CONNS_PER_SERVER: %lu\n", *(DWORD *)buffer );
+-        return TRUE;
+-
+-    case WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER:
+-        FIXME( "WINHTTP_OPTION_MAX_CONNS_PER_1_0_SERVER: %lu\n", *(DWORD *)buffer );
+-        return TRUE;
+-
+     case WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE:
+     {
+         DWORD buffer_size;
+@@ -309,10 +679,16 @@ static BOOL session_set_option( struct object_header *hdr, DWORD option, void *b
+     }
+ 
+     default:
+-        FIXME( "unimplemented option %lu\n", option );
++    {
++        BOOL handled, ret;
++
++        ret = set_dword_option( &session->opts, OPT_SESSION, option, buffer, buflen, &handled );
++        if (handled) return ret;
++        WARN( "option %lu cannot be set on a session\n", option );
+         set_option_error( option, TRUE );
+         return FALSE;
+     }
++    }
+ }
+ 
+ static const struct object_vtbl session_vtbl =
+@@ -340,6 +716,7 @@ HINTERNET WINAPI WinHttpOpen( LPCWSTR agent, DWORD access, LPCWSTR proxy, LPCWST
+     session->hdr.flags = flags;
+     session->hdr.refs = 1;
+     session->hdr.redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
++    init_http_opts( &session->opts );
+     session->resolve_timeout = DEFAULT_RESOLVE_TIMEOUT;
+     session->connect_timeout = DEFAULT_CONNECT_TIMEOUT;
+     session->send_timeout = DEFAULT_SEND_TIMEOUT;
+@@ -371,6 +748,7 @@ HINTERNET WINAPI WinHttpOpen( LPCWSTR agent, DWORD access, LPCWSTR proxy, LPCWST
+             goto end;
+         }
+     }
++    else if (access == WINHTTP_ACCESS_TYPE_NO_PROXY) session->access = access;
+     else if (access == WINHTTP_ACCESS_TYPE_NAMED_PROXY)
+     {
+         session->access = access;
+@@ -450,10 +828,23 @@ static BOOL connect_query_option( struct object_header *hdr, DWORD option, void
+         return TRUE;
+ 
+     default:
+-        FIXME( "unimplemented option %lu\n", option );
++    {
++        BOOL handled, ret;
++
++        /* a connection answers the queries of the session it belongs to */
++        ret = query_dword_option( &connect->session->opts, OPT_SESSION, option, buffer, buflen, &handled );
++        if (handled)
++        {
++            const struct dword_option *opt = find_dword_option( option );
++            if (!ret && opt && (!(opt->flags & OPT_SESSION) || !(opt->flags & OPT_QUERY)))
++                set_option_error( option, FALSE );
++            return ret;
++        }
++        WARN( "option %lu cannot be queried on a connection\n", option );
+         set_option_error( option, FALSE );
+         return FALSE;
+     }
++    }
+ }
+ 
+ static const struct object_vtbl connect_vtbl =
+@@ -517,13 +908,13 @@ static BOOL domain_matches(LPCWSTR server, LPCWSTR domain)
+ /* Matches INTERNET_MAX_HOST_NAME_LENGTH in wininet.h, also RFC 1035 */
+ #define MAX_HOST_NAME_LENGTH 256
+ 
+-static BOOL should_bypass_proxy(struct session *session, LPCWSTR server)
++static BOOL should_bypass_proxy(const WCHAR *proxy_bypass, LPCWSTR server)
+ {
+     LPCWSTR ptr;
+     BOOL ret = FALSE;
+ 
+-    if (!session->proxy_bypass) return FALSE;
+-    ptr = session->proxy_bypass;
++    if (!proxy_bypass) return FALSE;
++    ptr = proxy_bypass;
+     do {
+         LPCWSTR tmp = ptr;
+ 
+@@ -548,29 +939,29 @@ static BOOL should_bypass_proxy(struct session *session, LPCWSTR server)
+     return ret;
+ }
+ 
+-BOOL set_server_for_hostname( struct connect *connect, const WCHAR *server, INTERNET_PORT port )
++static BOOL set_server_for_hostname_proxy( struct connect *connect, const WCHAR *server, INTERNET_PORT port,
++                                           const WCHAR *proxy_server, const WCHAR *proxy_bypass )
+ {
+-    struct session *session = connect->session;
+     BOOL ret = TRUE;
+ 
+-    if (session->proxy_server && !should_bypass_proxy(session, server))
++    if (proxy_server && !should_bypass_proxy( proxy_bypass, server ))
+     {
+         LPCWSTR colon;
+ 
+-        if ((colon = wcschr( session->proxy_server, ':' )))
++        if ((colon = wcschr( proxy_server, ':' )))
+         {
+             if (!connect->servername || wcsnicmp( connect->servername,
+-                session->proxy_server, colon - session->proxy_server - 1 ))
++                proxy_server, colon - proxy_server - 1 ))
+             {
+                 free( connect->servername );
+                 connect->resolved = FALSE;
+-                if (!(connect->servername = malloc( (colon - session->proxy_server + 1) * sizeof(WCHAR) )))
++                if (!(connect->servername = malloc( (colon - proxy_server + 1) * sizeof(WCHAR) )))
+                 {
+                     ret = FALSE;
+                     goto end;
+                 }
+-                memcpy( connect->servername, session->proxy_server, (colon - session->proxy_server) * sizeof(WCHAR) );
+-                connect->servername[colon - session->proxy_server] = 0;
++                memcpy( connect->servername, proxy_server, (colon - proxy_server) * sizeof(WCHAR) );
++                connect->servername[colon - proxy_server] = 0;
+                 if (*(colon + 1))
+                     connect->serverport = wcstol( colon + 1, NULL, 10 );
+                 else
+@@ -579,11 +970,11 @@ BOOL set_server_for_hostname( struct connect *connect, const WCHAR *server, INTE
+         }
+         else
+         {
+-            if (!connect->servername || wcsicmp( connect->servername, session->proxy_server ))
++            if (!connect->servername || wcsicmp( connect->servername, proxy_server ))
+             {
+                 free( connect->servername );
+                 connect->resolved = FALSE;
+-                if (!(connect->servername = wcsdup( session->proxy_server )))
++                if (!(connect->servername = wcsdup( proxy_server )))
+                 {
+                     ret = FALSE;
+                     goto end;
+@@ -607,6 +998,46 @@ end:
+     return ret;
+ }
+ 
++BOOL set_server_for_hostname( struct connect *connect, const WCHAR *server, INTERNET_PORT port )
++{
++    struct session *session = connect->session;
++    WCHAR *proxy_server = NULL, *proxy_bypass = NULL;
++    BOOL ret;
++
++    EnterCriticalSection( &session->cs );
++    if (session->proxy_server) proxy_server = wcsdup( session->proxy_server );
++    if (session->proxy_bypass) proxy_bypass = wcsdup( session->proxy_bypass );
++    LeaveCriticalSection( &session->cs );
++    ret = set_server_for_hostname_proxy( connect, server, port, proxy_server, proxy_bypass );
++    free( proxy_server );
++    free( proxy_bypass );
++    return ret;
++}
++
++/* same, for a request that got its own WINHTTP_OPTION_PROXY */
++BOOL set_server_for_request( struct request *request, const WCHAR *server, INTERNET_PORT port )
++{
++    if (!request->has_proxy) return set_server_for_hostname( request->connect, server, port );
++    return set_server_for_hostname_proxy( request->connect, server, port,
++                                          request->proxy_access == WINHTTP_ACCESS_TYPE_NAMED_PROXY ? request->proxy_server : NULL,
++                                          request->proxy_bypass );
++}
++
++static BOOL request_apply_proxy( struct request *request )
++{
++    struct connect *connect = request->connect;
++
++#ifdef SG_MUTANT_WH_PROXYREQ
++    return TRUE;
++#endif
++    if (!set_server_for_request( request, connect->hostname, connect->hostport ))
++    {
++        SetLastError( ERROR_OUTOFMEMORY );
++        return FALSE;
++    }
++    return TRUE;
++}
++
+ /***********************************************************************
+  *          WinHttpConnect (winhttp.@)
+  */
+@@ -676,6 +1107,7 @@ static void request_destroy( struct object_header *hdr )
+     TRACE("%p\n", request);
+ 
+     stop_queue( &request->queue );
++    close_connection( request );
+     release_object( &request->connect->hdr );
+ 
+     if (request->cred_handle_initialized) FreeCredentialsHandle( &request->cred_handle );
+@@ -685,6 +1117,14 @@ static void request_destroy( struct object_header *hdr )
+     destroy_authinfo( request->authinfo );
+     destroy_authinfo( request->proxy_authinfo );
+ 
++    free_decomp( request );
++    free( request->proxy_server );
++    free( request->proxy_bypass );
++    free( request->server_spn );
++    free( request->proxy_spn );
++    free( request->passport_return_url );
++    free( request->passport_cbtext );
++    free( request->passport_cburl );
+     free( request->verb );
+     free( request->path );
+     free( request->username );
+@@ -943,21 +1383,100 @@ static BOOL request_query_option( struct object_header *hdr, DWORD option, void
+     case WINHTTP_OPTION_PROXY_PASSWORD:
+         return return_string_option( buffer, request->connect->session->proxy_password, buflen );
+ 
+-    case WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS:
++    case WINHTTP_OPTION_HTTP_PROTOCOL_USED:
++        /* only HTTP/1.x is spoken, and the option reports the advanced versions: none */
+         if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
+ 
+-        *(DWORD *)buffer = request->max_redirects;
++        *(DWORD *)buffer = 0;
+         *buflen = sizeof(DWORD);
+         return TRUE;
+ 
+-    case WINHTTP_OPTION_HTTP_PROTOCOL_USED:
++    case WINHTTP_OPTION_PROXY:
++        if (request->has_proxy)
++            return return_proxy_option( request->proxy_access, request->proxy_server, request->proxy_bypass,
++                                        buffer, buflen );
++        else
++        {
++            struct session *session = request->connect->session;
++            BOOL ret;
++
++            EnterCriticalSection( &session->cs );
++            ret = return_proxy_option( session->access == WINHTTP_ACCESS_TYPE_NAMED_PROXY ? session->access :
++                                       WINHTTP_ACCESS_TYPE_NO_PROXY, session->proxy_server, session->proxy_bypass,
++                                       buffer, buflen );
++            LeaveCriticalSection( &session->cs );
++            return ret;
++        }
++
++    case WINHTTP_OPTION_SERVER_SPN_USED:
++        return return_string_option( buffer, request->server_spn, buflen );
++
++    case WINHTTP_OPTION_PROXY_SPN_USED:
++        return return_string_option( buffer, request->proxy_spn, buflen );
++
++    case WINHTTP_OPTION_IS_PROXY_CONNECT_RESPONSE:
+         if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
+ 
+-        FIXME("WINHTTP_OPTION_HTTP_PROTOCOL_USED\n");
+-        *(DWORD *)buffer = 0;
++        *(DWORD *)buffer = request->proxy_connect_response;
+         *buflen = sizeof(DWORD);
+         return TRUE;
+ 
++    case WINHTTP_OPTION_SERVER_CERT_CHAIN_CONTEXT:
++    {
++        const CERT_CHAIN_CONTEXT *chain;
++        CERT_CHAIN_PARA para;
++
++        if (!validate_buffer( buffer, buflen, sizeof(chain) )) return FALSE;
++        if (!request->server_cert)
++        {
++            SetLastError( ERROR_WINHTTP_INCORRECT_HANDLE_STATE );
++            return FALSE;
++        }
++        memset( &para, 0, sizeof(para) );
++        para.cbSize = sizeof(para);
++        if (!CertGetCertificateChain( NULL, request->server_cert, NULL, request->server_cert->hCertStore, &para, 0, NULL,
++                                      &chain )) return FALSE;
++        *(const CERT_CHAIN_CONTEXT **)buffer = chain;
++        *buflen = sizeof(chain);
++        return TRUE;
++    }
++    case WINHTTP_OPTION_REQUEST_TIMES:
++    {
++        WINHTTP_REQUEST_TIMES *times = buffer;
++        ULONG count;
++
++        if (!validate_buffer( buffer, buflen, sizeof(*times) )) return FALSE;
++        count = min( times->cTimes, WinHttpRequestTimeLast );
++        memset( times->rgullTimes, 0, sizeof(times->rgullTimes) );
++        memcpy( times->rgullTimes, request->times, count * sizeof(ULONGLONG) );
++        times->cTimes = WinHttpRequestTimeLast;
++        *buflen = sizeof(*times);
++        return TRUE;
++    }
++    case WINHTTP_OPTION_REQUEST_STATS:
++    {
++        WINHTTP_REQUEST_STATS *stats = buffer;
++        ULONG count;
++
++        if (!validate_buffer( buffer, buflen, sizeof(*stats) )) return FALSE;
++        count = min( stats->cStats, WinHttpRequestStatLast );
++        memset( stats->rgullStats, 0, sizeof(stats->rgullStats) );
++        memcpy( stats->rgullStats, request->stats, count * sizeof(ULONGLONG) );
++        stats->ullFlags = request->stat_flags;
++        stats->ulIndex = request->stat_index;
++        stats->cStats = WinHttpRequestStatLast;
++        *buflen = sizeof(*stats);
++        return TRUE;
++    }
++    case WINHTTP_OPTION_PASSPORT_RETURN_URL:
++        return return_string_option( buffer, request->passport_return_url, buflen );
++
++    case WINHTTP_OPTION_PASSPORT_COBRANDING_TEXT:
++        return return_string_option( buffer, request->passport_cbtext, buflen );
++
++    case WINHTTP_OPTION_PASSPORT_COBRANDING_URL:
++        return return_string_option( buffer, request->passport_cburl, buflen );
++
+     case WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE:
+         if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
+ 
+@@ -984,10 +1503,16 @@ static BOOL request_query_option( struct object_header *hdr, DWORD option, void
+     }
+ 
+     default:
+-        FIXME( "unimplemented option %lu\n", option );
++    {
++        BOOL handled, ret;
++
++        ret = query_dword_option( &request->opts, OPT_REQUEST, option, buffer, buflen, &handled );
++        if (handled) return ret;
++        WARN( "option %lu cannot be queried on a request\n", option );
+         SetLastError( ERROR_INVALID_PARAMETER );
+         return FALSE;
+     }
++    }
+ }
+ 
+ static WCHAR *buffer_to_str( WCHAR *buffer, DWORD buflen )
+@@ -1011,11 +1536,26 @@ static BOOL request_set_option( struct object_header *hdr, DWORD option, void *b
+     {
+     case WINHTTP_OPTION_PROXY:
+     {
+-        WINHTTP_PROXY_INFO *pi = buffer;
++        DWORD access;
++        WCHAR *server, *bypass;
+ 
+-        FIXME( "%lu %s %s\n", pi->dwAccessType, debugstr_w(pi->lpszProxy), debugstr_w(pi->lpszProxyBypass) );
+-        return TRUE;
++        if (!parse_proxy_option( buffer, buflen, &access, &server, &bypass )) return FALSE;
++
++        free( request->proxy_server );
++        free( request->proxy_bypass );
++        request->proxy_server = server;
++        request->proxy_bypass = bypass;
++        request->proxy_access = access;
++        request->has_proxy = TRUE;
++        TRACE( "%lu %s %s\n", access, debugstr_w(server), debugstr_w(bypass) );
++        /* the connection the request uses follows the proxy it was given */
++        return request_apply_proxy( request );
+     }
++    case WINHTTP_OPTION_EXPIRE_CONNECTION:
++        /* the connection is closed once the request is done, whatever the server says */
++        request->expire_connection = TRUE;
++        return TRUE;
++
+     case WINHTTP_OPTION_DISABLE_FEATURE:
+     {
+         DWORD disable;
+@@ -1184,38 +1724,6 @@ static BOOL request_set_option( struct object_header *hdr, DWORD option, void *b
+         request->flags |= REQUEST_FLAG_WEBSOCKET_UPGRADE;
+         return TRUE;
+ 
+-    case WINHTTP_OPTION_CONNECT_RETRIES:
+-        FIXME("WINHTTP_OPTION_CONNECT_RETRIES\n");
+-        return TRUE;
+-
+-    case WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS:
+-        if (buflen == sizeof(DWORD))
+-        {
+-            request->max_redirects = *(DWORD *)buffer;
+-            SetLastError(NO_ERROR);
+-            return TRUE;
+-        }
+-
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return FALSE;
+-
+-    case WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE:
+-        FIXME("WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE\n");
+-        return TRUE;
+-
+-    case WINHTTP_OPTION_MAX_RESPONSE_DRAIN_SIZE:
+-        FIXME("WINHTTP_OPTION_MAX_RESPONSE_DRAIN_SIZE\n");
+-        return TRUE;
+-
+-    case WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL:
+-        if (buflen == sizeof(DWORD))
+-        {
+-            FIXME( "WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL %#lx\n", *(DWORD *)buffer );
+-            return TRUE;
+-        }
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return FALSE;
+-
+     case WINHTTP_OPTION_WEB_SOCKET_RECEIVE_BUFFER_SIZE:
+     {
+         DWORD buffer_size;
+@@ -1249,10 +1757,16 @@ static BOOL request_set_option( struct object_header *hdr, DWORD option, void *b
+     }
+ 
+     default:
+-        FIXME( "unimplemented option %lu\n", option );
++    {
++        BOOL handled, ret;
++
++        ret = set_dword_option( &request->opts, OPT_REQUEST, option, buffer, buflen, &handled );
++        if (handled) return ret;
++        WARN( "option %lu cannot be set on a request\n", option );
+         set_option_error( option, TRUE );
+         return FALSE;
+     }
++    }
+ }
+ 
+ static const struct object_vtbl request_vtbl =
+@@ -1343,7 +1857,9 @@ HINTERNET WINAPI WinHttpOpenRequest( HINTERNET hconnect, const WCHAR *verb, cons
+     request->send_timeout = connect->session->send_timeout;
+     request->receive_timeout = connect->session->receive_timeout;
+     request->receive_response_timeout = connect->session->receive_response_timeout;
+-    request->max_redirects = 10;
++#ifndef SG_MUTANT_WH_INHERIT
++    request->opts = connect->session->opts;
++#endif
+     request->websocket_receive_buffer_size = connect->session->websocket_receive_buffer_size;
+     request->websocket_send_buffer_size = connect->session->websocket_send_buffer_size;
+     request->websocket_set_send_buffer_size = request->websocket_send_buffer_size;
+@@ -1390,6 +1906,219 @@ BOOL WINAPI WinHttpCloseHandle( HINTERNET handle )
+     return TRUE;
+ }
+ 
++static DWORD worker_thread_count;
++static BOOL worker_thread_count_set;
++static HTTP_VERSION_INFO http_version = { 1, 1 };
++static DWORD tracing_enabled;
++
++/* the options that act on no handle at all (WinHttpOpen is not needed for them) */
++static BOOL query_global_option( DWORD option, void *buffer, DWORD *buflen )
++{
++    switch (option)
++    {
++    case WINHTTP_OPTION_PROXY:
++    {
++        WINHTTP_PROXY_INFO info;
++        BOOL ret;
++
++        if (!buflen)
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        if (!validate_buffer( buffer, buflen, sizeof(info) )) return FALSE;
++        if (!(ret = WinHttpGetDefaultProxyConfiguration( &info ))) return FALSE;
++        *(WINHTTP_PROXY_INFO *)buffer = info;
++        *buflen = sizeof(info);
++        return TRUE;
++    }
++    case WINHTTP_OPTION_ENABLETRACING:
++        if (!buflen)
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
++        *(DWORD *)buffer = tracing_enabled;
++        *buflen = sizeof(DWORD);
++        return TRUE;
++
++    default:
++        SetLastError( ERROR_INVALID_HANDLE );
++        return FALSE;
++    }
++}
++
++/* credentials WinINet shares with WinHTTP (WINHTTP_OPTION_GLOBAL_PROXY_CREDS / _SERVER_CREDS) */
++struct global_creds
++{
++    struct list entry;
++    BOOL proxy;
++    WCHAR *username, *password, *realm, *host;
++    DWORD scheme, port;
++};
++
++static CRITICAL_SECTION global_creds_cs;
++static CRITICAL_SECTION_DEBUG global_creds_debug =
++{
++    0, 0, &global_creds_cs,
++    { &global_creds_debug.ProcessLocksList, &global_creds_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": global_creds_cs") }
++};
++static CRITICAL_SECTION global_creds_cs = { &global_creds_debug, -1, 0, 0, 0, 0 };
++static struct list global_creds_list = LIST_INIT( global_creds_list );
++
++/* the fields of WINHTTP_CREDS_EX (WINHTTP_CREDS stops after dwPort) */
++struct winhttp_creds_ex
++{
++    char *lpszUserName;
++    char *lpszPassword;
++    char *lpszRealm;
++    DWORD dwAuthScheme;
++    char *lpszHostName;
++    DWORD dwPort;
++    char *lpszUrl;
++};
++
++static WCHAR *strdupAW_opt( const char *str )
++{
++    int len;
++    WCHAR *ret;
++
++    if (!str) return NULL;
++    len = MultiByteToWideChar( CP_ACP, 0, str, -1, NULL, 0 );
++    if ((ret = malloc( len * sizeof(WCHAR) ))) MultiByteToWideChar( CP_ACP, 0, str, -1, ret, len );
++    return ret;
++}
++
++static BOOL set_global_creds( DWORD option, void *buffer, DWORD buflen )
++{
++    const struct winhttp_creds_ex *in = buffer;
++    struct global_creds *creds;
++
++    if (!shared_creds_enabled())
++    {
++        SetLastError( ERROR_WINHTTP_INVALID_OPTION );
++        return FALSE;
++    }
++    if (!buffer || buflen < offsetof(struct winhttp_creds_ex, lpszUrl))
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    if (!(creds = calloc( 1, sizeof(*creds) )))
++    {
++        SetLastError( ERROR_OUTOFMEMORY );
++        return FALSE;
++    }
++    creds->proxy = option == WINHTTP_OPTION_GLOBAL_PROXY_CREDS;
++    creds->username = strdupAW_opt( in->lpszUserName );
++    creds->password = strdupAW_opt( in->lpszPassword );
++    creds->realm = strdupAW_opt( in->lpszRealm );
++    creds->host = strdupAW_opt( in->lpszHostName );
++    creds->scheme = in->dwAuthScheme;
++    creds->port = in->dwPort;
++
++    EnterCriticalSection( &global_creds_cs );
++    list_add_head( &global_creds_list, &creds->entry );
++    LeaveCriticalSection( &global_creds_cs );
++    return TRUE;
++}
++
++/* find shared credentials for a challenge; the strings are copies for the caller to free */
++BOOL find_global_creds( BOOL proxy, const WCHAR *host, DWORD port, DWORD scheme, WCHAR **username, WCHAR **password )
++{
++    struct global_creds *creds;
++    BOOL ret = FALSE;
++
++    EnterCriticalSection( &global_creds_cs );
++    LIST_FOR_EACH_ENTRY( creds, &global_creds_list, struct global_creds, entry )
++    {
++        if (creds->proxy != proxy || !creds->username || !creds->password) continue;
++        if (creds->host && wcsicmp( creds->host, host )) continue;
++        if (creds->port && creds->port != port) continue;
++        if (creds->scheme && creds->scheme != scheme) continue;
++        *username = wcsdup( creds->username );
++        *password = wcsdup( creds->password );
++        ret = *username && *password;
++        break;
++    }
++    LeaveCriticalSection( &global_creds_cs );
++    return ret;
++}
++
++BOOL global_server_creds_allowed( struct request *request )
++{
++    return request->opts.use_global_server_creds;
++}
++
++static BOOL set_global_option( DWORD option, void *buffer, DWORD buflen )
++{
++    switch (option)
++    {
++    case WINHTTP_OPTION_PROXY:
++    {
++        DWORD access;
++        WCHAR *server, *bypass;
++        WINHTTP_PROXY_INFO info;
++        BOOL ret;
++
++        if (!parse_proxy_option( buffer, buflen, &access, &server, &bypass )) return FALSE;
++        info.dwAccessType = access;
++        info.lpszProxy = server;
++        info.lpszProxyBypass = bypass;
++        ret = WinHttpSetDefaultProxyConfiguration( &info );
++        free( server );
++        free( bypass );
++        return ret;
++    }
++    case WINHTTP_OPTION_ENABLETRACING:
++        if (buflen != sizeof(DWORD))
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        tracing_enabled = *(DWORD *)buffer;
++        return TRUE;
++
++    case WINHTTP_OPTION_HTTP_VERSION:
++    {
++        HTTP_VERSION_INFO *info = buffer;
++
++        if (buflen != sizeof(*info))
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        http_version = *info;
++        return TRUE;
++    }
++    case WINHTTP_OPTION_WORKER_THREAD_COUNT:
++        if (buflen != sizeof(DWORD))
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        /* settable once */
++        if (worker_thread_count_set)
++        {
++            SetLastError( ERROR_WINHTTP_INCORRECT_HANDLE_STATE );
++            return FALSE;
++        }
++        worker_thread_count = *(DWORD *)buffer;
++        worker_thread_count_set = TRUE;
++        return TRUE;
++
++    case WINHTTP_OPTION_GLOBAL_PROXY_CREDS:
++    case WINHTTP_OPTION_GLOBAL_SERVER_CREDS:
++        return set_global_creds( option, buffer, buflen );
++
++    default:
++        SetLastError( ERROR_INVALID_HANDLE );
++        return FALSE;
++    }
++}
++
+ static BOOL query_option( struct object_header *hdr, DWORD option, void *buffer, DWORD *buflen )
+ {
+     BOOL ret = FALSE;
+@@ -1404,12 +2133,45 @@ static BOOL query_option( struct object_header *hdr, DWORD option, void *buffer,
+     {
+     case WINHTTP_OPTION_WORKER_THREAD_COUNT:
+     {
+-        FIXME( "WINHTTP_OPTION_WORKER_THREAD_COUNT semi-stub.\n" );
+         if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
+ 
+-        *(DWORD *)buffer = 0;
++        *(DWORD *)buffer = worker_thread_count;
++        *buflen = sizeof(DWORD);
++        return TRUE;
++    }
++    case WINHTTP_OPTION_HANDLE_TYPE:
++        if (hdr->type != WINHTTP_HANDLE_TYPE_SESSION && hdr->type != WINHTTP_HANDLE_TYPE_CONNECT &&
++            hdr->type != WINHTTP_HANDLE_TYPE_REQUEST) goto vtbl;
++        if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
++
++        *(DWORD *)buffer = hdr->type;
++        *buflen = sizeof(DWORD);
++        return TRUE;
++
++    case WINHTTP_OPTION_CALLBACK:
++        if (!validate_buffer( buffer, buflen, sizeof(hdr->callback) )) return FALSE;
++
++        *(WINHTTP_STATUS_CALLBACK *)buffer = hdr->callback;
++        *buflen = sizeof(hdr->callback);
++        return TRUE;
++
++    case WINHTTP_OPTION_EXTENDED_ERROR:
++        if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
++
++        *(DWORD *)buffer = get_extended_error();
+         *buflen = sizeof(DWORD);
+         return TRUE;
++
++    case WINHTTP_OPTION_HTTP_VERSION:
++    {
++        HTTP_VERSION_INFO *info = buffer;
++
++        if (!validate_buffer( buffer, buflen, sizeof(*info) )) return FALSE;
++
++        info->dwMajorVersion = http_version.dwMajorVersion;
++        info->dwMinorVersion = http_version.dwMinorVersion;
++        *buflen = sizeof(*info);
++        return TRUE;
+     }
+     case WINHTTP_OPTION_CONTEXT_VALUE:
+     {
+@@ -1420,6 +2182,7 @@ static BOOL query_option( struct object_header *hdr, DWORD option, void *buffer,
+         return TRUE;
+     }
+     default:
++    vtbl:
+         if (hdr->vtbl->query_option) ret = hdr->vtbl->query_option( hdr, option, buffer, buflen );
+         else
+         {
+@@ -1442,6 +2205,14 @@ BOOL WINAPI WinHttpQueryOption( HINTERNET handle, DWORD option, void *buffer, DW
+ 
+     TRACE( "%p, %lu, %p, %p\n", handle, option, buffer, buflen );
+ 
++    if (!handle)
++    {
++        if (option == WINHTTP_OPTION_HTTP_VERSION || option == WINHTTP_OPTION_WORKER_THREAD_COUNT ||
++            option == WINHTTP_OPTION_EXTENDED_ERROR) ret = query_option( NULL, option, buffer, buflen );
++        else ret = query_global_option( option, buffer, buflen );
++        if (ret) SetLastError( ERROR_SUCCESS );
++        return ret;
++    }
+     if (!(hdr = grab_object( handle )))
+     {
+         SetLastError( ERROR_INVALID_HANDLE );
+@@ -1478,6 +2249,15 @@ static BOOL set_option( struct object_header *hdr, DWORD option, void *buffer, D
+         hdr->context = *(DWORD_PTR *)buffer;
+         return TRUE;
+     }
++    case WINHTTP_OPTION_CALLBACK:
++        if (buflen != sizeof(hdr->callback))
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            return FALSE;
++        }
++        hdr->callback = *(WINHTTP_STATUS_CALLBACK *)buffer;
++        return TRUE;
++
+     default:
+         if (hdr->vtbl->set_option) ret = hdr->vtbl->set_option( hdr, option, buffer, buflen );
+         else
+@@ -1501,6 +2281,17 @@ BOOL WINAPI WinHttpSetOption( HINTERNET handle, DWORD option,  void *buffer, DWO
+ 
+     TRACE( "%p, %lu, %p, %lu\n", handle, option, buffer, buflen );
+ 
++    if (!handle)
++    {
++        if (!buffer && buflen)
++        {
++            SetLastError( ERROR_INVALID_PARAMETER );
++            return FALSE;
++        }
++        ret = set_global_option( option, buffer, buflen );
++        if (ret) SetLastError( ERROR_SUCCESS );
++        return ret;
++    }
+     if (!(hdr = grab_object( handle )))
+     {
+         SetLastError( ERROR_INVALID_HANDLE );
+diff --git a/dlls/winhttp/tests/winhttp.c b/dlls/winhttp/tests/winhttp.c
+index e409493..0be7b08 100644
+--- a/dlls/winhttp/tests/winhttp.c
++++ b/dlls/winhttp/tests/winhttp.c
+@@ -5388,7 +5388,6 @@ static void test_IWinHttpRequest_Invoke(void)
+     VariantInit(&arg[2]);
+     params.cArgs = 3;
+     hr = IWinHttpRequest_Invoke(request, DISPID_HTTPREQUEST_OPTION, &IID_NULL, 0, DISPATCH_PROPERTYPUT, &params, &ret, NULL, &err);
+-    todo_wine
+     ok(hr == S_OK, "error %#lx\n", hr);
+ 
+     VariantInit(&arg[0]);
+@@ -5433,7 +5432,6 @@ static void test_IWinHttpRequest_Invoke(void)
+ 
+     params.cArgs = 2;
+     hr = IWinHttpRequest_Invoke(request, DISPID_HTTPREQUEST_OPTION, &IID_NULL, 0, DISPATCH_PROPERTYGET, &params, NULL, NULL, NULL);
+-    todo_wine
+     ok(hr == S_OK, "error %#lx\n", hr);
+ 
+     params.cArgs = 0;
+diff --git a/dlls/winhttp/winhttp_private.h b/dlls/winhttp/winhttp_private.h
+index 3fa350b..ae66d44 100644
+--- a/dlls/winhttp/winhttp_private.h
++++ b/dlls/winhttp/winhttp_private.h
+@@ -64,11 +64,45 @@ struct hostdata
+     INTERNET_PORT port;
+     BOOL secure;
+     struct list connections;
++    DWORD active;   /* connections in use by requests */
++    BOOL http10;    /* the server answered with HTTP/1.0 */
++};
++
++/* options that a session hands down to the requests it creates */
++struct http_opts
++{
++    DWORD connect_retries;
++    DWORD max_redirects;
++    DWORD max_status_continue;
++    DWORD max_header_size;
++    DWORD max_drain_size;
++    DWORD codepage;
++    DWORD encode_extra;
++    DWORD decompression;
++    DWORD enable_http_protocol;
++    DWORD http_protocol_required;
++    DWORD disable_stream_queue;
++    DWORD receive_proxy_connect_response;
++    DWORD reject_userpwd_in_url;
++    DWORD spn;
++    DWORD unsafe_header_parsing;
++    DWORD use_global_server_creds;
++    DWORD request_priority;
++    DWORD read_buffer_size;
++    DWORD write_buffer_size;
++    DWORD assured_non_blocking_callbacks;
++    DWORD disable_secure_protocol_fallback;
++    DWORD ipv6_fast_fallback;
++    DWORD max_conns_per_server;
++    DWORD max_conns_per_1_0_server;
++    DWORD tcp_priority_hint;
++    DWORD revert_impersonation;
+ };
+ 
+ struct session
+ {
+     struct object_header hdr;
++    struct http_opts opts;
+     CRITICAL_SECTION cs;
+     WCHAR *agent;
+     DWORD access;
+@@ -84,6 +118,7 @@ struct session
+     struct list cookie_cache;
+     HANDLE unload_event;
+     DWORD secure_protocols;
++    BOOL secure_protocols_set;
+     DWORD passport_flags;
+     unsigned int websocket_receive_buffer_size;
+     unsigned int websocket_send_buffer_size;
+@@ -109,6 +144,8 @@ struct netconn
+     struct sockaddr_storage sockaddr;
+     BOOL secure; /* SSL active on connection? */
+     struct hostdata *host;
++    BOOL slot_held;    /* counted in host->active */
++    ULONG requests;    /* requests that used this connection */
+     ULONGLONG keep_until;
+     CtxtHandle ssl_ctx;
+     SecPkgContext_StreamSizes ssl_sizes;
+@@ -210,8 +247,24 @@ struct request
+     int send_timeout;
+     int receive_timeout;
+     int receive_response_timeout;
+-    DWORD max_redirects;
++    struct http_opts opts;
+     DWORD redirect_count; /* total number of redirects during this request */
++    BOOL has_proxy;       /* WINHTTP_OPTION_PROXY set on this request */
++    DWORD proxy_access;
++    WCHAR *proxy_server;
++    WCHAR *proxy_bypass;
++    BOOL expire_connection;     /* WINHTTP_OPTION_EXPIRE_CONNECTION */
++    BOOL proxy_connect_response; /* the response is the proxy's answer to CONNECT */
++    WCHAR *server_spn;
++    WCHAR *proxy_spn;
++    struct decomp *decomp;       /* WINHTTP_OPTION_DECOMPRESSION state of this response */
++    WCHAR *passport_return_url;
++    WCHAR *passport_cbtext;
++    WCHAR *passport_cburl;
++    ULONGLONG times[WinHttpRequestTimeLast];
++    ULONGLONG stats[WinHttpRequestStatLast];
++    ULONGLONG stat_flags;
++    ULONG stat_index;
+     WCHAR *status_text;
+     DWORD content_length; /* total number of bytes to be read */
+     DWORD content_read;   /* bytes read so far */
+@@ -274,6 +327,7 @@ struct socket
+     struct object_header hdr;
+     struct netconn *netconn;
+     int keepalive_interval;
++    int close_timeout;
+     unsigned int send_buffer_size;
+     enum socket_state state;
+     struct queue send_q;
+@@ -399,6 +453,9 @@ BOOL free_handle( HINTERNET );
+ 
+ void send_callback( struct object_header *, DWORD, LPVOID, DWORD );
+ void close_connection( struct request * );
++void free_decomp( struct request * );
++void set_extended_error( DWORD );
++DWORD get_extended_error(void);
+ void init_queue( struct queue *queue );
+ void stop_queue( struct queue * );
+ 
+@@ -422,10 +479,17 @@ BOOL set_cookies( struct request *, const WCHAR * );
+ DWORD add_cookie_headers( struct request * );
+ DWORD add_request_headers( struct request *, const WCHAR *, DWORD, DWORD );
+ void destroy_cookies( struct session * );
++void clear_cookies_for_host( struct session *, const WCHAR * );
+ BOOL set_server_for_hostname( struct connect *, const WCHAR *, INTERNET_PORT );
++BOOL set_server_for_request( struct request *, const WCHAR *, INTERNET_PORT );
+ void destroy_authinfo( struct authinfo * );
++BOOL find_global_creds( BOOL, const WCHAR *, DWORD, DWORD, WCHAR **, WCHAR ** );
++BOOL global_server_creds_allowed( struct request * );
+ 
+ void release_host( struct hostdata * );
++void release_slot( struct hostdata * );
++DWORD netconn_connect_multi( struct hostdata *, INTERNET_PORT, const struct sockaddr_storage *, DWORD, BOOL, int,
++                             struct netconn ** );
+ DWORD process_header( struct request *, const WCHAR *, const WCHAR *, DWORD, BOOL );
+ 
+ extern HRESULT WinHttpRequest_create( void ** );

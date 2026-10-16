@@ -1,0 +1,821 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Mon, 12 Oct 2026 14:31:59 -0700
+Subject: [PATCH] rstrtmgr: Restart Manager sessions, resource registration,
+ affected application list, shutdown and restart
+
+- RmStartSession/RmJoinSession/RmEndSession keep real sessions with a random session key
+- RmRegisterResources records files, processes (id and start time) and services
+- RmGetList reports the running processes that were registered, that run or have loaded a registered file
+  (from the real process list), and the registered services that are running; the caller reports
+  RmRebootReasonDetectedSelf
+- RmShutdown closes the top-level windows (or stops services), terminating only with the force flag, and
+  honours RmNoShutdown filters; RmRestart starts the services that RmShutdown stopped
+- RmAddFilter/RmRemoveFilter/RmCancelCurrentTask
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+
+diff --git a/dlls/rstrtmgr/Makefile.in b/dlls/rstrtmgr/Makefile.in
+index b7f6ad8..0c1e8e4 100644
+--- a/dlls/rstrtmgr/Makefile.in
++++ b/dlls/rstrtmgr/Makefile.in
+@@ -1,4 +1,5 @@
+ MODULE    = rstrtmgr.dll
++IMPORTS   = advapi32 user32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+diff --git a/dlls/rstrtmgr/main.c b/dlls/rstrtmgr/main.c
+index 238bcc2..acbc873 100644
+--- a/dlls/rstrtmgr/main.c
++++ b/dlls/rstrtmgr/main.c
+@@ -18,27 +18,216 @@
+ 
+ #include <stdarg.h>
+ 
++#include <stdarg.h>
++
+ #include "windef.h"
+ #include "winbase.h"
++#include "winuser.h"
++#include "winsvc.h"
++#include "tlhelp32.h"
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ #include "restartmanager.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(rstrtmgr);
+ 
++BOOLEAN WINAPI SystemFunction036(void *, ULONG);
++
++#define MAX_SESSIONS 64
++
++#ifndef ERROR_MAX_SESSIONS_REACHED
++#define ERROR_MAX_SESSIONS_REACHED 353
++#endif
++#ifndef ERROR_FAIL_SHUTDOWN
++#define ERROR_FAIL_SHUTDOWN 351
++#endif
++#ifndef ERROR_FAIL_RESTART
++#define ERROR_FAIL_RESTART 352
++#endif
++#define RM_SHUTDOWN_FORCE 0x1
++#define RM_SHUTDOWN_ONLY_REGISTERED 0x10
++
++struct filter
++{
++    struct list entry;
++    WCHAR *module;
++    RM_UNIQUE_PROCESS process;
++    WCHAR *service;
++    RM_FILTER_ACTION action;
++};
++
++struct session
++{
++    struct list entry;
++    DWORD handle;
++    WCHAR key[CCH_RM_SESSION_KEY + 1];
++    WCHAR **files;
++    UINT file_count;
++    RM_UNIQUE_PROCESS *apps;
++    UINT app_count;
++    WCHAR **services;
++    UINT service_count;
++    struct list filters;
++    /* services stopped by RmShutdown(), started again by RmRestart() */
++    WCHAR **stopped;
++    UINT stopped_count;
++};
++
++static CRITICAL_SECTION rm_cs;
++static CRITICAL_SECTION_DEBUG rm_cs_debug =
++{
++    0, 0, &rm_cs,
++    { &rm_cs_debug.ProcessLocksList, &rm_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": rm_cs") }
++};
++static CRITICAL_SECTION rm_cs = { &rm_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct list sessions = LIST_INIT(sessions);
++static UINT session_count;
++static DWORD next_handle = 1;
++
++static struct session *find_session(DWORD handle)
++{
++    struct session *session;
++
++    LIST_FOR_EACH_ENTRY(session, &sessions, struct session, entry)
++        if (session->handle == handle) return session;
++    return NULL;
++}
++
++static void free_string_list(WCHAR **list, UINT count)
++{
++    UINT i;
++
++    for (i = 0; i < count; i++) free(list[i]);
++    free(list);
++}
++
++static BOOL append_string(WCHAR ***list, UINT *count, const WCHAR *str)
++{
++    WCHAR **new_list;
++    WCHAR *copy;
++    UINT i;
++
++    for (i = 0; i < *count; i++)
++        if (!wcsicmp((*list)[i], str)) return TRUE;
++
++    if (!(copy = wcsdup(str))) return FALSE;
++    if (!(new_list = realloc(*list, (*count + 1) * sizeof(**list))))
++    {
++        free(copy);
++        return FALSE;
++    }
++    new_list[(*count)++] = copy;
++    *list = new_list;
++    return TRUE;
++}
++
+ /***********************************************************************
+- * RmGetList (rstrtmgr.@)
++ * RmStartSession (rstrtmgr.@)
+  *
+- * Retrieve the list of all applications and services using resources registered with the Restart Manager session
++ * Start a new Restart Manager session
+  */
+-DWORD WINAPI RmGetList(DWORD dwSessionHandle, UINT *pnProcInfoNeeded, UINT *pnProcInfo,
+-                                      RM_PROCESS_INFO *rgAffectedApps[], LPDWORD lpdwRebootReasons)
++DWORD WINAPI RmStartSession(DWORD *sessionhandle, DWORD flags, WCHAR sessionkey[])
+ {
+-    FIXME("%ld, %p, %p, %p, %p stub!\n", dwSessionHandle, pnProcInfoNeeded, pnProcInfo, rgAffectedApps, lpdwRebootReasons);
+-    if (pnProcInfoNeeded)
+-        *pnProcInfoNeeded = 0;
+-    if (pnProcInfo)
+-        *pnProcInfo = 0;
++    static const WCHAR hex[] = L"0123456789ABCDEF";
++    struct session *session;
++    GUID uuid;
++    UINT i;
++
++    TRACE("%p, %ld, %p\n", sessionhandle, flags, sessionkey);
++
++    if (!sessionhandle || !sessionkey) return ERROR_INVALID_PARAMETER;
++    if (flags) return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&rm_cs);
++    if (session_count >= MAX_SESSIONS)
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_MAX_SESSIONS_REACHED;
++    }
++    if (!(session = calloc(1, sizeof(*session))))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_OUTOFMEMORY;
++    }
++    SystemFunction036(&uuid, sizeof(uuid)); /* RtlGenRandom */
++    for (i = 0; i < sizeof(uuid); i++)
++    {
++        session->key[i * 2] = hex[((BYTE *)&uuid)[i] >> 4];
++        session->key[i * 2 + 1] = hex[((BYTE *)&uuid)[i] & 0xf];
++    }
++    session->key[CCH_RM_SESSION_KEY] = 0;
++    list_init(&session->filters);
++    session->handle = next_handle++;
++    list_add_tail(&sessions, &session->entry);
++    session_count++;
++
++    *sessionhandle = session->handle;
++    wcscpy(sessionkey, session->key);
++    LeaveCriticalSection(&rm_cs);
++    return ERROR_SUCCESS;
++}
++
++/***********************************************************************
++ * RmJoinSession (rstrtmgr.@)
++ */
++DWORD WINAPI RmJoinSession(DWORD *sessionhandle, const WCHAR sessionkey[])
++{
++    struct session *session;
++    DWORD ret = ERROR_INVALID_PARAMETER;
++
++    TRACE("%p, %s\n", sessionhandle, debugstr_w(sessionkey));
++
++    if (!sessionhandle || !sessionkey) return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&rm_cs);
++    LIST_FOR_EACH_ENTRY(session, &sessions, struct session, entry)
++    {
++        if (!wcsicmp(session->key, sessionkey))
++        {
++            *sessionhandle = session->handle;
++            ret = ERROR_SUCCESS;
++            break;
++        }
++    }
++    LeaveCriticalSection(&rm_cs);
++    return ret;
++}
++
++/***********************************************************************
++ * RmEndSession (rstrtmgr.@)
++ */
++DWORD WINAPI RmEndSession(DWORD handle)
++{
++    struct session *session;
++    struct filter *filter, *next;
++
++    TRACE("%lu\n", handle);
++
++    EnterCriticalSection(&rm_cs);
++    if (!(session = find_session(handle)))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_INVALID_HANDLE;
++    }
++    list_remove(&session->entry);
++    session_count--;
++    LeaveCriticalSection(&rm_cs);
++
++    LIST_FOR_EACH_ENTRY_SAFE(filter, next, &session->filters, struct filter, entry)
++    {
++        list_remove(&filter->entry);
++        free(filter->module);
++        free(filter->service);
++        free(filter);
++    }
++    free_string_list(session->files, session->file_count);
++    free_string_list(session->services, session->service_count);
++    free_string_list(session->stopped, session->stopped_count);
++    free(session->apps);
++    free(session);
+     return ERROR_SUCCESS;
+ }
+ 
+@@ -51,49 +240,460 @@ DWORD WINAPI RmRegisterResources(DWORD dwSessionHandle, UINT nFiles, LPCWSTR rgs
+                                                      UINT nApplications, RM_UNIQUE_PROCESS *rgApplications,
+                                                      UINT nServices, LPCWSTR rgsServiceNames[])
+ {
+-    FIXME("%ld, %d, %p, %d, %p, %d, %p stub!\n", dwSessionHandle, nFiles, rgsFilenames,
++    struct session *session;
++    DWORD ret = ERROR_SUCCESS;
++    UINT i;
++
++    TRACE("%ld, %d, %p, %d, %p, %d, %p\n", dwSessionHandle, nFiles, rgsFilenames,
+               nApplications, rgApplications, nServices, rgsServiceNames);
++
++    if ((nFiles && !rgsFilenames) || (nApplications && !rgApplications) || (nServices && !rgsServiceNames))
++        return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&rm_cs);
++    if (!(session = find_session(dwSessionHandle)))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_INVALID_HANDLE;
++    }
++
++    for (i = 0; i < nFiles && !ret; i++)
++    {
++        WCHAR full[MAX_PATH];
++        DWORD len;
++
++        if (!rgsFilenames[i]) { ret = ERROR_INVALID_PARAMETER; break; }
++        len = GetFullPathNameW(rgsFilenames[i], ARRAY_SIZE(full), full, NULL);
++        if (!len || len >= ARRAY_SIZE(full)) wcscpy(full, rgsFilenames[i]);
++        if (!append_string(&session->files, &session->file_count, full)) ret = ERROR_OUTOFMEMORY;
++    }
++    for (i = 0; i < nServices && !ret; i++)
++    {
++        if (!rgsServiceNames[i]) { ret = ERROR_INVALID_PARAMETER; break; }
++        if (!append_string(&session->services, &session->service_count, rgsServiceNames[i])) ret = ERROR_OUTOFMEMORY;
++    }
++    if (!ret && nApplications)
++    {
++        RM_UNIQUE_PROCESS *apps = realloc(session->apps, (session->app_count + nApplications) * sizeof(*apps));
++        if (!apps) ret = ERROR_OUTOFMEMORY;
++        else
++        {
++            memcpy(apps + session->app_count, rgApplications, nApplications * sizeof(*apps));
++            session->apps = apps;
++            session->app_count += nApplications;
++        }
++    }
++    LeaveCriticalSection(&rm_cs);
++    return ret;
++}
++
++/* One process that is affected by the registered resources. */
++struct affected
++{
++    RM_PROCESS_INFO *info;
++    UINT count, size;
++    DWORD reasons;
++};
++
++static BOOL get_process_times(HANDLE process, FILETIME *start)
++{
++    FILETIME exit, kernel, user;
++
++    return GetProcessTimes(process, start, &exit, &kernel, &user);
++}
++
++static BOOL add_affected(struct affected *affected, DWORD pid, const WCHAR *service, const WCHAR *display_name,
++        RM_APP_TYPE type)
++{
++    RM_PROCESS_INFO *info;
++    HANDLE process;
++    UINT i;
++
++    for (i = 0; i < affected->count; i++)
++        if (affected->info[i].Process.dwProcessId == pid &&
++            !wcscmp(affected->info[i].strServiceShortName, service ? service : L""))
++            return TRUE;
++
++    if (affected->count == affected->size)
++    {
++        UINT size = affected->size ? affected->size * 2 : 8;
++        if (!(info = realloc(affected->info, size * sizeof(*info)))) return FALSE;
++        affected->info = info;
++        affected->size = size;
++    }
++    info = &affected->info[affected->count];
++    memset(info, 0, sizeof(*info));
++    info->Process.dwProcessId = pid;
++    if ((process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)))
++    {
++        WCHAR path[MAX_PATH];
++        DWORD len = ARRAY_SIZE(path);
++
++        get_process_times(process, &info->Process.ProcessStartTime);
++        if (!display_name && QueryFullProcessImageNameW(process, 0, path, &len))
++        {
++            const WCHAR *name = wcsrchr(path, '\\');
++            lstrcpynW(info->strAppName, name ? name + 1 : path, ARRAY_SIZE(info->strAppName));
++        }
++        CloseHandle(process);
++    }
++    if (display_name) lstrcpynW(info->strAppName, display_name, ARRAY_SIZE(info->strAppName));
++    if (service) lstrcpynW(info->strServiceShortName, service, ARRAY_SIZE(info->strServiceShortName));
++    info->ApplicationType = type;
++    info->AppStatus = 1; /* RmStatusRunning */
++    if (!ProcessIdToSessionId(pid, &info->TSSessionID)) info->TSSessionID = 0;
++    info->bRestartable = type == RmService;
++    affected->count++;
++    if (pid == GetCurrentProcessId()) affected->reasons |= RmRebootReasonDetectedSelf;
++    return TRUE;
++}
++
++/* Does the process have one of the files as its executable or as a loaded module? */
++static BOOL process_uses_file(DWORD pid, const WCHAR *file)
++{
++    MODULEENTRY32W module;
++    HANDLE snapshot;
++    BOOL found = FALSE;
++
++    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | 0x10 /* TH32CS_SNAPMODULE32 */, pid);
++    if (snapshot == INVALID_HANDLE_VALUE) return FALSE;
++
++    module.dwSize = sizeof(module);
++    if (Module32FirstW(snapshot, &module))
++    {
++        do
++        {
++            if (!wcsicmp(module.szExePath, file)) { found = TRUE; break; }
++        } while (Module32NextW(snapshot, &module));
++    }
++    CloseHandle(snapshot);
++    return found;
++}
++
++static DWORD collect_affected(struct session *session, struct affected *affected)
++{
++    PROCESSENTRY32W entry;
++    HANDLE snapshot;
++    UINT i;
++
++    memset(affected, 0, sizeof(*affected));
++
++    /* registered applications */
++    for (i = 0; i < session->app_count; i++)
++    {
++        const RM_UNIQUE_PROCESS *app = &session->apps[i];
++        FILETIME start;
++        HANDLE process;
++
++        if (!(process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, app->dwProcessId))) continue;
++        if (!get_process_times(process, &start) || CompareFileTime(&start, &app->ProcessStartTime))
++        {
++            CloseHandle(process);
++            continue;
++        }
++        CloseHandle(process);
++        if (!add_affected(affected, app->dwProcessId, NULL, NULL, RmOtherWindow)) return ERROR_OUTOFMEMORY;
++    }
++
++    /* processes that run or have loaded a registered file */
++    if (session->file_count)
++    {
++        snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++        if (snapshot != INVALID_HANDLE_VALUE)
++        {
++            entry.dwSize = sizeof(entry);
++            if (Process32FirstW(snapshot, &entry))
++            {
++                do
++                {
++                    if (!entry.th32ProcessID) continue;
++                    for (i = 0; i < session->file_count; i++)
++                    {
++                        if (process_uses_file(entry.th32ProcessID, session->files[i]))
++                        {
++                            if (!add_affected(affected, entry.th32ProcessID, NULL, NULL, RmOtherWindow))
++                            {
++                                CloseHandle(snapshot);
++                                return ERROR_OUTOFMEMORY;
++                            }
++                            break;
++                        }
++                    }
++                } while (Process32NextW(snapshot, &entry));
++            }
++            CloseHandle(snapshot);
++        }
++    }
++
++    /* registered services that are running */
++    if (session->service_count)
++    {
++        SC_HANDLE manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
++
++        if (manager)
++        {
++            for (i = 0; i < session->service_count; i++)
++            {
++                SERVICE_STATUS_PROCESS status;
++                DWORD needed;
++                SC_HANDLE service = OpenServiceW(manager, session->services[i], SERVICE_QUERY_STATUS);
++
++                if (!service) continue;
++                if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, (BYTE *)&status, sizeof(status), &needed)
++                        && status.dwCurrentState != SERVICE_STOPPED)
++                {
++                    WCHAR display[CCH_RM_MAX_APP_NAME + 1];
++                    DWORD size = ARRAY_SIZE(display);
++
++                    if (!GetServiceDisplayNameW(manager, session->services[i], display, &size))
++                        wcscpy(display, session->services[i]);
++                    add_affected(affected, status.dwProcessId, session->services[i], display, RmService);
++                }
++                CloseServiceHandle(service);
++            }
++            CloseServiceHandle(manager);
++        }
++    }
++
+     return ERROR_SUCCESS;
+ }
+ 
+ /***********************************************************************
+- * RmStartSession (rstrtmgr.@)
++ * RmGetList (rstrtmgr.@)
+  *
+- * Start a new Restart Manager session
++ * Retrieve the list of all applications and services using resources registered with the Restart Manager session
+  */
+-DWORD WINAPI RmStartSession(DWORD *sessionhandle, DWORD flags, WCHAR sessionkey[])
++DWORD WINAPI RmGetList(DWORD dwSessionHandle, UINT *pnProcInfoNeeded, UINT *pnProcInfo,
++                                      RM_PROCESS_INFO *rgAffectedApps[], LPDWORD lpdwRebootReasons)
+ {
+-    FIXME("%p, %ld, %p stub!\n", sessionhandle, flags, sessionkey);
+-    if (sessionhandle)
+-        *sessionhandle = 0xdeadbeef;
+-    return ERROR_SUCCESS;
++    RM_PROCESS_INFO *out = (RM_PROCESS_INFO *)rgAffectedApps;
++    struct session *session;
++    struct affected affected;
++    DWORD ret;
++
++    TRACE("%ld, %p, %p, %p, %p\n", dwSessionHandle, pnProcInfoNeeded, pnProcInfo, rgAffectedApps, lpdwRebootReasons);
++
++    if (!pnProcInfoNeeded || !pnProcInfo) return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&rm_cs);
++    if (!(session = find_session(dwSessionHandle)))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_INVALID_HANDLE;
++    }
++    ret = collect_affected(session, &affected);
++    LeaveCriticalSection(&rm_cs);
++    if (ret) return ret;
++
++    *pnProcInfoNeeded = affected.count;
++    if (lpdwRebootReasons) *lpdwRebootReasons = affected.reasons;
++
++    if (!affected.count)
++    {
++        *pnProcInfo = 0;
++        free(affected.info);
++        return ERROR_SUCCESS;
++    }
++
++    if (!out || *pnProcInfo < affected.count)
++        ret = ERROR_MORE_DATA;
++    else
++    {
++        memcpy(out, affected.info, affected.count * sizeof(*out));
++        *pnProcInfo = affected.count;
++    }
++    free(affected.info);
++    return ret;
++}
++
++static BOOL is_filtered(struct session *session, const RM_PROCESS_INFO *info, RM_FILTER_ACTION action)
++{
++    struct filter *filter;
++
++    LIST_FOR_EACH_ENTRY(filter, &session->filters, struct filter, entry)
++    {
++        if (!(filter->action & action)) continue;
++        if (filter->service && info->strServiceShortName[0] && !wcsicmp(filter->service, info->strServiceShortName))
++            return TRUE;
++        if (!filter->service && !filter->module && filter->process.dwProcessId == info->Process.dwProcessId)
++            return TRUE;
++        if (filter->module)
++        {
++            WCHAR path[MAX_PATH];
++            DWORD len = ARRAY_SIZE(path);
++            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, info->Process.dwProcessId);
++            BOOL match = FALSE;
++
++            if (process)
++            {
++                if (QueryFullProcessImageNameW(process, 0, path, &len)) match = !wcsicmp(path, filter->module);
++                CloseHandle(process);
++            }
++            if (match) return TRUE;
++        }
++    }
++    return FALSE;
++}
++
++struct close_data
++{
++    DWORD pid;
++    BOOL found;
++};
++
++static BOOL CALLBACK close_window(HWND hwnd, LPARAM lparam)
++{
++    struct close_data *data = (struct close_data *)lparam;
++    DWORD pid;
++
++    GetWindowThreadProcessId(hwnd, &pid);
++    if (pid == data->pid && !GetWindow(hwnd, GW_OWNER))
++    {
++        data->found = TRUE;
++        PostMessageW(hwnd, WM_CLOSE, 0, 0);
++    }
++    return TRUE;
+ }
+ 
+ /***********************************************************************
+- * RmRestart (rstrtmgr.@)
++ * RmShutdown (rstrtmgr.@)
+  */
+-DWORD WINAPI RmRestart(DWORD handle, DWORD flags, RM_WRITE_STATUS_CALLBACK status)
++DWORD WINAPI RmShutdown(DWORD handle, ULONG flags, RM_WRITE_STATUS_CALLBACK status)
+ {
+-    FIXME("%lu, 0x%08lx, %p stub!\n", handle, flags, status);
+-    return ERROR_SUCCESS;
++    struct session *session;
++    struct affected affected;
++    DWORD ret = ERROR_SUCCESS;
++    UINT i;
++
++    TRACE("%lu, 0x%08lx, %p\n", handle, flags, status);
++
++    if (flags & ~(RM_SHUTDOWN_FORCE | RM_SHUTDOWN_ONLY_REGISTERED | 0x1)) return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&rm_cs);
++    if (!(session = find_session(handle)))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_INVALID_HANDLE;
++    }
++    if ((ret = collect_affected(session, &affected)))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ret;
++    }
++
++    if (status) status(0);
++    for (i = 0; i < affected.count && !ret; i++)
++    {
++        RM_PROCESS_INFO *info = &affected.info[i];
++        DWORD pid = info->Process.dwProcessId;
++
++        if (pid == GetCurrentProcessId() || is_filtered(session, info, RmNoShutdown))
++            continue;
++
++        if (info->ApplicationType == RmService)
++        {
++            SC_HANDLE manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
++            SC_HANDLE service = manager ? OpenServiceW(manager, info->strServiceShortName,
++                    SERVICE_STOP | SERVICE_QUERY_STATUS) : NULL;
++            SERVICE_STATUS service_status;
++
++            if (service && ControlService(service, SERVICE_CONTROL_STOP, &service_status))
++            {
++                DWORD wait;
++                for (wait = 0; wait < 50 && QueryServiceStatus(service, &service_status)
++                        && service_status.dwCurrentState != SERVICE_STOPPED; wait++)
++                    Sleep(100);
++                if (service_status.dwCurrentState == SERVICE_STOPPED)
++                    append_string(&session->stopped, &session->stopped_count, info->strServiceShortName);
++                else
++                    ret = ERROR_FAIL_SHUTDOWN;
++            }
++            else if (GetLastError() != ERROR_SERVICE_NOT_ACTIVE)
++                ret = ERROR_FAIL_SHUTDOWN;
++            if (service) CloseServiceHandle(service);
++            if (manager) CloseServiceHandle(manager);
++        }
++        else
++        {
++            struct close_data data = { pid, FALSE };
++            HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
++
++            if (!process) continue;
++            EnumWindows(close_window, (LPARAM)&data);
++            if (WaitForSingleObject(process, data.found ? 5000 : 0) != WAIT_OBJECT_0)
++            {
++                if ((flags & RM_SHUTDOWN_FORCE) && TerminateProcess(process, 1))
++                    WaitForSingleObject(process, 2000);
++                else
++                    ret = ERROR_FAIL_SHUTDOWN;
++            }
++            CloseHandle(process);
++        }
++        if (status) status((i + 1) * 100 / affected.count);
++    }
++    LeaveCriticalSection(&rm_cs);
++    free(affected.info);
++    if (!ret && status) status(100);
++    return ret;
+ }
+ 
+ /***********************************************************************
+- * RmEndSession (rstrtmgr.@)
++ * RmRestart (rstrtmgr.@)
+  */
+-DWORD WINAPI RmEndSession(DWORD handle)
++DWORD WINAPI RmRestart(DWORD handle, DWORD flags, RM_WRITE_STATUS_CALLBACK status)
+ {
+-    FIXME("%lu stub!\n", handle);
+-    return ERROR_SUCCESS;
++    struct session *session;
++    DWORD ret = ERROR_SUCCESS;
++    SC_HANDLE manager;
++    UINT i;
++
++    TRACE("%lu, 0x%08lx, %p\n", handle, flags, status);
++
++    if (flags) return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&rm_cs);
++    if (!(session = find_session(handle)))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_INVALID_HANDLE;
++    }
++
++    if (status) status(0);
++    /* applications are not restarted: they did not register a restart command line */
++    if (session->stopped_count && (manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT)))
++    {
++        for (i = 0; i < session->stopped_count; i++)
++        {
++            SC_HANDLE service = OpenServiceW(manager, session->stopped[i], SERVICE_START);
++
++            if (!service || (!StartServiceW(service, 0, NULL) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING))
++                ret = ERROR_FAIL_RESTART;
++            if (service) CloseServiceHandle(service);
++            if (status) status((i + 1) * 100 / session->stopped_count);
++        }
++        CloseServiceHandle(manager);
++    }
++    free_string_list(session->stopped, session->stopped_count);
++    session->stopped = NULL;
++    session->stopped_count = 0;
++    LeaveCriticalSection(&rm_cs);
++    if (!ret && status) status(100);
++    return ret;
+ }
+ 
+ /***********************************************************************
+- * RmShutdown (rstrtmgr.@)
++ * RmCancelCurrentTask (rstrtmgr.@)
+  */
+-DWORD WINAPI RmShutdown(DWORD handle, ULONG flags, RM_WRITE_STATUS_CALLBACK status)
++DWORD WINAPI RmCancelCurrentTask(DWORD handle)
+ {
+-    FIXME("%lu, 0x%08lx, %p stub!\n", handle, flags, status);
+-    return ERROR_SUCCESS;
++    DWORD ret;
++
++    TRACE("%lu\n", handle);
++
++    EnterCriticalSection(&rm_cs);
++    ret = find_session(handle) ? ERROR_SUCCESS : ERROR_INVALID_HANDLE;
++    LeaveCriticalSection(&rm_cs);
++    return ret;
+ }
+ 
+ /***********************************************************************
+@@ -102,8 +702,32 @@ DWORD WINAPI RmShutdown(DWORD handle, ULONG flags, RM_WRITE_STATUS_CALLBACK stat
+ DWORD WINAPI RmAddFilter(DWORD handle, LPCWSTR moduleName, RM_UNIQUE_PROCESS *process,
+                          LPCWSTR serviceShortName, RM_FILTER_ACTION filter)
+ {
+-    FIXME("%lu, %s %p %s 0x%08x stub!\n", handle, debugstr_w(moduleName), process,
++    struct session *session;
++    struct filter *entry;
++
++    TRACE("%lu, %s %p %s 0x%08x\n", handle, debugstr_w(moduleName), process,
+         debugstr_w(serviceShortName), filter);
++
++    if (filter != RmNoRestart && filter != RmNoShutdown) return ERROR_INVALID_PARAMETER;
++    if (!moduleName && !process && !serviceShortName) return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&rm_cs);
++    if (!(session = find_session(handle)))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_INVALID_HANDLE;
++    }
++    if (!(entry = calloc(1, sizeof(*entry))))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_OUTOFMEMORY;
++    }
++    if (moduleName) entry->module = wcsdup(moduleName);
++    if (serviceShortName) entry->service = wcsdup(serviceShortName);
++    if (process) entry->process = *process;
++    entry->action = filter;
++    list_add_tail(&session->filters, &entry->entry);
++    LeaveCriticalSection(&rm_cs);
+     return ERROR_SUCCESS;
+ }
+ 
+@@ -113,7 +737,30 @@ DWORD WINAPI RmAddFilter(DWORD handle, LPCWSTR moduleName, RM_UNIQUE_PROCESS *pr
+ DWORD WINAPI RmRemoveFilter(DWORD handle, LPCWSTR moduleName, RM_UNIQUE_PROCESS *process,
+                             LPCWSTR serviceShortName)
+ {
+-    FIXME("%lu, %s %p %s stub!\n", handle, debugstr_w(moduleName), process,
++    struct session *session;
++    struct filter *filter, *next;
++
++    TRACE("%lu, %s %p %s\n", handle, debugstr_w(moduleName), process,
+         debugstr_w(serviceShortName));
++
++    if (!moduleName && !process && !serviceShortName) return ERROR_INVALID_PARAMETER;
++
++    EnterCriticalSection(&rm_cs);
++    if (!(session = find_session(handle)))
++    {
++        LeaveCriticalSection(&rm_cs);
++        return ERROR_INVALID_HANDLE;
++    }
++    LIST_FOR_EACH_ENTRY_SAFE(filter, next, &session->filters, struct filter, entry)
++    {
++        if (moduleName && (!filter->module || wcsicmp(filter->module, moduleName))) continue;
++        if (serviceShortName && (!filter->service || wcsicmp(filter->service, serviceShortName))) continue;
++        if (process && filter->process.dwProcessId != process->dwProcessId) continue;
++        list_remove(&filter->entry);
++        free(filter->module);
++        free(filter->service);
++        free(filter);
++    }
++    LeaveCriticalSection(&rm_cs);
+     return ERROR_SUCCESS;
+ }
+diff --git a/dlls/rstrtmgr/rstrtmgr.spec b/dlls/rstrtmgr/rstrtmgr.spec
+index fed3b26..ef04492 100644
+--- a/dlls/rstrtmgr/rstrtmgr.spec
++++ b/dlls/rstrtmgr/rstrtmgr.spec
+@@ -1,9 +1,9 @@
+ @ stdcall RmAddFilter(long wstr ptr wstr long)
+-@ stub RmCancelCurrentTask
++@ stdcall RmCancelCurrentTask(long)
+ @ stdcall RmEndSession(long)
+ @ stub RmGetFilterList
+ @ stdcall RmGetList(long ptr ptr ptr ptr)
+-@ stub RmJoinSession
++@ stdcall RmJoinSession(ptr wstr)
+ @ stdcall RmRegisterResources(long long ptr long ptr long ptr)
+ @ stdcall RmRemoveFilter(long wstr ptr wstr)
+ @ stub RmReserveHeap

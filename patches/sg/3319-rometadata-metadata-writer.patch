@@ -1,0 +1,3577 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Thu, 15 Oct 2026 07:43:16 -0700
+Subject: [PATCH] rometadata: metadata writer: IMetaDataEmit, IMetaDataEmit2,
+ IMetaDataAssemblyEmit (3319)
+
+DECISIONS-2 NET-META. DefineScope now returns a new scope, and OpenScope[OnMemory]
+with ofWrite edits an existing one. The scope implements IMetaDataEmit/Emit2 (type,
+nested type, method, field, parameter, property, event, member/type/module/assembly
+references, type and method specs, generic parameters, constants, class layout,
+field marshalling, permission sets and security attribute sets, platform invoke
+maps, custom attributes, user strings, import of types/members and signature
+translation from another scope) and IMetaDataAssemblyEmit, and keeps the
+import interfaces: the reader sees the live state of the edit.
+
+Tokens stay valid while a scope is edited: rows are never moved, the members of a
+type are linked through pointer tables (the reader now understands FieldPtr,
+MethodPtr, ParamPtr, EventPtr and PropertyPtr). Save, SaveToStream and
+SaveToMemory write the standard layout (members of a type adjacent, sorted
+tables sorted, no pointer tables) and tell the IMapToken handler about every
+token that changed. Merge and edit-and-continue are not implemented.
+
+diff --git a/dlls/rometadata/Makefile.in b/dlls/rometadata/Makefile.in
+index ddc7cd8..45b1f3a 100644
+--- a/dlls/rometadata/Makefile.in
++++ b/dlls/rometadata/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = rometadata.dll
+ IMPORTLIB = rometadata
+-IMPORTS   = combase oleaut32
++IMPORTS   = combase oleaut32 advapi32
+ 
+ SOURCES = \
+ 	main.c \
+diff --git a/dlls/rometadata/emit.c b/dlls/rometadata/emit.c
+new file mode 100644
+index 0000000..3919e74
+--- /dev/null
++++ b/dlls/rometadata/emit.c
+@@ -0,0 +1,3022 @@
++/*
++ * ECMA-335 metadata writer: IMetaDataEmit, IMetaDataEmit2 and IMetaDataAssemblyEmit.
++ *
++ * This file is #included by metadata.c (it shares the table schema and the reader's
++ * structures). The writable scope keeps a model of the tables: every row is an array of
++ * raw column values in the encoding of the file format (heap offsets, coded indexes),
++ * and the heaps are growable byte arrays with duplicate detection. Imports on a writable
++ * scope are served by serialising the model and loading it with the reader.
++ *
++ * Written from the published ECMA-335 standard (partition II, metadata physical layout)
++ * and the documented behaviour of the metadata APIs.
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* attribute flags of ECMA-335 II.23.1 (corhdr.h does not have them) */
++#define afPublicKey        0x0001
++#define fdSpecialName      0x0200
++#define fdRTSpecialName    0x0400
++#define fdPinvokeImpl      0x2000
++#define fdHasFieldMarshal  0x1000
++#define fdHasFieldRVA      0x0100
++#define fdHasDefault       0x8000
++#define mdSpecialName      0x0800
++#define mdRTSpecialName    0x1000
++#define mdPinvokeImpl      0x2000
++#define mdHasSecurity      0x4000
++#define pdHasDefault       0x1000
++#define pdHasFieldMarshal  0x2000
++#define prHasDefault       0x1000
++#define tdSpecialName      0x00000400
++#define tdRTSpecialName    0x00000800
++#define tdHasSecurity      0x00040000
++
++/* ---- heaps ---- */
++
++enum heap_kind { H_STR, H_BLOB };   /* #US shares the blob encoding */
++
++struct heap
++{
++    BYTE *d;
++    SIZE_T n, cap;
++    enum heap_kind kind;
++    ULONG *tab;                 /* hash table of entry offsets, 0 = empty */
++    ULONG tabsize, count;
++    BOOL indexed;
++};
++
++struct md_model
++{
++    struct { ULONG rows, cap; ULONG *c; } tbl[NUM_TABLES];
++    struct heap str, us, blob;
++    BYTE *guid;
++    ULONG nguid;
++    char *version;
++    IUnknown *handler;
++    void **old;                 /* buffers of earlier serialisations, kept until the scope dies */
++    ULONG nold;
++};
++
++static ULONG hash_bytes(const BYTE *p, ULONG n)
++{
++    ULONG h = 2166136261u;
++
++    while (n--) h = (h ^ *p++) * 16777619u;
++    return h ? h : 1;
++}
++
++static BOOL heap_reserve(struct heap *h, SIZE_T extra)
++{
++    BYTE *p;
++    SIZE_T cap;
++
++    if (h->n + extra <= h->cap) return TRUE;
++    cap = (h->n + extra) * 2 + 64;
++    if (!(p = realloc(h->d, cap))) return FALSE;
++    h->d = p;
++    h->cap = cap;
++    return TRUE;
++}
++
++static ULONG put_compressed(BYTE *out, ULONG v)
++{
++    if (v < 0x80) { out[0] = v; return 1; }
++    if (v < 0x4000) { out[0] = 0x80 | (v >> 8); out[1] = v; return 2; }
++    out[0] = 0xc0 | (v >> 24); out[1] = v >> 16; out[2] = v >> 8; out[3] = v;
++    return 4;
++}
++
++/* the bytes of the entry at off: for strings up to the NUL, otherwise after the compressed length */
++static BOOL heap_entry(const struct heap *h, ULONG off, const BYTE **data, ULONG *len)
++{
++    ULONG l, hdr;
++
++    if (off >= h->n) return FALSE;
++    if (h->kind == H_STR)
++    {
++        const BYTE *z = memchr(h->d + off, 0, h->n - off);
++
++        if (!z) return FALSE;
++        *data = h->d + off;
++        *len = z - (h->d + off);
++        return TRUE;
++    }
++    if (!uncompress(h->d + off, h->d + h->n, &l, &hdr) || l > h->n - off - hdr) return FALSE;
++    *data = h->d + off + hdr;
++    *len = l;
++    return TRUE;
++}
++
++static BOOL heap_tab_insert(struct heap *h, ULONG off, ULONG hash)
++{
++    ULONG i;
++
++    if (h->count * 2 >= h->tabsize)
++    {
++        ULONG *old = h->tab, oldsize = h->tabsize, k;
++
++        h->tabsize = h->tabsize ? h->tabsize * 2 : 256;
++        if (!(h->tab = calloc(h->tabsize, sizeof(ULONG)))) { h->tab = old; h->tabsize = oldsize; return FALSE; }
++        for (k = 0; k < oldsize; k++)
++        {
++            const BYTE *d;
++            ULONG l, j;
++
++            if (!old[k] || !heap_entry(h, old[k], &d, &l)) continue;
++            for (j = hash_bytes(d, l) % h->tabsize; h->tab[j]; j = (j + 1) % h->tabsize) ;
++            h->tab[j] = old[k];
++        }
++        free(old);
++    }
++    for (i = hash % h->tabsize; h->tab[i]; i = (i + 1) % h->tabsize) ;
++    h->tab[i] = off;
++    h->count++;
++    return TRUE;
++}
++
++/* index the entries already in the heap (a heap loaded from a file) */
++static void heap_index(struct heap *h)
++{
++    ULONG off = 1;
++
++    if (h->indexed) return;
++    h->indexed = TRUE;
++    while (off < h->n)
++    {
++        const BYTE *d;
++        ULONG l, hdr;
++
++        if (h->kind == H_STR)
++        {
++            if (!heap_entry(h, off, &d, &l)) break;
++            if (l) heap_tab_insert(h, off, hash_bytes(d, l));
++            off += l + 1;
++        }
++        else
++        {
++            if (!uncompress(h->d + off, h->d + h->n, &l, &hdr) || l > h->n - off - hdr) break;
++            heap_tab_insert(h, off, hash_bytes(h->d + off + hdr, l));
++            off += hdr + l;
++        }
++    }
++}
++
++/* add an entry (or find the existing one); returns 0 on failure for non-empty data */
++static ULONG heap_add(struct heap *h, const void *data, ULONG len)
++{
++    ULONG hash, i, off;
++    BYTE hdr[4];
++
++    if (!len && h->kind == H_STR) return 0;
++    heap_index(h);
++    hash = hash_bytes(data, len);
++    if (h->tabsize)
++        for (i = hash % h->tabsize; h->tab[i]; i = (i + 1) % h->tabsize)
++        {
++            const BYTE *d;
++            ULONG l;
++
++            if (heap_entry(h, h->tab[i], &d, &l) && l == len && !memcmp(d, data, len)) return h->tab[i];
++        }
++    off = h->n;
++    if (h->kind == H_STR)
++    {
++        if (!heap_reserve(h, len + 1)) return 0;
++        memcpy(h->d + h->n, data, len);
++        h->d[h->n + len] = 0;
++        h->n += len + 1;
++    }
++    else
++    {
++        ULONG hl = put_compressed(hdr, len);
++
++        if (!heap_reserve(h, hl + len)) return 0;
++        memcpy(h->d + h->n, hdr, hl);
++        memcpy(h->d + h->n + hl, data, len);
++        h->n += hl + len;
++    }
++    if (!heap_tab_insert(h, off, hash)) return 0;
++    return off;
++}
++
++/* ---- the model ---- */
++
++static ULONG *mc(struct md_model *md, unsigned int t, ULONG rid, unsigned int col)
++{
++    return &md->tbl[t].c[(SIZE_T)(rid - 1) * MAX_COLS + col];
++}
++
++#define MROWS(md, tt) ((md)->tbl[tt].rows)
++
++static BOOL model_heaps_init(struct md_model *md)
++{
++    md->str.kind = H_STR;
++    md->blob.kind = H_BLOB;
++    md->us.kind = H_BLOB;
++    if (!heap_reserve(&md->str, 1) || !heap_reserve(&md->blob, 1) || !heap_reserve(&md->us, 1)) return FALSE;
++    md->str.d[0] = 0; md->str.n = 1;
++    md->blob.d[0] = 0; md->blob.n = 1;
++    md->us.d[0] = 0; md->us.n = 1;
++    return TRUE;
++}
++
++static void model_free(struct md_model *md)
++{
++    unsigned int t;
++    ULONG i;
++
++    if (!md) return;
++    for (t = 0; t < NUM_TABLES; t++) free(md->tbl[t].c);
++    free(md->str.d); free(md->str.tab);
++    free(md->us.d); free(md->us.tab);
++    free(md->blob.d); free(md->blob.tab);
++    free(md->guid);
++    free(md->version);
++    if (md->handler) IUnknown_Release(md->handler);
++    for (i = 0; i < md->nold; i++) free(md->old[i]);
++    free(md->old);
++    free(md);
++}
++
++static ULONG row_add(struct md_model *md, unsigned int t)
++{
++    ULONG rid = md->tbl[t].rows + 1;
++
++    if (rid > md->tbl[t].cap)
++    {
++        ULONG cap = md->tbl[t].cap ? md->tbl[t].cap * 2 : 16;
++        ULONG *p = realloc(md->tbl[t].c, (SIZE_T)cap * MAX_COLS * sizeof(ULONG));
++
++        if (!p) return 0;
++        md->tbl[t].c = p;
++        md->tbl[t].cap = cap;
++    }
++    memset(mc(md, t, rid, 0), 0, MAX_COLS * sizeof(ULONG));
++    md->tbl[t].rows = rid;
++    return rid;
++}
++
++static BOOL is_list_col(unsigned int t, unsigned int c)
++{
++    return (t == T_TYPEDEF && (c == 4 || c == 5)) || (t == T_METHOD && c == 5) ||
++           (t == T_EVENTMAP && c == 1) || (t == T_PROPMAP && c == 1);
++}
++
++/* shift (delta +1 at/after pos, or -1 after pos with refs to pos cleared) every reference to rows of table t */
++static void fix_refs(struct md_model *md, unsigned int t, ULONG pos, int delta, BOOL include_lists)
++{
++    unsigned int x, c;
++    ULONG r;
++
++    for (x = 0; x < NUM_TABLES; x++)
++    {
++        for (c = 0; c < MAX_COLS && schema[x][c]; c++)
++        {
++            BYTE col = schema[x][c];
++
++            if (col == t && col < NUM_TABLES)
++            {
++                if (!include_lists && is_list_col(x, c)) continue;
++                for (r = 1; r <= md->tbl[x].rows; r++)
++                {
++                    ULONG *v = mc(md, x, r, c);
++
++                    if (delta > 0) { if (*v >= pos) (*v)++; }
++                    else if (*v == pos && !is_list_col(x, c)) *v = 0;
++                    else if (*v > pos) (*v)--;
++                }
++            }
++            else if (is_coded(col))
++            {
++                enum coded_kind k = col - C_CODED;
++                unsigned int i, bits = coded_info[k].bits;
++
++                for (i = 0; i < coded_info[k].count; i++)
++                    if (coded_info[k].tables[i] == t) break;
++                if (i == coded_info[k].count) continue;
++                for (r = 1; r <= md->tbl[x].rows; r++)
++                {
++                    ULONG *v = mc(md, x, r, c), rid = *v >> bits;
++
++                    if ((*v & ((1u << bits) - 1)) != i || !rid) continue;
++                    if (delta > 0) { if (rid >= pos) *v = ((rid + 1) << bits) | i; }
++                    else if (rid == pos) *v = 0;
++                    else if (rid > pos) *v = ((rid - 1) << bits) | i;
++                }
++            }
++        }
++    }
++}
++
++/* remove row rid of a table that no list points into; references to it are cleared, later rows renumbered */
++static void row_remove(struct md_model *md, unsigned int t, ULONG rid)
++{
++    ULONG rows = md->tbl[t].rows;
++
++    if (rid < rows)
++        memmove(mc(md, t, rid, 0), mc(md, t, rid + 1, 0), (SIZE_T)(rows - rid) * MAX_COLS * sizeof(ULONG));
++    md->tbl[t].rows--;
++    fix_refs(md, t, rid, -1, TRUE);
++}
++
++/* The children of a parent (the fields or methods of a type, the parameters of a method, the events and
++ * properties of a type) are listed by the parent's list column, in the position space of the pointer table of
++ * the child table; the child rows themselves are never moved, so their tokens stay valid. A list of an owner
++ * ends where the next owner's list starts. */
++static ULONG member_add(struct md_model *md, unsigned int owner_t, ULONG owner, unsigned int lc, unsigned int child_t)
++{
++    unsigned int pt = ptr_table(child_t);
++    ULONG rid, pos, j, rows;
++
++    if (!(rid = row_add(md, child_t)) || !row_add(md, pt)) return 0;
++    rows = MROWS(md, pt);
++    pos = owner < MROWS(md, owner_t) ? *mc(md, owner_t, owner + 1, lc) : rows;
++    if (pos < rows)
++        memmove(mc(md, pt, pos + 1, 0), mc(md, pt, pos, 0), (SIZE_T)(rows - pos) * MAX_COLS * sizeof(ULONG));
++    *mc(md, pt, pos, 0) = rid;
++    for (j = owner + 1; j <= MROWS(md, owner_t); j++) (*mc(md, owner_t, j, lc))++;
++    return rid;
++}
++
++/* the owner row of a child row, or 0 */
++static ULONG member_owner(struct md_model *md, unsigned int owner_t, unsigned int lc, unsigned int child_t, ULONG rid)
++{
++    unsigned int pt = ptr_table(child_t);
++    ULONG idx, o, best = 0;
++
++    for (idx = 1; idx <= MROWS(md, pt); idx++)
++        if (*mc(md, pt, idx, 0) == rid) break;
++    if (idx > MROWS(md, pt)) return 0;
++    for (o = 1; o <= MROWS(md, owner_t); o++)
++        if (*mc(md, owner_t, o, lc) <= idx) best = o;
++    return best;
++}
++
++/* a row of a table that is sorted when it is saved: appended here, so that its token does not change */
++static ULONG sorted_add(struct md_model *md, unsigned int t, unsigned int keycol, ULONG key)
++{
++    ULONG rid = row_add(md, t);
++
++    if (rid) *mc(md, t, rid, keycol) = key;
++    return rid;
++}
++
++static BOOL tok_ok(struct md_model *md, ULONG32 tk)
++{
++    ULONG t = TK_T(tk), rid = TK_R(tk);
++
++    if (t == (mdtString >> 24)) return rid && rid < md->us.n;
++    return t < NUM_TABLES && rid >= 1 && rid <= md->tbl[t].rows;
++}
++
++/* the coded value of a token; a nil token is 0; HRESULT on a bad token */
++static HRESULT coded_of(struct md_model *md, enum coded_kind k, ULONG32 tk, ULONG *v)
++{
++    if (!tk) { *v = 0; return S_OK; }
++    if ((*v = encode_coded(k, tk)) == ~0u) return E_INVALIDARG;
++    if (!tok_ok(md, tk)) return CLDB_E_INDEX_NOTFOUND;
++    return S_OK;
++}
++
++static char *w_to_utf8(const WCHAR *w, int cch)
++{
++    int n = WideCharToMultiByte(CP_UTF8, 0, w, cch, NULL, 0, NULL, NULL);
++    char *ret;
++
++    if (n <= 0) return _strdup("");
++    if (!(ret = malloc(n + 1))) return NULL;
++    WideCharToMultiByte(CP_UTF8, 0, w, cch, ret, n, NULL, NULL);
++    ret[n] = 0;
++    if (cch == -1) ret[n - 1] = 0;
++    return ret;
++}
++
++/* heap index of a wide string (0 for empty or NULL); *ok is cleared on failure */
++static ULONG str_w(struct md_model *md, const WCHAR *w, BOOL *ok)
++{
++    char *u;
++    ULONG ret;
++
++    if (!w || !*w) return 0;
++    if (!(u = w_to_utf8(w, -1))) { *ok = FALSE; return 0; }
++    ret = heap_add(&md->str, u, strlen(u));
++    if (!ret && *u) *ok = FALSE;
++    free(u);
++    return ret;
++}
++
++/* "Ns.Name" split at the last dot into two string heap indexes */
++static BOOL str_ns_name(struct md_model *md, const WCHAR *w, ULONG *ns, ULONG *name)
++{
++    char *u = w_to_utf8(w, -1), *dot;
++    BOOL ok = TRUE;
++
++    if (!u) return FALSE;
++    dot = strrchr(u, '.');
++    if (dot)
++    {
++        *dot = 0;
++        *ns = *u ? heap_add(&md->str, u, strlen(u)) : 0;
++        *name = heap_add(&md->str, dot + 1, strlen(dot + 1));
++        ok = (*ns || !*u) && (*name || !dot[1]);
++    }
++    else
++    {
++        *ns = 0;
++        *name = heap_add(&md->str, u, strlen(u));
++        ok = *name || !*u;
++    }
++    free(u);
++    return ok;
++}
++
++static ULONG blob_of(struct md_model *md, const void *data, ULONG len, BOOL *ok)
++{
++    ULONG ret;
++
++    if (!data || !len) return 0;
++    ret = heap_add(&md->blob, data, len);
++    if (!ret) *ok = FALSE;
++    return ret;
++}
++
++static ULONG guid_add(struct md_model *md, const GUID *g)
++{
++    BYTE *p = realloc(md->guid, (md->nguid + 1) * 16);
++
++    if (!p) return 0;
++    md->guid = p;
++    memcpy(p + md->nguid * 16, g, 16);
++    return ++md->nguid;
++}
++
++static struct md_model *model_new(void)
++{
++    struct md_model *md = calloc(1, sizeof(*md));
++    GUID mvid;
++    ULONG rid;
++
++    if (!md) return NULL;
++    if (!model_heaps_init(md) || !(md->version = _strdup("v4.0.30319"))) goto fail;
++    CoCreateGuid(&mvid);
++    if (!(rid = row_add(md, T_MODULE))) goto fail;
++    *mc(md, T_MODULE, rid, 2) = guid_add(md, &mvid);
++    /* the global type <Module> */
++    if (!(rid = row_add(md, T_TYPEDEF))) goto fail;
++    *mc(md, T_TYPEDEF, rid, 1) = heap_add(&md->str, "<Module>", 8);
++    *mc(md, T_TYPEDEF, rid, 4) = 1;
++    *mc(md, T_TYPEDEF, rid, 5) = 1;
++    return md;
++fail:
++    model_free(md);
++    return NULL;
++}
++
++/* a model holding the rows and heaps of a parsed scope (to edit an existing file) */
++static struct md_model *model_from_reader(const struct md_scope *r)
++{
++    struct md_model *md = calloc(1, sizeof(*md));
++    unsigned int t, c;
++    ULONG rid;
++
++    if (!md) return NULL;
++    md->str.kind = H_STR;
++    md->blob.kind = H_BLOB;
++    md->us.kind = H_BLOB;
++    if (!(md->version = malloc(r->version_len + 1))) goto fail;
++    memcpy(md->version, r->version, r->version_len);
++    md->version[r->version_len] = 0;
++    for (t = 0; t < NUM_TABLES; t++)
++    {
++        if ((t == 0x1e || t == 0x1f) && r->tables[t].rows) goto fail;      /* edit-and-continue logs */
++        for (rid = 1; rid <= r->tables[t].rows; rid++)
++        {
++            ULONG row = row_add(md, t);
++
++            if (!row) goto fail;
++            for (c = 0; c < MAX_COLS && schema[t][c]; c++) *mc(md, t, row, c) = cell(r, t, rid, c);
++        }
++    }
++    if (!md->tbl[T_MODULE].rows) goto fail;
++    /* every list works in the position space of a pointer table: make one (identity) where the file has none */
++    {
++        static const BYTE children[5] = { T_FIELD, T_METHOD, T_PARAM, T_EVENT, T_PROPERTY };
++        unsigned int k;
++
++        for (k = 0; k < 5; k++)
++        {
++            unsigned int pt = ptr_table(children[k]);
++
++            if (md->tbl[pt].rows) continue;
++            for (rid = 1; rid <= md->tbl[children[k]].rows; rid++)
++            {
++                ULONG row = row_add(md, pt);
++
++                if (!row) goto fail;
++                *mc(md, pt, row, 0) = rid;
++            }
++        }
++    }
++#define COPY_HEAP(h, src, size) \
++    if (size) { if (!heap_reserve(&md->h, size)) goto fail; memcpy(md->h.d, src, size); md->h.n = size; } \
++    else if (!heap_reserve(&md->h, 1)) goto fail; else { md->h.d[0] = 0; md->h.n = 1; }
++    COPY_HEAP(str, r->strings, r->strings_size)
++    COPY_HEAP(us, r->us, r->us_size)
++    COPY_HEAP(blob, r->blob, r->blob_size)
++#undef COPY_HEAP
++    if (r->guid_size)
++    {
++        if (!(md->guid = malloc(r->guid_size))) goto fail;
++        memcpy(md->guid, r->guid, r->guid_size);
++        md->nguid = r->guid_size / 16;
++    }
++    return md;
++fail:
++    model_free(md);
++    return NULL;
++}
++
++/* ---- serialisation ---- */
++
++struct out
++{
++    BYTE *d;
++    SIZE_T n, cap;
++    BOOL fail;
++};
++
++static void out_put(struct out *o, const void *data, SIZE_T len)
++{
++    if (o->fail) return;
++    if (o->n + len > o->cap)
++    {
++        SIZE_T cap = (o->n + len) * 2 + 256;
++        BYTE *p = realloc(o->d, cap);
++
++        if (!p) { o->fail = TRUE; return; }
++        o->d = p;
++        o->cap = cap;
++    }
++    memcpy(o->d + o->n, data, len);
++    o->n += len;
++}
++
++static void out_uint(struct out *o, ULONG64 v, unsigned int width)
++{
++    BYTE b[8];
++    unsigned int i;
++
++    for (i = 0; i < width; i++) b[i] = v >> (8 * i);
++    out_put(o, b, width);
++}
++
++static void out_pad4(struct out *o)
++{
++    static const BYTE zero[4];
++
++    if (o->n & 3) out_put(o, zero, 4 - (o->n & 3));
++}
++
++/* the tables that ECMA-335 requires to be sorted, which the model keeps sorted */
++#define SORTED_MASK ((1ull << T_IFACEIMPL) | (1ull << T_CONSTANT) | (1ull << T_CA) | (1ull << T_FMARSHAL) | \
++                     (1ull << T_DECLSEC) | (1ull << T_CLASSLAYOUT) | (1ull << T_FIELDLAYOUT) | \
++                     (1ull << T_METHODSEM) | (1ull << T_METHODIMPL) | (1ull << T_IMPLMAP) | \
++                     (1ull << T_FIELDRVA) | (1ull << T_NESTED) | (1ull << T_GENERICPARAM) | (1ull << T_GPC))
++
++/* ---- compaction: what Save writes ---- */
++
++/* The model keeps every row where it was defined, so tokens do not change while a scope is edited. A saved file
++ * has the children of each parent in one run, no pointer tables, and the sorted tables sorted: Save renumbers. */
++
++struct tokmap { ULONG *m[NUM_TABLES]; ULONG n[NUM_TABLES]; };
++
++static void tokmap_free(struct tokmap *tm)
++{
++    unsigned int t;
++
++    for (t = 0; t < NUM_TABLES; t++) free(tm->m[t]);
++}
++
++static BOOL col_refs_table(unsigned int x, unsigned int c, unsigned int t, unsigned int *bits, unsigned int *tag)
++{
++    BYTE col = schema[x][c];
++
++    if (col == t && col < NUM_TABLES) { *bits = 0; return TRUE; }
++    if (is_coded(col))
++    {
++        enum coded_kind k = col - C_CODED;
++        unsigned int i;
++
++        for (i = 0; i < coded_info[k].count; i++)
++            if (coded_info[k].tables[i] == t) { *bits = coded_info[k].bits; *tag = i; return TRUE; }
++    }
++    return FALSE;
++}
++
++/* rewrite the references to rows of table t through map (old rid -> new rid) */
++static void remap_refs(struct md_model *c, unsigned int t, const ULONG *map)
++{
++    unsigned int x, col, bits = 0, tag = 0;
++    ULONG r;
++
++    for (x = 0; x < NUM_TABLES; x++)
++    {
++        if (x == 3 || x == 5 || x == 7 || x == 0x13 || x == 0x16) continue;     /* pointer tables are dropped */
++        for (col = 0; col < MAX_COLS && schema[x][col]; col++)
++        {
++            if (!col_refs_table(x, col, t, &bits, &tag) || is_list_col(x, col)) continue;
++            for (r = 1; r <= c->tbl[x].rows; r++)
++            {
++                ULONG *v = mc(c, x, r, col), rid;
++
++                if (!bits)
++                {
++                    if (*v && *v <= c->tbl[t].rows) *v = map[*v];
++                    continue;
++                }
++                if ((*v & ((1u << bits) - 1)) != tag) continue;
++                rid = *v >> bits;
++                if (rid && rid <= c->tbl[t].rows) *v = (map[rid] << bits) | tag;
++            }
++        }
++    }
++}
++
++/* put the rows of table t in the order given by map (old -> new) */
++static BOOL permute_rows(struct md_model *c, unsigned int t, const ULONG *map)
++{
++    ULONG rows = c->tbl[t].rows, r;
++    ULONG *n;
++
++    if (!rows) return TRUE;
++    if (!(n = malloc((SIZE_T)rows * MAX_COLS * sizeof(ULONG)))) return FALSE;
++    for (r = 1; r <= rows; r++) memcpy(&n[(SIZE_T)(map[r] - 1) * MAX_COLS], mc(c, t, r, 0), MAX_COLS * sizeof(ULONG));
++    memcpy(c->tbl[t].c, n, (SIZE_T)rows * MAX_COLS * sizeof(ULONG));
++    free(n);
++    return TRUE;
++}
++
++struct sortkey { ULONG k1, k2, idx; };
++
++static int cmp_sortkey(const void *a, const void *b)
++{
++    const struct sortkey *x = a, *y = b;
++
++    if (x->k1 != y->k1) return x->k1 < y->k1 ? -1 : 1;
++    if (x->k2 != y->k2) return x->k2 < y->k2 ? -1 : 1;
++    return x->idx < y->idx ? -1 : x->idx > y->idx;
++}
++
++/* stable sort of a table by one or two columns; fills map (old -> new) */
++static BOOL sort_table(struct md_model *c, unsigned int t, int col1, int col2, ULONG **map)
++{
++    ULONG rows = c->tbl[t].rows, r;
++    struct sortkey *keys;
++
++    if (!(*map = calloc(rows + 1, sizeof(ULONG)))) return FALSE;
++    if (!rows) return TRUE;
++    if (!(keys = malloc(rows * sizeof(*keys)))) return FALSE;
++    for (r = 1; r <= rows; r++)
++    {
++        keys[r - 1].k1 = *mc(c, t, r, col1);
++        keys[r - 1].k2 = col2 >= 0 ? *mc(c, t, r, col2) : 0;
++        keys[r - 1].idx = r;
++    }
++#ifndef SG_MUTANT_EMIT_NOSORT
++    qsort(keys, rows, sizeof(*keys), cmp_sortkey);
++#endif
++    for (r = 1; r <= rows; r++) (*map)[keys[r - 1].idx] = r;
++    free(keys);
++    return permute_rows(c, t, *map);
++}
++
++static struct md_model *model_compact(struct md_model *md, struct tokmap *tm)
++{
++    static const struct { BYTE owner, col, child; } rel[5] =
++    {
++        { T_TYPEDEF, 4, T_FIELD }, { T_TYPEDEF, 5, T_METHOD }, { T_EVENTMAP, 1, T_EVENT },
++        { T_PROPMAP, 1, T_PROPERTY }, { T_METHOD, 5, T_PARAM },
++    };
++    struct md_model *c = malloc(sizeof(*c));
++    ULONG *newlist[5] = {0}, *inv_method = NULL;
++    ULONG o, i, r;
++    unsigned int t, k;
++    BOOL ok = TRUE;
++
++    memset(tm, 0, sizeof(*tm));
++    if (!c) return NULL;
++    *c = *md;
++    for (t = 0; t < NUM_TABLES; t++)
++    {
++        c->tbl[t].c = NULL;
++        c->tbl[t].cap = 0;
++        c->tbl[t].rows = 0;
++    }
++    for (t = 0; t < NUM_TABLES; t++)
++    {
++        ULONG n = md->tbl[t].rows;
++
++        if (!n) continue;
++        if (!(c->tbl[t].c = malloc((SIZE_T)n * MAX_COLS * sizeof(ULONG)))) { ok = FALSE; break; }
++        memcpy(c->tbl[t].c, md->tbl[t].c, (SIZE_T)n * MAX_COLS * sizeof(ULONG));
++        c->tbl[t].rows = c->tbl[t].cap = n;
++    }
++    if (!ok) goto fail;
++
++    /* phase 1: the new order of the children, parent by parent */
++    for (k = 0; k < 5 && ok; k++)
++    {
++        unsigned int ot = rel[k].owner, child = rel[k].child, pt = ptr_table(child);
++        ULONG orows = md->tbl[ot].rows, crows = md->tbl[child].rows, counter = 0, *map, n;
++
++        if (!(map = calloc(crows + 1, sizeof(ULONG))) || !(newlist[k] = calloc(orows + 1, sizeof(ULONG)))) { free(map); ok = FALSE; break; }
++        tm->m[child] = map;
++        tm->n[child] = crows;
++        for (n = 1; n <= orows; n++)
++        {
++            /* the Param lists are taken in the new order of the methods */
++            ULONG owner = k == 4 ? inv_method[n] : n, s = *mc(md, ot, owner, rel[k].col),
++                  e = owner < orows ? *mc(md, ot, owner + 1, rel[k].col) : MROWS(md, pt) + 1;
++
++            newlist[k][n] = counter + 1;
++            for (i = s; i < e && i <= MROWS(md, pt); i++)
++            {
++                ULONG ch = *mc(md, pt, i, 0);
++
++                if (ch && ch <= crows && !map[ch]) map[ch] = ++counter;
++            }
++        }
++#ifdef SG_MUTANT_EMIT_NOPACK
++        memset(map, 0, (crows + 1) * sizeof(*map));
++        counter = 0;
++#endif
++        for (r = 1; r <= crows; r++) if (!map[r]) map[r] = ++counter;       /* children in no list */
++        if (k == 1)
++        {
++            if (!(inv_method = calloc(crows + 1, sizeof(ULONG)))) { ok = FALSE; break; }
++            for (r = 1; r <= crows; r++) inv_method[map[r]] = r;
++        }
++    }
++    if (!ok) goto fail;
++
++    /* phase 2: move the children and write the new lists */
++    for (k = 0; k < 5 && ok; k++) ok = permute_rows(c, rel[k].child, tm->m[rel[k].child]);
++    if (!ok) goto fail;
++    for (k = 0; k < 5; k++)
++    {
++        unsigned int ot = rel[k].owner;
++
++        for (o = 1; o <= c->tbl[ot].rows; o++) *mc(c, ot, o, rel[k].col) = newlist[k][o];
++    }
++    for (t = 3; t < NUM_TABLES; t++) if (t == 3 || t == 5 || t == 7 || t == 0x13 || t == 0x16) c->tbl[t].rows = 0;
++#ifndef SG_MUTANT_EMIT_NOREMAP
++    for (k = 0; k < 5; k++) remap_refs(c, rel[k].child, tm->m[rel[k].child]);
++#endif
++
++    /* phase 3: the sorted tables; those that others point to are sorted first */
++    {
++        static const struct { BYTE t; signed char k1, k2; } a[] =
++        {
++            { T_IFACEIMPL, 0, -1 }, { T_CONSTANT, 2, -1 }, { T_FMARSHAL, 0, -1 }, { T_DECLSEC, 1, -1 },
++            { T_CLASSLAYOUT, 2, -1 }, { T_FIELDLAYOUT, 1, -1 }, { T_METHODSEM, 2, -1 }, { T_METHODIMPL, 0, -1 },
++            { T_IMPLMAP, 1, -1 }, { T_FIELDRVA, 1, -1 }, { T_NESTED, 0, -1 }, { T_GENERICPARAM, 2, 0 },
++            { T_GPC, 0, -1 }, { T_CA, 0, -1 },
++        };
++
++        for (i = 0; i < ARRAY_SIZE(a) && ok; i++)
++        {
++            ok = sort_table(c, a[i].t, a[i].k1, a[i].k2, &tm->m[a[i].t]);
++            tm->n[a[i].t] = c->tbl[a[i].t].rows;
++            if (ok) remap_refs(c, a[i].t, tm->m[a[i].t]);
++            /* the generic parameter constraints are sorted by the owner, which has moved above */
++        }
++    }
++    if (!ok) goto fail;
++    free(inv_method);
++    for (k = 0; k < 5; k++) free(newlist[k]);
++    return c;
++fail:
++    free(inv_method);
++    for (k = 0; k < 5; k++) free(newlist[k]);
++    for (t = 0; t < NUM_TABLES; t++) free(c->tbl[t].c);
++    free(c);
++    tokmap_free(tm);
++    return NULL;
++}
++
++static void compact_free(struct md_model *c)
++{
++    unsigned int t;
++
++    for (t = 0; t < NUM_TABLES; t++) free(c->tbl[t].c);
++    free(c);
++}
++
++/* tell the handler (an IMapToken) about every token that Save changed */
++static void notify_tokens(IUnknown *handler, const struct tokmap *tm)
++{
++    IMapToken *map;
++    unsigned int t;
++    ULONG r, n;
++
++    if (!handler || FAILED(IUnknown_QueryInterface(handler, &IID_IMapToken, (void **)&map))) return;
++    for (t = 0; t < NUM_TABLES; t++)
++    {
++        if (!tm->m[t]) continue;
++        n = tm->n[t];
++        for (r = 1; r <= n; r++)
++            if (tm->m[t][r] != r) IMapToken_Map(map, MKTK(t, r), MKTK(t, tm->m[t][r]));
++    }
++    IMapToken_Release(map);
++}
++
++static BOOL write_metadata(struct md_model *md, BOOL saved, BYTE **data, SIZE_T *size)
++{
++    struct md_scope tmp;
++    struct out tb = {0}, root = {0};
++    unsigned int t, c;
++    ULONG64 valid = 0;
++    ULONG i, vlen;
++    ULONG str_size = (md->str.n + 3) & ~3u, us_size = (md->us.n + 3) & ~3u, blob_size = (md->blob.n + 3) & ~3u;
++    ULONG guid_size = md->nguid * 16;
++    BYTE heap_bits = 0;
++    BOOL skip[NUM_TABLES] = {0};
++    static const BYTE zero[4];
++
++    /* a pointer table that maps each position to the same row is left out of the file */
++    for (t = 0; t < NUM_TABLES; t++)
++    {
++        ULONG r;
++
++        if (t != 3 && t != 5 && t != 7 && t != 0x13 && t != 0x16) continue;
++        skip[t] = TRUE;
++#ifndef SG_MUTANT_EMIT_PTRLIVE
++        for (r = 1; r <= md->tbl[t].rows; r++) if (*mc(md, t, r, 0) != r) skip[t] = FALSE;
++#endif
++    }
++
++    memset(&tmp, 0, sizeof(tmp));
++    if (md->str.n > 0xffff) heap_bits |= 1;
++    if (md->nguid > 0xffff) heap_bits |= 2;
++    if (md->blob.n > 0xffff) heap_bits |= 4;
++    tmp.heap_sizes = heap_bits;
++    for (t = 0; t < NUM_TABLES; t++)
++    {
++        tmp.tables[t].rows = skip[t] ? 0 : md->tbl[t].rows;
++        if (tmp.tables[t].rows) valid |= (ULONG64)1 << t;
++    }
++
++    /* the #~ stream */
++    out_uint(&tb, 0, 4);
++    out_uint(&tb, 2, 1);
++    out_uint(&tb, 0, 1);
++    out_uint(&tb, heap_bits, 1);
++    out_uint(&tb, 1, 1);
++    out_uint(&tb, valid, 8);
++    out_uint(&tb, saved ? SORTED_MASK : 0, 8);
++    for (t = 0; t < NUM_TABLES; t++)
++        if (tmp.tables[t].rows) out_uint(&tb, tmp.tables[t].rows, 4);
++    for (t = 0; t < NUM_TABLES; t++)
++    {
++        ULONG r;
++
++        for (r = 1; r <= tmp.tables[t].rows; r++)
++            for (c = 0; c < MAX_COLS && schema[t][c]; c++)
++                out_uint(&tb, *mc(md, t, r, c), col_width(&tmp, schema[t][c]));
++    }
++    out_pad4(&tb);
++
++    /* the root and the stream headers */
++    vlen = (strlen(md->version) + 1 + 3) & ~3u;
++    {
++        static const char *names[5] = { "#~", "#Strings", "#US", "#GUID", "#Blob" };
++        ULONG sizes[5] = { tb.n, str_size, us_size, guid_size, blob_size };
++        ULONG hdr = 16 + vlen + 4, off;
++
++        for (i = 0; i < 5; i++) hdr += 8 + ((strlen(names[i]) + 1 + 3) & ~3u);
++        out_uint(&root, 0x424a5342, 4);
++        out_uint(&root, 1, 2);
++        out_uint(&root, 1, 2);
++        out_uint(&root, 0, 4);
++        out_uint(&root, vlen, 4);
++        out_put(&root, md->version, strlen(md->version) + 1);
++        for (i = strlen(md->version) + 1; i < vlen; i++) out_put(&root, zero, 1);
++        out_uint(&root, 0, 2);
++        out_uint(&root, 5, 2);
++        for (off = hdr, i = 0; i < 5; i++)
++        {
++            ULONG nl = (strlen(names[i]) + 1 + 3) & ~3u;
++
++            out_uint(&root, off, 4);
++            out_uint(&root, sizes[i], 4);
++            out_put(&root, names[i], strlen(names[i]) + 1);
++            out_put(&root, zero, nl - strlen(names[i]) - 1);
++            off += sizes[i];
++        }
++    }
++    out_put(&root, tb.d, tb.n);
++    out_put(&root, md->str.d, md->str.n);
++    out_put(&root, zero, str_size - md->str.n);
++    out_put(&root, md->us.d, md->us.n);
++    out_put(&root, zero, us_size - md->us.n);
++    out_put(&root, md->guid, guid_size);
++    out_put(&root, md->blob.d, md->blob.n);
++    out_put(&root, zero, blob_size - md->blob.n);
++    free(tb.d);
++    if (root.fail) { free(root.d); return FALSE; }
++    *data = root.d;
++    *size = root.n;
++    return TRUE;
++}
++
++/* the metadata as the reader should see it while the scope is edited */
++static BOOL model_serialize_live(struct md_model *md, BYTE **data, SIZE_T *size)
++{
++    return write_metadata(md, FALSE, data, size);
++}
++
++/* the metadata as a file: renumbered and sorted; the handler hears about the changed tokens */
++static BOOL model_serialize(struct md_model *md, BYTE **data, SIZE_T *size, BOOL notify)
++{
++    struct tokmap tm;
++    struct md_model *c;
++    BOOL ret;
++
++    if (!(c = model_compact(md, &tm))) return FALSE;
++    ret = write_metadata(c, TRUE, data, size);
++#ifndef SG_MUTANT_EMIT_NOMAP
++    if (ret && notify) notify_tokens(md->handler, &tm);
++#endif
++    compact_free(c);
++    tokmap_free(&tm);
++    return ret;
++}
++
++/* make the reader see the model: serialise and parse again (the old buffer stays valid until release) */
++static void model_sync(struct md_scope *m)
++{
++    struct md_model *md = m->model;
++    BYTE *buf;
++    SIZE_T size;
++    void **old;
++
++    if (!md || !m->dirty) return;
++    if (!model_serialize_live(md, &buf, &size)) return;
++    if (!(old = realloc(md->old, (md->nold + 1) * sizeof(*old)))) { free(buf); return; }
++    md->old = old;
++    if (m->file) md->old[md->nold++] = m->file;
++    memset(m->tables, 0, sizeof(m->tables));
++    m->file = buf;
++    m->file_size = size;
++    if (FAILED(parse_root(m, buf, size))) ERR("the serialised metadata does not parse\n");
++    m->dirty = FALSE;
++}
++
++/* ---- IMetaDataEmit ---- */
++
++static inline struct md_scope *impl_from_emit(IMetaDataEmit2 *iface)
++{
++    return CONTAINING_RECORD(iface, struct md_scope, emit_iface);
++}
++
++static inline struct md_scope *impl_from_asmemit(IMetaDataAssemblyEmit *iface)
++{
++    return CONTAINING_RECORD(iface, struct md_scope, asmemit_iface);
++}
++
++#define UNUSED_VAR __attribute__((unused))
++#define EMIT_ENTER struct md_scope *m = impl_from_emit(iface); struct md_model *md UNUSED_VAR = m->model; \
++                   HRESULT hr UNUSED_VAR; BOOL ok UNUSED_VAR = TRUE
++#define ASMEMIT_ENTER struct md_scope *m = impl_from_asmemit(iface); struct md_model *md UNUSED_VAR = m->model; \
++                      HRESULT hr UNUSED_VAR; BOOL ok UNUSED_VAR = TRUE
++#define UNCHANGED 0xffffffffu
++#define NO_MEM(cond) do { if (!(cond)) return E_OUTOFMEMORY; } while (0)
++
++static HRESULT WINAPI emit_QueryInterface(IMetaDataEmit2 *iface, REFIID riid, void **obj)
++{
++    return scope_qi(impl_from_emit(iface), riid, obj);
++}
++
++static ULONG WINAPI emit_AddRef(IMetaDataEmit2 *iface)
++{
++    return InterlockedIncrement(&impl_from_emit(iface)->refcount);
++}
++
++static ULONG WINAPI emit_Release(IMetaDataEmit2 *iface)
++{
++    return scope_release(impl_from_emit(iface));
++}
++
++static HRESULT WINAPI emit_SetModuleProps(IMetaDataEmit2 *iface, const WCHAR *name)
++{
++    EMIT_ENTER;
++
++    TRACE("%p %s\n", iface, debugstr_w(name));
++    if (!name) return E_INVALIDARG;
++    *mc(md, T_MODULE, 1, 1) = str_w(md, name, &ok);
++    NO_MEM(ok);
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_GetSaveSize(IMetaDataEmit2 *iface, DWORD fSave, DWORD *size)
++{
++    EMIT_ENTER;
++    BYTE *data;
++    SIZE_T len;
++
++    TRACE("%p %#lx %p\n", iface, fSave, size);
++    if (!size) return E_INVALIDARG;
++    NO_MEM(model_serialize(md, &data, &len, FALSE));
++    free(data);
++    *size = len;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_Save(IMetaDataEmit2 *iface, const WCHAR *file, DWORD flags)
++{
++    EMIT_ENTER;
++    BYTE *data;
++    SIZE_T len;
++    HANDLE h;
++    DWORD written;
++    BOOL ret;
++
++    TRACE("%p %s %#lx\n", iface, debugstr_w(file), flags);
++    if (!file) return E_INVALIDARG;
++    NO_MEM(model_serialize(md, &data, &len, TRUE));
++    h = CreateFileW(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (h == INVALID_HANDLE_VALUE) { free(data); return HRESULT_FROM_WIN32(GetLastError()); }
++    ret = WriteFile(h, data, len, &written, NULL) && written == len;
++    hr = ret ? S_OK : HRESULT_FROM_WIN32(GetLastError());
++    CloseHandle(h);
++    free(data);
++    return hr;
++}
++
++static HRESULT WINAPI emit_SaveToStream(IMetaDataEmit2 *iface, IStream *stream, DWORD flags)
++{
++    EMIT_ENTER;
++    BYTE *data;
++    SIZE_T len;
++    ULONG written;
++
++    TRACE("%p %p %#lx\n", iface, stream, flags);
++    if (!stream) return E_INVALIDARG;
++    NO_MEM(model_serialize(md, &data, &len, TRUE));
++    hr = IStream_Write(stream, data, len, &written);
++    free(data);
++    if (SUCCEEDED(hr) && written != len) hr = E_FAIL;
++    return hr;
++}
++
++static HRESULT WINAPI emit_SaveToMemory(IMetaDataEmit2 *iface, void *buf, ULONG size)
++{
++    EMIT_ENTER;
++    BYTE *data;
++    SIZE_T len;
++
++    TRACE("%p %p %lu\n", iface, buf, size);
++    if (!buf) return E_INVALIDARG;
++    NO_MEM(model_serialize(md, &data, &len, TRUE));
++    if (len > size) { free(data); return CLDB_E_TRUNCATION; }
++    memcpy(buf, data, len);
++    free(data);
++    return S_OK;
++}
++
++/* the TypeDef rows that are not nested, same namespace and name */
++static BOOL type_exists(struct md_model *md, ULONG ns, ULONG name, ULONG encloser)
++{
++    ULONG r, n;
++
++    for (r = 2; r <= MROWS(md, T_TYPEDEF); r++)
++    {
++        ULONG enc = 0;
++
++        if (*mc(md, T_TYPEDEF, r, 1) != name || *mc(md, T_TYPEDEF, r, 2) != ns) continue;
++        for (n = 1; n <= MROWS(md, T_NESTED); n++)
++            if (*mc(md, T_NESTED, n, 0) == r) enc = *mc(md, T_NESTED, n, 1);
++        if (enc == encloser) return TRUE;
++    }
++    return FALSE;
++}
++
++static HRESULT add_interfaces(struct md_model *md, ULONG td, const ULONG32 *impls)
++{
++    HRESULT hr;
++
++    for (; impls && *impls; impls++)
++    {
++        ULONG v, row;
++
++        if (TK_T(*impls) != T_TYPEDEF && TK_T(*impls) != T_TYPEREF && TK_T(*impls) != T_TYPESPEC) return E_INVALIDARG;
++        if (FAILED(hr = coded_of(md, CI_TYPEDEFORREF, *impls, &v))) return hr;
++        if (!(row = sorted_add(md, T_IFACEIMPL, 0, td))) return E_OUTOFMEMORY;
++        *mc(md, T_IFACEIMPL, row, 1) = v;
++    }
++    return S_OK;
++}
++
++static HRESULT define_typedef(struct md_scope *m, const WCHAR *name, DWORD flags, ULONG32 ext, const ULONG32 *impls,
++                              ULONG32 encloser, BOOL nested, ULONG32 *ptd)
++{
++    struct md_model *md = m->model;
++    ULONG ns = 0, nm = 0, extv, rid;
++    BOOL ok = TRUE;
++    HRESULT hr;
++
++    if (!name || !ptd) return E_INVALIDARG;
++    if (nested && !tok_ok(md, encloser) ) return CLDB_E_INDEX_NOTFOUND;
++    if (nested && TK_T(encloser) != T_TYPEDEF) return E_INVALIDARG;
++    if (ext && TK_T(ext) != T_TYPEDEF && TK_T(ext) != T_TYPEREF && TK_T(ext) != T_TYPESPEC) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_TYPEDEFORREF, ext, &extv))) return hr;
++    if (nested) nm = str_w(md, name, &ok);
++    else ok = str_ns_name(md, name, &ns, &nm);
++    NO_MEM(ok);
++#ifndef SG_MUTANT_EMIT_DUP
++    if (type_exists(md, ns, nm, nested ? TK_R(encloser) : 0)) return CLDB_E_RECORD_DUPLICATE;
++#endif
++
++    NO_MEM(rid = row_add(md, T_TYPEDEF));
++    *mc(md, T_TYPEDEF, rid, 0) = flags;
++    *mc(md, T_TYPEDEF, rid, 1) = nm;
++    *mc(md, T_TYPEDEF, rid, 2) = ns;
++    *mc(md, T_TYPEDEF, rid, 3) = extv;
++    *mc(md, T_TYPEDEF, rid, 4) = MROWS(md, ptr_table(T_FIELD)) + 1;
++    *mc(md, T_TYPEDEF, rid, 5) = MROWS(md, ptr_table(T_METHOD)) + 1;
++#ifdef SG_MUTANT_EMIT_NESTED
++    if (0)
++#else
++    if (nested)
++#endif
++    {
++        ULONG n;
++
++        NO_MEM(n = row_add(md, T_NESTED));
++        *mc(md, T_NESTED, n, 0) = rid;
++        *mc(md, T_NESTED, n, 1) = TK_R(encloser);
++    }
++    m->dirty = TRUE;
++    if (FAILED(hr = add_interfaces(md, rid, impls))) return hr;
++    *ptd = MKTK(T_TYPEDEF, rid);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineTypeDef(IMetaDataEmit2 *iface, const WCHAR *name, DWORD flags, ULONG32 ext,
++                                         ULONG32 *impls, ULONG32 *ptd)
++{
++    TRACE("%p %s %#lx %#x %p %p\n", iface, debugstr_w(name), flags, ext, impls, ptd);
++    return define_typedef(impl_from_emit(iface), name, flags, ext, impls, 0, FALSE, ptd);
++}
++
++static HRESULT WINAPI emit_DefineNestedType(IMetaDataEmit2 *iface, const WCHAR *name, DWORD flags, ULONG32 ext,
++                                            ULONG32 *impls, ULONG32 encloser, ULONG32 *ptd)
++{
++    TRACE("%p %s %#lx %#x %p %#x %p\n", iface, debugstr_w(name), flags, ext, impls, encloser, ptd);
++    return define_typedef(impl_from_emit(iface), name, flags, ext, impls, encloser, TRUE, ptd);
++}
++
++static HRESULT WINAPI emit_SetHandler(IMetaDataEmit2 *iface, IUnknown *handler)
++{
++    EMIT_ENTER;
++
++    TRACE("%p %p\n", iface, handler);
++    if (handler) IUnknown_AddRef(handler);
++    if (md->handler) IUnknown_Release(md->handler);
++    md->handler = handler;
++    return S_OK;
++}
++
++/* the owning TypeDef rid for a member definition: a nil token means the global type */
++static HRESULT owner_rid(struct md_model *md, ULONG32 td, ULONG *rid)
++{
++    if (!td) { *rid = 1; return S_OK; }
++    if (TK_T(td) != T_TYPEDEF) return E_INVALIDARG;
++    if (!tok_ok(md, td)) return CLDB_E_INDEX_NOTFOUND;
++    *rid = TK_R(td);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineMethod(IMetaDataEmit2 *iface, ULONG32 td, const WCHAR *name, DWORD flags,
++                                        const BYTE *sig, ULONG cbsig, ULONG rva, DWORD implflags, ULONG32 *pmd)
++{
++    EMIT_ENTER;
++    ULONG owner, rid, nm, sg, params;
++
++    TRACE("%p %#x %s %#lx %p %lu %lu %#lx %p\n", iface, td, debugstr_w(name), flags, sig, cbsig, rva, implflags, pmd);
++    if (!name || !pmd) return E_INVALIDARG;
++    if (FAILED(hr = owner_rid(md, td, &owner))) return hr;
++    nm = str_w(md, name, &ok);
++    sg = blob_of(md, sig, cbsig, &ok);
++    NO_MEM(ok);
++    NO_MEM(rid = member_add(md, T_TYPEDEF, owner, 5, T_METHOD));
++    params = MROWS(md, ptr_table(T_PARAM)) + 1;
++    *mc(md, T_METHOD, rid, 0) = rva;
++    *mc(md, T_METHOD, rid, 1) = implflags;
++    *mc(md, T_METHOD, rid, 2) = flags;
++    *mc(md, T_METHOD, rid, 3) = nm;
++    *mc(md, T_METHOD, rid, 4) = sg;
++    *mc(md, T_METHOD, rid, 5) = params;
++    m->dirty = TRUE;
++    *pmd = MKTK(T_METHOD, rid);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineMethodImpl(IMetaDataEmit2 *iface, ULONG32 td, ULONG32 body, ULONG32 decl)
++{
++    EMIT_ENTER;
++    ULONG bv, dv, row, owner;
++
++    TRACE("%p %#x %#x %#x\n", iface, td, body, decl);
++    if (TK_T(td) != T_TYPEDEF) return E_INVALIDARG;
++    if (FAILED(hr = owner_rid(md, td, &owner))) return hr;
++    if (!body || !decl) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_METHODDEFORREF, body, &bv))) return hr;
++    if (FAILED(hr = coded_of(md, CI_METHODDEFORREF, decl, &dv))) return hr;
++    NO_MEM(row = sorted_add(md, T_METHODIMPL, 0, owner));
++    *mc(md, T_METHODIMPL, row, 1) = bv;
++    *mc(md, T_METHODIMPL, row, 2) = dv;
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineTypeRefByName(IMetaDataEmit2 *iface, ULONG32 scope, const WCHAR *name, ULONG32 *ptr)
++{
++    EMIT_ENTER;
++    ULONG sv, ns = 0, nm = 0, r;
++
++    TRACE("%p %#x %s %p\n", iface, scope, debugstr_w(name), ptr);
++    if (!name || !ptr) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_RESSCOPE, scope, &sv))) return hr;
++    NO_MEM(str_ns_name(md, name, &ns, &nm));
++    for (r = 1; r <= MROWS(md, T_TYPEREF); r++)
++        if (*mc(md, T_TYPEREF, r, 0) == sv && *mc(md, T_TYPEREF, r, 1) == nm && *mc(md, T_TYPEREF, r, 2) == ns)
++        {
++            *ptr = MKTK(T_TYPEREF, r);
++            return S_OK;
++        }
++    NO_MEM(r = row_add(md, T_TYPEREF));
++    *mc(md, T_TYPEREF, r, 0) = sv;
++    *mc(md, T_TYPEREF, r, 1) = nm;
++    *mc(md, T_TYPEREF, r, 2) = ns;
++    m->dirty = TRUE;
++    *ptr = MKTK(T_TYPEREF, r);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineMemberRef(IMetaDataEmit2 *iface, ULONG32 parent, const WCHAR *name, const BYTE *sig,
++                                           ULONG cbsig, ULONG32 *pmr)
++{
++    EMIT_ENTER;
++    ULONG pv, nm, sg, r;
++
++    TRACE("%p %#x %s %p %lu %p\n", iface, parent, debugstr_w(name), sig, cbsig, pmr);
++    if (!name || !pmr) return E_INVALIDARG;
++    if (!parent) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_MEMBERREFPARENT, parent, &pv))) return hr;
++    nm = str_w(md, name, &ok);
++    sg = blob_of(md, sig, cbsig, &ok);
++    NO_MEM(ok);
++    for (r = 1; r <= MROWS(md, T_MEMBERREF); r++)
++        if (*mc(md, T_MEMBERREF, r, 0) == pv && *mc(md, T_MEMBERREF, r, 1) == nm && *mc(md, T_MEMBERREF, r, 2) == sg)
++        {
++            *pmr = MKTK(T_MEMBERREF, r);
++            return S_OK;
++        }
++    NO_MEM(r = row_add(md, T_MEMBERREF));
++    *mc(md, T_MEMBERREF, r, 0) = pv;
++    *mc(md, T_MEMBERREF, r, 1) = nm;
++    *mc(md, T_MEMBERREF, r, 2) = sg;
++    m->dirty = TRUE;
++    *pmr = MKTK(T_MEMBERREF, r);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_SetParent(IMetaDataEmit2 *iface, ULONG32 mr, ULONG32 tk)
++{
++    EMIT_ENTER;
++    ULONG pv;
++
++    TRACE("%p %#x %#x\n", iface, mr, tk);
++    if (TK_T(mr) != T_MEMBERREF) return E_INVALIDARG;
++    if (!tok_ok(md, mr)) return CLDB_E_INDEX_NOTFOUND;
++    if (!tk) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_MEMBERREFPARENT, tk, &pv))) return hr;
++    *mc(md, T_MEMBERREF, TK_R(mr), 0) = pv;
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_SetRVA(IMetaDataEmit2 *iface, ULONG32 md_tk, ULONG rva)
++{
++    EMIT_ENTER;
++
++    TRACE("%p %#x %lu\n", iface, md_tk, rva);
++    if (TK_T(md_tk) != T_METHOD) return E_INVALIDARG;
++    if (!tok_ok(md, md_tk)) return CLDB_E_INDEX_NOTFOUND;
++    *mc(md, T_METHOD, TK_R(md_tk), 0) = rva;
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_SetMethodImplFlags(IMetaDataEmit2 *iface, ULONG32 md_tk, DWORD flags)
++{
++    EMIT_ENTER;
++
++    TRACE("%p %#x %#lx\n", iface, md_tk, flags);
++    if (TK_T(md_tk) != T_METHOD) return E_INVALIDARG;
++    if (!tok_ok(md, md_tk)) return CLDB_E_INDEX_NOTFOUND;
++    *mc(md, T_METHOD, TK_R(md_tk), 1) = flags;
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_SetMethodProps(IMetaDataEmit2 *iface, ULONG32 md_tk, DWORD flags, ULONG rva, DWORD implflags)
++{
++    EMIT_ENTER;
++
++    TRACE("%p %#x %#lx %lu %#lx\n", iface, md_tk, flags, rva, implflags);
++    if (TK_T(md_tk) != T_METHOD) return E_INVALIDARG;
++    if (!tok_ok(md, md_tk)) return CLDB_E_INDEX_NOTFOUND;
++    if (flags != UNCHANGED) *mc(md, T_METHOD, TK_R(md_tk), 2) = flags;
++    if (rva != UNCHANGED) *mc(md, T_METHOD, TK_R(md_tk), 0) = rva;
++    if (implflags != UNCHANGED) *mc(md, T_METHOD, TK_R(md_tk), 1) = implflags;
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++/* StandAloneSig, TypeSpec and ModuleRef rows are found before they are created */
++static HRESULT find_or_add_blob_row(struct md_scope *m, unsigned int t, const BYTE *sig, ULONG cb, ULONG32 *tok)
++{
++    struct md_model *md = m->model;
++    BOOL ok = TRUE;
++    ULONG sg, r;
++
++    if (!sig || !cb || !tok) return E_INVALIDARG;
++    sg = blob_of(md, sig, cb, &ok);
++    NO_MEM(ok);
++    for (r = 1; r <= MROWS(md, t); r++)
++        if (*mc(md, t, r, 0) == sg) { *tok = MKTK(t, r); return S_OK; }
++    NO_MEM(r = row_add(md, t));
++    *mc(md, t, r, 0) = sg;
++    m->dirty = TRUE;
++    *tok = MKTK(t, r);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_GetTokenFromSig(IMetaDataEmit2 *iface, const BYTE *sig, ULONG cb, ULONG32 *pmsig)
++{
++    TRACE("%p %p %lu %p\n", iface, sig, cb, pmsig);
++    return find_or_add_blob_row(impl_from_emit(iface), T_STANDALONESIG, sig, cb, pmsig);
++}
++
++static HRESULT WINAPI emit_GetTokenFromTypeSpec(IMetaDataEmit2 *iface, const BYTE *sig, ULONG cb, ULONG32 *pts)
++{
++    TRACE("%p %p %lu %p\n", iface, sig, cb, pts);
++    return find_or_add_blob_row(impl_from_emit(iface), T_TYPESPEC, sig, cb, pts);
++}
++
++static HRESULT WINAPI emit_DefineModuleRef(IMetaDataEmit2 *iface, const WCHAR *name, ULONG32 *pmur)
++{
++    EMIT_ENTER;
++    ULONG nm, r;
++
++    TRACE("%p %s %p\n", iface, debugstr_w(name), pmur);
++    if (!name || !*name || !pmur) return E_INVALIDARG;
++    nm = str_w(md, name, &ok);
++    NO_MEM(ok);
++    for (r = 1; r <= MROWS(md, T_MODULEREF); r++)
++        if (*mc(md, T_MODULEREF, r, 0) == nm) { *pmur = MKTK(T_MODULEREF, r); return S_OK; }
++    NO_MEM(r = row_add(md, T_MODULEREF));
++    *mc(md, T_MODULEREF, r, 0) = nm;
++    m->dirty = TRUE;
++    *pmur = MKTK(T_MODULEREF, r);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineUserString(IMetaDataEmit2 *iface, const WCHAR *str, ULONG cch, ULONG32 *pstk)
++{
++    EMIT_ENTER;
++    BYTE *buf;
++    ULONG i, off;
++    BOOL wide = FALSE;
++
++    TRACE("%p %s %lu %p\n", iface, debugstr_wn(str, cch), cch, pstk);
++    if (!pstk || (!str && cch)) return E_INVALIDARG;
++    NO_MEM(buf = malloc(cch * 2 + 1));
++    for (i = 0; i < cch; i++)
++    {
++        BYTE lo = str[i] & 0xff, hi = str[i] >> 8;
++
++        buf[i * 2] = lo;
++        buf[i * 2 + 1] = hi;
++        /* the final byte: 1 if a character needs special handling (ECMA-335 II.24.2.4) */
++        if (hi || (lo >= 1 && lo <= 8) || (lo >= 0xe && lo <= 0x1f) || lo == 0x27 || lo == 0x2d || lo == 0x7f) wide = TRUE;
++    }
++    buf[cch * 2] = wide;
++    off = heap_add(&md->us, buf, cch * 2 + 1);
++    free(buf);
++    NO_MEM(off);
++    m->dirty = TRUE;
++    *pstk = (mdtString) | off;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineCustomAttribute(IMetaDataEmit2 *iface, ULONG32 owner, ULONG32 ctor, const void *blob,
++                                                 ULONG cb, ULONG32 *pcv)
++{
++    EMIT_ENTER;
++    ULONG ov, cv, bl, row;
++
++    TRACE("%p %#x %#x %p %lu %p\n", iface, owner, ctor, blob, cb, pcv);
++    if (!owner || !ctor) return E_INVALIDARG;
++    if (TK_T(ctor) != T_METHOD && TK_T(ctor) != T_MEMBERREF) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_HASCA, owner, &ov))) return hr;
++    if (FAILED(hr = coded_of(md, CI_CATYPE, ctor, &cv))) return hr;
++    bl = blob_of(md, blob, cb, &ok);
++    NO_MEM(ok);
++    NO_MEM(row = sorted_add(md, T_CA, 0, ov));
++    *mc(md, T_CA, row, 1) = cv;
++    *mc(md, T_CA, row, 2) = bl;
++    m->dirty = TRUE;
++    if (pcv) *pcv = MKTK(T_CA, row);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_SetCustomAttributeValue(IMetaDataEmit2 *iface, ULONG32 cv, const void *blob, ULONG cb)
++{
++    EMIT_ENTER;
++
++    TRACE("%p %#x %p %lu\n", iface, cv, blob, cb);
++    if (TK_T(cv) != T_CA) return E_INVALIDARG;
++    if (!tok_ok(md, cv)) return CLDB_E_INDEX_NOTFOUND;
++    *mc(md, T_CA, TK_R(cv), 2) = blob_of(md, blob, cb, &ok);
++    NO_MEM(ok);
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++/* the default value of a field, parameter or property */
++static HRESULT set_constant(struct md_scope *m, ULONG32 parent, DWORD type, const void *value, ULONG cch)
++{
++    struct md_model *md = m->model;
++    BOOL ok = TRUE;
++    ULONG pv = encode_coded(CI_HASCONSTANT, parent), size = 0, r, bl;
++
++    if (type == ELEMENT_TYPE_END) return S_OK;
++    if (pv == ~0u) return E_INVALIDARG;
++    switch (type)
++    {
++    case ELEMENT_TYPE_BOOLEAN: case ELEMENT_TYPE_I1: case ELEMENT_TYPE_U1: size = 1; break;
++    case ELEMENT_TYPE_CHAR: case ELEMENT_TYPE_I2: case ELEMENT_TYPE_U2: size = 2; break;
++    case ELEMENT_TYPE_I4: case ELEMENT_TYPE_U4: case ELEMENT_TYPE_R4: size = 4; break;
++    case ELEMENT_TYPE_I8: case ELEMENT_TYPE_U8: case ELEMENT_TYPE_R8: size = 8; break;
++    case ELEMENT_TYPE_STRING:
++        if (!value) return E_INVALIDARG;
++#ifndef SG_MUTANT_EMIT_CONST
++        size = (cch == UNCHANGED ? wcslen(value) : cch) * sizeof(WCHAR);
++#else
++        size = wcslen(value) * sizeof(WCHAR) - 2;
++#endif
++        break;
++    case ELEMENT_TYPE_CLASS: break;      /* a null reference */
++    default: return E_INVALIDARG;
++    }
++    if (size && !value) return E_INVALIDARG;
++    {
++        static const BYTE null_ref[4];
++
++        bl = blob_of(md, type == ELEMENT_TYPE_CLASS ? null_ref : value, type == ELEMENT_TYPE_CLASS ? 4 : size, &ok);
++        NO_MEM(ok);
++    }
++    for (r = 1; r <= MROWS(md, T_CONSTANT); r++)
++        if (*mc(md, T_CONSTANT, r, 2) == pv) break;
++    if (r > MROWS(md, T_CONSTANT)) NO_MEM(r = sorted_add(md, T_CONSTANT, 2, pv));
++    *mc(md, T_CONSTANT, r, 0) = type;
++    *mc(md, T_CONSTANT, r, 3) = bl;
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineField(IMetaDataEmit2 *iface, ULONG32 td, const WCHAR *name, DWORD flags,
++                                       const BYTE *sig, ULONG cbsig, DWORD ctype, const void *value, ULONG cch,
++                                       ULONG32 *pfd)
++{
++    EMIT_ENTER;
++    ULONG owner, rid, nm, sg;
++
++    TRACE("%p %#x %s %#lx %p %lu %#lx %p %lu %p\n", iface, td, debugstr_w(name), flags, sig, cbsig, ctype, value, cch, pfd);
++    if (!name || !pfd) return E_INVALIDARG;
++    if (FAILED(hr = owner_rid(md, td, &owner))) return hr;
++    nm = str_w(md, name, &ok);
++    sg = blob_of(md, sig, cbsig, &ok);
++    NO_MEM(ok);
++    NO_MEM(rid = member_add(md, T_TYPEDEF, owner, 4, T_FIELD));
++#ifndef SG_MUTANT_EMIT_FLAGS
++    if (ctype != ELEMENT_TYPE_END) flags |= fdHasDefault;
++#endif
++    *mc(md, T_FIELD, rid, 0) = flags;
++    *mc(md, T_FIELD, rid, 1) = nm;
++    *mc(md, T_FIELD, rid, 2) = sg;
++    m->dirty = TRUE;
++    if (FAILED(hr = set_constant(m, MKTK(T_FIELD, rid), ctype, value, cch))) return hr;
++    *pfd = MKTK(T_FIELD, rid);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineParam(IMetaDataEmit2 *iface, ULONG32 method, ULONG seq, const WCHAR *name, DWORD flags,
++                                       DWORD ctype, const void *value, ULONG cch, ULONG32 *ppd)
++{
++    EMIT_ENTER;
++    ULONG rid, nm;
++
++    TRACE("%p %#x %lu %s %#lx %#lx %p %lu %p\n", iface, method, seq, debugstr_w(name), flags, ctype, value, cch, ppd);
++    if (!ppd || TK_T(method) != T_METHOD) return E_INVALIDARG;
++    if (!tok_ok(md, method)) return CLDB_E_INDEX_NOTFOUND;
++    nm = str_w(md, name, &ok);
++    NO_MEM(ok);
++    NO_MEM(rid = member_add(md, T_METHOD, TK_R(method), 5, T_PARAM));
++    if (ctype != ELEMENT_TYPE_END) flags |= pdHasDefault;
++    *mc(md, T_PARAM, rid, 0) = flags;
++    *mc(md, T_PARAM, rid, 1) = seq;
++    *mc(md, T_PARAM, rid, 2) = nm;
++    m->dirty = TRUE;
++    if (FAILED(hr = set_constant(m, MKTK(T_PARAM, rid), ctype, value, cch))) return hr;
++    *ppd = MKTK(T_PARAM, rid);
++    return S_OK;
++}
++
++/* ---- IMetaDataAssemblyEmit ---- */
++
++static void put_version(struct md_model *md, unsigned int t, ULONG row, unsigned int col, const ASSEMBLYMETADATA *am)
++{
++    unsigned int i;
++
++    for (i = 0; i < 4; i++) *mc(md, t, row, col + i) = 0;
++    if (!am) return;
++    *mc(md, t, row, col) = am->usMajorVersion;
++    *mc(md, t, row, col + 1) = am->usMinorVersion;
++    *mc(md, t, row, col + 2) = am->usBuildNumber;
++    *mc(md, t, row, col + 3) = am->usRevisionNumber;
++}
++
++static ULONG culture_of(struct md_model *md, const ASSEMBLYMETADATA *am, BOOL *ok)
++{
++    return am && am->szLocale && *am->szLocale ? str_w(md, am->szLocale, ok) : 0;
++}
++
++static HRESULT set_assembly(struct md_scope *m, ULONG row, const void *key, ULONG cbkey, ULONG alg, const WCHAR *name,
++                            const ASSEMBLYMETADATA *am, DWORD flags)
++{
++    struct md_model *md = m->model;
++    BOOL ok = TRUE;
++
++    *mc(md, T_ASSEMBLY, row, 0) = alg;
++    put_version(md, T_ASSEMBLY, row, 1, am);
++    *mc(md, T_ASSEMBLY, row, 5) = flags;
++    *mc(md, T_ASSEMBLY, row, 6) = blob_of(md, key, cbkey, &ok);
++    *mc(md, T_ASSEMBLY, row, 7) = str_w(md, name, &ok);
++    *mc(md, T_ASSEMBLY, row, 8) = culture_of(md, am, &ok);
++    m->dirty = TRUE;
++    return ok ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI asmemit_QueryInterface(IMetaDataAssemblyEmit *iface, REFIID riid, void **obj)
++{
++    return scope_qi(impl_from_asmemit(iface), riid, obj);
++}
++
++static ULONG WINAPI asmemit_AddRef(IMetaDataAssemblyEmit *iface)
++{
++    return InterlockedIncrement(&impl_from_asmemit(iface)->refcount);
++}
++
++static ULONG WINAPI asmemit_Release(IMetaDataAssemblyEmit *iface)
++{
++    return scope_release(impl_from_asmemit(iface));
++}
++
++static HRESULT WINAPI asmemit_DefineAssembly(IMetaDataAssemblyEmit *iface, const void *key, ULONG cbkey, ULONG alg,
++                                             const WCHAR *name, const ASSEMBLYMETADATA *am, DWORD flags, ULONG32 *pma)
++{
++    ASMEMIT_ENTER;
++    ULONG row;
++
++    TRACE("%p %p %lu %#lx %s %p %#lx %p\n", iface, key, cbkey, alg, debugstr_w(name), am, flags, pma);
++    if (!name || !*name || !pma) return E_INVALIDARG;
++    if (MROWS(md, T_ASSEMBLY)) return CLDB_E_RECORD_DUPLICATE;   /* one assembly per manifest */
++    NO_MEM(row = row_add(md, T_ASSEMBLY));
++    if (FAILED(hr = set_assembly(m, row, key, cbkey, alg, name, am, flags))) return hr;
++    *pma = MKTK(T_ASSEMBLY, row);
++    return S_OK;
++}
++
++static HRESULT set_assemblyref(struct md_scope *m, ULONG row, const void *key, ULONG cbkey, const WCHAR *name,
++                               const ASSEMBLYMETADATA *am, const void *hash, ULONG cbhash, DWORD flags)
++{
++    struct md_model *md = m->model;
++    BOOL ok = TRUE;
++
++    put_version(md, T_ASMREF, row, 0, am);
++    *mc(md, T_ASMREF, row, 4) = flags;
++    *mc(md, T_ASMREF, row, 5) = blob_of(md, key, cbkey, &ok);
++    *mc(md, T_ASMREF, row, 6) = str_w(md, name, &ok);
++    *mc(md, T_ASMREF, row, 7) = culture_of(md, am, &ok);
++    *mc(md, T_ASMREF, row, 8) = blob_of(md, hash, cbhash, &ok);
++    m->dirty = TRUE;
++    return ok ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI asmemit_DefineAssemblyRef(IMetaDataAssemblyEmit *iface, const void *key, ULONG cbkey,
++                                                const WCHAR *name, const ASSEMBLYMETADATA *am, const void *hash,
++                                                ULONG cbhash, DWORD flags, ULONG32 *pmdar)
++{
++    ASMEMIT_ENTER;
++    ULONG row, r, nm, ky, cu;
++
++    TRACE("%p %p %lu %s %p %p %lu %#lx %p\n", iface, key, cbkey, debugstr_w(name), am, hash, cbhash, flags, pmdar);
++    if (!name || !*name || !pmdar) return E_INVALIDARG;
++    nm = str_w(md, name, &ok);
++    ky = blob_of(md, key, cbkey, &ok);
++    cu = culture_of(md, am, &ok);
++    NO_MEM(ok);
++    /* the same assembly (name, version, culture, key) is one row */
++    for (r = 1; r <= MROWS(md, T_ASMREF); r++)
++        if (*mc(md, T_ASMREF, r, 6) == nm && *mc(md, T_ASMREF, r, 7) == cu && *mc(md, T_ASMREF, r, 5) == ky &&
++            *mc(md, T_ASMREF, r, 0) == (am ? am->usMajorVersion : 0) &&
++            *mc(md, T_ASMREF, r, 1) == (am ? am->usMinorVersion : 0) &&
++            *mc(md, T_ASMREF, r, 2) == (am ? am->usBuildNumber : 0) &&
++            *mc(md, T_ASMREF, r, 3) == (am ? am->usRevisionNumber : 0))
++        {
++            *pmdar = MKTK(T_ASMREF, r);
++            return S_OK;
++        }
++    NO_MEM(row = row_add(md, T_ASMREF));
++    if (FAILED(hr = set_assemblyref(m, row, key, cbkey, name, am, hash, cbhash, flags))) return hr;
++    *pmdar = MKTK(T_ASMREF, row);
++    return S_OK;
++}
++
++static HRESULT WINAPI asmemit_DefineFile(IMetaDataAssemblyEmit *iface, const WCHAR *name, const void *hash, ULONG cbhash,
++                                         DWORD flags, ULONG32 *pmdf)
++{
++    ASMEMIT_ENTER;
++    ULONG row, nm, r;
++
++    TRACE("%p %s %p %lu %#lx %p\n", iface, debugstr_w(name), hash, cbhash, flags, pmdf);
++    if (!name || !*name || !pmdf) return E_INVALIDARG;
++    nm = str_w(md, name, &ok);
++    NO_MEM(ok);
++    for (r = 1; r <= MROWS(md, T_FILE); r++)
++        if (*mc(md, T_FILE, r, 1) == nm) return CLDB_E_RECORD_DUPLICATE;
++    NO_MEM(row = row_add(md, T_FILE));
++    *mc(md, T_FILE, row, 0) = flags;
++    *mc(md, T_FILE, row, 1) = nm;
++    *mc(md, T_FILE, row, 2) = blob_of(md, hash, cbhash, &ok);
++    NO_MEM(ok);
++    m->dirty = TRUE;
++    *pmdf = MKTK(T_FILE, row);
++    return S_OK;
++}
++
++static HRESULT WINAPI asmemit_DefineExportedType(IMetaDataAssemblyEmit *iface, const WCHAR *name, ULONG32 impl,
++                                                 ULONG32 typedef_tk, DWORD flags, ULONG32 *pmdct)
++{
++    ASMEMIT_ENTER;
++    ULONG row, ns = 0, nm = 0, iv;
++
++    TRACE("%p %s %#x %#x %#lx %p\n", iface, debugstr_w(name), impl, typedef_tk, flags, pmdct);
++    if (!name || !*name || !pmdct) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_IMPLEMENTATION, impl, &iv))) return hr;
++    NO_MEM(str_ns_name(md, name, &ns, &nm));
++    NO_MEM(row = row_add(md, T_EXPORTED));
++    *mc(md, T_EXPORTED, row, 0) = flags;
++    *mc(md, T_EXPORTED, row, 1) = TK_R(typedef_tk);
++    *mc(md, T_EXPORTED, row, 2) = nm;
++    *mc(md, T_EXPORTED, row, 3) = ns;
++    *mc(md, T_EXPORTED, row, 4) = iv;
++    m->dirty = TRUE;
++    *pmdct = MKTK(T_EXPORTED, row);
++    return S_OK;
++}
++
++static HRESULT WINAPI asmemit_DefineManifestResource(IMetaDataAssemblyEmit *iface, const WCHAR *name, ULONG32 impl,
++                                                     DWORD offset, DWORD flags, ULONG32 *pmdmr)
++{
++    ASMEMIT_ENTER;
++    ULONG row, nm, iv;
++
++    TRACE("%p %s %#x %lu %#lx %p\n", iface, debugstr_w(name), impl, offset, flags, pmdmr);
++    if (!name || !*name || !pmdmr) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_IMPLEMENTATION, impl, &iv))) return hr;
++    nm = str_w(md, name, &ok);
++    NO_MEM(ok);
++    NO_MEM(row = row_add(md, T_MANIFESTRES));
++    *mc(md, T_MANIFESTRES, row, 0) = offset;
++    *mc(md, T_MANIFESTRES, row, 1) = flags;
++    *mc(md, T_MANIFESTRES, row, 2) = nm;
++    *mc(md, T_MANIFESTRES, row, 3) = iv;
++    m->dirty = TRUE;
++    *pmdmr = MKTK(T_MANIFESTRES, row);
++    return S_OK;
++}
++
++static HRESULT WINAPI asmemit_SetAssemblyProps(IMetaDataAssemblyEmit *iface, ULONG32 ma, const void *key, ULONG cbkey,
++                                               ULONG alg, const WCHAR *name, const ASSEMBLYMETADATA *am, DWORD flags)
++{
++    ASMEMIT_ENTER;
++
++    TRACE("%p %#x %p %lu %#lx %s %p %#lx\n", iface, ma, key, cbkey, alg, debugstr_w(name), am, flags);
++    if (TK_T(ma) != T_ASSEMBLY) return E_INVALIDARG;
++    if (!tok_ok(md, ma)) return CLDB_E_INDEX_NOTFOUND;
++    return set_assembly(m, TK_R(ma), key, cbkey, alg, name, am, flags);
++}
++
++static HRESULT WINAPI asmemit_SetAssemblyRefProps(IMetaDataAssemblyEmit *iface, ULONG32 ar, const void *key,
++                                                  ULONG cbkey, const WCHAR *name, const ASSEMBLYMETADATA *am,
++                                                  const void *hash, ULONG cbhash, DWORD flags)
++{
++    ASMEMIT_ENTER;
++
++    TRACE("%p %#x %p %lu %s %p %p %lu %#lx\n", iface, ar, key, cbkey, debugstr_w(name), am, hash, cbhash, flags);
++    if (TK_T(ar) != T_ASMREF) return E_INVALIDARG;
++    if (!tok_ok(md, ar)) return CLDB_E_INDEX_NOTFOUND;
++    return set_assemblyref(m, TK_R(ar), key, cbkey, name, am, hash, cbhash, flags);
++}
++
++static HRESULT WINAPI asmemit_SetFileProps(IMetaDataAssemblyEmit *iface, ULONG32 file, const void *hash, ULONG cbhash,
++                                           DWORD flags)
++{
++    ASMEMIT_ENTER;
++
++    TRACE("%p %#x %p %lu %#lx\n", iface, file, hash, cbhash, flags);
++    if (TK_T(file) != T_FILE) return E_INVALIDARG;
++    if (!tok_ok(md, file)) return CLDB_E_INDEX_NOTFOUND;
++    if (hash) *mc(md, T_FILE, TK_R(file), 2) = blob_of(md, hash, cbhash, &ok);
++    NO_MEM(ok);
++    if (flags != UNCHANGED) *mc(md, T_FILE, TK_R(file), 0) = flags;
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI asmemit_SetExportedTypeProps(IMetaDataAssemblyEmit *iface, ULONG32 ct, ULONG32 impl,
++                                                   ULONG32 typedef_tk, DWORD flags)
++{
++    ASMEMIT_ENTER;
++    ULONG iv;
++
++    TRACE("%p %#x %#x %#x %#lx\n", iface, ct, impl, typedef_tk, flags);
++    if (TK_T(ct) != T_EXPORTED) return E_INVALIDARG;
++    if (!tok_ok(md, ct)) return CLDB_E_INDEX_NOTFOUND;
++    if (impl != UNCHANGED)
++    {
++        if (FAILED(hr = coded_of(md, CI_IMPLEMENTATION, impl, &iv))) return hr;
++        *mc(md, T_EXPORTED, TK_R(ct), 4) = iv;
++    }
++    if (typedef_tk != UNCHANGED) *mc(md, T_EXPORTED, TK_R(ct), 1) = TK_R(typedef_tk);
++    if (flags != UNCHANGED) *mc(md, T_EXPORTED, TK_R(ct), 0) = flags;
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI asmemit_SetManifestResourceProps(IMetaDataAssemblyEmit *iface, ULONG32 mr, ULONG32 impl,
++                                                       DWORD offset, DWORD flags)
++{
++    ASMEMIT_ENTER;
++    ULONG iv;
++
++    TRACE("%p %#x %#x %lu %#lx\n", iface, mr, impl, offset, flags);
++    if (TK_T(mr) != T_MANIFESTRES) return E_INVALIDARG;
++    if (!tok_ok(md, mr)) return CLDB_E_INDEX_NOTFOUND;
++    if (impl != UNCHANGED)
++    {
++        if (FAILED(hr = coded_of(md, CI_IMPLEMENTATION, impl, &iv))) return hr;
++        *mc(md, T_MANIFESTRES, TK_R(mr), 3) = iv;
++    }
++    if (offset != UNCHANGED) *mc(md, T_MANIFESTRES, TK_R(mr), 0) = offset;
++    if (flags != UNCHANGED) *mc(md, T_MANIFESTRES, TK_R(mr), 1) = flags;
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static const IMetaDataAssemblyEmitVtbl asmemit_vtbl =
++{
++    asmemit_QueryInterface, asmemit_AddRef, asmemit_Release,
++    asmemit_DefineAssembly, asmemit_DefineAssemblyRef, asmemit_DefineFile, asmemit_DefineExportedType,
++    asmemit_DefineManifestResource, asmemit_SetAssemblyProps, asmemit_SetAssemblyRefProps, asmemit_SetFileProps,
++    asmemit_SetExportedTypeProps, asmemit_SetManifestResourceProps,
++};
++
++/* ---- events and properties ---- */
++
++#define MS_SETTER 0x1
++#define MS_GETTER 0x2
++#define MS_OTHER  0x4
++#define MS_ADDON  0x8
++#define MS_REMOVE 0x10
++#define MS_FIRE   0x20
++
++/* the EventMap or PropertyMap row of a type, created when the type gets its first event or property */
++static ULONG map_row(struct md_model *md, unsigned int map_t, unsigned int child_t, ULONG owner)
++{
++    ULONG r;
++
++    for (r = 1; r <= MROWS(md, map_t); r++)
++        if (*mc(md, map_t, r, 0) == owner) return r;
++    if (!(r = row_add(md, map_t))) return 0;
++    *mc(md, map_t, r, 0) = owner;
++    *mc(md, map_t, r, 1) = MROWS(md, ptr_table(child_t)) + 1;
++    return r;
++}
++
++/* the method that has the given role for an event or property; replaced when it exists, except "other" */
++static HRESULT sem_set(struct md_model *md, ULONG32 assoc, DWORD kind, ULONG32 method)
++{
++    ULONG av, r;
++    HRESULT hr;
++
++    if (!method) return S_OK;
++    if (TK_T(method) != T_METHOD) return E_INVALIDARG;
++    if (!tok_ok(md, method)) return CLDB_E_INDEX_NOTFOUND;
++    if (FAILED(hr = coded_of(md, CI_HASSEMANTICS, assoc, &av))) return hr;
++    if (kind != MS_OTHER)
++        for (r = 1; r <= MROWS(md, T_METHODSEM); r++)
++            if (*mc(md, T_METHODSEM, r, 2) == av && *mc(md, T_METHODSEM, r, 0) == kind)
++            {
++                *mc(md, T_METHODSEM, r, 1) = TK_R(method);
++                return S_OK;
++            }
++    if (!(r = sorted_add(md, T_METHODSEM, 2, av))) return E_OUTOFMEMORY;
++    *mc(md, T_METHODSEM, r, 0) = kind;
++    *mc(md, T_METHODSEM, r, 1) = TK_R(method);
++    return S_OK;
++}
++
++static HRESULT sem_others(struct md_model *md, ULONG32 assoc, const ULONG32 *others)
++{
++    HRESULT hr;
++
++    for (; others && *others; others++)
++        if (FAILED(hr = sem_set(md, assoc, MS_OTHER, *others))) return hr;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineEvent(IMetaDataEmit2 *iface, ULONG32 td, const WCHAR *name, DWORD flags,
++                                       ULONG32 type, ULONG32 add, ULONG32 remove, ULONG32 fire, ULONG32 *others,
++                                       ULONG32 *pev)
++{
++    EMIT_ENTER;
++    ULONG owner, map, rid, nm, tv;
++
++    TRACE("%p %#x %s %#lx %#x %#x %#x %#x %p %p\n", iface, td, debugstr_w(name), flags, type, add, remove, fire, others, pev);
++    if (!name || !pev || !td) return E_INVALIDARG;
++    if (FAILED(hr = owner_rid(md, td, &owner))) return hr;
++    if (FAILED(hr = coded_of(md, CI_TYPEDEFORREF, type, &tv))) return hr;
++    nm = str_w(md, name, &ok);
++    NO_MEM(ok);
++    NO_MEM(map = map_row(md, T_EVENTMAP, T_EVENT, owner));
++    NO_MEM(rid = member_add(md, T_EVENTMAP, map, 1, T_EVENT));
++    *mc(md, T_EVENT, rid, 0) = flags;
++    *mc(md, T_EVENT, rid, 1) = nm;
++    *mc(md, T_EVENT, rid, 2) = tv;
++    m->dirty = TRUE;
++    *pev = MKTK(T_EVENT, rid);
++    if (FAILED(hr = sem_set(md, *pev, MS_ADDON, add))) return hr;
++    if (FAILED(hr = sem_set(md, *pev, MS_REMOVE, remove))) return hr;
++    if (FAILED(hr = sem_set(md, *pev, MS_FIRE, fire))) return hr;
++    return sem_others(md, *pev, others);
++}
++
++static HRESULT WINAPI emit_SetEventProps(IMetaDataEmit2 *iface, ULONG32 ev, DWORD flags, ULONG32 type, ULONG32 add,
++                                         ULONG32 remove, ULONG32 fire, ULONG32 *others)
++{
++    EMIT_ENTER;
++    ULONG tv;
++
++    TRACE("%p %#x %#lx %#x %#x %#x %#x %p\n", iface, ev, flags, type, add, remove, fire, others);
++    if (TK_T(ev) != T_EVENT) return E_INVALIDARG;
++    if (!tok_ok(md, ev)) return CLDB_E_INDEX_NOTFOUND;
++    if (flags != UNCHANGED) *mc(md, T_EVENT, TK_R(ev), 0) = flags;
++    if (type != UNCHANGED)
++    {
++        if (FAILED(hr = coded_of(md, CI_TYPEDEFORREF, type, &tv))) return hr;
++        *mc(md, T_EVENT, TK_R(ev), 2) = tv;
++    }
++    m->dirty = TRUE;
++    if (FAILED(hr = sem_set(md, ev, MS_ADDON, add))) return hr;
++    if (FAILED(hr = sem_set(md, ev, MS_REMOVE, remove))) return hr;
++    if (FAILED(hr = sem_set(md, ev, MS_FIRE, fire))) return hr;
++    return sem_others(md, ev, others);
++}
++
++static HRESULT WINAPI emit_DefineProperty(IMetaDataEmit2 *iface, ULONG32 td, const WCHAR *name, DWORD flags,
++                                          const BYTE *sig, ULONG cbsig, DWORD ctype, const void *value, ULONG cch,
++                                          ULONG32 setter, ULONG32 getter, ULONG32 *others, ULONG32 *pprop)
++{
++    EMIT_ENTER;
++    ULONG owner, map, rid, nm, sg;
++
++    TRACE("%p %#x %s %#lx %p %lu %#lx %p %lu %#x %#x %p %p\n", iface, td, debugstr_w(name), flags, sig, cbsig, ctype,
++          value, cch, setter, getter, others, pprop);
++    if (!name || !pprop || !td) return E_INVALIDARG;
++    if (FAILED(hr = owner_rid(md, td, &owner))) return hr;
++    nm = str_w(md, name, &ok);
++    sg = blob_of(md, sig, cbsig, &ok);
++    NO_MEM(ok);
++    NO_MEM(map = map_row(md, T_PROPMAP, T_PROPERTY, owner));
++    NO_MEM(rid = member_add(md, T_PROPMAP, map, 1, T_PROPERTY));
++    if (ctype != ELEMENT_TYPE_END) flags |= prHasDefault;
++    *mc(md, T_PROPERTY, rid, 0) = flags;
++    *mc(md, T_PROPERTY, rid, 1) = nm;
++    *mc(md, T_PROPERTY, rid, 2) = sg;
++    m->dirty = TRUE;
++    *pprop = MKTK(T_PROPERTY, rid);
++    if (FAILED(hr = set_constant(m, *pprop, ctype, value, cch))) return hr;
++    if (FAILED(hr = sem_set(md, *pprop, MS_SETTER, setter))) return hr;
++    if (FAILED(hr = sem_set(md, *pprop, MS_GETTER, getter))) return hr;
++    return sem_others(md, *pprop, others);
++}
++
++static HRESULT WINAPI emit_SetPropertyProps(IMetaDataEmit2 *iface, ULONG32 pr, DWORD flags, DWORD ctype,
++                                            const void *value, ULONG cch, ULONG32 setter, ULONG32 getter,
++                                            ULONG32 *others)
++{
++    EMIT_ENTER;
++
++    TRACE("%p %#x %#lx %#lx %p %lu %#x %#x %p\n", iface, pr, flags, ctype, value, cch, setter, getter, others);
++    if (TK_T(pr) != T_PROPERTY) return E_INVALIDARG;
++    if (!tok_ok(md, pr)) return CLDB_E_INDEX_NOTFOUND;
++    if (flags != UNCHANGED) *mc(md, T_PROPERTY, TK_R(pr), 0) = flags;
++    if (ctype != ELEMENT_TYPE_END && ctype != UNCHANGED)
++    {
++        *mc(md, T_PROPERTY, TK_R(pr), 0) |= prHasDefault;
++        if (FAILED(hr = set_constant(m, pr, ctype, value, cch))) return hr;
++    }
++    m->dirty = TRUE;
++    if (FAILED(hr = sem_set(md, pr, MS_SETTER, setter))) return hr;
++    if (FAILED(hr = sem_set(md, pr, MS_GETTER, getter))) return hr;
++    return sem_others(md, pr, others);
++}
++
++static HRESULT WINAPI emit_SetFieldProps(IMetaDataEmit2 *iface, ULONG32 fd, DWORD flags, DWORD ctype, const void *value,
++                                         ULONG cch)
++{
++    EMIT_ENTER;
++
++    TRACE("%p %#x %#lx %#lx %p %lu\n", iface, fd, flags, ctype, value, cch);
++    if (TK_T(fd) != T_FIELD) return E_INVALIDARG;
++    if (!tok_ok(md, fd)) return CLDB_E_INDEX_NOTFOUND;
++    if (flags != UNCHANGED) *mc(md, T_FIELD, TK_R(fd), 0) = flags;
++    if (ctype != ELEMENT_TYPE_END && ctype != UNCHANGED)
++    {
++        *mc(md, T_FIELD, TK_R(fd), 0) |= fdHasDefault;
++        if (FAILED(hr = set_constant(m, fd, ctype, value, cch))) return hr;
++    }
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_SetParamProps(IMetaDataEmit2 *iface, ULONG32 pd, const WCHAR *name, DWORD flags,
++                                         DWORD ctype, const void *value, ULONG cch)
++{
++    EMIT_ENTER;
++
++    TRACE("%p %#x %s %#lx %#lx %p %lu\n", iface, pd, debugstr_w(name), flags, ctype, value, cch);
++    if (TK_T(pd) != T_PARAM) return E_INVALIDARG;
++    if (!tok_ok(md, pd)) return CLDB_E_INDEX_NOTFOUND;
++    if (name) *mc(md, T_PARAM, TK_R(pd), 2) = str_w(md, name, &ok);
++    NO_MEM(ok);
++    if (flags != UNCHANGED) *mc(md, T_PARAM, TK_R(pd), 0) = flags;
++    if (ctype != ELEMENT_TYPE_END && ctype != UNCHANGED)
++    {
++        *mc(md, T_PARAM, TK_R(pd), 0) |= pdHasDefault;
++        if (FAILED(hr = set_constant(m, pd, ctype, value, cch))) return hr;
++    }
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_SetTypeDefProps(IMetaDataEmit2 *iface, ULONG32 td, DWORD flags, ULONG32 ext, ULONG32 *impls)
++{
++    EMIT_ENTER;
++    ULONG r, ev;
++
++    TRACE("%p %#x %#lx %#x %p\n", iface, td, flags, ext, impls);
++    if (TK_T(td) != T_TYPEDEF) return E_INVALIDARG;
++    if (!tok_ok(md, td)) return CLDB_E_INDEX_NOTFOUND;
++    if (ext != UNCHANGED)
++    {
++        if (FAILED(hr = coded_of(md, CI_TYPEDEFORREF, ext, &ev))) return hr;
++        *mc(md, T_TYPEDEF, TK_R(td), 3) = ev;
++    }
++    if (flags != UNCHANGED) *mc(md, T_TYPEDEF, TK_R(td), 0) = flags;
++    if (impls)
++    {
++        for (r = MROWS(md, T_IFACEIMPL); r >= 1; r--)
++            if (*mc(md, T_IFACEIMPL, r, 0) == TK_R(td)) row_remove(md, T_IFACEIMPL, r);
++        m->dirty = TRUE;
++        if (FAILED(hr = add_interfaces(md, TK_R(td), impls))) return hr;
++    }
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++/* ---- layout, marshalling, security, platform invoke ---- */
++
++static ULONG field_rid(ULONG32 f)
++{
++    return TK_T(f) == T_FIELD ? TK_R(f) : f;
++}
++
++static HRESULT WINAPI emit_SetClassLayout(IMetaDataEmit2 *iface, ULONG32 td, DWORD pack, COR_FIELD_OFFSET *offsets,
++                                          ULONG size)
++{
++    EMIT_ENTER;
++    ULONG owner, row;
++
++    TRACE("%p %#x %lu %p %lu\n", iface, td, pack, offsets, size);
++    if (TK_T(td) != T_TYPEDEF) return E_INVALIDARG;
++    if (FAILED(hr = owner_rid(md, td, &owner))) return hr;
++    for (row = 1; row <= MROWS(md, T_CLASSLAYOUT); row++)
++        if (*mc(md, T_CLASSLAYOUT, row, 2) == owner) break;
++    if (row > MROWS(md, T_CLASSLAYOUT)) NO_MEM(row = sorted_add(md, T_CLASSLAYOUT, 2, owner));
++    *mc(md, T_CLASSLAYOUT, row, 0) = pack;
++    *mc(md, T_CLASSLAYOUT, row, 1) = size;
++    m->dirty = TRUE;
++    for (; offsets && offsets->ridOfField; offsets++)
++    {
++        ULONG f = field_rid(offsets->ridOfField), r;
++
++        if (f > MROWS(md, T_FIELD) || member_owner(md, T_TYPEDEF, 4, T_FIELD, f) != owner) return E_INVALIDARG;
++        for (r = 1; r <= MROWS(md, T_FIELDLAYOUT); r++)
++            if (*mc(md, T_FIELDLAYOUT, r, 1) == f) break;
++        if (r > MROWS(md, T_FIELDLAYOUT)) NO_MEM(r = sorted_add(md, T_FIELDLAYOUT, 1, f));
++        *mc(md, T_FIELDLAYOUT, r, 0) = offsets->ulOffset;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DeleteClassLayout(IMetaDataEmit2 *iface, ULONG32 td)
++{
++    EMIT_ENTER;
++    ULONG owner, r;
++    BOOL found = FALSE;
++
++    TRACE("%p %#x\n", iface, td);
++    if (TK_T(td) != T_TYPEDEF) return E_INVALIDARG;
++    if (FAILED(hr = owner_rid(md, td, &owner))) return hr;
++    for (r = MROWS(md, T_CLASSLAYOUT); r >= 1; r--)
++        if (*mc(md, T_CLASSLAYOUT, r, 2) == owner) { row_remove(md, T_CLASSLAYOUT, r); found = TRUE; }
++    for (r = MROWS(md, T_FIELDLAYOUT); r >= 1; r--)
++        if (member_owner(md, T_TYPEDEF, 4, T_FIELD, *mc(md, T_FIELDLAYOUT, r, 1)) == owner)
++        {
++            row_remove(md, T_FIELDLAYOUT, r);
++            found = TRUE;
++        }
++    m->dirty = TRUE;
++    return found ? S_OK : CLDB_E_RECORD_NOTFOUND;
++}
++
++static void set_flag(struct md_model *md, ULONG32 tk, DWORD flag, BOOL on)
++{
++    ULONG *f;
++
++    switch (TK_T(tk))
++    {
++    case T_TYPEDEF: f = mc(md, T_TYPEDEF, TK_R(tk), 0); break;
++    case T_FIELD: f = mc(md, T_FIELD, TK_R(tk), 0); break;
++    case T_METHOD: f = mc(md, T_METHOD, TK_R(tk), 2); break;
++    case T_PARAM: f = mc(md, T_PARAM, TK_R(tk), 0); break;
++    default: return;
++    }
++    if (on) *f |= flag; else *f &= ~flag;
++}
++
++static HRESULT WINAPI emit_SetFieldMarshal(IMetaDataEmit2 *iface, ULONG32 tk, const BYTE *native, ULONG cb)
++{
++    EMIT_ENTER;
++    ULONG pv, r, bl;
++
++    TRACE("%p %#x %p %lu\n", iface, tk, native, cb);
++    if ((TK_T(tk) != T_FIELD && TK_T(tk) != T_PARAM) || !native || !cb) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_HASFIELDMARSHAL, tk, &pv))) return hr;
++    bl = blob_of(md, native, cb, &ok);
++    NO_MEM(ok);
++    for (r = 1; r <= MROWS(md, T_FMARSHAL); r++)
++        if (*mc(md, T_FMARSHAL, r, 0) == pv) break;
++    if (r > MROWS(md, T_FMARSHAL)) NO_MEM(r = sorted_add(md, T_FMARSHAL, 0, pv));
++    *mc(md, T_FMARSHAL, r, 1) = bl;
++    set_flag(md, tk, TK_T(tk) == T_FIELD ? fdHasFieldMarshal : pdHasFieldMarshal, TRUE);
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DeleteFieldMarshal(IMetaDataEmit2 *iface, ULONG32 tk)
++{
++    EMIT_ENTER;
++    ULONG pv, r;
++
++    TRACE("%p %#x\n", iface, tk);
++    if (TK_T(tk) != T_FIELD && TK_T(tk) != T_PARAM) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_HASFIELDMARSHAL, tk, &pv))) return hr;
++    for (r = 1; r <= MROWS(md, T_FMARSHAL); r++)
++        if (*mc(md, T_FMARSHAL, r, 0) == pv)
++        {
++            row_remove(md, T_FMARSHAL, r);
++            set_flag(md, tk, TK_T(tk) == T_FIELD ? fdHasFieldMarshal : pdHasFieldMarshal, FALSE);
++            m->dirty = TRUE;
++            return S_OK;
++        }
++    return CLDB_E_RECORD_NOTFOUND;
++}
++
++static HRESULT define_permission_set(struct md_scope *m, ULONG32 tk, DWORD action, const void *perm, ULONG cb,
++                                     BOOL replace, ULONG32 *ppm)
++{
++    struct md_model *md = m->model;
++    ULONG pv, r, bl;
++    BOOL ok = TRUE;
++    HRESULT hr;
++
++    if (TK_T(tk) != T_TYPEDEF && TK_T(tk) != T_METHOD && TK_T(tk) != T_ASSEMBLY) return E_INVALIDARG;
++    if (!perm || !cb) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_HASDECLSEC, tk, &pv))) return hr;
++    bl = blob_of(md, perm, cb, &ok);
++    NO_MEM(ok);
++    r = MROWS(md, T_DECLSEC) + 1;
++    if (replace)
++        for (r = 1; r <= MROWS(md, T_DECLSEC); r++)
++            if (*mc(md, T_DECLSEC, r, 1) == pv && *mc(md, T_DECLSEC, r, 0) == action) break;
++    if (r > MROWS(md, T_DECLSEC)) NO_MEM(r = sorted_add(md, T_DECLSEC, 1, pv));
++    *mc(md, T_DECLSEC, r, 0) = action;
++    *mc(md, T_DECLSEC, r, 2) = bl;
++    if (TK_T(tk) == T_TYPEDEF) set_flag(md, tk, tdHasSecurity, TRUE);
++    else if (TK_T(tk) == T_METHOD) set_flag(md, tk, mdHasSecurity, TRUE);
++    m->dirty = TRUE;
++    if (ppm) *ppm = MKTK(T_DECLSEC, r);
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefinePermissionSet(IMetaDataEmit2 *iface, ULONG32 tk, DWORD action, const void *perm,
++                                               ULONG cb, ULONG32 *ppm)
++{
++    TRACE("%p %#x %#lx %p %lu %p\n", iface, tk, action, perm, cb, ppm);
++    return define_permission_set(impl_from_emit(iface), tk, action, perm, cb, FALSE, ppm);
++}
++
++static HRESULT WINAPI emit_SetPermissionSetProps(IMetaDataEmit2 *iface, ULONG32 tk, DWORD action, const void *perm,
++                                                 ULONG cb, ULONG32 *ppm)
++{
++    TRACE("%p %#x %#lx %p %lu %p\n", iface, tk, action, perm, cb, ppm);
++    return define_permission_set(impl_from_emit(iface), tk, action, perm, cb, TRUE, ppm);
++}
++
++static HRESULT pinvoke_map(struct md_scope *m, ULONG32 tk, DWORD flags, const WCHAR *name, ULONG32 module, BOOL must_exist)
++{
++    struct md_model *md = m->model;
++    ULONG mv, r, nm = 0;
++    BOOL ok = TRUE;
++    HRESULT hr;
++
++    if (TK_T(tk) != T_METHOD && TK_T(tk) != T_FIELD) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_MEMBERFORWARDED, tk, &mv))) return hr;
++    if (module && (TK_T(module) != T_MODULEREF || !tok_ok(md, module))) return module && TK_T(module) != T_MODULEREF ? E_INVALIDARG : CLDB_E_INDEX_NOTFOUND;
++    nm = str_w(md, name, &ok);
++    NO_MEM(ok);
++    for (r = 1; r <= MROWS(md, T_IMPLMAP); r++)
++        if (*mc(md, T_IMPLMAP, r, 1) == mv) break;
++    if (r > MROWS(md, T_IMPLMAP))
++    {
++        if (must_exist) return CLDB_E_RECORD_NOTFOUND;
++        NO_MEM(r = sorted_add(md, T_IMPLMAP, 1, mv));
++    }
++    *mc(md, T_IMPLMAP, r, 0) = flags;
++    *mc(md, T_IMPLMAP, r, 2) = nm;
++    *mc(md, T_IMPLMAP, r, 3) = TK_R(module);
++    set_flag(md, tk, TK_T(tk) == T_METHOD ? mdPinvokeImpl : fdPinvokeImpl, TRUE);
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefinePinvokeMap(IMetaDataEmit2 *iface, ULONG32 tk, DWORD flags, const WCHAR *name,
++                                            ULONG32 module)
++{
++    TRACE("%p %#x %#lx %s %#x\n", iface, tk, flags, debugstr_w(name), module);
++    return pinvoke_map(impl_from_emit(iface), tk, flags, name, module, FALSE);
++}
++
++static HRESULT WINAPI emit_SetPinvokeMap(IMetaDataEmit2 *iface, ULONG32 tk, DWORD flags, const WCHAR *name,
++                                         ULONG32 module)
++{
++    TRACE("%p %#x %#lx %s %#x\n", iface, tk, flags, debugstr_w(name), module);
++    return pinvoke_map(impl_from_emit(iface), tk, flags, name, module, TRUE);
++}
++
++static HRESULT WINAPI emit_DeletePinvokeMap(IMetaDataEmit2 *iface, ULONG32 tk)
++{
++    EMIT_ENTER;
++    ULONG mv, r;
++
++    TRACE("%p %#x\n", iface, tk);
++    if (TK_T(tk) != T_METHOD && TK_T(tk) != T_FIELD) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_MEMBERFORWARDED, tk, &mv))) return hr;
++    for (r = 1; r <= MROWS(md, T_IMPLMAP); r++)
++        if (*mc(md, T_IMPLMAP, r, 1) == mv)
++        {
++            row_remove(md, T_IMPLMAP, r);
++            set_flag(md, tk, TK_T(tk) == T_METHOD ? mdPinvokeImpl : fdPinvokeImpl, FALSE);
++            m->dirty = TRUE;
++            return S_OK;
++        }
++    return CLDB_E_RECORD_NOTFOUND;
++}
++
++static HRESULT WINAPI emit_SetFieldRVA(IMetaDataEmit2 *iface, ULONG32 fd, ULONG rva)
++{
++    EMIT_ENTER;
++    ULONG r;
++
++    TRACE("%p %#x %lu\n", iface, fd, rva);
++    if (TK_T(fd) != T_FIELD) return E_INVALIDARG;
++    if (!tok_ok(md, fd)) return CLDB_E_INDEX_NOTFOUND;
++    for (r = 1; r <= MROWS(md, T_FIELDRVA); r++)
++        if (*mc(md, T_FIELDRVA, r, 1) == TK_R(fd)) break;
++    if (r > MROWS(md, T_FIELDRVA)) NO_MEM(r = sorted_add(md, T_FIELDRVA, 1, TK_R(fd)));
++    *mc(md, T_FIELDRVA, r, 0) = rva;
++    set_flag(md, fd, fdHasFieldRVA, TRUE);
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++/* a name that marks a deleted definition */
++static HRESULT WINAPI emit_DeleteToken(IMetaDataEmit2 *iface, ULONG32 tk)
++{
++    EMIT_ENTER;
++    ULONG rid = TK_R(tk);
++
++    TRACE("%p %#x\n", iface, tk);
++    if (!tok_ok(md, tk)) return CLDB_E_INDEX_NOTFOUND;
++    switch (TK_T(tk))
++    {
++    case T_TYPEDEF:
++        if (rid == 1) return E_INVALIDARG;
++        *mc(md, T_TYPEDEF, rid, 1) = heap_add(&md->str, "_Deleted", 8);
++        *mc(md, T_TYPEDEF, rid, 0) |= tdSpecialName | tdRTSpecialName;
++        break;
++    case T_METHOD:
++        *mc(md, T_METHOD, rid, 3) = heap_add(&md->str, "_Deleted", 8);
++        *mc(md, T_METHOD, rid, 2) |= mdSpecialName | mdRTSpecialName;
++        break;
++    case T_FIELD:
++        *mc(md, T_FIELD, rid, 1) = heap_add(&md->str, "_Deleted", 8);
++        *mc(md, T_FIELD, rid, 0) |= fdSpecialName | fdRTSpecialName;
++        break;
++    case T_CA:
++        row_remove(md, T_CA, rid);
++        break;
++    default:
++        FIXME("token %#x: table not supported\n", tk);
++        return E_NOTIMPL;
++    }
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++/* ---- generics ---- */
++
++static HRESULT add_constraints(struct md_model *md, ULONG gp, const ULONG32 *cons)
++{
++    HRESULT hr;
++
++    for (; cons && *cons; cons++)
++    {
++        ULONG v, row;
++
++        if (TK_T(*cons) != T_TYPEDEF && TK_T(*cons) != T_TYPEREF && TK_T(*cons) != T_TYPESPEC) return E_INVALIDARG;
++        if (FAILED(hr = coded_of(md, CI_TYPEDEFORREF, *cons, &v))) return hr;
++        if (!(row = sorted_add(md, T_GPC, 0, gp))) return E_OUTOFMEMORY;
++        *mc(md, T_GPC, row, 1) = v;
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineGenericParam(IMetaDataEmit2 *iface, ULONG32 tk, ULONG seq, DWORD flags,
++                                              const WCHAR *name, DWORD reserved, ULONG32 *cons, ULONG32 *pgp)
++{
++    EMIT_ENTER;
++    ULONG ov, nm, pos;
++
++    TRACE("%p %#x %lu %#lx %s %lu %p %p\n", iface, tk, seq, flags, debugstr_w(name), reserved, cons, pgp);
++    if (!pgp || !tk) return E_INVALIDARG;
++    if (TK_T(tk) != T_TYPEDEF && TK_T(tk) != T_METHOD) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_TYPEORMETHODDEF, tk, &ov))) return hr;
++    nm = str_w(md, name, &ok);
++    NO_MEM(ok);
++    NO_MEM(pos = row_add(md, T_GENERICPARAM));
++    *mc(md, T_GENERICPARAM, pos, 0) = seq;
++    *mc(md, T_GENERICPARAM, pos, 1) = flags;
++    *mc(md, T_GENERICPARAM, pos, 2) = ov;
++    *mc(md, T_GENERICPARAM, pos, 3) = nm;
++    m->dirty = TRUE;
++    *pgp = MKTK(T_GENERICPARAM, pos);
++    return add_constraints(md, pos, cons);
++}
++
++static HRESULT WINAPI emit_SetGenericParamProps(IMetaDataEmit2 *iface, ULONG32 gp, DWORD flags, const WCHAR *name,
++                                                DWORD reserved, ULONG32 *cons)
++{
++    EMIT_ENTER;
++    ULONG r;
++
++    TRACE("%p %#x %#lx %s %lu %p\n", iface, gp, flags, debugstr_w(name), reserved, cons);
++    if (TK_T(gp) != T_GENERICPARAM) return E_INVALIDARG;
++    if (!tok_ok(md, gp)) return CLDB_E_INDEX_NOTFOUND;
++    if (flags != UNCHANGED) *mc(md, T_GENERICPARAM, TK_R(gp), 1) = flags;
++    if (name) *mc(md, T_GENERICPARAM, TK_R(gp), 3) = str_w(md, name, &ok);
++    NO_MEM(ok);
++    if (cons)
++    {
++        for (r = MROWS(md, T_GPC); r >= 1; r--)
++            if (*mc(md, T_GPC, r, 0) == TK_R(gp)) row_remove(md, T_GPC, r);
++        m->dirty = TRUE;
++        if (FAILED(hr = add_constraints(md, TK_R(gp), cons))) return hr;
++    }
++    m->dirty = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI emit_DefineMethodSpec(IMetaDataEmit2 *iface, ULONG32 parent, const BYTE *sig, ULONG cb,
++                                            ULONG32 *pmi)
++{
++    EMIT_ENTER;
++    ULONG pv, sg, r;
++
++    TRACE("%p %#x %p %lu %p\n", iface, parent, sig, cb, pmi);
++    if (!parent || !sig || !cb || !pmi) return E_INVALIDARG;
++    if (TK_T(parent) != T_METHOD && TK_T(parent) != T_MEMBERREF) return E_INVALIDARG;
++    if (FAILED(hr = coded_of(md, CI_METHODDEFORREF, parent, &pv))) return hr;
++    sg = blob_of(md, sig, cb, &ok);
++    NO_MEM(ok);
++    for (r = 1; r <= MROWS(md, T_METHODSPEC); r++)
++        if (*mc(md, T_METHODSPEC, r, 0) == pv && *mc(md, T_METHODSPEC, r, 1) == sg)
++        {
++            *pmi = MKTK(T_METHODSPEC, r);
++            return S_OK;
++        }
++    NO_MEM(r = row_add(md, T_METHODSPEC));
++    *mc(md, T_METHODSPEC, r, 0) = pv;
++    *mc(md, T_METHODSPEC, r, 1) = sg;
++    m->dirty = TRUE;
++    *pmi = MKTK(T_METHODSPEC, r);
++    return S_OK;
++}
++
++/* ---- importing definitions from another scope ---- */
++
++struct xlate
++{
++    struct md_scope *dest;              /* the scope being emitted into */
++    IMetaDataAssemblyImport *ai;
++    const void *hash;
++    ULONG cbhash;
++    IMetaDataImport *imp;
++    IMetaDataAssemblyEmit *ae;
++};
++
++static HRESULT xlate_token(struct xlate *x, ULONG32 tk, ULONG32 *out);
++
++static ULONG tail_token(const BYTE *key, ULONG cb, BYTE token[8])
++{
++    HCRYPTPROV prov;
++    HCRYPTHASH hash;
++    BYTE digest[20];
++    DWORD size = sizeof(digest);
++    BOOL ok = FALSE;
++    int i;
++
++    if (!CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) return 0;
++    if (CryptCreateHash(prov, CALG_SHA1, 0, 0, &hash))
++    {
++        ok = CryptHashData(hash, key, cb, 0) && CryptGetHashParam(hash, HP_HASHVAL, digest, &size, 0);
++        CryptDestroyHash(hash);
++    }
++    CryptReleaseContext(prov, 0);
++    if (!ok) return 0;
++    for (i = 0; i < 8; i++) token[i] = digest[19 - i];
++    return 8;
++}
++
++/* an AssemblyRef in the destination for the assembly of the source scope */
++static HRESULT xlate_assembly_scope(struct xlate *x, ULONG32 *scope)
++{
++    ULONG32 as;
++    const void *key = NULL;
++    ULONG cbkey = 0, len;
++    WCHAR name[512], loc[64];
++    ASSEMBLYMETADATA am;
++    DWORD flags;
++    BYTE token[8];
++    HRESULT hr;
++
++    if (FAILED(hr = IMetaDataAssemblyImport_GetAssemblyFromScope(x->ai, &as))) return hr;
++    memset(&am, 0, sizeof(am));
++    am.szLocale = loc;
++    am.cbLocale = ARRAY_SIZE(loc);
++    if (FAILED(hr = IMetaDataAssemblyImport_GetAssemblyProps(x->ai, as, &key, &cbkey, NULL, name, ARRAY_SIZE(name),
++                                                             &len, &am, &flags))) return hr;
++    if (cbkey)
++    {
++        if (!tail_token(key, cbkey, token)) return E_FAIL;
++        key = token;
++        cbkey = 8;
++    }
++    return IMetaDataAssemblyEmit_DefineAssemblyRef(x->ae, key, cbkey, name, &am, x->hash, x->cbhash,
++                                                    flags & ~afPublicKey, scope);
++}
++
++static HRESULT xlate_typedef(struct xlate *x, ULONG32 td, ULONG32 *out)
++{
++    IMetaDataImport2 *imp2;
++    WCHAR name[1024];
++    ULONG len;
++    DWORD flags;
++    ULONG32 ext, enclosing, scope = 0;
++    HRESULT hr;
++
++    if (FAILED(hr = IMetaDataImport_GetTypeDefProps(x->imp, td, name, ARRAY_SIZE(name), &len, &flags, &ext))) return hr;
++    if (SUCCEEDED(IMetaDataImport_QueryInterface(x->imp, &IID_IMetaDataImport2, (void **)&imp2)))
++    {
++        hr = IMetaDataImport2_GetNestedClassProps(imp2, td, &enclosing);
++        IMetaDataImport2_Release(imp2);
++        if (SUCCEEDED(hr))
++        {
++            /* a nested type is named inside its enclosing type's reference */
++            if (FAILED(hr = xlate_typedef(x, enclosing, &scope))) return hr;
++            return IMetaDataEmit_DefineTypeRefByName((IMetaDataEmit *)&x->dest->emit_iface, scope, name, out);
++        }
++    }
++    if (x->ai) { if (FAILED(hr = xlate_assembly_scope(x, &scope))) return hr; }
++    else
++    {
++        WCHAR mod[512];
++        ULONG mlen;
++
++        if (FAILED(hr = IMetaDataImport_GetScopeProps(x->imp, mod, ARRAY_SIZE(mod), &mlen, NULL))) return hr;
++        if (FAILED(hr = IMetaDataEmit_DefineModuleRef((IMetaDataEmit *)&x->dest->emit_iface, mod, &scope))) return hr;
++    }
++    return IMetaDataEmit_DefineTypeRefByName((IMetaDataEmit *)&x->dest->emit_iface, scope, name, out);
++}
++
++static HRESULT xlate_typeref(struct xlate *x, ULONG32 tr, ULONG32 *out)
++{
++    WCHAR name[1024];
++    ULONG len;
++    ULONG32 scope, dscope = 0;
++    HRESULT hr;
++
++    if (FAILED(hr = IMetaDataImport_GetTypeRefProps(x->imp, tr, &scope, name, ARRAY_SIZE(name), &len))) return hr;
++    switch (TK_T(scope))
++    {
++    case T_ASMREF:
++    {
++        const void *key, *hash;
++        ULONG cbkey, cbhash, l;
++        WCHAR an[512], loc[64];
++        ASSEMBLYMETADATA am;
++        DWORD flags;
++
++        if (!x->ai) return E_INVALIDARG;
++        memset(&am, 0, sizeof(am));
++        am.szLocale = loc;
++        am.cbLocale = ARRAY_SIZE(loc);
++        if (FAILED(hr = IMetaDataAssemblyImport_GetAssemblyRefProps(x->ai, scope, &key, &cbkey, an, ARRAY_SIZE(an), &l,
++                                                                    &am, &hash, &cbhash, &flags))) return hr;
++        if (FAILED(hr = IMetaDataAssemblyEmit_DefineAssemblyRef(x->ae, key, cbkey, an, &am, hash, cbhash, flags,
++                                                                 &dscope))) return hr;
++        break;
++    }
++    case T_MODULEREF:
++    {
++        WCHAR mod[512];
++        ULONG l;
++
++        if (FAILED(hr = IMetaDataImport_GetModuleRefProps(x->imp, scope, mod, ARRAY_SIZE(mod), &l))) return hr;
++        if (FAILED(hr = IMetaDataEmit_DefineModuleRef((IMetaDataEmit *)&x->dest->emit_iface, mod, &dscope))) return hr;
++        break;
++    }
++    case T_TYPEREF:
++        if (FAILED(hr = xlate_typeref(x, scope, &dscope))) return hr;
++        break;
++    default:
++        dscope = 0;
++        break;
++    }
++    return IMetaDataEmit_DefineTypeRefByName((IMetaDataEmit *)&x->dest->emit_iface, dscope, name, out);
++}
++
++/* signature rewriting: tokens of the source scope become tokens of the destination */
++
++struct sigbuf { BYTE *p; ULONG n, cap; BOOL fail; };
++struct sigr { const BYTE *p, *end; BOOL fail; };
++
++static void sb_put(struct sigbuf *b, const void *d, ULONG n)
++{
++    if (b->fail) return;
++    if (b->n + n > b->cap)
++    {
++        ULONG cap = (b->n + n) * 2 + 32;
++        BYTE *p = realloc(b->p, cap);
++
++        if (!p) { b->fail = TRUE; return; }
++        b->p = p;
++        b->cap = cap;
++    }
++    memcpy(b->p + b->n, d, n);
++    b->n += n;
++}
++
++static BYTE sr_peek(struct sigr *r) { return r->p < r->end ? *r->p : 0; }
++
++static BYTE sr_byte(struct sigr *r)
++{
++    if (r->p >= r->end) { r->fail = TRUE; return 0; }
++    return *r->p++;
++}
++
++static ULONG sr_comp(struct sigr *r)
++{
++    ULONG v, len;
++
++    if (!uncompress(r->p, r->end, &v, &len)) { r->fail = TRUE; return 0; }
++    r->p += len;
++    return v;
++}
++
++/* copy a compressed integer (also signed ones, whose encoding has the same length) unchanged */
++static void sr_copy_comp(struct sigr *r, struct sigbuf *o)
++{
++    ULONG v, len;
++
++    if (!uncompress(r->p, r->end, &v, &len)) { r->fail = TRUE; return; }
++    sb_put(o, r->p, len);
++    r->p += len;
++}
++
++static void sb_comp(struct sigbuf *o, ULONG v)
++{
++    BYTE b[4];
++
++    sb_put(o, b, put_compressed(b, v));
++}
++
++/* a TypeDefOrRef coded token */
++static HRESULT sig_token(struct xlate *x, struct sigr *r, struct sigbuf *o)
++{
++    ULONG v = sr_comp(r), rid = v >> 2;
++    static const BYTE tables[3] = { T_TYPEDEF, T_TYPEREF, T_TYPESPEC };
++    ULONG32 out;
++    HRESULT hr;
++
++    if (r->fail || (v & 3) == 3) return META_E_BAD_SIGNATURE;
++    if (FAILED(hr = xlate_token(x, MKTK(tables[v & 3], rid), &out))) return hr;
++    for (v = 0; v < 3 && tables[v] != TK_T(out); v++) ;
++    if (v == 3) return META_E_BAD_SIGNATURE;
++    sb_comp(o, (TK_R(out) << 2) | v);
++    return S_OK;
++}
++
++static HRESULT sig_type(struct xlate *x, struct sigr *r, struct sigbuf *o);
++static HRESULT sig_method(struct xlate *x, struct sigr *r, struct sigbuf *o, BYTE conv);
++
++static HRESULT sig_mods_and_type(struct xlate *x, struct sigr *r, struct sigbuf *o)
++{
++    HRESULT hr;
++
++    for (;;)
++    {
++        BYTE b = sr_peek(r);
++
++        if (b == ELEMENT_TYPE_CMOD_REQD || b == ELEMENT_TYPE_CMOD_OPT)
++        {
++            sb_put(o, &b, 1);
++            r->p++;
++            if (FAILED(hr = sig_token(x, r, o))) return hr;
++        }
++        else if (b == ELEMENT_TYPE_PINNED || b == ELEMENT_TYPE_SENTINEL)
++        {
++            sb_put(o, &b, 1);
++            r->p++;
++        }
++        else break;
++    }
++    return sig_type(x, r, o);
++}
++
++static HRESULT sig_type(struct xlate *x, struct sigr *r, struct sigbuf *o)
++{
++    BYTE b = sr_byte(r);
++    ULONG i, n;
++    HRESULT hr;
++
++    if (r->fail) return META_E_BAD_SIGNATURE;
++    sb_put(o, &b, 1);
++    switch (b)
++    {
++    case ELEMENT_TYPE_VOID: case ELEMENT_TYPE_BOOLEAN: case ELEMENT_TYPE_CHAR: case ELEMENT_TYPE_I1:
++    case ELEMENT_TYPE_U1: case ELEMENT_TYPE_I2: case ELEMENT_TYPE_U2: case ELEMENT_TYPE_I4: case ELEMENT_TYPE_U4:
++    case ELEMENT_TYPE_I8: case ELEMENT_TYPE_U8: case ELEMENT_TYPE_R4: case ELEMENT_TYPE_R8: case ELEMENT_TYPE_STRING:
++    case ELEMENT_TYPE_I: case ELEMENT_TYPE_U: case ELEMENT_TYPE_OBJECT: case ELEMENT_TYPE_TYPEDBYREF:
++        return S_OK;
++    case ELEMENT_TYPE_PTR: case ELEMENT_TYPE_BYREF: case ELEMENT_TYPE_SZARRAY:
++        return sig_mods_and_type(x, r, o);
++    case ELEMENT_TYPE_VALUETYPE: case ELEMENT_TYPE_CLASS:
++        return sig_token(x, r, o);
++    case ELEMENT_TYPE_VAR: case ELEMENT_TYPE_MVAR:
++        sr_copy_comp(r, o);
++        return r->fail ? META_E_BAD_SIGNATURE : S_OK;
++    case ELEMENT_TYPE_ARRAY:
++        if (FAILED(hr = sig_mods_and_type(x, r, o))) return hr;
++        sr_copy_comp(r, o);                         /* rank */
++        n = sr_comp(r); sb_comp(o, n);              /* sizes */
++        for (i = 0; i < n && !r->fail; i++) sr_copy_comp(r, o);
++        n = sr_comp(r); sb_comp(o, n);              /* lower bounds */
++        for (i = 0; i < n && !r->fail; i++) sr_copy_comp(r, o);
++        return r->fail ? META_E_BAD_SIGNATURE : S_OK;
++    case ELEMENT_TYPE_GENERICINST:
++        b = sr_byte(r);
++        sb_put(o, &b, 1);
++        if (b != ELEMENT_TYPE_CLASS && b != ELEMENT_TYPE_VALUETYPE) return META_E_BAD_SIGNATURE;
++        if (FAILED(hr = sig_token(x, r, o))) return hr;
++        n = sr_comp(r); sb_comp(o, n);
++        for (i = 0; i < n; i++) if (FAILED(hr = sig_mods_and_type(x, r, o))) return hr;
++        return r->fail ? META_E_BAD_SIGNATURE : S_OK;
++    case ELEMENT_TYPE_FNPTR:
++        b = sr_byte(r);
++        sb_put(o, &b, 1);
++        return sig_method(x, r, o, b);
++    case ELEMENT_TYPE_CMOD_REQD: case ELEMENT_TYPE_CMOD_OPT:
++        if (FAILED(hr = sig_token(x, r, o))) return hr;
++        return sig_type(x, r, o);
++    case ELEMENT_TYPE_PINNED: case ELEMENT_TYPE_SENTINEL:
++        return sig_type(x, r, o);
++    default:
++        return META_E_BAD_SIGNATURE;
++    }
++}
++
++/* after the calling convention byte */
++static HRESULT sig_method(struct xlate *x, struct sigr *r, struct sigbuf *o, BYTE conv)
++{
++    ULONG i, n;
++    HRESULT hr;
++
++    if (conv & 0x10) sr_copy_comp(r, o);       /* generic parameter count */
++    n = sr_comp(r);
++    sb_comp(o, n);
++    if (r->fail) return META_E_BAD_SIGNATURE;
++    for (i = 0; i < n + 1; i++)                /* the return type and the parameters */
++        if (FAILED(hr = sig_mods_and_type(x, r, o))) return hr;
++    return S_OK;
++}
++
++static HRESULT xlate_sig(struct xlate *x, const BYTE *sig, ULONG cb, struct sigbuf *o)
++{
++    struct sigr r = { sig, sig + cb, FALSE };
++    BYTE conv;
++    ULONG i, n;
++    HRESULT hr;
++
++    if (!cb) return META_E_BAD_SIGNATURE;
++    conv = sr_byte(&r);
++    sb_put(o, &conv, 1);
++    switch (conv & 0x0f)
++    {
++    case 0x06:      /* field */
++        hr = sig_mods_and_type(x, &r, o);
++        break;
++    case 0x07:      /* local variables */
++        n = sr_comp(&r);
++        sb_comp(o, n);
++        for (hr = S_OK, i = 0; i < n && SUCCEEDED(hr); i++) hr = sig_mods_and_type(x, &r, o);
++        break;
++    case 0x0a:      /* method instantiation */
++        n = sr_comp(&r);
++        sb_comp(o, n);
++        for (hr = S_OK, i = 0; i < n && SUCCEEDED(hr); i++) hr = sig_mods_and_type(x, &r, o);
++        break;
++    case 0x08:      /* property: parameter count, type, parameters */
++        n = sr_comp(&r);
++        sb_comp(o, n);
++        for (hr = S_OK, i = 0; i < n + 1 && SUCCEEDED(hr); i++) hr = sig_mods_and_type(x, &r, o);
++        break;
++    default:
++        hr = sig_method(x, &r, o, conv);
++        break;
++    }
++    if (SUCCEEDED(hr) && (r.fail || o->fail)) hr = r.fail ? META_E_BAD_SIGNATURE : E_OUTOFMEMORY;
++    return hr;
++}
++
++static HRESULT xlate_token(struct xlate *x, ULONG32 tk, ULONG32 *out)
++{
++    HRESULT hr;
++
++    switch (TK_T(tk))
++    {
++    case T_TYPEDEF: return xlate_typedef(x, tk, out);
++    case T_TYPEREF: return xlate_typeref(x, tk, out);
++    case T_TYPESPEC:
++    {
++        const BYTE *sig;
++        ULONG cb;
++
++        if (FAILED(hr = IMetaDataImport_GetTypeSpecFromToken(x->imp, tk, &sig, &cb))) return hr;
++        {
++            struct sigr r = { sig, sig + cb, FALSE };
++            struct sigbuf t = {0};
++
++            if (SUCCEEDED(hr = sig_mods_and_type(x, &r, &t)))
++                hr = IMetaDataEmit_GetTokenFromTypeSpec((IMetaDataEmit *)&x->dest->emit_iface, t.p, t.n, out);
++            free(t.p);
++        }
++        return hr;
++    }
++    default:
++        return E_INVALIDARG;
++    }
++}
++
++static HRESULT WINAPI emit_DefineImportType(IMetaDataEmit2 *iface, IMetaDataAssemblyImport *ai, const void *hash,
++                                            ULONG cbhash, IMetaDataImport *imp, ULONG32 td,
++                                            IMetaDataAssemblyEmit *ae, ULONG32 *ptr)
++{
++    struct xlate x = { impl_from_emit(iface), ai, hash, cbhash, imp, ae };
++    HRESULT hr;
++
++    TRACE("%p %p %p %lu %p %#x %p %p\n", iface, ai, hash, cbhash, imp, td, ae, ptr);
++    if (!imp || !ptr || (ai && !ae)) return E_INVALIDARG;
++    if (TK_T(td) != T_TYPEDEF) return E_INVALIDARG;
++    hr = xlate_typedef(&x, td, ptr);
++    return hr;
++}
++
++static HRESULT translate_sig(struct xlate *x, const BYTE *sig, ULONG cb, BYTE *out, ULONG max, ULONG *pcb)
++{
++    struct sigbuf o = {0};
++    HRESULT hr = xlate_sig(x, sig, cb, &o);
++
++    if (SUCCEEDED(hr))
++    {
++        if (pcb) *pcb = o.n;
++        if (o.n > max) hr = CLDB_E_TRUNCATION;
++        else if (out) memcpy(out, o.p, o.n);
++    }
++    free(o.p);
++    return hr;
++}
++
++static HRESULT WINAPI emit_TranslateSigWithScope(IMetaDataEmit2 *iface, IMetaDataAssemblyImport *ai, const void *hash,
++                                                 ULONG cbhash, IMetaDataImport *imp, const BYTE *sig, ULONG cb,
++                                                 IMetaDataAssemblyEmit *ae, IMetaDataEmit *emit, BYTE *out,
++                                                 ULONG max, ULONG *pcb)
++{
++    struct xlate x = { impl_from_emit(iface), ai, hash, cbhash, imp, ae };
++
++    TRACE("%p %p %p %lu %p %p %lu %p %p %p %lu %p\n", iface, ai, hash, cbhash, imp, sig, cb, ae, emit, out, max, pcb);
++    if (!imp || !sig || !out || (ai && !ae)) return E_INVALIDARG;
++    return translate_sig(&x, sig, cb, out, max, pcb);
++}
++
++static HRESULT WINAPI emit_DefineImportMember(IMetaDataEmit2 *iface, IMetaDataAssemblyImport *ai, const void *hash,
++                                              ULONG cbhash, IMetaDataImport *imp, ULONG32 member,
++                                              IMetaDataAssemblyEmit *ae, ULONG32 parent, ULONG32 *pmr)
++{
++    struct xlate x = { impl_from_emit(iface), ai, hash, cbhash, imp, ae };
++    WCHAR name[1024];
++    ULONG len, cbsig;
++    const BYTE *sig;
++    struct sigbuf o = {0};
++    ULONG32 cls;
++    DWORD attr, impl, ct;
++    HRESULT hr;
++
++    TRACE("%p %p %p %lu %p %#x %p %#x %p\n", iface, ai, hash, cbhash, imp, member, ae, parent, pmr);
++    if (!imp || !pmr || !parent || (ai && !ae)) return E_INVALIDARG;
++    if (FAILED(hr = IMetaDataImport_GetMemberProps(imp, member, &cls, name, ARRAY_SIZE(name), &len, &attr, &sig, &cbsig,
++                                                    NULL, &impl, &ct, NULL, NULL))) return hr;
++    if (FAILED(hr = xlate_sig(&x, sig, cbsig, &o))) { free(o.p); return hr; }
++    hr = IMetaDataEmit_DefineMemberRef((IMetaDataEmit *)iface, parent, name, o.p, o.n, pmr);
++    free(o.p);
++    return hr;
++}
++
++/* ---- security attribute sets ---- */
++
++/* the assembly-qualified name that a permission set blob stores for an attribute type */
++static BOOL secattr_type_name(struct md_model *md, ULONG32 ctor, char *buf, ULONG max)
++{
++    ULONG32 parent = 0;
++    ULONG ns = 0, nm = 0, asmrow = 0;
++    char name[512];
++    const char *sns, *snm;
++
++    if (TK_T(ctor) == T_MEMBERREF)
++    {
++        ULONG v = *mc(md, T_MEMBERREF, TK_R(ctor), 0);
++
++        parent = decode_coded(CI_MEMBERREFPARENT, v);
++    }
++    else if (TK_T(ctor) == T_METHOD)
++    {
++        ULONG owner = member_owner(md, T_TYPEDEF, 5, T_METHOD, TK_R(ctor));
++
++        parent = MKTK(T_TYPEDEF, owner ? owner : 1);
++    }
++    if (TK_T(parent) == T_TYPEREF)
++    {
++        ULONG scope = decode_coded(CI_RESSCOPE, *mc(md, T_TYPEREF, TK_R(parent), 0));
++
++        nm = *mc(md, T_TYPEREF, TK_R(parent), 1);
++        ns = *mc(md, T_TYPEREF, TK_R(parent), 2);
++        if (TK_T(scope) == T_ASMREF) asmrow = TK_R(scope);
++    }
++    else if (TK_T(parent) == T_TYPEDEF)
++    {
++        nm = *mc(md, T_TYPEDEF, TK_R(parent), 1);
++        ns = *mc(md, T_TYPEDEF, TK_R(parent), 2);
++    }
++    else return FALSE;
++    snm = (const char *)md->str.d + nm;
++    sns = (const char *)md->str.d + ns;
++    if (*sns) snprintf(name, sizeof(name), "%s.%s", sns, snm); else snprintf(name, sizeof(name), "%s", snm);
++    if (asmrow)
++    {
++        char tok[24] = "null";
++        ULONG k = *mc(md, T_ASMREF, asmrow, 5), kl;
++        const BYTE *kd;
++        const char *an = (const char *)md->str.d + *mc(md, T_ASMREF, asmrow, 6);
++        const char *cu = (const char *)md->str.d + *mc(md, T_ASMREF, asmrow, 7);
++
++        if (k && heap_entry(&md->blob, k, &kd, &kl) && kl == 8)
++            snprintf(tok, sizeof(tok), "%02x%02x%02x%02x%02x%02x%02x%02x", kd[0], kd[1], kd[2], kd[3], kd[4], kd[5], kd[6], kd[7]);
++        snprintf(buf, max, "%s, %s, Version=%lu.%lu.%lu.%lu, Culture=%s, PublicKeyToken=%s", name, an,
++                 *mc(md, T_ASMREF, asmrow, 0), *mc(md, T_ASMREF, asmrow, 1), *mc(md, T_ASMREF, asmrow, 2),
++                 *mc(md, T_ASMREF, asmrow, 3), *cu ? cu : "neutral", tok);
++    }
++    else snprintf(buf, max, "%s", name);
++    return TRUE;
++}
++
++static HRESULT WINAPI emit_DefineSecurityAttributeSet(IMetaDataEmit2 *iface, ULONG32 obj, COR_SECATTR *attrs, ULONG count,
++                                                      ULONG *perr)
++{
++    EMIT_ENTER;
++    ULONG i, a;
++    BOOL *used;
++
++    TRACE("%p %#x %p %lu %p\n", iface, obj, attrs, count, perr);
++    if (perr) *perr = 0;
++    if (!attrs || !count) return E_INVALIDARG;
++    if (TK_T(obj) != T_TYPEDEF && TK_T(obj) != T_METHOD && TK_T(obj) != T_ASSEMBLY) return E_INVALIDARG;
++    if (!tok_ok(md, obj)) return CLDB_E_INDEX_NOTFOUND;
++    NO_MEM(used = calloc(count, sizeof(*used)));
++
++    /* one permission set per security action, in the order the actions first appear */
++    for (i = 0; i < count; i++)
++    {
++        struct sigbuf set = {0};
++        ULONG nattrs = 0, action = 0;
++        BOOL first = TRUE;
++
++        if (used[i]) continue;
++        for (a = i; a < count; a++)
++        {
++            const BYTE *c = attrs[a].pCustomAttribute;
++            ULONG cb = attrs[a].cbCustomAttribute, act, nnamed, plen;
++            char name[1024];
++            struct sigr r;
++            struct sigbuf props = {0};
++
++            if (!c || cb < 8 || c[0] != 1 || c[1] != 0 || !secattr_type_name(md, attrs[a].tkCtor, name, sizeof(name)))
++            {
++                if (perr) *perr = a;
++                free(set.p); free(used);
++                return META_E_CA_INVALID_BLOB;
++            }
++            act = rd32(c + 2);
++            if (first) { action = act; first = FALSE; }
++            if (act != action) continue;
++            used[a] = TRUE;
++            if (!nattrs) sb_put(&set, ".", 1);       /* the binary format marker, then the count */
++            nattrs++;
++            nnamed = rd16(c + 6);
++            r.p = c + 8; r.end = c + cb; r.fail = FALSE;
++            sb_comp(&props, nnamed);
++            sb_put(&props, r.p, r.end - r.p);
++            plen = props.n;
++            sb_comp(&set, strlen(name));
++            sb_put(&set, name, strlen(name));
++            sb_comp(&set, plen);
++            sb_put(&set, props.p, props.n);
++            free(props.p);
++        }
++        {
++            /* the count follows the marker: rebuild the blob as marker, count, attributes */
++            struct sigbuf blob = {0};
++            ULONG32 pm;
++
++            sb_put(&blob, ".", 1);
++            sb_comp(&blob, nattrs);
++            sb_put(&blob, set.p + 1, set.n - 1);
++            hr = define_permission_set(m, obj, action, blob.p, blob.n, FALSE, &pm);
++            free(blob.p);
++        }
++        free(set.p);
++        if (FAILED(hr)) { if (perr) *perr = i; free(used); return hr; }
++    }
++    free(used);
++    return S_OK;
++}
++
++/* ---- not supported ---- */
++
++static HRESULT WINAPI emit_ApplyEditAndContinue(IMetaDataEmit2 *iface, IUnknown *import)
++{
++    FIXME("%p %p: edit and continue is not supported\n", iface, import);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI emit_Merge(IMetaDataEmit2 *iface, IMetaDataImport *import, IMapToken *map, IUnknown *handler)
++{
++    FIXME("%p %p %p %p\n", iface, import, map, handler);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI emit_MergeEnd(IMetaDataEmit2 *iface)
++{
++    FIXME("%p\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI emit_GetDeltaSaveSize(IMetaDataEmit2 *iface, DWORD save, DWORD *size)
++{
++    FIXME("%p %#lx %p: edit and continue is not supported\n", iface, save, size);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI emit_SaveDelta(IMetaDataEmit2 *iface, const WCHAR *file, DWORD flags)
++{
++    FIXME("%p %s %#lx: edit and continue is not supported\n", iface, debugstr_w(file), flags);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI emit_SaveDeltaToStream(IMetaDataEmit2 *iface, IStream *stream, DWORD flags)
++{
++    FIXME("%p %p %#lx: edit and continue is not supported\n", iface, stream, flags);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI emit_SaveDeltaToMemory(IMetaDataEmit2 *iface, void *data, ULONG size)
++{
++    FIXME("%p %p %lu: edit and continue is not supported\n", iface, data, size);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI emit_ResetENCLog(IMetaDataEmit2 *iface)
++{
++    FIXME("%p: edit and continue is not supported\n", iface);
++    return E_NOTIMPL;
++}
++
++static const IMetaDataEmit2Vtbl emit_vtbl =
++{
++    emit_QueryInterface, emit_AddRef, emit_Release,
++    emit_SetModuleProps, emit_Save, emit_SaveToStream, emit_GetSaveSize, emit_DefineTypeDef, emit_DefineNestedType,
++    emit_SetHandler, emit_DefineMethod, emit_DefineMethodImpl, emit_DefineTypeRefByName, emit_DefineImportType,
++    emit_DefineMemberRef, emit_DefineImportMember, emit_DefineEvent, emit_SetClassLayout, emit_DeleteClassLayout,
++    emit_SetFieldMarshal, emit_DeleteFieldMarshal, emit_DefinePermissionSet, emit_SetRVA, emit_GetTokenFromSig,
++    emit_DefineModuleRef, emit_SetParent, emit_GetTokenFromTypeSpec, emit_SaveToMemory, emit_DefineUserString,
++    emit_DeleteToken, emit_SetMethodProps, emit_SetTypeDefProps, emit_SetEventProps, emit_SetPermissionSetProps,
++    emit_DefinePinvokeMap, emit_SetPinvokeMap, emit_DeletePinvokeMap, emit_DefineCustomAttribute,
++    emit_SetCustomAttributeValue, emit_DefineField, emit_DefineProperty, emit_DefineParam, emit_SetFieldProps,
++    emit_SetPropertyProps, emit_SetParamProps, emit_DefineSecurityAttributeSet, emit_ApplyEditAndContinue,
++    emit_TranslateSigWithScope, emit_SetMethodImplFlags, emit_SetFieldRVA, emit_Merge, emit_MergeEnd,
++    emit_DefineMethodSpec, emit_GetDeltaSaveSize, emit_SaveDelta, emit_SaveDeltaToStream, emit_SaveDeltaToMemory,
++    emit_DefineGenericParam, emit_SetGenericParamProps, emit_ResetENCLog,
++};
+diff --git a/dlls/rometadata/main.c b/dlls/rometadata/main.c
+index 48d8cd9..1b331ab 100644
+--- a/dlls/rometadata/main.c
++++ b/dlls/rometadata/main.c
+@@ -27,6 +27,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(rometadata);
+ 
+ HRESULT metadata_open_file(const WCHAR *path, DWORD flags, REFIID riid, IUnknown **obj);
+ HRESULT metadata_open_memory(const void *data, ULONG size, DWORD flags, REFIID riid, IUnknown **obj);
++HRESULT metadata_define_scope(REFIID riid, IUnknown **obj);
+ 
+ struct dispenser_option
+ {
+@@ -98,9 +99,8 @@ static ULONG WINAPI MetaDataDispenser_Release(IMetaDataDispenserEx *iface)
+ static HRESULT WINAPI MetaDataDispenser_DefineScope(IMetaDataDispenserEx *iface, REFCLSID rclsid,
+                                                     DWORD create_flags, REFIID riid, IUnknown **obj)
+ {
+-    WARN("%p %s %lx %s %p: no metadata engine\n", iface, debugstr_guid(rclsid), create_flags, debugstr_guid(riid),
+-            obj);
+-    return E_NOTIMPL;
++    TRACE("%p %s %lx %s %p\n", iface, debugstr_guid(rclsid), create_flags, debugstr_guid(riid), obj);
++    return metadata_define_scope(riid, obj);
+ }
+ 
+ static HRESULT WINAPI MetaDataDispenser_OpenScope(IMetaDataDispenserEx *iface, const WCHAR *scope,
+diff --git a/dlls/rometadata/metadata.c b/dlls/rometadata/metadata.c
+index 64212c4..4881bbe 100644
+--- a/dlls/rometadata/metadata.c
++++ b/dlls/rometadata/metadata.c
+@@ -27,6 +27,7 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "objbase.h"
++#include "wincrypt.h"
+ #include "cor.h"
+ #include "wine/debug.h"
+ 
+@@ -47,8 +48,13 @@ struct md_scope
+ {
+     IMetaDataImport2 import_iface;
+     IMetaDataAssemblyImport asm_iface;
++    IMetaDataEmit2 emit_iface;
++    IMetaDataAssemblyEmit asmemit_iface;
+     LONG refcount;
+ 
++    struct md_model *model;     /* the writer's tables when the scope can be edited */
++    BOOL dirty;                 /* the model changed since the tables above were loaded */
++
+     BYTE *file;                 /* owned copy of the image or metadata blob */
+     SIZE_T file_size;
+     const BYTE *root;           /* start of the metadata root */
+@@ -597,14 +603,24 @@ static HRESULT scope_create(const void *data, SIZE_T size, struct md_scope **ret
+ 
+ /* ---- helpers on the object ---- */
+ 
++static void model_sync(struct md_scope *m);
++struct md_model;
++static void model_free(struct md_model *md);
++
+ static inline struct md_scope *impl_from_import(IMetaDataImport2 *iface)
+ {
+-    return CONTAINING_RECORD(iface, struct md_scope, import_iface);
++    struct md_scope *m = CONTAINING_RECORD(iface, struct md_scope, import_iface);
++
++    model_sync(m);
++    return m;
+ }
+ 
+ static inline struct md_scope *impl_from_asm(IMetaDataAssemblyImport *iface)
+ {
+-    return CONTAINING_RECORD(iface, struct md_scope, asm_iface);
++    struct md_scope *m = CONTAINING_RECORD(iface, struct md_scope, asm_iface);
++
++    model_sync(m);
++    return m;
+ }
+ 
+ #define TK_T(tk) ((tk) >> 24)
+@@ -624,11 +640,47 @@ static BOOL tk_is(const struct md_scope *m, ULONG32 tk, unsigned int table)
+     return TK_T(tk) == table && TK_R(tk) >= 1 && TK_R(tk) <= m->tables[table].rows;
+ }
+ 
+-/* [start, end) row range of the children of a parent row, via a "list" column */
++/* The pointer tables (FieldPtr, MethodPtr, ParamPtr, EventPtr, PropertyPtr) of an uncompressed metadata
++ * stream put a level of indirection between a parent's list and the child rows. */
++static unsigned int ptr_table(unsigned int child)
++{
++    switch (child)
++    {
++    case T_FIELD: return 3;
++    case T_METHOD: return 5;
++    case T_PARAM: return 7;
++    case T_EVENT: return 0x13;
++    case T_PROPERTY: return 0x16;
++    }
++    return 0;
++}
++
++/* the child row at position idx of a list */
++static ULONG child_row(const struct md_scope *m, unsigned int child, ULONG idx)
++{
++    unsigned int p = ptr_table(child);
++
++    return p && m->tables[p].rows ? cell(m, p, idx, 0) : idx;
++}
++
++/* the list position of a child row */
++static ULONG child_idx(const struct md_scope *m, unsigned int child, ULONG rid)
++{
++    unsigned int p = ptr_table(child);
++    ULONG i;
++
++    if (!p || !m->tables[p].rows) return rid;
++    for (i = 1; i <= m->tables[p].rows; i++)
++        if (cell(m, p, i, 0) == rid) return i;
++    return 0;
++}
++
++/* [start, end) positions of the children of a parent row, via a "list" column */
+ static void child_range(const struct md_scope *m, unsigned int parent, ULONG prid, unsigned int listcol,
+                         unsigned int child, ULONG *start, ULONG *end)
+ {
+-    ULONG crows = m->tables[child].rows;
++    unsigned int p = ptr_table(child);
++    ULONG crows = p && m->tables[p].rows ? m->tables[p].rows : m->tables[child].rows;
+ 
+     *start = cell(m, parent, prid, listcol);
+     *end = prid < m->tables[parent].rows ? cell(m, parent, prid + 1, listcol) : crows + 1;
+@@ -643,6 +695,9 @@ static void child_range(const struct md_scope *m, unsigned int parent, ULONG pri
+ static ULONG owner_of(const struct md_scope *m, unsigned int parent, unsigned int listcol, ULONG rid)
+ {
+     ULONG lo = 1, hi = m->tables[parent].rows, best = 0;
++    unsigned int child = parent == T_TYPEDEF ? (listcol == 4 ? T_FIELD : T_METHOD) : T_PARAM;
++
++    if (!(rid = child_idx(m, child, rid))) return 0;
+ 
+     while (lo <= hi && hi)
+     {
+@@ -706,17 +761,19 @@ static void constant_out(const struct md_scope *m, ULONG32 parent, DWORD *type,
+ 
+ /* ---- IUnknown ---- */
+ 
+-static HRESULT WINAPI import_QueryInterface(IMetaDataImport2 *iface, REFIID riid, void **obj)
++static HRESULT scope_qi(struct md_scope *m, REFIID riid, void **obj)
+ {
+-    struct md_scope *m = impl_from_import(iface);
+-
+-    TRACE("%p %s %p\n", iface, debugstr_guid(riid), obj);
++    TRACE("%p %s %p\n", m, debugstr_guid(riid), obj);
+ 
+     if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IMetaDataImport)
+         || IsEqualGUID(riid, &IID_IMetaDataImport2))
+         *obj = &m->import_iface;
+     else if (IsEqualGUID(riid, &IID_IMetaDataAssemblyImport))
+         *obj = &m->asm_iface;
++    else if (m->model && (IsEqualGUID(riid, &IID_IMetaDataEmit) || IsEqualGUID(riid, &IID_IMetaDataEmit2)))
++        *obj = &m->emit_iface;
++    else if (m->model && IsEqualGUID(riid, &IID_IMetaDataAssemblyEmit))
++        *obj = &m->asmemit_iface;
+     else
+     {
+         WARN("Unsupported interface %s\n", debugstr_guid(riid));
+@@ -727,25 +784,36 @@ static HRESULT WINAPI import_QueryInterface(IMetaDataImport2 *iface, REFIID riid
+     return S_OK;
+ }
+ 
++static ULONG scope_release(struct md_scope *m);
++
++static HRESULT WINAPI import_QueryInterface(IMetaDataImport2 *iface, REFIID riid, void **obj)
++{
++    return scope_qi(CONTAINING_RECORD(iface, struct md_scope, import_iface), riid, obj);
++}
++
+ static ULONG WINAPI import_AddRef(IMetaDataImport2 *iface)
+ {
+-    struct md_scope *m = impl_from_import(iface);
+-    return InterlockedIncrement(&m->refcount);
++    return InterlockedIncrement(&CONTAINING_RECORD(iface, struct md_scope, import_iface)->refcount);
+ }
+ 
+-static ULONG WINAPI import_Release(IMetaDataImport2 *iface)
++static ULONG scope_release(struct md_scope *m)
+ {
+-    struct md_scope *m = impl_from_import(iface);
+     ULONG ref = InterlockedDecrement(&m->refcount);
+ 
+     if (!ref)
+     {
++        model_free(m->model);
+         free(m->file);
+         free(m);
+     }
+     return ref;
+ }
+ 
++static ULONG WINAPI import_Release(IMetaDataImport2 *iface)
++{
++    return scope_release(CONTAINING_RECORD(iface, struct md_scope, import_iface));
++}
++
+ /* ---- enumeration control ---- */
+ 
+ static void WINAPI import_CloseEnum(IMetaDataImport2 *iface, void *hEnum)
+@@ -864,7 +932,11 @@ static void list_members(const struct md_scope *m, ULONG32 cl, int kind, const c
+ 
+     child_range(m, T_TYPEDEF, TK_R(cl), kind ? 4 : 5, child, &s, &e);
+     for (i = s; i < e; i++)
+-        if (!filter || name_eq(cell_str(m, child, i, kind ? 1 : 3), filter)) tk_add(list, MKTK(child, i));
++    {
++        ULONG r = child_row(m, child, i);
++
++        if (!filter || name_eq(cell_str(m, child, r, kind ? 1 : 3), filter)) tk_add(list, MKTK(child, r));
++    }
+ }
+ 
+ static HRESULT enum_members_common(struct md_scope *m, void **phEnum, ULONG32 cl, const WCHAR *name, int kinds,
+@@ -925,7 +997,7 @@ static HRESULT WINAPI import_EnumParams(IMetaDataImport2 *iface, void **phEnum,
+ 
+         if (!tk_is(m, mb, T_METHOD)) return CLDB_E_INDEX_NOTFOUND;
+         child_range(m, T_METHOD, TK_R(mb), 5, T_PARAM, &s, &e);
+-        for (i = s; i < e; i++) tk_add(&list, MKTK(T_PARAM, i));
++        for (i = s; i < e; i++) tk_add(&list, MKTK(T_PARAM, child_row(m, T_PARAM, i)));
+     }
+     ENUM_END(phEnum, out, cMax, pc);
+ }
+@@ -991,7 +1063,7 @@ static HRESULT enum_evprop(struct md_scope *m, void **phEnum, ULONG32 td, int ki
+         {
+             if (cell(m, map, i, 0) != TK_R(td)) continue;
+             child_range(m, map, i, 1, child, &s, &e);
+-            for (j = s; j < e; j++) tk_add(&list, MKTK(child, j));
++            for (j = s; j < e; j++) tk_add(&list, MKTK(child, child_row(m, child, j)));
+         }
+     }
+     ENUM_END(phEnum, out, cMax, pc);
+@@ -1172,17 +1244,17 @@ static HRESULT find_member(struct md_scope *m, ULONG32 td, const WCHAR *name, co
+         for (i = s; i < e; i++)
+         {
+             const BYTE *data;
+-            ULONG size;
++            ULONG size, r = child_row(m, child, i);
+ 
+-            if (!name_eq(cell_str(m, child, i, kind ? 1 : 3), u)) continue;
++            if (!name_eq(cell_str(m, child, r, kind ? 1 : 3), u)) continue;
+             if (sig && cbsig)
+             {
+-                cell_blob(m, child, i, col, &data, &size);
++                cell_blob(m, child, r, col, &data, &size);
+                 if (size != cbsig || memcmp(data, sig, size)) continue;
+             }
+             /* private-scope members are not found by name */
+-            if ((cell(m, child, i, kind ? 0 : 2) & 7) == 0) continue;
+-            *pmb = MKTK(child, i);
++            if ((cell(m, child, r, kind ? 0 : 2) & 7) == 0) continue;
++            *pmb = MKTK(child, r);
+             hr = S_OK;
+             break;
+         }
+@@ -1442,9 +1514,9 @@ static HRESULT WINAPI import_GetEventProps(IMetaDataImport2 *iface, ULONG32 ev,
+         *cls = 0;
+         for (i = 1; i <= rows(m, T_EVENTMAP); i++)
+         {
+-            ULONG s, e;
++            ULONG s, e, idx = child_idx(m, T_EVENT, TK_R(ev));
+             child_range(m, T_EVENTMAP, i, 1, T_EVENT, &s, &e);
+-            if (TK_R(ev) >= s && TK_R(ev) < e) { *cls = MKTK(T_TYPEDEF, cell(m, T_EVENTMAP, i, 0)); break; }
++            if (idx >= s && idx < e) { *cls = MKTK(T_TYPEDEF, cell(m, T_EVENTMAP, i, 0)); break; }
+         }
+     }
+     if (flags) *flags = cell(m, T_EVENT, TK_R(ev), 0);
+@@ -1488,9 +1560,9 @@ static HRESULT WINAPI import_GetClassLayout(IMetaDataImport2 *iface, ULONG32 td,
+     child_range(m, T_TYPEDEF, TK_R(td), 4, T_FIELD, &s, &e);
+     for (i = 1; i <= rows(m, T_FIELDLAYOUT); i++)
+     {
+-        ULONG f = cell(m, T_FIELDLAYOUT, i, 1);
++        ULONG f = cell(m, T_FIELDLAYOUT, i, 1), fi = child_idx(m, T_FIELD, f);
+ 
+-        if (f < s || f >= e) continue;
++        if (fi < s || fi >= e) continue;
+         if (offsets && n < cMax)
+         {
+             offsets[n].ridOfField = MKTK(T_FIELD, f);
+@@ -1683,7 +1755,7 @@ static HRESULT WINAPI import_GetParamForMethodIndex(IMetaDataImport2 *iface, ULO
+     *ppd = 0;
+     child_range(m, T_METHOD, TK_R(md), 5, T_PARAM, &s, &e);
+     for (i = s; i < e; i++)
+-        if (cell(m, T_PARAM, i, 1) == seq) { *ppd = MKTK(T_PARAM, i); return S_OK; }
++        if (cell(m, T_PARAM, child_row(m, T_PARAM, i), 1) == seq) { *ppd = MKTK(T_PARAM, child_row(m, T_PARAM, i)); return S_OK; }
+     return CLDB_E_RECORD_NOTFOUND;
+ }
+ 
+@@ -1775,9 +1847,9 @@ static HRESULT WINAPI import_GetPropertyProps(IMetaDataImport2 *iface, ULONG32 p
+         *cls = 0;
+         for (i = 1; i <= rows(m, T_PROPMAP); i++)
+         {
+-            ULONG s, e;
++            ULONG s, e, idx = child_idx(m, T_PROPERTY, TK_R(prop));
+             child_range(m, T_PROPMAP, i, 1, T_PROPERTY, &s, &e);
+-            if (TK_R(prop) >= s && TK_R(prop) < e) { *cls = MKTK(T_TYPEDEF, cell(m, T_PROPMAP, i, 0)); break; }
++            if (idx >= s && idx < e) { *cls = MKTK(T_TYPEDEF, cell(m, T_PROPMAP, i, 0)); break; }
+         }
+     }
+     if (flags) *flags = cell(m, T_PROPERTY, TK_R(prop), 0);
+@@ -1974,17 +2046,17 @@ static HRESULT WINAPI import_GetVersionString(IMetaDataImport2 *iface, WCHAR *bu
+ 
+ static HRESULT WINAPI asm_QueryInterface(IMetaDataAssemblyImport *iface, REFIID riid, void **obj)
+ {
+-    return import_QueryInterface(&impl_from_asm(iface)->import_iface, riid, obj);
++    return scope_qi(CONTAINING_RECORD(iface, struct md_scope, asm_iface), riid, obj);
+ }
+ 
+ static ULONG WINAPI asm_AddRef(IMetaDataAssemblyImport *iface)
+ {
+-    return import_AddRef(&impl_from_asm(iface)->import_iface);
++    return InterlockedIncrement(&CONTAINING_RECORD(iface, struct md_scope, asm_iface)->refcount);
+ }
+ 
+ static ULONG WINAPI asm_Release(IMetaDataAssemblyImport *iface)
+ {
+-    return import_Release(&impl_from_asm(iface)->import_iface);
++    return scope_release(CONTAINING_RECORD(iface, struct md_scope, asm_iface));
+ }
+ 
+ /* fill ASSEMBLYMETADATA from the four version columns at col .. col+3 and the culture string */
+@@ -2219,6 +2291,8 @@ static const IMetaDataImport2Vtbl import_vtbl =
+ 
+ /* ---- entry points ---- */
+ 
++#include "emit.c"
++
+ static HRESULT scope_create(const void *data, SIZE_T size, struct md_scope **ret)
+ {
+     struct md_scope *m;
+@@ -2234,6 +2308,8 @@ static HRESULT scope_create(const void *data, SIZE_T size, struct md_scope **ret
+     m->file_size = size;
+     m->import_iface.lpVtbl = &import_vtbl;
+     m->asm_iface.lpVtbl = &asm_vtbl;
++    m->emit_iface.lpVtbl = &emit_vtbl;
++    m->asmemit_iface.lpVtbl = &asmemit_vtbl;
+     m->refcount = 1;
+     if (FAILED(hr = parse_image(m, m->file, size)))
+     {
+@@ -2247,6 +2323,35 @@ static HRESULT scope_create(const void *data, SIZE_T size, struct md_scope **ret
+ 
+ #define OPEN_FLAG_WRITE 0x1
+ 
++/* edit a scope that was read from a file */
++static HRESULT scope_make_writable(struct md_scope *m)
++{
++    if (!(m->model = model_from_reader(m))) return E_NOTIMPL;   /* too big, or edit-and-continue tables */
++    return S_OK;
++}
++
++/* a new, empty scope: a module and the global type */
++HRESULT metadata_define_scope(REFIID riid, IUnknown **obj)
++{
++    struct md_scope *m;
++    HRESULT hr;
++
++    if (!obj) return E_INVALIDARG;
++    *obj = NULL;
++    if (!(m = calloc(1, sizeof(*m)))) return E_OUTOFMEMORY;
++    m->import_iface.lpVtbl = &import_vtbl;
++    m->asm_iface.lpVtbl = &asm_vtbl;
++    m->emit_iface.lpVtbl = &emit_vtbl;
++    m->asmemit_iface.lpVtbl = &asmemit_vtbl;
++    m->refcount = 1;
++    if (!(m->model = model_new())) { free(m); return E_OUTOFMEMORY; }
++    m->dirty = TRUE;
++    model_sync(m);
++    hr = IMetaDataImport2_QueryInterface(&m->import_iface, riid, (void **)obj);
++    IMetaDataImport2_Release(&m->import_iface);
++    return hr;
++}
++
+ HRESULT metadata_open_memory(const void *data, ULONG size, DWORD flags, REFIID riid, IUnknown **obj)
+ {
+     struct md_scope *m;
+@@ -2255,8 +2360,12 @@ HRESULT metadata_open_memory(const void *data, ULONG size, DWORD flags, REFIID r
+     if (!obj) return E_INVALIDARG;
+     *obj = NULL;
+     if (!data || !size) return E_INVALIDARG;
+-    if (flags & OPEN_FLAG_WRITE) return E_NOTIMPL;
+     if (FAILED(hr = scope_create(data, size, &m))) return hr;
++    if ((flags & OPEN_FLAG_WRITE) && FAILED(hr = scope_make_writable(m)))
++    {
++        IMetaDataImport2_Release(&m->import_iface);
++        return hr;
++    }
+     hr = IMetaDataImport2_QueryInterface(&m->import_iface, riid, (void **)obj);
+     IMetaDataImport2_Release(&m->import_iface);
+     return hr;
+@@ -2272,7 +2381,6 @@ HRESULT metadata_open_file(const WCHAR *path, DWORD flags, REFIID riid, IUnknown
+ 
+     if (!path || !obj) return E_INVALIDARG;
+     *obj = NULL;
+-    if (flags & OPEN_FLAG_WRITE) return E_NOTIMPL;
+     file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+     if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+diff --git a/dlls/rometadata/tests/rometadata.c b/dlls/rometadata/tests/rometadata.c
+index 36f8150..70bf30f 100644
+--- a/dlls/rometadata/tests/rometadata.c
++++ b/dlls/rometadata/tests/rometadata.c
+@@ -644,6 +644,104 @@ static void test_real_file(void)
+     IMetaDataDispenser_Release(dispenser);
+ }
+ 
++static void test_emit(void)
++{
++    static const BYTE sig[] = { 0x20, 1, 1, 8 };
++    IMetaDataDispenserEx *dispenser;
++    IMetaDataEmit2 *emit;
++    IMetaDataAssemblyEmit *asm_emit;
++    IMetaDataImport2 *import;
++    IMetaDataImport *reopened;
++    mdTypeDef td, td2, found;
++    mdMethodDef method, method2, methods[4];
++    mdTypeRef object;
++    mdAssemblyRef asm_ref;
++    ASSEMBLYMETADATA am = { 4, 0, 0, 0 };
++    HCORENUM enum_handle = NULL;
++    ULONG count, len;
++    WCHAR name[64];
++    DWORD size, flags;
++    mdToken ext;
++    BYTE *data;
++    HRESULT hr;
++
++    hr = MetaDataGetDispenser(&CLSID_CorMetaDataDispenser, &IID_IMetaDataDispenserEx, (void **)&dispenser);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IMetaDataDispenserEx_DefineScope(dispenser, &CLSID_CorMetaDataDispenser, 0, &IID_IMetaDataEmit2, (IUnknown **)&emit);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IMetaDataEmit2_QueryInterface(emit, &IID_IMetaDataAssemblyEmit, (void **)&asm_emit);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IMetaDataEmit2_QueryInterface(emit, &IID_IMetaDataImport2, (void **)&import);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    hr = IMetaDataEmit2_SetModuleProps(emit, L"emitted.dll");
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IMetaDataAssemblyEmit_DefineAssemblyRef(asm_emit, NULL, 0, L"mscorlib", &am, NULL, 0, 0, &asm_ref);
++    ok(hr == S_OK && asm_ref == 0x23000001, "Got unexpected hr %#lx, token %#x.\n", hr, asm_ref);
++    hr = IMetaDataEmit2_DefineTypeRefByName(emit, asm_ref, L"System.Object", &object);
++    ok(hr == S_OK && object == 0x01000001, "Got unexpected hr %#lx, token %#x.\n", hr, object);
++
++    hr = IMetaDataEmit2_DefineTypeDef(emit, L"Ns.One", 1, object, NULL, &td);
++    ok(hr == S_OK && td == 0x02000002, "Got unexpected hr %#lx, token %#x.\n", hr, td);
++    hr = IMetaDataEmit2_DefineTypeDef(emit, L"Ns.One", 1, object, NULL, &td2);
++    ok(hr == CLDB_E_RECORD_DUPLICATE, "Got unexpected hr %#lx.\n", hr);
++    hr = IMetaDataEmit2_DefineTypeDef(emit, L"Ns.Two", 1, object, NULL, &td2);
++    ok(hr == S_OK && td2 == 0x02000003, "Got unexpected hr %#lx, token %#x.\n", hr, td2);
++
++    /* members of an earlier type defined after those of a later one keep their tokens */
++    hr = IMetaDataEmit2_DefineMethod(emit, td, L"A", 6, sig, sizeof(sig), 0, 0, &method);
++    ok(hr == S_OK && method == 0x06000001, "Got unexpected hr %#lx, token %#x.\n", hr, method);
++    hr = IMetaDataEmit2_DefineMethod(emit, td2, L"B", 6, sig, sizeof(sig), 0, 0, &method2);
++    ok(hr == S_OK && method2 == 0x06000002, "Got unexpected hr %#lx, token %#x.\n", hr, method2);
++    hr = IMetaDataEmit2_DefineMethod(emit, td, L"C", 6, sig, sizeof(sig), 0, 0, &methods[0]);
++    ok(hr == S_OK && methods[0] == 0x06000003, "Got unexpected hr %#lx, token %#x.\n", hr, methods[0]);
++
++    hr = IMetaDataImport2_EnumMethods(import, &enum_handle, td, methods, ARRAY_SIZE(methods), &count);
++    ok(hr == S_OK && count == 2 && methods[0] == method && methods[1] == 0x06000003, "Got unexpected hr %#lx, count %lu.\n", hr, count);
++    IMetaDataImport2_CloseEnum(import, enum_handle);
++    enum_handle = NULL;
++    hr = IMetaDataImport2_EnumMethods(import, &enum_handle, td2, methods, ARRAY_SIZE(methods), &count);
++    ok(hr == S_OK && count == 1 && methods[0] == method2, "Got unexpected hr %#lx, count %lu.\n", hr, count);
++    IMetaDataImport2_CloseEnum(import, enum_handle);
++
++    /* Save renumbers: the methods of each type become adjacent */
++    hr = IMetaDataEmit2_GetSaveSize(emit, 0, &size);
++    ok(hr == S_OK && size > 100, "Got unexpected hr %#lx, size %lu.\n", hr, size);
++    data = malloc(size);
++    hr = IMetaDataEmit2_SaveToMemory(emit, data, size);
++    ok(hr == S_OK && !memcmp(data, "BSJB", 4), "Got unexpected hr %#lx.\n", hr);
++    hr = IMetaDataDispenserEx_OpenScopeOnMemory(dispenser, data, size, 0, &IID_IMetaDataImport, (IUnknown **)&reopened);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IMetaDataImport_FindTypeDefByName(reopened, L"Ns.Two", 0, &found);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IMetaDataImport_GetTypeDefProps(reopened, found, name, ARRAY_SIZE(name), &len, &flags, &ext);
++    ok(hr == S_OK && !wcscmp(name, L"Ns.Two") && flags == 1, "Got unexpected hr %#lx, %s.\n", hr, wine_dbgstr_w(name));
++    enum_handle = NULL;
++    hr = IMetaDataImport_EnumMethods(reopened, &enum_handle, found, methods, ARRAY_SIZE(methods), &count);
++    ok(hr == S_OK && count == 1, "Got unexpected hr %#lx, count %lu.\n", hr, count);
++    hr = IMetaDataImport_GetMethodProps(reopened, methods[0], NULL, name, ARRAY_SIZE(name), &len, NULL, NULL, NULL, NULL, NULL);
++    ok(hr == S_OK && !wcscmp(name, L"B"), "Got unexpected hr %#lx, %s.\n", hr, wine_dbgstr_w(name));
++    IMetaDataImport_CloseEnum(reopened, enum_handle);
++    IMetaDataImport_Release(reopened);
++
++    /* a scope read for reading has no emit interface */
++    hr = IMetaDataDispenserEx_OpenScopeOnMemory(dispenser, data, size, 0, &IID_IMetaDataImport, (IUnknown **)&reopened);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    {
++        void *unk = (void *)1;
++
++        hr = IMetaDataImport_QueryInterface(reopened, &IID_IMetaDataEmit, &unk);
++        ok(FAILED(hr) && !unk, "Got unexpected hr %#lx.\n", hr);
++    }
++    IMetaDataImport_Release(reopened);
++    free(data);
++
++    IMetaDataImport2_Release(import);
++    IMetaDataAssemblyEmit_Release(asm_emit);
++    IMetaDataEmit2_Release(emit);
++    IMetaDataDispenserEx_Release(dispenser);
++}
++
+ START_TEST(rometadata)
+ {
+     HRESULT hr;
+@@ -655,6 +753,7 @@ START_TEST(rometadata)
+     test_dispenser_options();
+     test_import();
+     test_real_file();
++    test_emit();
+ 
+     RoUninitialize();
+ }

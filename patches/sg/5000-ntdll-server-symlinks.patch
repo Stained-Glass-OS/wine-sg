@@ -1,0 +1,189 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll, server: Keep relative symbolic link targets as written and make a link opened as itself an object of its own.
+
+Two fixes to the symbolic links of the series (ADR 0013 code):
+
+A relative link target is stored as it was written: its leading ".." steps,
+then its named components spelt as the file system has them. The target was
+resolved and the shortest relative path recomputed, so "..\d\a.txt" made in
+d read back from FSCTL_GET_REPARSE_POINT as "a.txt" (msvcp140's
+std::filesystem tests, read_symlink). Windows stores the text it is given.
+
+A symbolic link opened as itself (FILE_OPEN_REPARSE_POINT, as DeleteFileW
+and RemoveDirectoryW open it) is an object of its own: the server gives it the
+link's own inode, so its sharing is not checked against the handles open on
+its target. A directory link to a folder that other processes hold open
+without delete sharing (C:\windows) could not be removed: RemoveDirectoryW
+failed with ERROR_SHARING_VIOLATION (kernel32's volume test removes such a
+link on Windows). Deleting it removes the link, never the target; a client
+performing a deletion for another user accepts the link's own identity too.
+
+Gate: test/ntdll-symlink-gate.sh (64/32).
+---
+ dlls/ntdll/unix/file.c | 60 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ server/fd.c            | 46 ++++++++++++++++++++++++++++----------
+ 2 files changed, 93 insertions(+), 13 deletions(-)
+
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index d2d002f..f739a1f 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -4389,7 +4389,9 @@ void sg_client_unlinks( const void *data, unsigned int size )
+         if (S_ISLNK( st.st_mode ))
+         {
+             struct stat target;
+-            if (!stat( path, &target ) && target.st_dev == rec.dev && target.st_ino == rec.ino)
++            /* the link's own inode when it was opened as itself, its target's otherwise */
++            if ((st.st_dev == rec.dev && st.st_ino == rec.ino) ||
++                (!stat( path, &target ) && target.st_dev == rec.dev && target.st_ino == rec.ino))
+                 unlink( path );
+             continue;
+         }
+@@ -7088,6 +7090,53 @@ static char *sg_relative_unix_path( const char *from_dir, const char *to )
+     return ret;
+ }
+ 
++/* A relative target as it was written: its leading ".." steps, then its named
++ * components spelt as the file system has them (the tail of the resolved
++ * target "abs"). Windows stores the text it is given, so "..\d\f" made
++ * in d reads back as "..\d\f", not as the shorter "f". NULL when the text
++ * has ".." after a name (the computed relative path is used then). */
++static char *sg_relative_as_written( const WCHAR *path, USHORT len, const char *abs )
++{
++    unsigned int ups = 0, names = 0, i = 0, seen_name = 0;
++    const char *tail;
++    char *ret, *p;
++
++    while (i < len)
++    {
++        unsigned int start = i, n;
++
++        while (i < len && path[i] != '\\' && path[i] != '/') i++;
++        n = i - start;
++        if (i < len) i++;
++        if (!n || (n == 1 && path[start] == '.')) continue;
++        if (n == 2 && path[start] == '.' && path[start + 1] == '.')
++        {
++            if (seen_name) return NULL;
++            ups++;
++            continue;
++        }
++        seen_name = 1;
++        names++;
++    }
++    if (!names) return NULL;
++    /* the last "names" components of abs */
++    tail = abs + strlen( abs );
++    while (tail > abs && tail[-1] == '/') tail--;
++    for (i = 0; i < names; i++)
++    {
++        while (tail > abs && tail[-1] != '/') tail--;
++        if (i + 1 < names)
++        {
++            if (tail == abs) return NULL;
++            tail--;
++        }
++    }
++    if (!(ret = malloc( ups * 3 + strlen( tail ) + 1 ))) return NULL;
++    for (p = ret; ups--; p += 3) memcpy( p, "../", 3 );
++    strcpy( p, tail );
++    return ret;
++}
++
+ /* "\x\.\y\..\z" -> "\x\z", past a leading "\??\X:" */
+ static void sg_collapse_nt_path( WCHAR *path )
+ {
+@@ -7205,6 +7254,15 @@ static NTSTATUS sg_reparse_unix_target( const char *link, const WCHAR *path, USH
+         *ret = abs;
+         return STATUS_SUCCESS;
+     }
++    /* the components as written, spelt as the file system has them (before
++     * realpath() resolves links along the way) */
++#ifndef SG_MUTANT_SYMLINK_SHORTEST
++    if ((*ret = sg_relative_as_written( path, len, abs )))
++    {
++        free( abs );
++        return STATUS_SUCCESS;
++    }
++#endif
+     /* both sides as real paths: the link's directory comes from the server
+      * resolved, the target through dosdevices */
+     if ((real = sg_real_path( abs )))
+diff --git a/server/fd.c b/server/fd.c
+index c01c154..e00e198 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -1190,6 +1190,15 @@ static void unlink_closed_fd( struct inode *inode, struct closed_fd *fd )
+         else if (S_ISDIR(st.st_mode)) rmdir( fd->unix_name );
+         else unlink( fd->unix_name );
+     }
++    else
++    {
++        struct stat lst;
++
++        /* a symbolic link opened as itself has the link's own inode */
++        if (!lstat( fd->unix_name, &lst ) && S_ISLNK( lst.st_mode ) &&
++            lst.st_dev == inode->device->dev && lst.st_ino == inode->ino)
++            unlink( fd->unix_name );
++    }
+ }
+ 
+ /* close all pending file descriptors in the closed list */
+@@ -2325,13 +2334,32 @@ opened:
+     if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))
+     {
+         unsigned int err;
+-        struct inode *inode = get_inode( st.st_dev, st.st_ino, fd->unix_fd );
++        struct inode *inode;
++        char *link_name = NULL;
++        struct stat lst;
++
++        /* Stained Glass OS: a symbolic link opened as itself (FILE_OPEN_REPARSE_POINT,
++         * as DeleteFileW and RemoveDirectoryW open) is an object of its own, as on
++         * Windows: its sharing is not checked against the handles open on its
++         * target, so a link to a folder others hold open can still be removed */
++        if ((options & FILE_OPEN_REPARSE_POINT) && (path = dup_fd_name( root, name )))
++        {
++            link_name = sg_link_name( path );
++            free( path );
++        }
++#ifndef SG_MUTANT_LINK_SHARES_TARGET
++        if (link_name && !lstat( link_name, &lst ) && S_ISLNK( lst.st_mode ))
++            inode = get_inode( lst.st_dev, lst.st_ino, fd->unix_fd );
++        else
++#endif
++            inode = get_inode( st.st_dev, st.st_ino, fd->unix_fd );
+ 
+         if (!inode)
+         {
+             /* we can close the fd because there are no others open on the same file,
+              * otherwise we wouldn't have failed to allocate a new inode
+              */
++            free( link_name );
+             goto error;
+         }
+ 
+@@ -2342,18 +2370,12 @@ opened:
+             fd->unix_name = realpath( path, NULL );
+             free( path );
+         }
+-        /* Stained Glass OS: a symbolic link opened as itself (FILE_OPEN_REPARSE_POINT,
+-         * as DeleteFileW and RemoveDirectoryW open) is named as itself, so that
+-         * deleting, renaming or reading it acts on the link -- never on its target */
+-        if ((options & FILE_OPEN_REPARSE_POINT) && (path = dup_fd_name( root, name )))
++        /* Stained Glass OS: a symbolic link opened as itself is named as itself, so
++         * that deleting, renaming or reading it acts on the link -- never on its target */
++        if (link_name)
+         {
+-            char *link_name = sg_link_name( path );
+-            if (link_name)
+-            {
+-                free( fd->unix_name );
+-                fd->unix_name = link_name;
+-            }
+-            free( path );
++            free( fd->unix_name );
++            fd->unix_name = link_name;
+         }
+ 
+         closed_fd->unix_fd = fd->unix_fd;

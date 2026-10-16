@@ -95,7 +95,8 @@ check "another machine" "$(grep -q 'RPC server is unavailable' "$T/e"; echo $?)"
 
 echo "== path, namespace, output"
 wm 'path win32_bios get name'
-check "path <class>" "$(sed -n 2p "$T/o" | grep -q 'BIOS'; echo $?)"
+# the BIOS name is the firmware's own (fast-b 3526: no invented "Default System BIOS"), so any value
+check "path <class>" "$(sed -n 1p "$T/o" | grep -q '^Name' && sed -n 2p "$T/o" | grep -q '[^[:space:]]'; echo $?)"
 wm '/namespace:\\root\cimv2 path win32_operatingsystem get version /value'
 check "/namespace" "$(grep -q '^Version=' "$T/o"; echo $?)"
 wm 'path win32_nonesuch get x'

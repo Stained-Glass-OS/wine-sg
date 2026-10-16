@@ -1,0 +1,608 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] qmgr: BITS upload and upload-reply jobs (3577)
+
+qmgr: BITS upload and upload-reply jobs, reply calls
+
+Upload jobs (BG_JOB_TYPE_UPLOAD, _UPLOAD_REPLY) were never sent. The transfer now speaks the
+BITS upload protocol (Create-Session, Fragment with Content-Range, Close-Session, Cancel-Session)
+over winhttp, resends from the server's received range, and reports errors with the file's
+context. Upload jobs take one http(s) file, leave the local file alone on Complete and Cancel.
+GetReplyProgress, GetReplyData, SetReplyFileName and GetReplyFileName are implemented; the class
+factory's LockServer answers S_OK; SetPriority and SetNotifyFlags give E_INVALIDARG for bad values.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+---
+diff --git a/dlls/qmgr/factory.c b/dlls/qmgr/factory.c
+index 9736e00..2cfbe9a 100644
+--- a/dlls/qmgr/factory.c
++++ b/dlls/qmgr/factory.c
+@@ -72,8 +72,9 @@ BITS_IClassFactory_CreateInstance(IClassFactory *iface, IUnknown *pUnkOuter, REF
+ static HRESULT WINAPI
+ BITS_IClassFactory_LockServer(IClassFactory *iface, BOOL fLock)
+ {
+-    FIXME("Not implemented\n");
+-    return E_NOTIMPL;
++    /* the service lives as long as the service control manager keeps it, not as long as clients lock it */
++    TRACE("%p, %d\n", iface, fLock);
++    return S_OK;
+ }
+ 
+ static const IClassFactoryVtbl BITS_IClassFactory_Vtbl =
+diff --git a/dlls/qmgr/file.c b/dlls/qmgr/file.c
+index f5c6c56..1ef1f3e 100644
+--- a/dlls/qmgr/file.c
++++ b/dlls/qmgr/file.c
+@@ -461,37 +461,45 @@ static WCHAR *range_headers(const WCHAR *headers, const BG_FILE_RANGE *range)
+     return ret;
+ }
+ 
+-static BOOL transfer_file_http(BackgroundCopyFileImpl *file, URL_COMPONENTSW *uc,
+-                               const WCHAR *tmpfile)
++static HINTERNET open_session(BackgroundCopyJobImpl *job, DWORD flags)
+ {
+-    BackgroundCopyJobImpl *job = file->owner;
+-    HANDLE handle;
+-    HINTERNET ses, con = NULL, req = NULL;
+-    DWORD flags = (uc->nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+-    char buf[4096];
+-    BOOL ret = FALSE;
+-    DWORD written, range;
+-
+-    transitionJobState(job, BG_JOB_STATE_QUEUED, BG_JOB_STATE_CONNECTING);
++    HINTERNET ses;
+ 
+     /* the job's proxy settings */
+     switch (job->proxy_usage)
+     {
+     case BG_JOB_PROXY_USAGE_NO_PROXY:
+-        ses = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, WINHTTP_FLAG_ASYNC);
++        ses = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, flags);
+         break;
+     case BG_JOB_PROXY_USAGE_OVERRIDE:
+         ses = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_NAMED_PROXY, job->proxy_list,
+-                          job->proxy_bypass ? job->proxy_bypass : WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
++                          job->proxy_bypass ? job->proxy_bypass : WINHTTP_NO_PROXY_BYPASS, flags);
+         break;
+     case BG_JOB_PROXY_USAGE_AUTODETECT:
+-        ses = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, NULL, NULL, WINHTTP_FLAG_ASYNC);
+-        if (!ses) ses = WinHttpOpen(NULL, 0, NULL, NULL, WINHTTP_FLAG_ASYNC);
++        ses = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, NULL, NULL, flags);
++        if (!ses) ses = WinHttpOpen(NULL, 0, NULL, NULL, flags);
+         break;
+     default:
+-        ses = WinHttpOpen(NULL, 0, NULL, NULL, WINHTTP_FLAG_ASYNC);
++        ses = WinHttpOpen(NULL, 0, NULL, NULL, flags);
+         break;
+     }
++    return ses;
++}
++
++static BOOL transfer_file_http(BackgroundCopyFileImpl *file, URL_COMPONENTSW *uc,
++                               const WCHAR *tmpfile)
++{
++    BackgroundCopyJobImpl *job = file->owner;
++    HANDLE handle;
++    HINTERNET ses, con = NULL, req = NULL;
++    DWORD flags = (uc->nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
++    char buf[4096];
++    BOOL ret = FALSE;
++    DWORD written, range;
++
++    transitionJobState(job, BG_JOB_STATE_QUEUED, BG_JOB_STATE_CONNECTING);
++
++    ses = open_session(job, WINHTTP_FLAG_ASYNC);
+     if (!ses) return FALSE;
+     WinHttpSetStatusCallback(ses, progress_callback_http, WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS, 0);
+     if (!WinHttpSetOption(ses, WINHTTP_OPTION_CONTEXT_VALUE, &file, sizeof(file))) goto done;
+@@ -615,6 +623,308 @@ static BOOL transfer_file_local(BackgroundCopyFileImpl *file, const WCHAR *tmpna
+     return ret;
+ }
+ 
++/* ---- uploads: the BITS upload protocol over HTTP ----
++ * A session is opened with a Create-Session packet, the file goes up in Fragment packets with
++ * a Content-Range header, and a Close-Session packet ends it; the server answers each one with
++ * an Ack packet (BITS-Packet-Type) that names the session and how much it has received. An
++ * upload-reply job takes the body of the Close-Session answer as the server's reply. */
++
++#define BITS_UPLOAD_PROTOCOL L"{7DF0354D-249B-430F-820D-3D2A9BEF4931}"
++#define UPLOAD_FRAGMENT_SIZE 262144
++#define MAX_REPLY_SIZE (64 * 1024 * 1024)
++
++struct bits_answer
++{
++    DWORD status;
++    WCHAR packet[32], protocol[64], session[64];
++    BOOL has_received;
++    ULONG64 received;
++    HRESULT bits_error;
++    BYTE *body;
++    DWORD body_len;
++};
++
++static BOOL answer_header(HINTERNET req, const WCHAR *name, WCHAR *buf, DWORD chars)
++{
++    DWORD size = chars * sizeof(WCHAR);
++    buf[0] = 0;
++    return WinHttpQueryHeaders(req, WINHTTP_QUERY_CUSTOM, name, buf, &size, WINHTTP_NO_HEADER_INDEX);
++}
++
++/* one packet: a POST whose BITS-Packet-Type header says what it is */
++static BOOL bits_packet(BackgroundCopyJobImpl *job, HINTERNET con, const WCHAR *path, DWORD flags,
++                        const WCHAR *type, const WCHAR *session, const WCHAR *extra,
++                        const BYTE *data, DWORD len, struct bits_answer *ans, BOOL keep_body)
++{
++    WCHAR *headers, num[64];
++    HINTERNET req;
++    DWORD size, got;
++    BOOL ret = FALSE;
++    size_t hlen;
++
++    memset(ans, 0, sizeof(*ans));
++    hlen = (job->http_options.headers ? wcslen(job->http_options.headers) : 0) + wcslen(type) + 128 +
++           (session ? wcslen(session) : 0) + (extra ? wcslen(extra) : 0);
++    if (!(headers = malloc(hlen * sizeof(WCHAR)))) return FALSE;
++    swprintf(headers, hlen, L"%sBITS-Packet-Type: %s\r\n", job->http_options.headers ? job->http_options.headers : L"", type);
++    if (session) swprintf(headers + wcslen(headers), hlen - wcslen(headers), L"BITS-Session-Id: %s\r\n", session);
++    if (extra) wcscat(headers, extra);
++    if (!wcscmp(type, L"Create-Session"))
++        swprintf(headers + wcslen(headers), hlen - wcslen(headers), L"BITS-Supported-Protocols: %s\r\n", BITS_UPLOAD_PROTOCOL);
++
++    if (!(req = WinHttpOpenRequest(con, L"POST", path, NULL, NULL, NULL, flags))) goto done;
++    if (!set_request_credentials(req, job) || !set_request_security(req, job)) goto done;
++    if (!WinHttpSendRequest(req, headers, ~0u, (void *)data, len, len, 0)) goto done;
++    if (!WinHttpReceiveResponse(req, NULL)) goto done;
++
++    size = sizeof(ans->status);
++    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &ans->status, &size, NULL))
++        goto done;
++    answer_header(req, L"BITS-Packet-Type", ans->packet, ARRAY_SIZE(ans->packet));
++    answer_header(req, L"BITS-Protocol", ans->protocol, ARRAY_SIZE(ans->protocol));
++    answer_header(req, L"BITS-Session-Id", ans->session, ARRAY_SIZE(ans->session));
++    if (answer_header(req, L"BITS-Received-Content-Range", num, ARRAY_SIZE(num)))
++    {
++        ans->has_received = TRUE;
++        ans->received = _wcstoui64(num, NULL, 10);
++    }
++    if (answer_header(req, L"BITS-Error-Code", num, ARRAY_SIZE(num)))
++        ans->bits_error = (HRESULT)wcstoul(num, NULL, 16);
++
++    for (;;)
++    {
++        BYTE chunk[4096], *grown;
++        if (!WinHttpReadData(req, chunk, sizeof(chunk), &got)) goto done;
++        if (!got) break;
++        if (!keep_body) continue;
++        if (ans->body_len + got > MAX_REPLY_SIZE) goto done;
++        if (!(grown = realloc(ans->body, ans->body_len + got))) goto done;
++        ans->body = grown;
++        memcpy(ans->body + ans->body_len, chunk, got);
++        ans->body_len += got;
++    }
++    ret = TRUE;
++done:
++    if (!ret) job->error.code = HRESULT_FROM_WIN32(GetLastError());
++    if (req) WinHttpCloseHandle(req);
++    free(headers);
++    return ret;
++}
++
++static void upload_fail(BackgroundCopyFileImpl *file, BG_ERROR_CONTEXT context, HRESULT hr)
++{
++    BackgroundCopyJobImpl *job = file->owner;
++
++    EnterCriticalSection(&job->cs);
++    job->error.code = hr;
++    job->error.context = context;
++    if (job->error.file) IBackgroundCopyFile2_Release(job->error.file);
++    job->error.file = &file->IBackgroundCopyFile2_iface;
++    IBackgroundCopyFile2_AddRef(job->error.file);
++    LeaveCriticalSection(&job->cs);
++}
++
++/* a packet that is no Ack: the server's own error code if it sent one */
++static HRESULT answer_error(const struct bits_answer *ans, HRESULT unsupported)
++{
++    if (ans->status < 200 || ans->status >= 300) return hresult_from_http_response(ans->status);
++    if (ans->bits_error) return ans->bits_error;
++    return unsupported;
++}
++
++static BOOL is_ack(const struct bits_answer *ans)
++{
++    return !wcsicmp(ans->packet, L"Ack");
++}
++
++static BOOL upload_reply_store(BackgroundCopyJobImpl *job, struct bits_answer *ans)
++{
++    BOOL ret = TRUE;
++
++    EnterCriticalSection(&job->cs);
++    job->reply_total = ans->body_len;
++    if (job->reply_file)
++    {
++        HANDLE h = CreateFileW(job->reply_file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++        DWORD written;
++
++        if (h == INVALID_HANDLE_VALUE || !WriteFile(h, ans->body, ans->body_len, &written, NULL)) ret = FALSE;
++        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
++    }
++    else
++    {
++        free(job->reply_data);
++        job->reply_data = ans->body;
++        ans->body = NULL;
++    }
++    if (ret) job->reply_size = ans->body_len;
++    LeaveCriticalSection(&job->cs);
++    return ret;
++}
++
++static BOOL transfer_file_upload(BackgroundCopyFileImpl *file)
++{
++    BackgroundCopyJobImpl *job = file->owner;
++    URL_COMPONENTSW uc = { sizeof(uc) };
++    WCHAR host[MAX_PATH], path[2048], extra[1024], session[64] = L"", range[160];
++    HINTERNET ses = NULL, con = NULL;
++    struct bits_answer ans = { 0 };
++    HANDLE handle = INVALID_HANDLE_VALUE;
++    LARGE_INTEGER size, pos;
++    BYTE *buf = NULL;
++    BOOL ret = FALSE, closed = FALSE;
++    DWORD flags = 0;
++
++    uc.lpszHostName = host;
++    uc.dwHostNameLength = ARRAY_SIZE(host);
++    uc.lpszUrlPath = path;
++    uc.dwUrlPathLength = ARRAY_SIZE(path);
++    uc.lpszExtraInfo = extra;
++    uc.dwExtraInfoLength = ARRAY_SIZE(extra);
++    if (!WinHttpCrackUrl(file->info.RemoteName, 0, 0, &uc))
++    {
++        upload_fail(file, BG_ERROR_CONTEXT_REMOTE_FILE, BG_E_PROTOCOL_NOT_AVAILABLE);
++        goto done;
++    }
++    flags = uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
++    if (uc.dwExtraInfoLength && wcslen(path) + uc.dwExtraInfoLength < ARRAY_SIZE(path)) wcscat(path, extra);
++
++    handle = CreateFileW(file->info.LocalName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (handle == INVALID_HANDLE_VALUE || !GetFileSizeEx(handle, &size))
++    {
++        upload_fail(file, BG_ERROR_CONTEXT_LOCAL_FILE, HRESULT_FROM_WIN32(GetLastError()));
++        goto done;
++    }
++    EnterCriticalSection(&job->cs);
++    file->fileProgress.BytesTotal = size.QuadPart;
++    LeaveCriticalSection(&job->cs);
++    if (!(buf = malloc(UPLOAD_FRAGMENT_SIZE))) { upload_fail(file, BG_ERROR_CONTEXT_UNKNOWN, E_OUTOFMEMORY); goto done; }
++
++    transitionJobState(job, BG_JOB_STATE_QUEUED, BG_JOB_STATE_CONNECTING);
++    if (!(ses = open_session(job, 0)) || !(con = WinHttpConnect(ses, host, uc.nPort, 0)))
++    {
++        upload_fail(file, BG_ERROR_CONTEXT_REMOTE_FILE, HRESULT_FROM_WIN32(GetLastError()));
++        goto done;
++    }
++
++    if (!bits_packet(job, con, path, flags, L"Create-Session", NULL, NULL, NULL, 0, &ans, FALSE))
++    {
++        upload_fail(file, BG_ERROR_CONTEXT_REMOTE_FILE, job->error.code);
++        goto done;
++    }
++    if (!is_ack(&ans) || !ans.session[0] || (ans.protocol[0] && wcsicmp(ans.protocol, BITS_UPLOAD_PROTOCOL)))
++    {
++        upload_fail(file, BG_ERROR_CONTEXT_REMOTE_FILE, answer_error(&ans, BG_E_REMOTE_NOT_SUPPORTED));
++        goto done;
++    }
++    wcscpy(session, ans.session);
++
++    transitionJobState(job, BG_JOB_STATE_CONNECTING, BG_JOB_STATE_TRANSFERRING);
++    pos.QuadPart = 0;
++    while (pos.QuadPart < size.QuadPart)
++    {
++        DWORD n = 0, want = (DWORD)min(size.QuadPart - pos.QuadPart, UPLOAD_FRAGMENT_SIZE);
++
++        if (WaitForSingleObject(job->cancel, 0) == WAIT_OBJECT_0)
++        {
++            bits_packet(job, con, path, flags, L"Cancel-Session", session, NULL, NULL, 0, &ans, FALSE);
++            transitionJobState(job, BG_JOB_STATE_TRANSFERRING, BG_JOB_STATE_CANCELLED);
++            goto done;
++        }
++        if (!SetFilePointerEx(handle, pos, NULL, FILE_BEGIN) || !ReadFile(handle, buf, want, &n, NULL) || n != want)
++        {
++            upload_fail(file, BG_ERROR_CONTEXT_LOCAL_FILE, HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_HANDLE_EOF));
++            goto done;
++        }
++        swprintf(range, ARRAY_SIZE(range), L"Content-Range: bytes %I64d-%I64d/%I64d\r\n",
++                 pos.QuadPart, pos.QuadPart + n - 1, size.QuadPart);
++        if (!bits_packet(job, con, path, flags, L"Fragment", session, range, buf, n, &ans, FALSE))
++        {
++            upload_fail(file, BG_ERROR_CONTEXT_REMOTE_FILE, job->error.code);
++            goto done;
++        }
++        if (!is_ack(&ans))
++        {
++            upload_fail(file, BG_ERROR_CONTEXT_REMOTE_FILE, answer_error(&ans, BG_E_REMOTE_NOT_SUPPORTED));
++            goto done;
++        }
++        /* the server says how much it has: a short count means it lost data, so send from there */
++        if (ans.has_received && ans.received <= (ULONG64)pos.QuadPart + n) n = ans.received > (ULONG64)pos.QuadPart ? (DWORD)(ans.received - pos.QuadPart) : 0;
++        pos.QuadPart += n;
++        EnterCriticalSection(&job->cs);
++        file->fileProgress.BytesTransferred = pos.QuadPart;
++        job->jobProgress.BytesTransferred += n;
++        job->last_progress = GetTickCount64();
++        LeaveCriticalSection(&job->cs);
++        if (!n && ans.has_received && ans.received < (ULONG64)pos.QuadPart + want)
++        {
++            /* the server made no progress at all */
++            upload_fail(file, BG_ERROR_CONTEXT_REMOTE_FILE, BG_E_REMOTE_NOT_SUPPORTED);
++            goto done;
++        }
++    }
++
++    if (!bits_packet(job, con, path, flags, L"Close-Session", session, NULL, NULL, 0, &ans,
++                     job->type == BG_JOB_TYPE_UPLOAD_REPLY))
++    {
++        upload_fail(file, BG_ERROR_CONTEXT_REMOTE_FILE, job->error.code);
++        goto done;
++    }
++    closed = TRUE;
++    if (!is_ack(&ans))
++    {
++        upload_fail(file, BG_ERROR_CONTEXT_REMOTE_FILE, answer_error(&ans, BG_E_REMOTE_NOT_SUPPORTED));
++        goto done;
++    }
++    if (job->type == BG_JOB_TYPE_UPLOAD_REPLY && !upload_reply_store(job, &ans))
++    {
++        upload_fail(file, BG_ERROR_CONTEXT_LOCAL_FILE, HRESULT_FROM_WIN32(GetLastError()));
++        goto done;
++    }
++    ret = TRUE;
++
++done:
++    if (!ret && session[0] && !closed && job->state != BG_JOB_STATE_CANCELLED)
++        bits_packet(job, con, path, flags, L"Cancel-Session", session, NULL, NULL, 0, &ans, FALSE);
++    free(ans.body);
++    free(buf);
++    if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
++    if (con) WinHttpCloseHandle(con);
++    if (ses) WinHttpCloseHandle(ses);
++    if (!ret && job->state != BG_JOB_STATE_CANCELLED &&
++        !transitionJobState(job, BG_JOB_STATE_CONNECTING, BG_JOB_STATE_ERROR) &&
++        !transitionJobState(job, BG_JOB_STATE_TRANSFERRING, BG_JOB_STATE_ERROR))
++        transitionJobState(job, BG_JOB_STATE_QUEUED, BG_JOB_STATE_ERROR);
++    SetEvent(job->done);
++    return ret;
++}
++
++static BOOL process_upload(BackgroundCopyFileImpl *file, BackgroundCopyJobImpl *job)
++{
++    EnterCriticalSection(&job->cs);
++    file->fileProgress.BytesTotal = BG_SIZE_UNKNOWN;
++    file->fileProgress.BytesTransferred = 0;
++    file->fileProgress.Completed = FALSE;
++    LeaveCriticalSection(&job->cs);
++
++    TRACE("Uploading: %s -> %s\n", debugstr_w(file->info.LocalName), debugstr_w(file->info.RemoteName));
++
++    if (transfer_file_upload(file) &&
++        (transitionJobState(job, BG_JOB_STATE_CONNECTING, BG_JOB_STATE_QUEUED) ||
++         transitionJobState(job, BG_JOB_STATE_TRANSFERRING, BG_JOB_STATE_QUEUED)))
++    {
++        EnterCriticalSection(&job->cs);
++        file->fileProgress.Completed = TRUE;
++        job->jobProgress.FilesTransferred++;
++        LeaveCriticalSection(&job->cs);
++        return TRUE;
++    }
++    if (job->state == BG_JOB_STATE_ERROR || job->state == BG_JOB_STATE_TRANSIENT_ERROR)
++        job_failed(job);
++    return FALSE;
++}
++
+ BOOL processFile(BackgroundCopyFileImpl *file, BackgroundCopyJobImpl *job)
+ {
+     WCHAR tmpDir[MAX_PATH], tmpName[MAX_PATH];
+@@ -622,6 +932,8 @@ BOOL processFile(BackgroundCopyFileImpl *file, BackgroundCopyJobImpl *job)
+     URL_COMPONENTSW uc;
+     BOOL ret;
+ 
++    if (job->type != BG_JOB_TYPE_DOWNLOAD) return process_upload(file, job);
++
+     if (!GetTempPathW(MAX_PATH, tmpDir))
+     {
+         ERR("Couldn't create temp file name: %ld\n", GetLastError());
+diff --git a/dlls/qmgr/job.c b/dlls/qmgr/job.c
+index 7e94053..d1bd40a 100644
+--- a/dlls/qmgr/job.c
++++ b/dlls/qmgr/job.c
+@@ -557,6 +557,8 @@ static ULONG WINAPI BackgroundCopyJob_Release(IBackgroundCopyJob4 *iface)
+         free(job->notify_prog);
+         free(job->notify_params);
+         free(job->owner);
++        free(job->reply_file);
++        free(job->reply_data);
+         free(job);
+     }
+ 
+@@ -586,6 +588,12 @@ static HRESULT WINAPI BackgroundCopyJob_AddFileSet(IBackgroundCopyJob4 *iface, U
+ 
+         if (!remote || !local || !*remote || !*local) { hr = E_INVALIDARG; break; }
+         if (FAILED(hr = check_remote_name(remote))) break;
++        if (job->type != BG_JOB_TYPE_DOWNLOAD)
++        {
++            /* an upload goes to a web server, and a job has one file */
++            if (wcsnicmp(remote, L"http://", 7) && wcsnicmp(remote, L"https://", 8)) { hr = BG_E_PROTOCOL_NOT_AVAILABLE; break; }
++            if (!list_empty(&job->files) || i) { hr = BG_E_TOO_MANY_FILES; break; }
++        }
+         if (!(iswalpha(local[0]) && local[1] == ':' && local[2] == '\\') && !(local[0] == '\\' && local[1] == '\\'))
+         {
+             hr = E_INVALIDARG;
+@@ -724,12 +732,13 @@ static HRESULT WINAPI BackgroundCopyJob_Cancel(IBackgroundCopyJob4 *iface)
+                 WARN("Couldn't delete %s (%lu)\n", debugstr_w(file->tempFileName), GetLastError());
+                 hr = BG_S_UNABLE_TO_DELETE_FILES;
+             }
+-            if (file->info.LocalName && !DeleteFileW(file->info.LocalName))
++            if (job->type == BG_JOB_TYPE_DOWNLOAD && file->info.LocalName && !DeleteFileW(file->info.LocalName))
+             {
+                 WARN("Couldn't delete %s (%lu)\n", debugstr_w(file->info.LocalName), GetLastError());
+                 hr = BG_S_UNABLE_TO_DELETE_FILES;
+             }
+         }
++        if (job->type == BG_JOB_TYPE_UPLOAD_REPLY && job->reply_file) DeleteFileW(job->reply_file);
+         job->state = BG_JOB_STATE_CANCELLED;
+     }
+ 
+@@ -757,7 +766,8 @@ static HRESULT WINAPI BackgroundCopyJob_Complete(IBackgroundCopyJob4 *iface)
+         {
+             if (file->fileProgress.Completed)
+             {
+-                if (!MoveFileExW(file->tempFileName, file->info.LocalName,
++                /* an upload leaves its file where it is */
++                if (job->type == BG_JOB_TYPE_DOWNLOAD && !MoveFileExW(file->tempFileName, file->info.LocalName,
+                                  (MOVEFILE_COPY_ALLOWED
+                                   | MOVEFILE_REPLACE_EXISTING
+                                   | MOVEFILE_WRITE_THROUGH)))
+@@ -945,7 +955,7 @@ static HRESULT WINAPI BackgroundCopyJob_SetPriority(IBackgroundCopyJob4 *iface,
+ 
+     TRACE("%p, %d.\n", iface, priority);
+ 
+-    if (priority < BG_JOB_PRIORITY_FOREGROUND || priority > BG_JOB_PRIORITY_LOW) return E_NOTIMPL;
++    if (priority < BG_JOB_PRIORITY_FOREGROUND || priority > BG_JOB_PRIORITY_LOW) return E_INVALIDARG;
+     if (is_job_done(job)) return BG_E_INVALID_STATE;
+     job->priority = priority;
+     job_touch(job);
+@@ -973,7 +983,7 @@ static HRESULT WINAPI BackgroundCopyJob_SetNotifyFlags(IBackgroundCopyJob4 *ifac
+     TRACE("%p, %#lx.\n", iface, flags);
+ 
+     if (is_job_done(job)) return BG_E_INVALID_STATE;
+-    if (flags & ~valid_flags) return E_NOTIMPL;
++    if (flags & ~valid_flags) return E_INVALIDARG;
+     job->notify_flags = flags;
+     return S_OK;
+ }
+@@ -1217,26 +1227,90 @@ static HRESULT WINAPI BackgroundCopyJob_GetNotifyCmdLine(IBackgroundCopyJob4 *if
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetReplyProgress(IBackgroundCopyJob4 *iface, BG_JOB_REPLY_PROGRESS *progress)
+ {
+-    FIXME("%p, %p: stub\n", iface, progress);
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++
++    TRACE("%p, %p.\n", iface, progress);
++
++    if (!progress) return E_INVALIDARG;
++    if (job->type != BG_JOB_TYPE_UPLOAD_REPLY) return BG_E_INVALID_STATE;
++    EnterCriticalSection(&job->cs);
++    progress->BytesTotal = job->reply_total;
++    progress->BytesTransferred = job->reply_size;
++    LeaveCriticalSection(&job->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetReplyData(IBackgroundCopyJob4 *iface, byte **buffer, UINT64 *length)
+ {
+-    FIXME("%p, %p, %p: stub\n", iface, buffer, length);
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %p, %p.\n", iface, buffer, length);
++
++    if (!buffer || !length) return E_INVALIDARG;
++    *buffer = NULL;
++    *length = 0;
++    if (job->type != BG_JOB_TYPE_UPLOAD_REPLY) return BG_E_INVALID_STATE;
++    EnterCriticalSection(&job->cs);
++    if (job->state != BG_JOB_STATE_TRANSFERRED && job->state != BG_JOB_STATE_ACKNOWLEDGED)
++        hr = BG_E_INVALID_STATE;
++    else if (!job->reply_file && job->reply_data && job->reply_size)
++    {
++        /* with a reply file the data went there */
++        if (!(*buffer = CoTaskMemAlloc(job->reply_size))) hr = E_OUTOFMEMORY;
++        else
++        {
++            memcpy(*buffer, job->reply_data, job->reply_size);
++            *length = job->reply_size;
++        }
++    }
++    LeaveCriticalSection(&job->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_SetReplyFileName(IBackgroundCopyJob4 *iface, LPCWSTR filename)
+ {
+-    FIXME("%p, %s: stub\n", iface, debugstr_w(filename));
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    HRESULT hr = S_OK;
++    WCHAR *copy;
++
++    TRACE("%p, %s.\n", iface, debugstr_w(filename));
++
++    if (!filename || !*filename) return E_INVALIDARG;
++    if (job->type != BG_JOB_TYPE_UPLOAD_REPLY) return BG_E_INVALID_STATE;
++    if (!(iswalpha(filename[0]) && filename[1] == ':' && filename[2] == '\\') && !(filename[0] == '\\' && filename[1] == '\\'))
++        return E_INVALIDARG;
++    if (!(copy = wcsdup(filename))) return E_OUTOFMEMORY;
++    EnterCriticalSection(&job->cs);
++    if (is_job_done(job) || job->state == BG_JOB_STATE_TRANSFERRED)
++    {
++        free(copy);
++        hr = BG_E_INVALID_STATE;
++    }
++    else
++    {
++        free(job->reply_file);
++        job->reply_file = copy;
++        job_touch(job);
++    }
++    LeaveCriticalSection(&job->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI BackgroundCopyJob_GetReplyFileName(IBackgroundCopyJob4 *iface, LPWSTR *filename)
+ {
+-    FIXME("%p, %p: stub\n", iface, filename);
+-    return E_NOTIMPL;
++    BackgroundCopyJobImpl *job = impl_from_IBackgroundCopyJob4(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %p.\n", iface, filename);
++
++    if (!filename) return E_INVALIDARG;
++    *filename = NULL;
++    if (job->type != BG_JOB_TYPE_UPLOAD_REPLY) return BG_E_INVALID_STATE;
++    EnterCriticalSection(&job->cs);
++    hr = return_strval(job->reply_file ? job->reply_file : L"", filename);
++    LeaveCriticalSection(&job->cs);
++    return hr;
+ }
+ 
+ static int index_from_target(BG_AUTH_TARGET target)
+@@ -1846,6 +1920,9 @@ HRESULT BackgroundCopyJobConstructor(LPCWSTR displayName, BG_JOB_TYPE type, GUID
+     This->modified = This->created;
+     memset(&This->completed, 0, sizeof(This->completed));
+     This->last_progress = This->retry_at = This->transfer_start = 0;
++    This->reply_file = NULL;
++    This->reply_data = NULL;
++    This->reply_size = This->reply_total = 0;
+ 
+     *job = This;
+ 
+diff --git a/dlls/qmgr/qmgr.h b/dlls/qmgr/qmgr.h
+index 42d134c..6a87889 100644
+--- a/dlls/qmgr/qmgr.h
++++ b/dlls/qmgr/qmgr.h
+@@ -89,6 +89,10 @@ typedef struct
+     ULONGLONG last_progress;        /* tick of the last transfer progress */
+     ULONGLONG retry_at;             /* tick a transient error is retried at */
+     ULONGLONG transfer_start;       /* tick the transfer started, for the maximum download time */
++    /* upload-reply jobs: where the server's reply goes, or what it was */
++    WCHAR *reply_file;
++    BYTE *reply_data;
++    ULONG64 reply_size, reply_total;
+ } BackgroundCopyJobImpl;
+ 
+ /* Background copy file vtbl and related data */

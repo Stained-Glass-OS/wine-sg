@@ -58,7 +58,9 @@ static DWORD WINAPI window_thread(void *arg)
     wc.lpfnWndProc = DefWindowProcW;
     wc.lpszClassName = L"SgCacheCont";
     RegisterClassW(&wc);
-    top_hwnd = CreateWindowW(L"SgCacheCont", L"cache top", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 300, 200, NULL, NULL, NULL, NULL);
+    /* no caption: a captioned window's title bar and system menu are children
+     * too (the non-client provider, 3581); the tree under test is the child windows */
+    top_hwnd = CreateWindowW(L"SgCacheCont", L"cache top", WS_POPUP | WS_VISIBLE, 0, 0, 300, 200, NULL, NULL, NULL, NULL);
     c1 = CreateWindowW(L"SgCacheCont", L"c1", WS_CHILD | WS_VISIBLE, 0, 0, 100, 100, top_hwnd, NULL, NULL, NULL);
     c2 = CreateWindowW(L"SgCacheCont", L"c2", WS_CHILD | WS_VISIBLE, 100, 0, 100, 100, top_hwnd, NULL, NULL, NULL);
     g1 = CreateWindowW(L"SgCacheCont", L"g1", WS_CHILD | WS_VISIBLE, 0, 0, 50, 50, c1, NULL, NULL, NULL);

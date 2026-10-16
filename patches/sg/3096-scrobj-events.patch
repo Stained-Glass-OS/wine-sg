@@ -1,0 +1,587 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Mon, 12 Oct 2026 20:04:41 -0700
+Subject: [PATCH] scrobj: component events (<event>, fireEvent) reach connected
+ sinks
+
+The <event> elements of a component's <public> are kept. A component that has events supports
+IConnectionPointContainer (one connection point, for the dispinterface of its events), and
+IProvideClassInfo2 whose class information is made as a type library has it: the component's
+interface, an events dispinterface with one method for each event, and a coclass in which the events
+are the default source. fireEvent(name) in the component's script calls that event, by name,
+on each connected sink; an event it does not declare is ignored. The type library
+Scriptlet.TypeLib writes gets the events as a source interface too.
+
+diff --git a/dlls/scrobj/scrobj.c b/dlls/scrobj/scrobj.c
+index 21c4551..7925206 100644
+--- a/dlls/scrobj/scrobj.c
++++ b/dlls/scrobj/scrobj.c
+@@ -79,6 +79,12 @@ struct scriptlet_member
+     } u;
+ };
+ 
++struct scriptlet_event
++{
++    struct list entry;
++    WCHAR *name;
++};
++
+ struct method_parameter
+ {
+     struct list entry;
+@@ -116,11 +122,14 @@ struct instance_object
+ 
+ struct scriptlet_factory;
+ 
++struct scriptlet_instance;
++
+ struct scriptlet_global
+ {
+     IDispatchEx IDispatchEx_iface;
+     LONG ref;
+     struct scriptlet_factory *factory;
++    struct scriptlet_instance *instance;    /* the component the script is of, NULL when it is gone */
+ };
+ 
+ struct scriptlet_factory
+@@ -147,6 +156,11 @@ struct scriptlet_factory
+     struct list resources;
+     struct list objects;
+     struct list reg_scripts;    /* <script> of <registration>: kept, not run */
++    struct list events;         /* <event> of <public>: a component's events */
++    GUID events_iid;            /* the dispinterface they are in, made when first asked for */
++    BOOL have_events_iid;
++    ITypeInfo *class_info;      /* the component's class as a type library has it, made when first asked for */
++    ITypeLib *class_lib;
+     BOOL error_dialogs;         /* <?component error="true"?> */
+     BOOL debug;
+ };
+@@ -176,7 +190,12 @@ struct object_member
+ struct scriptlet_instance
+ {
+     IDispatchEx IDispatchEx_iface;
++    IConnectionPointContainer IConnectionPointContainer_iface;
++    IConnectionPoint IConnectionPoint_iface;
++    IProvideClassInfo2 IProvideClassInfo2_iface;
+     LONG ref;
++    IDispatch **sinks;          /* connected to the events; NULL entries are free */
++    DWORD sink_count;
+     struct list hosts;
+     struct list objects;        /* instance_object: the <object> elements, created on first use */
+     struct scriptlet_factory *factory;
+@@ -415,6 +434,9 @@ static HRESULT WINAPI global_GetDispID(IDispatchEx *iface, BSTR bstrName, DWORD
+     return DISP_E_UNKNOWNNAME;
+ }
+ 
++struct scriptlet_instance;
++static void fire_component_event(struct scriptlet_instance *instance, const WCHAR *name);
++
+ static HRESULT WINAPI global_InvokeEx(IDispatchEx *iface, DISPID id, LCID lcid, WORD wFlags, DISPPARAMS *pdp,
+         VARIANT *pvarRes, EXCEPINFO *pei, IServiceProvider *pspCaller)
+ {
+@@ -433,7 +455,12 @@ static HRESULT WINAPI global_InvokeEx(IDispatchEx *iface, DISPID id, LCID lcid,
+     if (id == GLOBAL_FIREEVENT)
+     {
+         if (!pdp || pdp->cArgs != 1) return DISP_E_BADPARAMCOUNT;
+-        return S_OK;    /* no event sinks are connected to a component */
++        VariantInit(&arg);
++        hres = VariantChangeType(&arg, &pdp->rgvarg[0], 0, VT_BSTR);
++        if (FAILED(hres)) return DISP_E_TYPEMISMATCH;
++        if (This->instance) fire_component_event(This->instance, V_BSTR(&arg));
++        VariantClear(&arg);
++        return S_OK;
+     }
+ 
+     if (!pdp || pdp->cArgs != 1) return DISP_E_BADPARAMCOUNT;
+@@ -1180,6 +1207,17 @@ static HRESULT WINAPI scriptlet_QueryInterface(IDispatchEx *iface, REFIID riid,
+         TRACE("(%p)->(IID_IDispatchEx %p)\n", This, ppv);
+         *ppv = &This->IDispatchEx_iface;
+     }
++    else if (IsEqualGUID(&IID_IConnectionPointContainer, riid) && !list_empty(&This->factory->events))
++    {
++        TRACE("(%p)->(IID_IConnectionPointContainer %p)\n", This, ppv);
++        *ppv = &This->IConnectionPointContainer_iface;
++    }
++    else if ((IsEqualGUID(&IID_IProvideClassInfo, riid) || IsEqualGUID(&IID_IProvideClassInfo2, riid)) &&
++             !list_empty(&This->factory->events))
++    {
++        TRACE("(%p)->(IID_IProvideClassInfo %p)\n", This, ppv);
++        *ppv = &This->IProvideClassInfo2_iface;
++    }
+     else
+     {
+         WARN("(%p)->(%s %p)\n", This, debugstr_guid(riid), ppv);
+@@ -1214,6 +1252,10 @@ static ULONG WINAPI scriptlet_Release(IDispatchEx *iface)
+         for (i = 0; i < This->member_cnt; i++)
+             SysFreeString(This->members[i].name);
+         free(This->members);
++        for (i = 0; i < This->sink_count; i++)
++            if (This->sinks[i]) IDispatch_Release(This->sinks[i]);
++        free(This->sinks);
++        if (This->global) This->global->instance = NULL;
+         detach_script_hosts(&This->hosts);
+         while (!list_empty(&This->objects))
+         {
+@@ -1475,6 +1517,264 @@ static IDispatchExVtbl DispatchExVtbl = {
+     scriptlet_GetNameSpaceParent
+ };
+ 
++
++/*
++ * A component's events: the connection point of its event dispinterface (whose type is made from
++ * the <event> elements when asked for), and fireEvent, which calls the connected sinks.
++ */
++static HRESULT component_class_typeinfo(struct scriptlet_factory *factory, ITypeInfo **ret);
++
++static void factory_events_iid(struct scriptlet_factory *factory, GUID *iid)
++{
++    if (!factory->have_events_iid)
++    {
++        CoCreateGuid(&factory->events_iid);
++        factory->have_events_iid = TRUE;
++    }
++    *iid = factory->events_iid;
++}
++
++static void fire_component_event(struct scriptlet_instance *This, const WCHAR *name)
++{
++    struct scriptlet_event *event;
++    DISPPARAMS params = {0};
++    DISPID id = 0, i = 0;
++    DWORD n;
++
++    LIST_FOR_EACH_ENTRY(event, &This->factory->events, struct scriptlet_event, entry)
++    {
++        i++;
++        if (!wcsicmp(event->name, name)) { id = i; break; }
++    }
++    if (!id) return;
++#ifdef SG_MUTANT_SCROBJ_NO_FIRE
++    return;
++#endif
++
++    IDispatchEx_AddRef(&This->IDispatchEx_iface);
++    for (n = 0; n < This->sink_count; n++)
++    {
++        IDispatch *sink = This->sinks[n];
++        if (!sink) continue;
++        IDispatch_AddRef(sink);
++        IDispatch_Invoke(sink, id, &IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &params, NULL, NULL, NULL);
++        IDispatch_Release(sink);
++    }
++    IDispatchEx_Release(&This->IDispatchEx_iface);
++}
++
++static inline struct scriptlet_instance *impl_from_instance_IConnectionPointContainer(IConnectionPointContainer *iface)
++{
++    return CONTAINING_RECORD(iface, struct scriptlet_instance, IConnectionPointContainer_iface);
++}
++
++static inline struct scriptlet_instance *impl_from_instance_IConnectionPoint(IConnectionPoint *iface)
++{
++    return CONTAINING_RECORD(iface, struct scriptlet_instance, IConnectionPoint_iface);
++}
++
++static inline struct scriptlet_instance *impl_from_instance_IProvideClassInfo2(IProvideClassInfo2 *iface)
++{
++    return CONTAINING_RECORD(iface, struct scriptlet_instance, IProvideClassInfo2_iface);
++}
++
++static HRESULT WINAPI instance_cpc_QueryInterface(IConnectionPointContainer *iface, REFIID riid, void **ppv)
++{
++    return scriptlet_QueryInterface(&impl_from_instance_IConnectionPointContainer(iface)->IDispatchEx_iface, riid, ppv);
++}
++
++static ULONG WINAPI instance_cpc_AddRef(IConnectionPointContainer *iface)
++{
++    return scriptlet_AddRef(&impl_from_instance_IConnectionPointContainer(iface)->IDispatchEx_iface);
++}
++
++static ULONG WINAPI instance_cpc_Release(IConnectionPointContainer *iface)
++{
++    return scriptlet_Release(&impl_from_instance_IConnectionPointContainer(iface)->IDispatchEx_iface);
++}
++
++static HRESULT WINAPI instance_cpc_EnumConnectionPoints(IConnectionPointContainer *iface, IEnumConnectionPoints **ret)
++{
++    FIXME("(%p)\n", ret);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI instance_cpc_FindConnectionPoint(IConnectionPointContainer *iface, REFIID riid, IConnectionPoint **ret)
++{
++    struct scriptlet_instance *This = impl_from_instance_IConnectionPointContainer(iface);
++    GUID iid;
++
++    TRACE("(%p)->(%s %p)\n", This, debugstr_guid(riid), ret);
++
++    if (!ret) return E_POINTER;
++    factory_events_iid(This->factory, &iid);
++    if (!IsEqualGUID(riid, &iid))
++    {
++        *ret = NULL;
++        return CONNECT_E_NOCONNECTION;
++    }
++    IConnectionPoint_AddRef((*ret = &This->IConnectionPoint_iface));
++    return S_OK;
++}
++
++static const IConnectionPointContainerVtbl instance_cpc_vtbl =
++{
++    instance_cpc_QueryInterface,
++    instance_cpc_AddRef,
++    instance_cpc_Release,
++    instance_cpc_EnumConnectionPoints,
++    instance_cpc_FindConnectionPoint
++};
++
++static HRESULT WINAPI instance_cp_QueryInterface(IConnectionPoint *iface, REFIID riid, void **ppv)
++{
++    struct scriptlet_instance *This = impl_from_instance_IConnectionPoint(iface);
++
++    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IConnectionPoint))
++    {
++        IConnectionPoint_AddRef((*ppv = iface));
++        return S_OK;
++    }
++    return scriptlet_QueryInterface(&This->IDispatchEx_iface, riid, ppv);
++}
++
++static ULONG WINAPI instance_cp_AddRef(IConnectionPoint *iface)
++{
++    return scriptlet_AddRef(&impl_from_instance_IConnectionPoint(iface)->IDispatchEx_iface);
++}
++
++static ULONG WINAPI instance_cp_Release(IConnectionPoint *iface)
++{
++    return scriptlet_Release(&impl_from_instance_IConnectionPoint(iface)->IDispatchEx_iface);
++}
++
++static HRESULT WINAPI instance_cp_GetConnectionInterface(IConnectionPoint *iface, IID *iid)
++{
++    struct scriptlet_instance *This = impl_from_instance_IConnectionPoint(iface);
++
++    if (!iid) return E_POINTER;
++    factory_events_iid(This->factory, iid);
++    return S_OK;
++}
++
++static HRESULT WINAPI instance_cp_GetConnectionPointContainer(IConnectionPoint *iface, IConnectionPointContainer **ret)
++{
++    struct scriptlet_instance *This = impl_from_instance_IConnectionPoint(iface);
++
++    if (!ret) return E_POINTER;
++    IConnectionPointContainer_AddRef((*ret = &This->IConnectionPointContainer_iface));
++    return S_OK;
++}
++
++static HRESULT WINAPI instance_cp_Advise(IConnectionPoint *iface, IUnknown *unk, DWORD *cookie)
++{
++    struct scriptlet_instance *This = impl_from_instance_IConnectionPoint(iface);
++    IDispatch *sink;
++    GUID iid;
++    DWORD i;
++
++    TRACE("(%p)->(%p %p)\n", This, unk, cookie);
++
++    if (!unk || !cookie) return E_POINTER;
++    factory_events_iid(This->factory, &iid);
++    if (FAILED(IUnknown_QueryInterface(unk, &iid, (void **)&sink)) &&
++        FAILED(IUnknown_QueryInterface(unk, &IID_IDispatch, (void **)&sink)))
++        return CONNECT_E_CANNOTCONNECT;
++
++    for (i = 0; i < This->sink_count; i++) if (!This->sinks[i]) break;
++    if (i == This->sink_count)
++    {
++        IDispatch **new_sinks = realloc(This->sinks, (i + 4) * sizeof(*new_sinks));
++        if (!new_sinks)
++        {
++            IDispatch_Release(sink);
++            return E_OUTOFMEMORY;
++        }
++        memset(new_sinks + i, 0, 4 * sizeof(*new_sinks));
++        This->sinks = new_sinks;
++        This->sink_count = i + 4;
++    }
++    This->sinks[i] = sink;
++    *cookie = i + 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI instance_cp_Unadvise(IConnectionPoint *iface, DWORD cookie)
++{
++    struct scriptlet_instance *This = impl_from_instance_IConnectionPoint(iface);
++
++    TRACE("(%p)->(%lu)\n", This, cookie);
++
++    if (!cookie || cookie > This->sink_count || !This->sinks[cookie - 1]) return CONNECT_E_NOCONNECTION;
++    IDispatch_Release(This->sinks[cookie - 1]);
++    This->sinks[cookie - 1] = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI instance_cp_EnumConnections(IConnectionPoint *iface, IEnumConnections **ret)
++{
++    FIXME("(%p)\n", ret);
++    return E_NOTIMPL;
++}
++
++static const IConnectionPointVtbl instance_cp_vtbl =
++{
++    instance_cp_QueryInterface,
++    instance_cp_AddRef,
++    instance_cp_Release,
++    instance_cp_GetConnectionInterface,
++    instance_cp_GetConnectionPointContainer,
++    instance_cp_Advise,
++    instance_cp_Unadvise,
++    instance_cp_EnumConnections
++};
++
++static HRESULT WINAPI instance_pci_QueryInterface(IProvideClassInfo2 *iface, REFIID riid, void **ppv)
++{
++    return scriptlet_QueryInterface(&impl_from_instance_IProvideClassInfo2(iface)->IDispatchEx_iface, riid, ppv);
++}
++
++static ULONG WINAPI instance_pci_AddRef(IProvideClassInfo2 *iface)
++{
++    return scriptlet_AddRef(&impl_from_instance_IProvideClassInfo2(iface)->IDispatchEx_iface);
++}
++
++static ULONG WINAPI instance_pci_Release(IProvideClassInfo2 *iface)
++{
++    return scriptlet_Release(&impl_from_instance_IProvideClassInfo2(iface)->IDispatchEx_iface);
++}
++
++static HRESULT WINAPI instance_pci_GetClassInfo(IProvideClassInfo2 *iface, ITypeInfo **ret)
++{
++    struct scriptlet_instance *This = impl_from_instance_IProvideClassInfo2(iface);
++
++    TRACE("(%p)->(%p)\n", This, ret);
++
++    if (!ret) return E_POINTER;
++    return component_class_typeinfo(This->factory, ret);
++}
++
++static HRESULT WINAPI instance_pci_GetGUID(IProvideClassInfo2 *iface, DWORD kind, GUID *guid)
++{
++    struct scriptlet_instance *This = impl_from_instance_IProvideClassInfo2(iface);
++
++    TRACE("(%p)->(%lu %p)\n", This, kind, guid);
++
++    if (!guid) return E_POINTER;
++    if (kind != GUIDKIND_DEFAULT_SOURCE_DISP_IID) return E_INVALIDARG;
++    factory_events_iid(This->factory, guid);
++    return S_OK;
++}
++
++static const IProvideClassInfo2Vtbl instance_pci_vtbl =
++{
++    instance_pci_QueryInterface,
++    instance_pci_AddRef,
++    instance_pci_Release,
++    instance_pci_GetClassInfo,
++    instance_pci_GetGUID
++};
++
+ static HRESULT create_scriptlet_instance(struct scriptlet_factory *factory, IDispatchEx **disp)
+ {
+     struct script_host *factory_host, *host;
+@@ -1486,6 +1786,9 @@ static HRESULT create_scriptlet_instance(struct scriptlet_factory *factory, IDis
+         return E_OUTOFMEMORY;
+ 
+     obj->IDispatchEx_iface.lpVtbl = &DispatchExVtbl;
++    obj->IConnectionPointContainer_iface.lpVtbl = &instance_cpc_vtbl;
++    obj->IConnectionPoint_iface.lpVtbl = &instance_cp_vtbl;
++    obj->IProvideClassInfo2_iface.lpVtbl = &instance_pci_vtbl;
+     obj->ref = 1;
+     obj->factory = factory;
+     list_init(&obj->hosts);
+@@ -1514,6 +1817,7 @@ static HRESULT create_scriptlet_instance(struct scriptlet_factory *factory, IDis
+     obj->global->IDispatchEx_iface.lpVtbl = &global_vtbl;
+     obj->global->ref = 1;
+     obj->global->factory = factory;
++    obj->global->instance = obj;
+     IClassFactory_AddRef(&factory->IClassFactory_iface);
+ 
+     LIST_FOR_EACH_ENTRY(factory_host, &factory->hosts, struct script_host, entry)
+@@ -1921,7 +2225,17 @@ static HRESULT parse_scriptlet_public(struct scriptlet_factory *factory)
+             member_type = MEMBER_PROPERTY;
+         else if (is_case_xml_name(factory, L"event"))
+         {
+-            /* events are declared, and no sink is connected to the component */
++            struct scriptlet_event *event;
++            WCHAR *name = NULL;
++
++            hres = read_xml_attribute(factory, L"name", &name);
++            if (hres == S_OK && name && *name && (event = calloc(1, sizeof(*event))))
++            {
++                event->name = name;
++                list_add_tail(&factory->events, &event->entry);
++            }
++            else free(name);
++            IXmlReader_MoveToElement(factory->xml_reader);
+             if (FAILED(hres = skip_element(factory))) return hres;
+             continue;
+         }
+@@ -2336,6 +2650,15 @@ static ULONG WINAPI scriptlet_factory_Release(IClassFactory *iface)
+             free(script->body);
+             free(script);
+         }
++        while (!list_empty(&This->events))
++        {
++            struct scriptlet_event *event = LIST_ENTRY(list_head(&This->events), struct scriptlet_event, entry);
++            list_remove(&event->entry);
++            free(event->name);
++            free(event);
++        }
++        if (This->class_info) ITypeInfo_Release(This->class_info);
++        if (This->class_lib) ITypeLib_Release(This->class_lib);
+         while (!list_empty(&This->reg_scripts))
+         {
+             struct scriptlet_script *script = LIST_ENTRY(list_head(&This->reg_scripts), struct scriptlet_script, entry);
+@@ -2436,6 +2759,7 @@ static HRESULT create_scriptlet_factory(const WCHAR *url, struct scriptlet_facto
+     list_init(&factory->resources);
+     list_init(&factory->objects);
+     list_init(&factory->reg_scripts);
++    list_init(&factory->events);
+ 
+     hres = parse_scriptlet_file(factory, url);
+     if (FAILED(hres))
+@@ -2978,10 +3302,54 @@ fail:
+     return hr;
+ }
+ 
++/* the interface of a component's events: one method for each, as they have no parameters */
++static HRESULT typelib_add_events(ICreateTypeLib2 *lib, struct scriptlet_factory *factory, const WCHAR *class_name,
++        ITypeInfo **ret)
++{
++    struct scriptlet_event *event;
++    ICreateTypeInfo *cti;
++    WCHAR name[128];
++    unsigned index = 0;
++    GUID guid;
++    HRESULT hr;
++
++    swprintf(name, ARRAY_SIZE(name), L"_I%sEvents", class_name);
++    if (FAILED(hr = ICreateTypeLib2_CreateTypeInfo(lib, name, TKIND_DISPATCH, &cti))) return hr;
++    factory_events_iid(factory, &guid);
++    ICreateTypeInfo_SetGuid(cti, &guid);
++    ICreateTypeInfo_SetTypeFlags(cti, TYPEFLAG_FDISPATCHABLE);
++
++    LIST_FOR_EACH_ENTRY(event, &factory->events, struct scriptlet_event, entry)
++    {
++        WCHAR *names[1] = { event->name };
++        FUNCDESC fd;
++
++        memset(&fd, 0, sizeof(fd));
++        fd.memid = index + 1;
++        fd.funckind = FUNC_DISPATCH;
++        fd.invkind = INVOKE_FUNC;
++        fd.callconv = CC_STDCALL;
++        fd.elemdescFunc.tdesc.vt = VT_VOID;
++        hr = ICreateTypeInfo_AddFuncDesc(cti, index, &fd);
++        if (SUCCEEDED(hr)) hr = ICreateTypeInfo_SetFuncAndParamNames(cti, index, names, 1);
++        if (FAILED(hr))
++        {
++            WARN("event %s: %#lx\n", debugstr_w(event->name), hr);
++            goto fail;
++        }
++        index++;
++    }
++
++    hr = ICreateTypeInfo_QueryInterface(cti, &IID_ITypeInfo, (void **)ret);
++fail:
++    ICreateTypeInfo_Release(cti);
++    return hr;
++}
++
+ static HRESULT typelib_add_class(ICreateTypeLib2 *lib, struct scriptlet_factory *factory, const WCHAR *url)
+ {
+     ICreateTypeInfo *cls;
+-    ITypeInfo *iface = NULL;
++    ITypeInfo *iface = NULL, *events = NULL;
+     WCHAR *class_name;
+     HREFTYPE href;
+     GUID guid;
+@@ -2990,6 +3358,7 @@ static HRESULT typelib_add_class(ICreateTypeLib2 *lib, struct scriptlet_factory
+ 
+     if (!(class_name = typelib_class_name(factory, url))) return E_OUTOFMEMORY;
+     hr = typelib_add_interface(lib, factory, class_name, &iface);
++    if (SUCCEEDED(hr) && !list_empty(&factory->events)) hr = typelib_add_events(lib, factory, class_name, &events);
+     if (SUCCEEDED(hr)) hr = ICreateTypeLib2_CreateTypeInfo(lib, class_name, TKIND_COCLASS, &cls);
+     if (SUCCEEDED(hr))
+     {
+@@ -3001,13 +3370,72 @@ static HRESULT typelib_add_class(ICreateTypeLib2 *lib, struct scriptlet_factory
+         if (FAILED(hr)) WARN("AddRefTypeInfo: %#lx\n", hr);
+         if (SUCCEEDED(hr)) hr = ICreateTypeInfo_AddImplType(cls, 0, href);
+         if (SUCCEEDED(hr)) hr = ICreateTypeInfo_SetImplTypeFlags(cls, 0, IMPLTYPEFLAG_FDEFAULT);
++        if (SUCCEEDED(hr) && events)
++        {
++            hr = ICreateTypeInfo_AddRefTypeInfo(cls, events, &href);
++            if (SUCCEEDED(hr)) hr = ICreateTypeInfo_AddImplType(cls, 1, href);
++            if (SUCCEEDED(hr)) hr = ICreateTypeInfo_SetImplTypeFlags(cls, 1, IMPLTYPEFLAG_FDEFAULT | IMPLTYPEFLAG_FSOURCE);
++        }
+         ICreateTypeInfo_Release(cls);
+     }
++    if (events) ITypeInfo_Release(events);
+     if (iface) ITypeInfo_Release(iface);
+     free(class_name);
+     return hr;
+ }
+ 
++/* the component's class as a type library has it, made when first asked for in a file of its own */
++static HRESULT component_class_typeinfo(struct scriptlet_factory *factory, ITypeInfo **ret)
++{
++    WCHAR dir[MAX_PATH], path[MAX_PATH];
++    ICreateTypeLib2 *lib;
++    ITypeLib *tl = NULL;
++    GUID guid;
++    UINT i, count;
++    HRESULT hr;
++
++    if (factory->class_info)
++    {
++        ITypeInfo_AddRef((*ret = factory->class_info));
++        return S_OK;
++    }
++
++    if (!GetTempPathW(ARRAY_SIZE(dir), dir) || !GetTempFileNameW(dir, L"wsc", 0, path)) return E_FAIL;
++    if (FAILED(hr = CreateTypeLib2(SYS_WIN32, path, &lib)))
++    {
++        DeleteFileW(path);
++        return hr;
++    }
++    CoCreateGuid(&guid);
++    ICreateTypeLib2_SetGuid(lib, &guid);
++    ICreateTypeLib2_SetLcid(lib, 0);
++    { WCHAR lib_name[] = L"ScriptletComponent"; ICreateTypeLib2_SetName(lib, lib_name); }
++    hr = typelib_add_class(lib, factory, NULL);
++    if (SUCCEEDED(hr)) hr = ICreateTypeLib2_SaveAllChanges(lib);
++    ICreateTypeLib2_Release(lib);
++    if (SUCCEEDED(hr)) hr = LoadTypeLibEx(path, REGKIND_NONE, &tl);
++    DeleteFileW(path);
++    if (FAILED(hr)) return hr;
++
++    count = ITypeLib_GetTypeInfoCount(tl);
++    for (i = 0; i < count; i++)
++    {
++        TYPEKIND kind;
++        if (SUCCEEDED(ITypeLib_GetTypeInfoType(tl, i, &kind)) && kind == TKIND_COCLASS)
++        {
++            if (SUCCEEDED(hr = ITypeLib_GetTypeInfo(tl, i, &factory->class_info))) break;
++        }
++    }
++    if (!factory->class_info)
++    {
++        ITypeLib_Release(tl);
++        return FAILED(hr) ? hr : E_FAIL;
++    }
++    factory->class_lib = tl;
++    ITypeInfo_AddRef((*ret = factory->class_info));
++    return S_OK;
++}
++
+ static HRESULT WINAPI scriptlet_typelib_Write(IGenScriptletTLib *iface)
+ {
+     struct scriptlet_typelib *This = impl_from_IGenScriptletTLib(iface);

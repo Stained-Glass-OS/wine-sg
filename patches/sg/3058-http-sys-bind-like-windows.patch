@@ -1,0 +1,423 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Mon, 12 Oct 2026 15:17:24 -0700
+Subject: [PATCH] http.sys: listen where Windows does
+
+- a URL with a "+" or "*" host or a host name listens on all interfaces, an IPv4 address host on that
+  address, localhost on the loopback interface only
+- the IP listen list (ListenOnlyList) restricts all of them, as on Windows; a URL whose address is not on
+  the list gets no socket
+- sockets are kept per port and address and shared by URLs; removing the last URL closes its sockets
+  (the check for unused sockets counted the entry being removed and never closed them)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+
+diff --git a/dlls/http.sys/http.c b/dlls/http.sys/http.c
+index a22efc9..43140bd 100644
+--- a/dlls/http.sys/http.c
++++ b/dlls/http.sys/http.c
+@@ -87,10 +87,14 @@ static struct list connections = LIST_INIT(connections);
+ struct listening_socket
+ {
+     struct list entry;
++    unsigned int users;
+     unsigned short port;
++    ULONG addr; /* network order */
+     SOCKET socket;
+ };
+ 
++#define MAX_LISTEN_ADDRS 16
++
+ static struct list listening_sockets = LIST_INIT(listening_sockets);
+ 
+ struct url
+@@ -98,7 +102,8 @@ struct url
+     struct list entry;
+     char *url;
+     HTTP_URL_CONTEXT context;
+-    struct listening_socket *listening_sock;
++    struct listening_socket *listening_socks[MAX_LISTEN_ADDRS];
++    unsigned int listening_count;
+ };
+ 
+ struct request_queue
+@@ -693,8 +698,11 @@ static DWORD WINAPI request_thread_proc(void *arg)
+         {
+             LIST_FOR_EACH_ENTRY(url, &queue->urls, struct url, entry)
+             {
+-                if (url->listening_sock && url->listening_sock->socket != -1)
+-                    accept_connection(url->listening_sock->socket);
++                unsigned int i;
++
++                for (i = 0; i < url->listening_count; ++i)
++                    if (url->listening_socks[i]->socket != -1)
++                        accept_connection(url->listening_socks[i]->socket);
+             }
+         }
+ 
+@@ -711,35 +719,55 @@ static DWORD WINAPI request_thread_proc(void *arg)
+     return 0;
+ }
+ 
+-static struct listening_socket *get_listening_socket(unsigned short port)
++/* a socket on all interfaces serves every address */
++static struct listening_socket *get_listening_socket(unsigned short port, ULONG addr)
+ {
+     struct listening_socket *listening_sock;
+ 
+     LIST_FOR_EACH_ENTRY(listening_sock, &listening_sockets, struct listening_socket, entry)
+     {
+-        if (listening_sock->port == port)
++        if (listening_sock->port == port && (listening_sock->addr == addr || listening_sock->addr == INADDR_ANY))
+             return listening_sock;
+     }
+ 
+     return NULL;
+ }
+ 
+-/* Servers listen on the loopback interface only, unless an administrator explicitly allowed
+- * all interfaces by listing 0.0.0.0 in the HTTP service's ListenOnlyList setting. */
+-static BOOL listen_on_all_interfaces(void)
++static BOOL parse_ipv4(const WCHAR *str, ULONG *addr)
++{
++    unsigned int octets[4], i;
++    const WCHAR *p = str;
++
++    for (i = 0; i < 4; i++)
++    {
++        unsigned int value = 0, digits = 0;
++
++        while (*p >= '0' && *p <= '9' && digits < 4) { value = value * 10 + (*p++ - '0'); digits++; }
++        if (!digits || value > 255) return FALSE;
++        octets[i] = value;
++        if (i < 3 && *p++ != '.') return FALSE;
++    }
++    if (*p) return FALSE;
++    *addr = octets[0] | (octets[1] << 8) | (octets[2] << 16) | (octets[3] << 24);
++    return TRUE;
++}
++
++/* The addresses the administrator limited the server to (HttpServiceConfigIPListenList);
++ * returns the number of addresses, 0 when there is no limit. */
++static unsigned int get_listen_only_list(ULONG *addrs, unsigned int max)
+ {
+     static const WCHAR path[] = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\HTTP\\Parameters";
+     static const WCHAR name[] = L"ListenOnlyList";
+     UNICODE_STRING key_name, value_name;
+     OBJECT_ATTRIBUTES attr;
+     KEY_VALUE_PARTIAL_INFORMATION *info;
++    unsigned int count = 0;
+     ULONG size = 0;
+     HANDLE key;
+-    BOOL ret = FALSE;
+ 
+     RtlInitUnicodeString(&key_name, path);
+     InitializeObjectAttributes(&attr, &key_name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+-    if (ZwOpenKey(&key, KEY_QUERY_VALUE, &attr)) return FALSE;
++    if (ZwOpenKey(&key, KEY_QUERY_VALUE, &attr)) return 0;
+ 
+     RtlInitUnicodeString(&value_name, name);
+     ZwQueryValueKey(key, &value_name, KeyValuePartialInformation, NULL, 0, &size);
+@@ -751,16 +779,65 @@ static BOOL listen_on_all_interfaces(void)
+             const WCHAR *p = (const WCHAR *)info->Data;
+             const WCHAR *end = (const WCHAR *)(info->Data + info->DataLength);
+ 
+-            while (p < end && *p)
++            while (p < end && *p && count < max)
+             {
+-                if (!wcscmp(p, L"0.0.0.0")) ret = TRUE;
++                if (parse_ipv4(p, &addrs[count])) count++;
+                 p += wcslen(p) + 1;
+             }
+         }
+         free(info);
+     }
+     ZwClose(key);
+-    return ret;
++    return count;
++}
++
++/* Works out where a URL is served, the way http.sys does: "+" and "*" and host names listen on all
++ * interfaces, an IP address on that address and localhost on the loopback interface; the listen
++ * list restricts all of them. */
++static unsigned int get_bind_addrs(const char *url, ULONG *addrs, unsigned int max)
++{
++    ULONG list[MAX_LISTEN_ADDRS], explicit_addr = INADDR_ANY;
++    unsigned int list_count, count = 0, i;
++    const char *host = url + 7, *end = strchr(host, ':');
++    char name[64];
++    WCHAR wname[64];
++    BOOL specific = FALSE;
++
++    if (end && (size_t)(end - host) < sizeof(name))
++    {
++        memcpy(name, host, end - host);
++        name[end - host] = 0;
++        if (!_stricmp(name, "localhost"))
++        {
++            explicit_addr = htonl(INADDR_LOOPBACK);
++            specific = TRUE;
++        }
++        else
++        {
++            for (i = 0; name[i]; i++) wname[i] = (unsigned char)name[i];
++            wname[i] = 0;
++            if (parse_ipv4(wname, &explicit_addr))
++                specific = TRUE;
++        }
++    }
++
++    list_count = get_listen_only_list(list, ARRAY_SIZE(list));
++    if (specific)
++    {
++        if (explicit_addr == INADDR_ANY) specific = FALSE; /* 0.0.0.0 means all addresses */
++        else if (!list_count) addrs[count++] = explicit_addr;
++        else
++            for (i = 0; i < list_count; i++)
++                if (list[i] == INADDR_ANY || list[i] == explicit_addr) { addrs[count++] = explicit_addr; break; }
++    }
++    if (!specific)
++    {
++        if (!list_count) addrs[count++] = INADDR_ANY;
++        else
++            for (i = 0; i < list_count && count < max; i++)
++                addrs[count++] = list[i];
++    }
++    return count;
+ }
+ 
+ /* Sends the whole buffer on a non-blocking socket. */
+@@ -793,6 +870,66 @@ static BOOL send_all(SOCKET s, const char *buffer, int len)
+     return TRUE;
+ }
+ 
++static NTSTATUS create_listening_socket(unsigned short port, ULONG address, const char *url,
++        struct listening_socket **ret)
++{
++    struct listening_socket *listening_sock;
++    struct sockaddr_in addr = {0};
++    ULONG one = 1, value = 1;
++    SOCKET s;
++
++    if ((s = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
++    {
++        ERR("Failed to create socket, error %u.\n", WSAGetLastError());
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    addr.sin_family = AF_INET;
++    addr.sin_port = port;
++    addr.sin_addr.S_un.S_addr = address;
++    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char *)&value, sizeof(value));
++    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == -1)
++    {
++        int error = WSAGetLastError();
++
++        closesocket(s);
++        if (error == WSAEADDRINUSE)
++        {
++            WARN("Address %s is already in use.\n", debugstr_a(url));
++            return STATUS_SHARING_VIOLATION;
++        }
++        else if (error == WSAEACCES)
++        {
++            WARN("Not enough permissions to bind to address %s.\n", debugstr_a(url));
++            return STATUS_ACCESS_DENIED;
++        }
++        ERR("Failed to bind socket, error %u.\n", error);
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    if (listen(s, SOMAXCONN) == -1)
++    {
++        ERR("Failed to listen to port %u, error %u.\n", port, WSAGetLastError());
++        closesocket(s);
++        return STATUS_OBJECT_NAME_COLLISION;
++    }
++
++    if (!(listening_sock = calloc(1, sizeof(*listening_sock))))
++    {
++        closesocket(s);
++        return STATUS_NO_MEMORY;
++    }
++    listening_sock->port = port;
++    listening_sock->addr = address;
++    listening_sock->socket = s;
++    list_add_head(&listening_sockets, &listening_sock->entry);
++
++    ioctlsocket(s, FIONBIO, &one);
++    WSAEventSelect(s, request_event, FD_ACCEPT);
++    *ret = listening_sock;
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS http_add_url(struct request_queue *queue, IRP *irp)
+ {
+     const struct http_add_url_params *params = irp->AssociatedIrp.SystemBuffer;
+@@ -800,11 +937,10 @@ static NTSTATUS http_add_url(struct request_queue *queue, IRP *irp)
+     struct sockaddr_in addr;
+     struct connection *conn;
+     struct url *url_entry, *new_entry;
+-    struct listening_socket *listening_sock;
++    ULONG bind_addrs[MAX_LISTEN_ADDRS];
++    unsigned int bind_count, i;
+     char *url, *endptr;
+     size_t queue_url_len, new_url_len;
+-    ULONG one = 1, value;
+-    SOCKET s = INVALID_SOCKET;
+ 
+     TRACE("host %s, context %s.\n", debugstr_a(params->url), wine_dbgstr_longlong(params->context));
+ 
+@@ -853,72 +989,45 @@ static NTSTATUS http_add_url(struct request_queue *queue, IRP *irp)
+         }
+     }
+ 
+-    listening_sock = get_listening_socket(addr.sin_port);
++    memset(new_entry, 0, sizeof(*new_entry));
++    bind_count = get_bind_addrs(url, bind_addrs, ARRAY_SIZE(bind_addrs));
+ 
+-    if (!listening_sock)
++    for (i = 0; i < bind_count; ++i)
+     {
+-        if ((s = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
+-        {
+-            ERR("Failed to create socket, error %u.\n", WSAGetLastError());
+-            LeaveCriticalSection(&http_cs);
+-            free(url);
+-            free(new_entry);
+-            return STATUS_UNSUCCESSFUL;
+-        }
++        struct listening_socket *listening_sock = get_listening_socket(addr.sin_port, bind_addrs[i]);
+ 
+-        addr.sin_family = AF_INET;
+-        addr.sin_addr.S_un.S_addr = listen_on_all_interfaces() ? INADDR_ANY : htonl(INADDR_LOOPBACK);
+-        value = 1;
+-        setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char *)&value, sizeof(value));
+-        if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == -1)
++        if (!listening_sock)
+         {
+-            LeaveCriticalSection(&http_cs);
+-            closesocket(s);
+-            free(url);
+-            free(new_entry);
+-            if (WSAGetLastError() == WSAEADDRINUSE)
+-            {
+-                WARN("Address %s is already in use.\n", debugstr_a(params->url));
+-                return STATUS_SHARING_VIOLATION;
+-            }
+-            else if (WSAGetLastError() == WSAEACCES)
++            NTSTATUS status = create_listening_socket(addr.sin_port, bind_addrs[i], params->url, &listening_sock);
++
++            if (status)
+             {
+-                WARN("Not enough permissions to bind to address %s.\n", debugstr_a(params->url));
+-                return STATUS_ACCESS_DENIED;
++                /* drop the sockets this URL created before the failure */
++                while (new_entry->listening_count)
++                {
++                    struct listening_socket *created = new_entry->listening_socks[--new_entry->listening_count];
++
++                    created->users--;
++                    if (!created->users)
++                    {
++                        shutdown(created->socket, SD_BOTH);
++                        closesocket(created->socket);
++                        list_remove(&created->entry);
++                        free(created);
++                    }
++                }
++                LeaveCriticalSection(&http_cs);
++                free(url);
++                free(new_entry);
++                return status;
+             }
+-            ERR("Failed to bind socket, error %u.\n", WSAGetLastError());
+-            return STATUS_UNSUCCESSFUL;
+-        }
+-
+-        if (listen(s, SOMAXCONN) == -1)
+-        {
+-            ERR("Failed to listen to port %u, error %u.\n", addr.sin_port, WSAGetLastError());
+-            LeaveCriticalSection(&http_cs);
+-            closesocket(s);
+-            free(url);
+-            free(new_entry);
+-            return STATUS_OBJECT_NAME_COLLISION;
+-        }
+-
+-        if (!(listening_sock = malloc(sizeof(struct listening_socket))))
+-        {
+-            LeaveCriticalSection(&http_cs);
+-            closesocket(s);
+-            free(url);
+-            free(new_entry);
+-            return STATUS_NO_MEMORY;
+         }
+-        listening_sock->port = addr.sin_port;
+-        listening_sock->socket = s;
+-        list_add_head(&listening_sockets, &listening_sock->entry);
+-
+-        ioctlsocket(s, FIONBIO, &one);
+-        WSAEventSelect(s, request_event, FD_ACCEPT);
++        listening_sock->users++;
++        new_entry->listening_socks[new_entry->listening_count++] = listening_sock;
+     }
+ 
+     new_entry->url = url;
+     new_entry->context = params->context;
+-    new_entry->listening_sock = listening_sock;
+     list_add_head(&queue->urls, &new_entry->entry);
+ 
+     /* See if any pending requests now match this queue. */
+@@ -937,25 +1046,6 @@ static NTSTATUS http_add_url(struct request_queue *queue, IRP *irp)
+     return STATUS_SUCCESS;
+ }
+ 
+-static BOOL is_listening_socket_used(const struct listening_socket *listening_sock)
+-{
+-    struct request_queue *queue_entry;
+-    struct url *url_entry;
+-
+-    LIST_FOR_EACH_ENTRY(queue_entry, &request_queues, struct request_queue, entry)
+-    {
+-        LIST_FOR_EACH_ENTRY(url_entry, &queue_entry->urls, struct url, entry)
+-        {
+-            if (listening_sock == url_entry->listening_sock)
+-            {
+-                return TRUE;
+-            }
+-        }
+-    }
+-
+-    return FALSE;
+-}
+-
+ static NTSTATUS http_remove_url(struct request_queue *queue, IRP *irp)
+ {
+     const char *url = irp->AssociatedIrp.SystemBuffer;
+@@ -972,14 +1062,18 @@ static NTSTATUS http_remove_url(struct request_queue *queue, IRP *irp)
+             free(url_entry->url);
+             url_entry->url = NULL;
+ 
+-            if (!is_listening_socket_used(url_entry->listening_sock))
++            while (url_entry->listening_count)
+             {
+-                shutdown(url_entry->listening_sock->socket, SD_BOTH);
+-                closesocket(url_entry->listening_sock->socket);
+-                list_remove(&url_entry->listening_sock->entry);
+-                free(url_entry->listening_sock);
++                struct listening_socket *listening_sock = url_entry->listening_socks[--url_entry->listening_count];
++
++                if (!--listening_sock->users)
++                {
++                    shutdown(listening_sock->socket, SD_BOTH);
++                    closesocket(listening_sock->socket);
++                    list_remove(&listening_sock->entry);
++                    free(listening_sock);
++                }
+             }
+-            url_entry->listening_sock = NULL;
+ 
+             list_remove(&url_entry->entry);
+             free(url_entry);

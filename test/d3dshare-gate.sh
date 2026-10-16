@@ -5,7 +5,7 @@
 #
 #   WINE=/opt/wine-sg/bin/wine test/d3dshare-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
-# Mutants (d3d11): SG_MUTANT_KM_REACQUIRE_WAITS, SG_MUTANT_KM_RELEASE_EFAIL, SG_MUTANT_SHARED_NO_ABANDON,
+# Mutants (d3d11): SG_MUTANT_KM_RELEASE_EFAIL, SG_MUTANT_SHARED_NO_PIXELS (texture.c); the abandon and reacquire rules are win32u's now (SG_MUTANT_KMT_NO_ABANDON, SG_MUTANT_KMT_REACQUIRE_WAITS),
 # SG_MUTANT_SHARED_NO_PIXELS, SG_MUTANT_SHARED_FLAGS_ANY (texture.c), SG_MUTANT_CLEARVIEW_WHOLE (device.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"

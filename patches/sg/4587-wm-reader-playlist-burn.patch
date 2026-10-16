@@ -1,0 +1,206 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winegstreamer: Implement IWMReaderPlaylistBurn's file check.
+
+IWMReaderPlaylistBurn::InitPlaylistBurn checks the files of a playlist
+asynchronously and sends WMT_INIT_PLAYLIST_BURN to the status callback when
+it is done, as documented. The check is whether each file is licensed for
+copying; without DRM support every file that can be read is approved (S_OK)
+and one that cannot gives the error opening it. GetInitResults returns the
+results (an error before a check has finished or with another file count),
+and EndPlaylistBurn forgets them.
+
+Gate: test/wmvcore-playlist-burn-gate.sh (64/32).
+---
+ dlls/winegstreamer/wm_reader.c | 137 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 130 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/winegstreamer/wm_reader.c b/dlls/winegstreamer/wm_reader.c
+index 3332c7b..2bf64f9 100644
+--- a/dlls/winegstreamer/wm_reader.c
++++ b/dlls/winegstreamer/wm_reader.c
+@@ -101,6 +101,11 @@ struct wm_reader
+     IWMBandwidthSharing **sharings;
+     unsigned int sharing_count;
+     IWMStreamPrioritization *priorities;
++
++    /* IWMReaderPlaylistBurn: the files' check results, valid once the check is done */
++    HRESULT *burn_results;
++    DWORD burn_count;
++    bool burn_ready;
+ };
+ 
+ #define MAX_PROFILE_STREAM 63
+@@ -2913,9 +2918,71 @@ static ULONG WINAPI playlist_Release(IWMReaderPlaylistBurn *iface)
+     return IUnknown_Release(reader->outer);
+ }
+ 
++struct playlist_burn_check
++{
++    struct wm_reader *reader;
++    IWMStatusCallback *callback;
++    void *context;
++    DWORD count;
++    WCHAR **filenames;
++};
++
++/* A file is approved for copying unless it is DRM protected with a license that
++ * forbids it; without DRM support every file that can be read is approved. */
++static DWORD WINAPI playlist_burn_thread(void *arg)
++{
++    struct playlist_burn_check *check = arg;
++    struct wm_reader *reader = check->reader;
++    HRESULT *results;
++    DWORD i, zero = 0;
++
++    if ((results = calloc(check->count, sizeof(*results))))
++    {
++        for (i = 0; i < check->count; ++i)
++        {
++            HANDLE file = CreateFileW(check->filenames[i], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                    NULL, OPEN_EXISTING, 0, NULL);
++
++#ifdef SG_MUTANT_BURN_ALL_OK
++            results[i] = S_OK;
++            if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
++            continue;
++#endif
++            if (file == INVALID_HANDLE_VALUE)
++                results[i] = HRESULT_FROM_WIN32(GetLastError());
++            else
++            {
++                results[i] = S_OK;
++                CloseHandle(file);
++            }
++        }
++    }
++
++    EnterCriticalSection(&reader->cs);
++    free(reader->burn_results);
++    reader->burn_results = results;
++    reader->burn_count = results ? check->count : 0;
++    reader->burn_ready = !!results;
++    LeaveCriticalSection(&reader->cs);
++
++    IWMStatusCallback_OnStatus(check->callback, WMT_INIT_PLAYLIST_BURN, results ? S_OK : E_OUTOFMEMORY,
++            WMT_TYPE_DWORD, (BYTE *)&zero, check->context);
++
++    IWMStatusCallback_Release(check->callback);
++    for (i = 0; i < check->count; ++i)
++        free(check->filenames[i]);
++    free(check->filenames);
++    free(check);
++    IUnknown_Release(reader->outer);
++    return 0;
++}
++
+ static HRESULT WINAPI playlist_InitPlaylistBurn(IWMReaderPlaylistBurn *iface, DWORD count,
+         const WCHAR **filenames, IWMStatusCallback *callback, void *context)
+ {
++    struct wm_reader *reader = impl_from_IWMReaderPlaylistBurn(iface);
++    struct playlist_burn_check *check;
++    HANDLE thread;
+     DWORD i;
+ 
+     TRACE("iface %p, count %lu, filenames %p, callback %p, context %p.\n",
+@@ -2929,31 +2996,86 @@ static HRESULT WINAPI playlist_InitPlaylistBurn(IWMReaderPlaylistBurn *iface, DW
+             return E_INVALIDARG;
+     }
+ 
+-    /* Burning a playlist runs a reader on each file and reports through the
+-     * status callback; that needs the asynchronous reader, which lives in
+-     * wmvcore, not on this object. */
+-    FIXME("Playlist burning is not supported.\n");
+-    return E_NOTIMPL;
++    if (!(check = calloc(1, sizeof(*check))) || !(check->filenames = calloc(count, sizeof(*check->filenames))))
++    {
++        free(check);
++        return E_OUTOFMEMORY;
++    }
++    for (i = 0; i < count; ++i)
++    {
++        if (!(check->filenames[i] = wcsdup(filenames[i])))
++        {
++            while (i--) free(check->filenames[i]);
++            free(check->filenames);
++            free(check);
++            return E_OUTOFMEMORY;
++        }
++    }
++    check->reader = reader;
++    check->callback = callback;
++    check->context = context;
++    check->count = count;
++
++    EnterCriticalSection(&reader->cs);
++    reader->burn_ready = false;
++    LeaveCriticalSection(&reader->cs);
++
++    IWMStatusCallback_AddRef(callback);
++    IUnknown_AddRef(reader->outer);
++    /* the check runs asynchronously and ends with WMT_INIT_PLAYLIST_BURN */
++    if (!(thread = CreateThread(NULL, 0, playlist_burn_thread, check, 0, NULL)))
++    {
++        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
++
++        IUnknown_Release(reader->outer);
++        IWMStatusCallback_Release(callback);
++        for (i = 0; i < count; ++i) free(check->filenames[i]);
++        free(check->filenames);
++        free(check);
++        return hr;
++    }
++    CloseHandle(thread);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI playlist_GetInitResults(IWMReaderPlaylistBurn *iface, DWORD count, HRESULT *hrs)
+ {
++    struct wm_reader *reader = impl_from_IWMReaderPlaylistBurn(iface);
++    HRESULT hr = S_OK;
++
+     TRACE("iface %p, count %lu, hrs %p.\n", iface, count, hrs);
+ 
+     if (!hrs)
+         return E_INVALIDARG;
+-    return E_UNEXPECTED; /* no burn was initialised */
++    EnterCriticalSection(&reader->cs);
++    if (!reader->burn_ready)
++        hr = E_UNEXPECTED; /* no check has finished */
++    else if (count != reader->burn_count)
++        hr = E_INVALIDARG;
++    else
++        memcpy(hrs, reader->burn_results, count * sizeof(*hrs));
++    LeaveCriticalSection(&reader->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI playlist_Cancel(IWMReaderPlaylistBurn *iface)
+ {
+     TRACE("iface %p.\n", iface);
+-    return S_OK; /* nothing to cancel */
++    return S_OK; /* the check of local files cannot be interrupted, it ends by itself */
+ }
+ 
+ static HRESULT WINAPI playlist_EndPlaylistBurn(IWMReaderPlaylistBurn *iface, HRESULT hr)
+ {
++    struct wm_reader *reader = impl_from_IWMReaderPlaylistBurn(iface);
++
+     TRACE("iface %p, hr %#lx.\n", iface, hr);
++
++    EnterCriticalSection(&reader->cs);
++    free(reader->burn_results);
++    reader->burn_results = NULL;
++    reader->burn_count = 0;
++    reader->burn_ready = false;
++    LeaveCriticalSection(&reader->cs);
+     return S_OK;
+ }
+ 
+@@ -3445,6 +3567,7 @@ static ULONG WINAPI unknown_inner_Release(IUnknown *iface)
+         DeleteCriticalSection(&reader->shutdown_cs);
+ 
+         profile_clear(reader);
++        free(reader->burn_results);
+         free(reader);
+     }
+ 

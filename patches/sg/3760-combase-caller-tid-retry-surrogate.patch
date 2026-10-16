@@ -1,0 +1,368 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] combase: CoGetCallerTID, message filter retries, CoRegisterSurrogate (3760)
+
+CoGetCallerTID and CoRegisterSurrogate were stubs (E_NOTIMPL), and a call
+rejected by the callee's message filter was either dropped on the floor
+(SERVERCALL_RETRYLATER ran the method anyway) or never offered to the caller's
+filter. CoGetCallerTID now names the calling apartment (its thread for an STA,
+0 for the MTA, S_FALSE for another process), a call that the callee's
+IMessageFilter::HandleInComingCall rejects goes to the caller's
+IMessageFilter::RetryRejectedCall, which cancels, retries at once or after a
+wait, and CoRegisterSurrogate keeps the process's ISurrogate. CORE review
+(patches/notes/3760.txt).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZFS4SPPzeH5d2c1MuzqCS
+---
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index e4cc077..785096c 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -3621,8 +3621,27 @@ HRESULT WINAPI CoTestCancel(void)
+  */
+ HRESULT WINAPI CoGetCallerTID(DWORD *tid)
+ {
+-    FIXME("stub!\n");
+-    return E_NOTIMPL;
++    struct tlsdata *tlsdata;
++    struct apartment *apt;
++
++    TRACE("%p\n", tid);
++
++    if (!tid) return E_INVALIDARG;
++    if (FAILED(com_get_tlsdata(&tlsdata))) return E_OUTOFMEMORY;
++    if (!(apt = tlsdata->apt)) return CO_E_NOTINITIALIZED;
++
++    switch (TLS_CALLER_KIND( tlsdata ))
++    {
++    case CALLER_INPROC:   /* an STA's caller: its thread, the MTA: 0 */
++        *tid = TLS_CALLER_TID( tlsdata );
++        return S_OK;
++    case CALLER_REMOTE:   /* another process: no apartment to name */
++        *tid = 0;
++        return S_FALSE;
++    default:              /* no incoming call: the caller is the apartment of this thread */
++        *tid = apt->multi_threaded ? 0 : GetCurrentThreadId();
++        return S_OK;
++    }
+ }
+ 
+ /***********************************************************************
+@@ -3695,11 +3714,44 @@ HRESULT WINAPI CoResumeClassObjects(void)
+ /***********************************************************************
+  *           CoRegisterSurrogate    (combase.@)
+  */
++static ISurrogate *registered_surrogate;
++static CRITICAL_SECTION surrogate_cs;
++static CRITICAL_SECTION_DEBUG surrogate_cs_debug =
++{
++    0, 0, &surrogate_cs,
++    { &surrogate_cs_debug.ProcessLocksList, &surrogate_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": surrogate_cs") }
++};
++static CRITICAL_SECTION surrogate_cs = { &surrogate_cs_debug, -1, 0, 0, 0, 0 };
++
+ HRESULT WINAPI CoRegisterSurrogate(ISurrogate *surrogate)
+ {
+-    FIXME("%p stub\n", surrogate);
++    ISurrogate *old;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p\n", surrogate);
++
++    if (!surrogate) return E_INVALIDARG;
++
++    /* COM keeps the surrogate of the process (a global interface pointer) and calls it to load and to free
++     * the DLL servers; a surrogate that registers again replaces the first */
++    ISurrogate_AddRef(surrogate);
++    EnterCriticalSection(&surrogate_cs);
++    old = registered_surrogate;
++    registered_surrogate = surrogate;
++    LeaveCriticalSection(&surrogate_cs);
++    if (old) ISurrogate_Release(old);
++    return S_OK;
++}
++
++/* the surrogate of the process, if it registered one: with a reference */
++ISurrogate *com_get_registered_surrogate(void)
++{
++    ISurrogate *ret;
++
++    EnterCriticalSection(&surrogate_cs);
++    if ((ret = registered_surrogate)) ISurrogate_AddRef(ret);
++    LeaveCriticalSection(&surrogate_cs);
++    return ret;
+ }
+ 
+ /***********************************************************************
+diff --git a/dlls/combase/combase_private.h b/dlls/combase/combase_private.h
+index 99345cb..8103a7e 100644
+--- a/dlls/combase/combase_private.h
++++ b/dlls/combase/combase_private.h
+@@ -105,6 +105,11 @@ struct tlsdata
+     CO_MTA_USAGE_COOKIE implicit_mta_cookie; /* mta referenced by roapi from sta thread */
+ };
+ 
++/* where the call being served comes from (CoGetCallerTID); kept in the unused part of the thread data */
++enum { CALLER_NONE, CALLER_INPROC, CALLER_REMOTE };
++#define TLS_CALLER_KIND(td) ((td)->unknown2[0])
++#define TLS_CALLER_TID(td)  ((td)->unknown2[1])
++
+ extern HRESULT WINAPI InternalTlsAllocData(struct tlsdata **data);
+ extern BOOL WINAPI InternalIsProcessInitialized(void);
+ 
+diff --git a/dlls/combase/rpc.c b/dlls/combase/rpc.c
+index 032ca67..9268e25 100644
+--- a/dlls/combase/rpc.c
++++ b/dlls/combase/rpc.c
+@@ -1431,6 +1431,102 @@ static inline HRESULT ClientRpcChannelBuffer_IsCorrectApartment(ClientRpcChannel
+     return S_OK;
+ }
+ 
++/* The calls this process makes to its own apartments, for CoGetCallerTID: the callee finds who called by the
++ * causality id the call carries (a logical thread makes one call at a time; a call it is served meanwhile
++ * pushes its own entry on top).  A call that has no entry comes from another process. */
++struct caller_entry
++{
++    struct list entry;
++    GUID        cid;
++    DWORD       tid;   /* the calling thread when it is in an STA, 0 in the MTA */
++};
++static struct list callers = LIST_INIT(callers);
++static CRITICAL_SECTION callers_cs;
++static CRITICAL_SECTION_DEBUG callers_cs_debug =
++{
++    0, 0, &callers_cs,
++    { &callers_cs_debug.ProcessLocksList, &callers_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": callers_cs") }
++};
++static CRITICAL_SECTION callers_cs = { &callers_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct caller_entry *caller_push(const GUID *cid, DWORD tid)
++{
++    struct caller_entry *entry = malloc(sizeof(*entry));
++
++    if (!entry) return NULL;
++    entry->cid = *cid;
++    entry->tid = tid;
++    EnterCriticalSection(&callers_cs);
++    list_add_tail(&callers, &entry->entry);
++    LeaveCriticalSection(&callers_cs);
++    return entry;
++}
++
++static void caller_pop(struct caller_entry *entry)
++{
++    if (!entry) return;
++    EnterCriticalSection(&callers_cs);
++    list_remove(&entry->entry);
++    LeaveCriticalSection(&callers_cs);
++    free(entry);
++}
++
++static DWORD caller_lookup(const GUID *cid, DWORD *tid)
++{
++    struct caller_entry *entry;
++    DWORD kind = CALLER_REMOTE;
++
++    *tid = 0;
++    EnterCriticalSection(&callers_cs);
++    LIST_FOR_EACH_ENTRY_REV(entry, &callers, struct caller_entry, entry)
++    {
++        if (!IsEqualGUID(&entry->cid, cid)) continue;
++        kind = CALLER_INPROC;
++        *tid = entry->tid;
++        break;
++    }
++    LeaveCriticalSection(&callers_cs);
++    return kind;
++}
++
++/* The call was rejected by the callee's message filter: ask the caller's filter what to do.  TRUE: call again;
++ * FALSE: report the rejection (no filter, or it asked to cancel). */
++static BOOL ClientRpcChannelBuffer_RetryRejected(struct apartment *apt, struct message_state *state, DWORD start_tick)
++{
++    IMessageFilter *filter;
++    DWORD type, wait;
++
++    if (apt->multi_threaded) return FALSE;
++    EnterCriticalSection(&apt->cs);
++    if ((filter = apt->filter)) IMessageFilter_AddRef(filter);
++    LeaveCriticalSection(&apt->cs);
++    if (!filter) return FALSE;
++
++    type = state->params.hr == RPC_E_SERVERCALL_RETRYLATER ? SERVERCALL_RETRYLATER : SERVERCALL_REJECTED;
++    wait = IMessageFilter_RetryRejectedCall(filter, UlongToHandle(state->target_tid), GetTickCount() - start_tick, type);
++    IMessageFilter_Release(filter);
++    TRACE("RetryRejectedCall(type %lu) returned %ld\n", type, wait);
++    if (wait == ~0u)                                     /* cancel: the call fails as rejected */
++    {
++        state->params.hr = RPC_E_CALL_REJECTED;
++        return FALSE;
++    }
++    if (wait >= 100)
++    {
++        /* wait this long, taking messages, and call again */
++        HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
++        DWORD index;
++
++        if (event)
++        {
++            CoWaitForMultipleHandles(0, wait, 1, &event, &index);
++            CloseHandle(event);
++        }
++    }
++    return TRUE;
++}
++
+ static HRESULT WINAPI ClientRpcChannelBuffer_SendReceive(LPRPCCHANNELBUFFER iface, RPCOLEMESSAGE *olemsg, ULONG *pstatus)
+ {
+     ClientRpcChannelBuffer *This = (ClientRpcChannelBuffer *)iface;
+@@ -1445,6 +1541,8 @@ static HRESULT WINAPI ClientRpcChannelBuffer_SendReceive(LPRPCCHANNELBUFFER ifac
+     HRESULT hrFault = S_OK;
+     struct apartment *apt = apartment_get_current_or_mta();
+     struct tlsdata *tlsdata;
++    DWORD start_tick;
++    struct caller_entry *in_proc_call = NULL;
+ 
+     TRACE("%p, iMethod %ld\n", olemsg, olemsg->iMethod);
+ 
+@@ -1488,49 +1586,70 @@ static HRESULT WINAPI ClientRpcChannelBuffer_SendReceive(LPRPCCHANNELBUFFER ifac
+      * from DllMain */
+ 
+     message_state->params.msg = olemsg;
+-    if (message_state->params.bypass_rpcrt)
++    if (This->server_pid == GetCurrentProcessId())
++        in_proc_call = caller_push(&message_state->channel_hook_info.uCausality, apt->multi_threaded ? 0 : GetCurrentThreadId());
++    start_tick = GetTickCount();
++    for (;;)
+     {
+-        TRACE("Calling apartment thread %#lx...\n", message_state->target_tid);
++        if (message_state->params.bypass_rpcrt)
++        {
++            TRACE("Calling apartment thread %#lx...\n", message_state->target_tid);
+ 
+-        msg->ProcNum &= ~RPC_FLAGS_VALID_BIT;
++            msg->ProcNum &= ~RPC_FLAGS_VALID_BIT;
+ 
+-        if (!PostMessageW(message_state->target_hwnd, DM_EXECUTERPC, 0,
+-                          (LPARAM)&message_state->params))
+-        {
+-            ERR("PostMessage failed with error %lu\n", GetLastError());
++            if (!PostMessageW(message_state->target_hwnd, DM_EXECUTERPC, 0,
++                              (LPARAM)&message_state->params))
++            {
++                ERR("PostMessage failed with error %lu\n", GetLastError());
+ 
+-            /* Note: message_state->params.iface doesn't have a reference and
+-             * so doesn't need to be released */
++                /* Note: message_state->params.iface doesn't have a reference and
++                 * so doesn't need to be released */
+ 
+-            hr = HRESULT_FROM_WIN32(GetLastError());
++                hr = HRESULT_FROM_WIN32(GetLastError());
++            }
+         }
+-    }
+-    else
+-    {
+-        /* we use a separate thread here because we need to be able to
+-         * pump the message loop in the application thread: if we do not,
+-         * any windows created by this thread will hang and RPCs that try
+-         * and re-enter this STA from an incoming server thread will
+-         * deadlock. InstallShield is an example of that.
+-         */
+-        if (!QueueUserWorkItem(rpc_sendreceive_thread, &message_state->params, WT_EXECUTEDEFAULT))
++        else
++        {
++            /* we use a separate thread here because we need to be able to
++             * pump the message loop in the application thread: if we do not,
++             * any windows created by this thread will hang and RPCs that try
++             * and re-enter this STA from an incoming server thread will
++             * deadlock. InstallShield is an example of that.
++             */
++            if (!QueueUserWorkItem(rpc_sendreceive_thread, &message_state->params, WT_EXECUTEDEFAULT))
++            {
++                ERR("QueueUserWorkItem failed with error %lu\n", GetLastError());
++                hr = E_UNEXPECTED;
++            }
++            else
++                hr = S_OK;
++        }
++
++        if (hr == S_OK)
+         {
+-            ERR("QueueUserWorkItem failed with error %lu\n", GetLastError());
+-            hr = E_UNEXPECTED;
++            if (WaitForSingleObject(message_state->params.handle, 0))
++            {
++                tlsdata->pending_call_count_client++;
++                hr = CoWaitForMultipleHandles(0, INFINITE, 1, &message_state->params.handle, &index);
++                tlsdata->pending_call_count_client--;
++            }
+         }
+-        else
+-            hr = S_OK;
+-    }
+ 
+-    if (hr == S_OK)
+-    {
+-        if (WaitForSingleObject(message_state->params.handle, 0))
++        /* A call that the callee's message filter rejected (it did not run) is offered to the caller's own
++         * filter, which says whether to cancel, retry at once or retry after a wait: IMessageFilter::RetryRejectedCall.
++         * Only calls within the process come back with the reason; a call to another process is reported. */
++        if (hr == S_OK && message_state->params.bypass_rpcrt &&
++            (message_state->params.hr == RPC_E_CALL_REJECTED ||
++             message_state->params.hr == RPC_E_SERVERCALL_RETRYLATER) &&
++            ClientRpcChannelBuffer_RetryRejected(apt, message_state, start_tick))
+         {
+-            tlsdata->pending_call_count_client++;
+-            hr = CoWaitForMultipleHandles(0, INFINITE, 1, &message_state->params.handle, &index);
+-            tlsdata->pending_call_count_client--;
++            message_state->params.hr = S_OK;
++            message_state->params.status = RPC_S_OK;
++            continue;
+         }
++        break;
+     }
++    caller_pop(in_proc_call);
+     ClientRpcChannelBuffer_ReleaseEventHandle(This, message_state->params.handle);
+ 
+     /* for WM shortcut, faults are returned in params->hr */
+@@ -1954,6 +2073,7 @@ void rpc_execute_call(struct dispatch_params *params)
+     ORPC_EXTENT_ARRAY orpc_ext_array;
+     WIRE_ORPC_EXTENT *first_wire_orpc_extent;
+     GUID old_causality_id;
++    DWORD old_caller_kind, old_caller_tid;
+     struct tlsdata *tlsdata;
+     struct apartment *apt;
+ 
+@@ -2028,13 +2148,9 @@ void rpc_execute_call(struct dispatch_params *params)
+             params->hr = RPC_E_CALL_REJECTED;
+             goto exit_reset_state;
+         case SERVERCALL_RETRYLATER:
+-#if 0 /* FIXME: handle retries on the client side before enabling this code */
+-            params->hr = RPC_E_RETRY;
++            /* the caller's message filter decides whether the call is made again (RetryRejectedCall) */
++            params->hr = RPC_E_SERVERCALL_RETRYLATER;
+             goto exit_reset_state;
+-#else
+-            FIXME("retry call later not implemented\n");
+-            break;
+-#endif
+         case SERVERCALL_ISHANDLED:
+         default:
+             break;
+@@ -2049,7 +2165,12 @@ void rpc_execute_call(struct dispatch_params *params)
+     old_causality_id = tlsdata->causality_id;
+     tlsdata->causality_id = orpcthis.cid;
+     tlsdata->pending_call_count_server++;
++    old_caller_kind = TLS_CALLER_KIND( tlsdata );
++    old_caller_tid = TLS_CALLER_TID( tlsdata );
++    TLS_CALLER_KIND( tlsdata ) = caller_lookup( &orpcthis.cid, &TLS_CALLER_TID( tlsdata ));
+     params->hr = IRpcStubBuffer_Invoke(params->stub, params->msg, params->chan);
++    TLS_CALLER_KIND( tlsdata ) = old_caller_kind;
++    TLS_CALLER_TID( tlsdata ) = old_caller_tid;
+     tlsdata->pending_call_count_server--;
+     tlsdata->causality_id = old_causality_id;
+ 

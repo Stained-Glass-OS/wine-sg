@@ -25,6 +25,7 @@ HRESULT WINAPI SLGetAuthenticationResult(HSLC, UINT *, BYTE **);
 HRESULT WINAPI SLRegisterEvent(HSLC, const WCHAR *, const SLID *, HANDLE);
 HRESULT WINAPI SLUnregisterEvent(HSLC, const WCHAR *, const SLID *, HANDLE);
 HRESULT WINAPI SLIsGenuineLocalEx(const SLID *, const SLID *, int *);
+HRESULT WINAPI SLGetSLIDList(HSLC, int, const SLID *, int, UINT *, SLID **);
 HRESULT WINAPI SLGetProductSkuInformation(HSLC, const SLID *, const WCHAR *, UINT *, UINT *, BYTE **);
 
 static void id(const char *name, HRESULT hr, const SLID *g)
@@ -162,9 +163,61 @@ int main(void)
             printf("consume-key %08lx\n", SLConsumeRight(h, &office, NULL, NULL, NULL));
             SLUninstallProofOfPurchase(h, &key);
         }
+        {
+            /* 5518: SLGetSLIDList, the combinations the license files can answer (0 app, 1 sku, 2 file, 4 pkey) */
+            SLID *list = NULL;
+            UINT cnt2 = 0;
+            hr = SLGetSLIDList(h, 0, NULL, 0, &cnt2, &list);
+            printf("slid-apps %08lx %u %d\n", hr, cnt2, list && IsEqualGUID(&list[0], &office));
+            if (list) LocalFree(list);
+            list = NULL; cnt2 = 0;
+            hr = SLGetSLIDList(h, 1, NULL, 1, &cnt2, &list);
+            printf("slid-skus %08lx %u %d\n", hr, cnt2, list && IsEqualGUID(&list[0], &sku_id));
+            if (list) LocalFree(list);
+            list = NULL; cnt2 = 0;
+            hr = SLGetSLIDList(h, 0, &office, 1, &cnt2, &list);
+            printf("slid-app-sku %08lx %u %d\n", hr, cnt2, list && IsEqualGUID(&list[0], &sku_id));
+            if (list) LocalFree(list);
+            list = NULL; cnt2 = 0;
+            hr = SLGetSLIDList(h, 1, &sku_id, 0, &cnt2, &list);
+            printf("slid-sku-app %08lx %u %d\n", hr, cnt2, list && IsEqualGUID(&list[0], &office));
+            if (list) LocalFree(list);
+            list = NULL; cnt2 = 0;
+            hr = SLGetSLIDList(h, 1, &sku_id, 2, &cnt2, &list);
+            printf("slid-sku-file %08lx %u %d\n", hr, cnt2, list && IsEqualGUID(&list[0], &s));
+            if (list) LocalFree(list);
+            list = NULL; cnt2 = 0;
+            hr = SLGetSLIDList(h, 0, &sku_id, 1, &cnt2, &list);
+            printf("slid-unknown-app %08lx %u\n", hr, cnt2);
+            printf("slid-no-query %08lx\n", SLGetSLIDList(h, 0, NULL, 1, &cnt2, &list));
+            printf("slid-sku-pkey %08lx\n", SLGetSLIDList(h, 1, &sku_id, 4, &cnt2, &list));
+            printf("slid-unlisted %08lx\n", SLGetSLIDList(h, 0, &office, 4, &cnt2, &list));
+        }
         SLUninstallLicense(h, &s);
+        {
+            SLID *list = NULL;
+            UINT cnt2 = 0;
+            printf("slid-after-uninstall %08lx %u\n", SLGetSLIDList(h, 1, NULL, 1, &cnt2, &list), cnt2);
+        }
     }
     SLUninstallLicense(h, &c);
-    SLClose(h);
+    {
+        /* 5518: a context is a real object; closed or invented ones are refused */
+        HSLC h2 = NULL;
+        HRESULT r1, r2;
+        UINT n2 = 0;
+        void *st2 = NULL;
+        SLID z = {0};
+        printf("distinct %d\n", SLOpen(&h2) == S_OK && h2 != h && h2 != (HSLC)0xdeadbeef);
+        printf("close %08lx\n", SLClose(h));
+        r1 = SLClose(h);
+        printf("close-again %08lx\n", r1);
+        printf("use-closed %08lx\n", SLGetLicensingStatusInformation(h, &app, NULL, NULL, &n2, &st2));
+        printf("close-invented %08lx\n", SLClose((HSLC)0xdeadbeef));
+        printf("close-null %08lx\n", SLClose(NULL));
+        printf("use-other %08lx\n", SLUninstallLicense(h2, &z));
+        r2 = SLClose(h2);
+        printf("close-other %08lx\n", r2);
+    }
     return 0;
 }
