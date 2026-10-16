@@ -100,6 +100,10 @@ done
 out=$(run "$SG_USER1" 'C:\tok.exe' disp)
 [ "$(v "$out" "CREATE hklm System\\CurrentControlSet\\Control\\Video\\SgTokProbe ->")" = 0 ] && \
 [ "$(v "$out" "SETVALUE hklm System\\CurrentControlSet\\Control\\GraphicsDrivers\\SgTokProbe ->")" = 0 ] && pass "...writes the display configuration keys" || fail "display config keys: $out"
+# a pipe between two of a standard user's processes: every byte arrives and the end is a broken pipe
+# (a dropped I/O APC made ReadFile fail with ERROR_ALERTED, 739: 5926)
+out=$(run "$SG_USER1" 'C:\tok.exe' pipe)
+[ "$(v "$out" PIPE)" = "9800 109" ] && pass "a standard user's pipe delivers every byte" || fail "pipe: $(v "$out" PIPE) (want 9800 109)"
 # a restricted token's child process now and then ends early (seen with the machine busy, also before this
 # patch): ask again until it has reported
 for try in 1 2 3; do

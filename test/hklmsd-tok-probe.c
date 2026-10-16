@@ -117,7 +117,8 @@ static void run_child(HANDLE token, const char *label)
     PROCESS_INFORMATION pi;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE r, w;
-    char buf[4096];
+    static char buf[65536];
+    char drain[4096];
     DWORD n, total = 0;
 
     CreatePipe(&r, &w, &sa, 0);
@@ -135,7 +136,16 @@ static void run_child(HANDLE token, const char *label)
         return;
     }
     CloseHandle(w);
-    while (ReadFile(r, buf + total, sizeof(buf) - 1 - total, &n, NULL) && n) total += n;
+    /* the child's GROUP lines alone can pass 4 KB (a user in many host groups): read everything, so the
+     * child never blocks on a full pipe and its later lines are not cut off (integ-2026-10) */
+    for (;;)
+    {
+        DWORD room = sizeof(buf) - 1 - total;
+        /* a zero-byte read is not the end (a zero-length write of the child's C runtime gives one):
+         * read until the pipe is broken */
+        if (!ReadFile(r, room ? buf + total : drain, room ? room : sizeof(drain), &n, NULL)) break;
+        if (room) total += n;
+    }
     buf[total] = 0;
     WaitForSingleObject(pi.hProcess, 60000);
     {
@@ -178,6 +188,37 @@ static void restricted(void)
     else printf("CreateRestrictedToken(chrome) failed %lu\n", GetLastError());
 }
 
+/* a child writes 200 lines to a pipe, the parent reads them all: with a shared server that cannot
+ * signal another user's thread, the reader's I/O APC was dropped and ReadFile failed with
+ * ERROR_ALERTED (5926) */
+static void pipe_test(void)
+{
+    HANDLE r, w;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    WCHAR cmd[MAX_PATH * 2], self[MAX_PATH];
+    char buf[4096];
+    DWORD n, total = 0, err = 0;
+
+    CreatePipe(&r, &w, &sa, 0);
+    SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = w; si.hStdError = w; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    swprintf(cmd, ARRAY_SIZE(cmd), L"\"%ls\" lines", self);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) { printf("PIPE create %lu\n", GetLastError()); return; }
+    CloseHandle(w);
+    for (;;)
+    {
+        if (!ReadFile(r, buf, sizeof(buf), &n, NULL)) { err = GetLastError(); break; }
+        total += n;
+    }
+    WaitForSingleObject(pi.hProcess, 60000);
+    printf("PIPE %lu %lu\n", total, err);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(r);
+}
+
 int main(int argc, char **argv)
 {
     const char *m = argc > 1 ? argv[1] : "info";
@@ -194,6 +235,12 @@ int main(int argc, char **argv)
         RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\GraphicsDrivers\\SgTokProbe");
     }
     else if (!strcmp(m, "restricted")) restricted();
+    else if (!strcmp(m, "pipe")) pipe_test();
+    else if (!strcmp(m, "lines"))
+    {
+        int i;
+        for (i = 0; i < 200; i++) { printf("line %03d of the pipe test, some text to fill it\n", i); if (!(i % 20)) fflush(stdout); }
+    }
     fflush(stdout);
     return 0;
 }
