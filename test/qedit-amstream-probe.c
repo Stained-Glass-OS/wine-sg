@@ -547,12 +547,16 @@ static void test_audio(void)
     IAudioData_GetInfo(ad1, &len, &ptr, NULL);
     CHECK(!memcmp(ptr, data, 6), "ReceiveMultiple data");
 
-    /* IMediaStream members that have no meaning for this stream */
-    CHECK_HR(IMediaStream_AllocateSample(stream, 0, &ss), E_NOTIMPL);
-    CHECK(ss == NULL, "AllocateSample output");
-    ss = (IStreamSample *)0xdead;
-    CHECK_HR(IMediaStream_CreateSharedSample(stream, (IStreamSample *)sample1, 0, &ss), E_NOTIMPL);
-    CHECK(ss == NULL, "CreateSharedSample output");
+    /* AllocateSample / CreateSharedSample: stubs-5 4580 implements them as documented (a sample
+     * with its own IAudioData; a sample sharing another's) -- they were E_NOTIMPL here */
+    ss = NULL;
+    CHECK_HR(IMediaStream_AllocateSample(stream, 0, &ss), S_OK);
+    CHECK(ss != NULL, "AllocateSample output");
+    if (ss) IStreamSample_Release(ss);
+    ss = NULL;
+    CHECK_HR(IMediaStream_CreateSharedSample(stream, (IStreamSample *)sample1, 0, &ss), S_OK);
+    CHECK(ss != NULL, "CreateSharedSample output");
+    if (ss) IStreamSample_Release(ss);
     CHECK_HR(IMediaStream_AllocateSample(stream, 0, NULL), E_POINTER);
     CHECK_HR(IMediaStream_SendEndOfStream(stream, 0), MS_E_INVALIDSTREAMTYPE);
 
@@ -651,11 +655,12 @@ static void test_ddraw(void)
     alloc_commit(&src, 4, sizeof(frame));
     IGraphBuilder_AddFilter(graph, &src.IBaseFilter_iface, NULL);
 
-    /* ---- stream members without a meaning here */
-    CHECK_HR(IMediaStream_AllocateSample(stream, 0, &ss), E_NOTIMPL);
-    CHECK(ss == NULL, "AllocateSample output");
+    /* ---- AllocateSample / CreateSharedSample: stubs-5 4580 implements them (documented; were
+     * E_NOTIMPL). Allocating here would fix the stream's format before the connection below, so
+     * only the argument checks run here; amstream-alloc is their gate */
+    CHECK_HR(IMediaStream_AllocateSample(stream, 0, NULL), E_POINTER);
     ss = (IStreamSample *)0xdead;
-    CHECK_HR(IMediaStream_CreateSharedSample(stream, NULL, 0, &ss), E_NOTIMPL);
+    CHECK_HR(IMediaStream_CreateSharedSample(stream, NULL, 0, &ss), E_POINTER);
     CHECK(ss == NULL, "CreateSharedSample output");
     CHECK_HR(IMediaStream_SendEndOfStream(stream, 0), MS_E_INVALIDSTREAMTYPE);
 

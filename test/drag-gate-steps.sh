@@ -65,7 +65,10 @@ field_is band "" && [ "$(pixel band-before $((AX + 100)) "$AY")" = "$(shot band-
 
 # --- Ctrl+click, Shift+click -------------------------------------------------------------------------
 set -- $(at c.txt); CX=$1; CY=$2
-xdotool mousemove "$CX" "$CY" keydown ctrl click 1 keyup ctrl; sleep 0.8
+# the key and the click reach different Wine windows (X focus vs pointer) and are not ordered between
+# them: the first Ctrl of the session lost the race on the integration build (slower first key, the
+# keyboard layout work of 3240/3754), so Ctrl is held a moment first, as a person does
+xdotool mousemove "$CX" "$CY" keydown ctrl sleep 0.3 click 1 keyup ctrl; sleep 0.8
 [ "$(field selcount)" = 3 ] && selected c.txt && pass "Ctrl+click adds an icon to the selection" || fail "Ctrl+click: $(dump | head -1)"
 xdotool mousemove "$AX" "$AY" keydown ctrl click 1 keyup ctrl; sleep 0.8
 [ "$(field selcount)" = 2 ] && ! selected a.txt && pass "Ctrl+click on a selected icon takes it out" || fail "Ctrl+click off: $(dump | head -1)"

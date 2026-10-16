@@ -306,8 +306,9 @@ static void test_dsound(void)
         CHECK_HR(ds->lpVtbl->ReleaseDirectSoundInterface(ds, s), E_NOTIMPL, "ReleaseDirectSoundInterface");
         CHECK_HR(ds->lpVtbl->ReleasePrimaryBufferInterface(ds, buf), E_NOTIMPL, "ReleasePrimaryBufferInterface");
         CHECK_HR(ds->lpVtbl->ReleaseSecondaryBufferInterface(ds, buf), E_NOTIMPL, "ReleaseSecondaryBufferInterface");
-        CHECK_HR(ds->lpVtbl->SetFocusWindow(ds, GetDesktopWindow(), TRUE), E_NOTIMPL, "SetFocusWindow");
-        CHECK_HR(ds->lpVtbl->GetFocusWindow(ds, &hwnd, &bg), E_NOTIMPL, "GetFocusWindow");
+        /* Set/GetFocusWindow: stubs-5 4579 implements them as documented (were E_NOTIMPL) */
+        CHECK_HR(ds->lpVtbl->SetFocusWindow(ds, GetDesktopWindow(), TRUE), S_OK, "SetFocusWindow");
+        CHECK_HR(ds->lpVtbl->GetFocusWindow(ds, &hwnd, &bg), S_OK, "GetFocusWindow");
         ds->lpVtbl->Release(ds);
     }
     hr = IBaseFilter_QueryInterface(filter, &IID_IQualityControl, (void **)&qc);

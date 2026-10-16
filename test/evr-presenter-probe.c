@@ -172,8 +172,11 @@ static void test_display_control(IMFVideoDisplayControl *control, HWND window)
 
     hr = IMFVideoDisplayControl_SetFullscreen(control, TRUE);
     CHECKF(hr == E_NOTIMPL, "SetFullscreen is E_NOTIMPL (documented) (%#lx)", hr);
+    /* GetFullscreen: the page documents S_OK with FALSE for video in the clipping window
+     * (stubs-5 4584); this check had E_NOTIMPL */
+    full = TRUE;
     hr = IMFVideoDisplayControl_GetFullscreen(control, &full);
-    CHECKF(hr == E_NOTIMPL, "GetFullscreen is E_NOTIMPL (documented) (%#lx)", hr);
+    CHECKF(hr == S_OK && !full, "GetFullscreen is S_OK, windowed (documented) (%#lx)", hr);
 
     hr = IMFVideoDisplayControl_GetIdealVideoSize(control, NULL, NULL);
     CHECKF(hr == E_POINTER, "GetIdealVideoSize(NULL, NULL) is E_POINTER (%#lx)", hr);

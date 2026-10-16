@@ -347,7 +347,9 @@ static void test_propbag(void)
     check(hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND), "missing value");
     VariantInit(&v);
     hr = IPropertyBag_Read(bag, L"Bin", &v, NULL);
-    check(hr == HRESULT_FROM_WIN32(ERROR_UNSUPPORTED_TYPE), "binary value is unsupported");
+    /* fast-b 3705 reads a binary value as a byte array (VT_ARRAY | VT_UI1); it was unsupported */
+    check(hr == S_OK && V_VT(&v) == (VT_ARRAY | VT_UI1), "binary value is a byte array");
+    VariantClear(&v);
 
     VariantInit(&v);
     V_VT(&v) = VT_BSTR;
