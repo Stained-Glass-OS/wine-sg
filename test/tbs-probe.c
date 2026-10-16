@@ -25,7 +25,9 @@ int main(void)
 
     if (!create || !info) { printf("FAIL tbs.dll missing\n"); return 1; }
     check("create-null-output", create(&p, NULL), 0x80284003);
-    check("create-null-params", create(NULL, &ctx), 0x80284007);
+    /* NULL params: TBS_E_BAD_PARAMETER, superseded by fast-a 3237 at integration (both codes are
+     * documented for Tbsi_Context_Create, the order is a guess; RECONCILE-CLOUD kept 3237's) */
+    check("create-null-params", create(NULL, &ctx), 0x80284002);
     p.version = 0; check("create-version-0", create(&p, &ctx), 0x80284007);
     p.version = 3; check("create-version-3", create(&p, &ctx), 0x80284007);
     p.version = 1; check("create-tpm12-no-tpm", create(&p, &ctx), 0x8028400F);

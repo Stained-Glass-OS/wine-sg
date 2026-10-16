@@ -56,7 +56,8 @@ x = 1 / 0
 WScript.Echo "after"
 EOS
 run "$T/err.vbs"
-if [ $RET = 1 ] && grep -q "^before\$" "$T/o" && ! grep -q "^after\$" "$T/o" && grep -q "err.vbs(2, [0-9]*) .*: .*[Dd]ivision by zero" "$T/o"
+# the report's stream: stdout here (5524) or stderr (kept fast-a 3241); both guesses (RECONCILE-CLOUD), so either
+if [ $RET = 1 ] && grep -q "^before\$" "$T/o" && ! grep -q "^after\$" "$T/o" && cat "$T/o" "$T/e" | grep -q "err.vbs(2, [0-9]*) .*: .*[Dd]ivision by zero"
 then pass "an unhandled error is reported with file, line and column and exits 1; the script stops there"; else fail "error report ($RET): $(cat "$T/o" "$T/e")"; fi
 
 cat > "$T/ok.vbs" <<'EOS'

@@ -21,6 +21,9 @@ done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-taskmonth.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
+# The start boundaries are UTC ("Z") and GetRunTimes answers local times: the expected times are UTC's,
+# so the probe runs with a UTC time zone (on a host in another zone every check failed by the offset).
+export TZ=UTC
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 TMPDIR=/var/tmp x86_64-w64-mingw32-gcc -O1 -o "$T/p64.exe" "$HERE/taskmonth-probe.c" -lole32 -loleaut32 -luuid &&
