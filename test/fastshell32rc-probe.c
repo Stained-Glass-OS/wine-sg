@@ -300,8 +300,11 @@ int main(void)
             IShellView3_DestroyViewWindow(view);
             IShellView3_Release(view);
 
-            /* the next view of the browser starts in the saved mode, not the one it is asked for */
-            view = make_view(&sb, FVM_LIST, &vw);
+            /* the next view of the browser starts in the saved mode when it is asked for none
+             * (FVM_AUTO); a mode it is asked for wins (changed at integration: Wine's ebrowser and
+             * comdlg32 filedlg conformance tests, which follow Windows, ask for a mode or a view id
+             * and expect it, so 3258's "saved mode first" guess was wrong) */
+            view = make_view(&sb, FVM_AUTO, &vw);
             EXPECT(view != NULL);
             if (view)
             {
@@ -310,6 +313,17 @@ int main(void)
                 EXPECT(fs.ViewMode == FVM_DETAILS);
                 EXPECT_HR(S_OK, IShellView3_GetView(view, &vid, (ULONG)-1));
                 EXPECT(IsEqualGUID(&vid, &VID_Details));
+                IShellView3_DestroyViewWindow(view);
+                IShellView3_Release(view);
+            }
+            /* a mode the browser asks for wins over the saved one */
+            view = make_view(&sb, FVM_LIST, &vw);
+            EXPECT(view != NULL);
+            if (view)
+            {
+                FOLDERSETTINGS fs;
+                EXPECT_HR(S_OK, IShellView3_GetCurrentInfo(view, &fs));
+                EXPECT(fs.ViewMode == FVM_LIST);
                 IShellView3_DestroyViewWindow(view);
                 IShellView3_Release(view);
             }
