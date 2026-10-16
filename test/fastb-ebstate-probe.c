@@ -273,8 +273,12 @@ static void test_eb(const WCHAR *dir_a, const WCHAR *dir_b, const WCHAR *dir_emp
     IPropertyBag_Release(bag);
 
     /* the view state stream */
+    /* "no stream yet" (STG_E_FILENOTFOUND) no longer holds once fast-a 3258 is in: the folder
+     * view saves its state in this stream when it is left (IShellView::SaveViewState), so A
+     * has a stream from its first visit (integ-2026-10) */
     hr = IShellBrowser_GetViewStateStream(sb, STGM_READ, &st);
-    CHECK(hr == STG_E_FILENOTFOUND && !st, "no stream yet %#lx", hr);
+    CHECK(hr == S_OK && st, "A has the stream its view saved %#lx", hr);
+    if (st) IStream_Release(st);
     hr = IShellBrowser_GetViewStateStream(sb, STGM_WRITE, &st);
     CHECK(hr == S_OK && st, "write stream %#lx", hr);
     if (st)
