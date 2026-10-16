@@ -228,6 +228,9 @@ int main(void)
         BOOL ok;
 
         cb.sleep_ms = 0; cb.calls = 0; cb.status = S_OK; cb.bytes = 99;
+        /* a completion of the earlier phases may have left the event signalled: the wait below
+         * returned before this read's callback ran (seen under load at integration) */
+        ResetEvent(cb.event);
         pCreateResult(NULL, &cb, NULL, &rr);
         res = (RESULT *)rr;
         memset(&res->overlapped, 0, sizeof(res->overlapped));
