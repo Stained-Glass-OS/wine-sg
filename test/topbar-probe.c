@@ -25,6 +25,30 @@ int WINAPI WinMain( HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show )
         hwnd = CreateWindowW( L"TopBar", L"window", WS_POPUP | WS_VISIBLE, 100, 400,
                               600, GetSystemMetrics( SM_CYSCREEN ) - 400, 0, 0, inst, 0 );
     SetForegroundWindow( hwnd );
+    if (strstr( cmd, "close" ))
+    {
+        /* (field report 2026-10-17) another window opens over the desktop and
+         * closes, 30 times: the red one, reaching under the taskbar, takes the
+         * foreground back each time -- the bar must stay over it */
+        WNDCLASSW bc = wc;
+        int i;
+        bc.hbrBackground = CreateSolidBrush( RGB( 0, 0, 255 ) );
+        bc.lpszClassName = L"TopBarClosing";
+        RegisterClassW( &bc );
+        for (i = 0; i < 30; i++)
+        {
+            HWND other = CreateWindowW( L"TopBarClosing", L"other", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 700, 50, 250, 200, 0, 0, inst, 0 );
+            SetForegroundWindow( other );
+            start = GetTickCount();
+            while (GetTickCount() - start < 50) { while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageW( &msg ); Sleep( 5 ); }
+            DestroyWindow( other );
+            start = GetTickCount();
+            while (GetTickCount() - start < 60) { while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageW( &msg ); Sleep( 5 ); }
+        }
+        start = GetTickCount();
+        while (GetTickCount() - start < 1500) { while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageW( &msg ); Sleep( 20 ); }
+        return 0;
+    }
     if (strstr( cmd, "flip" ))
     {
         WNDCLASSW bc = wc;

@@ -46,6 +46,13 @@ sleep 3; import -window root "$T/full.png"; wait $P
 # them): the red one must never show where the bar is, not for a frame (0604)
 "$WINE" 'C:\topbar-probe.exe' flip >/dev/null 2>&1 & P=$!
 sleep 0.8; FLIP=$("$T/stack-watch" 2400); wait $P
+# another window closing: the one under the taskbar takes the foreground
+# again, never over the bar (field report 2026-10-17). A regression guard: the
+# bar over it on the field machine (Xwayland, sg-deskcomp) is not reproduced
+# here, so SG_MUTANT_TOPMOST_UNDER passes this too.
+"$WINE" 'C:\topbar-probe.exe' close >/dev/null 2>&1 & P=$!
+sleep 0.8; CLOSE=$("$T/stack-watch" 3800); import -window root "$T/close.png"; wait $P
+C=$(px close 400 690)
 W=$(px window 400 690); A=$(px window 400 500); F=$(px full 400 690)
 echo "      taskbar $BAR; window over it: bar $W, window $A; full screen: bar $F"
 rc=0
@@ -57,5 +64,8 @@ rc=0
 set -- $FLIP
 [ "${2:-0}" -gt 5 ] && [ "${1:-1}" = 0 ] && echo "PASS  switching windows never stacks one over the taskbar, not for a moment ($2 restacks)" \
     || { echo "FAIL  a window was stacked over the taskbar while switching (${1:-?} times of ${2:-?} restacks)"; rc=1; }
+set -- $CLOSE
+[ "${1:-1}" = 0 ] && [ "$C" = "$BAR" ] && echo "PASS  another window closing: the window under the taskbar comes back, the bar stays over it (${2:-?} restacks)" \
+    || { echo "FAIL  another window closing put the window over the taskbar (${1:-?} times of ${2:-?} restacks; the bar's place shows $C)"; rc=1; }
 [ $rc = 0 ] && { echo "RESULT: PASS"; exit 0; }
 echo "RESULT: FAIL"; exit 1

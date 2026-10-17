@@ -130,6 +130,24 @@ P close; sleep 2
 P wait; sleep 1; P class; P dump 0 'C:\\t\\dump-assoc'
 import -window root "$T/final.png"
 P close; sleep 1
+
+# 9. spell check (View), and unsaved work kept over a close (David, 2026-10-17)
+"$WINE" notepad.exe > /dev/null 2>&1 &
+P wait; sleep 1
+focus; xdotool key ctrl+n; sleep 0.5
+xdotool type --delay 20 'teh helo wrold is here'; xdotool key Return; xdotool type --delay 20 'the hello world is fine'; xdotool key Return
+P cmd 399; sleep 1
+P screenpos 4; P screenpos 28
+import -window root "$T/spell.png"
+P cmd 399; sleep 1
+import -window root "$T/nospell.png"
+P close; sleep 2
+P class
+"$WINE" notepad.exe > /dev/null 2>&1 &
+P wait; sleep 1
+P tabs; P modified
+P dump 0 'C:\\t\\dump-r0'; P dump 1 'C:\\t\\dump-r1'; P dump 2 'C:\\t\\dump-r2'; P dump 3 'C:\\t\\dump-r3'
+P close; sleep 1
 EOF
 chmod +x "$T/session.sh"
 timeout -s KILL 420 xvfb-run -a -s '-screen 0 1024x700x24' "$T/session.sh"
@@ -186,6 +204,22 @@ case "$(after 'launch notepad.exe C:\t\find.txt' 1)" in
     *) fail "64-bit launch: $(after 'launch notepad.exe C:\t\find.txt' 1)" ;; esac
 # 8
 [ "$(after class 2)" = "class=SgNotepadEditor" ] && same "$C/t/dump-assoc" "$C/t/assoc.txt" && pass "opening a .txt (ShellExecute) opens it in our Notepad" || fail "association: $(after class 2)"
+
+# 9
+red() {   # red pixels under the line of character $2 in picture $1
+    xy=$(after "screenpos $2" 1); x=${xy#x=}; x=${x%% *}; y=${xy##*y=}
+    convert "$T/$1.png" -crop "300x24+$((x - 30))+$((y + 2))" +repage \
+        -fx '(r > 0.7 && g < 0.4 && b < 0.4) ? 1 : 0' -format '%[fx:int(mean*w*h+0.5)]' info: 2>/dev/null | tail -n 1
+}
+bad=$(red spell 4); good=$(red spell 28); off=$(red nospell 4)
+[ "${bad:-0}" -ge 20 ] && [ "${good:-99}" -le 2 ] && [ "${off:-99}" -le 2 ] \
+    && pass "View > Spell check: 'teh helo wrold' underlined in red ($bad px), 'the hello world is fine' not ($good px), off: none ($off px)" \
+    || fail "spell check: misspelt line $bad px, right line $good px, off $off px"
+[ "$(after class 3)" = "no notepad" ] && pass "closing with unsaved work: no question, the window goes" || fail "close with unsaved work: $(after class 3)"
+want=$(printf 'teh helo wrold is here\r\nthe hello world is fine\r\n')
+got=""; for k in 0 1 2 3; do [ "$(cat "$C/t/dump-r$k" 2>/dev/null)" = "$want" ] && got=$k; done
+[ -n "$got" ] && [ "$(after modified 4)" = "modified=1" ] && pass "...and the next start brings it back, still unsaved (tab $got)" \
+    || fail "unsaved work not restored: $(after tabs 10), $(after modified 4)"
 
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
