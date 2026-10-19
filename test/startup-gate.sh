@@ -6,7 +6,8 @@
 # Explorer\StartupApproved\{Run,Run32,StartupFolder}: a binary value per entry,
 # first byte odd when disabled. wineboot, starting the Run keys and the Startup
 # folder, must skip what is disabled there, start what is enabled or not listed,
-# and never apply it to RunOnce.
+# and never apply it to RunOnce. On the sign-in screen (SG_SIGN_IN_SCREEN,
+# sg-login-ui) none of it starts, and RunOnce is left for the first user.
 #
 #   WINE=/opt/wine-sg/bin/wine test/startup-gate.sh
 set -u
@@ -51,6 +52,15 @@ S=$(find "$C/users" -path '*Start Menu/Programs/StartUp' -type d | grep -v Publi
 [ -n "$S" ] || { mkdir -p "$C/users/$(id -un)/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/StartUp"; S="$C/users/$(id -un)/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/StartUp"; }
 cp "$T/probe.exe" "$S/folder-on.exe"; cp "$T/probe.exe" "$S/folder-off.exe"
 "$WINESERVER" -w
+# the sign-in screen first (patches/sg/5937): sg-login-ui sets
+# SG_SIGN_IN_SCREEN; nothing starts there and RunOnce waits for a user
+(cd "$C" && SG_SIGN_IN_SCREEN=1 timeout -s KILL 120 xvfb-run -a "$WINE" wineboot >/dev/null 2>&1)
+i=0; while [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+"$WINESERVER" -w
+if [ -s "$C/standin.log" ]; then
+    fail "the sign-in screen started startup programs: $(tr -d '\r' < "$C/standin.log" | tr '\n' ' ')"
+    rm -f "$C/standin.log"
+else pass "the sign-in screen starts no Run key, RunOnce or Startup folder program"; fi
 # a session's start: wineboot runs the Run keys and the Startup folder
 (cd "$C" && timeout -s KILL 120 xvfb-run -a "$WINE" wineboot >/dev/null 2>&1)
 i=0; while [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
@@ -64,7 +74,7 @@ has 'machine-on'    && pass "an HKLM Run entry starts" || fail "machine-on did n
 has 'user-off'      && fail "a disabled (03) HKCU Run entry started" || pass "a disabled (03) HKCU Run entry does not start"
 has 'machine-off'   && fail "a disabled (07) HKLM Run entry started" || pass "a disabled (07) HKLM Run entry does not start"
 has 'wow32-off'     && fail "a disabled 32-bit Run entry (Run32) started" || pass "a disabled 32-bit Run entry (StartupApproved\\Run32) does not start"
-has ' once'         && pass "RunOnce ignores StartupApproved, as on Windows" || fail "RunOnce entry did not run"
+has ' once'         && pass "RunOnce ignores StartupApproved, as on Windows (and outlived the sign-in screen)" || fail "RunOnce entry did not run"
 case "$log" in *folder-on.exe*) pass "a Startup folder item starts" ;; *) fail "folder-on.exe did not start" ;; esac
 case "$log" in *folder-off.exe*) fail "a disabled Startup folder item started" ;; *) pass "a disabled Startup folder item (StartupApproved\\StartupFolder) does not start" ;; esac
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
