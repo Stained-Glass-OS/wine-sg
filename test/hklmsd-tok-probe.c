@@ -234,6 +234,32 @@ int main(int argc, char **argv)
         RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\Video\\SgTokProbe");
         RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\GraphicsDrivers\\SgTokProbe");
     }
+    else if (!strcmp(m, "c2r"))
+    {
+        /* Click-to-Run Office's own machine hive: Office's virtual registry opens its keys with
+         * KEY_ALL_ACCESS as the user (Word's save of a new document, 5942); the rest of Office's
+         * machine keys stay read-only to users */
+        static const WCHAR *keys[] =
+        {
+            L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY",
+            L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\MACHINE\\Software\\Classes\\Installer\\Components\\SgC2R",
+            L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion",
+            L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\SgMadeLater",
+            L"Software\\Microsoft\\Office\\ClickToRun",
+            L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRYX",
+            L"Software\\Microsoft\\Office\\16.0\\SgC2R",
+        };
+        int i;
+        for (i = 0; i < ARRAY_SIZE(keys); i++)
+        {
+            HKEY k = NULL;
+            LONG r = RegOpenKeyExW(HKEY_LOCAL_MACHINE, keys[i], 0, KEY_ALL_ACCESS, &k);
+            printf("OPENALL %ls -> %ld\n", keys[i], r);
+            if (!r) RegCloseKey(k);
+        }
+        trywrite("hklm", HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\MACHINE\\SgUserMade");
+        RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\MACHINE\\SgUserMade");
+    }
     else if (!strcmp(m, "restricted")) restricted();
     else if (!strcmp(m, "pipe")) pipe_test();
     else if (!strcmp(m, "lines"))
