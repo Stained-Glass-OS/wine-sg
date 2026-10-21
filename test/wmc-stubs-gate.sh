@@ -5,14 +5,17 @@
 # its display updater, the music properties and the Genres list (the
 # IVector<HSTRING> it hands out, its view and iterator) for their IInspectable
 # contract, their defaults, their round-trips, the event registrations, and
-# ClearAll. These were FIXME stubs returning E_NOTIMPL.
+# ClearAll. These were FIXME stubs returning E_NOTIMPL. And (5947) the control's
+# weak reference, ISystemMediaTransportControls2 and the timeline properties
+# class: Spotify crashed without them.
 #
 #   WINE=/opt/wine-sg/bin/wine test/wmc-stubs-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
 # Mutants (windows.media.mediacontrol, -DSG_MUTANT_x): MC_IIDS (GetIids drops an
 # interface), MC_TRUST (PartialTrust), MC_ALBUM_ARTIST (AlbumArtist writes
 # Artist), MC_EVENT_REMOVE (a removed handler stays), MC_CLEARALL (ClearAll does
-# nothing), MC_CHANGED_STATE (iterators ignore changes to the list).
+# nothing), MC_CHANGED_STATE (iterators ignore changes to the list), SMTC_NO_WEAKREF,
+# SMTC_NO_CONTROLS2, SMTC_NO_TIMELINE (5947).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"

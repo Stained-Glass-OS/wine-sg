@@ -17,6 +17,9 @@
 #include <wchar.h>
 
 DEFINE_GUID(IID_ISMTC, 0x99fa3ff4, 0x1742, 0x42a6, 0x90, 0x2e, 0x08, 0x7d, 0x41, 0xf9, 0x65, 0xec);
+DEFINE_GUID(IID_ISMTC2, 0xea98d2f6, 0x7f3c, 0x4af2, 0xa5, 0x86, 0x72, 0x88, 0x98, 0x08, 0xef, 0xb1);
+DEFINE_GUID(IID_ITimeline, 0x5125316a, 0xc3a2, 0x475b, 0x85, 0x07, 0x93, 0x53, 0x4d, 0xc8, 0x8f, 0x15);
+DEFINE_GUID(IID_WeakSource, 0x00000038, 0x0000, 0x0000, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46);
 DEFINE_GUID(IID_ISMTCInterop, 0xddb0472d, 0xc911, 0x4a1f, 0x86, 0xd9, 0xdc, 0x3d, 0x71, 0xa9, 0x5f, 0x5a);
 DEFINE_GUID(IID_IUpdater, 0x8abbc53e, 0xfa55, 0x4ecf, 0xad, 0x8e, 0xc9, 0x84, 0xe5, 0xdd, 0x15, 0x50);
 DEFINE_GUID(IID_IMusic, 0x6bbf0c59, 0xd0a0, 0x4d26, 0x92, 0xa0, 0xf9, 0x78, 0xe1, 0xd1, 0x8e, 0x7b);
@@ -401,11 +404,93 @@ static void check_updater(void *updater)
     WindowsDeleteString(v);
 }
 
+/* patches/sg/5947: what Spotify asks of the control after creating it -- a weak
+ * reference (C++/WinRT, adding its ButtonPressed handler), the second control
+ * interface (shuffle, repeat, rate, timeline) and a timeline properties object.
+ * Each was missing, and Spotify crashed on the NULL. Returns the weak reference. */
+static void *check_weak_and_controls2(void *smtc)
+{
+    typedef HRESULT (WINAPI *f_resolve)(void *, REFIID, void **);
+    typedef HRESULT (WINAPI *f_d)(void *, double);
+    typedef HRESULT (WINAPI *f_i64)(void *, INT64);
+    void *src = NULL, *weak = NULL, *res = NULL, *c2 = NULL;
+    IInspectable *tl = NULL;
+    HSTRING cls;
+    HRESULT hr;
+    BOOLEAN b = 7;
+    double rate = 0;
+    INT64 pos = 0;
+    int mode = -1;
+
+    hr = IInspectable_QueryInterface(smtc, &IID_WeakSource, &src);
+    CHECKF(hr == S_OK && src, "the control has a weak reference source (%#lx)", hr);
+    if (src)
+    {
+        hr = CALL_P(src, 3, &weak);
+        CHECKF(hr == S_OK && weak, "GetWeakReference (%#lx)", hr);
+        IUnknown_Release((IUnknown *)src);
+    }
+    if (weak)
+    {
+        hr = ((f_resolve)VT(weak)[3])(weak, &IID_ISMTC, &res);
+        CHECKF(hr == S_OK && res == smtc, "...which resolves to the control while it is held (%#lx)", hr);
+        if (res) IInspectable_Release(res);
+    }
+
+    hr = IInspectable_QueryInterface(smtc, &IID_ISMTC2, &c2);
+    CHECKF(hr == S_OK && c2, "ISystemMediaTransportControls2 (%#lx)", hr);
+    if (!c2) return weak;
+    hr = CALL_P(c2, 6, &mode);
+    CHECKF(hr == S_OK && mode == 0, "AutoRepeatMode is None (%#lx, %d)", hr, mode);
+    CALL_U(c2, 7, 2);
+    CALL_P(c2, 6, &mode);
+    CHECKF(mode == 2, "AutoRepeatMode round-trips List (%d)", mode);
+    hr = CALL_P(c2, 8, &b);
+    CHECKF(hr == S_OK && b == FALSE, "ShuffleEnabled is off (%#lx, %d)", hr, b);
+    CALL_B(c2, 9, TRUE);
+    CALL_P(c2, 8, &b);
+    CHECKF(b == TRUE, "ShuffleEnabled round-trips (%d)", b);
+    hr = CALL_P(c2, 10, &rate);
+    CHECKF(hr == S_OK && rate == 1.0, "PlaybackRate is 1 (%#lx, %f)", hr, rate);
+    ((f_d)VT(c2)[11])(c2, 1.5);
+    CALL_P(c2, 10, &rate);
+    CHECKF(rate == 1.5, "PlaybackRate round-trips (%f)", rate);
+    check_events(c2, 13, "PlaybackPositionChangeRequested");
+    check_events(c2, 15, "PlaybackRateChangeRequested");
+    check_events(c2, 17, "ShuffleEnabledChangeRequested");
+    check_events(c2, 19, "AutoRepeatModeChangeRequested");
+
+    cls = mk(L"Windows.Media.SystemMediaTransportControlsTimelineProperties");
+    hr = RoActivateInstance(cls, &tl);
+    WindowsDeleteString(cls);
+    CHECKF(hr == S_OK && tl, "a SystemMediaTransportControlsTimelineProperties is made (%#lx)", hr);
+    if (tl)
+    {
+        void *itl = NULL;
+        hr = IInspectable_QueryInterface(tl, &IID_ITimeline, &itl);
+        CHECKF(hr == S_OK && itl, "...with its interface (%#lx)", hr);
+        if (itl)
+        {
+            ((f_i64)VT(itl)[15])(itl, 1234567);
+            hr = CALL_P(itl, 14, &pos);
+            CHECKF(hr == S_OK && pos == 1234567, "...its Position round-trips (%#lx, %I64d)", hr, pos);
+            hr = CALL_P(c2, 12, itl);
+            CHECKF(hr == S_OK, "UpdateTimelineProperties takes it (%#lx)", hr);
+            IUnknown_Release((IUnknown *)itl);
+        }
+        IInspectable_Release(tl);
+    }
+    hr = CALL_P(c2, 12, NULL);
+    CHECKF(hr == E_POINTER, "UpdateTimelineProperties(NULL) is E_POINTER (%#lx)", hr);
+    IInspectable_Release(c2);
+    return weak;
+}
+
 static void check_smtc(void *interop)
 {
     HWND window = CreateWindowExA(0, "static", 0, 0, 0, 0, 100, 100, NULL, NULL, GetModuleHandleA(NULL), 0);
     typedef HRESULT (WINAPI *f_get)(void *, HWND, REFIID, void **);
-    void *smtc = NULL, *updater = NULL, *updater2 = NULL;
+    void *smtc = NULL, *updater = NULL, *updater2 = NULL, *weak;
     struct inspectable_case sc = { "SystemMediaTransportControls", L"Windows.Media.SystemMediaTransportControls",
                                    { &IID_ISMTC } };
     HRESULT hr;
@@ -461,7 +546,16 @@ static void check_smtc(void *interop)
         check_updater(updater);
         IInspectable_Release(updater);
     }
+    weak = check_weak_and_controls2(smtc);
     IInspectable_Release(smtc);
+    if (weak)
+    {
+        typedef HRESULT (WINAPI *f_resolve)(void *, REFIID, void **);
+        void *res = (void *)1;
+        hr = ((f_resolve)VT(weak)[3])(weak, &IID_ISMTC, &res);
+        CHECKF(hr == S_OK && !res, "once released, its weak reference resolves to nothing (%#lx)", hr);
+        IUnknown_Release((IUnknown *)weak);
+    }
     DestroyWindow(window);
 }
 
