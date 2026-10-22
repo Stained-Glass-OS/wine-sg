@@ -126,6 +126,11 @@ test-flatbuttons:
 test-usersacl:
 	WINE=$(PREFIX)/bin/wine test/usersacl-gate.sh
 
+# A user's own HKCU after an elevated program wrote there, and a 32-bit
+# program's HKCU\\Software is the shared key (5948, 5949).
+test-userhive:
+	WINE=$(PREFIX)/bin/wine test/userhive-gate.sh
+
 # A key granted to BUILTIN\\Users is theirs to write from a 64-bit program's
 # view of the 32-bit registry: the keys on the way are passed through (0459).
 test-regwalk:

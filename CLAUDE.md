@@ -845,6 +845,22 @@ boot. Seen on a machine with Microsoft Edge installed; it depends on which
 process touches the key first. **The tell:** `reg add` under
 `HKLM\System\CurrentControlSet\Control\Video` fails for sggreet or a user.
 
+## `patches/sg/5948`, `5949`: the user's own HKCU (elevated programs, 32-bit view)
+
+An elevated program runs as SYSTEM with the **user's** HKCU. 0024's stamp
+(SYSTEM puts its default descriptor on an existing descriptor-less key) and
+its create path (a new key gets the creator's token descriptor) applied in
+users' hives too, so the first elevated installer since boot made
+`HKCU\Software` "Users read": the user could create nothing under it, and
+every Burn bundle failed with 0x80070005. **5948:** SYSTEM never stamps or
+creates descriptors under `\Registry\User\...`. **5949:** a
+`Wow6432Node` directly below `\Registry\User\<SID>\Software` is not a
+redirection point (Windows shares HKCU\Software since Windows 7); Wine's
+server redirected to any Wow6432Node subkey. **The tells:** a user's
+`reg add HKCU\Software\X` fails with access denied; a 32-bit program's
+`HKCU\Software\...` resolves (NtQueryKey name) under `WOW6432Node`.
+Gate `make test-userhive`.
+
 ## `patches/sg/0049`-`0054`: what Microsoft Edge needed
 
 Edge is user-installed (never shipped). These are the exports it calls that
