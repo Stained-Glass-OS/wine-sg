@@ -845,7 +845,7 @@ boot. Seen on a machine with Microsoft Edge installed; it depends on which
 process touches the key first. **The tell:** `reg add` under
 `HKLM\System\CurrentControlSet\Control\Video` fails for sggreet or a user.
 
-## `patches/sg/5948`, `5949`: the user's own HKCU (elevated programs, 32-bit view)
+## `patches/sg/5948`-`5950`: the user's own HKCU (elevated programs, 32-bit view, DACL merges)
 
 An elevated program runs as SYSTEM with the **user's** HKCU. 0024's stamp
 (SYSTEM puts its default descriptor on an existing descriptor-less key) and
@@ -859,7 +859,14 @@ redirection point (Windows shares HKCU\Software since Windows 7); Wine's
 server redirected to any Wow6432Node subkey. **The tells:** a user's
 `reg add HKCU\Software\X` fails with access denied; a 32-bit program's
 `HKCU\Software\...` resolves (NtQueryKey name) under `WOW6432Node`.
-Gate `make test-userhive`.
+**5950:** a hive's keys load without descriptors and Wine *reported* its
+generic one (owner Administrators, Users read); a program that merges an ACE
+into HKCU\Software's DACL (Opera's installer, Chromium-style
+SetNamedSecurityInfo) wrote it back and locked the standard user out. Such
+keys now report, and are checked against, the user's descriptor (user,
+SYSTEM, Administrators full). **Any descriptor the server reports for a
+descriptor-less key may be written back by a program: make it a correct
+one.** Gate `make test-userhive`.
 
 ## `patches/sg/0049`-`0054`: what Microsoft Edge needed
 

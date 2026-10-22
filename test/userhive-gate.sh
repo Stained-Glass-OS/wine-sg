@@ -1,32 +1,36 @@
 #!/bin/bash
 . "$(dirname "$0")/scratch-home.sh"
-# A user's own HKCU after an elevated program wrote there (patches/sg/5948), and a 32-bit program's
-# HKCU\Software (5949), in a shared prefix.
+# A user's own HKCU after an elevated program wrote there (patches/sg/5948), a 32-bit program's
+# HKCU\Software (5949), and the descriptor a key of a user's hive has (5950), in a shared prefix.
 # An elevated program runs as SYSTEM with the user's HKCU. The server let SYSTEM stamp the machine
 # descriptor (users read) onto an existing key, and gave the keys it created SYSTEM's: the user then
 # could not open HKCU\Software, nor create anything below it, until the server restarted. Every Burn
 # bundle failed ("Failed to open uninstall registry key", 0x80070005: Python, .NET Desktop Runtime).
 # And once a program had created HKCU\Software\WOW6432Node, Wine sent every 32-bit program there:
-# Windows shares HKCU\Software between the views (since Windows 7).
+# Windows shares HKCU\Software between the views (since Windows 7). And a key of the hive, loaded
+# without a descriptor, reported Wine's generic one (Administrators full, Users read below): Opera's
+# installer adds an entry to HKCU\Software's DACL (SetNamedSecurityInfo) and wrote that back.
 # With the user $SG_USER1 and SYSTEM ($SG_SYSTEM, the prefix owner):
 #   SYSTEM writes keys in the user's hive (HKU\<SID>\Software\..., existing and new ones)
+#   the user adds an entry to HKCU\Software's DACL as Opera does (owner: the user) and still creates keys;
+#     another user cannot write the user's HKCU; SYSTEM still can
 #   the user: opens HKCU\Software, writes below SYSTEM's keys, creates keys and Uninstall entries
 #   a planted HKCU\Software\WOW6432Node: a 32-bit program's HKCU\Software\... is still the shared key,
 #     and what it writes the 64-bit view sees, also after the server restarts; HKLM\Software\Microsoft
 #     in the 32-bit view is still below Wow6432Node
 #   WINE=... WINESERVER=... test/userhive-gate.sh
-# Mutants (server): SG_MUTANT_USERHIVE_STAMP, SG_MUTANT_HKCU_WOW_REDIRECT.
+# Mutants (server): SG_MUTANT_USERHIVE_STAMP, SG_MUTANT_HKCU_WOW_REDIRECT, SG_MUTANT_USERKEY_GENERIC_SD.
 # Needs passwordless sudo and the accounts of usersessions-gate.sh; exit 77 otherwise.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 WINE=${WINE:-/opt/wine-sg/bin/wine}
 WINESERVER=${WINESERVER:-$(dirname "$WINE")/wineserver}
 [ -x "$WINESERVER" ] || WINESERVER=$(dirname "$WINE")/server/wineserver
-SG_SYSTEM=${SG_SYSTEM:-sgsystem}; SG_USER1=${SG_USER1:-sgtest1}; SG_GROUP=${SG_GROUP:-sgwine}
+SG_SYSTEM=${SG_SYSTEM:-sgsystem}; SG_USER1=${SG_USER1:-sgtest1}; SG_USER2=${SG_USER2:-sgtest2}; SG_GROUP=${SG_GROUP:-sgwine}
 fails=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails + 1)); }
-for u in "$SG_SYSTEM" "$SG_USER1"; do
+for u in "$SG_SYSTEM" "$SG_USER1" "$SG_USER2"; do
     id "$u" >/dev/null 2>&1 && sudo -n -u "$u" true 2>/dev/null || { echo "SKIP: no $u or no sudo"; exit 77; }
 done
 command -v x86_64-w64-mingw32-gcc >/dev/null && command -v i686-w64-mingw32-gcc >/dev/null || { echo "SKIP: needs both mingw compilers"; exit 77; }
@@ -49,7 +53,7 @@ trap cleanup EXIT
 
 x86_64-w64-mingw32-gcc -O1 -o "$W/uh64.exe" "$HERE/userhive-probe.c" -ladvapi32 || { echo "FAIL build"; exit 1; }
 i686-w64-mingw32-gcc -O1 -o "$W/uh32.exe" "$HERE/userhive-probe.c" -ladvapi32 || { echo "FAIL build"; exit 1; }
-for u in "$SG_SYSTEM" "$SG_USER1"; do sudo -n install -d -o "$u" -m 700 "$W/home-$u" "$W/run-$u"; done
+for u in "$SG_SYSTEM" "$SG_USER1" "$SG_USER2"; do sudo -n install -d -o "$u" -m 700 "$W/home-$u" "$W/run-$u"; done
 sudo -n install -d -o "$SG_SYSTEM" -g "$SG_GROUP" -m 2770 "$PFX"
 sudo -n -u "$SG_SYSTEM" touch "$PFX/.sg-system-prefix"
 as "$SG_SYSTEM" sh -c "umask 002; '$WINESERVER' -p"
@@ -86,6 +90,17 @@ out=$(run "$SG_USER1" 'C:\uh64.exe' access)
 [ "$(v "$out" "OPENRW Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall ->")" = 0 ] && \
 [ "$(v "$out" "CREATE Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\SgUserApp ->")" = 0 ] \
     && pass "...and its Uninstall key, which SYSTEM wrote too (Burn's detection)" || fail "Uninstall: $out"
+
+# a program adds an entry to HKCU\Software's DACL, as Opera's installer does (Chromium's way)
+out=$(run "$SG_USER1" 'C:\uh64.exe' aclmerge)
+[ "$(v "$out" "GETSD ->")" = 0 ] && [ "$(v "$out" "OWNERISUSER ->")" = 1 ] && pass "HKCU\\Software is owned by $SG_USER1 (not Administrators)" || fail "owner of HKCU\\Software: $out"
+[ "$(v "$out" "SETSD ->")" = 0 ] && [ "$(v "$out" "CREATE Software\\SgAfterAcl ->")" = 0 ] && [ "$(v "$out" "OPENREAD Software ->")" = 0 ] \
+    && pass "...a program that adds an entry to its DACL leaves the user able to create keys there (Opera)" || fail "after a DACL merge: $out"
+out=$(run "$SG_USER2" 'C:\uh64.exe' other "$SID")
+[ "$(v "$out" "OTHERWRITE $SID\\Software ->")" = 5 ] && pass "another user cannot write $SG_USER1's HKCU" || fail "$SG_USER2 wrote $SG_USER1's HKCU: $out"
+run "$SG_SYSTEM" reg add "HKU\\$SID\\Software\\SgSystemAfter" /f >/dev/null
+out=$(run "$SG_SYSTEM" reg query "HKU\\$SID\\Software\\SgSystemAfter")
+case "$out" in *SgSystemAfter*) pass "...SYSTEM can" ;; *) fail "SYSTEM in the user's hive after the merge: $out" ;; esac
 
 # a program creates HKCU\Software\WOW6432Node\... (as a Windows program may: an ordinary key there)
 out=$(run "$SG_USER1" 'C:\uh64.exe' plant)

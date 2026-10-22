@@ -3,10 +3,13 @@
  *   userhive-probe access     (64-bit, as the user)
  *   userhive-probe plant      (64-bit: creates HKCU\Software\WOW6432Node\SgPlanted, as a program may)
  *   userhive-probe view       (32-bit: the names its keys resolve to)
- *   userhive-probe sid        (the user's SID, for HKU\<SID>)  */
+ *   userhive-probe sid        (the user's SID, for HKU\<SID>)
+ *   userhive-probe aclmerge   (as Opera's installer: adds an ACE to HKCU\Software's DACL, then creates a key)
+ *   userhive-probe other SID  (another user: opens HKU\SID\Software to write)  */
 #include <windows.h>
 #include <winternl.h>
 #include <sddl.h>
+#include <aclapi.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -76,6 +79,43 @@ int main(int argc, char **argv)
         if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok) && GetTokenInformation(tok, TokenUser, b, sizeof(b), &l) &&
             ConvertSidToStringSidA(((TOKEN_USER *)b)->User.Sid, &str))
             printf("SID %s\n", str);
+    }
+    else if (!strcmp(mode, "aclmerge"))
+    {
+        PACL dacl = NULL, merged = NULL;
+        PSECURITY_DESCRIPTOR sd = NULL, sd2 = NULL;
+        PSID owner = NULL, packages = NULL;
+        EXPLICIT_ACCESS_W ea = { 0 };
+        char *str = NULL;
+        HANDLE tok;
+        BYTE b[512];
+        DWORD l, r;
+
+        r = GetNamedSecurityInfoW(L"CURRENT_USER\\Software", SE_REGISTRY_KEY, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                                  &owner, NULL, &dacl, NULL, &sd);
+        printf("GETSD -> %lu\n", r);
+        if (!r && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok) && GetTokenInformation(tok, TokenUser, b, sizeof(b), &l))
+            printf("OWNERISUSER -> %d\n", EqualSid(owner, ((TOKEN_USER *)b)->User.Sid) ? 1 : 0);
+        ConvertStringSidToSidA("S-1-15-2-1", &packages);   /* ALL APPLICATION PACKAGES */
+        ea.grfAccessPermissions = KEY_READ;
+        ea.grfAccessMode = GRANT_ACCESS;
+        ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea.Trustee.ptstrName = packages;
+        r = SetEntriesInAclW(1, &ea, dacl, &merged);
+        if (!r) r = SetNamedSecurityInfoW((WCHAR *)L"CURRENT_USER\\Software", SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, merged, NULL);
+        printf("SETSD -> %lu\n", r);
+        if (!GetNamedSecurityInfoW(L"CURRENT_USER\\Software", SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL, &sd2) &&
+            ConvertSecurityDescriptorToStringSecurityDescriptorA(sd2, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &str, NULL))
+            printf("DACL %s\n", str);
+        createk("CREATE", "Software\\SgAfterAcl", 0);
+        openk("OPENREAD", HKEY_CURRENT_USER, "Software", KEY_READ);
+    }
+    else if (!strcmp(mode, "other") && argc > 2)
+    {
+        char path[256];
+        snprintf(path, sizeof(path), "%s\\Software", argv[2]);
+        openk("OTHERWRITE", HKEY_USERS, path, KEY_SET_VALUE | KEY_CREATE_SUB_KEY);
     }
     else if (!strcmp(mode, "plant"))
         createk("PLANT", "Software\\WOW6432Node\\SgPlanted", KEY_WOW64_64KEY);

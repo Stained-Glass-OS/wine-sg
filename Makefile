@@ -127,7 +127,7 @@ test-usersacl:
 	WINE=$(PREFIX)/bin/wine test/usersacl-gate.sh
 
 # A user's own HKCU after an elevated program wrote there, and a 32-bit
-# program's HKCU\\Software is the shared key (5948, 5949).
+# program's HKCU\\Software is the shared key; a hive's keys are the user's (5948-5950).
 test-userhive:
 	WINE=$(PREFIX)/bin/wine test/userhive-gate.sh
 
