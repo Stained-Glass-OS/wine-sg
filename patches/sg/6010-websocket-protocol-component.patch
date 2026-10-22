@@ -1,0 +1,1012 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] websocket: the WebSocket protocol component (6010)
+
+websocket.dll: client and server handles, handshakes, framing with masking,
+fragments, ping/pong and close, the action queue (N-WEBSOCKET).
+---
+diff --git a/dlls/websocket/Makefile.in b/dlls/websocket/Makefile.in
+index 9a8493d..a32388a 100644
+--- a/dlls/websocket/Makefile.in
++++ b/dlls/websocket/Makefile.in
+@@ -2,5 +2,7 @@ MODULE    = websocket.dll
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
++IMPORTS = bcrypt
++
+ SOURCES = \
+ 	websocket.c
+diff --git a/dlls/websocket/websocket.c b/dlls/websocket/websocket.c
+index 8668f96..2656289 100644
+--- a/dlls/websocket/websocket.c
++++ b/dlls/websocket/websocket.c
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2023 Vijay Kiran Kamuju
++ * Copyright 2026 Stained Glass OS
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -16,26 +17,852 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++/*
++ * Stained Glass OS: the WebSocket Protocol Component API. It does no I/O of its
++ * own: the program sends the bytes the component asks it to send
++ * (WEB_SOCKET_SEND_TO_NETWORK_ACTION), receives into the buffer it is given
++ * (WEB_SOCKET_RECEIVE_FROM_NETWORK_ACTION), and is told when its own sends and
++ * receives are complete. The handshake and framing are RFC 6455's: a client
++ * key and the server's Sec-WebSocket-Accept, frames masked by the client,
++ * messages split in fragments as large as the receive buffer, pings answered
++ * with pongs.
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winerror.h"
++#include "bcrypt.h"
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ #include "websocket.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(websocket);
+ 
+-HRESULT WINAPI WebSocketCreateClientHandle(const PWEB_SOCKET_PROPERTY properties, 
++#define DEFAULT_BUFFER_SIZE 4096
++#define MIN_BUFFER_SIZE     256
++#define MAX_BUFFER_SIZE     65536
++
++enum ws_state { STATE_CREATED, STATE_HANDSHAKE, STATE_OPEN, STATE_ABORTED };
++
++struct send_item
++{
++    struct list entry;
++    BYTE *frame;            /* the frame as sent */
++    ULONG frame_len;
++    void *app_context;
++    BOOL internal;          /* a pong the component sends by itself */
++    BOOL on_network;        /* the network has it: the send is complete */
++};
++
++struct recv_item
++{
++    struct list entry;
++    void *app_context;
++};
++
++/* the action handed out and not completed yet */
++enum pending { PENDING_NONE, PENDING_SEND_NET, PENDING_SEND_DONE, PENDING_RECV_NET, PENDING_RECV_DONE };
++
++struct websocket
++{
++    CRITICAL_SECTION cs;
++    BOOL server;
++    enum ws_state state;
++    ULONG recv_size, send_size;
++    BOOL masking;
++    char key[25];             /* the client's Sec-WebSocket-Key */
++    WEB_SOCKET_HTTP_HEADER *headers;
++    ULONG header_count;
++    char *header_data;
++
++    struct list sends;        /* struct send_item */
++    struct list receives;     /* struct recv_item */
++    enum pending send_pending, recv_pending;
++    struct send_item *send_current;
++
++    BYTE *rbuf;               /* bytes from the network, not handed out yet */
++    ULONG rlen, rcap;
++    ULONG consume;            /* bytes the receive indication in progress takes */
++    BOOL send_fragment;       /* a fragmented message is being sent */
++    /* the frame being received */
++    BOOL in_frame, frame_fin, frame_masked, recv_fragment;
++    BYTE frame_opcode, frame_mask[4];
++    ULONG64 frame_remaining, frame_pos;
++    BYTE message_opcode;      /* text or binary, of a fragmented message */
++    BYTE control[125];        /* a control frame's payload, handed to the program */
++};
++
++static struct websocket *ws_from_handle( WEB_SOCKET_HANDLE handle )
++{
++    return (struct websocket *)handle;
++}
++
++static const char ws_guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
++
++static void base64( const BYTE *data, ULONG len, char *out )
++{
++    static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    ULONG i, o = 0;
++
++    for (i = 0; i < len; i += 3)
++    {
++        ULONG v = data[i] << 16 | (i + 1 < len ? data[i + 1] << 8 : 0) | (i + 2 < len ? data[i + 2] : 0);
++        out[o++] = tab[(v >> 18) & 63];
++        out[o++] = tab[(v >> 12) & 63];
++        out[o++] = i + 1 < len ? tab[(v >> 6) & 63] : '=';
++        out[o++] = i + 2 < len ? tab[v & 63] : '=';
++    }
++    out[o] = 0;
++}
++
++/* Sec-WebSocket-Accept for a key: base64(SHA-1(key + GUID)) */
++static BOOL accept_value( const char *key, ULONG key_len, char out[29] )
++{
++    BYTE hash[20];
++    char buf[64 + sizeof(ws_guid)];
++
++    if (key_len > 64) return FALSE;
++    memcpy( buf, key, key_len );
++    memcpy( buf + key_len, ws_guid, sizeof(ws_guid) - 1 );
++    if (BCryptHash( BCRYPT_SHA1_ALG_HANDLE, NULL, 0, (BYTE *)buf, key_len + sizeof(ws_guid) - 1, hash, sizeof(hash) ))
++        return FALSE;
++    base64( hash, sizeof(hash), out );
++    return TRUE;
++}
++
++static HRESULT create_handle( BOOL server, const WEB_SOCKET_PROPERTY *props, ULONG count, WEB_SOCKET_HANDLE *handle )
++{
++    struct websocket *ws;
++    ULONG i;
++
++    if (!handle) return E_INVALIDARG;
++    *handle = NULL;
++    if (count && !props) return E_INVALIDARG;
++    if (!(ws = calloc( 1, sizeof(*ws) ))) return E_OUTOFMEMORY;
++    ws->server = server;
++    ws->recv_size = ws->send_size = DEFAULT_BUFFER_SIZE;
++    ws->masking = !server;
++    for (i = 0; i < count; i++)
++    {
++        const WEB_SOCKET_PROPERTY *p = &props[i];
++        ULONG v = 0;
++
++        if (p->ulValueSize == sizeof(ULONG) && p->pvValue) v = *(ULONG *)p->pvValue;
++        else if (p->Type != WEB_SOCKET_ALLOCATED_MASKING_PROPERTY_TYPE)
++        {
++            free( ws );
++            return E_INVALIDARG;
++        }
++        switch (p->Type)
++        {
++        case WEB_SOCKET_RECEIVE_BUFFER_SIZE_PROPERTY_TYPE:
++        case WEB_SOCKET_SEND_BUFFER_SIZE_PROPERTY_TYPE:
++            if (v < MIN_BUFFER_SIZE || v > MAX_BUFFER_SIZE)
++            {
++                free( ws );
++                return E_INVALIDARG;
++            }
++            if (p->Type == WEB_SOCKET_RECEIVE_BUFFER_SIZE_PROPERTY_TYPE) ws->recv_size = v;
++            else ws->send_size = v;
++            break;
++        case WEB_SOCKET_DISABLE_MASKING_PROPERTY_TYPE:
++            if (v) ws->masking = FALSE;
++            break;
++        case WEB_SOCKET_SUPPORTED_VERSIONS_PROPERTY_TYPE:
++            if (v != 13)
++            {
++                free( ws );
++                return E_INVALIDARG;
++            }
++            break;
++        case WEB_SOCKET_ALLOCATED_MASKING_PROPERTY_TYPE:
++        case WEB_SOCKET_DISABLE_UTF8_VERIFICATION_PROPERTY_TYPE:
++        case WEB_SOCKET_KEEPALIVE_INTERVAL_PROPERTY_TYPE:
++            break;
++        default:
++            free( ws );
++            return E_INVALIDARG;
++        }
++    }
++    ws->rcap = ws->recv_size + 14;
++    if (!(ws->rbuf = malloc( ws->rcap )))
++    {
++        free( ws );
++        return E_OUTOFMEMORY;
++    }
++    list_init( &ws->sends );
++    list_init( &ws->receives );
++    InitializeCriticalSection( &ws->cs );
++    *handle = (WEB_SOCKET_HANDLE)ws;
++    return S_OK;
++}
++
++HRESULT WINAPI WebSocketCreateClientHandle(const PWEB_SOCKET_PROPERTY properties,
++    ULONG count, WEB_SOCKET_HANDLE *handle)
++{
++    TRACE("(%p, %ld, %p)\n", properties, count, handle);
++    return create_handle( FALSE, properties, count, handle );
++}
++
++HRESULT WINAPI WebSocketCreateServerHandle(const PWEB_SOCKET_PROPERTY properties,
+     ULONG count, WEB_SOCKET_HANDLE *handle)
+ {
+-    FIXME("(%p, %ld, %p): stub\n", properties, count, handle);
++    TRACE("(%p, %ld, %p)\n", properties, count, handle);
++    return create_handle( TRUE, properties, count, handle );
++}
++
++static void free_headers( struct websocket *ws )
++{
++    free( ws->headers );
++    free( ws->header_data );
++    ws->headers = NULL;
++    ws->header_data = NULL;
++    ws->header_count = 0;
++}
++
++/* the headers the component hands out, kept until the handshake ends */
++static HRESULT set_headers( struct websocket *ws, const char **names, const char **values, ULONG count )
++{
++    ULONG i, size = 0;
++    char *p;
++
++    free_headers( ws );
++    for (i = 0; i < count; i++) size += strlen( names[i] ) + strlen( values[i] ) + 2;
++    if (!(ws->headers = calloc( count, sizeof(*ws->headers) )) || !(ws->header_data = malloc( size )))
++    {
++        free_headers( ws );
++        return E_OUTOFMEMORY;
++    }
++    for (i = 0, p = ws->header_data; i < count; i++)
++    {
++        ws->headers[i].pcName = p;
++        ws->headers[i].ulNameLength = strlen( names[i] );
++        strcpy( p, names[i] );
++        p += ws->headers[i].ulNameLength + 1;
++        ws->headers[i].pcValue = p;
++        ws->headers[i].ulValueLength = strlen( values[i] );
++        strcpy( p, values[i] );
++        p += ws->headers[i].ulValueLength + 1;
++    }
++    ws->header_count = count;
++    return S_OK;
++}
++
++static const WEB_SOCKET_HTTP_HEADER *find_header( const WEB_SOCKET_HTTP_HEADER *headers, ULONG count, const char *name )
++{
++    ULONG i, len = strlen( name );
++
++    for (i = 0; i < count; i++)
++        if (headers[i].ulNameLength == len && headers[i].pcName && !_strnicmp( headers[i].pcName, name, len ))
++            return &headers[i];
++    return NULL;
++}
++
++/* does a comma-separated header value hold the token? */
++static BOOL header_has_token( const WEB_SOCKET_HTTP_HEADER *h, const char *token )
++{
++    ULONG len = strlen( token ), i = 0, start, end;
++
++    if (!h || !h->pcValue) return FALSE;
++    while (i < h->ulValueLength)
++    {
++        while (i < h->ulValueLength && (h->pcValue[i] == ' ' || h->pcValue[i] == '\t' || h->pcValue[i] == ',')) i++;
++        start = i;
++        while (i < h->ulValueLength && h->pcValue[i] != ',') i++;
++        end = i;
++        while (end > start && (h->pcValue[end - 1] == ' ' || h->pcValue[end - 1] == '\t')) end--;
++        if (end - start == len && !_strnicmp( h->pcValue + start, token, len )) return TRUE;
++    }
++    return FALSE;
++}
++
++HRESULT WINAPI WebSocketBeginClientHandshake(WEB_SOCKET_HANDLE handle, PCSTR *subprotocols, ULONG subprotocol_count,
++        PCSTR *extensions, ULONG extension_count, const PWEB_SOCKET_HTTP_HEADER initial_headers,
++        ULONG initial_header_count, PWEB_SOCKET_HTTP_HEADER *additional_headers, ULONG *additional_header_count)
++{
++    struct websocket *ws = ws_from_handle( handle );
++    const char *names[5], *values[5];
++    char protocols[1024] = "";
++    BYTE nonce[16];
++    ULONG i, n = 0;
++    HRESULT hr;
++
++    TRACE("(%p, %p, %lu, %p, %lu, %p, %lu, %p, %p)\n", handle, subprotocols, subprotocol_count, extensions,
++          extension_count, initial_headers, initial_header_count, additional_headers, additional_header_count);
++
++    if (!ws || ws->server || !additional_headers || !additional_header_count) return E_INVALIDARG;
++    if (extension_count) return E_PROTOCOL_EXTENSIONS_NOT_SUPPORTED;
++    EnterCriticalSection( &ws->cs );
++    if (ws->state != STATE_CREATED)
++    {
++        LeaveCriticalSection( &ws->cs );
++        return E_INVALID_PROTOCOL_OPERATION;
++    }
++    BCryptGenRandom( NULL, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG );
++    base64( nonce, sizeof(nonce), ws->key );
++    names[n] = "Connection"; values[n++] = "Upgrade";
++    names[n] = "Upgrade"; values[n++] = "websocket";
++    names[n] = "Sec-WebSocket-Version"; values[n++] = "13";
++    names[n] = "Sec-WebSocket-Key"; values[n++] = ws->key;
++    for (i = 0; i < subprotocol_count && subprotocols && subprotocols[i]; i++)
++    {
++        if (strlen( protocols ) + strlen( subprotocols[i] ) + 3 > sizeof(protocols)) break;
++        if (i) strcat( protocols, ", " );
++        strcat( protocols, subprotocols[i] );
++    }
++    if (protocols[0]) { names[n] = "Sec-WebSocket-Protocol"; values[n++] = protocols; }
++    if (SUCCEEDED(hr = set_headers( ws, names, values, n )))
++    {
++        *additional_headers = ws->headers;
++        *additional_header_count = ws->header_count;
++        ws->state = STATE_HANDSHAKE;
++    }
++    LeaveCriticalSection( &ws->cs );
++    return hr;
++}
++
++HRESULT WINAPI WebSocketEndClientHandshake(WEB_SOCKET_HANDLE handle, const PWEB_SOCKET_HTTP_HEADER response_headers,
++        ULONG response_header_count, ULONG *selected_extensions, ULONG *selected_extension_count,
++        ULONG *selected_subprotocol)
++{
++    struct websocket *ws = ws_from_handle( handle );
++    const WEB_SOCKET_HTTP_HEADER *h;
++    char expect[29];
++    HRESULT hr = S_OK;
+ 
+-    return E_NOTIMPL;
++    TRACE("(%p, %p, %lu, %p, %p, %p)\n", handle, response_headers, response_header_count, selected_extensions,
++          selected_extension_count, selected_subprotocol);
++
++    if (!ws || ws->server || (response_header_count && !response_headers)) return E_INVALIDARG;
++    EnterCriticalSection( &ws->cs );
++    if (ws->state != STATE_HANDSHAKE) hr = E_INVALID_PROTOCOL_OPERATION;
++    else if (!header_has_token( find_header( response_headers, response_header_count, "Upgrade" ), "websocket" ) ||
++             !header_has_token( find_header( response_headers, response_header_count, "Connection" ), "Upgrade" ))
++        hr = E_INVALID_PROTOCOL_FORMAT;
++    else if (!(h = find_header( response_headers, response_header_count, "Sec-WebSocket-Accept" )) ||
++             !accept_value( ws->key, strlen( ws->key ), expect ) ||
++             h->ulValueLength != strlen( expect ) || memcmp( h->pcValue, expect, h->ulValueLength ))
++        hr = E_INVALID_PROTOCOL_FORMAT;
++#ifdef SG_MUTANT_WS_NO_ACCEPT_CHECK
++    if (hr == E_INVALID_PROTOCOL_FORMAT && ws->state == STATE_HANDSHAKE) hr = S_OK;
++#endif
++    else if (find_header( response_headers, response_header_count, "Sec-WebSocket-Extensions" ))
++        hr = E_PROTOCOL_EXTENSIONS_NOT_SUPPORTED;
++    if (SUCCEEDED(hr))
++    {
++        if (selected_extension_count) *selected_extension_count = 0;
++        /* the server's subprotocol: its index among the client's (one header, so 0) */
++        if (selected_subprotocol)
++            *selected_subprotocol = find_header( response_headers, response_header_count, "Sec-WebSocket-Protocol" ) ? 0 : ~0u;
++        free_headers( ws );
++        ws->state = STATE_OPEN;
++    }
++    LeaveCriticalSection( &ws->cs );
++    return hr;
++}
++
++HRESULT WINAPI WebSocketBeginServerHandshake(WEB_SOCKET_HANDLE handle, PCSTR subprotocol_selected,
++        PCSTR *extension_selected, ULONG extension_selected_count, const PWEB_SOCKET_HTTP_HEADER request_headers,
++        ULONG request_header_count, PWEB_SOCKET_HTTP_HEADER *response_headers, ULONG *response_header_count)
++{
++    struct websocket *ws = ws_from_handle( handle );
++    const WEB_SOCKET_HTTP_HEADER *key, *version;
++    const char *names[4], *values[4];
++    char accept[29];
++    ULONG n = 0;
++    HRESULT hr;
++
++    TRACE("(%p, %s, %p, %lu, %p, %lu, %p, %p)\n", handle, debugstr_a(subprotocol_selected), extension_selected,
++          extension_selected_count, request_headers, request_header_count, response_headers, response_header_count);
++
++    if (!ws || !ws->server || !response_headers || !response_header_count || (request_header_count && !request_headers))
++        return E_INVALIDARG;
++    if (extension_selected_count) return E_PROTOCOL_EXTENSIONS_NOT_SUPPORTED;
++    EnterCriticalSection( &ws->cs );
++    if (ws->state != STATE_CREATED) hr = E_INVALID_PROTOCOL_OPERATION;
++    else if (!header_has_token( find_header( request_headers, request_header_count, "Upgrade" ), "websocket" ) ||
++             !header_has_token( find_header( request_headers, request_header_count, "Connection" ), "Upgrade" ) ||
++             !(key = find_header( request_headers, request_header_count, "Sec-WebSocket-Key" )))
++        hr = E_INVALID_PROTOCOL_FORMAT;
++    else if (!(version = find_header( request_headers, request_header_count, "Sec-WebSocket-Version" )) ||
++             version->ulValueLength != 2 || memcmp( version->pcValue, "13", 2 ))
++        hr = E_PROTOCOL_VERSION_NOT_SUPPORTED;
++    else if (!accept_value( key->pcValue, key->ulValueLength, accept ))
++        hr = E_INVALID_PROTOCOL_FORMAT;
++    else
++    {
++        names[n] = "Connection"; values[n++] = "Upgrade";
++        names[n] = "Upgrade"; values[n++] = "websocket";
++        names[n] = "Sec-WebSocket-Accept"; values[n++] = accept;
++        if (subprotocol_selected) { names[n] = "Sec-WebSocket-Protocol"; values[n++] = subprotocol_selected; }
++        if (SUCCEEDED(hr = set_headers( ws, names, values, n )))
++        {
++            *response_headers = ws->headers;
++            *response_header_count = ws->header_count;
++            ws->state = STATE_HANDSHAKE;
++        }
++    }
++    LeaveCriticalSection( &ws->cs );
++    return hr;
++}
++
++HRESULT WINAPI WebSocketEndServerHandshake(WEB_SOCKET_HANDLE handle)
++{
++    struct websocket *ws = ws_from_handle( handle );
++    HRESULT hr = S_OK;
++
++    TRACE("(%p)\n", handle);
++
++    if (!ws || !ws->server) return E_INVALIDARG;
++    EnterCriticalSection( &ws->cs );
++    if (ws->state != STATE_HANDSHAKE) hr = E_INVALID_PROTOCOL_OPERATION;
++    else
++    {
++        free_headers( ws );
++        ws->state = STATE_OPEN;
++    }
++    LeaveCriticalSection( &ws->cs );
++    return hr;
++}
++
++/* a frame: FIN and opcode, the length, the client's masking key, the payload */
++static struct send_item *build_frame( struct websocket *ws, BYTE first, const BYTE *payload, ULONG len, BOOL close,
++                                      USHORT status )
++{
++    struct send_item *item;
++    ULONG payload_len = len + (close ? 2 : 0), header = 2, i;
++    BYTE *p, mask[4];
++
++    if (payload_len > 125 && payload_len <= 0xffff) header += 2;
++    else if (payload_len > 0xffff) header += 8;
++    if (ws->masking) header += 4;
++    if (!(item = calloc( 1, sizeof(*item) )) || !(item->frame = malloc( header + payload_len )))
++    {
++        free( item );
++        return NULL;
++    }
++    p = item->frame;
++    *p++ = first;
++    if (payload_len <= 125) *p++ = payload_len | (ws->masking ? 0x80 : 0);
++    else if (payload_len <= 0xffff)
++    {
++        *p++ = 126 | (ws->masking ? 0x80 : 0);
++        *p++ = payload_len >> 8;
++        *p++ = payload_len;
++    }
++    else
++    {
++        *p++ = 127 | (ws->masking ? 0x80 : 0);
++        for (i = 0; i < 8; i++) *p++ = i < 4 ? 0 : payload_len >> ((7 - i) * 8);
++    }
++    if (ws->masking)
++    {
++        BCryptGenRandom( NULL, mask, sizeof(mask), BCRYPT_USE_SYSTEM_PREFERRED_RNG );
++        memcpy( p, mask, 4 );
++        p += 4;
++    }
++    if (close)
++    {
++        *p++ = status >> 8;
++        *p++ = status;
++    }
++    if (len) memcpy( p, payload, len );
++#ifndef SG_MUTANT_WS_NO_MASK
++    if (ws->masking)
++        for (i = 0; i < payload_len; i++) item->frame[header + i] ^= mask[i % 4];
++#endif
++    item->frame_len = header + payload_len;
++    return item;
++}
++
++HRESULT WINAPI WebSocketSend(WEB_SOCKET_HANDLE handle, WEB_SOCKET_BUFFER_TYPE type, WEB_SOCKET_BUFFER *buffer,
++        PVOID context)
++{
++    struct websocket *ws = ws_from_handle( handle );
++    struct send_item *item = NULL;
++    BYTE opcode;
++    BOOL fin = TRUE;
++    HRESULT hr = S_OK;
++
++    TRACE("(%p, %#x, %p, %p)\n", handle, type, buffer, context);
++
++    if (!ws) return E_INVALIDARG;
++    EnterCriticalSection( &ws->cs );
++    if (ws->state != STATE_OPEN)
++    {
++        LeaveCriticalSection( &ws->cs );
++        return E_INVALID_PROTOCOL_OPERATION;
++    }
++    switch (type)
++    {
++    case WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE:
++    case WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE:
++    case WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE:
++    case WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE:
++        if (!buffer || (buffer->Data.ulBufferLength && !buffer->Data.pbBuffer) ||
++            buffer->Data.ulBufferLength > ws->send_size)
++        {
++            hr = E_INVALIDARG;
++            break;
++        }
++        fin = type == WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE || type == WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
++        opcode = ws->send_fragment ? 0x0 : (type <= WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ? 0x1 : 0x2);
++        item = build_frame( ws, (fin ? 0x80 : 0) | opcode, buffer->Data.pbBuffer, buffer->Data.ulBufferLength, FALSE, 0 );
++        if (item) ws->send_fragment = !fin;
++        break;
++    case WEB_SOCKET_CLOSE_BUFFER_TYPE:
++        if (buffer && buffer->CloseStatus.ulReasonLength > WEB_SOCKET_MAX_CLOSE_REASON_LENGTH)
++        {
++            hr = E_INVALIDARG;
++            break;
++        }
++        if (!buffer || buffer->CloseStatus.usStatus == WEB_SOCKET_EMPTY_CLOSE_STATUS)
++            item = build_frame( ws, 0x88, NULL, 0, FALSE, 0 );
++        else
++            item = build_frame( ws, 0x88, buffer->CloseStatus.pbReason, buffer->CloseStatus.ulReasonLength, TRUE,
++                                buffer->CloseStatus.usStatus );
++        break;
++    case WEB_SOCKET_PING_PONG_BUFFER_TYPE:
++        item = build_frame( ws, 0x89, NULL, 0, FALSE, 0 );
++        break;
++    case WEB_SOCKET_UNSOLICITED_PONG_BUFFER_TYPE:
++        item = build_frame( ws, 0x8a, NULL, 0, FALSE, 0 );
++        break;
++    default:
++        hr = E_INVALIDARG;
++        break;
++    }
++    if (SUCCEEDED(hr))
++    {
++        if (!item) hr = E_OUTOFMEMORY;
++        else
++        {
++            item->app_context = context;
++            list_add_tail( &ws->sends, &item->entry );
++        }
++    }
++    LeaveCriticalSection( &ws->cs );
++    return hr;
++}
++
++HRESULT WINAPI WebSocketReceive(WEB_SOCKET_HANDLE handle, WEB_SOCKET_BUFFER *buffer, PVOID context)
++{
++    struct websocket *ws = ws_from_handle( handle );
++    struct recv_item *item;
++    HRESULT hr = S_OK;
++
++    TRACE("(%p, %p, %p)\n", handle, buffer, context);
++
++    if (!ws || buffer) return E_INVALIDARG;  /* the buffer is reserved */
++    EnterCriticalSection( &ws->cs );
++    if (ws->state != STATE_OPEN) hr = E_INVALID_PROTOCOL_OPERATION;
++    else if (!(item = calloc( 1, sizeof(*item) ))) hr = E_OUTOFMEMORY;
++    else
++    {
++        item->app_context = context;
++        list_add_tail( &ws->receives, &item->entry );
++    }
++    LeaveCriticalSection( &ws->cs );
++    return hr;
++}
++
++/* parse what came from the network: a receive indication, or FALSE (more is needed) */
++static BOOL next_indication( struct websocket *ws, WEB_SOCKET_BUFFER *buffer, WEB_SOCKET_BUFFER_TYPE *type )
++{
++    for (;;)
++    {
++        ULONG pos = 0, avail, i;
++
++        if (!ws->in_frame)
++        {
++            ULONG need = 2, len;
++            BYTE *p = ws->rbuf;
++
++            if (ws->rlen < 2) return FALSE;
++            len = p[1] & 0x7f;
++            if (len == 126) need += 2;
++            else if (len == 127) need += 8;
++            if (p[1] & 0x80) need += 4;
++            if (ws->rlen < need) return FALSE;
++            ws->frame_fin = !!(p[0] & 0x80);
++            ws->frame_opcode = p[0] & 0x0f;
++            ws->frame_masked = !!(p[1] & 0x80);
++            if (len == 126) ws->frame_remaining = p[2] << 8 | p[3];
++            else if (len == 127)
++                for (ws->frame_remaining = 0, i = 0; i < 8; i++) ws->frame_remaining = ws->frame_remaining << 8 | p[2 + i];
++            else ws->frame_remaining = len;
++            if (ws->frame_masked) memcpy( ws->frame_mask, p + need - 4, 4 );
++            ws->frame_pos = 0;
++            ws->in_frame = TRUE;
++            memmove( ws->rbuf, ws->rbuf + need, ws->rlen - need );
++            ws->rlen -= need;
++        }
++
++        if (ws->frame_opcode >= 0x8)
++        {
++            /* a control frame, whole */
++            ULONG len = ws->frame_remaining;
++            if (len > 125 || ws->rlen < len) return FALSE;
++            for (i = 0; i < len; i++) ws->control[i] = ws->rbuf[i] ^ (ws->frame_masked ? ws->frame_mask[i % 4] : 0);
++            memmove( ws->rbuf, ws->rbuf + len, ws->rlen - len );
++            ws->rlen -= len;
++            ws->in_frame = FALSE;
++            if (ws->frame_opcode == 0x9)
++            {
++                /* a ping: answered with a pong of its payload, by the component */
++                struct send_item *pong = build_frame( ws, 0x8a, ws->control, len, FALSE, 0 );
++                if (pong)
++                {
++                    pong->internal = TRUE;
++                    list_add_tail( &ws->sends, &pong->entry );
++                }
++                continue;
++            }
++            if (ws->frame_opcode == 0xa)
++            {
++                buffer->Data.pbBuffer = ws->control;
++                buffer->Data.ulBufferLength = len;
++                *type = WEB_SOCKET_UNSOLICITED_PONG_BUFFER_TYPE;
++                ws->consume = 0;
++                return TRUE;
++            }
++            if (ws->frame_opcode == 0x8)
++            {
++                buffer->CloseStatus.usStatus = len >= 2 ? ws->control[0] << 8 | ws->control[1] : WEB_SOCKET_EMPTY_CLOSE_STATUS;
++                buffer->CloseStatus.pbReason = len > 2 ? ws->control + 2 : NULL;
++                buffer->CloseStatus.ulReasonLength = len > 2 ? len - 2 : 0;
++                *type = WEB_SOCKET_CLOSE_BUFFER_TYPE;
++                ws->consume = 0;
++                return TRUE;
++            }
++            continue; /* unknown control frames are skipped */
++        }
++
++        /* data: as much of the frame as there is, a fragment unless it ends the message */
++        avail = ws->rlen < ws->frame_remaining ? ws->rlen : (ULONG)ws->frame_remaining;
++        if (!avail && ws->frame_remaining) return FALSE;
++        if (ws->frame_opcode != 0x0) ws->message_opcode = ws->frame_opcode;
++        for (i = 0; i < avail; i++)
++            if (ws->frame_masked) ws->rbuf[pos + i] ^= ws->frame_mask[(ws->frame_pos + i) % 4];
++        buffer->Data.pbBuffer = ws->rbuf;
++        buffer->Data.ulBufferLength = avail;
++        if (ws->frame_fin && avail == ws->frame_remaining)
++            *type = ws->message_opcode == 0x2 ? WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE : WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
++        else
++            *type = ws->message_opcode == 0x2 ? WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE : WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE;
++        ws->frame_pos += avail;
++        ws->frame_remaining -= avail;
++        ws->consume = avail;
++        if (!ws->frame_remaining) ws->in_frame = FALSE;
++        return TRUE;
++    }
++}
++
++HRESULT WINAPI WebSocketGetAction(WEB_SOCKET_HANDLE handle, WEB_SOCKET_ACTION_QUEUE queue, WEB_SOCKET_BUFFER *buffers,
++        ULONG *buffer_count, WEB_SOCKET_ACTION *action, WEB_SOCKET_BUFFER_TYPE *buffer_type,
++        PVOID *app_context, PVOID *action_context)
++{
++    struct websocket *ws = ws_from_handle( handle );
++    HRESULT hr = S_OK;
++
++    TRACE("(%p, %#x, %p, %p, %p, %p, %p, %p)\n", handle, queue, buffers, buffer_count, action, buffer_type,
++          app_context, action_context);
++
++    if (!ws || !buffer_count || !action || !buffer_type || !app_context || !action_context ||
++        !(queue & WEB_SOCKET_ALL_ACTION_QUEUE) || (*buffer_count && !buffers))
++        return E_INVALIDARG;
++
++    EnterCriticalSection( &ws->cs );
++    *action = WEB_SOCKET_NO_ACTION;
++    *app_context = NULL;
++    *action_context = NULL;
++    *buffer_type = 0;
++    if (ws->state == STATE_ABORTED)
++    {
++        *buffer_count = 0;
++        LeaveCriticalSection( &ws->cs );
++        return E_INVALID_PROTOCOL_OPERATION;
++    }
++
++    if ((queue & WEB_SOCKET_SEND_ACTION_QUEUE) && ws->send_pending == PENDING_NONE && !list_empty( &ws->sends ))
++    {
++        struct send_item *item = LIST_ENTRY( list_head( &ws->sends ), struct send_item, entry );
++
++        if (!item->on_network)
++        {
++            if (*buffer_count < 1) hr = HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++            else
++            {
++                buffers[0].Data.pbBuffer = item->frame;
++                buffers[0].Data.ulBufferLength = item->frame_len;
++                *buffer_count = 1;
++                *action = WEB_SOCKET_SEND_TO_NETWORK_ACTION;
++                ws->send_pending = PENDING_SEND_NET;
++            }
++        }
++        else
++        {
++            *buffer_count = 0;
++            *action = WEB_SOCKET_INDICATE_SEND_COMPLETE_ACTION;
++            ws->send_pending = PENDING_SEND_DONE;
++        }
++        if (*action != WEB_SOCKET_NO_ACTION)
++        {
++            *app_context = item->app_context;
++            *action_context = item;
++            ws->send_current = item;
++        }
++        LeaveCriticalSection( &ws->cs );
++        return hr;
++    }
++
++    if ((queue & WEB_SOCKET_RECEIVE_ACTION_QUEUE) && ws->recv_pending == PENDING_NONE && !list_empty( &ws->receives ))
++    {
++        struct recv_item *item = LIST_ENTRY( list_head( &ws->receives ), struct recv_item, entry );
++
++        if (*buffer_count < 1) hr = HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++        else if (next_indication( ws, &buffers[0], buffer_type ))
++        {
++            *buffer_count = 1;
++            *action = WEB_SOCKET_INDICATE_RECEIVE_COMPLETE_ACTION;
++            *app_context = item->app_context;
++            *action_context = item;
++            ws->recv_pending = PENDING_RECV_DONE;
++        }
++        else
++        {
++            /* the rest of the frame (or of its header) from the network */
++            buffers[0].Data.pbBuffer = ws->rbuf + ws->rlen;
++            buffers[0].Data.ulBufferLength = ws->rcap - ws->rlen;
++            *buffer_count = 1;
++            *action = WEB_SOCKET_RECEIVE_FROM_NETWORK_ACTION;
++            *app_context = item->app_context;
++            *action_context = ws->rbuf;
++            ws->recv_pending = PENDING_RECV_NET;
++        }
++        /* a pong a ping asked for goes out first */
++        LeaveCriticalSection( &ws->cs );
++        return hr;
++    }
++
++    *buffer_count = 0;
++    LeaveCriticalSection( &ws->cs );
++    return S_OK;
++}
++
++VOID WINAPI WebSocketCompleteAction(WEB_SOCKET_HANDLE handle, PVOID action_context, ULONG bytes)
++{
++    struct websocket *ws = ws_from_handle( handle );
++
++    TRACE("(%p, %p, %lu)\n", handle, action_context, bytes);
++
++    if (!ws || !action_context) return;
++    EnterCriticalSection( &ws->cs );
++    if (ws->send_pending != PENDING_NONE && action_context == ws->send_current)
++    {
++        struct send_item *item = ws->send_current;
++
++        if (ws->send_pending == PENDING_SEND_NET && !item->internal) item->on_network = TRUE;
++        else
++        {
++            /* the program knows its send is done (or it was a pong of ours) */
++            list_remove( &item->entry );
++            free( item->frame );
++            free( item );
++        }
++        ws->send_current = NULL;
++        ws->send_pending = PENDING_NONE;
++    }
++    else if (ws->recv_pending == PENDING_RECV_NET && action_context == ws->rbuf)
++    {
++        ws->rlen += min( bytes, ws->rcap - ws->rlen );
++        ws->recv_pending = PENDING_NONE;
++    }
++    else if (ws->recv_pending == PENDING_RECV_DONE && !list_empty( &ws->receives ) &&
++             action_context == LIST_ENTRY( list_head( &ws->receives ), struct recv_item, entry ))
++    {
++        struct recv_item *item = action_context;
++
++        /* the data handed out is used up */
++        memmove( ws->rbuf, ws->rbuf + ws->consume, ws->rlen - ws->consume );
++        ws->rlen -= ws->consume;
++        ws->consume = 0;
++        list_remove( &item->entry );
++        free( item );
++        ws->recv_pending = PENDING_NONE;
++    }
++    else WARN("unknown action context %p\n", action_context);
++    LeaveCriticalSection( &ws->cs );
++}
++
++HRESULT WINAPI WebSocketGetGlobalProperty(WEB_SOCKET_PROPERTY_TYPE type, PVOID value, ULONG *size)
++{
++    ULONG v;
++
++    TRACE("(%d, %p, %p)\n", type, value, size);
++
++    if (!value || !size) return E_INVALIDARG;
++    switch (type)
++    {
++    case WEB_SOCKET_RECEIVE_BUFFER_SIZE_PROPERTY_TYPE:
++    case WEB_SOCKET_SEND_BUFFER_SIZE_PROPERTY_TYPE:
++        v = DEFAULT_BUFFER_SIZE;
++        break;
++    case WEB_SOCKET_SUPPORTED_VERSIONS_PROPERTY_TYPE:
++        v = 13;
++        break;
++    default:
++        return E_INVALIDARG;
++    }
++    if (*size < sizeof(v))
++    {
++        *size = sizeof(v);
++        return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++    }
++    *(ULONG *)value = v;
++    *size = sizeof(v);
++    return S_OK;
+ }
+ 
+ VOID WINAPI WebSocketAbortHandle(WEB_SOCKET_HANDLE handle)
+ {
+-    FIXME("(%p): stub\n", handle);
++    struct websocket *ws = ws_from_handle( handle );
++
++    TRACE("(%p)\n", handle);
++
++    if (!ws) return;
++    EnterCriticalSection( &ws->cs );
++    ws->state = STATE_ABORTED;
++    LeaveCriticalSection( &ws->cs );
+ }
+ 
+ VOID WINAPI WebSocketDeleteHandle(WEB_SOCKET_HANDLE handle)
+ {
+-    FIXME("(%p): stub\n", handle);
++    struct websocket *ws = ws_from_handle( handle );
++    struct send_item *s, *s2;
++    struct recv_item *r, *r2;
++
++    TRACE("(%p)\n", handle);
++
++    if (!ws) return;
++    LIST_FOR_EACH_ENTRY_SAFE( s, s2, &ws->sends, struct send_item, entry )
++    {
++        list_remove( &s->entry );
++        free( s->frame );
++        free( s );
++    }
++    LIST_FOR_EACH_ENTRY_SAFE( r, r2, &ws->receives, struct recv_item, entry )
++    {
++        list_remove( &r->entry );
++        free( r );
++    }
++    free_headers( ws );
++    free( ws->rbuf );
++    DeleteCriticalSection( &ws->cs );
++    free( ws );
+ }
+diff --git a/dlls/websocket/websocket.spec b/dlls/websocket/websocket.spec
+index 2b90740..ac1c35d 100644
+--- a/dlls/websocket/websocket.spec
++++ b/dlls/websocket/websocket.spec
+@@ -1,13 +1,13 @@
+-@ stdcall WebSocketAbortHandle(long)
+-@ stub WebSocketBeginClientHandshake
+-@ stub WebSocketBeginServerHandshake
+-@ stub WebSocketCompleteAction
++@ stdcall WebSocketAbortHandle(ptr)
++@ stdcall WebSocketBeginClientHandshake(ptr ptr long ptr long ptr long ptr ptr)
++@ stdcall WebSocketBeginServerHandshake(ptr str ptr long ptr long ptr ptr)
++@ stdcall WebSocketCompleteAction(ptr ptr long)
+ @ stdcall WebSocketCreateClientHandle(ptr long ptr)
+-@ stub WebSocketCreateServerHandle
+-@ stdcall WebSocketDeleteHandle(long)
+-@ stub WebSocketEndClientHandshake
+-@ stub WebSocketEndServerHandshake
+-@ stub WebSocketGetAction
+-@ stub WebSocketGetGlobalProperty
+-@ stub WebSocketReceive
+-@ stub WebSocketSend
++@ stdcall WebSocketCreateServerHandle(ptr long ptr)
++@ stdcall WebSocketDeleteHandle(ptr)
++@ stdcall WebSocketEndClientHandshake(ptr ptr long ptr ptr ptr)
++@ stdcall WebSocketEndServerHandshake(ptr)
++@ stdcall WebSocketGetAction(ptr long ptr ptr ptr ptr ptr ptr)
++@ stdcall WebSocketGetGlobalProperty(long ptr ptr)
++@ stdcall WebSocketReceive(ptr ptr ptr)
++@ stdcall WebSocketSend(ptr long ptr ptr)
+diff --git a/include/websocket.h b/include/websocket.h
+index a7cdb25..4e1040d 100644
+--- a/include/websocket.h
++++ b/include/websocket.h
+@@ -43,9 +43,90 @@ typedef struct _WEB_SOCKET_PROPERTY
+     ULONG                    ulValueSize;
+ } WEB_SOCKET_PROPERTY, *PWEB_SOCKET_PROPERTY;
+ 
++#define WEB_SOCKET_MAX_CLOSE_REASON_LENGTH 123
++
++typedef enum _WEB_SOCKET_CLOSE_STATUS
++{
++    WEB_SOCKET_SUCCESS_CLOSE_STATUS                = 1000,
++    WEB_SOCKET_ENDPOINT_UNAVAILABLE_CLOSE_STATUS   = 1001,
++    WEB_SOCKET_PROTOCOL_ERROR_CLOSE_STATUS         = 1002,
++    WEB_SOCKET_INVALID_DATA_TYPE_CLOSE_STATUS      = 1003,
++    WEB_SOCKET_EMPTY_CLOSE_STATUS                  = 1005,
++    WEB_SOCKET_ABORTED_CLOSE_STATUS                = 1006,
++    WEB_SOCKET_INVALID_PAYLOAD_CLOSE_STATUS        = 1007,
++    WEB_SOCKET_POLICY_VIOLATION_CLOSE_STATUS       = 1008,
++    WEB_SOCKET_MESSAGE_TOO_BIG_CLOSE_STATUS        = 1009,
++    WEB_SOCKET_UNSUPPORTED_EXTENSIONS_CLOSE_STATUS = 1010,
++    WEB_SOCKET_SERVER_ERROR_CLOSE_STATUS           = 1011,
++    WEB_SOCKET_SECURE_HANDSHAKE_ERROR_CLOSE_STATUS = 1015,
++} WEB_SOCKET_CLOSE_STATUS;
++
++typedef enum _WEB_SOCKET_ACTION_QUEUE
++{
++    WEB_SOCKET_SEND_ACTION_QUEUE    = 0x1,
++    WEB_SOCKET_RECEIVE_ACTION_QUEUE = 0x2,
++    WEB_SOCKET_ALL_ACTION_QUEUE     = WEB_SOCKET_SEND_ACTION_QUEUE | WEB_SOCKET_RECEIVE_ACTION_QUEUE,
++} WEB_SOCKET_ACTION_QUEUE;
++
++typedef enum _WEB_SOCKET_BUFFER_TYPE
++{
++    WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE     = 0x80000000,
++    WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE    = 0x80000001,
++    WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE   = 0x80000002,
++    WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE  = 0x80000003,
++    WEB_SOCKET_CLOSE_BUFFER_TYPE            = 0x80000004,
++    WEB_SOCKET_PING_PONG_BUFFER_TYPE        = 0x80000005,
++    WEB_SOCKET_UNSOLICITED_PONG_BUFFER_TYPE = 0x80000006,
++} WEB_SOCKET_BUFFER_TYPE;
++
++typedef enum _WEB_SOCKET_ACTION
++{
++    WEB_SOCKET_NO_ACTION                        = 0,
++    WEB_SOCKET_SEND_TO_NETWORK_ACTION           = 1,
++    WEB_SOCKET_INDICATE_SEND_COMPLETE_ACTION    = 2,
++    WEB_SOCKET_RECEIVE_FROM_NETWORK_ACTION      = 3,
++    WEB_SOCKET_INDICATE_RECEIVE_COMPLETE_ACTION = 4,
++} WEB_SOCKET_ACTION;
++
++typedef struct _WEB_SOCKET_HTTP_HEADER
++{
++    PCHAR pcName;
++    ULONG ulNameLength;
++    PCHAR pcValue;
++    ULONG ulValueLength;
++} WEB_SOCKET_HTTP_HEADER, *PWEB_SOCKET_HTTP_HEADER;
++
++typedef union _WEB_SOCKET_BUFFER
++{
++    struct
++    {
++        PBYTE pbBuffer;
++        ULONG ulBufferLength;
++    } Data;
++    struct
++    {
++        PBYTE pbReason;
++        ULONG ulReasonLength;
++        USHORT usStatus;
++    } CloseStatus;
++} WEB_SOCKET_BUFFER, *PWEB_SOCKET_BUFFER;
++
+ VOID WINAPI WebSocketAbortHandle(WEB_SOCKET_HANDLE);
++HRESULT WINAPI WebSocketBeginClientHandshake(WEB_SOCKET_HANDLE, PCSTR*, ULONG, PCSTR*, ULONG,
++        const PWEB_SOCKET_HTTP_HEADER, ULONG, PWEB_SOCKET_HTTP_HEADER*, ULONG*);
++HRESULT WINAPI WebSocketBeginServerHandshake(WEB_SOCKET_HANDLE, PCSTR, PCSTR*, ULONG,
++        const PWEB_SOCKET_HTTP_HEADER, ULONG, PWEB_SOCKET_HTTP_HEADER*, ULONG*);
++VOID WINAPI WebSocketCompleteAction(WEB_SOCKET_HANDLE, PVOID, ULONG);
+ HRESULT WINAPI WebSocketCreateClientHandle(const PWEB_SOCKET_PROPERTY, ULONG, WEB_SOCKET_HANDLE*);
++HRESULT WINAPI WebSocketCreateServerHandle(const PWEB_SOCKET_PROPERTY, ULONG, WEB_SOCKET_HANDLE*);
+ VOID WINAPI WebSocketDeleteHandle(WEB_SOCKET_HANDLE);
++HRESULT WINAPI WebSocketEndClientHandshake(WEB_SOCKET_HANDLE, const PWEB_SOCKET_HTTP_HEADER, ULONG, ULONG*, ULONG*, ULONG*);
++HRESULT WINAPI WebSocketEndServerHandshake(WEB_SOCKET_HANDLE);
++HRESULT WINAPI WebSocketGetAction(WEB_SOCKET_HANDLE, WEB_SOCKET_ACTION_QUEUE, WEB_SOCKET_BUFFER*, ULONG*,
++        WEB_SOCKET_ACTION*, WEB_SOCKET_BUFFER_TYPE*, PVOID*, PVOID*);
++HRESULT WINAPI WebSocketGetGlobalProperty(WEB_SOCKET_PROPERTY_TYPE, PVOID, ULONG*);
++HRESULT WINAPI WebSocketReceive(WEB_SOCKET_HANDLE, WEB_SOCKET_BUFFER*, PVOID);
++HRESULT WINAPI WebSocketSend(WEB_SOCKET_HANDLE, WEB_SOCKET_BUFFER_TYPE, WEB_SOCKET_BUFFER*, PVOID);
+ 
+ #ifdef __cplusplus
+ }
