@@ -10,6 +10,13 @@
 # Files) the descriptor's mode stands.
 #   - CreateDirectory with a descriptor giving the users read only (mode
 #     0755), by a process with umask 022 (a SYSTEM service's)
+#   - a folder and a file made with no descriptor (as installers make them)
+#     under a folder whose default ACL gives others r-x (Program Files):
+#     others may not write them. The umask was left out there and the bare
+#     default mode, 0777/0666, applied over the inherited ACL: every program
+#     an elevated installer put in Program Files was every account's to
+#     change (qa4/qa5, 2026-10-22). Mutation: ntdll with
+#     -DSG_MUTANT_INHERIT_WIDENS.
 #
 #   WINE=/opt/wine-sg/bin/wine test/dirshare-gate.sh
 # Mutations: the server with -DSG_MUTANT_DIR_MODE_NARROWS, or ntdll with
@@ -46,5 +53,14 @@ r1=$(p mkdir 'C:\shared\Vendor'); r3=$(p mkdir 'C:\kept\Vendor')
 [ "$r3" = ok ] && [ "$(gperm "$C/kept/Vendor")" != rwx ] \
     && pass "under a folder giving the group r-x (Program Files): the descriptor's mode stands ($(gperm "$C/kept/Vendor"))" \
     || fail "in the kept folder: $r3, group $(gperm "$C/kept/Vendor" 2>&1)"
+r4=$(p plaindir 'C:\kept\App'); r5=$(p plainfile 'C:\kept\App.exe'); r6=$(p plainfile 'C:\shared\data.bin')
+"$WINESERVER" -w
+operm() { stat -c %A "$1" | cut -c8-10; }
+[ "$r4" = ok ] && [ "$r5" = ok ] && [ "$(operm "$C/kept/App")" = r-x ] && [ "$(operm "$C/kept/App.exe")" = r-x ] \
+    && pass "a folder and a file made with no descriptor in Program Files: others may not write them ($(stat -c %A "$C/kept/App") $(stat -c %A "$C/kept/App.exe"))" \
+    || fail "made with no descriptor in the kept folder: $r4 $r5, $(stat -c %A "$C/kept/App" "$C/kept/App.exe" 2>&1 | tr '\n' ' ')"
+[ "$r6" = ok ] && [ "$(gperm "$C/shared/data.bin" | cut -c1-2)" = rw ] \
+    && pass "a file made with no descriptor where the users may make things: the group keeps its write ($(stat -c %A "$C/shared/data.bin"))" \
+    || fail "made with no descriptor in the shared folder: $r6, $(stat -c %A "$C/shared/data.bin" 2>&1)"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
