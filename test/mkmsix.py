@@ -9,9 +9,11 @@
 #             [--framework] [--display-name D] [--resource-id R]
 #             [--language L ...] [--dep NAME:MINVERSION ...]
 #             [--app ID:EXE[:ALIAS,ALIAS...][:DISPLAYNAME] ...]
-#             [--file SRC:NAME_IN_PACKAGE ...] [--allow-external]
+#             [--file SRC:NAME_IN_PACKAGE ...] [--allow-external] [--extensions FILE]
 #             (--allow-external: a package with external location, a "sparse"
-#             package: uap10:AllowExternalContent, the applications win32 ones)
+#             package: uap10:AllowExternalContent, the applications win32 ones;
+#             --extensions: the first application's <Extensions> are FILE's XML,
+#             with the com, desktop4, desktop5 and desktop10 prefixes declared)
 #   mkmsix.py bundle OUT --name N --version V [--publisher P] [--unmapped-payload]
 #             --pkg FILE:application:ARCH ... --pkg FILE:resource:LANGUAGE ...
 #             (--unmapped-payload: the block map leaves the packages out, as
@@ -100,7 +102,10 @@ def manifest(a):
         aliases = [x for x in f[2].split(',') if x] if len(f) > 2 else []
         disp = f[3] if len(f) > 3 else f'{app_id} app'
         ext = ''
-        if aliases:
+        if a.extensions and not apps:
+            with open(a.extensions) as f:
+                ext = '<Extensions>' + f.read() + '</Extensions>'
+        elif aliases:
             ext = ('<Extensions><uap5:Extension Category="windows.appExecutionAlias">'
                    '<uap5:AppExecutionAlias>' +
                    ''.join(f'<uap5:ExecutionAlias Alias={quoteattr(al)}/>' for al in aliases) +
@@ -116,6 +121,10 @@ def manifest(a):
             f'xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" '
             f'xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5" '
             f'xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10" '
+            f'xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10" '
+            f'xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4" '
+            f'xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5" '
+            f'xmlns:desktop10="http://schemas.microsoft.com/appx/manifest/desktop/windows10/10" '
             f'xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" '
             f'IgnorableNamespaces="uap uap5 uap10 rescap">'
             f'<Identity Name={quoteattr(a.name)}{arch} Publisher={quoteattr(a.publisher)} '
@@ -188,6 +197,7 @@ def main():
     p.add_argument('--pkg', action='append', default=[])
     p.add_argument('--unmapped-payload', action='store_true')
     p.add_argument('--allow-external', action='store_true')
+    p.add_argument('--extensions')
     a = p.parse_args()
     (cmd_package if a.kind == 'package' else cmd_bundle)(a)
 
