@@ -9,7 +9,9 @@
 #             [--framework] [--display-name D] [--resource-id R]
 #             [--language L ...] [--dep NAME:MINVERSION ...]
 #             [--app ID:EXE[:ALIAS,ALIAS...][:DISPLAYNAME] ...]
-#             [--file SRC:NAME_IN_PACKAGE ...]
+#             [--file SRC:NAME_IN_PACKAGE ...] [--allow-external]
+#             (--allow-external: a package with external location, a "sparse"
+#             package: uap10:AllowExternalContent, the applications win32 ones)
 #   mkmsix.py bundle OUT --name N --version V [--publisher P] [--unmapped-payload]
 #             --pkg FILE:application:ARCH ... --pkg FILE:resource:LANGUAGE ...
 #             (--unmapped-payload: the block map leaves the packages out, as
@@ -84,6 +86,8 @@ def manifest(a):
         props.append('<Framework>true</Framework>')
     if a.resource_id and a.language:
         props.append('<ResourcePackage>true</ResourcePackage>')
+    if a.allow_external:
+        props.append('<uap10:AllowExternalContent>true</uap10:AllowExternalContent>')
     deps = ['<TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0"/>']
     for d in a.dep:
         name, minv = d.split(':')
@@ -101,8 +105,9 @@ def manifest(a):
                    '<uap5:AppExecutionAlias>' +
                    ''.join(f'<uap5:ExecutionAlias Alias={quoteattr(al)}/>' for al in aliases) +
                    '</uap5:AppExecutionAlias></uap5:Extension></Extensions>')
+        sparse = ' uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App"' if a.allow_external else ''
         apps.append(f'<Application Id={quoteattr(app_id)} Executable={quoteattr(exe)} '
-                    f'EntryPoint="Windows.FullTrustApplication">'
+                    f'EntryPoint="Windows.FullTrustApplication"{sparse}>'
                     f'<uap:VisualElements DisplayName={quoteattr(disp)} Description="test" '
                     f'BackgroundColor="transparent" Square150x150Logo="Assets\\logo.png" '
                     f'Square44x44Logo="Assets\\logo.png"/>{ext}</Application>')
@@ -110,8 +115,9 @@ def manifest(a):
             f'<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" '
             f'xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" '
             f'xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5" '
+            f'xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10" '
             f'xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" '
-            f'IgnorableNamespaces="uap uap5 rescap">'
+            f'IgnorableNamespaces="uap uap5 uap10 rescap">'
             f'<Identity Name={quoteattr(a.name)}{arch} Publisher={quoteattr(a.publisher)} '
             f'Version="{a.version}"{rid}/>'
             f'<Properties>{"".join(props)}</Properties>'
@@ -181,6 +187,7 @@ def main():
     p.add_argument('--file', action='append', default=[])
     p.add_argument('--pkg', action='append', default=[])
     p.add_argument('--unmapped-payload', action='store_true')
+    p.add_argument('--allow-external', action='store_true')
     a = p.parse_args()
     (cmd_package if a.kind == 'package' else cmd_bundle)(a)
 
