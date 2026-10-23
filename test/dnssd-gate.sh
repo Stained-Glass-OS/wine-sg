@@ -9,12 +9,15 @@
 #  - DnsServiceResolve gives the instance: its name, host, port, address and TXT properties (a bare key has an
 #    empty value); an instance nobody publishes fails in the callback; a name without an instance is refused;
 #  - DnsServiceConstructInstance / CopyInstance / FreeInstance;
+#  - DnsStartMulticastQuery finds a record (the instance's SRV, this machine's A) and DnsStopMulticastQuery
+#    stops it, no callback coming after;
 #  - when the publisher goes away, the browse reports a PTR with no time to live; cancel ends it with
 #    ERROR_CANCELLED, once;
 #  - DnsServiceRegister advertises through the avahi daemon (avahi-browse sees it, with its port and TXT) only
 #    while the program holds it: DnsServiceDeRegister withdraws it (with its callback), and so does the
 #    program's end; a second registration of the name is refused.
-#   WINE=/opt/wine-sg/bin/wine test/dnssd-gate.sh   (mutants SG_MUTANT_MDNS_PTR_ONLY, SG_MUTANT_MDNS_KEEP_REGISTERED)
+#   WINE=/opt/wine-sg/bin/wine test/dnssd-gate.sh   (mutants SG_MUTANT_MDNS_PTR_ONLY, SG_MUTANT_MDNS_KEEP_REGISTERED,
+#   SG_MUTANT_MDNS_STOP_NOWAIT)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -67,6 +70,12 @@ expect Instance "1 4242 1 1 1" "the instance: name, port, host, address, TXT pro
 expect ResolveMissing "9506 1 1" "an instance nobody publishes fails in the callback"
 expect ResolveNoInstance 87 "a name without an instance is refused"
 expect Construct "1 1 80 2 1" "DnsServiceConstructInstance and DnsServiceCopyInstance"
+expect QuerySrv "0 1 1 1" "DnsStartMulticastQuery: the instance's SRV record, the handle filled in"
+expect QueryStop "0 1" "DnsStopMulticastQuery returns once the running callback is done"
+expect QueryQuiet 1 "no callback after it returns"
+expect QueryA "0 1 1" "this machine's address record by its .local name"
+expect QueryStopAgain 87 "a stopped query cannot be stopped again"
+expect QueryNull 87 "no request: ERROR_INVALID_PARAMETER"
 expect Removed 1 "the publisher gone, the browse reports a PTR with no time to live"
 expect Cancel "0 1 1223" "cancelling the browse: ERROR_CANCELLED in the callback"
 expect CancelAgain 1223 "a cancelled browse cannot be cancelled again"

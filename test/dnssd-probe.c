@@ -115,6 +115,26 @@ static int do_register( void )
     ExitProcess( 0 );
 }
 
+static HANDLE query_event;
+static LONG query_calls;
+static int query_srv, query_a;
+static void WINAPI query_cb( void *ctx, MDNS_QUERY_HANDLE *handle, DNS_QUERY_RESULT *result )
+{
+    DNS_RECORD *r;
+
+    /* a slow callback: it is still running when the probe stops the query */
+    SetEvent( query_event );
+    Sleep( 500 );
+    if (result->QueryStatus) { InterlockedIncrement( &query_calls ); return; }
+    for (r = result->pQueryRecords; r; r = r->pNext)
+    {
+        if (r->wType == DNS_TYPE_SRV && r->Data.SRV.wPort == 4242) query_srv = 1;
+        if (r->wType == DNS_TYPE_A) query_a = 1;
+    }
+    DnsRecordListFree( result->pQueryRecords, DnsFreeRecordList );
+    InterlockedIncrement( &query_calls );
+}
+
 static void WINAPI resolve_cb( DWORD status, void *ctx, DNS_SERVICE_INSTANCE *inst )
 {
     resolve_status = status;
@@ -211,6 +231,43 @@ int main( int argc, char **argv )
             copy ? copy->dwPropertyCount : 0, copy && !wcscmp( copy->values[1], L"2" ) && *copy->ip4Address == ip );
     DnsServiceFreeInstance( inst );
     DnsServiceFreeInstance( copy );
+
+    /* multicast queries */
+    {
+        MDNS_QUERY_REQUEST q = { 0 };
+        MDNS_QUERY_HANDLE h, h2;
+        WCHAR host[256];
+        DWORD len = 200;
+        LONG calls;
+
+        query_event = CreateEventW( NULL, FALSE, FALSE, NULL );
+        q.Version = DNS_QUERY_REQUEST_VERSION1;
+        q.Query = full;
+        q.QueryType = DNS_TYPE_SRV;
+        q.pQueryCallback = query_cb;
+        st = DnsStartMulticastQuery( &q, &h );
+        i = WaitForSingleObject( query_event, 10000 ) == WAIT_OBJECT_0;
+        /* stopped while the callback runs: it returns once the callback is done */
+        len = DnsStopMulticastQuery( &h );
+        calls = query_calls;
+        printf( "QuerySrv=%ld %lu %d %d\n", st, i, query_srv, h.wType == DNS_TYPE_SRV && !wcsicmp( h.nameBuf, full ) );
+        printf( "QueryStop=%lu %d\n", len, calls >= 1 );
+        Sleep( 1500 );
+        printf( "QueryQuiet=%d\n", calls == query_calls );
+        len = 200;
+        GetComputerNameExW( ComputerNameDnsHostname, host, &len );
+        wcscat( host, L".local" );
+        q.Query = host;
+        q.QueryType = DNS_TYPE_A;
+        ResetEvent( query_event );
+        st = DnsStartMulticastQuery( &q, &h2 );
+        for (len = 0; len < 100 && !query_a; len++) Sleep( 100 );
+        i = query_a;
+        printf( "QueryA=%ld %lu %d\n", st, i, query_a );
+        DnsStopMulticastQuery( &h2 );
+        printf( "QueryStopAgain=%ld\n", DnsStopMulticastQuery( &h2 ) );
+        printf( "QueryNull=%ld\n", DnsStartMulticastQuery( NULL, &h2 ) );
+    }
 
     /* the instance goes away: the first browse sees a PTR with no time to live */
     CloseHandle( CreateFileW( L"C:\\found.flag", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL ) );
