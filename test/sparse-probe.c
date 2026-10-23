@@ -47,6 +47,13 @@ typedef struct { InspVtbl i; HRESULT (WINAPI *get_Current)(void *, void **); HRE
 typedef struct { InspVtbl i; HRESULT (WINAPI *get_Status)(void *, void **); } Package3Vtbl;
 typedef struct { InspVtbl i; HRESULT (WINAPI *VerifyIsOK)(void *, boolean *); HRESULT (WINAPI *flags[11])(void *, boolean *); } StatusVtbl;
 typedef struct { InspVtbl i; HRESULT (WINAPI *get_IsPartiallyStaged)(void *, boolean *); } Status2Vtbl;
+typedef struct { InspVtbl i; HRESULT (WINAPI *get_MutableLocation)(void *, void **); HRESULT (WINAPI *get_EffectiveLocation)(void *, void **); } Package7Vtbl;
+typedef struct { InspVtbl i; HRESULT (WINAPI *get_EffectiveExternalLocation)(void *, void **);
+                 HRESULT (WINAPI *get_MachineExternalLocation)(void *, void **); HRESULT (WINAPI *get_UserExternalLocation)(void *, void **);
+                 HRESULT (WINAPI *get_InstalledPath)(void *, HSTRING *); HRESULT (WINAPI *get_MutablePath)(void *, HSTRING *);
+                 HRESULT (WINAPI *get_EffectivePath)(void *, HSTRING *); HRESULT (WINAPI *get_EffectiveExternalPath)(void *, HSTRING *);
+                 HRESULT (WINAPI *get_MachineExternalPath)(void *, HSTRING *); HRESULT (WINAPI *get_UserExternalPath)(void *, HSTRING *);
+                 void *GetLogo; void *GetAppListEntries; HRESULT (WINAPI *get_IsStub)(void *, boolean *); } Package8Vtbl;
 typedef struct { InspVtbl i; void *AddPackageVolumeAsync, *AddPackageToVolumeAsync, *ClearPackageStatus,
                  *RegisterPackageWithAppDataVolumeAsync, *FindPackageVolumeByName, *FindPackageVolumes;
                  HRESULT (WINAPI *GetDefaultPackageVolume)(void *, void **); } Manager3Vtbl;
@@ -108,6 +115,14 @@ static const GUID IID_IVector_Uri_ = {0x0d82bd8d,0xfe62,0x5d67,{0xa7,0xb9,0x78,0
 static const GUID IID_IVector_HSTRING_ = {0x98b9acc1,0x4b56,0x532e,{0xac,0x73,0x03,0xd5,0x29,0x1c,0xca,0x90}};
 static const GUID IID_IVector_Package_ = {0xd1bb509e,0x6989,0x5c69,{0xb1,0xff,0xd1,0x70,0x2f,0xe8,0xac,0xa3}};
 static const GUID IID_IUriRuntimeClassFactory_ = {0x44a9796f,0x723e,0x4fdf,{0xa2,0x18,0x03,0x3e,0x75,0xb0,0xc0,0x84}};
+static const GUID IID_IPackage2_ = {0xa6612fb6,0x7688,0x4ace,{0x95,0xfb,0x35,0x95,0x38,0xe7,0xaa,0x01}};
+static const GUID IID_IPackage4_ = {0x65aed1ae,0xb95b,0x450c,{0x88,0x2b,0x62,0x55,0x18,0x7f,0x39,0x7e}};
+static const GUID IID_IPackage5_ = {0x0e842dd4,0xd9ac,0x45ed,{0x9a,0x1e,0x74,0xce,0x05,0x6b,0x26,0x35}};
+static const GUID IID_IPackage6_ = {0x8b1ad942,0x12d7,0x4754,{0xae,0x4e,0x63,0x8c,0xbc,0x0e,0x3a,0x2e}};
+static const GUID IID_IPackage7_ = {0x86ff8d31,0xa2e4,0x45e0,{0x97,0x32,0x28,0x3a,0x6d,0x88,0xfd,0xe1}};
+static const GUID IID_IPackage8_ = {0x2c584f7b,0xce2a,0x4be6,{0xa0,0x93,0x77,0xcf,0xbb,0x2a,0x7e,0xa1}};
+static const GUID IID_IPackage9_ = {0xd5ab224f,0xd7e1,0x49ec,{0x90,0xce,0x72,0x0c,0xdb,0xd0,0x2e,0x9c}};
+static const GUID IID_IPackageWithMetadata_ = {0x95949780,0x1de9,0x40f2,{0xb4,0x52,0x0d,0xe9,0xf1,0x91,0x00,0x12}};
 static const GUID IID_IPackage3_ = {0x5f738b61,0xf86a,0x4917,{0x93,0xd1,0xf1,0xee,0x9d,0x3b,0x35,0xd9}};
 static const GUID IID_IPackageStatus2_ = {0xf428fa93,0x7c56,0x4862,{0xac,0xfa,0xab,0xae,0xdc,0xc0,0x69,0x4d}};
 static const GUID IID_IStorageItem_ = {0x4207a996,0xca2f,0x42f7,{0xbd,0xe8,0x8b,0x10,0x45,0x7a,0x7f,0x30}};
@@ -411,6 +426,45 @@ static int cmd_status( char *family )
         VT(pkg, PackageVtbl)->get_Id( pkg, &id );
         if (id) VT(id, PackageIdVtbl)->get_FullName( id, &name );
         printf( "package.%d=%ls\n", n, raw( name ) );
+        {
+            static const struct { const char *name; const GUID *iid; } ifaces[] =
+            {
+                { "IPackage2", &IID_IPackage2_ }, { "IPackage3", &IID_IPackage3_ }, { "IPackage4", &IID_IPackage4_ },
+                { "IPackage5", &IID_IPackage5_ }, { "IPackage6", &IID_IPackage6_ }, { "IPackage7", &IID_IPackage7_ },
+                { "IPackage8", &IID_IPackage8_ }, { "IPackage9", &IID_IPackage9_ },
+                { "IPackageWithMetadata", &IID_IPackageWithMetadata_ },
+            };
+            void *p;
+            for (i = 0; i < (int)(sizeof(ifaces) / sizeof(ifaces[0])); i++)
+            {
+                p = NULL;
+                printf( "qi.%d.%s=%08lx\n", n, ifaces[i].name, VT(pkg, InspVtbl)->QI( pkg, ifaces[i].iid, &p ) );
+                if (p && ifaces[i].iid == &IID_IPackage8_)
+                {
+                    HSTRING path = NULL;
+                    boolean stub = 2;
+                    VT(p, Package8Vtbl)->get_InstalledPath( p, &path );
+                    printf( "installed_path.%d=%ls\n", n, raw( path ) );
+                    path = NULL;
+                    VT(p, Package8Vtbl)->get_EffectiveExternalPath( p, &path );
+                    printf( "external_path.%d=%ls\n", n, raw( path ) );
+                    path = NULL;
+                    VT(p, Package8Vtbl)->get_MachineExternalPath( p, &path );
+                    printf( "machine_external_path.%d=%ls\n", n, raw( path ) );
+                    path = NULL;
+                    VT(p, Package8Vtbl)->get_UserExternalPath( p, &path );
+                    printf( "user_external_path.%d=%ls\n", n, raw( path ) );
+                    VT(p, Package8Vtbl)->get_IsStub( p, &stub );
+                    printf( "stub.%d=%d\n", n, stub );
+                }
+                if (p && ifaces[i].iid == &IID_IPackage7_)
+                {
+                    void *folder = NULL;
+                    VT(p, Package7Vtbl)->get_EffectiveLocation( p, &folder );
+                    printf( "effective_location.%d=%s\n", n, folder ? "yes" : "no" );
+                }
+            }
+        }
         VT(pkg, InspVtbl)->QI( pkg, &IID_IPackage3_, &p3 );
         if (p3) VT(p3, Package3Vtbl)->get_Status( p3, &st );
         if (st)

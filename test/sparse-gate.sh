@@ -190,6 +190,14 @@ expect "$out" package.0 "$SPARSE" "FindPackagesByUserSecurityIdPackageFamilyName
 expect "$out" ok.0 1 "its status is OK"
 expect "$out" status2.0 00000000 "its status has IPackageStatus2 (Dropbox used the NULL it got and crashed)"
 expect "$out" partial.0 0 "and it is not partially staged"
+for i in IPackage2 IPackage3 IPackage4 IPackage5 IPackage6 IPackage7 IPackage8 IPackage9 IPackageWithMetadata; do
+    expect "$out" "qi.0.$i" 00000000 "the package has $i, as on Windows"
+done
+expect "$out" external_path.0 'C:\SparseApp' "IPackage8.EffectiveExternalPath: its external location"
+expect "$out" user_external_path.0 'C:\SparseApp' "UserExternalPath too (registered for the user)"
+expect "$out" machine_external_path.0 '' "and no MachineExternalPath"
+expect "$out" stub.0 0 "IsStub: no"
+expect "$out" effective_location.0 yes "IPackage7.EffectiveLocation: a folder"
 out=$(run sparse-probe.exe stub "StainedGlass.SparseTest_$PUBID")
 expect "$out" preference 0 "the stub preference is Full"
 expect "$out" set_bad 80070057 "a bad preference is refused"

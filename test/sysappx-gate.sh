@@ -154,6 +154,9 @@ expect "$out" family 1 "once"
 out=$(user sparse-probe.exe status "$FAMILY")
 expect "$out" package.0 "$FULL" "$SG_OTHER walks the machine's package as Dropbox does"
 expect "$out" status2.0 00000000 "its status has IPackageStatus2"
+expect "$out" qi.0.IPackage8 00000000 "and IPackage8"
+expect "$out" machine_external_path.0 'C:\SysApp' "its MachineExternalPath is the external location (added by SYSTEM)"
+expect "$out" user_external_path.0 '' "and it has no UserExternalPath"
 # an older registration of the family for the user beside the machine's: one version shows
 OLD="StainedGlass.SysTest_0.9.0.0_x64__${FAMILY##*_}"
 SK="HKCU\\Software\\Wine\\AppModel\\Packages\\$OLD"
