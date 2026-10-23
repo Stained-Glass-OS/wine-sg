@@ -11,7 +11,7 @@
  * where a value is ?, an integer, 'text' or NULL and a cond is "col = value", "col > value",
  * "col < value", "col IS NULL". Parameters are bound with SQLBindParameter (input and output: an
  * output parameter of "SELECT ... " is not supported; ODBC escape "{? = call AddAge(?)}" sets its
- * output to the number of people and its input's sum with 100). Every statement, with its
+ * output to the number of people and its input's sum with 100; "{call ListPeople}" returns the table). Every statement, with its
  * parameters, is appended to the file SG_ADOMOCK_LOG names. SQLDisconnect ends the connection:
  * statements after it fail with SQLSTATE 08003, as a real driver's do.
  *
@@ -472,6 +472,17 @@ static SQLRETURN execute( struct stmt *st, const WCHAR *sql )
         }
         save_table( table_rows, kept );
         return SQL_SUCCESS;
+    }
+    /* { call ListPeople }: a procedure that returns the people */
+    {
+        struct parser call = { sql, st };
+        if (punct( &call, '{' ) && keyword( &call, L"call" ) && keyword( &call, L"ListPeople" ))
+        {
+            for (c = 0; c < NCOLS; c++) { st->cols[c].name = col_names[c]; st->cols[c].src = c; }
+            st->ncols = NCOLS;
+            for (r = 0; r < nrows; r++) st->rows[st->nrows++] = table_rows[r];
+            return SQL_SUCCESS;
+        }
     }
     /* {? = call AddAge(?)}: the output parameter gets the number of people, the input plus 100 back */
     if (punct( &ps, '{' ) && punct( &ps, '?' ) && punct( &ps, '=' ) && keyword( &ps, L"call" ) && keyword( &ps, L"AddAge" ))
