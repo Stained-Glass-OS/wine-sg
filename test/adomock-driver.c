@@ -84,7 +84,8 @@ struct stmt
     struct row rows[MAX_ROWS];
     int nrows, row, ncols;
     unsigned int got;           /* the columns of the current row SQLGetData has given, as bits */
-    struct result_col cols[NCOLS + 2];
+    struct result_col cols[NCOLS + 3];
+    int catalog;                /* a catalog function's result: every column a string */
     SQLLEN affected;
     WCHAR *prepared;
     int is_stmt;
@@ -349,6 +350,8 @@ static SQLRETURN execute( struct stmt *st, const WCHAR *sql )
     struct cond conds[8];
     int nrows, ncond, r, c, i;
     WCHAR logbuf[1024], vbuf[80];
+
+    st->catalog = 0;
 
     swprintf( logbuf, ARRAYSIZE(logbuf), L"SQL %ls", sql );
     for (i = 1; i <= MAX_PARAMS && st->params[i].ptr; i++)
@@ -642,6 +645,7 @@ __declspec(dllexport) SQLRETURN WINAPI SQLDescribeColW( SQLHANDLE h, SQLUSMALLIN
     src = st->cols[col - 1].src;
     if (name) lstrcpynW( name, st->cols[col - 1].name, size );
     if (len) *len = lstrlenW( st->cols[col - 1].name );
+    if (st->catalog) src = 1;
     if (type) *type = src == 1 ? SQL_WVARCHAR : SQL_INTEGER;
     if (colsize) *colsize = src == 1 ? 50 : 10;
     if (digits) *digits = 0;
@@ -668,9 +672,9 @@ __declspec(dllexport) SQLRETURN WINAPI SQLColAttributeW( SQLHANDLE h, SQLUSMALLI
     case 3: /* SQL_COLUMN_LENGTH */
     case 4: /* SQL_COLUMN_PRECISION */
     case 1003: /* SQL_DESC_LENGTH */
-    case 1005: /* SQL_DESC_PRECISION */ if (num) *num = st->cols[col - 1].src == 1 ? 50 : 10; break;
-    case 1013: /* SQL_DESC_OCTET_LENGTH */ if (num) *num = st->cols[col - 1].src == 1 ? 100 : 4; break;
-    case 6: /* SQL_COLUMN_DISPLAY_SIZE */ if (num) *num = st->cols[col - 1].src == 1 ? 50 : 11; break;
+    case 1005: /* SQL_DESC_PRECISION */ if (num) *num = (st->catalog || st->cols[col - 1].src == 1) ? 50 : 10; break;
+    case 1013: /* SQL_DESC_OCTET_LENGTH */ if (num) *num = (st->catalog || st->cols[col - 1].src == 1) ? 100 : 4; break;
+    case 6: /* SQL_COLUMN_DISPLAY_SIZE */ if (num) *num = (st->catalog || st->cols[col - 1].src == 1) ? 50 : 11; break;
     case 8: /* SQL_COLUMN_UNSIGNED */
     case 5: /* SQL_COLUMN_SCALE */
     case 1006: /* SQL_DESC_SCALE */ if (num) *num = 0; break;
@@ -744,27 +748,27 @@ __declspec(dllexport) SQLRETURN WINAPI SQLGetData( SQLHANDLE h, SQLUSMALLINT col
 }
 
 /* the catalog: People and its primary key */
-static void catalog_row( struct stmt *st, const WCHAR *const *names, int ncols )
-{
-    int c;
-    st->ncols = ncols;
-    for (c = 0; c < ncols; c++) { st->cols[c].name = names[c]; st->cols[c].src = 1; }
-}
-
 __declspec(dllexport) SQLRETURN WINAPI SQLPrimaryKeysW( SQLHANDLE h, SQLWCHAR *cat, SQLSMALLINT cl, SQLWCHAR *sch,
                                                         SQLSMALLINT sl, SQLWCHAR *tab, SQLSMALLINT tl )
 {
-    static const WCHAR *const names[] = { L"TABLE_CAT", L"TABLE_SCHEM", L"TABLE_NAME", L"COLUMN_NAME", L"KEY_SEQ" };
+    /* ODBC's result: TABLE_CAT, TABLE_SCHEM, TABLE_NAME, COLUMN_NAME, KEY_SEQ, PK_NAME; the row's
+     * values: 0 null, 1 the table, 2 the column */
+    static const WCHAR *const names[] = { L"TABLE_CAT", L"TABLE_SCHEM", L"TABLE_NAME", L"COLUMN_NAME", L"KEY_SEQ", L"PK_NAME" };
+    static const int src[] = { 0, 0, 1, 2, 0, 0 };
     struct stmt *st = h;
+    int c;
 
     if (!connected) { set_diag( L"08003" ); return SQL_ERROR; }
     log_line( L"PRIMARYKEYS" );
     st->nrows = st->row = 0;
-    catalog_row( st, names, 1 );   /* one string column per row: only the column name is asked for */
-    st->cols[0].name = L"COLUMN_NAME";
+    st->ncols = 6;
+    st->catalog = 1;
+    for (c = 0; c < 6; c++) { st->cols[c].name = names[c]; st->cols[c].src = src[c]; }
     if (!tab || wcsnicmp( tab, L"People", 6 )) return SQL_SUCCESS;
     memset( &st->rows[0], 0, sizeof(st->rows[0]) );
-    lstrcpyW( st->rows[0].v[1].str, L"Id" );
+    st->rows[0].v[0].is_null = 1;
+    lstrcpyW( st->rows[0].v[1].str, L"People" );
+    lstrcpyW( st->rows[0].v[2].str, L"Id" );
     st->nrows = 1;
     return SQL_SUCCESS;
 }

@@ -1,0 +1,878 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] msado15: A Recordset's changes are written to the data source (6037)
+
+Update and UpdateBatch returned E_NOTIMPL on a connected recordset and
+nothing reached the database. Now, as ADO's client cursor does:
+- A changed row is an UPDATE of its changed columns. The row is found by
+  its primary key (the PRIMARY_KEYS schema) and the changed columns' old
+  values, or by every comparable column when there is no key.
+- An added row is an INSERT.
+- A deleted row is a DELETE.
+- Moving off an edited row stores it.
+- In batch mode the changes wait for UpdateBatch, and CancelBatch takes
+  them back.
+- A statement that changes no row is DB_E_CONCURRENCYVIOLATION.
+---
+diff --git a/dlls/msado15/recordset.c b/dlls/msado15/recordset.c
+index 0b57774..312157e 100644
+--- a/dlls/msado15/recordset.c
++++ b/dlls/msado15/recordset.c
+@@ -86,7 +86,27 @@ struct recordset
+     VARIANT           *edit_backup;
+     LONG               edit_row;
+     LONG               pending_add;    /* 1 + the row AddNew appended and Update has not stored yet */
++
++    /* Stained Glass OS: the changes not yet written to the data source (write-back) */
++    struct row_track  *track;          /* per row, as many as allocated */
++    LONG               track_allocated;
++    VARIANT          **deleted;        /* rows deleted in batch mode: their values */
++    LONG               deleted_count;
++    BSTR               base_table;     /* the table the rows come from, NULL when unknown */
++    LONG              *key_cols;       /* its primary key's columns */
++    LONG               key_count;
++    BOOL               keys_known;
++};
++
++/* a row's change: TRACK_MODIFIED keeps the values it had when it was read */
++struct row_track
++{
++    BYTE     state;
++    VARIANT *original;
+ };
++#define TRACK_NONE      0
++#define TRACK_MODIFIED  1
++#define TRACK_ADDED     2
+ 
+ struct fields
+ {
+@@ -373,6 +393,63 @@ static HRESULT WINAPI field_get_Value( Field *iface, VARIANT *val )
+     return S_OK;
+ }
+ 
++/* Stained Glass OS: the change record of a row, the array grown to the rows allocated */
++static struct row_track *recordset_row_track( struct recordset *recordset, LONG row )
++{
++    if (row < 0) return NULL;
++    if (row >= recordset->track_allocated)
++    {
++        LONG count = max( row + 1, max( recordset->allocated, recordset->track_allocated * 2 ) );
++        struct row_track *grown = realloc( recordset->track, count * sizeof(*grown) );
++
++        if (!grown) return NULL;
++        memset( grown + recordset->track_allocated, 0, (count - recordset->track_allocated) * sizeof(*grown) );
++        recordset->track = grown;
++        recordset->track_allocated = count;
++    }
++    return &recordset->track[row];
++}
++
++static VARIANT *copy_row( struct recordset *recordset, LONG row )
++{
++    LONG c, cols = get_column_count( recordset );
++    VARIANT *copy = calloc( cols ? cols : 1, sizeof(*copy) );
++
++    if (copy) for (c = 0; c < cols; c++) VariantCopy( &copy[c], &recordset->data[row * cols + c] );
++    return copy;
++}
++
++static void free_row_values( struct recordset *recordset, VARIANT *values )
++{
++    LONG c, cols = get_column_count( recordset );
++
++    if (!values) return;
++    for (c = 0; c < cols; c++) VariantClear( &values[c] );
++    free( values );
++}
++
++/* a field of the row is about to change: the row's values as read are kept, once */
++static void recordset_track_change( struct recordset *recordset, LONG row )
++{
++    struct row_track *track = recordset_row_track( recordset, row );
++
++    if (!track || track->state != TRACK_NONE) return;
++    track->original = copy_row( recordset, row );
++    track->state = TRACK_MODIFIED;
++}
++
++static HRESULT recordset_leave_row( struct recordset *recordset );
++
++static void recordset_track_clear( struct recordset *recordset, LONG row )
++{
++    struct row_track *track = recordset_row_track( recordset, row );
++
++    if (!track) return;
++    free_row_values( recordset, track->original );
++    track->original = NULL;
++    track->state = TRACK_NONE;
++}
++
+ static void recordset_drop_backup( struct recordset *recordset )
+ {
+     if (recordset->edit_backup)
+@@ -429,6 +506,7 @@ static HRESULT WINAPI field_put_Value( Field *iface, VARIANT val )
+     }
+     if (field->recordset->editmode == adEditNone)
+         field->recordset->editmode = adEditInProgress;
++    recordset_track_change( field->recordset, row );
+ 
+     VariantClear( &field->recordset->data[row * col_count + col] );
+     field->recordset->data[row * col_count + col] = copy;
+@@ -1396,8 +1474,23 @@ static void close_recordset( struct recordset *recordset )
+ 
+     VariantClear( &recordset->filter );
+ 
++    /* Stained Glass OS: the write-back state */
++    SysFreeString( recordset->base_table );
++    recordset->base_table = NULL;
++    free( recordset->key_cols );
++    recordset->key_cols = NULL;
++    recordset->key_count = 0;
++    recordset->keys_known = FALSE;
++
+     if (!recordset->fields) return;
+     recordset_drop_backup( recordset );
++    for (i = 0; i < recordset->track_allocated; i++) free_row_values( recordset, recordset->track[i].original );
++    free( recordset->track );
++    recordset->track = NULL;
++    recordset->track_allocated = 0;
++    while (recordset->deleted_count) free_row_values( recordset, recordset->deleted[--recordset->deleted_count] );
++    free( recordset->deleted );
++    recordset->deleted = NULL;
+     col_count = get_column_count( recordset );
+ 
+     free(recordset->columntypes);
+@@ -1922,11 +2015,16 @@ static HRESULT WINAPI recordset_AddNew( _Recordset *iface, VARIANT field_list, V
+ 
+     if (recordset->state == adStateClosed) return MAKE_ADO_HRESULT( adErrObjectClosed );
+ 
++    /* Stained Glass OS: a row being edited is stored first (Update), as ADO does */
++    if (FAILED(hr = recordset_leave_row( recordset ))) return hr;
+     if (!resize_recordset( recordset, recordset->count + 1 )) return E_OUTOFMEMORY;
+     recordset->index = recordset->count - 1;
+     recordset->editmode = adEditAdd;
+     recordset->pending_add = recordset->index + 1;
+     recordset_drop_backup( recordset );
++    recordset_track_clear( recordset, recordset->index );
++    if (recordset_row_track( recordset, recordset->index ))
++        recordset->track[recordset->index].state = TRACK_ADDED;
+ 
+     /* with a field list the row is filled and stored at once */
+     if (V_VT(&field_list) != VT_ERROR && V_VT(&field_list) != VT_EMPTY)
+@@ -1958,6 +2056,7 @@ static HRESULT WINAPI recordset_CancelUpdate( _Recordset *iface )
+         LONG cols = get_column_count( recordset ), c, row = recordset->count - 1;
+ 
+         for (c = 0; c < cols && row >= 0; c++) VariantClear( &recordset->data[row * cols + c] );
++        if (row >= 0) recordset_track_clear( recordset, row );
+         if (row >= 0) recordset->count--;
+         recordset->index = recordset->count ? recordset->count - 1 : -1;
+         recordset->pending_add = 0;
+@@ -2253,6 +2352,441 @@ static BOOL criteria_matches( struct recordset *recordset, const struct criteria
+     }
+ }
+ 
++/* ---- Stained Glass OS: writing the changes to the data source -----------------------------------
++ *
++ * As ADO's client cursor does: a changed row is an UPDATE of the table the rows were read from,
++ * finding the row by its primary key (the provider's PRIMARY_KEYS schema) or, without one, by all of
++ * its values as they were read; an added row is an INSERT of the values given; a deleted one a
++ * DELETE. Each is a command with parameters on the recordset's connection. In batch mode
++ * (adLockBatchOptimistic) the changes wait for UpdateBatch, and CancelBatch takes them back. A
++ * statement that changes no row means the row was changed or deleted by someone else since it was
++ * read: DB_E_CONCURRENCYVIOLATION ("Row cannot be located for updating"). */
++
++/* The table of a source: a table's name, or the one table a SELECT reads. */
++static BSTR source_table( const WCHAR *text, LONG options )
++{
++    const WCHAR *p, *start, *from = NULL;
++    WCHAR quote = 0;
++    size_t len;
++
++    if (!text) return NULL;
++    if (options == adOptionUnspecified) options = adCmdUnknown;
++    if ((options & 0xff) == adCmdTable || (options & adCmdTableDirect) == adCmdTableDirect) return SysAllocString( text );
++    for (p = text; *p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'; p++);
++    if (wcsnicmp( p, L"select", 6 )) return NULL;
++    /* " from " outside of quotes */
++    for (; *p; p++)
++    {
++        if (quote) { if (*p == quote) quote = 0; continue; }
++        if (*p == '\'' || *p == '"' || *p == '[') { quote = *p == '[' ? ']' : *p; continue; }
++        if ((p[0] == ' ' || p[0] == '\t' || p[0] == '\n' || p[0] == '\r') && !wcsnicmp( p + 1, L"from", 4 ) &&
++            (p[5] == ' ' || p[5] == '\t' || p[5] == '\n' || p[5] == '\r'))
++        {
++            from = p + 5;
++            break;
++        }
++    }
++    if (!from) return NULL;
++    while (*from == ' ' || *from == '\t' || *from == '\n' || *from == '\r') from++;
++    start = from;
++    for (p = from; *p; p++)
++    {
++        if (*p == '[') { while (*p && *p != ']') p++; if (!*p) break; continue; }
++        if (*p == '"' || *p == '`') { WCHAR q = *p++; while (*p && *p != q) p++; if (!*p) break; continue; }
++        if (!(iswalnum( *p ) || *p == '_' || *p == '.' || *p == '$' || *p == '#')) break;
++    }
++    len = p - start;
++    if (!len) return NULL;
++    /* one table: what follows is the end, a clause, or an alias -- not a join */
++    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
++    if (*p == ',' || !wcsnicmp( p, L"join", 4 ) || !wcsnicmp( p, L"inner", 5 ) || !wcsnicmp( p, L"left", 4 ) ||
++        !wcsnicmp( p, L"right", 5 ) || !wcsnicmp( p, L"full", 4 ) || !wcsnicmp( p, L"cross", 5 ) || *p == '(')
++        return NULL;
++    return SysAllocStringLen( start, len );
++}
++
++static IDispatch *recordset_connection( struct recordset *recordset )
++{
++    if (V_VT(&recordset->active_connection) != VT_DISPATCH) return NULL;
++    return V_DISPATCH(&recordset->active_connection);
++}
++
++static BSTR field_name( struct recordset *recordset, LONG col )
++{
++    BSTR name = NULL;
++    Field_get_Name( recordset->fields->field[col], &name );
++    return name;
++}
++
++static BOOL field_comparable( struct recordset *recordset, LONG col )
++{
++    switch (impl_from_Field( recordset->fields->field[col] )->type)
++    {
++    case adLongVarChar: case adLongVarWChar: case adLongVarBinary: case adBinary: case adVarBinary:
++    case adIDispatch: case adIUnknown: case adChapter:
++        return FALSE;
++    default:
++        break;
++    }
++    return TRUE;
++}
++
++/* The table's primary key, from the provider (once). */
++static void recordset_find_keys( struct recordset *recordset )
++{
++    IDispatch *disp = recordset_connection( recordset );
++    _Connection *connection;
++    _Recordset *keys = NULL;
++    SAFEARRAY *restrictions;
++    VARIANT var, missing;
++    LONG i, cols = get_column_count( recordset ), index;
++    BSTR table = recordset->base_table, dot;
++
++    if (recordset->keys_known) return;
++    recordset->keys_known = TRUE;
++    if (!disp || !table || FAILED(IDispatch_QueryInterface( disp, &IID__Connection, (void **)&connection ))) return;
++    /* the restrictions: catalog, schema, table (the name without its owner) */
++    if ((dot = wcsrchr( table, '.' ))) table = dot + 1;
++    if (!(restrictions = SafeArrayCreateVector( VT_VARIANT, 0, 3 ))) goto done;
++    index = 2;
++    V_VT(&var) = VT_BSTR;
++    V_BSTR(&var) = SysAllocString( table );
++    if (V_BSTR(&var) && V_BSTR(&var)[0] == '[') { SysFreeString( V_BSTR(&var) ); V_BSTR(&var) = SysAllocStringLen( table + 1, wcslen( table ) - 2 ); }
++    SafeArrayPutElement( restrictions, &index, &var );
++    VariantClear( &var );
++    V_VT(&var) = VT_ARRAY | VT_VARIANT;
++    V_ARRAY(&var) = restrictions;
++    V_VT(&missing) = VT_ERROR;
++    V_ERROR(&missing) = DISP_E_PARAMNOTFOUND;
++    if (SUCCEEDED(_Connection_OpenSchema( connection, adSchemaPrimaryKeys, var, missing, &keys )) && keys)
++    {
++        VARIANT_BOOL eof = VARIANT_TRUE;
++        while (SUCCEEDED(_Recordset_get_EOF( keys, &eof )) && !eof)
++        {
++            VARIANT name, column;
++            V_VT(&column) = VT_BSTR;
++            V_BSTR(&column) = SysAllocString( L"COLUMN_NAME" );
++            VariantInit( &name );
++            if (SUCCEEDED(_Recordset_get_Collect( keys, column, &name )) && V_VT(&name) == VT_BSTR)
++            {
++                for (i = 0; i < cols; i++)
++                {
++                    BSTR fname = field_name( recordset, i );
++                    BOOL same = fname && !wcsicmp( fname, V_BSTR(&name) );
++                    LONG *grown;
++
++                    SysFreeString( fname );
++                    if (!same) continue;
++                    grown = realloc( recordset->key_cols, (recordset->key_count + 1) * sizeof(*grown) );
++                    if (grown)
++                    {
++                        recordset->key_cols = grown;
++                        recordset->key_cols[recordset->key_count++] = i;
++                    }
++                    break;
++                }
++            }
++            VariantClear( &name );
++            VariantClear( &column );
++            if (FAILED(_Recordset_MoveNext( keys ))) break;
++        }
++        _Recordset_Release( keys );
++    }
++    SafeArrayDestroy( restrictions );
++done:
++    _Connection_Release( connection );
++    TRACE( "%s: %ld key columns\n", debugstr_w( recordset->base_table ), recordset->key_count );
++}
++
++static BOOL values_equal( const VARIANT *a, const VARIANT *b )
++{
++    VARIANT ta, tb;
++    BOOL ret;
++    HRESULT hr;
++
++    if ((V_VT(a) == VT_NULL || V_VT(a) == VT_EMPTY) || (V_VT(b) == VT_NULL || V_VT(b) == VT_EMPTY))
++        return (V_VT(a) == VT_NULL || V_VT(a) == VT_EMPTY) == (V_VT(b) == VT_NULL || V_VT(b) == VT_EMPTY);
++    hr = VarCmp( (VARIANT *)a, (VARIANT *)b, LOCALE_USER_DEFAULT, 0 );
++    if (SUCCEEDED(hr)) return hr == VARCMP_EQ;
++    VariantInit( &ta );
++    VariantInit( &tb );
++    ret = SUCCEEDED(VariantChangeType( &ta, a, 0, VT_BSTR )) && SUCCEEDED(VariantChangeType( &tb, b, 0, VT_BSTR )) &&
++          !wcscmp( V_BSTR(&ta), V_BSTR(&tb) );
++    VariantClear( &ta );
++    VariantClear( &tb );
++    return ret;
++}
++
++/* A statement text being built. */
++struct sql
++{
++    WCHAR *text;
++    size_t len, cap;
++    VARIANT *values;
++    ULONG count;
++};
++
++static void sql_add( struct sql *sql, const WCHAR *str )
++{
++    size_t n = wcslen( str );
++    if (sql->len + n + 1 > sql->cap)
++    {
++        size_t cap = max( sql->cap * 2, sql->len + n + 64 );
++        WCHAR *grown = realloc( sql->text, cap * sizeof(WCHAR) );
++        if (!grown) return;
++        sql->text = grown;
++        sql->cap = cap;
++    }
++    memcpy( sql->text + sql->len, str, (n + 1) * sizeof(WCHAR) );
++    sql->len += n;
++}
++
++/* a column's name in a statement: as it is, or quoted when it is not a plain name */
++static void sql_add_name( struct sql *sql, const WCHAR *name )
++{
++    const WCHAR *p;
++    for (p = name; *p; p++) if (!iswalnum( *p ) && *p != '_') break;
++    if (!*p && name[0]) { sql_add( sql, name ); return; }
++    sql_add( sql, L"\"" );
++    sql_add( sql, name );
++    sql_add( sql, L"\"" );
++}
++
++static void sql_add_value( struct sql *sql, const VARIANT *value )
++{
++    VARIANT *grown = realloc( sql->values, (sql->count + 1) * sizeof(*grown) );
++    if (!grown) return;
++    sql->values = grown;
++    VariantInit( &sql->values[sql->count] );
++    VariantCopy( &sql->values[sql->count++], value );
++    sql_add( sql, L"?" );
++}
++
++static void sql_free( struct sql *sql )
++{
++    ULONG i;
++    for (i = 0; i < sql->count; i++) VariantClear( &sql->values[i] );
++    free( sql->values );
++    free( sql->text );
++}
++
++static BOOL is_key_col( struct recordset *recordset, LONG col )
++{
++    LONG i;
++    for (i = 0; i < recordset->key_count; i++) if (recordset->key_cols[i] == col) return TRUE;
++    return FALSE;
++}
++
++/* " WHERE" with the row as it was read: its key and, for an UPDATE (current given), the columns it
++ * changes (ADO's default Update Criteria, adCriteriaUpdCols: a change someone else made to them since
++ * is a conflict); without a key every column that can be compared */
++static void sql_add_criteria( struct recordset *recordset, struct sql *sql, const VARIANT *original,
++                              const VARIANT *current )
++{
++    LONG i, cols = get_column_count( recordset );
++    BOOL first = TRUE;
++
++    recordset_find_keys( recordset );
++    sql_add( sql, L" WHERE " );
++    for (i = 0; i < cols; i++)
++    {
++        LONG col = i;
++        BSTR name;
++
++        if (recordset->key_count && !is_key_col( recordset, col ))
++        {
++#ifdef SG_MUTANT_ADO_KEY_ONLY
++            continue;
++#endif
++            if (!current || values_equal( &current[col], &original[col] )) continue;
++        }
++        if (!field_comparable( recordset, col )) continue;
++        if (!(name = field_name( recordset, col ))) continue;
++        if (!first) sql_add( sql, L" AND " );
++        first = FALSE;
++        sql_add_name( sql, name );
++        if (V_VT(&original[col]) == VT_NULL || V_VT(&original[col]) == VT_EMPTY) sql_add( sql, L" IS NULL" );
++        else
++        {
++            sql_add( sql, L" = " );
++            sql_add_value( sql, &original[col] );
++        }
++        SysFreeString( name );
++    }
++}
++
++/* The statement, with its values as parameters, on the recordset's connection. */
++static HRESULT recordset_run( struct recordset *recordset, struct sql *sql, LONG *affected )
++{
++    IDispatch *conn = recordset_connection( recordset );
++    _Connection *connection = NULL;
++    _Command *command = NULL;
++    SAFEARRAY *array = NULL;
++    VARIANT values, rows;
++    BSTR text = NULL;
++    LONG i;
++    HRESULT hr;
++
++    *affected = 0;
++    if (!sql->text) return E_OUTOFMEMORY;
++    TRACE( "%s, %lu values\n", debugstr_w( sql->text ), sql->count );
++#ifdef SG_MUTANT_ADO_NO_WRITEBACK
++    *affected = 1;
++    return S_OK;
++#endif
++    if (!conn) return MAKE_ADO_HRESULT( adErrInvalidConnection );
++    if (FAILED(hr = IDispatch_QueryInterface( conn, &IID__Connection, (void **)&connection ))) return hr;
++    if (FAILED(hr = Command_create( (void **)&command ))) goto done;
++    if (FAILED(hr = _Command_putref_ActiveConnection( command, connection ))) goto done;
++    if (!(text = SysAllocString( sql->text ))) { hr = E_OUTOFMEMORY; goto done; }
++    if (FAILED(hr = _Command_put_CommandText( command, text ))) goto done;
++    VariantInit( &values );
++    if (sql->count)
++    {
++        if (!(array = SafeArrayCreateVector( VT_VARIANT, 0, sql->count ))) { hr = E_OUTOFMEMORY; goto done; }
++        for (i = 0; i < (LONG)sql->count; i++) SafeArrayPutElement( array, &i, &sql->values[i] );
++        V_VT(&values) = VT_ARRAY | VT_VARIANT;
++        V_ARRAY(&values) = array;
++    }
++    else
++    {
++        V_VT(&values) = VT_ERROR;
++        V_ERROR(&values) = DISP_E_PARAMNOTFOUND;
++    }
++    VariantInit( &rows );
++    hr = _Command_Execute( command, &rows, &values, adCmdText | adExecuteNoRecords, NULL );
++    if (SUCCEEDED(hr) && V_VT(&rows) == VT_I4) *affected = V_I4(&rows);
++
++done:
++    if (array) SafeArrayDestroy( array );
++    SysFreeString( text );
++    if (command) _Command_Release( command );
++    _Connection_Release( connection );
++    return hr;
++}
++
++#ifndef DB_E_CONCURRENCYVIOLATION
++#define DB_E_CONCURRENCYVIOLATION ((HRESULT)0x80040e38)
++#endif
++
++static HRESULT recordset_check_table( struct recordset *recordset )
++{
++    if (!recordset->base_table) return MAKE_ADO_HRESULT( adErrFeatureNotAvailable );
++    return S_OK;
++}
++
++/* A row's change written: an UPDATE of its changed columns, or the INSERT of an added row. */
++static HRESULT recordset_write_row( struct recordset *recordset, LONG row )
++{
++    struct row_track *track = recordset_row_track( recordset, row );
++    LONG c, cols = get_column_count( recordset ), affected = 0;
++    const VARIANT *values = row_values( recordset, row );
++    struct sql sql = { 0 };
++    BOOL any = FALSE;
++    HRESULT hr;
++
++    if (!track || track->state == TRACK_NONE) return S_OK;
++    if (FAILED(hr = recordset_check_table( recordset ))) return hr;
++    if (track->state == TRACK_ADDED)
++    {
++        sql_add( &sql, L"INSERT INTO " );
++        sql_add( &sql, recordset->base_table );
++        sql_add( &sql, L" (" );
++        for (c = 0; c < cols; c++)
++        {
++            BSTR name;
++            if (V_VT(&values[c]) == VT_EMPTY || !(name = field_name( recordset, c ))) continue;
++            if (any) sql_add( &sql, L", " );
++            sql_add_name( &sql, name );
++            SysFreeString( name );
++            any = TRUE;
++        }
++        if (!any)
++        {
++            sql_free( &sql );
++            recordset_track_clear( recordset, row );
++            return S_OK;
++        }
++        sql_add( &sql, L") VALUES (" );
++        any = FALSE;
++        for (c = 0; c < cols; c++)
++        {
++            if (V_VT(&values[c]) == VT_EMPTY) continue;
++            if (any) sql_add( &sql, L", " );
++            sql_add_value( &sql, &values[c] );
++            any = TRUE;
++        }
++        sql_add( &sql, L")" );
++    }
++    else
++    {
++        sql_add( &sql, L"UPDATE " );
++        sql_add( &sql, recordset->base_table );
++        sql_add( &sql, L" SET " );
++        for (c = 0; c < cols; c++)
++        {
++            BSTR name;
++            if (values_equal( &values[c], &track->original[c] ) || !(name = field_name( recordset, c ))) continue;
++            if (any) sql_add( &sql, L", " );
++            sql_add_name( &sql, name );
++            sql_add( &sql, L" = " );
++            if (V_VT(&values[c]) == VT_EMPTY) { VARIANT null; V_VT(&null) = VT_NULL; sql_add_value( &sql, &null ); }
++            else sql_add_value( &sql, &values[c] );
++            SysFreeString( name );
++            any = TRUE;
++        }
++        if (!any)
++        {
++            /* nothing changed after all */
++            sql_free( &sql );
++            recordset_track_clear( recordset, row );
++            return S_OK;
++        }
++        sql_add_criteria( recordset, &sql, track->original, values );
++    }
++    hr = recordset_run( recordset, &sql, &affected );
++    sql_free( &sql );
++    if (SUCCEEDED(hr) && affected == 0) hr = DB_E_CONCURRENCYVIOLATION;
++    if (SUCCEEDED(hr)) recordset_track_clear( recordset, row );
++    return hr;
++}
++
++/* A row deleted: the DELETE of it as it was read. */
++static HRESULT recordset_write_delete( struct recordset *recordset, const VARIANT *original )
++{
++    struct sql sql = { 0 };
++    LONG affected = 0;
++    HRESULT hr;
++
++    if (FAILED(hr = recordset_check_table( recordset ))) return hr;
++    sql_add( &sql, L"DELETE FROM " );
++    sql_add( &sql, recordset->base_table );
++    sql_add_criteria( recordset, &sql, original, NULL );
++    hr = recordset_run( recordset, &sql, &affected );
++    sql_free( &sql );
++    if (SUCCEEDED(hr) && affected == 0) hr = DB_E_CONCURRENCYVIOLATION;
++    return hr;
++}
++
++static BOOL recordset_writes_back( struct recordset *recordset )
++{
++    return recordset_connection( recordset ) && recordset->lock_type != adLockReadOnly;
++}
++
++/* Moving off a row being edited stores it first, as ADO does (not in batch mode). */
++static HRESULT recordset_leave_row( struct recordset *recordset )
++{
++    if (recordset->editmode == adEditNone || !recordset_writes_back( recordset ) ||
++        recordset->lock_type == adLockBatchOptimistic)
++        return S_OK;
++    {
++        VARIANT missing;
++        V_VT(&missing) = VT_ERROR;
++        V_ERROR(&missing) = DISP_E_PARAMNOTFOUND;
++        return _Recordset_Update( &recordset->Recordset_iface, missing, missing );
++    }
++}
++
+ static HRESULT WINAPI recordset_Delete( _Recordset *iface, AffectEnum affect_records )
+ {
+     struct recordset *recordset = impl_from_Recordset( iface );
+@@ -2277,6 +2811,38 @@ static HRESULT WINAPI recordset_Delete( _Recordset *iface, AffectEnum affect_rec
+     else
+         return MAKE_ADO_HRESULT( adErrInvalidArgument );
+ 
++    /* Stained Glass OS: the rows go from the data source: at once, or kept for UpdateBatch */
++    if (recordset_writes_back( recordset ))
++    {
++        for (i = from; i < to; i++)
++        {
++            struct row_track *track = recordset_row_track( recordset, i );
++            const VARIANT *original = track && track->state == TRACK_MODIFIED ? track->original : row_values( recordset, i );
++            HRESULT hr;
++
++            if (track && track->state == TRACK_ADDED) continue;   /* never written: nothing to delete */
++            if (recordset->lock_type == adLockBatchOptimistic)
++            {
++                VARIANT **grown = realloc( recordset->deleted, (recordset->deleted_count + 1) * sizeof(*grown) );
++                VARIANT *copy = calloc( cols ? cols : 1, sizeof(*copy) );
++                LONG c;
++
++                if (!grown || !copy) { free( copy ); if (grown) recordset->deleted = grown; return E_OUTOFMEMORY; }
++                recordset->deleted = grown;
++                for (c = 0; c < cols; c++) VariantCopy( &copy[c], &original[c] );
++                recordset->deleted[recordset->deleted_count++] = copy;
++            }
++            else if (FAILED(hr = recordset_write_delete( recordset, original ))) return hr;
++        }
++    }
++    for (i = from; i < to; i++) recordset_track_clear( recordset, i );
++    if (recordset->track && to < recordset->track_allocated)
++    {
++        LONG n = min( recordset->count, recordset->track_allocated ) - to;
++        if (n > 0) memmove( recordset->track + from, recordset->track + to, n * sizeof(*recordset->track) );
++        memset( recordset->track + from + max( n, 0 ), 0, (to - from) * sizeof(*recordset->track) );
++    }
++
+     for (i = from * cols; i < to * cols; i++) VariantClear( &recordset->data[i] );
+     memmove( recordset->data + from * cols, recordset->data + to * cols,
+              (recordset->count - to) * cols * sizeof(*recordset->data) );
+@@ -2382,6 +2948,10 @@ static HRESULT WINAPI recordset_Move( _Recordset *iface, ADO_LONGPTR num_records
+         if (!recordset_has_current( recordset )) return MAKE_ADO_HRESULT( adErrNoCurrentRecord );
+ 
+     target = base + num_records;
++    {
++        HRESULT hr;
++        if (FAILED(hr = recordset_leave_row( recordset ))) return hr;
++    }
+ #ifndef SG_MUTANT_ADO_MOVE
+     if (target < 0) target = -1;                             /* before the first: BOF */
+     else if (target >= recordset->count) target = recordset->count; /* after the last: EOF */
+@@ -2394,8 +2964,11 @@ static HRESULT WINAPI recordset_MoveNext( _Recordset *iface )
+ {
+     struct recordset *recordset = impl_from_Recordset( iface );
+ 
++    HRESULT hr;
++
+     TRACE( "%p\n", recordset );
+ 
++    if (FAILED(hr = recordset_leave_row( recordset ))) return hr;
+     if (recordset->index < recordset->count) recordset->index++;
+     return S_OK;
+ }
+@@ -2404,8 +2977,11 @@ static HRESULT WINAPI recordset_MovePrevious( _Recordset *iface )
+ {
+     struct recordset *recordset = impl_from_Recordset( iface );
+ 
++    HRESULT hr;
++
+     TRACE( "%p\n", recordset );
+ 
++    if (FAILED(hr = recordset_leave_row( recordset ))) return hr;
+     if (recordset->index >= 0) recordset->index--;
+     return S_OK;
+ }
+@@ -2414,8 +2990,11 @@ static HRESULT WINAPI recordset_MoveFirst( _Recordset *iface )
+ {
+     struct recordset *recordset = impl_from_Recordset( iface );
+ 
++    HRESULT hr;
++
+     TRACE( "%p\n", recordset );
+ 
++    if (FAILED(hr = recordset_leave_row( recordset ))) return hr;
+     recordset->index = 0;
+     return S_OK;
+ }
+@@ -2424,8 +3003,11 @@ static HRESULT WINAPI recordset_MoveLast( _Recordset *iface )
+ {
+     struct recordset *recordset = impl_from_Recordset( iface );
+ 
++    HRESULT hr;
++
+     TRACE( "%p\n", recordset );
+ 
++    if (FAILED(hr = recordset_leave_row( recordset ))) return hr;
+     recordset->index = (recordset->count > 0) ? recordset->count - 1 : 0;
+     return S_OK;
+ }
+@@ -3012,6 +3594,9 @@ static HRESULT WINAPI recordset_Open( _Recordset *iface, VARIANT source, VARIANT
+         recordset->source = text;
+     }
+     else SysFreeString( text );
++    /* Stained Glass OS: the table changes are written to */
++    SysFreeString( recordset->base_table );
++    recordset->base_table = source_table( recordset->source, options );
+     recordset->open_options = options;
+     recordset->affected = affected > 0 ? affected : 0;
+     if (lock_type != adLockUnspecified) recordset->lock_type = lock_type;
+@@ -3195,17 +3780,30 @@ static HRESULT WINAPI recordset_Update( _Recordset *iface, VARIANT fields, VARIA
+         if (FAILED(hr = recordset_set_fields( recordset, &fields, &values ))) return hr;
+     }
+ 
+-    recordset->pending_add = 0;
+-
+     /* without a connection there is nothing to commit and the edit mode stays as it is */
+-    if (V_DISPATCH(&recordset->active_connection) == NULL)
++    if (V_VT(&recordset->active_connection) != VT_DISPATCH || V_DISPATCH(&recordset->active_connection) == NULL)
+     {
++        recordset->pending_add = 0;
+         recordset_drop_backup( recordset );
+         return S_OK;
+     }
+ 
+-    recordset->editmode = adEditNone;
+-    return E_NOTIMPL;
++    /* Stained Glass OS: the row is written to the data source -- in batch mode by UpdateBatch */
++    {
++        LONG row = recordset->pending_add ? recordset->pending_add - 1 :
++                   recordset->edit_backup ? recordset->edit_row : recordset->index;
++        HRESULT hr = S_OK;
++
++        if (recordset->lock_type == adLockReadOnly && recordset_row_track( recordset, row ) &&
++            recordset->track[row].state != TRACK_NONE)
++            return MAKE_ADO_HRESULT( adErrFeatureNotAvailable );
++        if (recordset->lock_type != adLockBatchOptimistic && row >= 0 && row < recordset->count)
++            hr = recordset_write_row( recordset, row );
++        if (FAILED(hr)) return hr;
++        recordset->pending_add = 0;
++        recordset_end_edit( recordset );
++        return S_OK;
++    }
+ }
+ 
+ static HRESULT WINAPI recordset_get_AbsolutePage( _Recordset *iface, PositionEnum_Param *pos )
+@@ -3411,6 +4009,17 @@ static HRESULT WINAPI recordset_put_Sort( _Recordset *iface, BSTR criteria )
+     for (i = 0; i < n; i++)
+         memcpy( sorted + i * cols, row_values( recordset, perm[i] ), cols * sizeof(*sorted) );
+     memcpy( recordset->data, sorted, n * cols * sizeof(*sorted) );
++    /* Stained Glass OS: each row's change record moves with it */
++    if (recordset->track && recordset_row_track( recordset, n - 1 ))
++    {
++        struct row_track *moved = malloc( n * sizeof(*moved) );
++        if (moved)
++        {
++            for (i = 0; i < n; i++) moved[i] = recordset->track[perm[i]];
++            memcpy( recordset->track, moved, n * sizeof(*moved) );
++            free( moved );
++        }
++    }
+     recordset->index = 0;
+     free( perm ); free( sorted ); free( order ); free( keys ); free( desc );
+     return S_OK;
+@@ -3447,27 +4056,97 @@ static HRESULT WINAPI recordset__xClone( _Recordset *iface, _Recordset **obj )
+ static HRESULT WINAPI recordset_UpdateBatch( _Recordset *iface, AffectEnum affect_records )
+ {
+     struct recordset *recordset = impl_from_Recordset( iface );
++    LONG row, first = 0, last = recordset->count - 1, i;
++    HRESULT hr = S_OK;
+ 
+-    FIXME( "%p, %u\n", iface, affect_records );
++    TRACE( "%p, %u\n", iface, affect_records );
+ 
+-    if (V_DISPATCH(&recordset->active_connection) == NULL)
++    if (recordset->state == adStateClosed) return MAKE_ADO_HRESULT( adErrObjectClosed );
++    if (V_VT(&recordset->active_connection) != VT_DISPATCH || V_DISPATCH(&recordset->active_connection) == NULL)
+         return S_OK;
++    if (recordset->lock_type == adLockReadOnly) return MAKE_ADO_HRESULT( adErrFeatureNotAvailable );
++    if (affect_records == adAffectCurrent)
++    {
++        if (!recordset_has_current( recordset )) return MAKE_ADO_HRESULT( adErrNoCurrentRecord );
++        first = last = recordset->index;
++    }
+ 
+-    recordset->editmode = adEditNone;
+-    return E_NOTIMPL;
++    /* Stained Glass OS: the deleted rows go, then each changed or added row is written */
++    if (affect_records != adAffectCurrent)
++    {
++        while (recordset->deleted_count && SUCCEEDED(hr))
++        {
++            if (FAILED(hr = recordset_write_delete( recordset, recordset->deleted[0] ))) break;
++            free_row_values( recordset, recordset->deleted[0] );
++            memmove( recordset->deleted, recordset->deleted + 1, --recordset->deleted_count * sizeof(*recordset->deleted) );
++        }
++    }
++    for (row = first; row <= last && SUCCEEDED(hr); row++) hr = recordset_write_row( recordset, row );
++    if (SUCCEEDED(hr))
++    {
++        recordset->pending_add = 0;
++        recordset_end_edit( recordset );
++    }
++    (void)i;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI recordset_CancelBatch( _Recordset *iface, AffectEnum affect_records )
+ {
+     struct recordset *recordset = impl_from_Recordset( iface );
++    LONG cols = get_column_count( recordset ), row, c;
+ 
+-    FIXME( "%p, %u\n", iface, affect_records );
++    TRACE( "%p, %u\n", iface, affect_records );
+ 
+-    if (V_DISPATCH(&recordset->active_connection) == NULL)
++    if (recordset->state == adStateClosed) return MAKE_ADO_HRESULT( adErrObjectClosed );
++    if (V_VT(&recordset->active_connection) != VT_DISPATCH || V_DISPATCH(&recordset->active_connection) == NULL)
+         return S_OK;
+ 
+-    recordset->editmode = adEditNone;
+-    return E_NOTIMPL;
++    /* Stained Glass OS: the changed rows get their values back, the added ones go, the deleted come back */
++    for (row = recordset->count - 1; row >= 0; row--)
++    {
++        struct row_track *track = row < recordset->track_allocated ? &recordset->track[row] : NULL;
++
++        if (!track || track->state == TRACK_NONE) continue;
++        if (affect_records == adAffectCurrent && row != recordset->index) continue;
++        if (track->state == TRACK_MODIFIED)
++        {
++            for (c = 0; c < cols; c++)
++            {
++                VariantClear( &recordset->data[row * cols + c] );
++                VariantCopy( &recordset->data[row * cols + c], &track->original[c] );
++            }
++            recordset_track_clear( recordset, row );
++        }
++        else
++        {
++            recordset_track_clear( recordset, row );
++            for (c = 0; c < cols; c++) VariantClear( &recordset->data[row * cols + c] );
++            memmove( recordset->data + row * cols, recordset->data + (row + 1) * cols,
++                     (recordset->count - row - 1) * cols * sizeof(*recordset->data) );
++            memset( recordset->data + (recordset->count - 1) * cols, 0, cols * sizeof(*recordset->data) );
++            if (row + 1 < recordset->track_allocated)
++                memmove( recordset->track + row, recordset->track + row + 1,
++                         (min( recordset->count, recordset->track_allocated ) - row - 1) * sizeof(*recordset->track) );
++            if (recordset->count - 1 < recordset->track_allocated)
++                memset( &recordset->track[recordset->count - 1], 0, sizeof(*recordset->track) );
++            recordset->count--;
++        }
++    }
++    if (affect_records != adAffectCurrent)
++    {
++        while (recordset->deleted_count)
++        {
++            VARIANT *values = recordset->deleted[--recordset->deleted_count];
++            if (resize_recordset( recordset, recordset->count + 1 ))
++                for (c = 0; c < cols; c++) VariantCopy( &recordset->data[(recordset->count - 1) * cols + c], &values[c] );
++            free_row_values( recordset, values );
++        }
++    }
++    if (recordset->index >= recordset->count) recordset->index = recordset->count ? recordset->count - 1 : -1;
++    recordset->pending_add = 0;
++    recordset_end_edit( recordset );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI recordset_get_CursorLocation( _Recordset *iface, CursorLocationEnum *cursor_loc )
