@@ -14,7 +14,11 @@
  *  - StopAnimation leaves the initial or the final value, as the animation's
  *    stop behaviour says;
  *  - an empty scoped batch, and the commit batch, complete; a suspended
- *    batch leaves out what is started meanwhile.
+ *    batch leaves out what is started meanwhile;
+ *  - expression animations (6050) follow what they reference -- another
+ *    visual's Offset, a property set entry, scalar parameters -- with
+ *    arithmetic, functions and ?:, until stopped; an expression key frame is
+ *    evaluated with its animation's parameters.
  *
  * The interfaces are called through their vtable slots; their IIDs are the
  * public ones. Prints name=value lines; see test/wuianim-gate.sh.
@@ -87,6 +91,7 @@ DEFINE_GUID(probe_IID_ICompositionEasingFunction, 0x5145e356, 0xbf79, 0x4ea8, 0x
 #define CUBIC_GET_CP2                           7
 #define EXPRESSION_GET                          6
 #define ANIMATION_SET_SCALAR_PARAMETER          13
+#define ANIMATION_SET_REFERENCE_PARAMETER       12
 #define VISUAL_GET_OFFSET                       20
 #define VISUAL_PUT_OFFSET                       21
 #define VISUAL_GET_OPACITY                      22
@@ -382,6 +387,123 @@ static void check_objects( void )
     WindowsDeleteString( s );
 }
 
+static void *expression( const WCHAR *text )
+{
+    void *expr = NULL;
+    HSTRING s = hs( text );
+    SLOT( compositor, COMPOSITOR_CREATE_EXPRESSION_WITH, HRESULT (WINAPI *)( void *, HSTRING, void ** ) )(
+            compositor, s, &expr );
+    WindowsDeleteString( s );
+    return expr;
+}
+
+static void set_scalar_parameter( void *anim, const WCHAR *name, float value )
+{
+    void *animation = qi( anim, &probe_IID_ICompositionAnimation );
+    HSTRING s = hs( name );
+    SLOT( animation, ANIMATION_SET_SCALAR_PARAMETER, HRESULT (WINAPI *)( void *, HSTRING, float ) )( animation, s, value );
+    WindowsDeleteString( s );
+}
+
+static void set_reference_parameter( void *anim, const WCHAR *name, void *object )
+{
+    void *animation = qi( anim, &probe_IID_ICompositionAnimation );
+    HSTRING s = hs( name );
+    SLOT( animation, ANIMATION_SET_REFERENCE_PARAMETER, HRESULT (WINAPI *)( void *, HSTRING, void * ) )(
+            animation, s, qi( object, &probe_IID_ICompositionObject ) );
+    WindowsDeleteString( s );
+}
+
+static void put_offset( void *visual, float x, float y )
+{
+    struct vector3 v = { x, y, 0 };
+    SLOT( visual, VISUAL_PUT_OFFSET, HRESULT (WINAPI *)( void *, struct vector3 ) )( visual, v );
+}
+
+static void check_expressions( void *children, HWND hwnd )
+{
+    struct ui_color red = { 255, 255, 0, 0 };
+    struct vector2 size = { 50, 50 };
+    void *source = NULL, *sprite = NULL, *visual, *brush = NULL, *expr, *set = NULL, *anim, *kf;
+    struct vector3 v1, v2, v3;
+    float opacity, opacity2, opacity3;
+    COLORREF pixel;
+    HSTRING s;
+    HRESULT hr;
+    HDC dc;
+
+    /* a sprite following another visual's offset */
+    SLOT( compositor, COMPOSITOR_CREATE_CONTAINER_VISUAL, get_fn )( compositor, &source );
+    source = qi( source, &probe_IID_IVisual );
+    put_offset( source, 20, 0 );
+    SLOT( compositor, COMPOSITOR_CREATE_COLOR_BRUSH_WITH_COLOR, HRESULT (WINAPI *)( void *, struct ui_color, void ** ) )(
+            compositor, red, &brush );
+    SLOT( compositor, COMPOSITOR_CREATE_SPRITE_VISUAL, get_fn )( compositor, &sprite );
+    SLOT( sprite, SPRITE_PUT_BRUSH, put_fn )( sprite, qi( brush, &probe_IID_ICompositionBrush ) );
+    visual = qi( sprite, &probe_IID_IVisual );
+    SLOT( visual, VISUAL_PUT_SIZE, HRESULT (WINAPI *)( void *, struct vector2 ) )( visual, size );
+    SLOT( children, COLLECTION_INSERT_AT_TOP, put_fn )( children, visual );
+
+    expr = expression( L"Vector3(src.Offset.X + dx, Max(5, src.Offset.Y), 0)" );
+    set_reference_parameter( expr, L"src", source );
+    set_scalar_parameter( expr, L"dx", 10 );
+    hr = start( visual, L"Offset", expr );
+    pump( 200 );
+    v1 = get_offset( visual );
+    put_offset( source, 40, 0 );
+    pump( 300 );
+    v2 = get_offset( visual );
+    printf( "expr_reference=%d (%#lx %f %f)\n", hr == S_OK && v1.x == 30.0f && v1.y == 5.0f, hr, v1.x, v1.y );
+    printf( "expr_follows=%d (%f %f)\n", v2.x == 50.0f && v2.y == 5.0f, v2.x, v2.y );
+    dc = GetDC( hwnd );
+    pixel = GetPixel( dc, 75, 30 );
+    ReleaseDC( hwnd, dc );
+    printf( "expr_drawn=%d (%06lx)\n", pixel == RGB(255, 0, 0), pixel );
+    stop( visual, L"Offset" );
+    put_offset( source, 60, 0 );
+    pump( 200 );
+    v3 = get_offset( visual );
+    printf( "expr_stopped=%d (%f)\n", v3.x == 50.0f, v3.x );
+
+    /* scalar parameters, functions, a property set entry, ?: */
+    expr = expression( L"Clamp(p * 2, 0, 1) - (props.Foo > 2 ? 0.25 : 0)" );
+    set_scalar_parameter( expr, L"p", 0.3f );
+    SLOT( compositor, COMPOSITOR_CREATE_PROPERTY_SET, get_fn )( compositor, &set );
+    s = hs( L"Foo" );
+    SLOT( set, SET_INSERT_SCALAR, HRESULT (WINAPI *)( void *, HSTRING, float ) )( set, s, 3.0f );
+    set_reference_parameter( expr, L"props", set );
+    start( visual, L"Opacity", expr );
+    pump( 200 );
+    opacity = get_opacity( visual );
+    SLOT( set, SET_INSERT_SCALAR, HRESULT (WINAPI *)( void *, HSTRING, float ) )( set, s, 1.0f );
+    pump( 300 );
+    opacity2 = get_opacity( visual );
+    WindowsDeleteString( s );
+    printf( "expr_scalar=%d (%f %f)\n", fabsf( opacity - 0.35f ) < 0.0001f && fabsf( opacity2 - 0.6f ) < 0.0001f,
+            opacity, opacity2 );
+    stop( visual, L"Opacity" );
+
+    /* an expression key frame, with its animation's parameter */
+    SLOT( compositor, COMPOSITOR_CREATE_SCALAR_KEYFRAME, get_fn )( compositor, &anim );
+    kf = qi( anim, &probe_IID_IKeyFrameAnimation );
+    s = hs( L"Lerp(this.StartingValue, q, 0.5) + 0.1" );
+    hr = SLOT( kf, KF_INSERT_EXPRESSION, HRESULT (WINAPI *)( void *, float, HSTRING ) )( kf, 1.0f, s );
+    WindowsDeleteString( s );
+    set_scalar_parameter( anim, L"q", 0.4f );
+    set_duration( anim, 100 );
+    SLOT( visual, VISUAL_PUT_OPACITY, HRESULT (WINAPI *)( void *, float ) )( visual, 0.2f );
+    start( visual, L"Opacity", anim );
+    pump( 600 );
+    opacity3 = get_opacity( visual );
+    printf( "expr_keyframe=%d (%#lx %f)\n", hr == S_OK && fabsf( opacity3 - 0.4f ) < 0.0001f, hr, opacity3 );
+
+    /* a malformed expression key frame is refused */
+    s = hs( L"1 + * 2" );
+    hr = SLOT( kf, KF_INSERT_EXPRESSION, HRESULT (WINAPI *)( void *, float, HSTRING ) )( kf, 0.5f, s );
+    WindowsDeleteString( s );
+    printf( "expr_malformed=%d (%#lx)\n", hr == E_INVALIDARG, hr );
+}
+
 static LRESULT CALLBACK wndproc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
 {
     if (msg == WM_ERASEBKGND) return 1;
@@ -579,6 +701,8 @@ static void check_animations( void )
     if (commit) SLOT( commit, BATCH_GET_IS_ENDED, HRESULT (WINAPI *)( void *, boolean * ) )( commit, &ended );
     printf( "commit_batch=%d (%#lx active %d calls %d ended %d)\n", commit && active && h4.calls == 1 && ended, hr,
             active, h4.calls, ended );
+
+    check_expressions( children, hwnd );
 
     DestroyWindow( hwnd );
 }

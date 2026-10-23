@@ -20,7 +20,13 @@
 #  - StopAnimation leaves the initial or the final value, as the stop
 #    behaviour says;
 #  - an empty batch completes, a suspended batch leaves out what is started
-#    meanwhile, and the commit batch completes after the next commit.
+#    meanwhile, and the commit batch completes after the next commit;
+#  - expression animations (6050): a sprite's Offset follows another
+#    visual's ("Vector3(src.Offset.X + dx, ...)") and is drawn there, keeps
+#    following until StopAnimation; scalar parameters, Clamp, a property set
+#    entry and ?: give an Opacity that changes with the entry; an expression
+#    key frame ("Lerp(this.StartingValue, q, 0.5) + 0.1") is evaluated with
+#    its animation's parameter; a malformed one is refused.
 #
 #   WINE=/opt/wine-sg/bin/wine test/wuianim-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
@@ -92,6 +98,13 @@ check 'stop_final=1'            "and the final value by default"
 check 'empty_batch=1'           "an empty scoped batch completes"
 check 'suspended_batch=1'       "a suspended batch leaves out what is started meanwhile"
 check 'commit_batch=1'          "the commit batch completes after the next commit"
+check 'expr_reference=1'        "an expression animation reads another visual's Offset and a parameter"
+check 'expr_follows=1'          "and follows it when it moves"
+check 'expr_drawn=1'            "the window shows the sprite where the expression put it"
+check 'expr_stopped=1'          "StopAnimation stops it following"
+check 'expr_scalar=1'           "scalar parameters, Clamp, a property set entry and ?: are evaluated, again on change"
+check 'expr_keyframe=1'         "an expression key frame is evaluated with its animation's parameters"
+check 'expr_malformed=1'        "a malformed expression key frame is refused"
 check 'done=1'                  "the probe ran to the end"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
