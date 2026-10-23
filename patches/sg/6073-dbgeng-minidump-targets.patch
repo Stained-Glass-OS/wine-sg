@@ -1,0 +1,1064 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dbgeng: Minidump targets for OpenDumpFile (6073)
+
+OpenDumpFile and OpenDumpFileWide gave E_NOTIMPL. A user-mode minidump
+becomes a target: its threads, their recorded contexts, its modules, its
+memory ranges and its exception; what it leaves out of a module (code,
+unwind data) is read from the module's image file when that is still the
+same file, so stacks walk as in a debugger. WaitForEvent reports the
+dump's exception once; registers and memory do not change.
+---
+diff --git a/dlls/dbgeng/dbgeng.c b/dlls/dbgeng/dbgeng.c
+index 7b53a1f..1ccc274 100644
+--- a/dlls/dbgeng/dbgeng.c
++++ b/dlls/dbgeng/dbgeng.c
+@@ -275,6 +275,7 @@ struct target_process
+     unsigned int dll_count;
+     ULONG64 dll_bases[256];
+     char dll_names[256][64];
++    struct dump_target *dump;           /* OpenDumpFile: the process as a minidump recorded it */
+ };
+ 
+ struct debug_client
+@@ -373,15 +374,445 @@ static HRESULT debug_target_return_string(const char *str, char *buffer, unsigne
+     return len < buffer_size ? S_OK : S_FALSE;
+ }
+ 
++/* ---- minidump targets ----
++ *
++ * OpenDumpFile makes a target of a user-mode minidump: its threads (and their contexts), modules, memory
++ * ranges and exception come from the file's streams. Such a target has no process: its handle is a value that
++ * names it for dbghelp (symbols, stack walks with our memory reader), never a real handle, and nothing
++ * runs or changes in it.
++ */
++struct dump_range
++{
++    ULONG64 start, size;
++    const BYTE *data;
++};
++
++/* a module's image file, for what a dump leaves out of it (code, unwind data): as loaded, from its sections */
++struct dump_image
++{
++    BOOL tried;
++    BYTE *file;
++    SIZE_T file_size;
++    const IMAGE_SECTION_HEADER *sections;
++    unsigned int section_count;
++    DWORD headers_size;
++};
++
++struct dump_target
++{
++    WCHAR *path;
++    struct dump_image *images;          /* one per module */
++    HANDLE file, mapping;
++    const BYTE *base;
++    SIZE_T size;
++    const MINIDUMP_THREAD_LIST *threads;
++    const MINIDUMP_MODULE_LIST *modules;
++    const MINIDUMP_EXCEPTION_STREAM *exception;
++    struct dump_range *ranges;
++    unsigned int range_count;
++    USHORT arch;                        /* PROCESSOR_ARCHITECTURE_* */
++    ULONG flags;                        /* the header's MINIDUMP_TYPE */
++    BOOL event_reported;
++};
++
++#define DUMP_HANDLE_BASE 0x7fe00000
++static struct target_process *dump_targets[64];
++static CRITICAL_SECTION dump_cs;
++static CRITICAL_SECTION_DEBUG dump_cs_debug =
++{
++    0, 0, &dump_cs,
++    { &dump_cs_debug.ProcessLocksList, &dump_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": dump_cs") }
++};
++static CRITICAL_SECTION dump_cs = { &dump_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct target_process *dump_target_from_handle(HANDLE handle)
++{
++    ULONG_PTR i = ((ULONG_PTR)handle - DUMP_HANDLE_BASE) / 4;
++    struct target_process *target = NULL;
++
++    if ((ULONG_PTR)handle < DUMP_HANDLE_BASE || i >= ARRAY_SIZE(dump_targets)) return NULL;
++    EnterCriticalSection(&dump_cs);
++    target = dump_targets[i];
++    LeaveCriticalSection(&dump_cs);
++    return target;
++}
++
++static const void *dump_at(const struct dump_target *dump, RVA64 rva, ULONG64 size)
++{
++    if (rva > dump->size || size > dump->size - rva) return NULL;
++    return dump->base + rva;
++}
++
++static const void *dump_stream(const struct dump_target *dump, ULONG type, ULONG *size)
++{
++    const MINIDUMP_HEADER *hdr = (const MINIDUMP_HEADER *)dump->base;
++    const MINIDUMP_DIRECTORY *dir = dump_at(dump, hdr->StreamDirectoryRva,
++            (ULONG64)hdr->NumberOfStreams * sizeof(*dir));
++    ULONG i;
++
++    if (!dir) return NULL;
++    for (i = 0; i < hdr->NumberOfStreams; i++)
++    {
++        if (dir[i].StreamType != type) continue;
++        if (size) *size = dir[i].Location.DataSize;
++        return dump_at(dump, dir[i].Location.Rva, dir[i].Location.DataSize);
++    }
++    return NULL;
++}
++
++static BOOL dump_add_range(struct dump_target *dump, ULONG64 start, ULONG64 size, const BYTE *data)
++{
++    struct dump_range *ranges;
++
++    if (!data || !size) return TRUE;
++    if (!(ranges = realloc(dump->ranges, (dump->range_count + 1) * sizeof(*ranges)))) return FALSE;
++    dump->ranges = ranges;
++    ranges[dump->range_count].start = start;
++    ranges[dump->range_count].size = size;
++    ranges[dump->range_count++].data = data;
++    return TRUE;
++}
++
++static void dump_free(struct dump_target *dump)
++{
++    if (!dump) return;
++    /* the module list is in the mapped file */
++    if (dump->images && dump->modules)
++    {
++        ULONG i;
++        for (i = 0; i < dump->modules->NumberOfModules; i++) free(dump->images[i].file);
++    }
++    if (dump->base) UnmapViewOfFile(dump->base);
++    if (dump->mapping) CloseHandle(dump->mapping);
++    if (dump->file && dump->file != INVALID_HANDLE_VALUE) CloseHandle(dump->file);
++    free(dump->images);
++    free(dump->ranges);
++    free(dump->path);
++    free(dump);
++}
++
++/* the image file a dump module was loaded from, if it is still that file (time stamp and size) */
++static const struct dump_image *dump_module_image(struct dump_target *dump, ULONG index)
++{
++    const MINIDUMP_MODULE *m = &dump->modules->Modules[index];
++    struct dump_image *image = &dump->images[index];
++    const MINIDUMP_STRING *name;
++    const IMAGE_DOS_HEADER *dos;
++    const IMAGE_NT_HEADERS *nt;
++    WCHAR path[MAX_PATH];
++    LARGE_INTEGER size;
++    HANDLE file;
++    DWORD read;
++
++    if (image->tried) return image->file ? image : NULL;
++    image->tried = TRUE;
++    if (!(name = dump_at(dump, m->ModuleNameRva, sizeof(ULONG))) || !dump_at(dump, m->ModuleNameRva + sizeof(ULONG), name->Length) ||
++        name->Length / sizeof(WCHAR) >= MAX_PATH)
++        return NULL;
++    memcpy(path, name->Buffer, name->Length);
++    path[name->Length / sizeof(WCHAR)] = 0;
++    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
++    if (file == INVALID_HANDLE_VALUE) return NULL;
++    if (GetFileSizeEx(file, &size) && size.QuadPart < 512 * 1024 * 1024 && (image->file = malloc(size.QuadPart)) &&
++        (!ReadFile(file, image->file, size.QuadPart, &read, NULL) || read != size.QuadPart))
++    {
++        free(image->file);
++        image->file = NULL;
++    }
++    CloseHandle(file);
++    if (!image->file) return NULL;
++    image->file_size = size.QuadPart;
++    dos = (const IMAGE_DOS_HEADER *)image->file;
++    if (image->file_size < sizeof(*dos) || dos->e_magic != IMAGE_DOS_SIGNATURE ||
++        dos->e_lfanew + sizeof(IMAGE_NT_HEADERS32) > image->file_size)
++        goto bad;
++    nt = (const IMAGE_NT_HEADERS *)(image->file + dos->e_lfanew);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.TimeDateStamp != m->TimeDateStamp)
++        goto bad;
++    image->sections = (const IMAGE_SECTION_HEADER *)((const BYTE *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
++    image->section_count = nt->FileHeader.NumberOfSections;
++    if ((const BYTE *)(image->sections + image->section_count) > image->file + image->file_size)
++        goto bad;
++    image->headers_size = nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386 ?
++            ((const IMAGE_NT_HEADERS32 *)nt)->OptionalHeader.SizeOfHeaders :
++            ((const IMAGE_NT_HEADERS64 *)nt)->OptionalHeader.SizeOfHeaders;
++    return image;
++bad:
++    WARN("%s is not the image the dump recorded\n", debugstr_w(path));
++    free(image->file);
++    image->file = NULL;
++    return NULL;
++}
++
++/* bytes of a module's image at a relative address, as the loader lays them out */
++static SIZE_T dump_image_read(const struct dump_image *image, ULONG64 rva, BYTE *buffer, SIZE_T size)
++{
++    unsigned int i;
++
++    if (rva < image->headers_size)
++    {
++        SIZE_T n = min(size, image->headers_size - rva);
++        if (rva + n > image->file_size) return 0;
++        memcpy(buffer, image->file + rva, n);
++        return n;
++    }
++    for (i = 0; i < image->section_count; i++)
++    {
++        const IMAGE_SECTION_HEADER *sec = &image->sections[i];
++        ULONG64 vsize = max(sec->Misc.VirtualSize, sec->SizeOfRawData), off;
++        SIZE_T n;
++
++        if (rva < sec->VirtualAddress || rva - sec->VirtualAddress >= vsize) continue;
++        off = rva - sec->VirtualAddress;
++        n = min(size, vsize - off);
++        if (off >= sec->SizeOfRawData) memset(buffer, 0, n);
++        else
++        {
++            SIZE_T raw = min(n, sec->SizeOfRawData - off);
++            if (sec->PointerToRawData + off + raw > image->file_size) return 0;
++            memcpy(buffer, image->file + sec->PointerToRawData + off, raw);
++            memset(buffer + raw, 0, n - raw);
++        }
++        return n;
++    }
++    return 0;
++}
++
++static HRESULT dump_open(const WCHAR *path, HANDLE file_handle, struct dump_target **out)
++{
++    const MINIDUMP_MEMORY_LIST *memory;
++    const MINIDUMP_MEMORY64_LIST *memory64;
++    const MINIDUMP_SYSTEM_INFO *sysinfo;
++    struct dump_target *dump;
++    LARGE_INTEGER size;
++    ULONG len, i;
++    HRESULT hr = HRESULT_FROM_WIN32(ERROR_BAD_FORMAT);
++
++    *out = NULL;
++    if (!(dump = calloc(1, sizeof(*dump)))) return E_OUTOFMEMORY;
++    if (path && !(dump->path = wcsdup(path))) { dump_free(dump); return E_OUTOFMEMORY; }
++    if (file_handle) DuplicateHandle(GetCurrentProcess(), file_handle, GetCurrentProcess(), &dump->file, 0, FALSE,
++            DUPLICATE_SAME_ACCESS);
++    else dump->file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++    if (!dump->file || dump->file == INVALID_HANDLE_VALUE)
++    {
++        hr = HRESULT_FROM_WIN32(GetLastError());
++        dump_free(dump);
++        return hr;
++    }
++    if (!GetFileSizeEx(dump->file, &size) || size.QuadPart < sizeof(MINIDUMP_HEADER) ||
++        !(dump->mapping = CreateFileMappingW(dump->file, NULL, PAGE_READONLY, 0, 0, NULL)) ||
++        !(dump->base = MapViewOfFile(dump->mapping, FILE_MAP_READ, 0, 0, 0)))
++        goto fail;
++    dump->size = size.QuadPart;
++    if (((const MINIDUMP_HEADER *)dump->base)->Signature != MINIDUMP_SIGNATURE ||
++        (((const MINIDUMP_HEADER *)dump->base)->Version & 0xffff) != (MINIDUMP_VERSION & 0xffff))
++        goto fail;
++    dump->flags = ((const MINIDUMP_HEADER *)dump->base)->Flags;
++
++    if ((dump->threads = dump_stream(dump, ThreadListStream, &len)) &&
++        (len < sizeof(ULONG) || (ULONG64)dump->threads->NumberOfThreads * sizeof(MINIDUMP_THREAD) > len - sizeof(ULONG)))
++        dump->threads = NULL;
++    if ((dump->modules = dump_stream(dump, ModuleListStream, &len)) &&
++        (len < sizeof(ULONG) || (ULONG64)dump->modules->NumberOfModules * sizeof(MINIDUMP_MODULE) > len - sizeof(ULONG)))
++        dump->modules = NULL;
++    if (dump->modules && dump->modules->NumberOfModules &&
++        !(dump->images = calloc(dump->modules->NumberOfModules, sizeof(*dump->images))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto fail;
++    }
++    if ((dump->exception = dump_stream(dump, ExceptionStream, &len)) && len < sizeof(MINIDUMP_EXCEPTION_STREAM))
++        dump->exception = NULL;
++    dump->arch = PROCESSOR_ARCHITECTURE_UNKNOWN;
++    if ((sysinfo = dump_stream(dump, SystemInfoStream, &len)) && len >= sizeof(*sysinfo))
++        dump->arch = sysinfo->ProcessorArchitecture;
++
++    /* the memory: the ranges of the memory lists, and the threads' stacks */
++    if ((memory = dump_stream(dump, MemoryListStream, &len)) && len >= sizeof(ULONG))
++        for (i = 0; i < memory->NumberOfMemoryRanges && (i + 1) * sizeof(MINIDUMP_MEMORY_DESCRIPTOR) <= len - sizeof(ULONG); i++)
++        {
++            const MINIDUMP_MEMORY_DESCRIPTOR *d = &memory->MemoryRanges[i];
++            if (!dump_add_range(dump, d->StartOfMemoryRange, d->Memory.DataSize,
++                    dump_at(dump, d->Memory.Rva, d->Memory.DataSize))) { hr = E_OUTOFMEMORY; goto fail; }
++        }
++    if ((memory64 = dump_stream(dump, Memory64ListStream, &len)) && len >= 2 * sizeof(ULONG64))
++    {
++        RVA64 rva = memory64->BaseRva;
++        for (i = 0; i < memory64->NumberOfMemoryRanges &&
++                (i + 1) * sizeof(MINIDUMP_MEMORY_DESCRIPTOR64) <= len - 2 * sizeof(ULONG64); i++)
++        {
++            const MINIDUMP_MEMORY_DESCRIPTOR64 *d = &memory64->MemoryRanges[i];
++            if (!dump_add_range(dump, d->StartOfMemoryRange, d->DataSize, dump_at(dump, rva, d->DataSize)))
++            { hr = E_OUTOFMEMORY; goto fail; }
++            rva += d->DataSize;
++        }
++    }
++    if (dump->threads)
++        for (i = 0; i < dump->threads->NumberOfThreads; i++)
++        {
++            const MINIDUMP_MEMORY_DESCRIPTOR *d = &dump->threads->Threads[i].Stack;
++            if (!dump_add_range(dump, d->StartOfMemoryRange, d->Memory.DataSize,
++                    dump_at(dump, d->Memory.Rva, d->Memory.DataSize))) { hr = E_OUTOFMEMORY; goto fail; }
++        }
++    *out = dump;
++    return S_OK;
++
++fail:
++    WARN("%s is not a minidump this engine reads\n", debugstr_w(path));
++    dump_free(dump);
++    return hr;
++}
++
++/* as ReadProcessMemory: the bytes the dump recorded from the address on (a range ending early is a partial copy) */
++static BOOL dump_read(const struct dump_target *dump, ULONG64 addr, void *buffer, SIZE_T size, SIZE_T *got)
++{
++    SIZE_T done = 0;
++    unsigned int i;
++
++    while (done < size)
++    {
++        ULONG64 at = addr + done;
++        const struct dump_range *r = NULL;
++
++        for (i = 0; i < dump->range_count; i++)
++            if (at >= dump->ranges[i].start && at - dump->ranges[i].start < dump->ranges[i].size)
++            {
++                r = &dump->ranges[i];
++                break;
++            }
++        if (!r)
++        {
++            /* what the dump left out of a module, from its image file */
++            const struct dump_image *image;
++            SIZE_T n = 0;
++            ULONG m;
++
++            for (m = 0; dump->modules && m < dump->modules->NumberOfModules; m++)
++            {
++                const MINIDUMP_MODULE *mod = &dump->modules->Modules[m];
++
++                if (at < mod->BaseOfImage || at - mod->BaseOfImage >= mod->SizeOfImage) continue;
++#ifndef SG_MUTANT_DUMP_NO_IMAGES
++                if ((image = dump_module_image((struct dump_target *)dump, m)))
++                    n = dump_image_read(image, at - mod->BaseOfImage, (BYTE *)buffer + done,
++                            min(size - done, mod->SizeOfImage - (at - mod->BaseOfImage)));
++#endif
++                break;
++            }
++            if (!n) break;
++            done += n;
++            continue;
++        }
++        {
++            SIZE_T n = min(size - done, r->size - (at - r->start));
++            memcpy((BYTE *)buffer + done, r->data + (at - r->start), n);
++            done += n;
++        }
++    }
++#ifdef SG_MUTANT_DUMP_NO_MEMORY
++    done = 0;
++#endif
++    if (got) *got = done;
++    if (done == size) return TRUE;
++    SetLastError(ERROR_PARTIAL_COPY);
++    return FALSE;
++}
++
++static BOOL target_read_memory(struct target_process *target, const void *addr, void *buffer, SIZE_T size, SIZE_T *got)
++{
++    if (target->dump) return dump_read(target->dump, (ULONG_PTR)addr, buffer, size, got);
++    return ReadProcessMemory(target->handle, addr, buffer, size, got);
++}
++
++/* StackWalk64's reader for a dump target */
++static BOOL CALLBACK dump_read_cb(HANDLE process, DWORD64 addr, void *buffer, DWORD size, DWORD *read)
++{
++    struct target_process *target = dump_target_from_handle(process);
++    SIZE_T got = 0;
++    BOOL ret;
++
++    if (!target || !target->dump) return FALSE;
++    ret = dump_read(target->dump, addr, buffer, size, &got);
++    if (read) *read = got;
++    return ret;
++}
++
++static const MINIDUMP_THREAD *dump_find_thread(const struct dump_target *dump, DWORD tid)
++{
++    ULONG i;
++
++    if (!dump->threads) return NULL;
++    for (i = 0; i < dump->threads->NumberOfThreads; i++)
++        if (dump->threads->Threads[i].ThreadId == tid) return &dump->threads->Threads[i];
++    return NULL;
++}
++
++/* the context the dump recorded for a thread: the one of the exception for its thread */
++static HRESULT dump_get_context(const struct dump_target *dump, DWORD tid, CONTEXT *ctx)
++{
++    const MINIDUMP_THREAD *thread = dump_find_thread(dump, tid);
++    const MINIDUMP_LOCATION_DESCRIPTOR *loc;
++    const void *data;
++
++#ifdef __x86_64__
++    if (dump->arch != PROCESSOR_ARCHITECTURE_AMD64) return E_NOTIMPL;
++#elif defined(__i386__)
++    if (dump->arch != PROCESSOR_ARCHITECTURE_INTEL) return E_NOTIMPL;
++#elif defined(__aarch64__)
++    if (dump->arch != PROCESSOR_ARCHITECTURE_ARM64) return E_NOTIMPL;
++#endif
++    if (dump->exception && dump->exception->ThreadId == tid) loc = &dump->exception->ThreadContext;
++    else if (thread) loc = &thread->ThreadContext;
++    else return E_INVALIDARG;
++    if (!(data = dump_at(dump, loc->Rva, loc->DataSize))) return E_FAIL;
++    memset(ctx, 0, sizeof(*ctx));
++    memcpy(ctx, data, min(loc->DataSize, sizeof(*ctx)));
++    return S_OK;
++}
++
++static HRESULT dump_init_modules(struct target_process *target)
++{
++    const struct dump_target *dump = target->dump;
++    ULONG i, count = dump->modules ? dump->modules->NumberOfModules : 0;
++
++    if (count && !(target->modules.info = calloc(count, sizeof(*target->modules.info)))) return E_OUTOFMEMORY;
++    for (i = 0; i < count; i++)
++    {
++        const MINIDUMP_MODULE *m = &dump->modules->Modules[i];
++        const MINIDUMP_STRING *name = dump_at(dump, m->ModuleNameRva, sizeof(ULONG));
++
++        target->modules.info[i].params.Base = m->BaseOfImage;
++        target->modules.info[i].params.Size = m->SizeOfImage;
++        target->modules.info[i].params.TimeDateStamp = m->TimeDateStamp;
++        target->modules.info[i].params.Checksum = m->CheckSum;
++        if (name && dump_at(dump, m->ModuleNameRva + sizeof(ULONG), name->Length))
++            WideCharToMultiByte(CP_ACP, 0, name->Buffer, name->Length / sizeof(WCHAR),
++                    target->modules.info[i].image_name, sizeof(target->modules.info[i].image_name) - 1, NULL, NULL);
++    }
++    switch (dump->arch)
++    {
++    case PROCESSOR_ARCHITECTURE_AMD64: target->cpu_type = IMAGE_FILE_MACHINE_AMD64; break;
++    case PROCESSOR_ARCHITECTURE_ARM64: target->cpu_type = IMAGE_FILE_MACHINE_ARM64; break;
++    case PROCESSOR_ARCHITECTURE_ARM: target->cpu_type = IMAGE_FILE_MACHINE_ARMNT; break;
++    default: target->cpu_type = IMAGE_FILE_MACHINE_I386; break;
++    }
++    target->modules.loaded = count;
++    target->modules.unloaded = 0;
++    target->modules.initialized = TRUE;
++    return S_OK;
++}
++
+ static WORD debug_target_get_module_machine(struct target_process *target, HMODULE module)
+ {
+     IMAGE_DOS_HEADER dos = { 0 };
+     WORD machine = 0;
+ 
+-    ReadProcessMemory(target->handle, module, &dos, sizeof(dos), NULL);
++    target_read_memory(target, module, &dos, sizeof(dos), NULL);
+     if (dos.e_magic == IMAGE_DOS_SIGNATURE)
+     {
+-        ReadProcessMemory(target->handle, (const char *)module + dos.e_lfanew + 4 /* PE signature */, &machine,
++        target_read_memory(target, (const char *)module + dos.e_lfanew + 4 /* PE signature */, &machine,
+                 sizeof(machine), NULL);
+     }
+ 
+@@ -393,10 +824,10 @@ static DWORD debug_target_get_module_timestamp(struct target_process *target, HM
+     IMAGE_DOS_HEADER dos = { 0 };
+     DWORD timestamp = 0;
+ 
+-    ReadProcessMemory(target->handle, module, &dos, sizeof(dos), NULL);
++    target_read_memory(target, module, &dos, sizeof(dos), NULL);
+     if (dos.e_magic == IMAGE_DOS_SIGNATURE)
+     {
+-        ReadProcessMemory(target->handle, (const char *)module + dos.e_lfanew + 4 /* PE signature */ +
++        target_read_memory(target, (const char *)module + dos.e_lfanew + 4 /* PE signature */ +
+                 FIELD_OFFSET(IMAGE_FILE_HEADER, TimeDateStamp), &timestamp, sizeof(timestamp), NULL);
+     }
+ 
+@@ -415,6 +846,9 @@ static HRESULT debug_target_init_modules_info(struct target_process *target)
+     if (target->modules.initialized)
+         return S_OK;
+ 
++    if (target->dump)
++        return dump_init_modules(target);
++
+     if (!target->handle)
+         return E_UNEXPECTED;
+ 
+@@ -519,6 +953,9 @@ static void debug_client_detach_target(struct target_process *target)
+     if (!target->handle)
+         return;
+     debug_target_sym_cleanup(target);
++    /* a dump's handle only names it: debug_target_free lets it go */
++    if (target->dump)
++        return;
+ 
+     if (target->attach_flags & DEBUG_ATTACH_NONINVASIVE)
+     {
+@@ -1016,6 +1453,20 @@ static ULONG STDMETHODCALLTYPE debugclient_AddRef(IDebugClient7 *iface)
+ 
+ static void debug_target_free(struct target_process *target)
+ {
++    if (target->dump)
++    {
++        ULONG_PTR i = ((ULONG_PTR)target->handle - DUMP_HANDLE_BASE) / 4;
++
++        if (target->sym_init)
++            SymCleanup(target->handle);
++        target->sym_init = FALSE;
++        EnterCriticalSection(&dump_cs);
++        if (i < ARRAY_SIZE(dump_targets) && dump_targets[i] == target)
++            dump_targets[i] = NULL;
++        LeaveCriticalSection(&dump_cs);
++        dump_free(target->dump);
++        target->handle = NULL;
++    }
+     free(target->modules.info);
+     free(target);
+ }
+@@ -1396,11 +1847,66 @@ static HRESULT STDMETHODCALLTYPE debugclient_SetProcessOptions(IDebugClient7 *if
+     return S_OK;
+ }
+ 
++static HRESULT debug_client_open_dump(struct debug_client *debug_client, const WCHAR *filename, ULONG64 file)
++{
++    const MINIDUMP_MISC_INFO *misc;
++    struct target_process *target;
++    struct dump_target *dump;
++    unsigned int i;
++    ULONG len;
++    HRESULT hr;
++
++    if (!filename && !file)
++        return E_INVALIDARG;
++    if (FAILED(hr = dump_open(filename, (HANDLE)(ULONG_PTR)file, &dump)))
++        return hr;
++    if (!(target = calloc(1, sizeof(*target))))
++    {
++        dump_free(dump);
++        return E_OUTOFMEMORY;
++    }
++    EnterCriticalSection(&dump_cs);
++    for (i = 0; i < ARRAY_SIZE(dump_targets); i++)
++        if (!dump_targets[i])
++        {
++            dump_targets[i] = target;
++            break;
++        }
++    LeaveCriticalSection(&dump_cs);
++    if (i == ARRAY_SIZE(dump_targets))
++    {
++        dump_free(dump);
++        free(target);
++        return E_OUTOFMEMORY;
++    }
++    target->dump = dump;
++    target->handle = (HANDLE)(ULONG_PTR)(DUMP_HANDLE_BASE + 4 * i);
++    target->client = debug_client;
++    if ((misc = dump_stream(dump, MiscInfoStream, &len)) && len >= FIELD_OFFSET(MINIDUMP_MISC_INFO, ProcessCreateTime) &&
++            (misc->Flags1 & MINIDUMP_MISC1_PROCESS_ID))
++        target->pid = misc->ProcessId;
++    list_add_head(debug_client->targets, &target->entry);
++    return S_OK;
++}
++
+ static HRESULT STDMETHODCALLTYPE debugclient_OpenDumpFile(IDebugClient7 *iface, const char *filename)
+ {
+-    FIXME("%p, %s stub.\n", iface, debugstr_a(filename));
++    struct debug_client *debug_client = impl_from_IDebugClient(iface);
++    WCHAR *name;
++    HRESULT hr;
++    int len;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %s.\n", iface, debugstr_a(filename));
++
++    if (!filename)
++        return E_INVALIDARG;
++    len = MultiByteToWideChar(CP_ACP, 0, filename, -1, NULL, 0);
++    if (!(name = malloc(len * sizeof(WCHAR))))
++        return E_OUTOFMEMORY;
++    MultiByteToWideChar(CP_ACP, 0, filename, -1, name, len);
++    hr = debug_client_open_dump(debug_client, name, 0);
++    free(name);
++    return hr;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE debugclient_WriteDumpFile2(IDebugClient7 *iface, const char *dumpfile, ULONG qualifier,
+@@ -1446,7 +1952,7 @@ static HRESULT STDMETHODCALLTYPE debugclient_TerminateProcesses(IDebugClient7 *i
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(cur, cur2, debug_client->targets, struct target_process, entry)
+     {
+-        if (cur->handle && !TerminateProcess(cur->handle, 0))
++        if (cur->handle && !cur->dump && !TerminateProcess(cur->handle, 0))
+             hr = HRESULT_FROM_WIN32(GetLastError());
+         debug_client_detach_target(cur);
+         list_remove(&cur->entry);
+@@ -1485,7 +1991,7 @@ static HRESULT STDMETHODCALLTYPE debugclient_EndSession(IDebugClient7 *iface, UL
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(cur, cur2, debug_client->targets, struct target_process, entry)
+     {
+-        if (flags == DEBUG_END_ACTIVE_TERMINATE && cur->handle)
++        if (flags == DEBUG_END_ACTIVE_TERMINATE && cur->handle && !cur->dump)
+             TerminateProcess(cur->handle, 0);
+         debug_client_detach_target(cur);
+         list_remove(&cur->entry);
+@@ -2045,8 +2551,8 @@ static HRESULT STDMETHODCALLTYPE debugclient_CreateProcessAndAttachWide(IDebugCl
+ 
+ static HRESULT STDMETHODCALLTYPE debugclient_OpenDumpFileWide(IDebugClient7 *iface, const WCHAR *filename, ULONG64 handle)
+ {
+-    FIXME("%p, %s, %s.\n", iface, debugstr_w(filename), wine_dbgstr_longlong(handle));
+-    return E_NOTIMPL;
++    TRACE("%p, %s, %s.\n", iface, debugstr_w(filename), wine_dbgstr_longlong(handle));
++    return debug_client_open_dump(impl_from_IDebugClient(iface), filename, handle);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE debugclient_WriteDumpFileWide(IDebugClient7 *iface, const WCHAR *filename,
+@@ -2076,29 +2582,64 @@ static HRESULT STDMETHODCALLTYPE debugclient_AddDumpInformationFileWide(IDebugCl
+ 
+ static HRESULT STDMETHODCALLTYPE debugclient_GetNumberDumpFiles(IDebugClient7 *iface, ULONG *count)
+ {
++    struct target_process *target = debug_client_get_target(impl_from_IDebugClient(iface));
++
+     TRACE("%p, %p.\n", iface, count);
+ 
+     if (!count)
+         return E_POINTER;
+-    /* dump targets are not supported, so there are no dump files */
+-    *count = 0;
++    /* a dump target's one file */
++    *count = target && target->dump ? 1 : 0;
+     return S_OK;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE debugclient_GetDumpFile(IDebugClient7 *iface, ULONG index, char *buffer, ULONG buf_size,
+-        ULONG *name_size, ULONG64 *handle, ULONG *type)
++#define DEBUG_DUMP_FILE_BASE_ 0xffffffff
++
++static HRESULT STDMETHODCALLTYPE debugclient_GetDumpFileWide(IDebugClient7 *iface, ULONG index, WCHAR *buffer,
++        ULONG buf_size, ULONG *name_size, ULONG64 *handle, ULONG *type)
+ {
++    struct target_process *target = debug_client_get_target(impl_from_IDebugClient(iface));
++    const WCHAR *path;
++    ULONG len;
++
+     TRACE("%p, %lu, %p, %lu, %p, %p, %p.\n", iface, index, buffer, buf_size, name_size, handle, type);
+ 
+-    return E_INVALIDARG;
++    if (!target || !target->dump || index)
++        return E_INVALIDARG;
++    path = target->dump->path ? target->dump->path : L"";
++    len = wcslen(path) + 1;
++    if (name_size) *name_size = len;
++    if (handle) *handle = (ULONG_PTR)target->dump->file;
++    if (type) *type = DEBUG_DUMP_FILE_BASE_;
++    if (buffer && buf_size)
++    {
++        lstrcpynW(buffer, path, buf_size);
++        return len <= buf_size ? S_OK : S_FALSE;
++    }
++    return S_OK;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE debugclient_GetDumpFileWide(IDebugClient7 *iface, ULONG index, WCHAR *buffer,
+-        ULONG buf_size, ULONG *name_size, ULONG64 *handle, ULONG *type)
++static HRESULT STDMETHODCALLTYPE debugclient_GetDumpFile(IDebugClient7 *iface, ULONG index, char *buffer, ULONG buf_size,
++        ULONG *name_size, ULONG64 *handle, ULONG *type)
+ {
++    WCHAR path[MAX_PATH];
++    char pathA[MAX_PATH * 3];
++    ULONG len;
++    HRESULT hr;
++
+     TRACE("%p, %lu, %p, %lu, %p, %p, %p.\n", iface, index, buffer, buf_size, name_size, handle, type);
+ 
+-    return E_INVALIDARG;
++    if (FAILED(hr = debugclient_GetDumpFileWide(iface, index, path, ARRAY_SIZE(path), NULL, handle, type)))
++        return hr;
++    WideCharToMultiByte(CP_ACP, 0, path, -1, pathA, sizeof(pathA), NULL, NULL);
++    len = strlen(pathA) + 1;
++    if (name_size) *name_size = len;
++    if (buffer && buf_size)
++    {
++        lstrcpynA(buffer, pathA, buf_size);
++        return len <= buf_size ? S_OK : S_FALSE;
++    }
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE debugclient_AttachKernelWide(IDebugClient7 *iface, ULONG flags, const WCHAR *options)
+@@ -2674,6 +3215,19 @@ static HRESULT debug_target_get_threads(struct target_process *target, DWORD **i
+     *ids = NULL;
+     *count = 0;
+ 
++    if (target->dump)
++    {
++        ULONG i, n = target->dump->threads ? target->dump->threads->NumberOfThreads : 0;
++
++        if (n && !(list = malloc(n * sizeof(*list))))
++            return E_OUTOFMEMORY;
++        for (i = 0; i < n; i++)
++            list[i] = target->dump->threads->Threads[i].ThreadId;
++        *ids = list;
++        *count = n;
++        return S_OK;
++    }
++
+     if ((snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)) == INVALID_HANDLE_VALUE)
+         return HRESULT_FROM_WIN32(GetLastError());
+ 
+@@ -2749,8 +3303,13 @@ static HRESULT debug_client_get_thread_id_by_sysid(struct debug_client *debug_cl
+ 
+ static HRESULT debug_client_open_thread(struct debug_client *debug_client, DWORD sysid, HANDLE *handle)
+ {
++    struct target_process *target = debug_client_get_target(debug_client);
+     HANDLE *tmp;
+ 
++    /* a dump's threads have no handles */
++    if (target && target->dump)
++        return E_NOTIMPL;
++
+     if (!(*handle = OpenThread(THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, sysid)))
+         return HRESULT_FROM_WIN32(GetLastError());
+ 
+@@ -2767,10 +3326,21 @@ static HRESULT debug_client_open_thread(struct debug_client *debug_client, DWORD
+ 
+ static HRESULT debug_client_get_thread_teb(struct debug_client *debug_client, DWORD sysid, ULONG64 *teb)
+ {
++    struct target_process *target = debug_client_get_target(debug_client);
+     THREAD_BASIC_INFORMATION info;
+     HANDLE thread;
+     NTSTATUS status;
+ 
++    if (target && target->dump)
++    {
++        const MINIDUMP_THREAD *t = dump_find_thread(target->dump, sysid);
++
++        if (!t)
++            return E_INVALIDARG;
++        *teb = t->Teb;
++        return S_OK;
++    }
++
+     if (!(thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, sysid)))
+         return HRESULT_FROM_WIN32(GetLastError());
+     status = NtQueryInformationThread(thread, ThreadBasicInformation, &info, sizeof(info), NULL);
+@@ -2818,7 +3388,7 @@ static HRESULT STDMETHODCALLTYPE debugdataspaces_ReadVirtual(IDebugDataSpaces *i
+     if (!(target = debug_client_get_target(debug_client)))
+         return E_UNEXPECTED;
+ 
+-    if (ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)offset, buffer, buffer_size, &length))
++    if (target_read_memory(target, (const void *)(ULONG_PTR)offset, buffer, buffer_size, &length))
+     {
+         if (read_len)
+             *read_len = length;
+@@ -2879,7 +3449,7 @@ static HRESULT STDMETHODCALLTYPE debugdataspaces_SearchVirtual(IDebugDataSpaces
+         ULONG64 want = min(end - pos, (ULONG64)chunk + pattern_size - 1);
+         SIZE_T got = 0, i;
+ 
+-        if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)pos, buf, want, &got) && !got)
++        if (!target_read_memory(target, (const void *)(ULONG_PTR)pos, buf, want, &got) && !got)
+         {
+             free(buf);
+             return HRESULT_FROM_WIN32(ERROR_NOACCESS);
+@@ -2942,7 +3512,7 @@ static HRESULT STDMETHODCALLTYPE debugdataspaces_ReadPointersVirtual(IDebugDataS
+     if (!(buf = malloc((SIZE_T)count * size)))
+         return E_OUTOFMEMORY;
+ 
+-    ok = ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)offset, buf, (SIZE_T)count * size, &length);
++    ok = target_read_memory(target, (const void *)(ULONG_PTR)offset, buf, (SIZE_T)count * size, &length);
+     if (!ok || length != (SIZE_T)count * size)
+     {
+         HRESULT hr = ok ? HRESULT_FROM_WIN32(ERROR_PARTIAL_COPY) : HRESULT_FROM_WIN32(GetLastError());
+@@ -3746,6 +4316,8 @@ static HRESULT debug_client_get_context(struct debug_client *debug_client, CONTE
+         return E_UNEXPECTED;
+     if (FAILED(hr = debug_client_get_thread_sysid(debug_client, debug_client->current_thread, &sysid)))
+         return hr;
++    if (target->dump)
++        return dump_get_context(target->dump, sysid, ctx);
+     if (!(thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, sysid)))
+         return HRESULT_FROM_WIN32(GetLastError());
+     memset(ctx, 0, sizeof(*ctx));
+@@ -3758,10 +4330,15 @@ static HRESULT debug_client_get_context(struct debug_client *debug_client, CONTE
+ 
+ static HRESULT debug_client_set_context(struct debug_client *debug_client, CONTEXT *ctx)
+ {
++    struct target_process *target = debug_client_get_target(debug_client);
+     DWORD sysid;
+     HANDLE thread;
+     HRESULT hr;
+ 
++    /* a dump records the registers; it does not change */
++    if (target && target->dump)
++        return E_UNEXPECTED;
++
+     if (FAILED(hr = debug_client_get_thread_sysid(debug_client, debug_client->current_thread, &sysid)))
+         return hr;
+     if (!(thread = OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, sysid)))
+@@ -4041,7 +4618,7 @@ static HRESULT debug_client_read_typed(struct debug_client *debug_client, ULONG6
+         return E_FAIL;
+     if (buffer_size < size)
+         return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+-    if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)offset, buffer, size, &read))
++    if (!target_read_memory(target, (const void *)(ULONG_PTR)offset, buffer, size, &read))
+         return HRESULT_FROM_WIN32(GetLastError());
+     if (read_len)
+         *read_len = read;
+@@ -4399,7 +4976,7 @@ static HRESULT STDMETHODCALLTYPE sym_group_ExpandSymbol(IDebugSymbolGroup2 *ifac
+             ULONG64 pointer = 0;
+ 
+             SymGetTypeInfo(process, parent.module, resolved, TI_GET_TYPE, &pointed);
+-            ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)parent.address, &pointer,
++            target_read_memory(target, (const void *)(ULONG_PTR)parent.address, &pointer,
+                     min(parent.size, sizeof(pointer)), NULL);
+             child.name = strdup("*");
+             child.module = parent.module;
+@@ -4457,7 +5034,7 @@ static char *sym_group_value_text(struct sym_group *group, unsigned int index)
+     if (!(process = debug_client_sym_handle(debug_client, NULL)) || !target)
+         return NULL;
+     if (!item->type_id || !item->size || item->size > sizeof(data)
+-            || !ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)item->address, data, item->size, &read)
++            || !target_read_memory(target, (const void *)(ULONG_PTR)item->address, data, item->size, &read)
+             || read != item->size)
+         return strdup("??");
+     sym_format_value(process, item->module, item->type_id, data, item->size, &sb);
+@@ -5172,11 +5749,11 @@ static HRESULT debug_client_disasm_one(struct debug_client *debug_client, ULONG6
+ 
+     if (!target || !target->handle)
+         return E_UNEXPECTED;
+-    if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)offset, buffer, sizeof(buffer), &len) || !len)
++    if (!target_read_memory(target, (const void *)(ULONG_PTR)offset, buffer, sizeof(buffer), &len) || !len)
+     {
+         /* near the end of a mapping a shorter read may still hold an instruction */
+         len = 0;
+-        while (len < sizeof(buffer) && ReadProcessMemory(target->handle, (const char *)(ULONG_PTR)offset + len,
++        while (len < sizeof(buffer) && target_read_memory(target, (const char *)(ULONG_PTR)offset + len,
+                 buffer + len, 1, NULL))
+             ++len;
+         if (!len)
+@@ -5364,7 +5941,9 @@ static HRESULT debug_client_walk_stack(struct debug_client *debug_client, const
+         return hr;
+     if (FAILED(hr = debug_client_get_thread_sysid(debug_client, debug_client->current_thread, &sysid)))
+         return hr;
+-    if (!(thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, sysid)))
++    if (target->dump)
++        thread = NULL;
++    else if (!(thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, sysid)))
+         return HRESULT_FROM_WIN32(GetLastError());
+ 
+     memset(&frame, 0, sizeof(frame));
+@@ -5382,7 +5961,7 @@ static HRESULT debug_client_walk_stack(struct debug_client *debug_client, const
+ 
+     while (n < frames_size)
+     {
+-        if (n && !StackWalk64(machine, process, thread, &frame, &ctx, NULL, SymFunctionTableAccess64,
++        if (n && !StackWalk64(machine, process, thread, &frame, &ctx, target->dump ? dump_read_cb : NULL, SymFunctionTableAccess64,
+                 SymGetModuleBase64, NULL))
+             break;
+         if (n && !frame.AddrPC.Offset)
+@@ -5408,7 +5987,7 @@ static HRESULT debug_client_walk_stack(struct debug_client *debug_client, const
+         if (n == 1 && !frame.AddrReturn.Offset)
+         {
+             /* the first walk step only reports the starting frame */
+-            if (!StackWalk64(machine, process, thread, &frame, &ctx, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
++            if (!StackWalk64(machine, process, thread, &frame, &ctx, target->dump ? dump_read_cb : NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
+                 break;
+             frames[0].ReturnOffset = frame.AddrReturn.Offset;
+             frames[0].FrameOffset = frame.AddrFrame.Offset;
+@@ -5524,7 +6103,7 @@ static ULONG64 expr_read_memory(struct expr *e, ULONG64 address, unsigned int si
+     ULONG64 value = 0;
+     SIZE_T read = 0;
+ 
+-    if (!target || !target->handle || !ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)address, &value, size, &read)
++    if (!target || !target->handle || !target_read_memory(target, (const void *)(ULONG_PTR)address, &value, size, &read)
+             || read != size)
+     {
+         e->failed = TRUE;
+@@ -6636,7 +7215,7 @@ static HRESULT debug_cmd_dump(struct debug_client *debug_client, const char *cmd
+             WCHAR w[130];
+             char line[300];
+ 
+-            if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)address, w, sizeof(w) - sizeof(WCHAR), &got))
++            if (!target_read_memory(target, (const void *)(ULONG_PTR)address, w, sizeof(w) - sizeof(WCHAR), &got))
+                 got = 0;
+             got /= sizeof(WCHAR);
+             w[got] = 0;
+@@ -6646,7 +7225,7 @@ static HRESULT debug_cmd_dump(struct debug_client *debug_client, const char *cmd
+         }
+         else
+         {
+-            if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)address, data, max, &got))
++            if (!target_read_memory(target, (const void *)(ULONG_PTR)address, data, max, &got))
+                 got = 0;
+             data[got] = 0;
+             for (i = 0; i < got; ++i)
+@@ -6674,7 +7253,7 @@ static HRESULT debug_cmd_dump(struct debug_client *debug_client, const char *cmd
+ 
+             debug_dump_line_prefix(&sb, is64, address + pos);
+             memset(line, 0, sizeof(line));
+-            ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)(address + pos), line, n, &got);
++            target_read_memory(target, (const void *)(ULONG_PTR)(address + pos), line, n, &got);
+             avail = got;
+             for (i = 0; i < n; i += unit)
+             {
+@@ -7540,7 +8119,7 @@ static void debug_target_insert_breakpoints(struct target_process *target)
+         if (bp->inserted || bp->type != DEBUG_BREAKPOINT_CODE || !(bp->flags & DEBUG_BREAKPOINT_ENABLED)
+                 || (bp->flags & DEBUG_BREAKPOINT_DEFERRED) || bp->offset == DEBUG_INVALID_OFFSET)
+             continue;
+-        if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)bp->offset, &bp->original, 1, NULL))
++        if (!target_read_memory(target, (const void *)(ULONG_PTR)bp->offset, &bp->original, 1, NULL))
+             continue;
+         if (!WriteProcessMemory(target->handle, (void *)(ULONG_PTR)bp->offset, &int3, 1, NULL))
+             continue;
+@@ -7595,11 +8174,11 @@ static void debug_target_image_info(struct target_process *target, ULONG64 base,
+         GetModuleFileNameExA(target->handle, module, info->path, sizeof(info->path));
+     }
+     debug_path_to_module_name(info->path, info->name, sizeof(info->name));
+-    if (!base || !target->handle || !ReadProcessMemory(target->handle, (void *)(ULONG_PTR)base, &dos, sizeof(dos), NULL)
++    if (!base || !target->handle || !target_read_memory(target, (void *)(ULONG_PTR)base, &dos, sizeof(dos), NULL)
+             || dos.e_magic != IMAGE_DOS_SIGNATURE)
+         return;
+     pe_offset = dos.e_lfanew;
+-    if (!ReadProcessMemory(target->handle, (char *)(ULONG_PTR)base + pe_offset, header, sizeof(header), NULL))
++    if (!target_read_memory(target, (char *)(ULONG_PTR)base + pe_offset, header, sizeof(header), NULL))
+         return;
+     info->timestamp = *(DWORD *)(header + 8);
+     info->size = *(DWORD *)(header + 24 + 56);
+@@ -7760,10 +8339,10 @@ static void debug_client_record_event(struct debug_client *debug_client, ULONG t
+     {
+         SIZE_T got = 0;
+ 
+-        if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)ip, ev->code, sizeof(ev->code), &got) || !got)
++        if (!target_read_memory(target, (const void *)(ULONG_PTR)ip, ev->code, sizeof(ev->code), &got) || !got)
+         {
+             got = 0;
+-            while (got < sizeof(ev->code) && ReadProcessMemory(target->handle, (const char *)(ULONG_PTR)ip + got,
++            while (got < sizeof(ev->code) && target_read_memory(target, (const char *)(ULONG_PTR)ip + got,
+                     ev->code + got, 1, NULL))
+                 ++got;
+         }
+@@ -7985,7 +8564,7 @@ static BOOL debug_client_handle_event(struct debug_client *debug_client, struct
+         {
+             SIZE_T got = 0;
+ 
+-            ReadProcessMemory(target->handle, i->lpDebugStringData, buf, len * (i->fUnicode ? 2 : 1), &got);
++            target_read_memory(target, i->lpDebugStringData, buf, len * (i->fUnicode ? 2 : 1), &got);
+             if (i->fUnicode)
+             {
+                 char *narrow = debug_strdup_acp_from_w((WCHAR *)buf);
+@@ -10183,7 +10762,7 @@ static HRESULT STDMETHODCALLTYPE debugsymbols_SetScopeFromJitDebugInfo(IDebugSym
+ 
+     if (!target || !target->handle)
+         return E_UNEXPECTED;
+-    if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)info_offset, &info, sizeof(info), &got) ||
++    if (!target_read_memory(target, (const void *)(ULONG_PTR)info_offset, &info, sizeof(info), &got) ||
+             got != sizeof(info))
+         return HRESULT_FROM_WIN32(ERROR_NOACCESS);
+     if (info.size < sizeof(info) || !info.context_record)
+@@ -10193,7 +10772,7 @@ static HRESULT STDMETHODCALLTYPE debugsymbols_SetScopeFromJitDebugInfo(IDebugSym
+     {
+         AMD64_CONTEXT ctx;
+ 
+-        if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)info.context_record, &ctx, sizeof(ctx), &got) ||
++        if (!target_read_memory(target, (const void *)(ULONG_PTR)info.context_record, &ctx, sizeof(ctx), &got) ||
+                 got != sizeof(ctx))
+             return HRESULT_FROM_WIN32(ERROR_NOACCESS);
+         frame.InstructionOffset = ctx.Rip;
+@@ -10204,7 +10783,7 @@ static HRESULT STDMETHODCALLTYPE debugsymbols_SetScopeFromJitDebugInfo(IDebugSym
+     {
+         I386_CONTEXT ctx;
+ 
+-        if (!ReadProcessMemory(target->handle, (const void *)(ULONG_PTR)info.context_record, &ctx, sizeof(ctx), &got) ||
++        if (!target_read_memory(target, (const void *)(ULONG_PTR)info.context_record, &ctx, sizeof(ctx), &got) ||
+                 got != sizeof(ctx))
+             return HRESULT_FROM_WIN32(ERROR_NOACCESS);
+         frame.InstructionOffset = ctx.Eip;
+@@ -11430,15 +12009,21 @@ static HRESULT STDMETHODCALLTYPE debugcontrol_GetDebuggeeType(IDebugControl4 *if
+         ULONG *qualifier)
+ {
+     struct debug_client *debug_client = impl_from_IDebugControl4(iface);
++    struct target_process *target;
+ 
+     TRACE("%p, %p, %p.\n", iface, debug_class, qualifier);
+ 
+     if (!debug_class || !qualifier)
+         return E_POINTER;
+-    if (debug_client_get_target(debug_client))
++    if ((target = debug_client_get_target(debug_client)))
+     {
+         *debug_class = DEBUG_CLASS_USER_WINDOWS;
+-        *qualifier = DEBUG_USER_WINDOWS_PROCESS;
++        /* a dump with all the memory is a full one */
++        if (target->dump)
++            *qualifier = target->dump->flags & MiniDumpWithFullMemory ? DEBUG_USER_WINDOWS_DUMP
++                                                                     : DEBUG_USER_WINDOWS_SMALL_DUMP;
++        else
++            *qualifier = DEBUG_USER_WINDOWS_PROCESS;
+     }
+     else
+     {
+@@ -12516,6 +13101,48 @@ static HRESULT STDMETHODCALLTYPE debugcontrol_WaitForEvent(IDebugControl4 *iface
+     if (target->live)
+         return debug_client_wait_live(debug_client, target, timeout);
+ 
++    /* a dump: its exception (or a break) is the one event; then nothing more happens */
++    if (target->dump)
++    {
++        const struct dump_target *dump = target->dump;
++        struct dbg_last_event *ev = &debug_client->last_event;
++        ULONG id, i;
++
++        if (dump->event_reported)
++            return E_UNEXPECTED;
++        target->dump->event_reported = TRUE;
++        memset(ev, 0, sizeof(*ev));
++        ev->valid = TRUE;
++        ev->pid = target->pid;
++        if (dump->exception)
++        {
++            const MINIDUMP_EXCEPTION *rec = &dump->exception->ExceptionRecord;
++
++            ev->type = DEBUG_EVENT_EXCEPTION;
++            ev->tid = dump->exception->ThreadId;
++            ev->exception.ExceptionCode = rec->ExceptionCode;
++            ev->exception.ExceptionFlags = rec->ExceptionFlags;
++            ev->exception.ExceptionRecord = rec->ExceptionRecord;
++            ev->exception.ExceptionAddress = rec->ExceptionAddress;
++            ev->exception.NumberParameters = min(rec->NumberParameters, EXCEPTION_MAXIMUM_PARAMETERS);
++            for (i = 0; i < ev->exception.NumberParameters; i++)
++                ev->exception.ExceptionInformation[i] = rec->ExceptionInformation[i];
++            ev->first_chance = FALSE;
++            snprintf(ev->description, sizeof(ev->description), "Exception %08x in a dump", (unsigned int)rec->ExceptionCode);
++        }
++        else
++        {
++            ev->type = DEBUG_EVENT_BREAKPOINT;
++            ev->tid = dump->threads && dump->threads->NumberOfThreads ? dump->threads->Threads[0].ThreadId : 0;
++            snprintf(ev->description, sizeof(ev->description), "Break in a dump");
++        }
++        debug_client->current_process = 0;
++        if (SUCCEEDED(debug_client_get_thread_id_by_sysid(debug_client, ev->tid, &id)))
++            debug_client->current_thread = id;
++        debug_client->exec_status = DEBUG_STATUS_BREAK;
++        return S_OK;
++    }
++
+     /* DEBUG_ATTACH_EXISTING re-attaches to a process a debugger abandoned, which is not running events:
+      * the engine only gets access to it (UNVERIFIED against Windows) */
+ #ifdef SG_MUTANT_DBG_EXISTING
+@@ -14489,6 +15116,9 @@ static HRESULT STDMETHODCALLTYPE debugadvanced_GetSystemObjectInformation(IDebug
+ 
+     if (!target || !target->handle)
+         return E_UNEXPECTED;
++    /* the live threads' details; a dump records none of them */
++    if (target->dump)
++        return E_NOTIMPL;
+     switch (which)
+     {
+     case 0: /* DEBUG_SYSOBJINFO_THREAD_BASIC_INFORMATION */
