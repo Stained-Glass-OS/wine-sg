@@ -3,6 +3,11 @@
 #define COBJMACROS
 #include <windows.h>
 #include <aclapi.h>
+#include <wincred.h>
+
+/* the MinGW headers lack the binary blob credential */
+#define BinaryBlobCredential_ 3
+typedef struct { ULONG cbBlob; BYTE *pbBlob; } blob_cred_info;
 #include <stdio.h>
 
 #define P(...) printf(__VA_ARGS__)
@@ -170,6 +175,23 @@ int main( void )
         FreeInheritedFromArray( (PINHERITED_FROMW)from_a, info.AceCount, NULL );
         LocalFree( leaf_sd );
         (void)rootW;
+    }
+    /* binary blob credentials */
+    {
+        static BYTE bytes[] = { 1, 2, 3, 250, 251, 0, 7 };
+        blob_cred_info blob = { sizeof(bytes), bytes }, *back = NULL;
+        CRED_MARSHAL_TYPE type = 0;
+        WCHAR *marshaled = NULL;
+        BOOL m, u, is;
+
+        m = CredMarshalCredentialW( BinaryBlobCredential_, &blob, &marshaled );
+        u = marshaled && CredUnmarshalCredentialW( marshaled, &type, (void **)&back );
+        is = marshaled && CredIsMarshaledCredentialW( marshaled );
+        P( "BlobCredential=%d %d %d %d %d %d\n", m, marshaled && marshaled[2] == 'A' + BinaryBlobCredential_, u,
+           u && type == BinaryBlobCredential_ && back->cbBlob == sizeof(bytes) && !memcmp( back->pbBlob, bytes, sizeof(bytes) ),
+           is, CredIsMarshaledCredentialW( L"@@Dxyz" ) );
+        if (back) CredFree( back );
+        if (marshaled) CredFree( marshaled );
     }
     P( "done=1\n" );
     return 0;

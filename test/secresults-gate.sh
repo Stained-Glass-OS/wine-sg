@@ -9,10 +9,12 @@
 #    lacks it: ERROR_PRIVILEGE_NOT_HELD), AUDIT_ALLOW_NO_PRIVILEGE checks without it, the client is
 #    the impersonated one (ERROR_NO_IMPERSONATION_TOKEN when there is none); no audit is generated;
 #  - BuildImpersonateTrustee/ExplicitAccessWithName, GetMultipleTrustee/Operation;
+#  - CredMarshal/UnmarshalCredential and CredIsMarshaledCredential of binary blob credentials (SEC-CRED);
 #  - TreeSetNamedSecurityInfoA down a tree of keys, GetInheritanceSourceW/A (an inherited ACE's ancestor
 #    three levels up, past a closer ancestor's matching ACE that is not inheritable), FreeInheritedFromArray.
 #   WINE=/opt/wine-sg/bin/wine test/secresults-gate.sh   (mutants SG_MUTANT_RESULTLIST_SKIP_DENY (a wrong
-#   grant), SG_MUTANT_RESULTLIST_ALL_TYPES, SG_MUTANT_RESULTLIST_NO_INHERIT, SG_MUTANT_AUDIT_NO_PRIVILEGE_CHECK, SG_MUTANT_INHERIT_ANY_ACE)
+#   grant), SG_MUTANT_RESULTLIST_ALL_TYPES, SG_MUTANT_RESULTLIST_NO_INHERIT, SG_MUTANT_AUDIT_NO_PRIVILEGE_CHECK, SG_MUTANT_INHERIT_ANY_ACE,
+#   SG_MUTANT_CRED_BLOB_SIZE_ONLY)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -53,6 +55,7 @@ expect SetExplicit 0 "a key gets an explicit, not inheritable ACE"
 expect TreeSetA 0 "TreeSetNamedSecurityInfoA gives an inheritable ACE to the tree"
 expect InheritanceSource "0 3 CURRENT_USER\\Software\\SGInh" "GetInheritanceSourceW finds the ancestor three levels up"
 expect InheritanceSourceA "0 3 CURRENT_USER\\Software\\SGInh" "and GetInheritanceSourceA"
+expect BlobCredential "1 1 1 1 1 0" "SEC-CRED: a binary blob credential marshals, unmarshals and is recognized; a bad one is not"
 expect done 1 "the probe ran to the end"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
