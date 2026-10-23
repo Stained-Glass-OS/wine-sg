@@ -25,6 +25,15 @@
 #define PW_RENDERFULLCONTENT 2
 #endif
 
+static void write_file(const char *name, const char *text)
+{
+    FILE *f = fopen(name, "w");
+    if (f) { fputs(text, f); fclose(f); }
+}
+
+/* WM_WINE_CLIENT_SURFACE (Stained Glass OS 6500) as another program would send it */
+#define SG_WM_CLIENT_SURFACE 0x8000000f
+
 static void phase(const char *text)
 {
     FILE *f = fopen("C:\\phase.txt", "w");
@@ -121,6 +130,13 @@ static int render(HWND target)
         pvkQueuePresentKHR(queue, &pi);
         Sleep(50);
     }
+    /* the message naming another process than the sender is refused, even from the host's own child */
+    {
+        char text[64];
+        BOOL sent = SendNotifyMessageW(target, SG_WM_CLIENT_SURFACE, GetCurrentProcessId() + 4, 1);
+        snprintf(text, sizeof(text), "sent=%d\n", sent);
+        write_file("C:\\forged.txt", text);
+    }
     Sleep(60000);   /* a still page: nothing more is presented */
     return 0;
 }
@@ -147,12 +163,50 @@ static int print(HWND target, const char *file)
     return 0;
 }
 
+/* CMD started at low integrity, as Chromium's sandbox runs its GPU process; FALSE if it could not be */
+static BOOL spawn_low(char *cmd, PROCESS_INFORMATION *pi)
+{
+    STARTUPINFOA si = { sizeof(si) };
+    HANDLE token = NULL, low = NULL;
+    SID_IDENTIFIER_AUTHORITY mandatory = SECURITY_MANDATORY_LABEL_AUTHORITY;
+    PSID sid = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY, &token) ||
+        !DuplicateTokenEx(token, 0, NULL, SecurityImpersonation, TokenPrimary, &low) ||
+        !AllocateAndInitializeSid(&mandatory, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &sid))
+        return FALSE;
+    TOKEN_MANDATORY_LABEL label = { { sid, SE_GROUP_INTEGRITY } };
+    return SetTokenInformation(low, TokenIntegrityLevel, &label, sizeof(label) + GetLengthSid(sid)) &&
+           CreateProcessAsUserA(low, NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, pi);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2 && !strcmp(argv[1], "render"))
         return render((HWND)(ULONG_PTR)strtoull(argv[2], NULL, 16));
     if (argc > 3 && !strcmp(argv[1], "print"))
         return print((HWND)(ULONG_PTR)strtoull(argv[2], NULL, 16), argv[3]);
+    if (argc > 1 && !strcmp(argv[1], "spoof"))
+    {
+        /* not started by the host: a low-integrity process of its own tells the host's window
+         * that it has a swap chain there, which it has not -- refused */
+        char cmd[512], hwnd[64] = "";
+        FILE *f = fopen("C:\\hwnd.txt", "r");
+        if (f) { fgets(hwnd, sizeof(hwnd), f); fclose(f); }
+        snprintf(cmd, sizeof(cmd), "\"%s\" spoof2 %s", argv[0], hwnd);
+        PROCESS_INFORMATION pi = {};
+        if (!spawn_low(cmd, &pi)) { write_file("C:\\spoof.txt", "sent=nolow\n"); return 1; }
+        WaitForSingleObject(pi.hProcess, 20000);
+        return 0;
+    }
+    if (argc > 2 && !strcmp(argv[1], "spoof2"))
+    {
+        char text[64];
+        HWND target = (HWND)(ULONG_PTR)strtoull(argv[2], NULL, 16);
+        BOOL sent = SendNotifyMessageW(target, SG_WM_CLIENT_SURFACE, GetCurrentProcessId(), 1);
+        snprintf(text, sizeof(text), "sent=%d err=%lu\n", sent, sent ? 0 : GetLastError());
+        write_file("C:\\spoof.txt", text);
+        return 0;
+    }
     if (argc < 2 || strcmp(argv[1], "host")) return 4;
     BOOL into_top = argc > 2 && !strcmp(argv[2], "top");
 
@@ -164,21 +218,11 @@ int main(int argc, char **argv)
     HWND child = CreateWindowA("XprocChild", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 50, 50, 200, 150, top, 0, 0, 0);
     CreateWindowA("XprocChild", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 10, 10, top, 0, 0, 0);
     char cmd[512];
+    snprintf(cmd, sizeof(cmd), "%p", (void *)top);
+    write_file("C:\\hwnd.txt", cmd);
     snprintf(cmd, sizeof(cmd), "\"%s\" render %p", argv[0], (void *)(into_top ? top : child));
     STARTUPINFOA si = { sizeof(si) }; PROCESS_INFORMATION pi = {};
-    /* at low integrity, as Chromium's sandbox runs its GPU process */
-    HANDLE token = NULL, low = NULL;
-    SID_IDENTIFIER_AUTHORITY mandatory = SECURITY_MANDATORY_LABEL_AUTHORITY;
-    PSID sid = NULL;
-    BOOL lowered = FALSE;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY, &token) &&
-        DuplicateTokenEx(token, 0, NULL, SecurityImpersonation, TokenPrimary, &low) &&
-        AllocateAndInitializeSid(&mandatory, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &sid))
-    {
-        TOKEN_MANDATORY_LABEL label = { { sid, SE_GROUP_INTEGRITY } };
-        lowered = SetTokenInformation(low, TokenIntegrityLevel, &label, sizeof(label) + GetLengthSid(sid)) &&
-                  CreateProcessAsUserA(low, NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-    }
+    BOOL lowered = spawn_low(cmd, &pi);
     { FILE *f = fopen("C:\\low.txt", "w"); if (f) { fprintf(f, "low=%d\n", lowered); fclose(f); } }
     if (!lowered && !CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) { printf("child=FAIL spawn\n"); return 1; }
     pump(8000);
@@ -211,6 +255,11 @@ int main(int argc, char **argv)
     }
     phase("printed");
     pump(3000);
+    if (!into_top)
+    {
+        phase("spoofwait");
+        for (int i = 0; i < 400 && GetFileAttributesA("C:\\spoof.txt") == INVALID_FILE_ATTRIBUTES; i++) pump(50);
+    }
     if (!into_top)
     {
         /* the child moves away: what is left where it was is the top-level's own white */

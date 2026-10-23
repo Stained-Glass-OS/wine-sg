@@ -19,7 +19,8 @@
 #   WINE=/opt/wine-sg/bin/wine test/xproc-child-gate.sh
 #   (SG_DESKCOMP=<sg-deskcomp>, default /usr/libexec/stained-glass/sg-deskcomp: the covered print)
 # Mutants: SG_MUTANT_FOREIGN_SURFACE_PAINTED (win32u window.c), SG_MUTANT_PRINT_NO_FRAMES (dce.c),
-# SG_MUTANT_UIPI_CLIENT_SURFACE (server queue.c: the low-integrity renderer's message to an elevated host).
+# SG_MUTANT_UIPI_CLIENT_SURFACE (server queue.c: the low-integrity renderer's message to an elevated host),
+# SG_MUTANT_UIPI_CLIENT_SURFACE_ANY (server: any low-integrity sender's message let through).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -52,7 +53,7 @@ fail=0
 # run MODE DESKTOP [compositor]: the child's centre is at 250,225 on the screen, a spot of the
 # top-level outside its children at 120,380
 run() {
-    rm -f "$C/phase.txt" "$C"/print*.txt
+    rm -f "$C/phase.txt" "$C"/print*.txt "$C/spoof.txt" "$C/forged.txt"
     (cd "$C" && timeout 120 "$WINE" explorer "/desktop=$2,1024x700" "C:\\xproc-child-probe.exe" host "$1" \
         >"$T/run-$1.log" 2>&1 &)
     if [ -n "${3:-}" ]; then
@@ -66,12 +67,20 @@ run() {
     after=$(px 250 225); safter=$(px 120 380)
     wait_phase printed
     print0=$(tr -d '\r' < "$C/print0.txt" 2>/dev/null); print1=$(tr -d '\r' < "$C/print1.txt" 2>/dev/null)
-    moved=
-    if [ "$1" = child ]; then wait_phase moved; sleep 1; moved=$(px 250 225); fi
+    moved=; spoof=
+    if [ "$1" = child ]; then
+        # a low-integrity process the host did not start claims a swap chain in its top-level
+        wait_phase spoofwait
+        (cd "$C" && timeout 60 "$WINE" explorer "/desktop=$2,1024x700" "C:\\xproc-child-probe.exe" spoof >/dev/null 2>&1)
+        i=0; while [ ! -s "$C/spoof.txt" ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+        spoof=$(tr -d '\r' < "$C/spoof.txt" 2>/dev/null)
+        wait_phase moved; sleep 1; moved=$(px 250 225)
+    fi
+    forged=$(tr -d '\r' < "$C/forged.txt" 2>/dev/null)
     "$WINESERVER" -k 2>/dev/null; sleep 1
     [ -n "$CP" ] && { kill "$CP" 2>/dev/null; CP=; }
     echo "      ($1${3:+ composited}: child before=$before after=$after moved=$moved, spot before=$sbefore after=$safter;" \
-         "print: $print0 / covered: $print1)"
+         "print: $print0 / covered: $print1; spoof: $spoof; forged: $forged)"
 }
 
 run child gate
@@ -87,6 +96,14 @@ if [ "$moved" = FFFFFF ]; then echo "PASS  where the child was is the host's own
 else echo "FAIL  the place the child left is not the host's ($moved)"; fail=1; fi
 if [ "$sbefore$safter" = FFFFFFFFFFFF ]; then echo "PASS  the rest of the host is its own white"
 else echo "FAIL  the host's own part is not white ($sbefore $safter)"; fail=1; fi
+case "$spoof" in
+    sent=0*) echo "PASS  a low-integrity process the host did not start cannot claim a swap chain in its window ($spoof)";;
+    *) echo "FAIL  a low-integrity stranger's WM_WINE_CLIENT_SURFACE reached the host ($spoof)"; fail=1;;
+esac
+case "$forged" in
+    sent=0*) echo "PASS  the renderer cannot claim a swap chain for another process ($forged)";;
+    *) echo "FAIL  WM_WINE_CLIENT_SURFACE naming another process got through ($forged)"; fail=1;;
+esac
 case "$print0" in
     "ok=1 child=ff0000 spot=ffffff") echo "PASS  PrintWindow from another process shows the child's frame";;
     *) echo "FAIL  PrintWindow does not show the child's frame ($print0)"; fail=1;;
