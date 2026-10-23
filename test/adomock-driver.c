@@ -92,6 +92,13 @@ struct stmt
 };
 
 static int connected;
+
+/* SG_ADOMOCK_LONG=1: the text column is a long one (SQL_WLONGVARCHAR, as SQLite's TEXT) */
+static BOOL long_text( const struct stmt *st, int src )
+{
+    char value[8];
+    return !st->catalog && src == 1 && GetEnvironmentVariableA( "SG_ADOMOCK_LONG", value, sizeof(value) ) && value[0] == '1';
+}
 static WCHAR diag[64];
 static int env_handle, dbc_handle;
 
@@ -646,8 +653,8 @@ __declspec(dllexport) SQLRETURN WINAPI SQLDescribeColW( SQLHANDLE h, SQLUSMALLIN
     if (name) lstrcpynW( name, st->cols[col - 1].name, size );
     if (len) *len = lstrlenW( st->cols[col - 1].name );
     if (st->catalog) src = 1;
-    if (type) *type = src == 1 ? SQL_WVARCHAR : SQL_INTEGER;
-    if (colsize) *colsize = src == 1 ? 50 : 10;
+    if (type) *type = long_text( st, src ) ? -10 /* SQL_WLONGVARCHAR */ : src == 1 ? SQL_WVARCHAR : SQL_INTEGER;
+    if (colsize) *colsize = long_text( st, src ) ? 65536 : src == 1 ? 50 : 10;
     if (digits) *digits = 0;
     if (nullable) *nullable = src == 0 ? 0 : 1;
     return SQL_SUCCESS;
@@ -672,7 +679,9 @@ __declspec(dllexport) SQLRETURN WINAPI SQLColAttributeW( SQLHANDLE h, SQLUSMALLI
     case 3: /* SQL_COLUMN_LENGTH */
     case 4: /* SQL_COLUMN_PRECISION */
     case 1003: /* SQL_DESC_LENGTH */
-    case 1005: /* SQL_DESC_PRECISION */ if (num) *num = (st->catalog || st->cols[col - 1].src == 1) ? 50 : 10; break;
+    case 1005: /* SQL_DESC_PRECISION */
+        if (num) *num = long_text( st, st->cols[col - 1].src ) ? 65536 : (st->catalog || st->cols[col - 1].src == 1) ? 50 : 10;
+        break;
     case 1013: /* SQL_DESC_OCTET_LENGTH */ if (num) *num = (st->catalog || st->cols[col - 1].src == 1) ? 100 : 4; break;
     case 6: /* SQL_COLUMN_DISPLAY_SIZE */ if (num) *num = (st->catalog || st->cols[col - 1].src == 1) ? 50 : 11; break;
     case 8: /* SQL_COLUMN_UNSIGNED */
