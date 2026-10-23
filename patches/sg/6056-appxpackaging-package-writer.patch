@@ -1,0 +1,782 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] appxpackaging: The package writer (6056)
+
+IAppxFactory::CreatePackageWriter gave E_NOTIMPL. Packaging tools
+(MSIX packagers, build systems, installers that repackage) write AppX and
+MSIX packages with it.
+
+IAppxPackageWriter is declared in appxpackaging.idl. New writer.c writes
+the ZIP as files are added: each payload file's local header and data,
+deflated with a full flush after every 64 KiB so each block's compressed
+size goes in the block map; Close adds AppxManifest.xml (refused unless
+the manifest reader takes it), AppxBlockMap.xml with every block's hash,
+[Content_Types].xml and the central directory, with ZIP64 records where
+32 bits do not do (unless the settings force ZIP32). Names are stored as
+OPC part names; repeated and footprint names are refused.
+---
+diff --git a/dlls/appxpackaging/Makefile.in b/dlls/appxpackaging/Makefile.in
+index 4f3bdcb..c8d59da 100644
+--- a/dlls/appxpackaging/Makefile.in
++++ b/dlls/appxpackaging/Makefile.in
+@@ -8,4 +8,5 @@ SOURCES = \
+ 	main.c \
+ 	manifest.c \
+ 	package.c \
++	writer.c \
+ 	zip.c
+diff --git a/dlls/appxpackaging/main.c b/dlls/appxpackaging/main.c
+index 4f80a12..a6805ff 100644
+--- a/dlls/appxpackaging/main.c
++++ b/dlls/appxpackaging/main.c
+@@ -48,8 +48,9 @@ static ULONG WINAPI appx_factory_Release( IAppxFactory *iface ) { return 1; }
+ static HRESULT WINAPI appx_factory_CreatePackageWriter( IAppxFactory *iface, IStream *output,
+                                                         APPX_PACKAGE_SETTINGS *settings, IAppxPackageWriter **writer )
+ {
+-    FIXME( "iface %p, output %p, settings %p, writer %p stub!\n", iface, output, settings, writer );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, output %p, settings %p, writer %p.\n", iface, output, settings, writer );
++    if (!output || !settings || !writer) return E_POINTER;
++    return package_writer_create( output, settings, writer );
+ }
+ 
+ static HRESULT WINAPI appx_factory_CreatePackageReader( IAppxFactory *iface, IStream *input, IAppxPackageReader **reader )
+diff --git a/dlls/appxpackaging/private.h b/dlls/appxpackaging/private.h
+index 65d8948..d96909d 100644
+--- a/dlls/appxpackaging/private.h
++++ b/dlls/appxpackaging/private.h
+@@ -87,6 +87,10 @@ HRESULT blockmap_reader_create( BYTE *data, SIZE_T size, IAppxBlockMapReader **r
+ HRESULT validated_blockmap_reader_create( IStream *stream, const WCHAR *signature, IAppxBlockMapReader **reader );
+ HRESULT read_whole_stream( IStream *stream, SIZE_T max, BYTE **data, SIZE_T *size );
+ 
++/* ---- writer.c --------------------------------------------------------- */
++
++HRESULT package_writer_create( IStream *output, const APPX_PACKAGE_SETTINGS *settings, IAppxPackageWriter **writer );
++
+ /* ---- helpers ---------------------------------------------------------- */
+ 
+ static inline WCHAR *co_strdupW( const WCHAR *s )
+diff --git a/dlls/appxpackaging/writer.c b/dlls/appxpackaging/writer.c
+new file mode 100644
+index 0000000..605cebe
+--- /dev/null
++++ b/dlls/appxpackaging/writer.c
+@@ -0,0 +1,696 @@
++/*
++ * IAppxPackageWriter: writes an AppX/MSIX package
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * A package is a ZIP archive (an OPC package): the payload files as they are
++ * added, then AppxManifest.xml, AppxBlockMap.xml and [Content_Types].xml.
++ * Each file is written whole as it is added: its local header, its data --
++ * deflated with a full flush after every 64 KiB of input, so each block's
++ * compressed size is known for the block map -- and the central directory at
++ * Close. ZIP64 records are written for what does not fit 32 bits, unless the
++ * settings force ZIP32.
++ */
++
++#include <stdlib.h>
++#include "private.h"
++#include "bcrypt.h"
++#include "urlmon.h"
++#include "zlib.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(appx);
++
++#define BLOCK_SIZE 65536
++#define MAX_HASH   64
++
++struct written_file
++{
++    char *zip_name;             /* the part name as stored: '/'-separated, percent-encoded UTF-8 */
++    WCHAR *name;                /* as given, '\\'-separated */
++    BOOL in_blockmap;
++    UINT16 method;
++    UINT32 crc;
++    UINT64 size, compressed_size, offset;
++    UINT32 lfh_size;
++    unsigned int block_count;
++    BYTE *hashes;               /* block_count * hash_size */
++    UINT32 *block_sizes;        /* compressed, for a deflated file */
++};
++
++struct content_default
++{
++    WCHAR *extension;
++    WCHAR *type;
++};
++
++struct writer
++{
++    IAppxPackageWriter IAppxPackageWriter_iface;
++    LONG ref;
++    IStream *output;
++    BOOL zip32, closed, failed;
++    BCRYPT_ALG_HANDLE hash_alg;
++    ULONG hash_size;
++    const WCHAR *hash_uri;
++    UINT64 offset;              /* written so far */
++    unsigned int count;
++    struct written_file *files;
++    unsigned int default_count;
++    struct content_default *defaults;
++    unsigned int override_count;
++    struct content_default *overrides;  /* extension holds the part name */
++};
++
++static voidpf writer_zalloc( voidpf opaque, uInt items, uInt size )
++{
++    return (UINT64)items * size > 0x7fffffff ? NULL : malloc( items * size );
++}
++
++static void writer_zfree( voidpf opaque, voidpf address )
++{
++    free( address );
++}
++
++static void put16( BYTE *p, UINT16 v ) { p[0] = v; p[1] = v >> 8; }
++static void put32( BYTE *p, UINT32 v ) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
++static void put64( BYTE *p, UINT64 v ) { put32( p, v ); put32( p + 4, v >> 32 ); }
++
++static HRESULT write_out( struct writer *w, const void *data, SIZE_T size )
++{
++    const BYTE *p = data;
++    HRESULT hr;
++    ULONG done;
++
++    while (size)
++    {
++        ULONG chunk = size > 0x10000000 ? 0x10000000 : size;
++        if (FAILED(hr = IStream_Write( w->output, p, chunk, &done ))) return hr;
++        if (done != chunk) return STG_E_MEDIUMFULL;
++        p += chunk;
++        size -= chunk;
++        w->offset += chunk;
++    }
++    return S_OK;
++}
++
++/* a part name: the OPC form of a name, '/'-separated and percent-encoded where it must be */
++static char *zip_name_of( const WCHAR *name )
++{
++    static const char keep[] = "-._~!$&'()*+,;=:@/";
++    int len = WideCharToMultiByte( CP_UTF8, 0, name, -1, NULL, 0, NULL, NULL );
++    char *utf8, *out, *o;
++    const unsigned char *p;
++
++    if (!(utf8 = malloc( len ))) return NULL;
++    WideCharToMultiByte( CP_UTF8, 0, name, -1, utf8, len, NULL, NULL );
++    if (!(out = malloc( len * 3 + 1 ))) { free( utf8 ); return NULL; }
++    for (p = (const unsigned char *)utf8, o = out; *p; p++)
++    {
++        unsigned char c = *p == '\\' ? '/' : *p;
++        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || strchr( keep, c )) *o++ = c;
++        else o += sprintf( o, "%%%02X", c );
++    }
++    *o = 0;
++    free( utf8 );
++    return out;
++}
++
++static BOOL footprint_name( const WCHAR *name )
++{
++    static const WCHAR *const names[] =
++    {
++        L"AppxManifest.xml", L"AppxBlockMap.xml", L"AppxSignature.p7x", L"[Content_Types].xml",
++        L"AppxMetadata\\CodeIntegrity.cat", L"AppxMetadata\\ContentGroupMap.xml",
++        L"AppxMetadata\\AppxBundleManifest.xml",
++    };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(names); i++) if (!wcsicmp( names[i], name )) return TRUE;
++    return FALSE;
++}
++
++/* writes a file: compressed (or stored), hashed by block, its local header first */
++static HRESULT write_file( struct writer *w, const WCHAR *name, const BYTE *data, UINT64 size,
++                           APPX_COMPRESSION_OPTION option, BOOL in_blockmap )
++{
++    struct written_file *f, *files;
++    BYTE *compressed = NULL, header[30 + 20], *p;
++    UINT64 compressed_size = 0;
++    unsigned int i, name_len, extra_len = 0;
++    BOOL zip64;
++    HRESULT hr = S_OK;
++
++    if (!(files = realloc( w->files, (w->count + 1) * sizeof(*files) ))) return E_OUTOFMEMORY;
++    w->files = files;
++    f = &files[w->count];
++    memset( f, 0, sizeof(*f) );
++    /* [Content_Types].xml is not a part: its name is stored as it is */
++    if (!wcscmp( name, L"[Content_Types].xml" )) f->zip_name = strdup( "[Content_Types].xml" );
++    else f->zip_name = zip_name_of( name );
++    if (!f->zip_name || !(f->name = strdupW( name ))) goto oom;
++    f->in_blockmap = in_blockmap;
++    f->size = size;
++    f->offset = w->offset;
++    f->crc = crc32( 0, data, size );
++    f->block_count = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    if (f->block_count && !(f->hashes = malloc( (SIZE_T)f->block_count * w->hash_size ))) goto oom;
++    for (i = 0; i < f->block_count; i++)
++    {
++        UINT64 off = (UINT64)i * BLOCK_SIZE;
++        ULONG len = size - off < BLOCK_SIZE ? size - off : BLOCK_SIZE;
++        if (BCryptHash( w->hash_alg, NULL, 0, (BYTE *)data + off, len, f->hashes + (SIZE_T)i * w->hash_size, w->hash_size ))
++        { hr = E_FAIL; goto fail; }
++    }
++
++    if (option == APPX_COMPRESSION_OPTION_NONE)
++    {
++        f->method = 0;
++        compressed_size = size;
++    }
++    else
++    {
++        static const int levels[] = { 0, Z_DEFAULT_COMPRESSION, Z_BEST_COMPRESSION, 1, 1 };
++        z_stream z = { 0 };
++        UINT64 bound = size + size / 8 + 64 * (f->block_count + 1) + 1024;
++
++        f->method = 8;
++        if (!(compressed = malloc( bound ))) goto oom;
++        if (f->block_count && !(f->block_sizes = malloc( f->block_count * sizeof(*f->block_sizes) ))) goto oom;
++        z.zalloc = writer_zalloc;
++        z.zfree = writer_zfree;
++        if (deflateInit2( &z, levels[option], Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY ) != Z_OK) { hr = E_FAIL; goto fail; }
++        z.next_out = compressed;
++        z.avail_out = bound;
++        /* each block flushed on its own, so its compressed size is its own */
++        if (!f->block_count)
++        {
++            z.next_in = (BYTE *)data;
++            z.avail_in = 0;
++            if (deflate( &z, Z_FINISH ) != Z_STREAM_END) { deflateEnd( &z ); hr = E_FAIL; goto fail; }
++        }
++        for (i = 0; i < f->block_count; i++)
++        {
++            UINT64 off = (UINT64)i * BLOCK_SIZE, before = z.total_out;
++            ULONG len = size - off < BLOCK_SIZE ? size - off : BLOCK_SIZE;
++            int flush = i + 1 == f->block_count ? Z_FINISH : Z_FULL_FLUSH, ret;
++
++            z.next_in = (BYTE *)data + off;
++            z.avail_in = len;
++            ret = deflate( &z, flush );
++            if ((flush == Z_FINISH ? ret != Z_STREAM_END : ret != Z_OK) || z.avail_in)
++            {
++                deflateEnd( &z );
++                hr = E_FAIL;
++                goto fail;
++            }
++            f->block_sizes[i] = z.total_out - before;
++        }
++        compressed_size = z.total_out;
++        deflateEnd( &z );
++#ifdef SG_MUTANT_WRITER_STORE_ALL
++        f->method = 0;
++        compressed_size = size;
++#endif
++    }
++    f->compressed_size = compressed_size;
++
++    /* the local header; ZIP64 sizes in its extra field when they do not fit */
++    zip64 = !w->zip32 && (size >= 0xffffffff || compressed_size >= 0xffffffff);
++    if (w->zip32 && (size >= 0xffffffff || compressed_size >= 0xffffffff || f->offset >= 0xffffffff))
++    { hr = APPX_E_REQUESTED_RANGE_TOO_LARGE; goto fail; }
++    name_len = strlen( f->zip_name );
++    p = header;
++    put32( p, 0x04034b50 );
++    put16( p + 4, zip64 ? 45 : 20 );
++    put16( p + 6, 0x0800 );             /* UTF-8 names */
++    put16( p + 8, f->method );
++    put16( p + 10, 0 );
++    put16( p + 12, 0x21 );              /* 1980-01-01 */
++    put32( p + 14, f->crc );
++    put32( p + 18, zip64 ? 0xffffffff : compressed_size );
++    put32( p + 22, zip64 ? 0xffffffff : size );
++    put16( p + 26, name_len );
++    if (zip64)
++    {
++        extra_len = 20;
++        put16( p + 30, 1 );
++        put16( p + 32, 16 );
++        put64( p + 34, size );
++        put64( p + 42, compressed_size );
++    }
++    put16( p + 28, extra_len );
++    f->lfh_size = 30 + name_len + extra_len;
++    if (FAILED(hr = write_out( w, header, 30 )) || FAILED(hr = write_out( w, f->zip_name, name_len ))
++            || (extra_len && FAILED(hr = write_out( w, header + 30, extra_len )))
++            || FAILED(hr = write_out( w, f->method ? compressed : data, compressed_size )))
++        goto fail;
++    free( compressed );
++    w->count++;
++    return S_OK;
++
++oom:
++    hr = E_OUTOFMEMORY;
++fail:
++    free( compressed );
++    free( f->zip_name );
++    free( f->name );
++    free( f->hashes );
++    free( f->block_sizes );
++    return hr;
++}
++
++static void free_defaults( struct content_default *list, unsigned int count )
++{
++    unsigned int i;
++    for (i = 0; i < count; i++) { free( list[i].extension ); free( list[i].type ); }
++    free( list );
++}
++
++static HRESULT add_content_type( struct writer *w, const WCHAR *name, const WCHAR *type )
++{
++    const WCHAR *dot = wcsrchr( name, '.' ), *slash = wcsrchr( name, '\\' );
++    struct content_default *list;
++    unsigned int i;
++
++    /* one Default per extension; a part whose type differs from its extension's gets an Override */
++    if (dot && (!slash || dot > slash) && dot[1])
++    {
++        for (i = 0; i < w->default_count; i++)
++        {
++            if (wcsicmp( w->defaults[i].extension, dot + 1 )) continue;
++            if (!wcsicmp( w->defaults[i].type, type )) return S_OK;
++            break;
++        }
++        if (i == w->default_count)
++        {
++            if (!(list = realloc( w->defaults, (w->default_count + 1) * sizeof(*list) ))) return E_OUTOFMEMORY;
++            w->defaults = list;
++            list[w->default_count].extension = strdupW( dot + 1 );
++            list[w->default_count].type = strdupW( type );
++            if (!list[w->default_count].extension || !list[w->default_count].type) return E_OUTOFMEMORY;
++            w->default_count++;
++            return S_OK;
++        }
++    }
++    if (!(list = realloc( w->overrides, (w->override_count + 1) * sizeof(*list) ))) return E_OUTOFMEMORY;
++    w->overrides = list;
++    list[w->override_count].extension = strdupW( name );
++    list[w->override_count].type = strdupW( type );
++    if (!list[w->override_count].extension || !list[w->override_count].type) return E_OUTOFMEMORY;
++    w->override_count++;
++    return S_OK;
++}
++
++/* ---- text building ------------------------------------------------------- */
++
++struct text
++{
++    char *data;
++    SIZE_T len, size;
++};
++
++static BOOL text_add( struct text *t, const char *s )
++{
++    SIZE_T len = strlen( s );
++    if (t->len + len + 1 > t->size)
++    {
++        SIZE_T size = max( t->size * 2, t->len + len + 1024 );
++        char *data = realloc( t->data, size );
++        if (!data) return FALSE;
++        t->data = data;
++        t->size = size;
++    }
++    memcpy( t->data + t->len, s, len + 1 );
++    t->len += len;
++    return TRUE;
++}
++
++/* a string for an attribute: UTF-8, with the XML specials escaped */
++static BOOL text_add_attr( struct text *t, const WCHAR *s )
++{
++    int len = WideCharToMultiByte( CP_UTF8, 0, s, -1, NULL, 0, NULL, NULL );
++    char *utf8 = malloc( len ), *p;
++    BOOL ret = TRUE;
++    char one[2] = { 0 };
++
++    if (!utf8) return FALSE;
++    WideCharToMultiByte( CP_UTF8, 0, s, -1, utf8, len, NULL, NULL );
++    for (p = utf8; *p && ret; p++)
++    {
++        switch (*p)
++        {
++        case '&': ret = text_add( t, "&amp;" ); break;
++        case '<': ret = text_add( t, "&lt;" ); break;
++        case '>': ret = text_add( t, "&gt;" ); break;
++        case '"': ret = text_add( t, "&quot;" ); break;
++        default: one[0] = *p; ret = text_add( t, one ); break;
++        }
++    }
++    free( utf8 );
++    return ret;
++}
++
++static BOOL base64_add( struct text *t, const BYTE *data, ULONG size )
++{
++    static const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    char out[5] = { 0 };
++    ULONG i;
++
++    for (i = 0; i < size; i += 3)
++    {
++        UINT32 v = data[i] << 16 | (i + 1 < size ? data[i + 1] << 8 : 0) | (i + 2 < size ? data[i + 2] : 0);
++        out[0] = chars[(v >> 18) & 63];
++        out[1] = chars[(v >> 12) & 63];
++        out[2] = i + 1 < size ? chars[(v >> 6) & 63] : '=';
++        out[3] = i + 2 < size ? chars[v & 63] : '=';
++        if (!text_add( t, out )) return FALSE;
++    }
++    return TRUE;
++}
++
++static HRESULT build_blockmap( struct writer *w, struct text *t )
++{
++    char buf[128];
++    unsigned int i, b;
++    WCHAR uri[80];
++
++    lstrcpynW( uri, w->hash_uri, ARRAY_SIZE(uri) );
++    if (!text_add( t, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>"
++                   "<BlockMap xmlns=\"http://schemas.microsoft.com/appx/2010/blockmap\" HashMethod=\"" )
++            || !text_add_attr( t, uri ) || !text_add( t, "\">" ))
++        return E_OUTOFMEMORY;
++    for (i = 0; i < w->count; i++)
++    {
++        const struct written_file *f = &w->files[i];
++
++        if (!f->in_blockmap) continue;
++        if (!text_add( t, "<File Name=\"" ) || !text_add_attr( t, f->name )) return E_OUTOFMEMORY;
++        sprintf( buf, "\" Size=\"%I64u\" LfhSize=\"%u\"%s", f->size, f->lfh_size, f->block_count ? ">" : "/>" );
++        if (!text_add( t, buf )) return E_OUTOFMEMORY;
++        for (b = 0; b < f->block_count; b++)
++        {
++            if (!text_add( t, "<Block Hash=\"" ) || !base64_add( t, f->hashes + (SIZE_T)b * w->hash_size, w->hash_size ))
++                return E_OUTOFMEMORY;
++            if (f->method) sprintf( buf, "\" Size=\"%u\"/>", f->block_sizes[b] );
++            else strcpy( buf, "\"/>" );
++            if (!text_add( t, buf )) return E_OUTOFMEMORY;
++        }
++        if (f->block_count && !text_add( t, "</File>" )) return E_OUTOFMEMORY;
++    }
++    return text_add( t, "</BlockMap>" ) ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT build_content_types( struct writer *w, struct text *t )
++{
++    unsigned int i;
++
++    if (!text_add( t, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
++                   "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" ))
++        return E_OUTOFMEMORY;
++    for (i = 0; i < w->default_count; i++)
++    {
++        if (!text_add( t, "<Default Extension=\"" ) || !text_add_attr( t, w->defaults[i].extension )
++                || !text_add( t, "\" ContentType=\"" ) || !text_add_attr( t, w->defaults[i].type ) || !text_add( t, "\"/>" ))
++            return E_OUTOFMEMORY;
++    }
++    for (i = 0; i < w->override_count; i++)
++    {
++        char *part = zip_name_of( w->overrides[i].extension );
++        WCHAR *wpart;
++        int len;
++        BOOL ok;
++
++        if (!part) return E_OUTOFMEMORY;
++        len = MultiByteToWideChar( CP_UTF8, 0, part, -1, NULL, 0 );
++        if (!(wpart = malloc( len * sizeof(WCHAR) ))) { free( part ); return E_OUTOFMEMORY; }
++        MultiByteToWideChar( CP_UTF8, 0, part, -1, wpart, len );
++        ok = text_add( t, "<Override PartName=\"/" ) && text_add_attr( t, wpart ) && text_add( t, "\" ContentType=\"" )
++             && text_add_attr( t, w->overrides[i].type ) && text_add( t, "\"/>" );
++        free( wpart );
++        free( part );
++        if (!ok) return E_OUTOFMEMORY;
++    }
++    return text_add( t, "</Types>" ) ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT write_central_directory( struct writer *w )
++{
++    UINT64 start = w->offset, size;
++    BYTE rec[46 + 28], end64[56 + 20], end[22];
++    unsigned int i;
++    BOOL zip64_end = FALSE;
++    HRESULT hr;
++
++    for (i = 0; i < w->count; i++)
++    {
++        const struct written_file *f = &w->files[i];
++        BOOL big = f->size >= 0xffffffff || f->compressed_size >= 0xffffffff || f->offset >= 0xffffffff;
++        unsigned int name_len = strlen( f->zip_name ), extra = 0;
++
++        put32( rec, 0x02014b50 );
++        put16( rec + 4, big ? 45 : 20 );
++        put16( rec + 6, big ? 45 : 20 );
++        put16( rec + 8, 0x0800 );
++        put16( rec + 10, f->method );
++        put16( rec + 12, 0 );
++        put16( rec + 14, 0x21 );
++        put32( rec + 16, f->crc );
++        put32( rec + 20, big ? 0xffffffff : f->compressed_size );
++        put32( rec + 24, big ? 0xffffffff : f->size );
++        put16( rec + 28, name_len );
++        put16( rec + 32, 0 );
++        put16( rec + 34, 0 );
++        put16( rec + 36, 0 );
++        put32( rec + 38, 0 );
++        put32( rec + 42, big ? 0xffffffff : f->offset );
++        if (big)
++        {
++            extra = 28;
++            put16( rec + 46, 1 );
++            put16( rec + 48, 24 );
++            put64( rec + 50, f->size );
++            put64( rec + 58, f->compressed_size );
++            put64( rec + 66, f->offset );
++            zip64_end = TRUE;
++        }
++        put16( rec + 30, extra );
++        if (FAILED(hr = write_out( w, rec, 46 )) || FAILED(hr = write_out( w, f->zip_name, name_len ))
++                || (extra && FAILED(hr = write_out( w, rec + 46, extra ))))
++            return hr;
++    }
++    size = w->offset - start;
++    if (w->count >= 0xffff || start >= 0xffffffff || size >= 0xffffffff) zip64_end = TRUE;
++    if (zip64_end && w->zip32) return APPX_E_REQUESTED_RANGE_TOO_LARGE;
++    if (zip64_end)
++    {
++        UINT64 end64_offset = w->offset;
++
++        put32( end64, 0x06064b50 );
++        put64( end64 + 4, 44 );
++        put16( end64 + 12, 45 );
++        put16( end64 + 14, 45 );
++        put32( end64 + 16, 0 );
++        put32( end64 + 20, 0 );
++        put64( end64 + 24, w->count );
++        put64( end64 + 32, w->count );
++        put64( end64 + 40, size );
++        put64( end64 + 48, start );
++        put32( end64 + 56, 0x07064b50 );
++        put32( end64 + 60, 0 );
++        put64( end64 + 64, end64_offset );
++        put32( end64 + 72, 1 );
++        if (FAILED(hr = write_out( w, end64, 76 ))) return hr;
++    }
++    put32( end, 0x06054b50 );
++    put16( end + 4, 0 );
++    put16( end + 6, 0 );
++    put16( end + 8, w->count >= 0xffff ? 0xffff : w->count );
++    put16( end + 10, w->count >= 0xffff ? 0xffff : w->count );
++    put32( end + 12, size >= 0xffffffff ? 0xffffffff : size );
++    put32( end + 16, start >= 0xffffffff ? 0xffffffff : start );
++    put16( end + 20, 0 );
++    return write_out( w, end, 22 );
++}
++
++/* ---- IAppxPackageWriter ---------------------------------------------------- */
++
++static inline struct writer *impl_from_IAppxPackageWriter( IAppxPackageWriter *iface )
++{
++    return CONTAINING_RECORD( iface, struct writer, IAppxPackageWriter_iface );
++}
++
++static HRESULT WINAPI writer_QueryInterface( IAppxPackageWriter *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAppxPackageWriter ))
++    {
++        *out = iface;
++        IAppxPackageWriter_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "%s not implemented.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI writer_AddRef( IAppxPackageWriter *iface )
++{
++    return InterlockedIncrement( &impl_from_IAppxPackageWriter( iface )->ref );
++}
++
++static ULONG WINAPI writer_Release( IAppxPackageWriter *iface )
++{
++    struct writer *w = impl_from_IAppxPackageWriter( iface );
++    ULONG ref = InterlockedDecrement( &w->ref );
++    unsigned int i;
++
++    if (!ref)
++    {
++        for (i = 0; i < w->count; i++)
++        {
++            free( w->files[i].zip_name );
++            free( w->files[i].name );
++            free( w->files[i].hashes );
++            free( w->files[i].block_sizes );
++        }
++        free( w->files );
++        free_defaults( w->defaults, w->default_count );
++        free_defaults( w->overrides, w->override_count );
++        IStream_Release( w->output );
++        free( w );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI writer_AddPayloadFile( IAppxPackageWriter *iface, LPCWSTR name, LPCWSTR content_type,
++                                             APPX_COMPRESSION_OPTION option, IStream *input )
++{
++    struct writer *w = impl_from_IAppxPackageWriter( iface );
++    unsigned int i;
++    BYTE *data;
++    SIZE_T size;
++    HRESULT hr;
++
++    TRACE( "iface %p, name %s, content_type %s, option %d, input %p.\n", iface, debugstr_w( name ),
++           debugstr_w( content_type ), option, input );
++    if (!name || !content_type || !input) return E_INVALIDARG;
++    if (w->closed || w->failed) return E_UNEXPECTED;
++    if ((unsigned int)option > APPX_COMPRESSION_OPTION_SUPERFAST) return E_INVALIDARG;
++    /* a payload file is neither a footprint file nor an absolute, empty or repeated name */
++    if (!name[0] || name[0] == '\\' || name[0] == '/' || wcschr( name, '/' ) || footprint_name( name )) return E_INVALIDARG;
++    for (i = 0; i < w->count; i++) if (!wcsicmp( w->files[i].name, name )) return E_INVALIDARG;
++
++    if (FAILED(hr = read_whole_stream( input, (SIZE_T)1 << 31, &data, &size ))) return hr;
++    if (SUCCEEDED(hr = add_content_type( w, name, content_type )))
++        hr = write_file( w, name, data, size, option, TRUE );
++    free( data );
++    /* a half-written file leaves the package unusable */
++    if (FAILED(hr) && hr != E_INVALIDARG) w->failed = TRUE;
++    return hr;
++}
++
++static HRESULT WINAPI writer_Close( IAppxPackageWriter *iface, IStream *manifest )
++{
++    struct writer *w = impl_from_IAppxPackageWriter( iface );
++    struct text blockmap = { 0 }, types = { 0 };
++    IAppxManifestReader *reader;
++    BYTE *data;
++    SIZE_T size;
++    HRESULT hr;
++
++    TRACE( "iface %p, manifest %p.\n", iface, manifest );
++    if (!manifest) return E_INVALIDARG;
++    if (w->closed || w->failed) return E_UNEXPECTED;
++
++    /* the manifest must be one the reader takes */
++    if (FAILED(hr = read_whole_stream( manifest, 16 * 1024 * 1024, &data, &size ))) return hr;
++    if (FAILED(hr = manifest_reader_create( data, size, &reader )))
++    {
++        free( data );
++        return hr;
++    }
++    IAppxManifestReader_Release( reader );
++    w->closed = TRUE;
++    hr = write_file( w, L"AppxManifest.xml", data, size, APPX_COMPRESSION_OPTION_NORMAL, TRUE );
++    free( data );
++    if (SUCCEEDED(hr)) hr = build_blockmap( w, &blockmap );
++    if (SUCCEEDED(hr)) hr = write_file( w, L"AppxBlockMap.xml", (BYTE *)blockmap.data, blockmap.len,
++                                        APPX_COMPRESSION_OPTION_NORMAL, FALSE );
++    if (SUCCEEDED(hr)) hr = add_content_type( w, L"AppxManifest.xml", L"application/vnd.ms-appx.manifest+xml" );
++    if (SUCCEEDED(hr)) hr = add_content_type( w, L"AppxBlockMap.xml", L"application/vnd.ms-appx.blockmap+xml" );
++    if (SUCCEEDED(hr)) hr = build_content_types( w, &types );
++    if (SUCCEEDED(hr)) hr = write_file( w, L"[Content_Types].xml", (BYTE *)types.data, types.len,
++                                        APPX_COMPRESSION_OPTION_NORMAL, FALSE );
++    if (SUCCEEDED(hr)) hr = write_central_directory( w );
++    if (SUCCEEDED(hr)) IStream_Commit( w->output, STGC_DEFAULT );
++    free( blockmap.data );
++    free( types.data );
++    if (FAILED(hr)) w->failed = TRUE;
++    return hr;
++}
++
++static const IAppxPackageWriterVtbl writer_vtbl =
++{
++    writer_QueryInterface, writer_AddRef, writer_Release,
++    writer_AddPayloadFile, writer_Close,
++};
++
++HRESULT package_writer_create( IStream *output, const APPX_PACKAGE_SETTINGS *settings, IAppxPackageWriter **out )
++{
++    struct writer *w;
++    BSTR uri = NULL;
++
++    *out = NULL;
++    if (!(w = calloc( 1, sizeof(*w) ))) return E_OUTOFMEMORY;
++    w->IAppxPackageWriter_iface.lpVtbl = &writer_vtbl;
++    w->ref = 1;
++    w->output = output;
++    IStream_AddRef( output );
++    w->zip32 = settings->forceZip32;
++    w->hash_alg = BCRYPT_SHA256_ALG_HANDLE;
++    w->hash_size = 32;
++    w->hash_uri = L"http://www.w3.org/2001/04/xmlenc#sha256";
++    /* the hash method: SHA-256 (the default), SHA-384 or SHA-512 */
++    if (settings->hashMethod && SUCCEEDED(IUri_GetAbsoluteUri( settings->hashMethod, &uri )))
++    {
++        if (!wcscmp( uri, L"http://www.w3.org/2001/04/xmldsig-more#sha384" ))
++        {
++            w->hash_alg = BCRYPT_SHA384_ALG_HANDLE;
++            w->hash_size = 48;
++            w->hash_uri = L"http://www.w3.org/2001/04/xmldsig-more#sha384";
++        }
++        else if (!wcscmp( uri, L"http://www.w3.org/2001/04/xmlenc#sha512" ))
++        {
++            w->hash_alg = BCRYPT_SHA512_ALG_HANDLE;
++            w->hash_size = 64;
++            w->hash_uri = L"http://www.w3.org/2001/04/xmlenc#sha512";
++        }
++        else if (wcscmp( uri, L"http://www.w3.org/2001/04/xmlenc#sha256" ))
++        {
++            WARN( "hash method %s\n", debugstr_w( uri ) );
++            SysFreeString( uri );
++            IAppxPackageWriter_Release( &w->IAppxPackageWriter_iface );
++            return E_INVALIDARG;
++        }
++        SysFreeString( uri );
++    }
++    *out = &w->IAppxPackageWriter_iface;
++    return S_OK;
++}
+diff --git a/include/appxpackaging.idl b/include/appxpackaging.idl
+index 18d804f..d38060e 100644
+--- a/include/appxpackaging.idl
++++ b/include/appxpackaging.idl
+@@ -90,6 +90,18 @@ interface IAppxManifestDeviceCapabilitiesEnumerator;
+ interface IAppxBlockMapFile;
+ interface IAppxBlockMapBlock;
+ 
++[
++    object,
++    uuid(9099e33b-246f-41e4-881a-008eb613f858),
++    local
++]
++interface IAppxPackageWriter : IUnknown
++{
++    HRESULT AddPayloadFile([in, string] LPCWSTR file_name, [in, string] LPCWSTR content_type,
++                           [in] APPX_COMPRESSION_OPTION compression_option, [in] IStream *input_stream);
++    HRESULT Close([in] IStream *manifest);
++}
++
+ [
+     object,
+     uuid(75cf3930-3244-4fe0-a8c8-e0bcb270b889),
