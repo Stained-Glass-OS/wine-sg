@@ -13,7 +13,8 @@
 #    outside them (0231);
 #  - Direct3D 11 devices are ID3D11Device5, immediate contexts
 #    ID3D11DeviceContext4, DXGI devices IDXGIDevice4 (0232);
-#  - WIC converts 32bppBGRA to 64bppPRGBAHalf with the right linear values,
+#  - WIC converts 32bppBGRA to 64bppPRGBAHalf with the right linear values
+#    (WICConvertBitmapSource's CanConvert to a wide format crashed, 6049),
 #    and Direct2D makes a bitmap of that format (0230, 0229);
 #  - SetWindowFeedbackSetting is kept and GetWindowFeedbackSetting reads it
 #    back (0233).
