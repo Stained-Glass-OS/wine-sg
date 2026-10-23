@@ -154,18 +154,36 @@ expect "$out" family 1 "once"
 out=$(user sparse-probe.exe status "$FAMILY")
 expect "$out" package.0 "$FULL" "$SG_OTHER walks the machine's package as Dropbox does"
 expect "$out" status2.0 00000000 "its status has IPackageStatus2"
-# a stale registration of the family for the user (an update's, whose files are gone): one version shows
-STALE="StainedGlass.SysTest_2.0.0.0_x64__${FAMILY##*_}"
-SK="HKCU\\Software\\Wine\\AppModel\\Packages\\$STALE"
-user reg add "$SK" /v Name /d StainedGlass.SysTest /f >/dev/null
-user reg add "$SK" /v Publisher /d "$PUB" /f >/dev/null
-user reg add "$SK" /v FamilyName /d "$FAMILY" /f >/dev/null
-user reg add "$SK" /v InstallLocation /d 'C:\NoSuchFolder\gone' /f >/dev/null
-user reg add "$SK" /v Version /t REG_QWORD /d 0x0002000000000000 /f >/dev/null
+# an older registration of the family for the user beside the machine's: one version shows
+OLD="StainedGlass.SysTest_0.9.0.0_x64__${FAMILY##*_}"
+SK="HKCU\\Software\\Wine\\AppModel\\Packages\\$OLD"
+fake_record() {   # fake_record KEY INSTALLLOCATION VERSION
+    user reg add "$1" /v Name /d StainedGlass.SysTest /f >/dev/null
+    user reg add "$1" /v Publisher /d "$PUB" /f >/dev/null
+    user reg add "$1" /v FamilyName /d "$FAMILY" /f >/dev/null
+    user reg add "$1" /v InstallLocation /d "$2" /f >/dev/null
+    user reg add "$1" /v Version /t REG_QWORD /d "$3" /f >/dev/null
+}
+fake_record "$SK" 'C:\Data' 0x0000000900000000
 out=$(user sparse-probe.exe status "$FAMILY")
-expect "$out" count 1 "with a stale newer registration of the user's beside it, the family shows once"
-expect "$out" package.0 "$FULL" "as the version whose content is there"
+expect "$out" count 1 "with an older registration of the user's beside it, the family shows once"
+expect "$out" package.0 "$FULL" "as the newest version"
 user reg delete "$SK" /f >/dev/null
+# a registration of the user's whose content is gone is dropped at the user's next start
+GONE="StainedGlass.SysTest_2.0.0.0_x64__${FAMILY##*_}"
+GK="HKCU\\Software\\Wine\\AppModel\\Packages\\$GONE"
+fake_record "$GK" 'C:\NoSuchFolder\gone' 0x0002000000000000
+out=$(user sparse-probe.exe status "$FAMILY")
+expect "$out" count 1 "a registration whose files are gone is not listed"
+user reg query "$GK" 2>/dev/null | grep -q '^HKEY' && fail "and it is still recorded" || pass "and it is dropped (AppReadiness-like)"
+# a sparse package's registration whose own folder is gone but whose external content is there stays
+SPK="HKCU\\Software\\Wine\\AppModel\\Packages\\StainedGlass.SysTest_3.0.0.0_x64__${FAMILY##*_}"
+fake_record "$SPK" 'C:\NoSuchFolder\gone3' 0x0003000000000000
+user reg add "$SPK" /v ExternalLocation /d 'C:\SysApp' /f >/dev/null
+user sparse-probe.exe status "$FAMILY" >/dev/null
+user reg query "$SPK" 2>/dev/null | grep -q '^HKEY' && pass "a sparse registration whose external content is there is kept" ||
+    fail "the sparse registration was dropped"
+user reg delete "$SPK" /f >/dev/null
 out=$(user 'C:\SysApp\sys-app.exe' identity)
 expect "$out" identity "$FULL" "the program in its external location has the package identity for $SG_OTHER"
 out=$(user pkgverb-probe.exe create "$C1")
@@ -186,6 +204,17 @@ haskey "HKLM\\Software\\Wine\\AppModel\\Packages\\$FULL" && fail "the record is 
 [ -f "$C/ProgramData/Microsoft/Windows/Start Menu/Programs/Sys test app.lnk" ] && fail "the Start menu entry stays" ||
     pass "its Start menu entry goes"
 haskey "HKLM\\Software\\Classes\\CLSID\\$C1" && fail "the class stays" || pass "its class goes"
+# the user's own registration of the removed package goes at their next start, its Start entry too
+UK="HKCU\\Software\\Wine\\AppModel\\Packages\\$FULL"
+fake_record "$UK" 'C:\SysApp' 0x0001000000000000
+LNK="$C/users/$SG_OTHER/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Sys user.lnk"
+sudo -n -u "$SG_OTHER" mkdir -p "$(dirname "$LNK")" && sudo -n -u "$SG_OTHER" sh -c "echo x > '$LNK'"
+user reg add "$UK" /v Shortcuts /t REG_MULTI_SZ /d "C:\\users\\$SG_OTHER\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Sys user.lnk" /f >/dev/null
+out=$(user sparse-probe.exe status "$FAMILY")
+expect "$out" count 0 "a package SYSTEM removed for all users is gone for $SG_OTHER"
+user reg query "$UK" 2>/dev/null | grep -q '^HKEY' && fail "$SG_OTHER's registration is still recorded" ||
+    pass "$SG_OTHER's own registration of it is dropped at their next start"
+[ -f "$LNK" ] && fail "their Start menu entry stays" || pass "with their Start menu entry"
 out=$(user pkgverb-probe.exe menu 'C:\Data\a.txt')
 lacks "$out" "item=SG Package Verb|enabled" "$SG_OTHER's menu no longer has the command"
 
