@@ -29,3 +29,12 @@ c.Execute "DELETE FROM People WHERE Id = 99"
 WScript.Echo "second_execute=" & Hex(Err.Number) : Err.Clear
 c.Close
 WScript.Echo "close=" & Hex(Err.Number)
+' connections that were never opened, or failed to open, go away cleanly
+For i = 1 To 20
+  Set c2 = CreateObject("ADODB.Connection")
+  c2.ConnectionString = "Driver={No Such Driver}"
+  If i Mod 2 = 0 Then c2.Open
+  Err.Clear
+  Set c2 = Nothing
+Next
+WScript.Echo "released=" & Hex(Err.Number)

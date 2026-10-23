@@ -30,11 +30,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 mkdir -p "$WINEPREFIX"
-"$MINGW" -O2 -shared -o "$T/adomock.dll" "$HERE/adomock-driver.c" || { fail "the driver did not build"; exit 1; }
+"$MINGW" -O2 -shared -o "$T/adomock.dll" "$HERE/adomock-driver.c" &&
+"$MINGW" -O2 -o "$T/adorelease-probe.exe" "$HERE/adorelease-probe.c" -lole32 -luuid || { fail "the driver did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 C="$WINEPREFIX/drive_c"
-cp "$T/adomock.dll" "$C/"
+cp "$T/adomock.dll" "$T/adorelease-probe.exe" "$C/"
 cp "$HERE/adoodbc.vbs" "$C/"
 timeout -s KILL 60 "$WINE" reg add 'HKLM\Software\ODBC\ODBCINST.INI\SG ADO Mock' /v Driver /d 'C:\adomock.dll' /f >/dev/null 2>&1
 timeout -s KILL 60 "$WINE" reg add 'HKLM\Software\ODBC\ODBCINST.INI\ODBC Drivers' /v 'SG ADO Mock' /d Installed /f >/dev/null 2>&1
@@ -58,6 +59,9 @@ expect collect_put_err 0 "rs(\"Age\") = 5 sets the field's value"
 expect collect_put 5 "which reads back"
 expect second_execute 0 "a later command still runs on the connection"
 expect close 0 "Close"
+expect released 0 "connections never opened, or failed to open, are released (6033)"
+out=$(cd "$C" && timeout -s KILL 60 "$WINE" adorelease-probe.exe 2>/dev/null </dev/null | tr -d '\r')
+expect released ok "64 connections never opened are released, the heap full of stale data (6033)"
 log=$(tr -d '\r' < "$C/adomock.log" 2>/dev/null)
 n_before=$(printf '%s\n' "$log" | sed -n '/DELETE FROM People/q;p' | grep -c DISCONNECT)
 [ "$n_before" = 0 ] && pass "the driver is not disconnected while the connection is open" ||
