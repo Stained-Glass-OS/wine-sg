@@ -1,0 +1,1207 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] appxpackaging: Block map readers and device capabilities (6055)
+
+IAppxPackageReader::GetBlockMap, IAppxBundleReader::GetBlockMap,
+IAppxFactory::CreateBlockMapReader and CreateValidatedBlockMapReader, and
+IAppxManifestReader::GetDeviceCapabilities gave E_NOTIMPL. Package tools
+and installers read a package's block map to check its files, and its
+device capabilities to show what it uses.
+
+The block map interfaces (IAppxBlockMapReader, IAppxBlockMapFile,
+IAppxBlockMapBlock and their enumerators) and
+IAppxManifestDeviceCapabilitiesEnumerator are declared in
+appxpackaging.idl. New blockmap.c reads AppxBlockMap.xml: its files with
+their sizes and local file header sizes, their blocks' hashes and
+compressed sizes, the hash method URI and the XML itself;
+ValidateFileHash checks a stream against a file's blocks. A validated
+reader also checks the block map's digest in the package signature
+(AppxSignature.p7x) and that signature. The manifest reader keeps its
+DeviceCapability names.
+---
+diff --git a/dlls/appxpackaging/Makefile.in b/dlls/appxpackaging/Makefile.in
+index 613db3a..4f3bdcb 100644
+--- a/dlls/appxpackaging/Makefile.in
++++ b/dlls/appxpackaging/Makefile.in
+@@ -1,8 +1,9 @@
+ MODULE    = appxpackaging.dll
+-IMPORTS   = $(ZLIB_PE_LIBS) uuid ole32 oleaut32 xmllite bcrypt
++IMPORTS   = $(ZLIB_PE_LIBS) uuid ole32 oleaut32 xmllite bcrypt crypt32 urlmon
+ EXTRAINCL = $(ZLIB_PE_CFLAGS)
+ 
+ SOURCES = \
++	blockmap.c \
+ 	classes.idl \
+ 	main.c \
+ 	manifest.c \
+diff --git a/dlls/appxpackaging/blockmap.c b/dlls/appxpackaging/blockmap.c
+new file mode 100644
+index 0000000..889f37e
+--- /dev/null
++++ b/dlls/appxpackaging/blockmap.c
+@@ -0,0 +1,851 @@
++/*
++ * IAppxBlockMapReader: a package's block map, read on its own or from a package
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * The block map (AppxBlockMap.xml) names every file of a package with its
++ * size, the size of its ZIP local file header, and the hash (and, for
++ * compressed files, the compressed size) of each 64 KiB block. A validated
++ * reader also checks the block map's digest in the package signature
++ * (AppxSignature.p7x: "PKCX" and a PKCS #7 message whose indirect data holds
++ * the AXBM digest) and that message's signature.
++ */
++
++#include <stdlib.h>
++#include "private.h"
++#include "bcrypt.h"
++#include "wincrypt.h"
++#include "xmllite.h"
++#include "urlmon.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(appx);
++
++#define BLOCK_SIZE 65536
++#define MAX_HASH   64
++
++struct bm_block
++{
++    BYTE hash[MAX_HASH];
++    UINT32 compressed_size;
++};
++
++struct bm_file
++{
++    WCHAR *name;
++    UINT64 size;
++    UINT32 lfh_size;
++    unsigned int block_count;
++    struct bm_block *blocks;
++};
++
++struct blockmap
++{
++    IAppxBlockMapReader IAppxBlockMapReader_iface;
++    LONG ref;
++    BYTE *data;                 /* the XML */
++    SIZE_T size;
++    WCHAR *hash_method;
++    BCRYPT_ALG_HANDLE hash_alg;
++    ULONG hash_size;
++    unsigned int file_count;
++    struct bm_file *files;
++};
++
++static void blockmap_free( struct blockmap *bm )
++{
++    unsigned int i;
++
++    for (i = 0; i < bm->file_count; i++)
++    {
++        free( bm->files[i].name );
++        free( bm->files[i].blocks );
++    }
++    free( bm->files );
++    free( bm->hash_method );
++    free( bm->data );
++    free( bm );
++}
++
++static int b64val( WCHAR c )
++{
++    if (c >= 'A' && c <= 'Z') return c - 'A';
++    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
++    if (c >= '0' && c <= '9') return c - '0' + 52;
++    if (c == '+') return 62;
++    if (c == '/') return 63;
++    return -1;
++}
++
++static BOOL base64_decode( const WCHAR *s, BYTE *out, ULONG size )
++{
++    ULONG n = 0;
++    UINT32 acc = 0;
++    int bits = 0, v;
++
++    for (; *s && *s != '='; s++)
++    {
++        if ((v = b64val( *s )) < 0) return FALSE;
++        acc = (acc << 6) | v;
++        bits += 6;
++        if (bits >= 8)
++        {
++            bits -= 8;
++            if (n >= size) return FALSE;
++            out[n++] = acc >> bits;
++        }
++    }
++    return n == size;
++}
++
++static HRESULT attr( IXmlReader *reader, const WCHAR *name, const WCHAR **value )
++{
++    HRESULT hr = IXmlReader_MoveToAttributeByName( reader, name, NULL );
++    *value = NULL;
++    if (hr != S_OK) return S_FALSE;
++    return IXmlReader_GetValue( reader, value, NULL );
++}
++
++static BOOL parse_u64( const WCHAR *text, UINT64 *value )
++{
++    WCHAR *end;
++
++    if (!text || !text[0]) return FALSE;
++    *value = _wcstoui64( text, &end, 10 );
++    return !*end;
++}
++
++static HRESULT parse( struct blockmap *bm )
++{
++    struct bm_file *cur = NULL;
++    unsigned int blocks_seen = 0;
++    BOOL have_root = FALSE;
++    IXmlReader *reader = NULL;
++    IStream *stream = NULL;
++    XmlNodeType type;
++    HGLOBAL mem;
++    HRESULT hr;
++
++    if (!(mem = GlobalAlloc( GMEM_MOVEABLE, bm->size ? bm->size : 1 ))) return E_OUTOFMEMORY;
++    memcpy( GlobalLock( mem ), bm->data, bm->size );
++    GlobalUnlock( mem );
++    if (FAILED(hr = CreateStreamOnHGlobal( mem, TRUE, &stream )))
++    {
++        GlobalFree( mem );
++        return hr;
++    }
++    if (SUCCEEDED(hr = CreateXmlReader( &IID_IXmlReader, (void **)&reader, NULL )))
++    {
++        IXmlReader_SetProperty( reader, XmlReaderProperty_DtdProcessing, DtdProcessing_Prohibit );
++        hr = IXmlReader_SetInput( reader, (IUnknown *)stream );
++    }
++
++    while (SUCCEEDED(hr) && (hr = IXmlReader_Read( reader, &type )) == S_OK)
++    {
++        const WCHAR *name, *value;
++        UINT depth;
++
++        if (FAILED(hr = IXmlReader_GetDepth( reader, &depth ))) break;
++        if (type == XmlNodeType_EndElement)
++        {
++            if (cur && depth == 1)
++            {
++                if (blocks_seen != cur->block_count) { hr = APPX_E_INVALID_BLOCKMAP; break; }
++                cur = NULL;
++            }
++            continue;
++        }
++        if (type != XmlNodeType_Element) continue;
++        if (FAILED(hr = IXmlReader_GetLocalName( reader, &name, NULL ))) break;
++
++        if (depth == 0)
++        {
++            if (wcscmp( name, L"BlockMap" )) { hr = APPX_E_INVALID_BLOCKMAP; break; }
++            have_root = TRUE;
++            if (FAILED(hr = attr( reader, L"HashMethod", &value ))) break;
++            if (value && !wcscmp( value, L"http://www.w3.org/2001/04/xmlenc#sha256" ))
++            { bm->hash_alg = BCRYPT_SHA256_ALG_HANDLE; bm->hash_size = 32; }
++            else if (value && !wcscmp( value, L"http://www.w3.org/2001/04/xmldsig-more#sha384" ))
++            { bm->hash_alg = BCRYPT_SHA384_ALG_HANDLE; bm->hash_size = 48; }
++            else if (value && !wcscmp( value, L"http://www.w3.org/2001/04/xmlenc#sha512" ))
++            { bm->hash_alg = BCRYPT_SHA512_ALG_HANDLE; bm->hash_size = 64; }
++            else { WARN( "hash method %s\n", debugstr_w( value ) ); hr = APPX_E_INVALID_BLOCKMAP; break; }
++            if (!(bm->hash_method = strdupW( value ))) { hr = E_OUTOFMEMORY; break; }
++        }
++        else if (depth == 1 && !wcscmp( name, L"File" ))
++        {
++            struct bm_file *files;
++            UINT64 size, lfh = 0;
++            BOOL empty = IXmlReader_IsEmptyElement( reader );
++            unsigned int i;
++
++            if (attr( reader, L"Size", &value ) != S_OK || !parse_u64( value, &size )) { hr = APPX_E_INVALID_BLOCKMAP; break; }
++            if (attr( reader, L"LfhSize", &value ) == S_OK && value && !parse_u64( value, &lfh ))
++            { hr = APPX_E_INVALID_BLOCKMAP; break; }
++            if (attr( reader, L"Name", &value ) != S_OK || !value || !value[0]) { hr = APPX_E_INVALID_BLOCKMAP; break; }
++            for (i = 0; i < bm->file_count; i++)
++                if (!wcsicmp( bm->files[i].name, value )) break;
++            if (i < bm->file_count || bm->file_count >= 0x100000 || size > ((UINT64)1 << 40))
++            { hr = APPX_E_INVALID_BLOCKMAP; break; }
++            if (!(files = realloc( bm->files, (bm->file_count + 1) * sizeof(*files) ))) { hr = E_OUTOFMEMORY; break; }
++            bm->files = files;
++            cur = &files[bm->file_count];
++            memset( cur, 0, sizeof(*cur) );
++            if (!(cur->name = strdupW( value ))) { hr = E_OUTOFMEMORY; break; }
++            bm->file_count++;
++            cur->size = size;
++            cur->lfh_size = lfh;
++            cur->block_count = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
++            if (cur->block_count && !(cur->blocks = calloc( cur->block_count, sizeof(*cur->blocks) )))
++            { hr = E_OUTOFMEMORY; break; }
++            blocks_seen = 0;
++            if (empty)
++            {
++                if (cur->block_count) { hr = APPX_E_INVALID_BLOCKMAP; break; }
++                cur = NULL;
++            }
++        }
++        else if (depth == 2 && cur && !wcscmp( name, L"Block" ))
++        {
++            struct bm_block *block;
++            UINT64 compressed;
++
++            if (blocks_seen >= cur->block_count) { hr = APPX_E_INVALID_BLOCKMAP; break; }
++            block = &cur->blocks[blocks_seen];
++            if (attr( reader, L"Hash", &value ) != S_OK || !value || !base64_decode( value, block->hash, bm->hash_size ))
++            { hr = APPX_E_INVALID_BLOCKMAP; break; }
++            /* no Size: a stored block, as long as it is */
++            if (attr( reader, L"Size", &value ) == S_OK && value)
++            {
++                if (!parse_u64( value, &compressed ) || compressed > BLOCK_SIZE * 2) { hr = APPX_E_INVALID_BLOCKMAP; break; }
++                block->compressed_size = compressed;
++            }
++            else
++            {
++                UINT64 off = (UINT64)blocks_seen * BLOCK_SIZE;
++                block->compressed_size = cur->size - off < BLOCK_SIZE ? cur->size - off : BLOCK_SIZE;
++            }
++            blocks_seen++;
++        }
++    }
++    if (hr == S_FALSE) hr = S_OK;
++    if (SUCCEEDED(hr) && (cur || !have_root)) hr = APPX_E_INVALID_BLOCKMAP;
++    if (FAILED(hr) && hr != E_OUTOFMEMORY) hr = APPX_E_INVALID_BLOCKMAP;
++    if (reader) IXmlReader_Release( reader );
++    IStream_Release( stream );
++    return hr;
++}
++
++/* ---- IAppxBlockMapBlock ---------------------------------------------------- */
++
++struct block
++{
++    IAppxBlockMapBlock IAppxBlockMapBlock_iface;
++    LONG ref;
++    struct blockmap *bm;        /* referenced */
++    const struct bm_block *block;
++};
++
++static inline struct block *impl_from_IAppxBlockMapBlock( IAppxBlockMapBlock *iface )
++{
++    return CONTAINING_RECORD( iface, struct block, IAppxBlockMapBlock_iface );
++}
++
++static HRESULT WINAPI block_QueryInterface( IAppxBlockMapBlock *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAppxBlockMapBlock ))
++    {
++        *out = iface;
++        IAppxBlockMapBlock_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI block_AddRef( IAppxBlockMapBlock *iface )
++{
++    return InterlockedIncrement( &impl_from_IAppxBlockMapBlock( iface )->ref );
++}
++
++static ULONG WINAPI block_Release( IAppxBlockMapBlock *iface )
++{
++    struct block *impl = impl_from_IAppxBlockMapBlock( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IAppxBlockMapReader_Release( &impl->bm->IAppxBlockMapReader_iface );
++        free( impl );
++    }
++    return ref;
++}
++
++/* the hash is the block's: valid while the block is */
++static HRESULT WINAPI block_GetHash( IAppxBlockMapBlock *iface, UINT32 *size, BYTE **buffer )
++{
++    struct block *impl = impl_from_IAppxBlockMapBlock( iface );
++
++    TRACE( "iface %p, size %p, buffer %p.\n", iface, size, buffer );
++    if (!size || !buffer) return E_POINTER;
++    *size = impl->bm->hash_size;
++    *buffer = (BYTE *)impl->block->hash;
++    return S_OK;
++}
++
++static HRESULT WINAPI block_GetCompressedSize( IAppxBlockMapBlock *iface, UINT32 *size )
++{
++    if (!size) return E_POINTER;
++    *size = impl_from_IAppxBlockMapBlock( iface )->block->compressed_size;
++    return S_OK;
++}
++
++static const IAppxBlockMapBlockVtbl block_vtbl =
++{
++    block_QueryInterface, block_AddRef, block_Release,
++    block_GetHash, block_GetCompressedSize,
++};
++
++/* ---- IAppxBlockMapBlocksEnumerator, IAppxBlockMapFilesEnumerator ----------- */
++
++struct item_enum
++{
++    IAppxBlockMapBlocksEnumerator IAppxBlockMapBlocksEnumerator_iface;
++    IAppxBlockMapFilesEnumerator IAppxBlockMapFilesEnumerator_iface;
++    LONG ref;
++    struct blockmap *bm;        /* referenced */
++    const struct bm_file *file; /* the blocks of this file, or NULL: the files */
++    unsigned int index, count;
++};
++
++static HRESULT file_create( struct blockmap *bm, const struct bm_file *file, IAppxBlockMapFile **out );
++
++static inline struct item_enum *impl_from_IAppxBlockMapBlocksEnumerator( IAppxBlockMapBlocksEnumerator *iface )
++{
++    return CONTAINING_RECORD( iface, struct item_enum, IAppxBlockMapBlocksEnumerator_iface );
++}
++
++static inline struct item_enum *impl_from_IAppxBlockMapFilesEnumerator( IAppxBlockMapFilesEnumerator *iface )
++{
++    return CONTAINING_RECORD( iface, struct item_enum, IAppxBlockMapFilesEnumerator_iface );
++}
++
++static ULONG item_enum_release( struct item_enum *impl )
++{
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IAppxBlockMapReader_Release( &impl->bm->IAppxBlockMapReader_iface );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI blocks_QueryInterface( IAppxBlockMapBlocksEnumerator *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAppxBlockMapBlocksEnumerator ))
++    {
++        *out = iface;
++        IAppxBlockMapBlocksEnumerator_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI blocks_AddRef( IAppxBlockMapBlocksEnumerator *iface )
++{
++    return InterlockedIncrement( &impl_from_IAppxBlockMapBlocksEnumerator( iface )->ref );
++}
++
++static ULONG WINAPI blocks_Release( IAppxBlockMapBlocksEnumerator *iface )
++{
++    return item_enum_release( impl_from_IAppxBlockMapBlocksEnumerator( iface ) );
++}
++
++static HRESULT WINAPI blocks_GetCurrent( IAppxBlockMapBlocksEnumerator *iface, IAppxBlockMapBlock **out )
++{
++    struct item_enum *impl = impl_from_IAppxBlockMapBlocksEnumerator( iface );
++    struct block *block;
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (impl->index >= impl->count) return APPX_E_PACKAGING_INTERNAL;
++    if (!(block = calloc( 1, sizeof(*block) ))) return E_OUTOFMEMORY;
++    block->IAppxBlockMapBlock_iface.lpVtbl = &block_vtbl;
++    block->ref = 1;
++    block->bm = impl->bm;
++    IAppxBlockMapReader_AddRef( &impl->bm->IAppxBlockMapReader_iface );
++    block->block = &impl->file->blocks[impl->index];
++    *out = &block->IAppxBlockMapBlock_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI blocks_GetHasCurrent( IAppxBlockMapBlocksEnumerator *iface, BOOL *has )
++{
++    struct item_enum *impl = impl_from_IAppxBlockMapBlocksEnumerator( iface );
++    if (!has) return E_POINTER;
++    *has = impl->index < impl->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI blocks_MoveNext( IAppxBlockMapBlocksEnumerator *iface, BOOL *has )
++{
++    struct item_enum *impl = impl_from_IAppxBlockMapBlocksEnumerator( iface );
++    if (!has) return E_POINTER;
++    if (impl->index < impl->count) impl->index++;
++    *has = impl->index < impl->count;
++    return S_OK;
++}
++
++static const IAppxBlockMapBlocksEnumeratorVtbl blocks_vtbl =
++{
++    blocks_QueryInterface, blocks_AddRef, blocks_Release,
++    blocks_GetCurrent, blocks_GetHasCurrent, blocks_MoveNext,
++};
++
++static HRESULT WINAPI files_QueryInterface( IAppxBlockMapFilesEnumerator *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAppxBlockMapFilesEnumerator ))
++    {
++        *out = iface;
++        IAppxBlockMapFilesEnumerator_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI files_AddRef( IAppxBlockMapFilesEnumerator *iface )
++{
++    return InterlockedIncrement( &impl_from_IAppxBlockMapFilesEnumerator( iface )->ref );
++}
++
++static ULONG WINAPI files_Release( IAppxBlockMapFilesEnumerator *iface )
++{
++    return item_enum_release( impl_from_IAppxBlockMapFilesEnumerator( iface ) );
++}
++
++static HRESULT WINAPI files_GetCurrent( IAppxBlockMapFilesEnumerator *iface, IAppxBlockMapFile **out )
++{
++    struct item_enum *impl = impl_from_IAppxBlockMapFilesEnumerator( iface );
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    if (impl->index >= impl->count) return APPX_E_PACKAGING_INTERNAL;
++    return file_create( impl->bm, &impl->bm->files[impl->index], out );
++}
++
++static HRESULT WINAPI files_GetHasCurrent( IAppxBlockMapFilesEnumerator *iface, BOOL *has )
++{
++    struct item_enum *impl = impl_from_IAppxBlockMapFilesEnumerator( iface );
++    if (!has) return E_POINTER;
++    *has = impl->index < impl->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI files_MoveNext( IAppxBlockMapFilesEnumerator *iface, BOOL *has )
++{
++    struct item_enum *impl = impl_from_IAppxBlockMapFilesEnumerator( iface );
++    if (!has) return E_POINTER;
++    if (impl->index < impl->count) impl->index++;
++    *has = impl->index < impl->count;
++    return S_OK;
++}
++
++static const IAppxBlockMapFilesEnumeratorVtbl files_vtbl =
++{
++    files_QueryInterface, files_AddRef, files_Release,
++    files_GetCurrent, files_GetHasCurrent, files_MoveNext,
++};
++
++static struct item_enum *item_enum_create( struct blockmap *bm, const struct bm_file *file )
++{
++    struct item_enum *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return NULL;
++    impl->IAppxBlockMapBlocksEnumerator_iface.lpVtbl = &blocks_vtbl;
++    impl->IAppxBlockMapFilesEnumerator_iface.lpVtbl = &files_vtbl;
++    impl->ref = 1;
++    impl->bm = bm;
++    IAppxBlockMapReader_AddRef( &bm->IAppxBlockMapReader_iface );
++    impl->file = file;
++    impl->count = file ? file->block_count : bm->file_count;
++    return impl;
++}
++
++/* ---- IAppxBlockMapFile ----------------------------------------------------- */
++
++struct file
++{
++    IAppxBlockMapFile IAppxBlockMapFile_iface;
++    LONG ref;
++    struct blockmap *bm;        /* referenced */
++    const struct bm_file *file;
++};
++
++static inline struct file *impl_from_IAppxBlockMapFile( IAppxBlockMapFile *iface )
++{
++    return CONTAINING_RECORD( iface, struct file, IAppxBlockMapFile_iface );
++}
++
++static HRESULT WINAPI file_QueryInterface( IAppxBlockMapFile *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAppxBlockMapFile ))
++    {
++        *out = iface;
++        IAppxBlockMapFile_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI file_AddRef( IAppxBlockMapFile *iface )
++{
++    return InterlockedIncrement( &impl_from_IAppxBlockMapFile( iface )->ref );
++}
++
++static ULONG WINAPI file_Release( IAppxBlockMapFile *iface )
++{
++    struct file *impl = impl_from_IAppxBlockMapFile( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IAppxBlockMapReader_Release( &impl->bm->IAppxBlockMapReader_iface );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI file_GetBlocks( IAppxBlockMapFile *iface, IAppxBlockMapBlocksEnumerator **blocks )
++{
++    struct file *impl = impl_from_IAppxBlockMapFile( iface );
++    struct item_enum *e;
++
++    TRACE( "iface %p, blocks %p.\n", iface, blocks );
++    if (!blocks) return E_POINTER;
++    if (!(e = item_enum_create( impl->bm, impl->file ))) return E_OUTOFMEMORY;
++    *blocks = &e->IAppxBlockMapBlocksEnumerator_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_GetLocalFileHeaderSize( IAppxBlockMapFile *iface, UINT32 *size )
++{
++    if (!size) return E_POINTER;
++    *size = impl_from_IAppxBlockMapFile( iface )->file->lfh_size;
++    return S_OK;
++}
++
++static HRESULT WINAPI file_GetName( IAppxBlockMapFile *iface, LPWSTR *name )
++{
++    if (!name) return E_POINTER;
++    return (*name = co_strdupW( impl_from_IAppxBlockMapFile( iface )->file->name )) ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI file_GetUncompressedSize( IAppxBlockMapFile *iface, UINT64 *size )
++{
++    if (!size) return E_POINTER;
++    *size = impl_from_IAppxBlockMapFile( iface )->file->size;
++    return S_OK;
++}
++
++/* the stream's content, from its start, against the file's size and block hashes */
++static HRESULT WINAPI file_ValidateFileHash( IAppxBlockMapFile *iface, IStream *stream, BOOL *valid )
++{
++    struct file *impl = impl_from_IAppxBlockMapFile( iface );
++    const struct bm_file *f = impl->file;
++    BYTE *buffer, hash[MAX_HASH], extra;
++    LARGE_INTEGER zero = {{ 0 }};
++    unsigned int i;
++    ULONG read;
++    HRESULT hr;
++
++    TRACE( "iface %p, stream %p, valid %p.\n", iface, stream, valid );
++    if (!stream || !valid) return E_POINTER;
++    *valid = FALSE;
++    if (FAILED(hr = IStream_Seek( stream, zero, STREAM_SEEK_SET, NULL ))) return hr;
++    if (!(buffer = malloc( BLOCK_SIZE ))) return E_OUTOFMEMORY;
++    for (i = 0; i < f->block_count; i++)
++    {
++        UINT64 off = (UINT64)i * BLOCK_SIZE;
++        ULONG len = f->size - off < BLOCK_SIZE ? f->size - off : BLOCK_SIZE;
++
++        if (FAILED(hr = IStream_Read( stream, buffer, len, &read ))) break;
++        if (read != len) break;
++        if (BCryptHash( impl->bm->hash_alg, NULL, 0, buffer, len, hash, impl->bm->hash_size )) break;
++#ifdef SG_MUTANT_BLOCKMAP_NO_VALIDATE
++        continue;
++#endif
++        if (memcmp( hash, f->blocks[i].hash, impl->bm->hash_size )) break;
++    }
++    free( buffer );
++    if (FAILED(hr)) return hr;
++    /* the whole of it, and nothing more */
++    if (i == f->block_count && SUCCEEDED(IStream_Read( stream, &extra, 1, &read )) && !read) *valid = TRUE;
++    return S_OK;
++}
++
++static const IAppxBlockMapFileVtbl file_vtbl =
++{
++    file_QueryInterface, file_AddRef, file_Release,
++    file_GetBlocks, file_GetLocalFileHeaderSize, file_GetName, file_GetUncompressedSize, file_ValidateFileHash,
++};
++
++static HRESULT file_create( struct blockmap *bm, const struct bm_file *f, IAppxBlockMapFile **out )
++{
++    struct file *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAppxBlockMapFile_iface.lpVtbl = &file_vtbl;
++    impl->ref = 1;
++    impl->bm = bm;
++    IAppxBlockMapReader_AddRef( &bm->IAppxBlockMapReader_iface );
++    impl->file = f;
++    *out = &impl->IAppxBlockMapFile_iface;
++    return S_OK;
++}
++
++/* ---- IAppxBlockMapReader --------------------------------------------------- */
++
++static inline struct blockmap *impl_from_IAppxBlockMapReader( IAppxBlockMapReader *iface )
++{
++    return CONTAINING_RECORD( iface, struct blockmap, IAppxBlockMapReader_iface );
++}
++
++static HRESULT WINAPI reader_QueryInterface( IAppxBlockMapReader *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAppxBlockMapReader ))
++    {
++        *out = iface;
++        IAppxBlockMapReader_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI reader_AddRef( IAppxBlockMapReader *iface )
++{
++    return InterlockedIncrement( &impl_from_IAppxBlockMapReader( iface )->ref );
++}
++
++static ULONG WINAPI reader_Release( IAppxBlockMapReader *iface )
++{
++    struct blockmap *bm = impl_from_IAppxBlockMapReader( iface );
++    ULONG ref = InterlockedDecrement( &bm->ref );
++    if (!ref) blockmap_free( bm );
++    return ref;
++}
++
++static HRESULT WINAPI reader_GetFile( IAppxBlockMapReader *iface, LPCWSTR name, IAppxBlockMapFile **file )
++{
++    struct blockmap *bm = impl_from_IAppxBlockMapReader( iface );
++    unsigned int i;
++
++    TRACE( "iface %p, name %s, file %p.\n", iface, debugstr_w( name ), file );
++    if (!name || !file) return E_POINTER;
++    *file = NULL;
++    for (i = 0; i < bm->file_count; i++)
++        if (!wcsicmp( bm->files[i].name, name )) return file_create( bm, &bm->files[i], file );
++    return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
++}
++
++static HRESULT WINAPI reader_GetFiles( IAppxBlockMapReader *iface, IAppxBlockMapFilesEnumerator **files )
++{
++    struct blockmap *bm = impl_from_IAppxBlockMapReader( iface );
++    struct item_enum *e;
++
++    TRACE( "iface %p, files %p.\n", iface, files );
++    if (!files) return E_POINTER;
++    if (!(e = item_enum_create( bm, NULL ))) return E_OUTOFMEMORY;
++    *files = &e->IAppxBlockMapFilesEnumerator_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI reader_GetHashMethod( IAppxBlockMapReader *iface, IUri **uri )
++{
++    struct blockmap *bm = impl_from_IAppxBlockMapReader( iface );
++
++    TRACE( "iface %p, uri %p.\n", iface, uri );
++    if (!uri) return E_POINTER;
++    return CreateUri( bm->hash_method, Uri_CREATE_CANONICALIZE, 0, uri );
++}
++
++static HRESULT WINAPI reader_GetStream( IAppxBlockMapReader *iface, IStream **stream )
++{
++    struct blockmap *bm = impl_from_IAppxBlockMapReader( iface );
++    HGLOBAL mem;
++    HRESULT hr;
++
++    TRACE( "iface %p, stream %p.\n", iface, stream );
++    if (!stream) return E_POINTER;
++    if (!(mem = GlobalAlloc( GMEM_MOVEABLE, bm->size ? bm->size : 1 ))) return E_OUTOFMEMORY;
++    memcpy( GlobalLock( mem ), bm->data, bm->size );
++    GlobalUnlock( mem );
++    if (FAILED(hr = CreateStreamOnHGlobal( mem, TRUE, stream ))) GlobalFree( mem );
++    else
++    {
++        ULARGE_INTEGER size;
++        size.QuadPart = bm->size;
++        IStream_SetSize( *stream, size );
++    }
++    return hr;
++}
++
++static const IAppxBlockMapReaderVtbl reader_vtbl =
++{
++    reader_QueryInterface, reader_AddRef, reader_Release,
++    reader_GetFile, reader_GetFiles, reader_GetHashMethod, reader_GetStream,
++};
++
++/* takes data */
++HRESULT blockmap_reader_create( BYTE *data, SIZE_T size, IAppxBlockMapReader **out )
++{
++    struct blockmap *bm;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!(bm = calloc( 1, sizeof(*bm) )))
++    {
++        free( data );
++        return E_OUTOFMEMORY;
++    }
++    bm->IAppxBlockMapReader_iface.lpVtbl = &reader_vtbl;
++    bm->ref = 1;
++    bm->data = data;
++    bm->size = size;
++    if (FAILED(hr = parse( bm )))
++    {
++        WARN( "not a block map, hr %#lx\n", hr );
++        blockmap_free( bm );
++        return hr;
++    }
++    *out = &bm->IAppxBlockMapReader_iface;
++    return S_OK;
++}
++
++HRESULT read_whole_stream( IStream *stream, SIZE_T max, BYTE **data, SIZE_T *size )
++{
++    STATSTG stat;
++    ULONG read;
++    HRESULT hr;
++
++    *data = NULL;
++    *size = 0;
++    if (FAILED(hr = IStream_Stat( stream, &stat, STATFLAG_NONAME ))) return hr;
++    if (stat.cbSize.QuadPart > max) return APPX_E_INVALID_BLOCKMAP;
++    if (!(*data = malloc( stat.cbSize.QuadPart + 1 ))) return E_OUTOFMEMORY;
++    /* from the current position, as the other readers */
++    if (FAILED(hr = IStream_Read( stream, *data, stat.cbSize.QuadPart, &read )))
++    {
++        free( *data );
++        *data = NULL;
++        return hr;
++    }
++    *size = read;
++    return S_OK;
++}
++
++/* AppxSignature.p7x: "PKCX", then a PKCS #7 signed message; its content's AXBM digest is the block map's */
++static HRESULT check_signature( const BYTE *blockmap, SIZE_T blockmap_size, const WCHAR *path )
++{
++    HCRYPTMSG msg = NULL;
++    HCERTSTORE store = NULL;
++    PCCERT_CONTEXT signer = NULL;
++    CERT_INFO *signer_info = NULL;
++    BYTE *sig = NULL, *content = NULL, digest[32];
++    DWORD sig_size = 0, read, len = 0, i;
++    HANDLE file;
++    HRESULT hr = TRUST_E_NOSIGNATURE;
++
++    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32( GetLastError() );
++    sig_size = GetFileSize( file, NULL );
++    if (sig_size > 4 && sig_size < 16 * 1024 * 1024 && (sig = malloc( sig_size ))
++            && ReadFile( file, sig, sig_size, &read, NULL ) && read == sig_size && !memcmp( sig, "PKCX", 4 ))
++        hr = S_OK;
++    CloseHandle( file );
++    if (FAILED(hr)) goto done;
++
++    /* the message, and its signature by its signer */
++    hr = TRUST_E_NOSIGNATURE;
++    if (!(msg = CryptMsgOpenToDecode( X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, 0, 0, NULL, NULL ))) goto done;
++    if (!CryptMsgUpdate( msg, sig + 4, sig_size - 4, TRUE )) goto done;
++    if (!CryptMsgGetParam( msg, CMSG_CONTENT_PARAM, 0, NULL, &len ) || !(content = malloc( len ))
++            || !CryptMsgGetParam( msg, CMSG_CONTENT_PARAM, 0, content, &len ))
++        goto done;
++    hr = TRUST_E_BAD_DIGEST;
++    if ((store = CertOpenStore( CERT_STORE_PROV_MSG, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, 0, msg )))
++    {
++        DWORD info_size = 0;
++
++        if (CryptMsgGetParam( msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, NULL, &info_size )
++                && (signer_info = malloc( info_size ))
++                && CryptMsgGetParam( msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, signer_info, &info_size ))
++            signer = CertGetSubjectCertificateFromStore( store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, signer_info );
++    }
++    if (!signer || !CryptMsgControl( msg, 0, CMSG_CTRL_VERIFY_SIGNATURE, signer->pCertInfo ))
++    {
++        WARN( "the signature does not verify\n" );
++        goto done;
++    }
++
++    /* the digests: "APPX", then tagged SHA-256 values */
++    if (BCryptHash( BCRYPT_SHA256_ALG_HANDLE, NULL, 0, (BYTE *)blockmap, blockmap_size, digest, sizeof(digest) ))
++        goto done;
++    for (i = 0; i + 4 + sizeof(digest) <= len; i++)
++    {
++        if (memcmp( content + i, "AXBM", 4 )) continue;
++#ifndef SG_MUTANT_BLOCKMAP_SIGNATURE_IGNORED
++        if (memcmp( content + i + 4, digest, sizeof(digest) )) break;
++#endif
++        hr = S_OK;
++        break;
++    }
++    if (FAILED(hr)) WARN( "the block map is not the signed one\n" );
++
++done:
++    if (signer) CertFreeCertificateContext( signer );
++    if (store) CertCloseStore( store, 0 );
++    if (msg) CryptMsgClose( msg );
++    free( signer_info );
++    free( content );
++    free( sig );
++    return hr;
++}
++
++HRESULT validated_blockmap_reader_create( IStream *stream, const WCHAR *signature, IAppxBlockMapReader **out )
++{
++    BYTE *data;
++    SIZE_T size;
++    HRESULT hr;
++
++    *out = NULL;
++    if (FAILED(hr = read_whole_stream( stream, 256 * 1024 * 1024, &data, &size ))) return hr;
++    if (FAILED(hr = check_signature( data, size, signature )))
++    {
++        free( data );
++        return hr;
++    }
++    return blockmap_reader_create( data, size, out );
++}
+diff --git a/dlls/appxpackaging/main.c b/dlls/appxpackaging/main.c
+index d35a9c3..4f80a12 100644
+--- a/dlls/appxpackaging/main.c
++++ b/dlls/appxpackaging/main.c
+@@ -81,15 +81,23 @@ static HRESULT WINAPI appx_factory_CreateManifestReader( IAppxFactory *iface, IS
+ 
+ static HRESULT WINAPI appx_factory_CreateBlockMapReader( IAppxFactory *iface, IStream *input, IAppxBlockMapReader **reader )
+ {
+-    FIXME( "iface %p, input %p, reader %p stub!\n", iface, input, reader );
+-    return E_NOTIMPL;
++    BYTE *data;
++    SIZE_T size;
++    HRESULT hr;
++
++    TRACE( "iface %p, input %p, reader %p.\n", iface, input, reader );
++    if (!input || !reader) return E_POINTER;
++    *reader = NULL;
++    if (FAILED(hr = read_whole_stream( input, 256 * 1024 * 1024, &data, &size ))) return hr;
++    return blockmap_reader_create( data, size, reader );
+ }
+ 
+ static HRESULT WINAPI appx_factory_CreateValidatedBlockMapReader( IAppxFactory *iface, IStream *input,
+                                                                   LPCWSTR signature, IAppxBlockMapReader **reader )
+ {
+-    FIXME( "iface %p, input %p, signature %s, reader %p stub!\n", iface, input, debugstr_w( signature ), reader );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, input %p, signature %s, reader %p.\n", iface, input, debugstr_w( signature ), reader );
++    if (!input || !signature || !reader) return E_POINTER;
++    return validated_blockmap_reader_create( input, signature, reader );
+ }
+ 
+ static const IAppxFactoryVtbl appx_factory_vtbl =
+diff --git a/dlls/appxpackaging/manifest.c b/dlls/appxpackaging/manifest.c
+index 00dd4fb..0c79261 100644
+--- a/dlls/appxpackaging/manifest.c
++++ b/dlls/appxpackaging/manifest.c
+@@ -289,6 +289,8 @@ struct manifest
+     struct dependency *deps;      /* PackageDependency elements */
+     unsigned int resource_count;
+     WCHAR **resources;            /* Resource elements' Language */
++    unsigned int device_cap_count;
++    WCHAR **device_caps;          /* DeviceCapability elements' Name */
+ };
+ 
+ static void free_values( struct name_value *v, unsigned int count )
+@@ -448,6 +450,15 @@ static HRESULT parse_manifest( struct manifest *m )
+         {
+             if (FAILED(hr = all_attributes( reader, &m->apps[m->app_count - 1] ))) break;
+         }
++        else if (depth == 2 && !wcscmp( path[1], L"Capabilities" ) && !wcscmp( name, L"DeviceCapability" ))
++        {
++            WCHAR *cap = NULL, **caps;
++            if (FAILED(hr = attribute( reader, L"Name", &cap ))) break;
++            if (!cap || !cap[0] || m->device_cap_count >= 1024) { free( cap ); hr = APPX_E_INVALID_MANIFEST; break; }
++            if (!(caps = realloc( m->device_caps, (m->device_cap_count + 1) * sizeof(*caps) ))) { free( cap ); hr = E_OUTOFMEMORY; break; }
++            m->device_caps = caps;
++            caps[m->device_cap_count++] = cap;
++        }
+         else if (depth == 2 && !wcscmp( path[1], L"Capabilities" ) && !wcscmp( name, L"Capability" ))
+         {
+             WCHAR *cap = NULL;
+@@ -572,6 +583,8 @@ static ULONG WINAPI manifest_Release( IAppxManifestReader *iface )
+         free( m->deps );
+         for (i = 0; i < m->resource_count; i++) free( m->resources[i] );
+         free( m->resources );
++        for (i = 0; i < m->device_cap_count; i++) free( m->device_caps[i] );
++        free( m->device_caps );
+         free( m );
+     }
+     return ref;
+@@ -874,11 +887,102 @@ static HRESULT WINAPI manifest_GetResources( IAppxManifestReader *iface, IAppxMa
+     return S_OK;
+ }
+ 
++/* the device capabilities: the DeviceCapability elements' names, in order */
++struct devcap_enum
++{
++    IAppxManifestDeviceCapabilitiesEnumerator IAppxManifestDeviceCapabilitiesEnumerator_iface;
++    LONG ref;
++    struct manifest *manifest;
++    unsigned int index;
++};
++
++static inline struct devcap_enum *impl_from_IAppxManifestDeviceCapabilitiesEnumerator(
++        IAppxManifestDeviceCapabilitiesEnumerator *iface )
++{
++    return CONTAINING_RECORD( iface, struct devcap_enum, IAppxManifestDeviceCapabilitiesEnumerator_iface );
++}
++
++static HRESULT WINAPI devcap_QueryInterface( IAppxManifestDeviceCapabilitiesEnumerator *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAppxManifestDeviceCapabilitiesEnumerator ))
++    {
++        *out = iface;
++        IAppxManifestDeviceCapabilitiesEnumerator_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI devcap_AddRef( IAppxManifestDeviceCapabilitiesEnumerator *iface )
++{
++    return InterlockedIncrement( &impl_from_IAppxManifestDeviceCapabilitiesEnumerator( iface )->ref );
++}
++
++static ULONG WINAPI devcap_Release( IAppxManifestDeviceCapabilitiesEnumerator *iface )
++{
++    struct devcap_enum *impl = impl_from_IAppxManifestDeviceCapabilitiesEnumerator( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        IAppxManifestReader_Release( &impl->manifest->IAppxManifestReader_iface );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI devcap_GetCurrent( IAppxManifestDeviceCapabilitiesEnumerator *iface, LPWSTR *cap )
++{
++    struct devcap_enum *impl = impl_from_IAppxManifestDeviceCapabilitiesEnumerator( iface );
++
++    if (!cap) return E_POINTER;
++    *cap = NULL;
++    if (impl->index >= impl->manifest->device_cap_count) return APPX_E_PACKAGING_INTERNAL;
++    return (*cap = co_strdupW( impl->manifest->device_caps[impl->index] )) ? S_OK : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI devcap_GetHasCurrent( IAppxManifestDeviceCapabilitiesEnumerator *iface, BOOL *has )
++{
++    struct devcap_enum *impl = impl_from_IAppxManifestDeviceCapabilitiesEnumerator( iface );
++    if (!has) return E_POINTER;
++    *has = impl->index < impl->manifest->device_cap_count;
++    return S_OK;
++}
++
++static HRESULT WINAPI devcap_MoveNext( IAppxManifestDeviceCapabilitiesEnumerator *iface, BOOL *has )
++{
++    struct devcap_enum *impl = impl_from_IAppxManifestDeviceCapabilitiesEnumerator( iface );
++    if (!has) return E_POINTER;
++    if (impl->index < impl->manifest->device_cap_count) impl->index++;
++    *has = impl->index < impl->manifest->device_cap_count;
++    return S_OK;
++}
++
++static const IAppxManifestDeviceCapabilitiesEnumeratorVtbl devcap_vtbl =
++{
++    devcap_QueryInterface, devcap_AddRef, devcap_Release,
++    devcap_GetCurrent, devcap_GetHasCurrent, devcap_MoveNext,
++};
++
+ static HRESULT WINAPI manifest_GetDeviceCapabilities( IAppxManifestReader *iface,
+                                                       IAppxManifestDeviceCapabilitiesEnumerator **device_capabilities )
+ {
+-    FIXME( "iface %p, device_capabilities %p stub!\n", iface, device_capabilities );
+-    return E_NOTIMPL;
++    struct manifest *m = impl_from_IAppxManifestReader( iface );
++    struct devcap_enum *impl;
++
++    TRACE( "iface %p, device_capabilities %p.\n", iface, device_capabilities );
++    if (!device_capabilities) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAppxManifestDeviceCapabilitiesEnumerator_iface.lpVtbl = &devcap_vtbl;
++    impl->ref = 1;
++    impl->manifest = m;
++    IAppxManifestReader_AddRef( iface );
++#ifdef SG_MUTANT_APPX_NO_DEVCAPS
++    impl->index = m->device_cap_count;
++#endif
++    *device_capabilities = &impl->IAppxManifestDeviceCapabilitiesEnumerator_iface;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI manifest_GetPrerequisite( IAppxManifestReader *iface, LPCWSTR name, UINT64 *value )
+diff --git a/dlls/appxpackaging/package.c b/dlls/appxpackaging/package.c
+index bd50b76..9408596 100644
+--- a/dlls/appxpackaging/package.c
++++ b/dlls/appxpackaging/package.c
+@@ -623,8 +623,17 @@ static ULONG WINAPI package_Release( IAppxPackageReader *iface )
+ 
+ static HRESULT WINAPI package_GetBlockMap( IAppxPackageReader *iface, IAppxBlockMapReader **reader )
+ {
+-    FIXME( "iface %p, reader %p stub!\n", iface, reader );
+-    return E_NOTIMPL;
++    struct package *pkg = impl_from_IAppxPackageReader( iface );
++    const struct zip_entry *e;
++    BYTE *data;
++    HRESULT hr;
++
++    TRACE( "iface %p, reader %p.\n", iface, reader );
++    if (!reader) return E_POINTER;
++    *reader = NULL;
++    if (!(e = zip_find( pkg->zip, L"AppxBlockMap.xml" ))) return APPX_E_MISSING_REQUIRED_FILE;
++    if (FAILED(hr = zip_read( pkg->zip, e, &data ))) return hr;
++    return blockmap_reader_create( data, e->size, reader );
+ }
+ 
+ static HRESULT WINAPI package_GetFootprintFile( IAppxPackageReader *iface, APPX_FOOTPRINT_FILE_TYPE type, IAppxFile **file )
+@@ -1467,8 +1476,8 @@ static HRESULT WINAPI bundle_GetFootprintFile( IAppxBundleReader *iface, APPX_BU
+ 
+ static HRESULT WINAPI bundle_GetBlockMap( IAppxBundleReader *iface, IAppxBlockMapReader **reader )
+ {
+-    FIXME( "iface %p, reader %p stub!\n", iface, reader );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, reader %p.\n", iface, reader );
++    return package_GetBlockMap( &impl_from_IAppxBundleReader( iface )->pkg->IAppxPackageReader_iface, reader );
+ }
+ 
+ static HRESULT WINAPI bundle_GetManifest( IAppxBundleReader *iface, IAppxBundleManifestReader **manifest )
+diff --git a/dlls/appxpackaging/private.h b/dlls/appxpackaging/private.h
+index 327e7be..65d8948 100644
+--- a/dlls/appxpackaging/private.h
++++ b/dlls/appxpackaging/private.h
+@@ -81,6 +81,12 @@ HRESULT package_reader_create( IStream *stream, IAppxPackageReader **reader );
+ HRESULT bundle_reader_create( IStream *stream, IAppxBundleReader **reader );
+ HRESULT bundle_manifest_reader_create( const BYTE *data, SIZE_T size, IAppxBundleManifestReader **reader );
+ 
++/* ---- blockmap.c ------------------------------------------------------- */
++
++HRESULT blockmap_reader_create( BYTE *data, SIZE_T size, IAppxBlockMapReader **reader );
++HRESULT validated_blockmap_reader_create( IStream *stream, const WCHAR *signature, IAppxBlockMapReader **reader );
++HRESULT read_whole_stream( IStream *stream, SIZE_T max, BYTE **data, SIZE_T *size );
++
+ /* ---- helpers ---------------------------------------------------------- */
+ 
+ static inline WCHAR *co_strdupW( const WCHAR *s )
+diff --git a/include/appxpackaging.idl b/include/appxpackaging.idl
+index 9f11fa0..18d804f 100644
+--- a/include/appxpackaging.idl
++++ b/include/appxpackaging.idl
+@@ -87,6 +87,83 @@ interface IAppxManifestPackageDependenciesEnumerator;
+ interface IAppxManifestResourcesEnumerator;
+ interface IAppxManifestDeviceCapabilitiesEnumerator;
+ 
++interface IAppxBlockMapFile;
++interface IAppxBlockMapBlock;
++
++[
++    object,
++    uuid(75cf3930-3244-4fe0-a8c8-e0bcb270b889),
++    local
++]
++interface IAppxBlockMapBlock : IUnknown
++{
++    HRESULT GetHash([out] UINT32 *buffer_size, [out, retval, size_is(, *buffer_size)] BYTE **buffer);
++    HRESULT GetCompressedSize([out, retval] UINT32 *size);
++}
++
++[
++    object,
++    uuid(6b429b5b-36ef-479e-b9eb-0c1482b49e16),
++    local
++]
++interface IAppxBlockMapBlocksEnumerator : IUnknown
++{
++    HRESULT GetCurrent([out, retval] IAppxBlockMapBlock **block);
++    HRESULT GetHasCurrent([out, retval] BOOL *has_current);
++    HRESULT MoveNext([out, retval] BOOL *has_next);
++}
++
++[
++    object,
++    uuid(277672ac-4f63-42c1-8abc-beae3600eb59),
++    local
++]
++interface IAppxBlockMapFile : IUnknown
++{
++    HRESULT GetBlocks([out, retval] IAppxBlockMapBlocksEnumerator **blocks);
++    HRESULT GetLocalFileHeaderSize([out, retval] UINT32 *size);
++    HRESULT GetName([out, retval, string] LPWSTR *name);
++    HRESULT GetUncompressedSize([out, retval] UINT64 *size);
++    HRESULT ValidateFileHash([in] IStream *file_stream, [out, retval] BOOL *is_valid);
++}
++
++[
++    object,
++    uuid(02b856a2-4262-4070-bacb-1a8cbbc42305),
++    local
++]
++interface IAppxBlockMapFilesEnumerator : IUnknown
++{
++    HRESULT GetCurrent([out, retval] IAppxBlockMapFile **file);
++    HRESULT GetHasCurrent([out, retval] BOOL *has_current);
++    HRESULT MoveNext([out, retval] BOOL *has_current);
++}
++
++[
++    object,
++    uuid(5efec991-bca3-42d1-9ec2-e92d609ec22a),
++    local
++]
++interface IAppxBlockMapReader : IUnknown
++{
++    HRESULT GetFile([in, string] LPCWSTR filename, [out, retval] IAppxBlockMapFile **file);
++    HRESULT GetFiles([out, retval] IAppxBlockMapFilesEnumerator **files);
++    HRESULT GetHashMethod([out, retval] IUri **hash_method);
++    HRESULT GetStream([out, retval] IStream **blockmap_stream);
++}
++
++[
++    object,
++    uuid(30204541-427b-4a1c-bacf-655bf463a540),
++    local
++]
++interface IAppxManifestDeviceCapabilitiesEnumerator : IUnknown
++{
++    HRESULT GetCurrent([out, retval, string] LPWSTR *device_capability);
++    HRESULT GetHasCurrent([out, retval] BOOL *has_current);
++    HRESULT MoveNext([out, retval] BOOL *has_next);
++}
++
+ [
+     object,
+     uuid(91df827b-94fd-468f-827b-57f41b2f6f2e),

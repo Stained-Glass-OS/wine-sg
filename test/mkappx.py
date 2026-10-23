@@ -36,7 +36,8 @@ MANIFEST = f'''<?xml version="1.0" encoding="utf-8"?>
   <Dependencies>
     <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
   </Dependencies>
-  <Capabilities><Capability Name="internetClient" /></Capabilities>
+  <Capabilities><Capability Name="internetClient" /><DeviceCapability Name="webcam" />
+    <DeviceCapability Name="microphone" /></Capabilities>
   <Applications>
     <Application Id="App" Executable="app.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements DisplayName="AppX test app" Description="test" BackgroundColor="transparent"
