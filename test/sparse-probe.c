@@ -14,6 +14,7 @@
  *   sparse-probe identity                   GetCurrentPackageFullName of this process
  *   sparse-probe lnk PATH                   a shortcut's target
  *   sparse-probe remove FULLNAME            RemovePackageAsync
+ *   sparse-probe status FAMILY              the family's packages walked as Dropbox does: status, IPackageStatus2
  *
  * Interfaces are declared here from their published IIDs (the MIT windows crate).
  *
@@ -37,7 +38,15 @@ typedef struct { InspVtbl i; void *AddPackageAsync, *UpdatePackageAsync;
                  HRESULT (WINAPI *RemovePackageAsync)(void *, HSTRING, void **);
                  void *StagePackageAsync, *RegisterPackageAsync, *FindPackages, *FindPackagesByUserSecurityId,
                       *FindPackagesByNamePublisher, *FindPackagesByUserSecurityIdNamePublisher, *FindUsers, *SetPackageState;
-                 HRESULT (WINAPI *FindPackageByPackageFullName)(void *, HSTRING, void **); } ManagerVtbl;
+                 HRESULT (WINAPI *FindPackageByPackageFullName)(void *, HSTRING, void **);
+                 void *CleanupPackageForUserAsync, *FindPackagesByPackageFamilyName;
+                 HRESULT (WINAPI *FindPackagesByUserSecurityIdPackageFamilyName)(void *, HSTRING, HSTRING, void **); } ManagerVtbl;
+typedef struct { InspVtbl i; HRESULT (WINAPI *First)(void *, void **); } IterableVtbl;
+typedef struct { InspVtbl i; HRESULT (WINAPI *get_Current)(void *, void **); HRESULT (WINAPI *get_HasCurrent)(void *, boolean *);
+                 HRESULT (WINAPI *MoveNext)(void *, boolean *); } IteratorVtbl;
+typedef struct { InspVtbl i; HRESULT (WINAPI *get_Status)(void *, void **); } Package3Vtbl;
+typedef struct { InspVtbl i; HRESULT (WINAPI *VerifyIsOK)(void *, boolean *); HRESULT (WINAPI *flags[11])(void *, boolean *); } StatusVtbl;
+typedef struct { InspVtbl i; HRESULT (WINAPI *get_IsPartiallyStaged)(void *, boolean *); } Status2Vtbl;
 typedef struct { InspVtbl i; void *AddPackageVolumeAsync, *AddPackageToVolumeAsync, *ClearPackageStatus,
                  *RegisterPackageWithAppDataVolumeAsync, *FindPackageVolumeByName, *FindPackageVolumes;
                  HRESULT (WINAPI *GetDefaultPackageVolume)(void *, void **); } Manager3Vtbl;
@@ -99,6 +108,8 @@ static const GUID IID_IVector_Uri_ = {0x0d82bd8d,0xfe62,0x5d67,{0xa7,0xb9,0x78,0
 static const GUID IID_IVector_HSTRING_ = {0x98b9acc1,0x4b56,0x532e,{0xac,0x73,0x03,0xd5,0x29,0x1c,0xca,0x90}};
 static const GUID IID_IVector_Package_ = {0xd1bb509e,0x6989,0x5c69,{0xb1,0xff,0xd1,0x70,0x2f,0xe8,0xac,0xa3}};
 static const GUID IID_IUriRuntimeClassFactory_ = {0x44a9796f,0x723e,0x4fdf,{0xa2,0x18,0x03,0x3e,0x75,0xb0,0xc0,0x84}};
+static const GUID IID_IPackage3_ = {0x5f738b61,0xf86a,0x4917,{0x93,0xd1,0xf1,0xee,0x9d,0x3b,0x35,0xd9}};
+static const GUID IID_IPackageStatus2_ = {0xf428fa93,0x7c56,0x4862,{0xac,0xfa,0xab,0xae,0xdc,0xc0,0x69,0x4d}};
 static const GUID IID_IStorageItem_ = {0x4207a996,0xca2f,0x42f7,{0xbd,0xe8,0x8b,0x10,0x45,0x7a,0x7f,0x30}};
 
 static HSTRING hs( const WCHAR *s )
@@ -378,6 +389,51 @@ static int cmd_info( char *full_name )
     return 0;
 }
 
+/* the packages of a family, walked as Dropbox walks them at start: each one's full name, its status
+ * flags, then IPackageStatus2 */
+static int cmd_status( char *family )
+{
+    void *pm = manager( &IID_IPackageManager_ ), *list = NULL, *it = NULL, *pkg, *id, *p3, *st, *st2;
+    boolean has = FALSE, value;
+    HSTRING name;
+    int n = 0, i;
+
+    if (!pm) return 1;
+    printf( "find=%08lx\n", VT(pm, ManagerVtbl)->FindPackagesByUserSecurityIdPackageFamilyName( pm, hs( L"" ), hsa( family ), &list ) );
+    if (!list) return 1;
+    VT(list, IterableVtbl)->First( list, &it );
+    if (it) VT(it, IteratorVtbl)->get_HasCurrent( it, &has );
+    while (has)
+    {
+        pkg = id = p3 = st = st2 = NULL;
+        name = NULL;
+        VT(it, IteratorVtbl)->get_Current( it, &pkg );
+        VT(pkg, PackageVtbl)->get_Id( pkg, &id );
+        if (id) VT(id, PackageIdVtbl)->get_FullName( id, &name );
+        printf( "package.%d=%ls\n", n, raw( name ) );
+        VT(pkg, InspVtbl)->QI( pkg, &IID_IPackage3_, &p3 );
+        if (p3) VT(p3, Package3Vtbl)->get_Status( p3, &st );
+        if (st)
+        {
+            value = 0;
+            VT(st, StatusVtbl)->VerifyIsOK( st, &value );
+            printf( "ok.%d=%d\n", n, value );
+            for (i = 0; i < 11; i++) VT(st, StatusVtbl)->flags[i]( st, &value );
+            printf( "status2.%d=%08lx\n", n, VT(st, InspVtbl)->QI( st, &IID_IPackageStatus2_, &st2 ) );
+            if (st2)
+            {
+                value = 2;
+                VT(st2, Status2Vtbl)->get_IsPartiallyStaged( st2, &value );
+                printf( "partial.%d=%d\n", n, value );
+            }
+        }
+        n++;
+        VT(it, IteratorVtbl)->MoveNext( it, &has );
+    }
+    printf( "count=%d\n", n );
+    return 0;
+}
+
 static int cmd_remove( char *full_name )
 {
     void *pm = manager( &IID_IPackageManager_ ), *op = NULL;
@@ -429,6 +485,7 @@ int main( int argc, char **argv )
     else if (!strcmp( argv[1], "stub" ) && argc > 2) ret = cmd_stub( argv[2] );
     else if (!strcmp( argv[1], "info" ) && argc > 2) ret = cmd_info( argv[2] );
     else if (!strcmp( argv[1], "remove" ) && argc > 2) ret = cmd_remove( argv[2] );
+    else if (!strcmp( argv[1], "status" ) && argc > 2) ret = cmd_status( argv[2] );
     else if (!strcmp( argv[1], "identity" )) ret = cmd_identity();
     else if (!strcmp( argv[1], "lnk" ) && argc > 2) ret = cmd_lnk( argv[2] );
     return ret;

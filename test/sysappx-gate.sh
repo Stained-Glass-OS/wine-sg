@@ -151,6 +151,21 @@ haskey "HKCU\\Software\\Wine\\AppModel\\Packages\\$FULL" && fail "SYSTEM's own H
 out=$(user sparse-probe.exe volume "$FAMILY")
 expect "$out" family.0 "$FULL" "$SG_OTHER finds the machine's package by its family"
 expect "$out" family 1 "once"
+out=$(user sparse-probe.exe status "$FAMILY")
+expect "$out" package.0 "$FULL" "$SG_OTHER walks the machine's package as Dropbox does"
+expect "$out" status2.0 00000000 "its status has IPackageStatus2"
+# a stale registration of the family for the user (an update's, whose files are gone): one version shows
+STALE="StainedGlass.SysTest_2.0.0.0_x64__${FAMILY##*_}"
+SK="HKCU\\Software\\Wine\\AppModel\\Packages\\$STALE"
+user reg add "$SK" /v Name /d StainedGlass.SysTest /f >/dev/null
+user reg add "$SK" /v Publisher /d "$PUB" /f >/dev/null
+user reg add "$SK" /v FamilyName /d "$FAMILY" /f >/dev/null
+user reg add "$SK" /v InstallLocation /d 'C:\NoSuchFolder\gone' /f >/dev/null
+user reg add "$SK" /v Version /t REG_QWORD /d 0x0002000000000000 /f >/dev/null
+out=$(user sparse-probe.exe status "$FAMILY")
+expect "$out" count 1 "with a stale newer registration of the user's beside it, the family shows once"
+expect "$out" package.0 "$FULL" "as the version whose content is there"
+user reg delete "$SK" /f >/dev/null
 out=$(user 'C:\SysApp\sys-app.exe' identity)
 expect "$out" identity "$FULL" "the program in its external location has the package identity for $SG_OTHER"
 out=$(user pkgverb-probe.exe create "$C1")

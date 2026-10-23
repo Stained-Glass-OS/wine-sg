@@ -185,6 +185,11 @@ out=$(run sparse-probe.exe volume "StainedGlass.SparseTest_$PUBID")
 expect "$out" all.vector yes "PackageVolume.FindPackages gives an IVector<Package>"
 expect "$out" family 1 "FindPackagesByPackageFamilyName finds the package"
 expect "$out" family.0 "$SPARSE" "by its full name"
+out=$(run sparse-probe.exe status "StainedGlass.SparseTest_$PUBID")
+expect "$out" package.0 "$SPARSE" "FindPackagesByUserSecurityIdPackageFamilyName finds it, walked as Dropbox does"
+expect "$out" ok.0 1 "its status is OK"
+expect "$out" status2.0 00000000 "its status has IPackageStatus2 (Dropbox used the NULL it got and crashed)"
+expect "$out" partial.0 0 "and it is not partially staged"
 out=$(run sparse-probe.exe stub "StainedGlass.SparseTest_$PUBID")
 expect "$out" preference 0 "the stub preference is Full"
 expect "$out" set_bad 80070057 "a bad preference is refused"
