@@ -148,6 +148,43 @@ int main(void)
         hex("ecdh_kdf", d1, 48, 0);
         (void)raw2;
     }
+    /* the generic ECDH provider: the curve by name, or by the key's size */
+    {
+        BCRYPT_ALG_HANDLE gen, p384;
+        BCRYPT_KEY_HANDLE g1, g2, pub1, pub2;
+        BCRYPT_SECRET_HANDLE s1, s2;
+        UCHAR r1[64], r2[64];
+        ULONG l1 = 0, l2 = 0;
+        BCRYPT_ECCKEY_BLOB *eb = (BCRYPT_ECCKEY_BLOB *)blob;
+
+        printf("ecdh_open=%#lx\n", BCryptOpenAlgorithmProvider(&gen, L"ECDH", NULL, 0));
+        printf("ecdh_badcurve=%#lx\n", BCryptSetProperty(gen, L"ECCCurveName", (UCHAR *)L"brainpoolP999", sizeof(L"brainpoolP999"), 0));
+        printf("ecdh_curve=%#lx\n", BCryptSetProperty(gen, L"ECCCurveName", (UCHAR *)L"nistP384", sizeof(L"nistP384"), 0));
+        status = BCryptGenerateKeyPair(gen, &g1, 0, 0);
+        if (!status) status = BCryptFinalizeKeyPair(g1, 0);
+        printf("ecdh_generate=%#lx\n", status);
+        BCryptExportKey(g1, NULL, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &len, 0);
+        printf("ecdh_keysize=%lu\n", eb->cbKey);
+        BCryptOpenAlgorithmProvider(&p384, BCRYPT_ECDH_P384_ALGORITHM, NULL, 0);
+        BCryptImportKeyPair(p384, NULL, BCRYPT_ECCPUBLIC_BLOB, &pub1, blob, len, 0);
+        BCryptGenerateKeyPair(p384, &g2, 384, 0);
+        BCryptFinalizeKeyPair(g2, 0);
+        BCryptExportKey(g2, NULL, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &len, 0);
+        eb->dwMagic = 0x504b4345;  /* the generic public magic */
+        printf("ecdh_import_generic=%#lx\n", BCryptImportKeyPair(gen, NULL, BCRYPT_ECCPUBLIC_BLOB, &pub2, blob, len, 0));
+        BCryptSecretAgreement(g1, pub2, &s1, 0);
+        BCryptSecretAgreement(g2, pub1, &s2, 0);
+        BCryptDeriveKey(s1, BCRYPT_KDF_RAW_SECRET, NULL, r1, sizeof(r1), &l1, 0);
+        BCryptDeriveKey(s2, BCRYPT_KDF_RAW_SECRET, NULL, r2, sizeof(r2), &l2, 0);
+        printf("ecdh_generic_agree=%d len %lu\n", l1 == l2 && l1 && !memcmp(r1, r2, l1), l1);
+        BCryptCloseAlgorithmProvider(gen, 0);
+        BCryptOpenAlgorithmProvider(&gen, L"ECDH", NULL, 0);
+        status = BCryptGenerateKeyPair(gen, &g1, 256, 0);
+        if (!status) status = BCryptFinalizeKeyPair(g1, 0);
+        if (!status) status = BCryptExportKey(g1, NULL, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &len, 0);
+        printf("ecdh_bysize=%#lx %lu\n", status, eb->cbKey);
+        printf("ecdh_nosize=%#lx\n", BCryptGenerateKeyPair(gen, &g2, 0, 0));
+    }
     printf("done=1\n");
     return 0;
 }

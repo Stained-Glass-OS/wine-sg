@@ -6,8 +6,9 @@
 # (RFC 8018), HKDF (RFC 5869: HkdfHashAlgorithm, HkdfSaltAndFinalize / HkdfPrkAndFinalize, KDF_HKDF_INFO), the
 # SP 800-56A concatenation KDF and the SP 800-108 counter-mode HMAC KDF; BCryptDeriveKey(secret,
 # "SP800_56A_CONCAT") runs the concatenation KDF over an ECDH agreement. Expected values: RFC vectors and
-# Python's hashlib/hmac on the same inputs.
-#   WINE=/opt/wine-sg/bin/wine test/bcryptkdf-gate.sh   (mutant SG_MUTANT_KDF_CONCAT_NO_OTHERINFO)
+# Python's hashlib/hmac on the same inputs. 6089: the generic "ECDH" provider (curve by ECCCurveName, or by the
+# key size; blobs with the generic magic) agrees with ECDH_P384 keys.
+#   WINE=/opt/wine-sg/bin/wine test/bcryptkdf-gate.sh   (mutants SG_MUTANT_KDF_CONCAT_NO_OTHERINFO, SG_MUTANT_ECDH_CURVE_IGNORED)
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -56,6 +57,15 @@ print('ecdh_concat=0 len 48')
 print('ecdh_both=1')
 raw = bytes.fromhex(out.get('ecdh_raw', ''))
 print('ecdh_kdf=' + concat('sha256', raw[::-1], b'AESAliceBob', 48).hex())
+print('ecdh_open=0')
+print('ecdh_badcurve=0xc00000bb')
+print('ecdh_curve=0')
+print('ecdh_generate=0')
+print('ecdh_keysize=48')
+print('ecdh_import_generic=0')
+print('ecdh_generic_agree=1 len 48')
+print('ecdh_bysize=0 32')
+print('ecdh_nosize=0xc000000d')
 print('done=1')
 EOP
 while IFS= read -r line; do
