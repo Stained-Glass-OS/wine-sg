@@ -1,0 +1,164 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] server: A refused TCP connection is tried again, as on Windows (6527)
+
+When the other side answers a SYN with a reset, Windows' TCP retries
+twice, about half a second and then a second later, before it reports
+WSAECONNREFUSED. A closed port therefore takes about 1.5 seconds to
+refuse, and a server that starts listening in the meantime is connected
+to. Linux refuses at once. HandBrake starts its encoding worker and polls
+it 11 times through HttpClient with no delay between tries, so under Wine
+every encode failed ("Unable to connect to the HandBrake Worker instance
+after 10 attempts").
+
+The server now keeps a connecting stream socket's address. When the
+connect is refused, at once or through the poll, it connects again after
+0.5 s and then 1 s. The socket stays in the connecting state and is not
+polled in between. Blocking connects, non-blocking connects with select,
+and ConnectEx all take the same time to fail.
+---
+diff --git a/server/sock.c b/server/sock.c
+index 6742ff4..21f51eb 100644
+--- a/server/sock.c
++++ b/server/sock.c
+@@ -261,6 +261,10 @@ struct sock
+     struct list         accept_list; /* list of pending accept requests */
+     struct accept_req  *accept_recv_req; /* pending accept-into request which will recv on this socket */
+     struct connect_req *connect_req; /* pending connection request */
++    struct timeout_user *connect_retry; /* a refused connection's next attempt (wine-sg 6527) */
++    unsigned int        connect_tries; /* the refusals retried */
++    union unix_sockaddr connect_addr; /* where the connection goes */
++    socklen_t           connect_addr_len;
+     struct poll_req    *main_poll;   /* main poll */
+     union win_sockaddr  addr;        /* socket name */
+     int                 addr_len;    /* socket name length */
+@@ -1434,6 +1438,50 @@ static void sock_dispatch_events( struct sock *sock, enum connection_state prevs
+     post_sock_messages( sock );
+ }
+ 
++/* Stained Glass OS (wine-sg 6527): as Windows' TCP does, a connection the other side refuses (a
++ * reset in answer to the SYN) is tried twice more, half a second and then a second later, before
++ * it fails: a closed port takes one and a half seconds to say so, not none. Programs that start a
++ * local server and connect to it at once (HandBrake's worker) count on that time. */
++static const timeout_t connect_retry_delays[] = { -TICKS_PER_SEC / 2, -TICKS_PER_SEC };
++
++static void connect_retry_timeout( void *private );
++
++static int sock_retry_refused( struct sock *sock )
++{
++#ifdef SG_MUTANT_SOCK_NO_RST_RETRY
++    return 0;
++#endif
++    if (sock->type != WS_SOCK_STREAM || !sock->connect_addr_len || sock->connect_retry) return 0;
++    if (sock->connect_tries >= ARRAY_SIZE(connect_retry_delays)) return 0;
++    if (!(sock->connect_retry = add_timeout_user( connect_retry_delays[sock->connect_tries], connect_retry_timeout, sock )))
++        return 0;
++    if (debug_level) fprintf( stderr, "socket %p: connection refused, trying again (%u)\n", sock, sock->connect_tries );
++    sock->connect_tries++;
++    return 1;
++}
++
++static void connect_retry_timeout( void *private )
++{
++    struct sock *sock = private;
++    int fd, ret;
++
++    sock->connect_retry = NULL;
++    if (sock->state != SOCK_CONNECTING) return;
++    fd = get_unix_fd( sock->fd );
++    ret = connect( fd, &sock->connect_addr.addr, sock->connect_addr_len );
++    /* (a socket whose connect failed answers ECONNABORTED once its error was read) */
++    if (ret < 0 && errno == ECONNABORTED) ret = connect( fd, &sock->connect_addr.addr, sock->connect_addr_len );
++    if (!ret || errno == EINPROGRESS || errno == EALREADY || errno == EISCONN)
++    {
++        sock_reselect( sock );   /* polled again: connected or refused */
++        return;
++    }
++    if (errno == ECONNREFUSED && sock_retry_refused( sock )) return;
++    /* refused for good */
++    sock->errors[AFD_POLL_BIT_CONNECT_ERR] = errno;
++    sock_poll_event( sock->fd, POLLERR );
++}
++
+ static void sock_poll_event( struct fd *fd, int event )
+ {
+     struct sock *sock = get_fd_user( fd );
+@@ -1447,12 +1495,29 @@ static void sock_poll_event( struct fd *fd, int event )
+     if (debug_level)
+         fprintf(stderr, "socket %p select event: %x\n", sock, event);
+ 
++    if (sock->state == SOCK_CONNECTING && sock->connect_retry)
++    {
++        /* (wine-sg 6527) between attempts: the refused socket's own state means nothing */
++        release_object( sock );
++        return;
++    }
++
+     if ((event & POLLERR) && sock_udp_check_errors( sock ))
+         event &= ~POLLERR;
+ 
+     if (event & (POLLERR | POLLHUP))
+         error = sock_error( sock, &event );
+ 
++    if (sock->state == SOCK_CONNECTING && (event & (POLLERR | POLLHUP)) && error == ECONNREFUSED &&
++        sock_retry_refused( sock ))
++    {
++        /* (wine-sg 6527) not yet: not polled until the next attempt */
++        sock->errors[AFD_POLL_BIT_CONNECT_ERR] = 0;
++        sock_reselect( sock );
++        release_object( sock );
++        return;
++    }
++
+ #ifndef SG_MUTANT_UDP_NO_POLLIN
+     if (sock->udp_reset_pending) event |= POLLIN;  /* the next receive reports the port unreachable */
+ #endif
+@@ -1609,6 +1674,7 @@ static int sock_get_poll_events( struct fd *fd )
+         return -1;
+ 
+     case SOCK_CONNECTING:
++        if (sock->connect_retry) return -1;  /* waiting to try again (wine-sg 6527) */
+         return POLLOUT;
+ 
+     case SOCK_LISTENING:
+@@ -1790,6 +1856,8 @@ static void sock_destroy( struct object *obj )
+ 
+     /* FIXME: special socket shutdown stuff? */
+ 
++    if (sock->connect_retry) remove_timeout_user( sock->connect_retry );
++
+     for (i = 0; i < 2; ++i)
+     {
+         if (sock->bound_addr[i] && --sock->bound_addr[i]->reuse_count <= 0)
+@@ -1836,6 +1904,9 @@ static struct sock *create_socket(void)
+     sock->ifchange_obj = NULL;
+     sock->accept_recv_req = NULL;
+     sock->connect_req = NULL;
++    sock->connect_retry = NULL;
++    sock->connect_tries = 0;
++    sock->connect_addr_len = 0;
+     sock->main_poll = NULL;
+     memset( &sock->addr, 0, sizeof(sock->addr) );
+     sock->addr_len = 0;
+@@ -2777,6 +2848,12 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+             unix_addr.in.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
+ 
+         memcpy( &peer_addr, &unix_addr, sizeof(unix_addr) );
++        /* (wine-sg 6527) kept for the attempts after a refusal */
++        if (sock->connect_retry) remove_timeout_user( sock->connect_retry );
++        sock->connect_retry = NULL;
++        sock->connect_tries = 0;
++        memcpy( &sock->connect_addr, &unix_addr, sizeof(unix_addr) );
++        sock->connect_addr_len = unix_len;
+         ret = connect( unix_fd, &unix_addr.addr, unix_len );
+         if (ret < 0 && errno == ECONNABORTED)
+         {
+@@ -2808,6 +2885,9 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+             }
+         }
+ 
++        if (ret < 0 && errno == ECONNREFUSED && sock_retry_refused( sock ))
++            errno = EINPROGRESS;  /* (wine-sg 6527) refused at once: tried again, as on Windows */
++
+         if (ret < 0 && errno != EINPROGRESS)
+         {
+             set_error( sock_get_ntstatus( errno ) );
