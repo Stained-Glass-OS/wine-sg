@@ -1,0 +1,1474 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] wsdapi: the discovery provider (WS-Discovery client)
+
+WSDCreateDiscoveryProvider returned E_NOTIMPL. IWSDiscoveryProvider now searches by type and scope
+(multicast Probe, ProbeMatches relating to it for MATCH_TIMEOUT), by id (Resolve, ends at its
+match) and by address (directed Probe over HTTP), reports IWSDiscoveredService objects through
+the sink with SearchComplete or SearchFailed(S_FALSE), and hears Hello/Bye only while a sink is
+attached (the UDP 3702 listener is closed by Detach or by releasing the provider).
+The publisher's listener now binds the wildcard address (bound to the adapter's unicast address
+it never received the group's datagrams on Linux), and Probes without Types reach its handler.
+Also fixed: a Types list of two or more names crashed the reader; the types and URI list writers
+checked their bounds in bytes against characters; Probe/Resolve need no AppSequence.
+---
+diff --git a/dlls/wsdapi/Makefile.in b/dlls/wsdapi/Makefile.in
+index d669ed1..b11f4c5 100644
+--- a/dlls/wsdapi/Makefile.in
++++ b/dlls/wsdapi/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = wsdapi.dll
+ IMPORTLIB = wsdapi
+-IMPORTS   = bcrypt iphlpapi rpcrt4 user32 webservices ws2_32
++IMPORTS   = bcrypt iphlpapi rpcrt4 user32 webservices winhttp ws2_32
+ 
+ SOURCES = \
+ 	address.c \
+@@ -8,5 +8,6 @@ SOURCES = \
+ 	memory.c \
+ 	msgparams.c \
+ 	network.c \
++	provider.c \
+ 	soap.c \
+ 	xml.c
+diff --git a/dlls/wsdapi/discovery.c b/dlls/wsdapi/discovery.c
+index 360100e..fe68140 100644
+--- a/dlls/wsdapi/discovery.c
++++ b/dlls/wsdapi/discovery.c
+@@ -693,7 +693,9 @@ HRESULT WINAPI WSDCreateDiscoveryPublisher(IWSDXMLContext *pContext, IWSDiscover
+ 
+ HRESULT WINAPI WSDCreateDiscoveryProvider(IWSDXMLContext *context, IWSDiscoveryProvider **provider)
+ {
+-    FIXME("(%p, %p) stub\n", context, provider);
++    TRACE("(%p, %p)\n", context, provider);
+ 
+-    return E_NOTIMPL;
++    if (!provider) return E_POINTER;
++    *provider = NULL;
++    return create_discovery_provider(context, provider);
+ }
+diff --git a/dlls/wsdapi/network.c b/dlls/wsdapi/network.c
+index 97573c5..fab2ada 100644
+--- a/dlls/wsdapi/network.c
++++ b/dlls/wsdapi/network.c
+@@ -412,8 +412,15 @@ static int start_listening(IWSDiscoveryPublisherImpl *impl, SOCKADDR_STORAGE *bi
+         address_length = sizeof(SOCKADDR_IN6);
+     }
+ 
+-    /* Update the port for the binding address */
++    /* Bind to the wildcard address with the discovery port: on Linux a socket bound to the adapter's unicast
++     * address never receives the datagrams sent to the multicast group, so probes went unheard. The group is
++     * still joined on this adapter only, below. */
++#ifdef SG_MUTANT_WSD_BIND_UNICAST
+     memcpy(&bind_addr, bind_address, address_length);
++#else
++    memset(&bind_addr, 0, sizeof(bind_addr));
++    bind_addr.ss_family = bind_address->ss_family;
++#endif
+     ((SOCKADDR_IN *)&bind_addr)->sin_port = htons(SEND_PORT);
+ 
+     /* Update the port for the interface address */
+diff --git a/dlls/wsdapi/provider.c b/dlls/wsdapi/provider.c
+new file mode 100644
+index 0000000..6adf97f
+--- /dev/null
++++ b/dlls/wsdapi/provider.c
+@@ -0,0 +1,1061 @@
++/*
++ * Web Services on Devices: the discovery provider (the client side of WS-Discovery)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * A search sends a Probe (or a Resolve) to the WS-Discovery multicast group from a socket of its own on a
++ * port the system picks, and reads the unicast replies that relate to it for MATCH_TIMEOUT (ten seconds, as
++ * the IWSDiscoveryProviderNotify::SearchFailed documentation gives it); a resolve ends at its first match.
++ * SearchByAddress posts a directed Probe over HTTP to the address it is given.
++ *
++ * Hello and Bye announcements are only listened for while a notification sink is attached: Attach opens the
++ * multicast listener (UDP 3702) and Detach closes it. Nothing here listens otherwise, and no firewall or
++ * system configuration is touched.
++ */
++
++#include <stdarg.h>
++
++#define COBJMACROS
++
++#include "wsdapi_internal.h"
++#include "iphlpapi.h"
++#include "winhttp.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wsdapi);
++
++#define DISCOVERY_PORT       3702
++#define DISCOVERY_IPV4       0xEFFFFFFA /* 239.255.255.250 */
++static const IN6_ADDR discovery_ipv6 = {{{ 0xff,0x02,0,0,0,0,0,0,0,0,0,0,0,0,0,0x0c }}}; /* FF02::C */
++
++#define MATCH_TIMEOUT        10000
++#define RECEIVE_SLICE        250
++#define PROBE_REPEAT         2
++#define DIRECTED_TIMEOUT     21000
++#define RECEIVE_BUFFER_SIZE  65536
++
++static const WCHAR discovery_urn[] = L"urn:schemas-xmlsoap-org:ws:2005:04:discovery";
++
++struct provider
++{
++    IWSDiscoveryProvider IWSDiscoveryProvider_iface;
++    LONG ref;
++    LONG internal_ref;        /* the COM references count as one; each thread holds one */
++    IWSDXMLContext *context;
++    DWORD family;
++    CRITICAL_SECTION cs;
++    IWSDiscoveryProviderNotify *sink;
++    LONG generation;          /* bumped by Detach; a search or listener of an older one stops */
++    HANDLE threads[64];
++    DWORD thread_ids[64];
++    unsigned int thread_count;
++    SOCKET listeners[2];
++    BOOL wsa;
++};
++
++struct service
++{
++    IWSDiscoveredService IWSDiscoveredService_iface;
++    LONG ref;
++    struct wsd_match *match;  /* owns the strings and lists below */
++    WSD_ENDPOINT_REFERENCE epr;
++    LPWSTR tag;
++    WCHAR remote[64], local[64];
++    ULONGLONG instance_id;
++};
++
++static inline struct provider *impl_from_IWSDiscoveryProvider(IWSDiscoveryProvider *iface)
++{
++    return CONTAINING_RECORD(iface, struct provider, IWSDiscoveryProvider_iface);
++}
++
++static inline struct service *impl_from_IWSDiscoveredService(IWSDiscoveredService *iface)
++{
++    return CONTAINING_RECORD(iface, struct service, IWSDiscoveredService_iface);
++}
++
++/* ---- IWSDiscoveredService ---- */
++
++static HRESULT WINAPI service_QueryInterface(IWSDiscoveredService *iface, REFIID riid, void **out)
++{
++    TRACE("(%p, %s, %p)\n", iface, debugstr_guid(riid), out);
++
++    if (!out) return E_POINTER;
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IWSDiscoveredService))
++    {
++        *out = iface;
++        IWSDiscoveredService_AddRef(iface);
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI service_AddRef(IWSDiscoveredService *iface)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++    return InterlockedIncrement(&service->ref);
++}
++
++static ULONG WINAPI service_Release(IWSDiscoveredService *iface)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++    ULONG ref = InterlockedDecrement(&service->ref);
++
++    if (!ref)
++    {
++        WSDFreeLinkedMemory(service->match);
++        free(service->tag);
++        free(service);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI service_GetEndpointReference(IWSDiscoveredService *iface, WSD_ENDPOINT_REFERENCE **epr)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++
++    if (!epr) return E_POINTER;
++    *epr = &service->epr;
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetTypes(IWSDiscoveredService *iface, WSD_NAME_LIST **types)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++
++    if (!types) return E_POINTER;
++    *types = service->match->types;
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetScopes(IWSDiscoveredService *iface, WSD_URI_LIST **scopes)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++
++    if (!scopes) return E_POINTER;
++    *scopes = service->match->scopes;
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetXAddrs(IWSDiscoveredService *iface, WSD_URI_LIST **xaddrs)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++
++    if (!xaddrs) return E_POINTER;
++    *xaddrs = service->match->xaddrs;
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetMetadataVersion(IWSDiscoveredService *iface, ULONGLONG *version)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++
++    if (!version) return E_POINTER;
++    *version = service->match->metadata_version;
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetExtendedDiscoXML(IWSDiscoveredService *iface, WSDXML_ELEMENT **header_any,
++    WSDXML_ELEMENT **body_any)
++{
++    if (!header_any || !body_any) return E_POINTER;
++    /* extension elements are not kept */
++    *header_any = NULL;
++    *body_any = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetProbeResolveTag(IWSDiscoveredService *iface, LPCWSTR *tag)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++
++    if (!tag) return E_POINTER;
++    *tag = service->tag;
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetRemoteTransportAddress(IWSDiscoveredService *iface, LPCWSTR *address)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++
++    if (!address) return E_POINTER;
++    *address = service->remote[0] ? service->remote : NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetLocalTransportAddress(IWSDiscoveredService *iface, LPCWSTR *address)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++
++    if (!address) return E_POINTER;
++    *address = service->local[0] ? service->local : NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetLocalInterfaceGUID(IWSDiscoveredService *iface, GUID *guid)
++{
++    if (!guid) return E_POINTER;
++    /* which adapter a reply came in on is not tracked */
++    memset(guid, 0, sizeof(*guid));
++    return S_OK;
++}
++
++static HRESULT WINAPI service_GetInstanceId(IWSDiscoveredService *iface, ULONGLONG *instance_id)
++{
++    struct service *service = impl_from_IWSDiscoveredService(iface);
++
++    if (!instance_id) return E_POINTER;
++    *instance_id = service->instance_id;
++    return S_OK;
++}
++
++static const IWSDiscoveredServiceVtbl service_vtbl =
++{
++    service_QueryInterface,
++    service_AddRef,
++    service_Release,
++    service_GetEndpointReference,
++    service_GetTypes,
++    service_GetScopes,
++    service_GetXAddrs,
++    service_GetMetadataVersion,
++    service_GetExtendedDiscoXML,
++    service_GetProbeResolveTag,
++    service_GetRemoteTransportAddress,
++    service_GetLocalTransportAddress,
++    service_GetLocalInterfaceGUID,
++    service_GetInstanceId,
++};
++
++static void address_to_string(const SOCKADDR_STORAGE *addr, WCHAR *buffer, DWORD size)
++{
++    DWORD len = size;
++
++    buffer[0] = 0;
++    if (!addr || !addr->ss_family) return;
++    if (WSAAddressToStringW((SOCKADDR *)addr, addr->ss_family == AF_INET6 ? sizeof(SOCKADDR_IN6) : sizeof(SOCKADDR_IN),
++            NULL, buffer, &len))
++        buffer[0] = 0;
++}
++
++/* takes the match over from the message it came in */
++static struct service *create_service(struct wsd_match *match, const WSD_SOAP_MESSAGE *msg, LPCWSTR tag,
++    const SOCKADDR_STORAGE *remote, const SOCKADDR_STORAGE *local)
++{
++    struct service *service;
++
++    if (!(service = calloc(1, sizeof(*service)))) return NULL;
++    if (tag && !(service->tag = wcsdup(tag)))
++    {
++        free(service);
++        return NULL;
++    }
++    service->IWSDiscoveredService_iface.lpVtbl = &service_vtbl;
++    service->ref = 1;
++    WSDDetachLinkedMemory(match);
++    match->next = NULL;
++    service->match = match;
++    service->epr.Address = match->address;
++    if (msg->Header.AppSequence) service->instance_id = msg->Header.AppSequence->InstanceId;
++    address_to_string(remote, service->remote, ARRAY_SIZE(service->remote));
++    address_to_string(local, service->local, ARRAY_SIZE(service->local));
++    return service;
++}
++
++static void provider_free(struct provider *provider)
++{
++    unsigned int i;
++
++    for (i = 0; i < provider->thread_count; i++) CloseHandle(provider->threads[i]);
++    if (provider->sink) IWSDiscoveryProviderNotify_Release(provider->sink);
++    IWSDXMLContext_Release(provider->context);
++    provider->cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection(&provider->cs);
++    if (provider->wsa) WSACleanup();
++    free(provider);
++}
++
++static void provider_internal_addref(struct provider *provider)
++{
++    InterlockedIncrement(&provider->internal_ref);
++}
++
++static void provider_internal_release(struct provider *provider)
++{
++    if (!InterlockedDecrement(&provider->internal_ref)) provider_free(provider);
++}
++
++/* ---- networking ---- */
++
++static IP_ADAPTER_ADDRESSES *get_adapters(ULONG family)
++{
++    ULONG err, size = 8192;
++    IP_ADAPTER_ADDRESSES *tmp, *ret;
++
++    if (!(ret = malloc(size))) return NULL;
++    err = GetAdaptersAddresses(family, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, ret, &size);
++    while (err == ERROR_BUFFER_OVERFLOW)
++    {
++        if (!(tmp = realloc(ret, size))) break;
++        ret = tmp;
++        err = GetAdaptersAddresses(family, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, ret, &size);
++    }
++    if (err == ERROR_SUCCESS) return ret;
++    free(ret);
++    return NULL;
++}
++
++static int group_address(int family, SOCKADDR_STORAGE *addr)
++{
++    memset(addr, 0, sizeof(*addr));
++    if (family == AF_INET6)
++    {
++        SOCKADDR_IN6 *in6 = (SOCKADDR_IN6 *)addr;
++
++        in6->sin6_family = AF_INET6;
++        in6->sin6_port = htons(DISCOVERY_PORT);
++        in6->sin6_addr = discovery_ipv6;
++        return sizeof(*in6);
++    }
++    else
++    {
++        SOCKADDR_IN *in = (SOCKADDR_IN *)addr;
++
++        in->sin_family = AF_INET;
++        in->sin_port = htons(DISCOVERY_PORT);
++        in->sin_addr.s_addr = htonl(DISCOVERY_IPV4);
++        return sizeof(*in);
++    }
++}
++
++/* sends the datagram to the discovery group on every adapter of the family that has an address and is up */
++static BOOL send_to_group(SOCKET s, int family, const char *data, int len)
++{
++    IP_ADAPTER_ADDRESSES *adapters, *adapter;
++    SOCKADDR_STORAGE group;
++    int group_len = group_address(family, &group);
++    BOOL sent = FALSE;
++
++    if (!(adapters = get_adapters(family))) return FALSE;
++    for (adapter = adapters; adapter; adapter = adapter->Next)
++    {
++        if (!adapter->FirstUnicastAddress || adapter->OperStatus != IfOperStatusUp) continue;
++        if (family == AF_INET6)
++        {
++            DWORD index = adapter->Ipv6IfIndex;
++            if (setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_IF, (char *)&index, sizeof(index))) continue;
++        }
++        else
++        {
++            SOCKADDR_IN *in = (SOCKADDR_IN *)adapter->FirstUnicastAddress->Address.lpSockaddr;
++            if (setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, (char *)&in->sin_addr, sizeof(in->sin_addr))) continue;
++        }
++        if (sendto(s, data, len, 0, (SOCKADDR *)&group, group_len) == len) sent = TRUE;
++        else WARN("sendto on adapter %s failed: %d\n", debugstr_a(adapter->AdapterName), WSAGetLastError());
++    }
++    free(adapters);
++    return sent;
++}
++
++/* joins the discovery group on every adapter of the family */
++static BOOL join_group(SOCKET s, int family)
++{
++    IP_ADAPTER_ADDRESSES *adapters, *adapter;
++    BOOL joined = FALSE;
++
++    if (!(adapters = get_adapters(family))) return FALSE;
++    for (adapter = adapters; adapter; adapter = adapter->Next)
++    {
++        if (!adapter->FirstUnicastAddress || adapter->OperStatus != IfOperStatusUp) continue;
++        if (family == AF_INET6)
++        {
++            struct ipv6_mreq mreq;
++
++            mreq.ipv6mr_multiaddr = discovery_ipv6;
++            mreq.ipv6mr_interface = adapter->Ipv6IfIndex;
++            if (!setsockopt(s, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq))) joined = TRUE;
++        }
++        else
++        {
++            struct ip_mreq mreq;
++
++            mreq.imr_multiaddr.s_addr = htonl(DISCOVERY_IPV4);
++            mreq.imr_interface = ((SOCKADDR_IN *)adapter->FirstUnicastAddress->Address.lpSockaddr)->sin_addr;
++            if (!setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq))) joined = TRUE;
++        }
++    }
++    free(adapters);
++    return joined;
++}
++
++static IWSDiscoveryProviderNotify *get_sink(struct provider *provider, LONG generation)
++{
++    IWSDiscoveryProviderNotify *sink = NULL;
++
++    EnterCriticalSection(&provider->cs);
++    if (provider->generation == generation && provider->sink)
++    {
++        sink = provider->sink;
++        IWSDiscoveryProviderNotify_AddRef(sink);
++    }
++    LeaveCriticalSection(&provider->cs);
++    return sink;
++}
++
++static BOOL still_attached(struct provider *provider, LONG generation)
++{
++    return ReadNoFence(&provider->generation) == generation;
++}
++
++static BOOL add_thread(struct provider *provider, LPTHREAD_START_ROUTINE proc, void *param)
++{
++    unsigned int i, j;
++    HANDLE thread;
++    DWORD id;
++
++    EnterCriticalSection(&provider->cs);
++    /* forget finished threads */
++    for (i = j = 0; i < provider->thread_count; i++)
++    {
++        if (WaitForSingleObject(provider->threads[i], 0) == WAIT_OBJECT_0) CloseHandle(provider->threads[i]);
++        else
++        {
++            provider->threads[j] = provider->threads[i];
++            provider->thread_ids[j++] = provider->thread_ids[i];
++        }
++    }
++    provider->thread_count = j;
++    if (provider->thread_count == ARRAY_SIZE(provider->threads) ||
++        !(thread = CreateThread(NULL, 0, proc, param, 0, &id)))
++    {
++        LeaveCriticalSection(&provider->cs);
++        return FALSE;
++    }
++    provider->threads[provider->thread_count] = thread;
++    provider->thread_ids[provider->thread_count++] = id;
++    LeaveCriticalSection(&provider->cs);
++    return TRUE;
++}
++
++/* ---- searches ---- */
++
++struct search
++{
++    struct provider *provider;
++    LONG generation;
++    BOOL resolve;
++    LPWSTR tag;
++    WCHAR message_id[64];
++    char *xml;
++    ULONG xml_len;
++    LPWSTR url;               /* a directed probe */
++    unsigned int found_count;
++    LPWSTR found[64];         /* endpoint addresses already reported */
++};
++
++static void free_search(struct search *search)
++{
++    unsigned int i;
++
++    for (i = 0; i < search->found_count; i++) free(search->found[i]);
++    provider_internal_release(search->provider);
++    free(search->xml);
++    free(search->url);
++    free(search->tag);
++    free(search);
++}
++
++static BOOL already_found(struct search *search, LPCWSTR address)
++{
++    unsigned int i;
++
++    for (i = 0; i < search->found_count; i++)
++        if (!wcscmp(search->found[i], address)) return TRUE;
++    if (search->found_count < ARRAY_SIZE(search->found)) search->found[search->found_count++] = wcsdup(address);
++    return FALSE;
++}
++
++/* reports the matches of a reply to this search; returns how many were new */
++static unsigned int handle_reply(struct search *search, IWSDiscoveryProviderNotify *sink, const char *data, int len,
++    const SOCKADDR_STORAGE *remote, const SOCKADDR_STORAGE *local)
++{
++    WSD_SOAP_MESSAGE *msg = NULL;
++    struct wsd_match *match, *next;
++    unsigned int added = 0;
++    int type;
++
++    if (FAILED(read_message(NULL, data, len, &msg, &type)) || !msg) return 0;
++    if (type != (search->resolve ? MSGTYPE_RESOLVEMATCHES : MSGTYPE_PROBEMATCHES)
++#ifndef SG_MUTANT_WSD_ANY_RELATES
++        || !msg->Header.RelatesTo.MessageID || wcscmp(msg->Header.RelatesTo.MessageID, search->message_id)
++#endif
++        )
++    {
++        TRACE("ignoring message of type %d relating to %s\n", type, debugstr_w(msg->Header.RelatesTo.MessageID));
++        goto done;
++    }
++
++    for (match = msg->Body; match; match = next)
++    {
++        struct service *service;
++
++        next = match->next;
++        if (already_found(search, match->address)) continue;
++        if (!(service = create_service(match, msg, search->tag, remote, local))) continue;
++        TRACE("found %s\n", debugstr_w(match->address));
++        IWSDiscoveryProviderNotify_Add(sink, &service->IWSDiscoveredService_iface);
++        IWSDiscoveredService_Release(&service->IWSDiscoveredService_iface);
++        added++;
++    }
++
++done:
++    WSDFreeLinkedMemory(msg);
++    return added;
++}
++
++static unsigned int multicast_search(struct search *search, IWSDiscoveryProviderNotify *sink, int family)
++{
++    SOCKADDR_STORAGE bind_addr, remote, local;
++    unsigned int found = 0, sends = 0;
++    DWORD start, now, timeout = RECEIVE_SLICE;
++    int len, addr_len;
++    char *buffer;
++    SOCKET s;
++
++    if ((s = socket(family, SOCK_DGRAM, IPPROTO_UDP)) == INVALID_SOCKET) return 0;
++    memset(&bind_addr, 0, sizeof(bind_addr));
++    bind_addr.ss_family = family;
++    len = family == AF_INET6 ? sizeof(SOCKADDR_IN6) : sizeof(SOCKADDR_IN);
++    if (bind(s, (SOCKADDR *)&bind_addr, len) || !(buffer = malloc(RECEIVE_BUFFER_SIZE)))
++    {
++        closesocket(s);
++        return 0;
++    }
++    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
++    addr_len = sizeof(local);
++    if (getsockname(s, (SOCKADDR *)&local, &addr_len)) memset(&local, 0, sizeof(local));
++
++    start = GetTickCount();
++    if (!send_to_group(s, family, search->xml, search->xml_len))
++        WARN("probe could not be sent on any adapter (family %d)\n", family);
++    sends++;
++
++    while ((now = GetTickCount()) - start < MATCH_TIMEOUT && still_attached(search->provider, search->generation))
++    {
++        /* repeat the probe a little later, as UDP may drop it */
++        if (sends < PROBE_REPEAT && now - start >= 200 * sends)
++        {
++            send_to_group(s, family, search->xml, search->xml_len);
++            sends++;
++        }
++        addr_len = sizeof(remote);
++        len = recvfrom(s, buffer, RECEIVE_BUFFER_SIZE - 1, 0, (SOCKADDR *)&remote, &addr_len);
++        if (len <= 0) continue;
++        found += handle_reply(search, sink, buffer, len, &remote, &local);
++        if (search->resolve && found) break;
++    }
++
++    free(buffer);
++    closesocket(s);
++    return found;
++}
++
++static unsigned int directed_search(struct search *search, IWSDiscoveryProviderNotify *sink, HRESULT *hr)
++{
++    WCHAR host[256], path[2048];
++    URL_COMPONENTS comp = { sizeof(comp) };
++    HINTERNET session = NULL, connect = NULL, request = NULL;
++    DWORD status = 0, size = sizeof(status), avail, read, total = 0;
++    unsigned int found = 0;
++    char *body = NULL, *tmp;
++
++    *hr = S_FALSE;
++    comp.lpszHostName = host;
++    comp.dwHostNameLength = ARRAY_SIZE(host);
++    comp.lpszUrlPath = path;
++    comp.dwUrlPathLength = ARRAY_SIZE(path);
++    if (!WinHttpCrackUrl(search->url, 0, 0, &comp)) goto failed;
++
++    if (!(session = WinHttpOpen(L"WSDAPI", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0))) goto failed;
++    WinHttpSetTimeouts(session, DIRECTED_TIMEOUT, DIRECTED_TIMEOUT, DIRECTED_TIMEOUT, DIRECTED_TIMEOUT);
++    if (!(connect = WinHttpConnect(session, host, comp.nPort, 0))) goto failed;
++    if (!(request = WinHttpOpenRequest(connect, L"POST", path, NULL, NULL, NULL,
++            comp.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0))) goto failed;
++    if (!WinHttpSendRequest(request, L"Content-Type: application/soap+xml; charset=utf-8\r\n", -1,
++            search->xml, search->xml_len, search->xml_len, 0)) goto failed;
++    if (!WinHttpReceiveResponse(request, NULL)) goto failed;
++    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &size,
++            NULL) || status != 200)
++    {
++        WARN("directed probe to %s answered %lu\n", debugstr_w(search->url), status);
++        goto done;
++    }
++    while (WinHttpQueryDataAvailable(request, &avail) && avail && total < RECEIVE_BUFFER_SIZE)
++    {
++        if (!(tmp = realloc(body, total + avail + 1))) goto done;
++        body = tmp;
++        if (!WinHttpReadData(request, body + total, avail, &read) || !read) break;
++        total += read;
++    }
++    if (body && total)
++    {
++        SOCKADDR_STORAGE remote;
++        INT remote_len = sizeof(remote);
++        WCHAR text[300];
++
++        /* the remote transport address is the host the probe went to */
++        memset(&remote, 0, sizeof(remote));
++        swprintf(text, ARRAY_SIZE(text), L"%s:%u", host, comp.nPort);
++        if (WSAStringToAddressW(text, AF_INET, NULL, (SOCKADDR *)&remote, &remote_len) &&
++            (swprintf(text, ARRAY_SIZE(text), L"[%s]:%u", host, comp.nPort), remote_len = sizeof(remote),
++             WSAStringToAddressW(text, AF_INET6, NULL, (SOCKADDR *)&remote, &remote_len)))
++            memset(&remote, 0, sizeof(remote));
++        found = handle_reply(search, sink, body, total, &remote, NULL);
++    }
++    goto done;
++
++failed:
++    WARN("directed probe to %s failed: %lu\n", debugstr_w(search->url), GetLastError());
++    *hr = HRESULT_FROM_WIN32(GetLastError());
++    if (*hr == S_OK) *hr = E_FAIL;
++done:
++    free(body);
++    if (request) WinHttpCloseHandle(request);
++    if (connect) WinHttpCloseHandle(connect);
++    if (session) WinHttpCloseHandle(session);
++    return found;
++}
++
++static DWORD WINAPI search_thread(void *param)
++{
++    struct search *search = param;
++    struct provider *provider = search->provider;
++    IWSDiscoveryProviderNotify *sink;
++    unsigned int found = 0;
++    HRESULT hr = S_FALSE;
++
++    if (!(sink = get_sink(provider, search->generation))) goto done;
++
++    if (search->url) found = directed_search(search, sink, &hr);
++    else
++    {
++        if (provider->family & WSDAPI_ADDRESSFAMILY_IPV4) found += multicast_search(search, sink, AF_INET);
++        if ((provider->family & WSDAPI_ADDRESSFAMILY_IPV6) && !(search->resolve && found))
++            found += multicast_search(search, sink, AF_INET6);
++    }
++
++    if (still_attached(provider, search->generation))
++    {
++        if (found) IWSDiscoveryProviderNotify_SearchComplete(sink, search->tag);
++#ifndef SG_MUTANT_WSD_NO_FAILED
++        else IWSDiscoveryProviderNotify_SearchFailed(sink, hr, search->tag);
++#endif
++    }
++    IWSDiscoveryProviderNotify_Release(sink);
++
++done:
++    free_search(search);
++    return 0;
++}
++
++static HRESULT start_search(struct provider *provider, const WSD_NAME_LIST *types, const WSD_URI_LIST *scopes,
++    LPCWSTR match_by, LPCWSTR resolve_id, LPCWSTR url, LPCWSTR tag)
++{
++    struct search *search;
++    HRESULT hr;
++
++    EnterCriticalSection(&provider->cs);
++    if (!provider->sink)
++    {
++        LeaveCriticalSection(&provider->cs);
++        return E_ABORT;
++    }
++    LeaveCriticalSection(&provider->cs);
++
++    if (!(search = calloc(1, sizeof(*search)))) return E_OUTOFMEMORY;
++    search->provider = provider;
++    provider_internal_addref(provider);
++    search->generation = ReadNoFence(&provider->generation);
++    search->resolve = resolve_id != NULL;
++    if ((tag && !(search->tag = wcsdup(tag))) || (url && !(search->url = wcsdup(url))))
++    {
++        free_search(search);
++        return E_OUTOFMEMORY;
++    }
++
++    hr = build_search_message(provider->context, url ? url : discovery_urn, types, scopes, match_by, resolve_id,
++            &search->xml, &search->xml_len, search->message_id);
++    if (FAILED(hr))
++    {
++        free_search(search);
++        return hr;
++    }
++    TRACE("search %s, message %s\n", debugstr_w(tag), debugstr_w(search->message_id));
++
++    if (!add_thread(provider, search_thread, search))
++    {
++        free_search(search);
++        return E_FAIL;
++    }
++    return S_OK;
++}
++
++/* ---- the Hello/Bye listener, only while attached ---- */
++
++struct listener
++{
++    struct provider *provider;
++    LONG generation;
++    SOCKET socket;
++};
++
++static DWORD WINAPI listener_thread(void *param)
++{
++    struct listener *listener = param;
++    struct provider *provider = listener->provider;
++    SOCKADDR_STORAGE remote, local;
++    int len, addr_len;
++    char *buffer;
++
++    addr_len = sizeof(local);
++    if (getsockname(listener->socket, (SOCKADDR *)&local, &addr_len)) memset(&local, 0, sizeof(local));
++
++    if ((buffer = malloc(RECEIVE_BUFFER_SIZE)))
++    {
++#ifdef SG_MUTANT_WSD_KEEP_LISTENING
++        while (TRUE)
++#else
++        while (still_attached(provider, listener->generation))
++#endif
++        {
++            IWSDiscoveryProviderNotify *sink;
++            struct wsd_match *match, *next;
++            WSD_SOAP_MESSAGE *msg = NULL;
++            int type;
++
++            addr_len = sizeof(remote);
++            len = recvfrom(listener->socket, buffer, RECEIVE_BUFFER_SIZE - 1, 0, (SOCKADDR *)&remote, &addr_len);
++            if (len <= 0) continue;
++            if (FAILED(read_message(NULL, buffer, len, &msg, &type)) || !msg) continue;
++            if ((type == MSGTYPE_HELLO || type == MSGTYPE_BYE) && (sink = get_sink(provider, listener->generation)))
++            {
++                for (match = msg->Body; match; match = next)
++                {
++                    struct service *service;
++
++                    next = match->next;
++                    if (!(service = create_service(match, msg, NULL, &remote, &local))) continue;
++                    TRACE("%s from %s\n", type == MSGTYPE_HELLO ? "hello" : "bye", debugstr_w(match->address));
++                    if (type == MSGTYPE_HELLO) IWSDiscoveryProviderNotify_Add(sink, &service->IWSDiscoveredService_iface);
++                    else IWSDiscoveryProviderNotify_Remove(sink, &service->IWSDiscoveredService_iface);
++                    IWSDiscoveredService_Release(&service->IWSDiscoveredService_iface);
++                }
++                IWSDiscoveryProviderNotify_Release(sink);
++            }
++            WSDFreeLinkedMemory(msg);
++        }
++        free(buffer);
++    }
++
++    closesocket(listener->socket);
++    provider_internal_release(provider);
++    free(listener);
++    return 0;
++}
++
++static BOOL start_listener(struct provider *provider, int family)
++{
++    SOCKADDR_STORAGE addr;
++    struct listener *listener;
++    DWORD timeout = RECEIVE_SLICE;
++    const BOOL reuse = TRUE;
++    int len;
++    SOCKET s;
++
++    if ((s = socket(family, SOCK_DGRAM, IPPROTO_UDP)) == INVALID_SOCKET) return FALSE;
++    memset(&addr, 0, sizeof(addr));
++    addr.ss_family = family;
++    len = family == AF_INET6 ? sizeof(SOCKADDR_IN6) : sizeof(SOCKADDR_IN);
++    ((SOCKADDR_IN *)&addr)->sin_port = htons(DISCOVERY_PORT);   /* same offset in both */
++    if (family == AF_INET6) setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&reuse, sizeof(reuse));
++    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)) ||
++        bind(s, (SOCKADDR *)&addr, len) || !join_group(s, family) ||
++        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) ||
++        !(listener = malloc(sizeof(*listener))))
++    {
++        WARN("no announcement listener for family %d: %d\n", family, WSAGetLastError());
++        closesocket(s);
++        return FALSE;
++    }
++    listener->provider = provider;
++    listener->generation = provider->generation;
++    listener->socket = s;
++    provider_internal_addref(provider);
++    if (!add_thread(provider, listener_thread, listener))
++    {
++        provider_internal_release(provider);
++        closesocket(s);
++        free(listener);
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/* stops what an attachment started; the caller's own thread (a callback calling Detach) is not waited for */
++static void stop_threads(struct provider *provider)
++{
++    DWORD self = GetCurrentThreadId();
++    HANDLE threads[ARRAY_SIZE(provider->threads)];
++    unsigned int i, count = 0;
++
++    EnterCriticalSection(&provider->cs);
++    for (i = 0; i < provider->thread_count; i++)
++    {
++        if (provider->thread_ids[i] == self) CloseHandle(provider->threads[i]);
++        else threads[count++] = provider->threads[i];
++    }
++    provider->thread_count = 0;
++    LeaveCriticalSection(&provider->cs);
++
++    if (count) WaitForMultipleObjects(count, threads, TRUE, INFINITE);
++    for (i = 0; i < count; i++) CloseHandle(threads[i]);
++}
++
++/* ---- IWSDiscoveryProvider ---- */
++
++static HRESULT WINAPI provider_QueryInterface(IWSDiscoveryProvider *iface, REFIID riid, void **out)
++{
++    TRACE("(%p, %s, %p)\n", iface, debugstr_guid(riid), out);
++
++    if (!out) return E_INVALIDARG;
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IWSDiscoveryProvider))
++    {
++        *out = iface;
++        IWSDiscoveryProvider_AddRef(iface);
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI provider_AddRef(IWSDiscoveryProvider *iface)
++{
++    struct provider *provider = impl_from_IWSDiscoveryProvider(iface);
++    ULONG ref = InterlockedIncrement(&provider->ref);
++
++    TRACE("(%p) ref %lu\n", provider, ref);
++    return ref;
++}
++
++static ULONG WINAPI provider_Release(IWSDiscoveryProvider *iface)
++{
++    struct provider *provider = impl_from_IWSDiscoveryProvider(iface);
++    ULONG ref = InterlockedDecrement(&provider->ref);
++    IWSDiscoveryProviderNotify *sink;
++
++    TRACE("(%p) ref %lu\n", provider, ref);
++    if (!ref)
++    {
++        /* released while attached: stop listening and searching now, as Detach would */
++        EnterCriticalSection(&provider->cs);
++        sink = provider->sink;
++        provider->sink = NULL;
++        InterlockedIncrement(&provider->generation);
++        LeaveCriticalSection(&provider->cs);
++        stop_threads(provider);
++        if (sink) IWSDiscoveryProviderNotify_Release(sink);
++        provider_internal_release(provider);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI provider_SetAddressFamily(IWSDiscoveryProvider *iface, DWORD family)
++{
++    struct provider *provider = impl_from_IWSDiscoveryProvider(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("(%p, %lu)\n", provider, family);
++
++    if (family != WSDAPI_ADDRESSFAMILY_IPV4 && family != WSDAPI_ADDRESSFAMILY_IPV6 &&
++        family != (WSDAPI_ADDRESSFAMILY_IPV4 | WSDAPI_ADDRESSFAMILY_IPV6))
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&provider->cs);
++    /* like the publisher's: it can only be chosen before the provider is used */
++    if (provider->sink) hr = STG_E_INVALIDFUNCTION;
++    else provider->family = family;
++    LeaveCriticalSection(&provider->cs);
++    return hr;
++}
++
++static HRESULT WINAPI provider_Attach(IWSDiscoveryProvider *iface, IWSDiscoveryProviderNotify *sink)
++{
++    struct provider *provider = impl_from_IWSDiscoveryProvider(iface);
++    BOOL listening = FALSE;
++
++    TRACE("(%p, %p)\n", provider, sink);
++
++    if (!sink) return E_POINTER;
++
++    EnterCriticalSection(&provider->cs);
++    if (provider->sink)
++    {
++        LeaveCriticalSection(&provider->cs);
++        return E_ABORT;
++    }
++    provider->sink = sink;
++    IWSDiscoveryProviderNotify_AddRef(sink);
++    LeaveCriticalSection(&provider->cs);
++
++    if (provider->family & WSDAPI_ADDRESSFAMILY_IPV4) listening |= start_listener(provider, AF_INET);
++    if (provider->family & WSDAPI_ADDRESSFAMILY_IPV6) listening |= start_listener(provider, AF_INET6);
++    /* searches still work without the listener (another program may hold the port exclusively) */
++    if (!listening) WARN("not listening for announcements\n");
++    return S_OK;
++}
++
++static HRESULT WINAPI provider_Detach(IWSDiscoveryProvider *iface)
++{
++    struct provider *provider = impl_from_IWSDiscoveryProvider(iface);
++    IWSDiscoveryProviderNotify *sink;
++
++    TRACE("(%p)\n", provider);
++
++    EnterCriticalSection(&provider->cs);
++    if (!(sink = provider->sink))
++    {
++        LeaveCriticalSection(&provider->cs);
++        return E_ABORT;
++    }
++    provider->sink = NULL;
++    InterlockedIncrement(&provider->generation);
++    LeaveCriticalSection(&provider->cs);
++
++#ifndef SG_MUTANT_WSD_KEEP_LISTENING
++    stop_threads(provider);
++#endif
++    IWSDiscoveryProviderNotify_Release(sink);
++    return S_OK;
++}
++
++static HRESULT WINAPI provider_SearchById(IWSDiscoveryProvider *iface, LPCWSTR id, LPCWSTR tag)
++{
++    struct provider *provider = impl_from_IWSDiscoveryProvider(iface);
++
++    TRACE("(%p, %s, %s)\n", provider, debugstr_w(id), debugstr_w(tag));
++
++    if (!id || !id[0] || wcslen(id) > WSD_MAX_TEXT_LENGTH || (tag && wcslen(tag) > WSD_MAX_TEXT_LENGTH))
++        return E_INVALIDARG;
++    return start_search(provider, NULL, NULL, NULL, id, NULL, tag);
++}
++
++static HRESULT WINAPI provider_SearchByAddress(IWSDiscoveryProvider *iface, LPCWSTR address, LPCWSTR tag)
++{
++    struct provider *provider = impl_from_IWSDiscoveryProvider(iface);
++
++    TRACE("(%p, %s, %s)\n", provider, debugstr_w(address), debugstr_w(tag));
++
++    if (!address || wcslen(address) > WSD_MAX_TEXT_LENGTH || (tag && wcslen(tag) > WSD_MAX_TEXT_LENGTH))
++        return E_INVALIDARG;
++    if (wcsnicmp(address, L"http://", 7) && wcsnicmp(address, L"https://", 8)) return E_INVALIDARG;
++    return start_search(provider, NULL, NULL, NULL, NULL, address, tag);
++}
++
++static HRESULT WINAPI provider_SearchByType(IWSDiscoveryProvider *iface, const WSD_NAME_LIST *types,
++    const WSD_URI_LIST *scopes, LPCWSTR match_by, LPCWSTR tag)
++{
++    struct provider *provider = impl_from_IWSDiscoveryProvider(iface);
++    const WSD_NAME_LIST *type;
++    const WSD_URI_LIST *scope;
++
++    TRACE("(%p, %p, %p, %s, %s)\n", provider, types, scopes, debugstr_w(match_by), debugstr_w(tag));
++
++    if ((match_by && wcslen(match_by) > WSD_MAX_TEXT_LENGTH) || (tag && wcslen(tag) > WSD_MAX_TEXT_LENGTH))
++        return E_INVALIDARG;
++    for (type = types; type; type = type->Next)
++        if (!type->Element || !type->Element->LocalName || !type->Element->Space ||
++            !type->Element->Space->PreferredPrefix || !type->Element->Space->Uri)
++            return E_INVALIDARG;
++    for (scope = scopes; scope; scope = scope->Next)
++        if (!scope->Element) return E_INVALIDARG;
++    /* a scope rule without scopes says nothing */
++    if (match_by && !scopes) return E_INVALIDARG;
++    return start_search(provider, types, scopes, match_by, NULL, NULL, tag);
++}
++
++static HRESULT WINAPI provider_GetXMLContext(IWSDiscoveryProvider *iface, IWSDXMLContext **context)
++{
++    struct provider *provider = impl_from_IWSDiscoveryProvider(iface);
++
++    TRACE("(%p, %p)\n", provider, context);
++
++    if (!context) return E_POINTER;
++    *context = provider->context;
++    IWSDXMLContext_AddRef(*context);
++    return S_OK;
++}
++
++static const IWSDiscoveryProviderVtbl provider_vtbl =
++{
++    provider_QueryInterface,
++    provider_AddRef,
++    provider_Release,
++    provider_SetAddressFamily,
++    provider_Attach,
++    provider_Detach,
++    provider_SearchById,
++    provider_SearchByAddress,
++    provider_SearchByType,
++    provider_GetXMLContext,
++};
++
++HRESULT create_discovery_provider(IWSDXMLContext *context, IWSDiscoveryProvider **out)
++{
++    struct provider *provider;
++    WSADATA wsa;
++    HRESULT hr;
++
++    if (!(provider = calloc(1, sizeof(*provider)))) return E_OUTOFMEMORY;
++    provider->IWSDiscoveryProvider_iface.lpVtbl = &provider_vtbl;
++    provider->ref = 1;
++    provider->internal_ref = 1;
++    provider->family = WSDAPI_ADDRESSFAMILY_IPV4 | WSDAPI_ADDRESSFAMILY_IPV6;
++
++    if (context)
++    {
++        provider->context = context;
++        IWSDXMLContext_AddRef(context);
++    }
++    else if (FAILED(hr = WSDXMLCreateContext(&provider->context)))
++    {
++        free(provider);
++        return hr;
++    }
++    if (FAILED(hr = register_namespaces(provider->context)))
++    {
++        IWSDXMLContext_Release(provider->context);
++        free(provider);
++        return hr;
++    }
++    provider->wsa = !WSAStartup(MAKEWORD(2, 2), &wsa);
++    InitializeCriticalSectionEx(&provider->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    provider->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": provider.cs");
++
++    *out = &provider->IWSDiscoveryProvider_iface;
++    return S_OK;
++}
+diff --git a/dlls/wsdapi/soap.c b/dlls/wsdapi/soap.c
+index 8c68b2e..592c7f2 100644
+--- a/dlls/wsdapi/soap.c
++++ b/dlls/wsdapi/soap.c
+@@ -518,7 +518,8 @@ static HRESULT build_types_list(LPWSTR buffer, size_t buffer_size, const WSD_NAM
+         memory_needed = sizeof(WCHAR) * (lstrlenW(cur->Element->LocalName) +
+             lstrlenW(cur->Element->Space->PreferredPrefix) + 3);
+ 
+-        if (current_buf_pos + memory_needed > buffer + buffer_size)
++        /* memory_needed and buffer_size are bytes, the pointers count characters */
++        if (current_buf_pos + memory_needed / sizeof(WCHAR) > buffer + buffer_size / sizeof(WCHAR))
+             return E_INVALIDARG;
+ 
+         if (cur != list)
+@@ -545,17 +546,17 @@ static HRESULT build_uri_list(LPWSTR buffer, size_t buffer_size, const WSD_URI_L
+ 
+     do
+     {
+-        /* Calculate space needed, including trailing space */
++        /* Calculate space needed, including the separating space and the NULL character */
+         string_len = lstrlenW(cur->Element);
+-        memory_needed = (string_len + 1) * sizeof(WCHAR);
++        memory_needed = (string_len + 2) * sizeof(WCHAR);
+ 
+-        if (cur_buf_pos + memory_needed > buffer + buffer_size)
++        if (cur_buf_pos + memory_needed / sizeof(WCHAR) > buffer + buffer_size / sizeof(WCHAR))
+             return E_INVALIDARG;
+ 
+         if (cur != list)
+             *cur_buf_pos++ = ' ';
+ 
+-        memcpy(cur_buf_pos, cur->Element, memory_needed);
++        memcpy(cur_buf_pos, cur->Element, (string_len + 1) * sizeof(WCHAR));
+         cur_buf_pos += string_len;
+ 
+         cur = cur->Next;
+@@ -684,27 +685,30 @@ static HRESULT create_soap_header_xml_elements(IWSDXMLContext *xml_context, WSD_
+         if (FAILED(ret)) goto cleanup;
+     }
+ 
+-    /* <d:AppSequence> */
+-    ret = add_child_element(xml_context, header_element, discoveryNsUri, appSequenceString, L"", &app_sequence_element);
+-    if (FAILED(ret)) goto cleanup;
++    /* <d:AppSequence>, which a discovery provider's Probe and Resolve do not carry */
++    if (header->AppSequence != NULL)
++    {
++        ret = add_child_element(xml_context, header_element, discoveryNsUri, appSequenceString, L"", &app_sequence_element);
++        if (FAILED(ret)) goto cleanup;
+ 
+-    /* InstanceId attribute */
+-    ret = add_ulonglong_attribute(xml_context, app_sequence_element, NULL, instanceIdString, min(UINT_MAX,
+-        header->AppSequence->InstanceId));
+-    if (FAILED(ret)) goto cleanup;
++        /* InstanceId attribute */
++        ret = add_ulonglong_attribute(xml_context, app_sequence_element, NULL, instanceIdString, min(UINT_MAX,
++            header->AppSequence->InstanceId));
++        if (FAILED(ret)) goto cleanup;
+ 
+-    /* SequenceID attribute */
+-    if (header->AppSequence->SequenceId != NULL)
+-    {
+-        ret = add_string_attribute(xml_context, app_sequence_element, NULL, sequenceIdString, header->AppSequence->SequenceId);
++        /* SequenceID attribute */
++        if (header->AppSequence->SequenceId != NULL)
++        {
++            ret = add_string_attribute(xml_context, app_sequence_element, NULL, sequenceIdString, header->AppSequence->SequenceId);
++            if (FAILED(ret)) goto cleanup;
++        }
++
++        /* MessageNumber attribute */
++        ret = add_ulonglong_attribute(xml_context, app_sequence_element, NULL, messageNumberString, min(UINT_MAX,
++            header->AppSequence->MessageNumber));
+         if (FAILED(ret)) goto cleanup;
+     }
+ 
+-    /* MessageNumber attribute */
+-    ret = add_ulonglong_attribute(xml_context, app_sequence_element, NULL, messageNumberString, min(UINT_MAX,
+-        header->AppSequence->MessageNumber));
+-    if (FAILED(ret)) goto cleanup;
+-
+     /* </d:AppSequence> */
+ 
+     /* Write any headers */
+@@ -1840,6 +1844,7 @@ static WSD_NAME_LIST *build_types_list_from_string(IWSDXMLContext *context, LPCW
+                 cur_list = WSDAllocateLinkedMemory(parent, sizeof(WSD_NAME_LIST));
+                 if (cur_list == NULL) goto cleanup;
+ 
++                ZeroMemory(cur_list, sizeof(WSD_NAME_LIST));
+                 prev_list->Next = cur_list;
+             }
+ 
+@@ -1861,6 +1866,7 @@ static WSD_NAME_LIST *build_types_list_from_string(IWSDXMLContext *context, LPCW
+             name->LocalName = duplicate_string(name, name_start);
+ 
+             cur_list->Element = name;
++            prev_list = cur_list;
+             prefix_start = &temp_buffer[i + 1];
+             name_start = NULL;
+         }
+@@ -1895,6 +1901,9 @@ static BOOL is_duplicate_message(IWSDiscoveryPublisherImpl *impl, LPCWSTR id)
+     BOOL ret = FALSE;
+     int len;
+ 
++    /* a discovery provider's replies are matched by what they relate to instead */
++    if (!impl) return FALSE;
++
+     EnterCriticalSection(&impl->message_ids_critical_section);
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(msg_id, msg_id_cursor, &impl->message_ids, struct message_id, entry)
+@@ -2073,6 +2082,14 @@ HRESULT read_message(IWSDiscoveryPublisherImpl *impl, const char *xml, int xml_l
+     soap_msg->Header.To = duplicate_string(soap_msg, value);
+     if (soap_msg->Header.To == NULL) goto outofmemory;
+ 
++    /* what a reply answers */
++    if (SUCCEEDED(WSDXMLGetValueFromAny(addressingNsUri, relatesToString, (WSDXML_ELEMENT *) header_element->FirstChild,
++            &value)) && value)
++    {
++        soap_msg->Header.RelatesTo.MessageID = duplicate_string(soap_msg, value);
++        if (soap_msg->Header.RelatesTo.MessageID == NULL) goto outofmemory;
++    }
++
+     ret = WSDXMLGetValueFromAny(addressingNsUri, messageIdString, (WSDXML_ELEMENT *) header_element->FirstChild, &value);
+     if (FAILED(ret)) goto cleanup;
+ 
+@@ -2133,6 +2150,7 @@ HRESULT read_message(IWSDiscoveryPublisherImpl *impl, const char *xml, int xml_l
+     remove_element(find_element(header_element, toString, addressingNsUri));
+     remove_element(find_element(header_element, messageIdString, addressingNsUri));
+     remove_element(find_element(header_element, appSequenceString, discoveryNsUri));
++    remove_element(find_element(header_element, relatesToString, addressingNsUri));
+ 
+     soap_msg->Header.AnyHeaders = (WSDXML_ELEMENT *) header_element->FirstChild;
+ 
+@@ -2166,13 +2184,10 @@ HRESULT read_message(IWSDiscoveryPublisherImpl *impl, const char *xml, int xml_l
+         /* Check for the "types" element */
+         ret = WSDXMLGetValueFromAny(discoveryNsUri, typesString, (WSDXML_ELEMENT *) probe_element->FirstChild, &value);
+ 
+-        if (FAILED(ret))
+-        {
+-            WARN("Unable to find Types element in received Probe message\n");
+-            goto cleanup;
+-        }
+-
+-        probe->Types = build_types_list_from_string(context, value, probe);
++        /* Types is optional: a probe without it asks for every target service */
++        if (SUCCEEDED(ret) && value && value[0])
++            probe->Types = build_types_list_from_string(context, value, probe);
++        ret = S_OK;
+ 
+         /* the optional scopes, and the rule they are matched by */
+         {
+@@ -2222,6 +2237,67 @@ HRESULT read_message(IWSDiscoveryPublisherImpl *impl, const char *xml, int xml_l
+         soap_msg = NULL; /* caller will clean this up */
+         *msg_type = MSGTYPE_PROBE;
+     }
++    else
++    {
++        /* a discovery provider's messages: the matches they carry, read while the sender's prefixes are known */
++        static const struct { const WCHAR *action, *element, *child; int type; } replies[] =
++        {
++            { L"http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches", L"ProbeMatches", L"ProbeMatch",
++              MSGTYPE_PROBEMATCHES },
++            { L"http://schemas.xmlsoap.org/ws/2005/04/discovery/ResolveMatches", L"ResolveMatches", L"ResolveMatch",
++              MSGTYPE_RESOLVEMATCHES },
++            { L"http://schemas.xmlsoap.org/ws/2005/04/discovery/Hello", L"Hello", NULL, MSGTYPE_HELLO },
++            { L"http://schemas.xmlsoap.org/ws/2005/04/discovery/Bye", L"Bye", NULL, MSGTYPE_BYE },
++        };
++        struct wsd_match *matches = NULL, **tail = &matches;
++        WSDXML_ELEMENT *element, *item;
++        unsigned int r;
++
++        for (r = 0; r < ARRAY_SIZE(replies); r++)
++            if (!lstrcmpW(soap_msg->Header.Action, replies[r].action)) break;
++        if (r == ARRAY_SIZE(replies)) goto cleanup;
++        if (!(element = find_element(body_element, replies[r].element, discoveryNsUri))) goto cleanup;
++
++        for (item = replies[r].child ? (WSDXML_ELEMENT *)element->FirstChild : element; item;
++             item = replies[r].child ? (WSDXML_ELEMENT *)item->Node.Next : NULL)
++        {
++            WSDXML_ELEMENT *epr;
++            struct wsd_match *match;
++
++            if (item->Node.Type != ElementType) continue;
++            if (replies[r].child && (lstrcmpW(item->Name->LocalName, replies[r].child) ||
++                    lstrcmpW(item->Name->Space->Uri, discoveryNsUri))) continue;
++            if (!(epr = find_element(item, endpointReferenceString, addressingNsUri))) continue;
++            if (FAILED(WSDXMLGetValueFromAny(addressingNsUri, addressString, (WSDXML_ELEMENT *)epr->FirstChild,
++                    &value)) || !value || !value[0]) continue;
++
++            if (!(match = WSDAllocateLinkedMemory(soap_msg, sizeof(*match)))) goto outofmemory;
++            ZeroMemory(match, sizeof(*match));
++            if (!(match->address = duplicate_string(match, value))) goto outofmemory;
++            if (SUCCEEDED(WSDXMLGetValueFromAny(discoveryNsUri, typesString, (WSDXML_ELEMENT *)item->FirstChild,
++                    &value)) && value && value[0])
++                match->types = build_types_list_from_string(context, value, match);
++            if (SUCCEEDED(WSDXMLGetValueFromAny(discoveryNsUri, scopesString, (WSDXML_ELEMENT *)item->FirstChild,
++                    &value)) && value)
++                match->scopes = build_uri_list_from_string(match, value);
++            if (SUCCEEDED(WSDXMLGetValueFromAny(discoveryNsUri, xAddrsString, (WSDXML_ELEMENT *)item->FirstChild,
++                    &value)) && value)
++                match->xaddrs = build_uri_list_from_string(match, value);
++            if (SUCCEEDED(WSDXMLGetValueFromAny(discoveryNsUri, metadataVersionString,
++                    (WSDXML_ELEMENT *)item->FirstChild, &value)) && value)
++                wide_text_to_ulonglong(value, &match->metadata_version);
++            *tail = match;
++            tail = &match->next;
++        }
++
++        soap_msg->Body = matches;
++        soap_msg->BodyType = generate_type(replies[r].action, soap_msg);
++        if (soap_msg->BodyType == NULL) goto cleanup;
++        *out_msg = soap_msg;
++        soap_msg = NULL;
++        *msg_type = replies[r].type;
++        ret = S_OK;
++    }
+ 
+     goto cleanup;
+ 
+@@ -2237,3 +2313,87 @@ cleanup:
+ 
+     return ret;
+ }
++
++/* ---- for the discovery provider (provider.c) ---- */
++
++/* a Probe (types, scopes) or, with resolve_id, a Resolve, to "to" (the discovery URN for multicast, the device's
++ * address for a directed probe): the whole document, with its message ID */
++HRESULT build_search_message(IWSDXMLContext *context, LPCWSTR to, const WSD_NAME_LIST *types_list,
++    const WSD_URI_LIST *scopes_list, LPCWSTR match_by, LPCWSTR resolve_id, char **out_xml, ULONG *out_len,
++    WCHAR *message_id)
++{
++    static const char xml_header[] = "<?xml version=\"1.0\" encoding=\"utf-8\"?>";
++    WSDXML_ELEMENT *body_element = NULL, *search_element, *scopes_element = NULL, *epr_element;
++    struct list *discovered_namespaces = NULL;
++    WSDXML_NAME *body_name = NULL;
++    WSD_SOAP_HEADER soap_header;
++    WS_HEAP *heap = NULL;
++    ULONG xml_length = 0;
++    char *xml = NULL;
++    LPWSTR buffer;
++    HRESULT ret = E_OUTOFMEMORY;
++
++    *out_xml = NULL;
++    if (!create_guid(message_id)) return E_FAIL;
++    if (!(discovered_namespaces = WSDAllocateLinkedMemory(NULL, sizeof(struct list)))) return E_OUTOFMEMORY;
++    list_init(discovered_namespaces);
++
++    populate_soap_header(&soap_header, to ? to : discoveryTo, resolve_id ?
++            L"http://schemas.xmlsoap.org/ws/2005/04/discovery/Resolve" : actionProbe, message_id, NULL, NULL);
++
++    ret = IWSDXMLContext_AddNameToNamespace(context, envelopeNsUri, bodyString, &body_name);
++    if (FAILED(ret)) goto cleanup;
++    ret = WSDXMLBuildAnyForSingleElement(body_name, NULL, &body_element);
++    if (FAILED(ret)) goto cleanup;
++    ret = add_child_element(context, body_element, discoveryNsUri, resolve_id ? L"Resolve" : probeString, NULL,
++            &search_element);
++    if (FAILED(ret)) goto cleanup;
++
++    if (resolve_id)
++    {
++        ret = add_child_element(context, search_element, addressingNsUri, endpointReferenceString, NULL, &epr_element);
++        if (FAILED(ret)) goto cleanup;
++        ret = add_child_element(context, epr_element, addressingNsUri, addressString, resolve_id, NULL);
++        if (FAILED(ret)) goto cleanup;
++    }
++    else
++    {
++        if (types_list)
++        {
++            ret = E_OUTOFMEMORY;
++            if (!(buffer = WSDAllocateLinkedMemory(search_element, WSD_MAX_TEXT_LENGTH * sizeof(WCHAR)))) goto cleanup;
++            ret = build_types_list(buffer, WSD_MAX_TEXT_LENGTH * sizeof(WCHAR), types_list, discovered_namespaces);
++            if (FAILED(ret)) goto cleanup;
++            ret = add_child_element(context, search_element, discoveryNsUri, typesString, buffer, NULL);
++            if (FAILED(ret)) goto cleanup;
++        }
++        if (scopes_list)
++        {
++            ret = E_OUTOFMEMORY;
++            if (!(buffer = WSDAllocateLinkedMemory(search_element, WSD_MAX_TEXT_LENGTH * sizeof(WCHAR)))) goto cleanup;
++            ret = build_uri_list(buffer, WSD_MAX_TEXT_LENGTH * sizeof(WCHAR), scopes_list);
++            if (FAILED(ret)) goto cleanup;
++            ret = add_child_element(context, search_element, discoveryNsUri, scopesString, buffer, &scopes_element);
++            if (FAILED(ret)) goto cleanup;
++            if (match_by && FAILED(ret = add_string_attribute(context, scopes_element, NULL, L"MatchBy", match_by)))
++                goto cleanup;
++        }
++    }
++
++    ret = create_soap_envelope(context, &soap_header, body_element, &heap, &xml, &xml_length, discovered_namespaces);
++    if (FAILED(ret)) goto cleanup;
++    ret = E_OUTOFMEMORY;
++    if (!(*out_xml = malloc(xml_length + sizeof(xml_header)))) goto cleanup;
++    memcpy(*out_xml, xml_header, sizeof(xml_header) - 1);
++    memcpy(*out_xml + sizeof(xml_header) - 1, xml, xml_length);
++    *out_len = xml_length + sizeof(xml_header) - 1;
++    (*out_xml)[*out_len] = 0;
++    ret = S_OK;
++
++cleanup:
++    if (heap) WsFreeHeap(heap);
++    WSDFreeLinkedMemory(body_name);
++    WSDFreeLinkedMemory(body_element);
++    WSDFreeLinkedMemory(discovered_namespaces);
++    return ret;
++}
+diff --git a/dlls/wsdapi/wsdapi_internal.h b/dlls/wsdapi/wsdapi_internal.h
+index 286d84c..307b110 100644
+--- a/dlls/wsdapi/wsdapi_internal.h
++++ b/dlls/wsdapi/wsdapi_internal.h
+@@ -109,6 +109,27 @@ HRESULT read_message(IWSDiscoveryPublisherImpl *impl, const char *xml, int xml_l
+ 
+ #define MSGTYPE_UNKNOWN     0
+ #define MSGTYPE_PROBE       1
++#define MSGTYPE_PROBEMATCHES   2
++#define MSGTYPE_RESOLVEMATCHES 3
++#define MSGTYPE_HELLO          4
++#define MSGTYPE_BYE            5
++
++/* the discovery provider's parts of soap.c */
++/* what a ProbeMatches, ResolveMatches, Hello or Bye carries (the message's Body, a list in its linked memory) */
++struct wsd_match
++{
++    struct wsd_match *next;
++    LPWSTR address;
++    WSD_NAME_LIST *types;
++    WSD_URI_LIST *scopes;
++    WSD_URI_LIST *xaddrs;
++    ULONGLONG metadata_version;
++};
++
++HRESULT build_search_message(IWSDXMLContext *context, LPCWSTR to, const WSD_NAME_LIST *types_list,
++    const WSD_URI_LIST *scopes_list, LPCWSTR match_by, LPCWSTR resolve_id, char **out_xml, ULONG *out_len,
++    WCHAR *message_id);
++HRESULT create_discovery_provider(IWSDXMLContext *context, IWSDiscoveryProvider **provider);
+ 
+ /* xml.c */
+ 
