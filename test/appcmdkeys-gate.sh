@@ -1,13 +1,14 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# The application-command keys (patches/sg/6524): a window that leaves VK_BROWSER_BACK..VK_LAUNCH_APP2
-# to DefWindowProc gets WM_APPCOMMAND (FAPPCOMMAND_KEY), and a shell hook window in another process
-# HSHELL_APPCOMMAND, as the media keys must reach the desktop's player controls; a window that
-# handles WM_KEYDOWN itself makes none. Real X key events (xdotool) through winex11, whose
+# The application-command keys (patches/sg/6524, 6526): VK_BROWSER_BACK..VK_LAUNCH_APP2 are
+# WM_APPCOMMAND (FAPPCOMMAND_KEY, with the key state) for the window, also one that handles WM_KEYDOWN
+# itself, and what a window passes on to DefWindowProc reaches a shell hook window in another process
+# (HSHELL_APPCOMMAND), as the media keys must reach the desktop's player controls; a window that
+# handles WM_APPCOMMAND keeps it. Real X key events (xdotool) through winex11, whose
 # XF86AudioPlay/Pause/Next/Prev/Stop, Calculator and MyComputer keysyms are checked too
 # (test/appcmdkeys-probe.c).
 #   WINE=/opt/wine-sg/bin/wine test/appcmdkeys-gate.sh     (SG_APPCMD_DISPLAY=N: that display)
-# Mutant: SG_MUTANT_APPCMD_NO_KEY (win32u defwnd.c).
+# Mutant: SG_MUTANT_APPCMD_NO_KEY (win32u message.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -73,22 +74,28 @@ HOOK=$(tr -d '\r' < "$T/hook" | sed -n 's/^hook_appcmd cmd=\([0-9]*\) device=0 k
 yes_no "$(printf '%s' "$HOOK" | grep -q "^14 11 " && echo 1)" "the shell hook gets HSHELL_APPCOMMAND MEDIA_PLAY_PAUSE, then MEDIA_NEXTTRACK" "$HOOK"
 yes_no "$([ "$HOOK" = "14 11 14 12 13 18 17 " ] && echo 1)" "and every other key's command, once each" "$HOOK"
 
-# the window that handles WM_KEYDOWN itself
-BEFORE=$(lines "$T/hook" "^hook_appcmd")
-timeout -s KILL 200 "$WINE" 'C:\probe.exe' target eat > "$T/eat" 2>/dev/null &
-EP=$!
-wait_line "$T/eat" "^target_ready=1" || { fail "the second target window"; exit 1; }
-WID=$(xdotool search --sync --name '^sgappcmd-eat$' | head -n 1)
-xdotool windowactivate --sync "$WID" 2>/dev/null || xdotool windowfocus --sync "$WID"
-sleep 1
-xdotool key --clearmodifiers XF86AudioPlay; sleep 0.4; xdotool key --clearmodifiers XF86AudioNext
-sleep 1.5
-yes_no "$([ "$(lines "$T/eat" "^key vk=")" = 2 ] && echo 1)" "the second window got the keys"
-yes_no "$([ "$(lines "$T/eat" "^self_appcmd")" = 0 ] && [ "$(lines "$T/hook" "^hook_appcmd")" = "$BEFORE" ] && echo 1)" \
-    "a window that handles WM_KEYDOWN makes no app command"
+# a window that handles WM_KEYDOWN itself still gets them (6526: VLC's Qt interface), and passes
+# them on; one that handles WM_APPCOMMAND keeps them from the shell hooks
+for mode in eat handle; do
+    BEFORE=$(lines "$T/hook" "^hook_appcmd")
+    timeout -s KILL 200 "$WINE" 'C:\probe.exe' target $mode > "$T/$mode" 2>/dev/null &
+    eval "P_$mode=\$!"
+    wait_line "$T/$mode" "^target_ready=1" || { fail "the $mode window"; exit 1; }
+    WID=$(xdotool search --sync --name "^sgappcmd-$mode\$" | head -n 1)
+    xdotool windowactivate --sync "$WID" 2>/dev/null || xdotool windowfocus --sync "$WID"
+    sleep 1
+    xdotool key --clearmodifiers XF86AudioPlay; sleep 0.4; xdotool key --clearmodifiers XF86AudioNext
+    sleep 1.5
+    eval "HOOK_$mode=\$((\$(lines "\$T/hook" "^hook_appcmd") - BEFORE))"
+done
+yes_no "$([ "$(lines "$T/eat" "^key vk=")" = 2 ] && [ "$(lines "$T/eat" "^self_appcmd cmd=1[14] device=0 window=1")" = 2 ] && echo 1)" \
+    "a window that handles WM_KEYDOWN itself still gets WM_APPCOMMAND" "$(lines "$T/eat" "^self_appcmd")"
+yes_no "$([ "$HOOK_eat" = 2 ] && echo 1)" "and, passing it on, the shell hooks get it" "$HOOK_eat"
+yes_no "$([ "$(lines "$T/handle" "^self_appcmd")" = 2 ] && [ "$HOOK_handle" = 0 ] && echo 1)" \
+    "a window that handles WM_APPCOMMAND keeps it from the shell hooks" "$HOOK_handle"
 
 touch "$C/stop"
-wait "$HP" "$TP" "$EP" 2>/dev/null; HP=; TP=
+wait "$HP" "$TP" "$P_eat" "$P_handle" 2>/dev/null; HP=; TP=
 yes_no "$(tr -d '\r' < "$T/hook" | grep -q '^done=1' && echo 1)" "the hook window ran to the end"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

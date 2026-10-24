@@ -2,7 +2,8 @@
  *
  *   probe hook          a shell hook window (RegisterShellHookWindow): prints every HSHELL_APPCOMMAND
  *   probe target        a window that leaves its keys to DefWindowProc: prints its keys and app commands
- *   probe target eat    one that handles WM_KEYDOWN itself (no app command may come of it)
+ *   probe target eat    one that handles WM_KEYDOWN itself (it still gets the app commands: 6526)
+ *   probe target handle one that handles WM_APPCOMMAND itself (the shell hooks get none)
  * Each runs until C:\stop exists. Prints name=value lines; see test/appcmdkeys-gate.sh.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
@@ -16,7 +17,7 @@
 #endif
 
 static UINT shellhook;
-static BOOL eat;
+static BOOL eat, handle;
 
 static LRESULT CALLBACK hook_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
@@ -41,6 +42,7 @@ static LRESULT CALLBACK target_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
     case WM_APPCOMMAND:
         printf( "self_appcmd cmd=%u device=%#x window=%d\n", HIWORD( lparam ) & ~FAPPCOMMAND_MASK,
                 HIWORD( lparam ) & FAPPCOMMAND_MASK, (HWND)wparam == hwnd );
+        if (handle) return TRUE;
         break;
     }
     return DefWindowProcW( hwnd, msg, wparam, lparam );
@@ -71,7 +73,8 @@ int main( int argc, char **argv )
     else
     {
         eat = argc > 2 && !strcmp( argv[2], "eat" );
-        title = eat ? L"sgappcmd-eat" : L"sgappcmd-target";
+        handle = argc > 2 && !strcmp( argv[2], "handle" );
+        title = eat ? L"sgappcmd-eat" : handle ? L"sgappcmd-handle" : L"sgappcmd-target";
         cls.lpfnWndProc = target_proc;
         cls.lpszClassName = L"sgappcmd_target";
         RegisterClassW( &cls );
