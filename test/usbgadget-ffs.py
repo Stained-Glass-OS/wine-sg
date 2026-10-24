@@ -8,6 +8,8 @@
 #   vendor IN  request 0x01: "SGWINUSB"
 #   vendor OUT request 0x02: keeps the data; vendor IN request 0x03 gives it back
 # Written from the Linux kernel's FunctionFS documentation and the public descriptor formats.
+# FunctionFS takes the extended property's name and REG_SZ data as UTF-8 and makes them UTF-16
+# itself; a stall answers the read/write on ep0 with EL2HLT. (Fixed on qa5, 2026-10-23.)
 import os, struct, sys, threading
 
 FFS = sys.argv[1]
@@ -25,8 +27,8 @@ def descriptors():
     # wIndex, bCount/wCount
     compat_entry = struct.pack('<BB8s8s6s', 0, 1, b'WINUSB', b'', b'')
     compat = struct.pack('<BIHHBB', 0, 11 + len(compat_entry), 1, 4, 1, 0) + compat_entry
-    name = 'DeviceInterfaceGUID\0'.encode('utf-16-le')
-    data = (GUID + '\0').encode('utf-16-le')
+    name = b"DeviceInterfaceGUID\0"
+    data = (GUID + "\0").encode()
     prop = struct.pack('<IIH', 14 + len(name) + len(data), 1, len(name)) + name + struct.pack('<I', len(data)) + data
     ext = struct.pack('<BIHHH', 0, 11 + len(prop), 1, 5, 1) + prop
     body = struct.pack('<III', 3, 3, 2) + fs + hs + compat + ext
@@ -55,10 +57,14 @@ def control(ep0):
             if request_type & 0x80:
                 if vendor and request == 0x01: os.write(ep0, b'SGWINUSB'[:length])
                 elif vendor and request == 0x03: os.write(ep0, stored[:length])
-                else: os.read(ep0, 0)       # stall
+                else:
+                    try: os.read(ep0, 0)    # stall: FunctionFS answers EL2HLT
+                    except OSError: pass
             else:
                 if vendor and request == 0x02: stored = os.read(ep0, length) if length else b''
-                else: os.write(ep0, b'')    # stall
+                else:
+                    try: os.write(ep0, b'')   # stall
+                    except OSError: pass
 
 def bulk():
     enabled.wait()
@@ -71,7 +77,10 @@ def bulk():
         except OSError:
             continue
         try:
-            os.write(ep_in, pattern if data.startswith(b'PATTERN') else data)
+            out = pattern if data.startswith(b'PATTERN') else data
+            os.write(ep_in, out)
+            if out and len(out) % 512 == 0:
+                os.write(ep_in, b'')    # a zero-length packet ends a transfer of whole packets
         except OSError:
             pass
 

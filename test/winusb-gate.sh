@@ -7,7 +7,8 @@
 # overlapped I/O, a pipe timeout, abort and reset).
 # The device is the test gadget of test/usbgadget-setup.sh, which needs root and a test VM:
 #   sudo test/usbgadget-setup.sh start "$USER"; make test-winusb; sudo test/usbgadget-setup.sh stop
-# Without the gadget this SKIPs. Mutants: SG_MUTANT_WINEUSB_NO_MSOS (wineusb.sys unixlib.c),
+# A VM without mingw can use a probe built elsewhere: PROBE=/path/winusb-probe.exe.
+# Without the gadget this SKIPs. Mutants (host builds only; not run on a VM): SG_MUTANT_WINEUSB_NO_MSOS (wineusb.sys unixlib.c),
 # SG_MUTANT_WINEUSB_NO_CONTROL (wineusb.sys unixlib.c), SG_MUTANT_WINUSB_NOT_STARTED (winusb.sys).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -18,7 +19,8 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 RC=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
-command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW missing"; exit 77; }
+PROBE="${PROBE:-}"
+[ -n "$PROBE" ] || command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW missing (or PROBE=prebuilt winusb-probe.exe)"; exit 77; }
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 node=
 for d in /sys/bus/usb/devices/*; do
@@ -31,7 +33,11 @@ done
 [ -r "$node" ] && [ -w "$node" ] || { echo "SKIP: $node is not usable by $(id -un) (usbgadget-setup.sh start $(id -un))"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-winusb.XXXXXX)
 trap 'WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
-TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/winusb-probe.c" -lsetupapi -luuid || { fail "probe did not build"; exit 1; }
+if [ -n "$PROBE" ]; then
+    cp "$PROBE" "$T/probe.exe" || { fail "no probe at $PROBE"; exit 1; }
+else
+    TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/winusb-probe.c" -lsetupapi -luuid || { fail "probe did not build"; exit 1; }
+fi
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINESERVER WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d"
 unset DISPLAY WAYLAND_DISPLAY
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
