@@ -15,6 +15,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINE="$(cd "$(dirname "$WINE")" && pwd)/$(basename "$WINE")"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
+[ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 DXVK="${DXVK:-/opt/sg-d3d/dxvk/x64}"
 MINGWXX="${MINGWXX:-x86_64-w64-mingw32-g++}"
 for t in Xvfb "$MINGWXX"; do command -v "$t" >/dev/null || { echo "SKIP: $t missing"; exit 77; }; done

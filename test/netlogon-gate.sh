@@ -18,6 +18,7 @@
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
+[ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 NET=/run/stained-glass-net
 ME=$(id -u)
 USERS_SHARE=$NET/users/$ME/unc/sgtestsrv/share

@@ -17,6 +17,7 @@ set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
+[ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 DXVK="${DXVK:-/opt/sg-d3d/dxvk/x64}"
 MINGWXX="${MINGWXX:-x86_64-w64-mingw32-g++}"
 RC=0
