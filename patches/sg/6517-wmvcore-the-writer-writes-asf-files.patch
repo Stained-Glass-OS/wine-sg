@@ -1,0 +1,1080 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] wmvcore: The writer writes ASF files (6517)
+
+BeginWriting was E_NOTIMPL and WriteSample/WriteStreamSample were
+refused. A multiplexer written from the ASF specification now writes
+the header (file properties, a stream properties object per audio or
+video stream of the profile, the header extension, the content
+descriptions of the writer's attributes), fixed-size data packets of
+one payload each, and a simple index per video stream, to the output
+file (whose header is completed at EndWriting) and to the writer's
+sinks. WriteSample takes inputs whose format is the stream's own;
+WriteStreamSample takes stream samples. The statistics count samples
+and bytes. Also fixes the metadata editor (6515) freeing its attribute
+store on Close while the program still held its IWMHeaderInfo.
+---
+diff --git a/dlls/wmvcore/Makefile.in b/dlls/wmvcore/Makefile.in
+index dacead6..6f20a42 100644
+--- a/dlls/wmvcore/Makefile.in
++++ b/dlls/wmvcore/Makefile.in
+@@ -1,11 +1,12 @@
+ MODULE    = wmvcore.dll
+ IMPORTLIB = wmvcore
+-IMPORTS   = kernel32 shlwapi
++IMPORTS   = kernel32 shlwapi ole32
+ DELAYIMPORTS = winegstreamer
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
++	asfmux.c \
+ 	async_reader.c \
+ 	editor.c \
+ 	profile.c \
+diff --git a/dlls/wmvcore/asf.h b/dlls/wmvcore/asf.h
+new file mode 100644
+index 0000000..f4d1a81
+--- /dev/null
++++ b/dlls/wmvcore/asf.h
+@@ -0,0 +1,53 @@
++/*
++ * ASF objects shared by the metadata editor and the writer (wine-sg 6515, 6517)
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WMVCORE_ASF_H
++#define __WMVCORE_ASF_H
++
++/* a growing byte buffer; failed is set once an allocation fails */
++struct asf_buffer
++{
++    BYTE *data;
++    SIZE_T size, capacity;
++    BOOL failed;
++};
++
++void asf_put(struct asf_buffer *buffer, const void *data, SIZE_T size);
++void asf_put_word(struct asf_buffer *buffer, WORD value);
++void asf_put_dword(struct asf_buffer *buffer, DWORD value);
++void asf_put_qword(struct asf_buffer *buffer, UINT64 value);
++
++/* the Content Description and Extended Content Description objects of a store's file
++ * attributes (stream 0), appended to out; *count is raised by the objects written */
++void asf_put_descriptions(IWMHeaderInfo3 *info, struct asf_buffer *out, DWORD *count);
++
++/* the writer's ASF multiplexer (asfmux.c) */
++struct asf_mux;
++HRESULT asf_mux_create(IWMProfile *profile, IWMHeaderInfo3 *header, struct asf_mux **out);
++HRESULT asf_mux_begin(struct asf_mux *mux, const WCHAR *filename, IWMWriterSink **sinks, DWORD sink_count);
++/* one media object (a sample) of a stream; times in 100 ns from the start */
++HRESULT asf_mux_write(struct asf_mux *mux, WORD stream, UINT64 time, UINT64 duration, BOOL clean_point,
++                      const BYTE *data, DWORD size);
++HRESULT asf_mux_end(struct asf_mux *mux);
++void asf_mux_destroy(struct asf_mux *mux);
++/* bytes and samples written to a stream (0: all) */
++void asf_mux_statistics(struct asf_mux *mux, WORD stream, UINT64 *bytes, UINT64 *samples);
++
++#endif
+diff --git a/dlls/wmvcore/asfmux.c b/dlls/wmvcore/asfmux.c
+new file mode 100644
+index 0000000..1ecbfa3
+--- /dev/null
++++ b/dlls/wmvcore/asfmux.c
+@@ -0,0 +1,538 @@
++/*
++ * The writer's ASF multiplexer
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Stained Glass OS (wine-sg 6517): the writer could not write (BeginWriting was E_NOTIMPL).
++ * This is its ASF multiplexer, written from the public Advanced Systems Format specification:
++ * a header object (file properties, a stream properties object per stream of the profile, the
++ * header extension, the content descriptions of the writer's attributes), a data object of
++ * fixed-size packets carrying one payload each (media objects split over packets as needed),
++ * and a simple index object for each video stream. The file's header is written again at the
++ * end with the counts and durations; sinks get the header first, then each packet.
++ */
++
++#include "wmvcore_private.h"
++#include "wmsdk.h"
++#include "nserror.h"
++#include "asferr.h"
++#include "profile.h"
++#include "asf.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wmvcore);
++
++static const GUID asf_header = {0x75b22630, 0x668e, 0x11cf, {0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62, 0xce, 0x6c}};
++static const GUID asf_file_properties = {0x8cabdca1, 0xa947, 0x11cf, {0x8e, 0xe4, 0x00, 0xc0, 0x0c, 0x20, 0x53, 0x65}};
++static const GUID asf_stream_properties = {0xb7dc0791, 0xa9b7, 0x11cf, {0x8e, 0xe6, 0x00, 0xc0, 0x0c, 0x20, 0x53, 0x65}};
++static const GUID asf_header_extension = {0x5fbf03b5, 0xa92e, 0x11cf, {0x8e, 0xe3, 0x00, 0xc0, 0x0c, 0x20, 0x53, 0x65}};
++static const GUID asf_reserved_1 = {0xabd3d211, 0xa9ba, 0x11cf, {0x8e, 0xe6, 0x00, 0xc0, 0x0c, 0x20, 0x53, 0x65}};
++static const GUID asf_data = {0x75b22636, 0x668e, 0x11cf, {0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62, 0xce, 0x6c}};
++static const GUID asf_simple_index = {0x33000890, 0xe5b1, 0x11cf, {0x89, 0xf4, 0x00, 0xa0, 0xc9, 0x03, 0x49, 0xcb}};
++static const GUID asf_audio_media = {0xf8699e40, 0x5b4d, 0x11cf, {0xa8, 0xfd, 0x00, 0x80, 0x5f, 0x5c, 0x44, 0x2b}};
++static const GUID asf_video_media = {0xbc19efc0, 0x5b4d, 0x11cf, {0xa8, 0xfd, 0x00, 0x80, 0x5f, 0x5c, 0x44, 0x2b}};
++static const GUID asf_no_error_correction = {0x20fb5700, 0x5b55, 0x11cf, {0xa8, 0xfd, 0x00, 0x80, 0x5f, 0x5c, 0x44, 0x2b}};
++
++static const GUID media_audio = {0x73647561, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID media_video = {0x73646976, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID format_waveformatex = {0x05589f81, 0xc356, 0x11ce, {0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a}};
++static const GUID format_videoinfo = {0x05589f80, 0xc356, 0x11ce, {0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a}};
++
++#define PACKET_SIZE      3200
++#define PACKET_HEADER    13     /* error correction (3), length type and property flags, padding, send time, duration */
++#define PAYLOAD_HEADER   15     /* stream, object number, offset, replicated data length, replicated data (8) */
++#define PAYLOAD_SPACE    (PACKET_SIZE - PACKET_HEADER - PAYLOAD_HEADER)
++#define INDEX_INTERVAL   10000000   /* one second */
++
++struct key_frame
++{
++    UINT64 time;            /* 100 ns */
++    DWORD packet, packets;  /* where it starts, and over how many packets */
++};
++
++struct mux_stream
++{
++    WORD number;
++    BOOL video;
++    BYTE *type_data;        /* the stream properties' type-specific data */
++    DWORD type_size;
++    DWORD bitrate, buffer_window;
++    BYTE object_number;
++    UINT64 bytes, samples;
++    struct key_frame *keys;
++    DWORD key_count, key_capacity;
++};
++
++struct asf_mux
++{
++    struct mux_stream streams[MAX_PROFILE_STREAM];
++    DWORD stream_count;
++    IWMHeaderInfo3 *header;
++    GUID file_id;
++    DWORD preroll;          /* ms */
++
++    HANDLE file;
++    IWMWriterSink **sinks;
++    DWORD sink_count;
++    UINT64 header_size;
++    UINT64 packets;
++    UINT64 end_time, send_time;
++    BOOL started;
++};
++
++static struct mux_stream *find_stream(struct asf_mux *mux, WORD number)
++{
++    DWORD i;
++    for (i = 0; i < mux->stream_count; i++)
++        if (mux->streams[i].number == number) return &mux->streams[i];
++    return NULL;
++}
++
++/* the stream properties' type-specific data: a WAVEFORMATEX, or the encoded size and a BITMAPINFOHEADER */
++static HRESULT stream_type_data(struct mux_stream *stream, const WM_MEDIA_TYPE *mt)
++{
++    struct asf_buffer buffer = { 0 };
++
++    if (IsEqualGUID(&mt->majortype, &media_audio) && IsEqualGUID(&mt->formattype, &format_waveformatex) && mt->cbFormat >= 16)
++    {
++        WORD extra = mt->cbFormat >= 18 ? *(WORD *)(mt->pbFormat + 16) : 0;
++        DWORD size = 18 + min(extra, mt->cbFormat >= 18 ? mt->cbFormat - 18 : 0);
++
++        asf_put(&buffer, mt->pbFormat, min(mt->cbFormat, 16));
++        asf_put_word(&buffer, size - 18);
++        if (size > 18) asf_put(&buffer, mt->pbFormat + 18, size - 18);
++    }
++    else if (IsEqualGUID(&mt->majortype, &media_video) && IsEqualGUID(&mt->formattype, &format_videoinfo) && mt->cbFormat >= 88)
++    {
++        const BYTE *bih = mt->pbFormat + 48;
++        DWORD bih_size = mt->cbFormat - 48;
++
++        stream->video = TRUE;
++        asf_put_dword(&buffer, *(DWORD *)(bih + 4));        /* encoded width */
++        asf_put_dword(&buffer, abs(*(LONG *)(bih + 8)));    /* encoded height */
++        {
++            BYTE reserved = 2;
++            asf_put(&buffer, &reserved, 1);
++        }
++        asf_put_word(&buffer, bih_size);
++        asf_put(&buffer, bih, bih_size);
++        /* the BITMAPINFOHEADER's own size field is the format data's size */
++        if (!buffer.failed) *(DWORD *)(buffer.data + 11) = bih_size;
++    }
++    else
++    {
++        FIXME("stream %u: major type %s, format %s not written\n", stream->number, debugstr_guid(&mt->majortype),
++              debugstr_guid(&mt->formattype));
++        return NS_E_INVALID_STREAM;
++    }
++    if (buffer.failed) return E_OUTOFMEMORY;
++    stream->type_data = buffer.data;
++    stream->type_size = buffer.size;
++    return S_OK;
++}
++
++HRESULT asf_mux_create(IWMProfile *profile, IWMHeaderInfo3 *header, struct asf_mux **out)
++{
++    struct asf_mux *mux;
++    DWORD count, i;
++    HRESULT hr;
++
++    *out = NULL;
++    if (FAILED(hr = IWMProfile_GetStreamCount(profile, &count))) return hr;
++    if (!count) return NS_E_INVALIDPROFILE;
++    if (count > MAX_PROFILE_STREAM) return NS_E_INVALIDPROFILE;
++    if (!(mux = calloc(1, sizeof(*mux)))) return E_OUTOFMEMORY;
++    mux->header = header;
++    CoCreateGuid(&mux->file_id);
++    mux->file = INVALID_HANDLE_VALUE;
++
++    for (i = 0; i < count; i++)
++    {
++        struct mux_stream *stream = &mux->streams[mux->stream_count];
++        IWMStreamConfig *config;
++        IWMMediaProps *props;
++        WM_MEDIA_TYPE *mt;
++        DWORD size = 0;
++
++        if (FAILED(hr = IWMProfile_GetStream(profile, i, &config))) goto fail;
++        IWMStreamConfig_GetStreamNumber(config, &stream->number);
++        IWMStreamConfig_GetBitrate(config, &stream->bitrate);
++        IWMStreamConfig_GetBufferWindow(config, &stream->buffer_window);
++        hr = IWMStreamConfig_QueryInterface(config, &IID_IWMMediaProps, (void **)&props);
++        IWMStreamConfig_Release(config);
++        if (FAILED(hr)) goto fail;
++        if (SUCCEEDED(hr = IWMMediaProps_GetMediaType(props, NULL, &size)) && (mt = malloc(size)))
++        {
++            if (SUCCEEDED(hr = IWMMediaProps_GetMediaType(props, mt, &size)))
++                hr = stream_type_data(stream, mt);
++            free(mt);
++        }
++        else if (SUCCEEDED(hr)) hr = E_OUTOFMEMORY;
++        IWMMediaProps_Release(props);
++        if (FAILED(hr)) goto fail;
++        mux->preroll = max(mux->preroll, stream->buffer_window);
++        mux->stream_count++;
++    }
++    *out = mux;
++    return S_OK;
++
++fail:
++    asf_mux_destroy(mux);
++    return hr;
++}
++
++/* the header object, with what is known so far */
++static HRESULT build_header(struct asf_mux *mux, struct asf_buffer *out, BOOL final)
++{
++    UINT64 size, play_duration, data_size;
++    DWORD count = 0, i, bitrate = 0;
++    FILETIME now;
++    BYTE reserved[2] = { 1, 2 };
++
++    asf_put(out, &asf_header, sizeof(GUID));
++    asf_put_qword(out, 0);
++    asf_put_dword(out, 0);
++    asf_put(out, reserved, 2);
++
++    /* file properties */
++    for (i = 0; i < mux->stream_count; i++) bitrate += mux->streams[i].bitrate;
++    GetSystemTimeAsFileTime(&now);
++    play_duration = final ? mux->end_time + (UINT64)mux->preroll * 10000 : 0;
++    data_size = 50 + mux->packets * PACKET_SIZE;
++    asf_put(out, &asf_file_properties, sizeof(GUID));
++    asf_put_qword(out, 104);
++    asf_put(out, &mux->file_id, sizeof(GUID));
++    asf_put_qword(out, 0);                          /* file size: filled in below */
++    asf_put_qword(out, (UINT64)now.dwHighDateTime << 32 | now.dwLowDateTime);
++    asf_put_qword(out, final ? mux->packets : 0);
++    asf_put_qword(out, play_duration);
++    asf_put_qword(out, final ? mux->send_time : 0);
++    asf_put_qword(out, mux->preroll);
++    asf_put_dword(out, final ? 0x2 /* seekable */ : 0x1 /* broadcast: not known yet */);
++    asf_put_dword(out, PACKET_SIZE);
++    asf_put_dword(out, PACKET_SIZE);
++    asf_put_dword(out, bitrate);
++    count++;
++
++    /* streams */
++    for (i = 0; i < mux->stream_count; i++)
++    {
++        struct mux_stream *stream = &mux->streams[i];
++
++        asf_put(out, &asf_stream_properties, sizeof(GUID));
++        asf_put_qword(out, 78 + stream->type_size);
++        asf_put(out, stream->video ? &asf_video_media : &asf_audio_media, sizeof(GUID));
++        asf_put(out, &asf_no_error_correction, sizeof(GUID));
++        asf_put_qword(out, 0);                      /* time offset */
++        asf_put_dword(out, stream->type_size);
++        asf_put_dword(out, 0);                      /* error correction data */
++        asf_put_word(out, stream->number & 0x7f);
++        asf_put_dword(out, 0);
++        asf_put(out, stream->type_data, stream->type_size);
++        count++;
++    }
++
++    /* the header extension (required, empty) */
++    asf_put(out, &asf_header_extension, sizeof(GUID));
++    asf_put_qword(out, 46);
++    asf_put(out, &asf_reserved_1, sizeof(GUID));
++    asf_put_word(out, 6);
++    asf_put_dword(out, 0);
++    count++;
++
++#ifndef SG_MUTANT_WMVW_NO_DESCRIPTIONS
++    asf_put_descriptions(mux->header, out, &count);
++#endif
++
++    if (out->failed) return E_OUTOFMEMORY;
++    size = out->size;
++    memcpy(out->data + 16, &size, 8);
++    memcpy(out->data + 24, &count, 4);
++    /* the file size, once known */
++    if (final)
++    {
++        UINT64 file_size = size + data_size;
++        for (i = 0; i < mux->stream_count; i++)
++            if (mux->streams[i].video)
++            {
++                UINT64 entries = (mux->end_time + INDEX_INTERVAL - 1) / INDEX_INTERVAL;
++                file_size += 56 + entries * 6;
++            }
++        memcpy(out->data + 30 + 24 + 16, &file_size, 8);
++    }
++    return S_OK;
++}
++
++static HRESULT write_bytes(struct asf_mux *mux, const void *data, DWORD size)
++{
++    DWORD written;
++
++    if (mux->file == INVALID_HANDLE_VALUE) return S_OK;
++    if (!WriteFile(mux->file, data, size, &written, NULL) || written != size)
++        return HRESULT_FROM_WIN32(GetLastError());
++    return S_OK;
++}
++
++/* a unit (the header or a packet) to every sink */
++static HRESULT sinks_send(struct asf_mux *mux, const BYTE *data, DWORD size, BOOL header)
++{
++    DWORD i, length;
++    INSSBuffer *buffer;
++    BYTE *dst;
++    HRESULT hr;
++
++    for (i = 0; i < mux->sink_count; i++)
++    {
++        if (header) hr = wm_buffer_create(size, &buffer);
++        else hr = IWMWriterSink_AllocateDataUnit(mux->sinks[i], size, &buffer);
++        if (FAILED(hr)) return hr;
++        if (SUCCEEDED(hr = INSSBuffer_GetBufferAndLength(buffer, &dst, &length)))
++        {
++            memcpy(dst, data, size);
++            INSSBuffer_SetLength(buffer, size);
++            hr = header ? IWMWriterSink_OnHeader(mux->sinks[i], buffer) : IWMWriterSink_OnDataUnit(mux->sinks[i], buffer);
++        }
++        INSSBuffer_Release(buffer);
++        if (FAILED(hr)) return hr;
++    }
++    return S_OK;
++}
++
++HRESULT asf_mux_begin(struct asf_mux *mux, const WCHAR *filename, IWMWriterSink **sinks, DWORD sink_count)
++{
++    struct asf_buffer header = { 0 };
++    BYTE data_object[50];
++    HRESULT hr;
++
++    if (filename)
++    {
++        mux->file = CreateFileW(filename, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++        if (mux->file == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
++    }
++    mux->sinks = sinks;
++    mux->sink_count = sink_count;
++
++    if (FAILED(hr = build_header(mux, &header, FALSE))) goto done;
++    mux->header_size = header.size;
++
++    /* the data object's header: its size and packet count are written at the end */
++    memcpy(data_object, &asf_data, sizeof(GUID));
++    memset(data_object + 16, 0, 8);
++    memcpy(data_object + 24, &mux->file_id, sizeof(GUID));
++    memset(data_object + 40, 0, 8);
++    data_object[48] = 1;
++    data_object[49] = 1;
++
++    if (FAILED(hr = write_bytes(mux, header.data, header.size))) goto done;
++    if (FAILED(hr = write_bytes(mux, data_object, sizeof(data_object)))) goto done;
++    {
++        /* sinks get the header with the data object's header after it */
++        struct asf_buffer unit = { 0 };
++        asf_put(&unit, header.data, header.size);
++        asf_put(&unit, data_object, sizeof(data_object));
++        hr = unit.failed ? E_OUTOFMEMORY : sinks_send(mux, unit.data, unit.size, TRUE);
++        free(unit.data);
++    }
++    mux->started = SUCCEEDED(hr);
++
++done:
++    free(header.data);
++    return hr;
++}
++
++static HRESULT add_key(struct mux_stream *stream, UINT64 time, DWORD packet)
++{
++    if (stream->key_count == stream->key_capacity)
++    {
++        DWORD capacity = max(64, stream->key_capacity * 2);
++        struct key_frame *keys = realloc(stream->keys, capacity * sizeof(*keys));
++        if (!keys) return E_OUTOFMEMORY;
++        stream->keys = keys;
++        stream->key_capacity = capacity;
++    }
++    stream->keys[stream->key_count].time = time;
++    stream->keys[stream->key_count].packet = packet;
++    stream->keys[stream->key_count++].packets = 0;
++    return S_OK;
++}
++
++HRESULT asf_mux_write(struct asf_mux *mux, WORD number, UINT64 time, UINT64 duration, BOOL clean_point,
++                      const BYTE *data, DWORD size)
++{
++    struct mux_stream *stream = find_stream(mux, number);
++    BYTE packet[PACKET_SIZE];
++    DWORD offset = 0, presentation, send, first_packet = mux->packets;
++    HRESULT hr;
++
++    if (!mux->started) return NS_E_INVALID_REQUEST;
++    if (!stream) return NS_E_INVALID_STREAM;
++
++    presentation = (DWORD)(time / 10000) + mux->preroll;
++    send = (DWORD)(time / 10000);
++    if (stream->video && clean_point && FAILED(hr = add_key(stream, time, mux->packets))) return hr;
++
++    do
++    {
++        DWORD chunk = min(size - offset, PAYLOAD_SPACE), pos = 0;
++        WORD padding = PAYLOAD_SPACE - chunk, packet_duration = 0;
++
++        memset(packet, 0, sizeof(packet));
++        /* error correction data: present, two bytes */
++        packet[pos++] = 0x82;
++        packet[pos++] = 0;
++        packet[pos++] = 0;
++        /* one payload; padding length a WORD; packet length and sequence absent (fixed size) */
++        packet[pos++] = 0x10;
++        /* replicated data length a BYTE, offset a DWORD, object number a BYTE, stream number a BYTE */
++        packet[pos++] = 0x5d;
++        memcpy(packet + pos, &padding, 2); pos += 2;
++        memcpy(packet + pos, &send, 4); pos += 4;
++        memcpy(packet + pos, &packet_duration, 2); pos += 2;
++
++        packet[pos++] = (stream->number & 0x7f) | (clean_point ? 0x80 : 0);
++        packet[pos++] = stream->object_number;
++        memcpy(packet + pos, &offset, 4); pos += 4;
++        packet[pos++] = 8;
++        memcpy(packet + pos, &size, 4); pos += 4;
++        memcpy(packet + pos, &presentation, 4); pos += 4;
++#ifndef SG_MUTANT_WMVW_NO_PAYLOAD
++        memcpy(packet + pos, data + offset, chunk);
++#endif
++        offset += chunk;
++
++        if (FAILED(hr = write_bytes(mux, packet, PACKET_SIZE))) return hr;
++        if (FAILED(hr = sinks_send(mux, packet, PACKET_SIZE, FALSE))) return hr;
++        mux->packets++;
++    } while (offset < size);
++
++    if (stream->video && clean_point) stream->keys[stream->key_count - 1].packets = mux->packets - first_packet;
++    stream->object_number++;
++    stream->bytes += size;
++    stream->samples++;
++    mux->end_time = max(mux->end_time, time + duration);
++    mux->send_time = max(mux->send_time, time);
++    return S_OK;
++}
++
++/* a simple index object of a video stream: per second, the last key frame at or before it */
++static void put_simple_index(struct asf_mux *mux, struct mux_stream *stream, struct asf_buffer *out)
++{
++    UINT64 entries = (mux->end_time + INDEX_INTERVAL - 1) / INDEX_INTERVAL, i;
++    DWORD max_packets = 1, k = 0;
++
++    for (i = 0; i < stream->key_count; i++) max_packets = max(max_packets, stream->keys[i].packets);
++    asf_put(out, &asf_simple_index, sizeof(GUID));
++    asf_put_qword(out, 56 + entries * 6);
++    asf_put(out, &mux->file_id, sizeof(GUID));
++    asf_put_qword(out, INDEX_INTERVAL);
++    asf_put_dword(out, max_packets);
++    asf_put_dword(out, entries);
++    for (i = 0; i < entries; i++)
++    {
++        UINT64 at = i * INDEX_INTERVAL;
++        DWORD packet = 0;
++        WORD packets = 1;
++
++        while (k + 1 < stream->key_count && stream->keys[k + 1].time <= at) k++;
++        if (stream->key_count)
++        {
++            packet = stream->keys[k].packet;
++            packets = stream->keys[k].packets;
++        }
++        asf_put_dword(out, packet);
++        asf_put_word(out, packets);
++    }
++}
++
++HRESULT asf_mux_end(struct asf_mux *mux)
++{
++    struct asf_buffer header = { 0 }, index = { 0 };
++    LARGE_INTEGER zero = { 0 };
++    UINT64 data_size, packets;
++    DWORD i;
++    HRESULT hr = S_OK;
++
++    if (!mux->started) return NS_E_INVALID_REQUEST;
++    mux->started = FALSE;
++
++    for (i = 0; i < mux->stream_count; i++)
++        if (mux->streams[i].video) put_simple_index(mux, &mux->streams[i], &index);
++    if (index.failed) { hr = E_OUTOFMEMORY; goto done; }
++    if (index.size && FAILED(hr = write_bytes(mux, index.data, index.size))) goto done;
++
++    if (mux->file != INVALID_HANDLE_VALUE)
++    {
++        /* the header again, with the counts and durations; it keeps its size */
++        if (FAILED(hr = build_header(mux, &header, TRUE))) goto done;
++        if (header.size != mux->header_size)
++        {
++            ERR("header size changed: %Iu, %I64u\n", header.size, mux->header_size);
++            hr = E_FAIL;
++            goto done;
++        }
++        SetFilePointerEx(mux->file, zero, NULL, FILE_BEGIN);
++        if (FAILED(hr = write_bytes(mux, header.data, header.size))) goto done;
++        data_size = 50 + mux->packets * PACKET_SIZE;
++        packets = mux->packets;
++        if (FAILED(hr = write_bytes(mux, &asf_data, sizeof(GUID)))) goto done;
++        if (FAILED(hr = write_bytes(mux, &data_size, 8))) goto done;
++        if (FAILED(hr = write_bytes(mux, &mux->file_id, sizeof(GUID)))) goto done;
++        if (FAILED(hr = write_bytes(mux, &packets, 8))) goto done;
++    }
++    for (i = 0; i < mux->sink_count; i++)
++        IWMWriterSink_OnEndWriting(mux->sinks[i]);
++
++done:
++    if (mux->file != INVALID_HANDLE_VALUE)
++    {
++        CloseHandle(mux->file);
++        mux->file = INVALID_HANDLE_VALUE;
++    }
++    free(header.data);
++    free(index.data);
++    return hr;
++}
++
++void asf_mux_statistics(struct asf_mux *mux, WORD number, UINT64 *bytes, UINT64 *samples)
++{
++    DWORD i;
++
++    *bytes = *samples = 0;
++    for (i = 0; i < mux->stream_count; i++)
++        if (!number || mux->streams[i].number == number)
++        {
++            *bytes += mux->streams[i].bytes;
++            *samples += mux->streams[i].samples;
++        }
++}
++
++void asf_mux_destroy(struct asf_mux *mux)
++{
++    DWORD i;
++
++    if (!mux) return;
++    if (mux->file != INVALID_HANDLE_VALUE) CloseHandle(mux->file);
++    for (i = 0; i < mux->stream_count; i++)
++    {
++        free(mux->streams[i].type_data);
++        free(mux->streams[i].keys);
++    }
++    free(mux);
++}
+diff --git a/dlls/wmvcore/editor.c b/dlls/wmvcore/editor.c
+index fe3a985..3724db6 100644
+--- a/dlls/wmvcore/editor.c
++++ b/dlls/wmvcore/editor.c
+@@ -34,6 +34,7 @@
+ #include "asferr.h"
+ #include "nserror.h"
+ #include "profile.h"
++#include "asf.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -121,17 +122,15 @@ static ULONG WINAPI editor_Release(IWMMetadataEditor *iface)
+     return ref;
+ }
+ 
+-/* a new attribute store (the old one's values gone) */
++/* the attribute store emptied: interfaces the program holds stay valid */
+ static HRESULT editor_new_header(struct editor *editor)
+ {
+-    struct writer_header *header;
+-    HRESULT hr;
+-
+-    if (FAILED(hr = writer_header_create((IUnknown *)&editor->IWMMetadataEditor_iface, &header)))
+-        return hr;
+-    if (editor->header) writer_header_destroy(editor->header);
+-    editor->header = header;
+-    return S_OK;
++    if (editor->header)
++    {
++        writer_header_clear(editor->header);
++        return S_OK;
++    }
++    return writer_header_create((IUnknown *)&editor->IWMMetadataEditor_iface, &editor->header);
+ }
+ 
+ static void add_attribute(struct editor *editor, const WCHAR *name, WMT_ATTR_DATATYPE type, const BYTE *value, DWORD length)
+@@ -311,14 +310,7 @@ static HRESULT WINAPI editor_Close(IWMMetadataEditor *iface)
+     return S_OK;
+ }
+ 
+-struct buffer
+-{
+-    BYTE *data;
+-    SIZE_T size, capacity;
+-    BOOL failed;
+-};
+-
+-static void put(struct buffer *buffer, const void *data, SIZE_T size)
++void asf_put(struct asf_buffer *buffer, const void *data, SIZE_T size)
+ {
+     if (buffer->failed) return;
+     if (buffer->size + size > buffer->capacity)
+@@ -333,7 +325,9 @@ static void put(struct buffer *buffer, const void *data, SIZE_T size)
+     buffer->size += size;
+ }
+ 
+-static void put_word(struct buffer *buffer, WORD value) { put(buffer, &value, 2); }
++void asf_put_word(struct asf_buffer *buffer, WORD value) { asf_put(buffer, &value, 2); }
++void asf_put_dword(struct asf_buffer *buffer, DWORD value) { asf_put(buffer, &value, 4); }
++void asf_put_qword(struct asf_buffer *buffer, UINT64 value) { asf_put(buffer, &value, 8); }
+ 
+ static BOOL is_description_name(const WCHAR *name)
+ {
+@@ -364,13 +358,12 @@ static HRESULT get_attribute(IWMHeaderInfo3 *info, WORD index, WCHAR **name, WMT
+ }
+ 
+ /* the Content Description and Extended Content Description objects of the store's file attributes */
+-static void build_descriptions(struct editor *editor, struct buffer *out, DWORD *count)
++void asf_put_descriptions(IWMHeaderInfo3 *info, struct asf_buffer *out, DWORD *count)
+ {
+-    IWMHeaderInfo3 *info = writer_header_iface(editor->header);
+     const WCHAR *strings[ARRAY_SIZE(description_names)] = { 0 };
+     WCHAR *names[ARRAY_SIZE(description_names)] = { 0 };
+     BYTE *values[ARRAY_SIZE(description_names)] = { 0 };
+-    struct buffer ecd = { 0 };
++    struct asf_buffer ecd = { 0 };
+     WORD attr_count = 0, ecd_count = 0, i, k;
+     BOOL any_description = FALSE;
+     UINT64 size;
+@@ -378,7 +371,7 @@ static void build_descriptions(struct editor *editor, struct buffer *out, DWORD
+     IWMHeaderInfo3_GetAttributeCountEx(info, 0, &attr_count);
+ 
+     /* the extended descriptors */
+-    put_word(&ecd, 0);
++    asf_put_word(&ecd, 0);
+     for (i = 0; i < attr_count; i++)
+     {
+         WMT_ATTR_DATATYPE type;
+@@ -422,11 +415,11 @@ static void build_descriptions(struct editor *editor, struct buffer *out, DWORD
+         }
+         name_length = (wcslen(name) + 1) * sizeof(WCHAR);
+         value_length = min(length, 0xffff);
+-        put_word(&ecd, name_length);
+-        put(&ecd, name, name_length);
+-        put_word(&ecd, descriptor_type);
+-        put_word(&ecd, value_length);
+-        put(&ecd, value, value_length);
++        asf_put_word(&ecd, name_length);
++        asf_put(&ecd, name, name_length);
++        asf_put_word(&ecd, descriptor_type);
++        asf_put_word(&ecd, value_length);
++        asf_put(&ecd, value, value_length);
+         ecd_count++;
+         free(name);
+         free(value);
+@@ -443,19 +436,19 @@ static void build_descriptions(struct editor *editor, struct buffer *out, DWORD
+             lengths[k] = strings[k] ? (wcslen(strings[k]) + 1) * sizeof(WCHAR) : 0;
+             size += lengths[k];
+         }
+-        put(out, &asf_content_description, sizeof(GUID));
+-        put(out, &size, 8);
+-        put(out, lengths, sizeof(lengths));
++        asf_put(out, &asf_content_description, sizeof(GUID));
++        asf_put(out, &size, 8);
++        asf_put(out, lengths, sizeof(lengths));
+         for (k = 0; k < ARRAY_SIZE(description_names); k++)
+-            if (strings[k]) put(out, strings[k], lengths[k]);
++            if (strings[k]) asf_put(out, strings[k], lengths[k]);
+         (*count)++;
+     }
+     if (ecd_count)
+     {
+         size = OBJECT_SIZE + ecd.size;
+-        put(out, &asf_extended_content_description, sizeof(GUID));
+-        put(out, &size, 8);
+-        put(out, ecd.data, ecd.size);
++        asf_put(out, &asf_extended_content_description, sizeof(GUID));
++        asf_put(out, &size, 8);
++        asf_put(out, ecd.data, ecd.size);
+         (*count)++;
+     }
+     if (ecd.failed) out->failed = TRUE;
+@@ -470,7 +463,7 @@ static void build_descriptions(struct editor *editor, struct buffer *out, DWORD
+ static HRESULT WINAPI editor_Flush(IWMMetadataEditor *iface)
+ {
+     struct editor *editor = impl_from_IWMMetadataEditor(iface);
+-    struct buffer out = { 0 };
++    struct asf_buffer out = { 0 };
+     WCHAR temp[MAX_PATH + 16];
+     BYTE header[HEADER_SIZE] = { 0 }, chunk[65536];
+     DWORD count = 0, pos, i, read, written;
+@@ -489,7 +482,7 @@ static HRESULT WINAPI editor_Flush(IWMMetadataEditor *iface)
+     }
+ 
+     /* the header's objects but the two descriptions, then the new descriptions */
+-    put(&out, header, sizeof(header));
++    asf_put(&out, header, sizeof(header));
+     for (i = 0, pos = 0; i < editor->object_count; i++)
+     {
+         const BYTE *object = editor->objects + pos;
+@@ -499,13 +492,13 @@ static HRESULT WINAPI editor_Flush(IWMMetadataEditor *iface)
+         if (!IsEqualGUID((GUID *)object, &asf_content_description) &&
+             !IsEqualGUID((GUID *)object, &asf_extended_content_description))
+         {
+-            put(&out, object, object_size);
++            asf_put(&out, object, object_size);
+             count++;
+         }
+         pos += object_size;
+     }
+ #ifndef SG_MUTANT_WMED_NO_WRITE
+-    build_descriptions(editor, &out, &count);
++    asf_put_descriptions(writer_header_iface(editor->header), &out, &count);
+ #endif
+     if (out.failed)
+     {
+diff --git a/dlls/wmvcore/profile.h b/dlls/wmvcore/profile.h
+index 1cc0913..fb99ee7 100644
+--- a/dlls/wmvcore/profile.h
++++ b/dlls/wmvcore/profile.h
+@@ -49,5 +49,6 @@ struct writer_header;
+ HRESULT writer_header_create(IUnknown *outer, struct writer_header **out);
+ IWMHeaderInfo3 *writer_header_iface(struct writer_header *header);
+ void writer_header_destroy(struct writer_header *header);
++void writer_header_clear(struct writer_header *header);
+ 
+ #endif
+diff --git a/dlls/wmvcore/writer.c b/dlls/wmvcore/writer.c
+index b393017..c33ec70 100644
+--- a/dlls/wmvcore/writer.c
++++ b/dlls/wmvcore/writer.c
+@@ -21,6 +21,7 @@
+ #include "nserror.h"
+ #include "asferr.h"
+ #include "profile.h"
++#include "asf.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -55,6 +56,7 @@ typedef struct {
+     struct writer_input *inputs;
+     DWORD input_count;
+     WCHAR *filename;
++    struct asf_mux *mux;        /* while writing (wine-sg 6517) */
+ } WMWriter;
+ 
+ static inline WMWriter *impl_from_IWMWriter(IWMWriter *iface)
+@@ -127,6 +129,7 @@ static ULONG WINAPI WMWriter_Release(IWMWriter *iface)
+         if (This->profile)
+             IWMProfile3_Release(This->profile);
+         free(This->filename);
++        asf_mux_destroy(This->mux);
+         writer_header_destroy(This->header);
+         This->cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&This->cs);
+@@ -295,6 +298,18 @@ static BOOL input_format_accepted(const struct writer_input *input, const WM_MED
+     return FALSE;
+ }
+ 
++/* the input's chosen format is the stream's own: its samples go in as they are */
++static BOOL input_is_stream_format(const struct writer_input *input)
++{
++    const WM_MEDIA_TYPE *mt = input->stream_mt, *chosen = input->chosen;
++
++    if (!mt) return FALSE;
++    if (!chosen) return input_format_count(input) == 0;
++    return IsEqualGUID(&mt->subtype, &chosen->subtype) && IsEqualGUID(&mt->formattype, &chosen->formattype)
++            && mt->cbFormat >= 16 && chosen->cbFormat >= 16
++            && !memcmp(mt->pbFormat, chosen->pbFormat, IsEqualGUID(&mt->formattype, &format_waveformatex) ? 16 : min(mt->cbFormat, chosen->cbFormat));
++}
++
+ /* IWMInputMediaProps: a media type and the connection name of the input. */
+ struct input_props
+ {
+@@ -716,24 +731,40 @@ static HRESULT WINAPI WMWriter_BeginWriting(IWMWriter *iface)
+                 hr = NS_E_INVALID_INPUT_FORMAT;
+         }
+     }
++    if (SUCCEEDED(hr) && This->mux)
++        hr = NS_E_INVALID_REQUEST;
++    /* the ASF stream: header now, packets as samples come (asfmux.c) */
++    if (SUCCEEDED(hr) && SUCCEEDED(hr = asf_mux_create((IWMProfile *)This->profile, writer_header_iface(This->header), &This->mux)))
++    {
++        if (FAILED(hr = asf_mux_begin(This->mux, This->filename, This->sinks, This->sink_count)))
++        {
++            asf_mux_destroy(This->mux);
++            This->mux = NULL;
++        }
++    }
+     LeaveCriticalSection(&This->cs);
+-    if (FAILED(hr))
+-        return hr;
+-
+-    /* Producing the ASF stream needs the encoders of the profile's streams,
+-     * which this implementation does not have. */
+-    FIXME("(%p): no encoder, cannot start writing\n", This);
+-    return E_NOTIMPL;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI WMWriter_EndWriting(IWMWriter *iface)
+ {
+     WMWriter *This = impl_from_IWMWriter(iface);
+ 
++    HRESULT hr;
++
+     TRACE("(%p)\n", This);
+ 
+-    /* Writing never starts here, so it is never running. */
+-    return NS_E_INVALID_REQUEST;
++    EnterCriticalSection(&This->cs);
++    if (!This->mux)
++        hr = NS_E_INVALID_REQUEST;
++    else
++    {
++        hr = asf_mux_end(This->mux);
++        asf_mux_destroy(This->mux);
++        This->mux = NULL;
++    }
++    LeaveCriticalSection(&This->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI WMWriter_AllocateSample(IWMWriter *iface, DWORD size, INSSBuffer **sample)
+@@ -752,20 +783,63 @@ static HRESULT WINAPI WMWriter_WriteSample(IWMWriter *iface, DWORD dwInputNum, Q
+ {
+     WMWriter *This = impl_from_IWMWriter(iface);
+ 
++    struct writer_input *input;
++    UINT64 duration = 0;
++    DWORD length;
++    BYTE *data;
++    HRESULT hr;
++
+     TRACE("(%p)->(%ld %s %lx %p)\n", This, dwInputNum, wine_dbgstr_longlong(cnsSampleTime), flags, sample);
+ 
+     if (!sample)
+         return E_INVALIDARG;
+-    return NS_E_INVALID_REQUEST;
++    EnterCriticalSection(&This->cs);
++    if (!This->mux)
++    {
++        LeaveCriticalSection(&This->cs);
++        return NS_E_INVALID_REQUEST;
++    }
++    if (dwInputNum >= This->input_count)
++    {
++        LeaveCriticalSection(&This->cs);
++        return E_INVALIDARG;
++    }
++    input = &This->inputs[dwInputNum];
++    if (!input_is_stream_format(input))
++    {
++        /* the stream's codec: encoding is not here yet */
++        FIXME("input %lu: no encoder from %s\n", dwInputNum, input->chosen ? debugstr_guid(&input->chosen->subtype) : "-");
++        LeaveCriticalSection(&This->cs);
++        return E_NOTIMPL;
++    }
++    if (SUCCEEDED(hr = INSSBuffer_GetBufferAndLength(sample, &data, &length)))
++    {
++        const WM_MEDIA_TYPE *mt = input->stream_mt;
++
++        if (IsEqualGUID(&mt->formattype, &format_waveformatex) && rd32(mt->pbFormat + 8))
++            duration = (UINT64)length * 10000000 / rd32(mt->pbFormat + 8);
++        else if (IsEqualGUID(&mt->formattype, &format_videoinfo))
++            memcpy(&duration, mt->pbFormat + 40, 8);
++        hr = asf_mux_write(This->mux, input->stream_number, cnsSampleTime, duration,
++                           !IsEqualGUID(&input->type, &media_type_video) || (flags & WM_SF_CLEANPOINT), data, length);
++    }
++    LeaveCriticalSection(&This->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI WMWriter_Flush(IWMWriter *iface)
+ {
+     WMWriter *This = impl_from_IWMWriter(iface);
+ 
++    HRESULT hr;
++
+     TRACE("(%p)\n", This);
+ 
+-    return NS_E_INVALID_REQUEST;
++    /* packets go out as they fill: nothing is held back */
++    EnterCriticalSection(&This->cs);
++    hr = This->mux ? S_OK : NS_E_INVALID_REQUEST;
++    LeaveCriticalSection(&This->cs);
++    return hr;
+ }
+ 
+ static const IWMWriterVtbl WMWriterVtbl = {
+@@ -1024,13 +1098,32 @@ static HRESULT WINAPI WMWriterAdvanced_WriteStreamSample(IWMWriterAdvanced3 *ifa
+         QWORD sample_time, DWORD sample_send_time, QWORD sample_duration, DWORD flags, INSSBuffer *sample)
+ {
+     WMWriter *This = impl_from_IWMWriterAdvanced3(iface);
++    DWORD length;
++    BYTE *data;
++    HRESULT hr;
++
+     TRACE("(%p)->(%u %s %lu %s %lx %p)\n", This, stream_num, wine_dbgstr_longlong(sample_time),
+           sample_send_time, wine_dbgstr_longlong(sample_duration), flags, sample);
+ 
+     if (!sample)
+         return E_INVALIDARG;
+-    /* Writing never starts here, so it is never running. */
+-    return NS_E_INVALID_REQUEST;
++    EnterCriticalSection(&This->cs);
++    if (!This->mux)
++        hr = NS_E_INVALID_REQUEST;
++    else if (SUCCEEDED(hr = INSSBuffer_GetBufferAndLength(sample, &data, &length)))
++    {
++        BOOL video = FALSE;
++        DWORD i;
++
++        for (i = 0; i < This->input_count; i++)
++            if (This->inputs[i].stream_number == stream_num)
++                video = IsEqualGUID(&This->inputs[i].type, &media_type_video);
++        /* the samples are already in the stream's format */
++        hr = asf_mux_write(This->mux, stream_num, sample_time, sample_duration, !video || (flags & WM_SF_CLEANPOINT),
++                           data, length);
++    }
++    LeaveCriticalSection(&This->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI WMWriterAdvanced_SetLiveSource(IWMWriterAdvanced3 *iface, BOOL is_live_source)
+@@ -1112,11 +1205,19 @@ static HRESULT WINAPI WMWriterAdvanced_GetStatistics(IWMWriterAdvanced3 *iface,
+         return E_INVALIDARG;
+     if (FAILED(hr = writer_expected_bitrate(This, stream_num, &bitrate)))
+         return hr;
+-    /* Nothing was written: only the expected bit rate is known. */
+     memset(stats, 0, sizeof(*stats));
+ #ifndef SG_MUTANT_WMVW_NOEXPECTED
+     stats->dwExpectedBitrate = bitrate;
+ #endif
++    EnterCriticalSection(&This->cs);
++    if (This->mux)
++    {
++        UINT64 bytes, samples;
++        asf_mux_statistics(This->mux, stream_num, &bytes, &samples);
++        stats->qwSampleCount = samples;
++        stats->qwByteCount = bytes;
++    }
++    LeaveCriticalSection(&This->cs);
+     return S_OK;
+ }
+ 
+diff --git a/dlls/wmvcore/writer_header.c b/dlls/wmvcore/writer_header.c
+index ebf5f05..a22f094 100644
+--- a/dlls/wmvcore/writer_header.c
++++ b/dlls/wmvcore/writer_header.c
+@@ -801,6 +801,42 @@ IWMHeaderInfo3 *writer_header_iface(struct writer_header *header)
+     return &header->IWMHeaderInfo3_iface;
+ }
+ 
++/* every attribute, marker, script and codec description gone (wine-sg 6515: the editor's Close) */
++void writer_header_clear(struct writer_header *header)
++{
++    unsigned int i;
++
++    EnterCriticalSection(&header->cs);
++    for (i = 0; i < header->attr_count; ++i)
++        attribute_clear(&header->attrs[i]);
++    free(header->attrs);
++    header->attrs = NULL;
++    header->attr_count = 0;
++    for (i = 0; i < header->marker_count; ++i)
++        free(header->markers[i].name);
++    free(header->markers);
++    header->markers = NULL;
++    header->marker_count = 0;
++    for (i = 0; i < header->script_count; ++i)
++    {
++        free(header->scripts[i].type);
++        free(header->scripts[i].command);
++    }
++    free(header->scripts);
++    header->scripts = NULL;
++    header->script_count = 0;
++    for (i = 0; i < header->codec_count; ++i)
++    {
++        free(header->codecs[i].name);
++        free(header->codecs[i].description);
++        free(header->codecs[i].info);
++    }
++    free(header->codecs);
++    header->codecs = NULL;
++    header->codec_count = 0;
++    LeaveCriticalSection(&header->cs);
++}
++
+ void writer_header_destroy(struct writer_header *header)
+ {
+     unsigned int i;
