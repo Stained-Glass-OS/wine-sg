@@ -1,0 +1,323 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll, server: registry watches end in the caller's APC routine
+
+NtNotifyChangeMultipleKeys and NtNotifyChangeKey ignored an APC routine (a FIXME) and refused a watch
+that had one and no event, which is how GLib watches the registry: GTK programs (Geany, GIMP,
+Inkscape...) never heard of a change to file associations or settings. set_registry_notification now
+takes the caller's async block (the event is optional when there is one); when the watch ends the server
+queues an APC_ASYNC_IO to the thread that set it, and that thread's ntdll fills the I/O status block
+(STATUS_SUCCESS on a change, STATUS_NOTIFY_CLEANUP when the handle is closed or the key goes) and queues
+the APC routine as a user APC, so it runs in the thread's next alertable wait. Event watches are
+unchanged; a handle keeps the filter of its first watch, as before (and as the tests expect).
+---
+diff --git a/dlls/ntdll/unix/registry.c b/dlls/ntdll/unix/registry.c
+index b42e147..e272c10 100644
+--- a/dlls/ntdll/unix/registry.c
++++ b/dlls/ntdll/unix/registry.c
+@@ -782,6 +782,29 @@ NTSTATUS WINAPI NtDeleteValueKey( HANDLE key, const UNICODE_STRING *name )
+ }
+ 
+ 
++/* a watch that ends in the caller's APC routine: the server completes it on the calling thread */
++struct async_regnotify
++{
++    struct async_fileio io;
++    PIO_APC_ROUTINE     apc;
++    void               *apc_context;
++    client_ptr_t        iosb;
++};
++
++static BOOL regnotify_complete( void *user, ULONG_PTR *info, unsigned int *status )
++{
++    struct async_regnotify *notify = user;
++
++    TRACE( "watch %p ended, status %#x\n", notify, *status );
++    *info = 0;
++#ifndef SG_MUTANT_REGAPC_NO_APC
++    NtQueueApcThread( NtCurrentThread(), (PNTAPCFUNC)notify->apc, (ULONG_PTR)notify->apc_context,
++                      (ULONG_PTR)notify->iosb, 0 );
++#endif
++    release_fileio( &notify->io );
++    return TRUE;
++}
++
+ /******************************************************************************
+  *              NtNotifyChangeMultipleKeys  (NTDLL.@)
+  */
+@@ -790,13 +813,14 @@ NTSTATUS WINAPI NtNotifyChangeMultipleKeys( HANDLE key, ULONG count, OBJECT_ATTR
+                                             IO_STATUS_BLOCK *io, ULONG filter, BOOLEAN subtree,
+                                             void *buffer, ULONG length, BOOLEAN async )
+ {
++    struct async_regnotify *notify = NULL;
+     unsigned int ret;
+ 
+     TRACE( "(%p,%u,%p,%p,%p,%p,%p,0x%08x, 0x%08x,%p,0x%08x,0x%08x)\n",
+            key, (int)count, attr, event, apc, apc_context, io,
+            (int)filter, async, buffer, (int)length, subtree );
+ 
+-    if (count || attr || apc || apc_context || buffer || length)
++    if (count || attr || buffer || length)
+         FIXME( "Unimplemented optional parameter\n" );
+ 
+     if (!async)
+@@ -806,6 +830,16 @@ NTSTATUS WINAPI NtNotifyChangeMultipleKeys( HANDLE key, ULONG count, OBJECT_ATTR
+         ret = NtCreateEvent( &event, EVENT_ALL_ACCESS, &attr, SynchronizationEvent, FALSE );
+         if (ret) return ret;
+     }
++    else if (apc)
++    {
++        /* the APC routine runs on this thread once the watch ends (change, handle closed, key gone) */
++        if (!(notify = (struct async_regnotify *)alloc_fileio( sizeof(*notify), regnotify_complete, key )))
++            return STATUS_NO_MEMORY;
++        notify->apc         = apc;
++        notify->apc_context = apc_context;
++        notify->iosb        = iosb_client_ptr( io );
++    }
++    else if (!event) return STATUS_INVALID_PARAMETER;
+ 
+     SERVER_START_REQ( set_registry_notification )
+     {
+@@ -813,10 +847,13 @@ NTSTATUS WINAPI NtNotifyChangeMultipleKeys( HANDLE key, ULONG count, OBJECT_ATTR
+         req->event   = wine_server_obj_handle( event );
+         req->subtree = subtree;
+         req->filter  = filter;
++        req->user    = wine_server_client_ptr( notify );
++        req->iosb    = notify ? notify->iosb : 0;
+         ret = wine_server_call( req );
+     }
+     SERVER_END_REQ;
+ 
++    if (notify && ret != STATUS_PENDING) release_fileio( &notify->io );
+     if (!async)
+     {
+         if (ret == STATUS_PENDING) ret = NtWaitForSingleObject( event, FALSE, NULL );
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index c141a88..71e9e83 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -2793,6 +2793,8 @@ struct set_registry_notification_request
+     int          subtree;
+     unsigned int filter;
+     char __pad_28[4];
++    client_ptr_t user;
++    client_ptr_t iosb;
+ };
+ struct set_registry_notification_reply
+ {
+@@ -7399,6 +7401,6 @@ union generic_reply
+     struct register_terminate_port_reply register_terminate_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 876
++#define SERVER_PROTOCOL_VERSION 877
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/protocol.def b/server/protocol.def
+index 5279f76..6c38736 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -2169,9 +2169,11 @@ struct process_info
+ /* Add a registry key change notification */
+ @REQ(set_registry_notification)
+     obj_handle_t hkey;         /* key to watch for changes */
+-    obj_handle_t event;        /* event to set */
++    obj_handle_t event;        /* event to set (or 0) */
+     int          subtree;      /* should we watch the whole subtree? */
+     unsigned int filter;       /* things to watch */
++    client_ptr_t user;         /* async_fileio to complete on this thread (or 0) */
++    client_ptr_t iosb;         /* its I/O status block */
+ @END
+ 
+ 
+diff --git a/server/registry.c b/server/registry.c
+index 5f2f857..eda7514 100644
+--- a/server/registry.c
++++ b/server/registry.c
+@@ -44,16 +44,25 @@
+ #include "handle.h"
+ #include "request.h"
+ #include "process.h"
++#include "thread.h"
+ #include "unicode.h"
+ #include "security.h"
+ 
+ #include "winternl.h"
+ 
++struct notify_waiter
++{
++    struct event     *event;    /* event to set, or NULL */
++    struct thread    *thread;   /* thread to complete an async on (APC routine), or NULL */
++    client_ptr_t      user;     /* its async_fileio */
++    client_ptr_t      iosb;     /* and I/O status block */
++};
++
+ struct notify
+ {
+     struct list       entry;    /* entry in list of notifications */
+-    struct event    **events;   /* events to set when changing this key */
+-    unsigned int      event_count; /* number of events */
++    struct notify_waiter *events; /* who to tell when changing this key */
++    unsigned int      event_count; /* number of waiters */
+     int               subtree;  /* true if subtree notification */
+     unsigned int      filter;   /* which events to notify on */
+     obj_handle_t      hkey;     /* hkey associated with this notification */
+@@ -426,8 +435,31 @@ static void do_notification( struct key *key, struct notify *notify, int del )
+ 
+     for (i = 0; i < notify->event_count; ++i)
+     {
+-        set_event( notify->events[i] );
+-        release_object( notify->events[i] );
++        struct notify_waiter *waiter = &notify->events[i];
++
++        if (waiter->event)
++        {
++            set_event( waiter->event );
++            release_object( waiter->event );
++        }
++        if (waiter->thread)
++        {
++            union apc_call data;
++
++            /* the thread's ntdll fills the I/O status block and queues the caller's APC routine;
++             * a handle closed or a key gone ends the watch as NotifyCleanup */
++            memset( &data, 0, sizeof(data) );
++            data.type            = APC_ASYNC_IO;
++            data.async_io.user   = waiter->user;
++            data.async_io.sb     = waiter->iosb;
++#ifdef SG_MUTANT_REGAPC_NO_CLEANUP
++            data.async_io.status = STATUS_SUCCESS;
++#else
++            data.async_io.status = del ? STATUS_NOTIFY_CLEANUP : STATUS_SUCCESS;
++#endif
++            thread_queue_apc( waiter->thread->process, waiter->thread, NULL, &data );
++            release_object( waiter->thread );
++        }
+     }
+     free( notify->events );
+     notify->events = NULL;
+@@ -3086,47 +3118,54 @@ DECL_HANDLER(save_registry)
+ DECL_HANDLER(set_registry_notification)
+ {
+     struct key *key;
+-    struct event *event;
++    struct event *event = NULL;
+     struct notify *notify;
++    struct notify_waiter *new_array;
+ 
+-    key = get_hkey_obj( req->hkey, KEY_NOTIFY );
+-    if (key)
++    if (!req->event && !req->user)
++    {
++        set_error( STATUS_INVALID_PARAMETER );
++        return;
++    }
++    if (!(key = get_hkey_obj( req->hkey, KEY_NOTIFY ))) return;
++    if (req->event && !(event = get_event_obj( current->process, req->event, SYNCHRONIZE )))
++    {
++        release_object( key );
++        return;
++    }
++    notify = find_notify( key, current->process, req->hkey );
++    if (!notify)
+     {
+-        event = get_event_obj( current->process, req->event, SYNCHRONIZE );
+-        if (event)
++        notify = mem_alloc( sizeof(*notify) );
++        if (notify)
+         {
+-            notify = find_notify( key, current->process, req->hkey );
+-            if (!notify)
+-            {
+-                notify = mem_alloc( sizeof(*notify) );
+-                if (notify)
+-                {
+-                    notify->events  = NULL;
+-                    notify->event_count = 0;
+-                    notify->subtree = req->subtree;
+-                    notify->filter  = req->filter;
+-                    notify->hkey    = req->hkey;
+-                    notify->process = current->process;
+-                    list_add_head( &key->notify_list, &notify->entry );
+-                }
+-            }
+-            if (notify)
+-            {
+-                struct event **new_array;
+-
+-                if ((new_array = realloc( notify->events, (notify->event_count + 1) * sizeof(*notify->events) )))
+-                {
+-                    notify->events = new_array;
+-                    notify->events[notify->event_count++] = (struct event *)grab_object( event );
+-                    reset_event( event );
+-                    set_error( STATUS_PENDING );
+-                }
+-                else set_error( STATUS_NO_MEMORY );
+-            }
+-            release_object( event );
++            notify->events  = NULL;
++            notify->event_count = 0;
++            notify->subtree = req->subtree;
++            notify->filter  = req->filter;
++            notify->hkey    = req->hkey;
++            notify->process = current->process;
++            list_add_head( &key->notify_list, &notify->entry );
+         }
+-        release_object( key );
+     }
++    if (notify)
++    {
++        if ((new_array = realloc( notify->events, (notify->event_count + 1) * sizeof(*notify->events) )))
++        {
++            struct notify_waiter *waiter = &new_array[notify->event_count++];
++
++            notify->events = new_array;
++            waiter->event  = event ? (struct event *)grab_object( event ) : NULL;
++            waiter->thread = req->user ? (struct thread *)grab_object( current ) : NULL;
++            waiter->user   = req->user;
++            waiter->iosb   = req->iosb;
++            if (event) reset_event( event );
++            set_error( STATUS_PENDING );
++        }
++        else set_error( STATUS_NO_MEMORY );
++    }
++    if (event) release_object( event );
++    release_object( key );
+ }
+ 
+ /* rename a registry key */
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 60f6c0a..933eb89 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -1291,7 +1291,9 @@ C_ASSERT( offsetof(struct set_registry_notification_request, hkey) == 12 );
+ C_ASSERT( offsetof(struct set_registry_notification_request, event) == 16 );
+ C_ASSERT( offsetof(struct set_registry_notification_request, subtree) == 20 );
+ C_ASSERT( offsetof(struct set_registry_notification_request, filter) == 24 );
+-C_ASSERT( sizeof(struct set_registry_notification_request) == 32 );
++C_ASSERT( offsetof(struct set_registry_notification_request, user) == 32 );
++C_ASSERT( offsetof(struct set_registry_notification_request, iosb) == 40 );
++C_ASSERT( sizeof(struct set_registry_notification_request) == 48 );
+ C_ASSERT( offsetof(struct rename_key_request, hkey) == 12 );
+ C_ASSERT( sizeof(struct rename_key_request) == 16 );
+ C_ASSERT( offsetof(struct create_timer_request, access) == 12 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 39fb113..3b87083 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -1243,6 +1243,8 @@ static void dump_set_registry_notification_request( const struct set_registry_no
+     fprintf( stderr, ", event=%04x", req->event );
+     fprintf( stderr, ", subtree=%d", req->subtree );
+     fprintf( stderr, ", filter=%08x", req->filter );
++    dump_uint64( ", user=", &req->user );
++    dump_uint64( ", iosb=", &req->iosb );
+ }
+ 
+ static void dump_rename_key_request( const struct rename_key_request *req )
+@@ -4759,6 +4761,7 @@ static const struct
+     { "NETWORK_BUSY",                STATUS_NETWORK_BUSY },
+     { "NETWORK_UNREACHABLE",         STATUS_NETWORK_UNREACHABLE },
+     { "NONE_MAPPED",                 STATUS_NONE_MAPPED },
++    { "NOTIFY_CLEANUP",              STATUS_NOTIFY_CLEANUP },
+     { "NOT_ALL_ASSIGNED",            STATUS_NOT_ALL_ASSIGNED },
+     { "NOT_A_DIRECTORY",             STATUS_NOT_A_DIRECTORY },
+     { "NOT_FOUND",                   STATUS_NOT_FOUND },
