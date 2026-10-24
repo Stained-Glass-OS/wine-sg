@@ -7,7 +7,9 @@
 # (test/mpris-probe.c). The gate runs its own bus (dbus-run-session) and its own X server.
 #   WINE=/opt/wine-sg/bin/wine test/mpris-gate.sh
 # A gate for a 32-bit program too: MINGW=i686-w64-mingw32-gcc.
-# Mutants: SG_MUTANT_MPRIS_NO_SIGNAL (unixlib.c: no PropertiesChanged), SG_MUTANT_MPRIS_NO_BUTTON
+# With a timeline (6525): CanSeek, Position, Seek and SetPosition as PlaybackPositionChangeRequested,
+# Seeked when the program jumps.
+# Mutants: SG_MUTANT_MPRIS_NO_SEEK (unixlib.c: no position requests), SG_MUTANT_MPRIS_NO_SIGNAL (unixlib.c: no PropertiesChanged), SG_MUTANT_MPRIS_NO_BUTTON
 # (main.c: no ButtonPressed) (windows.media.mediacontrol); SG_MUTANT_REF_NO_FOREIGN (windows.storage
 # stream.c: a reference to another implementation's stream could not be opened: no cover).
 set -u
@@ -92,10 +94,13 @@ for p in CanPlay CanPause CanGoNext CanGoPrevious CanControl; do F="$F $p=$(prop
 printf '      flags:%s\n' "$F"
 yes_no "$([ "$F" = " CanPlay=true CanPause=true CanGoNext=true CanGoPrevious=false CanControl=true" ] && echo 1)" \
     "CanPlay/CanPause/CanGoNext from IsXEnabled, CanGoPrevious off"
+CS=$(prop org.mpris.MediaPlayer2.Player CanSeek)
+yes_no "$(printf '%s' "$CS" | grep -q false && echo 1)" "no timeline yet: CanSeek false" "$CS"
 RO=$(gdbus call --session -d "$NAME" -o /org/mpris/MediaPlayer2 -m org.freedesktop.DBus.Properties.Set org.mpris.MediaPlayer2.Player Rate '<2.0>' 2>&1)
 yes_no "$(printf '%s' "$RO" | grep -qi "error" && echo 1)" "Properties.Set is refused (read-only)" "$RO"
 
-dbus-monitor --session "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/mpris/MediaPlayer2'" > "$T/signals" 2>/dev/null & MP=$!
+dbus-monitor --session "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/mpris/MediaPlayer2'" \
+    "type='signal',interface='org.mpris.MediaPlayer2.Player',member='Seeked'" > "$T/signals" 2>/dev/null & MP=$!
 sleep 0.5
 call PlayPause; sleep 0.3; call Next
 stage paused || { fail "the probe did not see the buttons"; cat "$T/out"; exit 1; }
@@ -106,6 +111,27 @@ sleep 0.5
 yes_no "$(grep -A12 PropertiesChanged "$T/signals" | grep -q '"Paused"' && echo 1)" "PropertiesChanged carries the new PlaybackStatus"
 call PlayPause; sleep 0.3; call Previous; sleep 0.5
 touch "$C/go"
+# (6525) the timeline: seeking and setting the position become PlaybackPositionChangeRequested
+stage timeline || { fail "the probe set no timeline"; cat "$T/out"; exit 1; }
+sleep 0.5
+CS=$(prop org.mpris.MediaPlayer2.Player CanSeek)
+yes_no "$(printf '%s' "$CS" | grep -q true && echo 1)" "a timeline with a seekable range: CanSeek true" "$CS"
+POS=$(prop org.mpris.MediaPlayer2.Player Position)
+yes_no "$(printf '%s' "$POS" | grep -q "<int64 10000000>" && echo 1)" "Position is the timeline's, from its start (10 s, paused)" "$POS"
+MD=$(prop org.mpris.MediaPlayer2.Player Metadata)
+yes_no "$(printf '%s' "$MD" | grep -q "'mpris:length': <int64 200000000>" && echo 1)" "mpris:length is the timeline's (200 s)"
+TRACK=$(printf '%s' "$MD" | sed -n "s/.*'mpris:trackid': <objectpath '\([^']*\)'>.*/\1/p")
+gdbus call --session -d "$NAME" -o /org/mpris/MediaPlayer2 -m org.mpris.MediaPlayer2.Player.Seek 5000000 >/dev/null 2>&1; sleep 0.3
+gdbus call --session -d "$NAME" -o /org/mpris/MediaPlayer2 -m org.mpris.MediaPlayer2.Player.SetPosition "$TRACK" 50000000 >/dev/null 2>&1; sleep 0.3
+gdbus call --session -d "$NAME" -o /org/mpris/MediaPlayer2 -m org.mpris.MediaPlayer2.Player.SetPosition /org/stainedglass/mpris/stale 70000000 >/dev/null 2>&1; sleep 0.3
+gdbus call --session -d "$NAME" -o /org/mpris/MediaPlayer2 -m org.mpris.MediaPlayer2.Player.Seek -- -100000000 >/dev/null 2>&1; sleep 0.3
+gdbus call --session -d "$NAME" -o /org/mpris/MediaPlayer2 -m org.mpris.MediaPlayer2.Player.SetPosition "$TRACK" 190000000 >/dev/null 2>&1
+stage seeked || { fail "the probe did not get the positions"; cat "$T/out"; exit 1; }
+sleep 0.7
+yes_no "$(grep -A2 'member=Seeked' "$T/signals" | grep -q 'int64 50000000' && echo 1)" "the program's jump to 50 s is a Seeked signal"
+POS=$(prop org.mpris.MediaPlayer2.Player Position)
+yes_no "$(printf '%s' "$POS" | grep -q "<int64 50000000>" && echo 1)" "and Position follows" "$POS"
+touch "$C/go3"
 stage off || { fail "the probe did not finish"; cat "$T/out"; exit 1; }
 i=0; while [ -n "$(names)" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 yes_no "$([ -z "$(names)" ] && echo 1)" "a disabled session leaves the bus" "$(names)"
@@ -130,6 +156,12 @@ check next         "Next comes back as ButtonPressed Next"
 check other_thread "raised from a thread of the controls (not the caller's)"
 check play         "PlayPause while Paused comes back as Play"
 check no_previous  "Previous, not enabled, is not raised"
+check timeline     "UpdateTimelineProperties with a seekable range"
+check seek_forward "Seek(+5 s) is PlaybackPositionChangeRequested at 15 s (in the timeline's own time)"
+check set_position "SetPosition(track, 50 s) at 50 s"
+check seek_clamped "Seek(-100 s) at the seekable start (5 s)"
+check set_clamped  "SetPosition past the seekable end at its end (180 s)"
+check stale_ignored "SetPosition for another track is ignored"
 check done         "the probe ran to the end"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

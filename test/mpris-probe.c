@@ -35,6 +35,13 @@ typedef ULONG (WINAPI *release_fn)( void * );
 typedef HRESULT (WINAPI *from_path_fn)( void *, HSTRING, void ** );
 /* (mingw's headers lack these) */
 DEFINE_GUID(IID_IStorageFileStatics_, 0x5984c710, 0xdaf2, 0x43c8, 0x8b, 0xb4, 0xa4, 0xd3, 0xea, 0xcf, 0xd0, 0x3f);
+DEFINE_GUID(IID_ISMTC2_, 0xea98d2f6, 0x7f3c, 0x4af2, 0xa5, 0x86, 0x72, 0x88, 0x98, 0x08, 0xef, 0xb1);
+DEFINE_GUID(IID_ITimeline_, 0x5125316a, 0xc3a2, 0x475b, 0x85, 0x07, 0x93, 0x53, 0x4d, 0xc8, 0x8f, 0x15);
+DEFINE_GUID(IID_IPositionHandler_, 0x44e34f15, 0xbdc0, 0x50a7, 0xac, 0xe4, 0x39, 0xe9, 0x1f, 0xb7, 0x53, 0xf1);
+typedef HRESULT (WINAPI *put_time_fn)( void *, INT64 );
+typedef HRESULT (WINAPI *get_time_fn)( void *, INT64 * );
+typedef HRESULT (WINAPI *update_timeline_fn)( void *, void * );
+typedef HRESULT (WINAPI *add_handler_fn)( void *, void *, EventRegistrationToken * );
 
 static HSTRING hs( const WCHAR *s )
 {
@@ -170,6 +177,68 @@ static ITypedEventHandler_SystemMediaTransportControls_SystemMediaTransportContr
 };
 static ITypedEventHandler_SystemMediaTransportControls_SystemMediaTransportControlsButtonPressedEventArgs handler = { &handler_vtbl };
 
+/* PlaybackPositionChangeRequested (wine-sg 6525) */
+static LONG requests;
+static INT64 requested[16];
+static HRESULT WINAPI position_QueryInterface( IUnknown *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IPositionHandler_ ))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI position_AddRef( IUnknown *iface ) { return 2; }
+static ULONG WINAPI position_Release( IUnknown *iface ) { return 1; }
+static HRESULT WINAPI position_Invoke( IUnknown *iface, void *sender, void *args )
+{
+    INT64 pos = -1;
+    LONG n;
+
+    if (FAILED(SLOT( args, 6, get_time_fn )( args, &pos ))) pos = -2;
+    printf( "requested position=%lld sender=%d\n", (long long)pos, sender != NULL );
+    n = InterlockedIncrement( &requests ) - 1;
+    if (n < 16) requested[n] = pos;
+    SetEvent( press_event );
+    return S_OK;
+}
+static void *position_vtbl[] = { position_QueryInterface, position_AddRef, position_Release, position_Invoke };
+static struct { void **vtbl; } position_handler = { position_vtbl };
+
+static BOOL wait_requests( LONG count, DWORD ms )
+{
+    DWORD start = GetTickCount();
+    while (requests < count && GetTickCount() - start < ms) WaitForSingleObject( press_event, 200 );
+    return requests >= count;
+}
+
+/* a timeline: 1 s start, 200 s long, seekable from 5 s to 180 s, at position (from the start) */
+static HRESULT set_timeline( void *smtc2, INT64 position )
+{
+    IInspectable *inspectable;
+    void *timeline;
+    HSTRING str;
+    HRESULT hr;
+
+    str = hs( L"Windows.Media.SystemMediaTransportControlsTimelineProperties" );
+    hr = RoActivateInstance( str, &inspectable );
+    WindowsDeleteString( str );
+    if (FAILED(hr)) return hr;
+    hr = IInspectable_QueryInterface( inspectable, &IID_ITimeline_, &timeline );
+    IInspectable_Release( inspectable );
+    if (FAILED(hr)) return hr;
+    SLOT( timeline, 7, put_time_fn )( timeline, 10000000 );
+    SLOT( timeline, 9, put_time_fn )( timeline, 10000000 + 2000000000LL );
+    SLOT( timeline, 11, put_time_fn )( timeline, 10000000 + 50000000 );
+    SLOT( timeline, 13, put_time_fn )( timeline, 10000000 + 1800000000LL );
+    SLOT( timeline, 15, put_time_fn )( timeline, 10000000 + position );
+    hr = SLOT( smtc2, 12, update_timeline_fn )( smtc2, timeline );
+    SLOT( timeline, 2, release_fn )( timeline );
+    return hr;
+}
+
 static BOOL wait_presses( LONG count, DWORD ms )
 {
     DWORD start = GetTickCount();
@@ -253,6 +322,32 @@ int main( int argc, char **argv )
     wait_file( L"C:\\go", 60000 );
     Sleep( 500 );
     printf( "no_previous=%d presses=%ld\n", presses == 3, presses );
+
+    /* a timeline (paused, at 10 s): the gate seeks +5 s, sets 50 s, sets a stale track's (ignored),
+     * seeks -100 s (the seekable start, 5 s), sets 190 s (past the seekable end: 180 s) */
+    {
+        EventRegistrationToken position_token;
+        void *smtc2 = NULL;
+
+        hr = ISystemMediaTransportControls_QueryInterface( smtc, &IID_ISMTC2_, &smtc2 );
+        if (SUCCEEDED(hr)) hr = SLOT( smtc2, 13, add_handler_fn )( smtc2, &position_handler, &position_token );
+        if (SUCCEEDED(hr)) hr = set_timeline( smtc2, 100000000 );
+        printf( "timeline=%d hr=%#lx\n", SUCCEEDED(hr), hr );
+        printf( "stage=timeline\n" );
+        ok = wait_requests( 4, 60000 );
+        /* (times are the timeline's own: its start, 1 s, plus the position) */
+        printf( "seek_forward=%d\n", ok && requested[0] == 10000000 + 150000000 );
+        printf( "set_position=%d\n", ok && requested[1] == 10000000 + 500000000 );
+        printf( "seek_clamped=%d\n", ok && requested[2] == 10000000 + 50000000 );
+        printf( "set_clamped=%d\n", ok && requested[3] == 10000000 + 1800000000LL );
+        /* the program goes there: a jump */
+        if (smtc2) set_timeline( smtc2, 500000000 );
+        printf( "stage=seeked\n" );
+        wait_file( L"C:\\go3", 60000 );
+        Sleep( 500 );
+        printf( "stale_ignored=%d requests=%ld\n", requests == 4, requests );
+        if (smtc2) SLOT( smtc2, 2, release_fn )( smtc2 );
+    }
 
     ISystemMediaTransportControls_put_IsEnabled( smtc, FALSE );
     printf( "stage=off\n" );
