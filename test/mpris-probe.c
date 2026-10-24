@@ -239,6 +239,51 @@ static HRESULT set_timeline( void *smtc2, INT64 position )
     return hr;
 }
 
+/* (6528) a handler that is not agile, registered in a single-threaded apartment: called there */
+static DWORD sta_thread_id, sta_called_thread;
+static LONG sta_presses;
+static HRESULT WINAPI sta_QueryInterface( ITypedEventHandler_SystemMediaTransportControls_SystemMediaTransportControlsButtonPressedEventArgs *iface, REFIID iid, void **out )
+{
+    if (IsEqualGUID( iid, &IID_IUnknown ) ||
+        IsEqualGUID( iid, &IID_ITypedEventHandler_SystemMediaTransportControls_SystemMediaTransportControlsButtonPressedEventArgs ))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;   /* (not IAgileObject) */
+    return E_NOINTERFACE;
+}
+static HRESULT WINAPI sta_Invoke( ITypedEventHandler_SystemMediaTransportControls_SystemMediaTransportControlsButtonPressedEventArgs *iface,
+                                  ISystemMediaTransportControls *sender, ISystemMediaTransportControlsButtonPressedEventArgs *args )
+{
+    sta_called_thread = GetCurrentThreadId();
+    InterlockedIncrement( &sta_presses );
+    return S_OK;
+}
+static ITypedEventHandler_SystemMediaTransportControls_SystemMediaTransportControlsButtonPressedEventArgsVtbl sta_vtbl =
+{
+    sta_QueryInterface, handler_AddRef, handler_Release, sta_Invoke,
+};
+static ITypedEventHandler_SystemMediaTransportControls_SystemMediaTransportControlsButtonPressedEventArgs sta_handler = { &sta_vtbl };
+static HANDLE sta_ready, sta_quit;
+
+static DWORD WINAPI sta_thread( void *arg )
+{
+    ISystemMediaTransportControls *smtc = arg;
+    EventRegistrationToken token;
+    MSG msg;
+
+    CoInitializeEx( NULL, COINIT_APARTMENTTHREADED );
+    sta_thread_id = GetCurrentThreadId();
+    ISystemMediaTransportControls_add_ButtonPressed( smtc, &sta_handler, &token );
+    SetEvent( sta_ready );
+    while (MsgWaitForMultipleObjects( 1, &sta_quit, FALSE, INFINITE, QS_ALLINPUT ) != WAIT_OBJECT_0)
+        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
+    ISystemMediaTransportControls_remove_ButtonPressed( smtc, token );
+    CoUninitialize();
+    return 0;
+}
+
 static BOOL wait_presses( LONG count, DWORD ms )
 {
     DWORD start = GetTickCount();
@@ -282,6 +327,10 @@ int main( int argc, char **argv )
     if (SUCCEEDED(hr)) hr = ISystemMediaTransportControls_add_ButtonPressed( smtc, &handler, &token );
     printf( "controls=%d hr=%#lx pid=%lu\n", SUCCEEDED(hr), hr, GetCurrentProcessId() );
     if (FAILED(hr)) return 1;
+    sta_ready = CreateEventW( NULL, TRUE, FALSE, NULL );
+    sta_quit = CreateEventW( NULL, TRUE, FALSE, NULL );
+    CloseHandle( CreateThread( NULL, 0, sta_thread, smtc, 0, NULL ) );
+    WaitForSingleObject( sta_ready, 5000 );
 
     /* disabled: nothing on the bus yet */
     ISystemMediaTransportControls_put_PlaybackStatus( smtc, MediaPlaybackStatus_Playing );
@@ -313,6 +362,9 @@ int main( int argc, char **argv )
     printf( "pause=%d\n", ok && pressed[0] == SystemMediaTransportControlsButton_Pause );
     printf( "next=%d\n", ok && pressed[1] == SystemMediaTransportControlsButton_Next );
     printf( "other_thread=%d\n", ok && press_thread[0] != GetCurrentThreadId() );
+    Sleep( 300 );
+    printf( "sta_thread=%d presses=%ld thread=%lu want=%lu\n", sta_presses >= 2 && sta_called_thread == sta_thread_id,
+            sta_presses, sta_called_thread, sta_thread_id );
 
     ISystemMediaTransportControls_put_PlaybackStatus( smtc, MediaPlaybackStatus_Paused );
     printf( "stage=paused\n" );
@@ -353,6 +405,8 @@ int main( int argc, char **argv )
     printf( "stage=off\n" );
     wait_file( L"C:\\go2", 60000 );
     ISystemMediaTransportControls_remove_ButtonPressed( smtc, token );
+    SetEvent( sta_quit );
+    Sleep( 200 );
     ISystemMediaTransportControlsDisplayUpdater_Release( updater );
     ISystemMediaTransportControls_Release( smtc );
     ISystemMediaTransportControlsInterop_Release( interop );

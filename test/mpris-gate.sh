@@ -10,7 +10,8 @@
 # With a timeline (6525): CanSeek, Position, Seek and SetPosition as PlaybackPositionChangeRequested,
 # Seeked when the program jumps.
 # Mutants: SG_MUTANT_MPRIS_NO_SEEK (unixlib.c: no position requests), SG_MUTANT_MPRIS_NO_SIGNAL (unixlib.c: no PropertiesChanged), SG_MUTANT_MPRIS_NO_BUTTON
-# (main.c: no ButtonPressed) (windows.media.mediacontrol); SG_MUTANT_REF_NO_FOREIGN (windows.storage
+# (main.c: no ButtonPressed), SG_MUTANT_SMTC_NO_APARTMENT (main.c: not agile, called on our thread)
+# (windows.media.mediacontrol); SG_MUTANT_REF_NO_FOREIGN (windows.storage
 # stream.c: a reference to another implementation's stream could not be opened: no cover).
 set -u
 if [ -z "${SG_MPRIS_BUS:-}" ]; then
@@ -154,6 +155,7 @@ check copied       "the music properties and cover from a tagged file"
 check pause        "PlayPause while Playing comes back as ButtonPressed Pause"
 check next         "Next comes back as ButtonPressed Next"
 check other_thread "raised from a thread of the controls (not the caller's)"
+check sta_thread   "a handler that is not agile is called in its single-threaded apartment (6528: Firefox)"
 check play         "PlayPause while Paused comes back as Play"
 check no_previous  "Previous, not enabled, is not raised"
 check timeline     "UpdateTimelineProperties with a seekable range"
