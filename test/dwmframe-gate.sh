@@ -5,7 +5,8 @@
 # program paints that band transparent black under its tabs and title, and DWM shows the frame there and draws
 # and hit-tests the caption buttons (DwmDefWindowProc). Wine had no DWM: a black bar with no minimise, maximise
 # or close button. Now the display driver gives the band's transparent pixels the caption colour and draws the
-# buttons where DWMWA_CAPTION_BUTTON_BOUNDS says they are, and DwmDefWindowProc answers WM_NCHITTEST for them,
+# buttons where DWMWA_CAPTION_BUTTON_BOUNDS says they are (opaque black a program draws there -- GDI+, Direct2D,
+# alpha 255 -- stays black; only transparent black shows the frame), and DwmDefWindowProc answers WM_NCHITTEST for them,
 # so pressing one does what a caption button does.
 # The probe is such a window (black client, a blue square in the 32 px band) on a shell desktop.
 #   WINE=/opt/wine-sg/bin/wine test/dwmframe-gate.sh   (SG_XDISPLAY=N to use Xvfb :N)
@@ -62,6 +63,8 @@ p=$(px $((wx + 150)) $((wy + 16)))
 [ "$p" = "255,255,255" ] && pass "the band's transparent pixels show the frame (white), not black ($p)" || fail "band pixel: $p"
 p=$(px $((wx + 50)) $((wy + 16)))
 [ "$p" = "0,0,255" ] && pass "what the program drew there stays ($p)" || fail "blue square: $p"
+p=$(px $((wx + 90)) $((wy + 16)))
+[ "$p" = "0,0,0" ] && pass "opaque black there (alpha 255, as GDI+ draws it) stays black ($p)" || fail "opaque black square: $p"
 p=$(px $((wx + 150)) $((wy + 120)))
 [ "$p" = "0,0,0" ] && pass "below the band its black stays black ($p)" || fail "client below the band: $p"
 w=$(( (br - bl) / 3 ))

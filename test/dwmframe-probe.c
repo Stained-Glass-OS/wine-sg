@@ -34,6 +34,19 @@ static LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         FillRect(dc, &rc, GetStockObject(BLACK_BRUSH));
         FillRect(dc, &sq, blue);
         DeleteObject(blue);
+        {
+            /* opaque black, as GDI+ or Direct2D draw it (alpha 255): it stays black over the frame */
+            BITMAPINFO bi = {{ sizeof(BITMAPINFOHEADER), 20, -20, 1, 32, BI_RGB }};
+            DWORD *bits;
+            HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
+            HDC mem = CreateCompatibleDC(dc);
+            int i;
+            for (i = 0; i < 400; i++) bits[i] = 0xff000000;
+            SelectObject(mem, bm);
+            BitBlt(dc, 80, 6, 20, 20, mem, 0, 0, SRCCOPY);
+            DeleteDC(mem);
+            DeleteObject(bm);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
