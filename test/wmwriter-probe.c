@@ -372,8 +372,10 @@ int main( void )
         {
             DWORD entries = *(DWORD *)(data + pos + 52);
             const BYTE *e = data + pos + 56;
-            ok = entries == 3 && video_count > FRAMES && *(DWORD *)e == video_objects[0].packet &&
-                 *(DWORD *)(e + 6) == video_objects[10].packet && *(DWORD *)(e + 12) == video_objects[20].packet;
+            /* entries count in presentation time: the first second is the preroll */
+            ok = entries == 4 && video_count > FRAMES && *(DWORD *)e == video_objects[0].packet &&
+                 *(DWORD *)(e + 6) == video_objects[0].packet && *(DWORD *)(e + 12) == video_objects[10].packet &&
+                 *(DWORD *)(e + 18) == video_objects[20].packet;
             printf( "index=%d entries=%lu first=%lu want=%lu\n", ok, entries, *(DWORD *)e,
                     video_count ? video_objects[0].packet : 0 );
         }
