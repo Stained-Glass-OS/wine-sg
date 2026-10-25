@@ -1,0 +1,345 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] evr: A presenter of the program's own (6532)
+
+Three gaps kept a DirectShow program's own EVR presenter from showing
+video. MPC-HC's default renderer, the EVR custom presenter, is one such
+program.
+- GetService(MR_VIDEO_RENDER_SERVICE, IID_IMFVideoRenderer) went to the
+  default presenter, which has no such interface. It now returns the
+  renderer itself, as Windows does, so InitializeRenderer() can install
+  the program's presenter.
+- The mixer waited for every input stream to have a sample. A renderer
+  configured with three streams, whose substreams (subtitles) never got
+  one, was never mixed. Only the reference stream is needed; substreams
+  are mixed in when they have a frame.
+- The filter gave the presenter no IMFClock (LookupService answered S_OK
+  with nothing) and never called its IMFClockStateSink. A presenter that
+  schedules by the clock stayed paused and showed nothing. The filter now
+  exposes the graph clock in presentation time, with QPC system time, and
+  calls OnClockStart, OnClockPause, OnClockRestart and OnClockStop. Unknown
+  interfaces on that service now get E_NOINTERFACE.
+---
+diff --git a/dlls/evr/evr.c b/dlls/evr/evr.c
+index 7e2ed5c..4fa5601 100644
+--- a/dlls/evr/evr.c
++++ b/dlls/evr/evr.c
+@@ -49,6 +49,7 @@ struct evr
+     IMFVideoRenderer IMFVideoRenderer_iface;
+     IMediaEventSink IMediaEventSink_iface;
+     IMFTopologyServiceLookup IMFTopologyServiceLookup_iface;
++    IMFClock IMFClock_iface;    /* (wine-sg 6532) the graph's clock, as the presenter sees it */
+ 
+     IMFTransform *mixer;
+     IMFVideoPresenter *presenter;
+@@ -56,6 +57,9 @@ struct evr
+     IMFMediaType *media_type;
+     unsigned int flags;
+     DWORD stream_count;
++    MFCLOCK_STATE clock_state;   /* (wine-sg 6532) */
++    LONGLONG paused_time;        /* the presentation time the clock stopped at */
++    BOOL clock_started;
+ };
+ 
+ #define EVR_MAX_STREAMS 16
+@@ -508,11 +512,164 @@ static HRESULT evr_query_accept(struct strmbase_renderer *iface, const AM_MEDIA_
+     return hr;
+ }
+ 
++/* Stained Glass OS (wine-sg 6532): the clock the filter shows its presenter, and the clock-state
++ * notifications. As Windows' EVR filter does in a DirectShow graph, the presenter finds an IMFClock
++ * (the graph's reference clock, in presentation time) through LookupService(MR_VIDEO_RENDER_SERVICE)
++ * and its IMFClockStateSink hears OnClockStart, OnClockPause, OnClockRestart and OnClockStop. A
++ * custom presenter that schedules frames by them (MPC-HC's EVR presenter) never left its paused
++ * state and showed one frame, black. */
++static LONGLONG evr_system_time(void)
++{
++    LARGE_INTEGER counter, frequency;
++
++    QueryPerformanceCounter(&counter);
++    QueryPerformanceFrequency(&frequency);
++    return (LONGLONG)((double)counter.QuadPart * 10000000.0 / (double)frequency.QuadPart);
++}
++
++static LONGLONG evr_presentation_time(struct evr *filter)
++{
++    REFERENCE_TIME now;
++
++    if (filter->clock_state != MFCLOCK_STATE_RUNNING)
++        return filter->paused_time;
++    if (filter->renderer.filter.clock && SUCCEEDED(IReferenceClock_GetTime(filter->renderer.filter.clock, &now)))
++        return now - filter->renderer.stream_start;
++    return filter->paused_time;
++}
++
++static void evr_notify_clock(struct evr *filter, MFCLOCK_STATE state)
++{
++    IMFClockStateSink *sink;
++    LONGLONG system_time = evr_system_time();
++
++#ifdef SG_MUTANT_EVR_NO_CLOCK_STATE
++    return;
++#endif
++    if (!filter->presenter || FAILED(IMFVideoPresenter_QueryInterface(filter->presenter,
++            &IID_IMFClockStateSink, (void **)&sink)))
++        return;
++
++    switch (state)
++    {
++        case MFCLOCK_STATE_RUNNING:
++            if (filter->clock_started)
++                IMFClockStateSink_OnClockRestart(sink, system_time);
++            else
++                IMFClockStateSink_OnClockStart(sink, system_time, filter->paused_time);
++            filter->clock_started = TRUE;
++            break;
++        case MFCLOCK_STATE_PAUSED:
++            IMFClockStateSink_OnClockPause(sink, system_time);
++            break;
++        default:
++            IMFClockStateSink_OnClockStop(sink, system_time);
++            filter->clock_started = FALSE;
++            break;
++    }
++    IMFClockStateSink_Release(sink);
++}
++
++static struct evr *impl_from_IMFClock(IMFClock *iface)
++{
++    return CONTAINING_RECORD(iface, struct evr, IMFClock_iface);
++}
++
++static HRESULT WINAPI filter_clock_QueryInterface(IMFClock *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IMFClock) || IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IMFClock_AddRef(iface);
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI filter_clock_AddRef(IMFClock *iface)
++{
++    struct evr *filter = impl_from_IMFClock(iface);
++    return IUnknown_AddRef(filter->renderer.filter.outer_unk);
++}
++
++static ULONG WINAPI filter_clock_Release(IMFClock *iface)
++{
++    struct evr *filter = impl_from_IMFClock(iface);
++    return IUnknown_Release(filter->renderer.filter.outer_unk);
++}
++
++static HRESULT WINAPI filter_clock_GetClockCharacteristics(IMFClock *iface, DWORD *flags)
++{
++    if (!flags) return E_POINTER;
++    *flags = MFCLOCK_CHARACTERISTICS_FLAG_FREQUENCY_10MHZ;
++    return S_OK;
++}
++
++static HRESULT WINAPI filter_clock_GetCorrelatedTime(IMFClock *iface, DWORD reserved, LONGLONG *clock_time,
++        MFTIME *system_time)
++{
++    struct evr *filter = impl_from_IMFClock(iface);
++
++    if (!clock_time || !system_time) return E_POINTER;
++    EnterCriticalSection(&filter->renderer.filter.filter_cs);
++    *clock_time = evr_presentation_time(filter);
++    *system_time = evr_system_time();
++    LeaveCriticalSection(&filter->renderer.filter.filter_cs);
++    return S_OK;
++}
++
++static HRESULT WINAPI filter_clock_GetContinuityKey(IMFClock *iface, DWORD *key)
++{
++    if (!key) return E_POINTER;
++    *key = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI filter_clock_GetState(IMFClock *iface, DWORD reserved, MFCLOCK_STATE *state)
++{
++    struct evr *filter = impl_from_IMFClock(iface);
++
++    if (!state) return E_POINTER;
++    *state = filter->clock_state;
++    return S_OK;
++}
++
++static HRESULT WINAPI filter_clock_GetProperties(IMFClock *iface, MFCLOCK_PROPERTIES *props)
++{
++    if (!props) return E_POINTER;
++    memset(props, 0, sizeof(*props));
++    props->qwClockFrequency = MFCLOCK_FREQUENCY_HNS;
++    props->dwClockTolerance = MFCLOCK_TOLERANCE_UNKNOWN;
++    props->dwClockJitter = 1;
++    return S_OK;
++}
++
++static const IMFClockVtbl filter_clock_vtbl =
++{
++    filter_clock_QueryInterface,
++    filter_clock_AddRef,
++    filter_clock_Release,
++    filter_clock_GetClockCharacteristics,
++    filter_clock_GetCorrelatedTime,
++    filter_clock_GetContinuityKey,
++    filter_clock_GetState,
++    filter_clock_GetProperties,
++};
++
+ /* FIXME: errors should be propagated from init/start/stop handlers. */
+ static void evr_init_stream(struct strmbase_renderer *iface)
+ {
+     struct evr *filter = impl_from_strmbase_renderer(iface);
+ 
++    /* (wine-sg 6532) from stopped: the clock starts again from the beginning */
++    if (filter->clock_state == MFCLOCK_STATE_INVALID || filter->clock_state == MFCLOCK_STATE_STOPPED)
++    {
++        if (filter->clock_started) evr_notify_clock(filter, MFCLOCK_STATE_STOPPED);
++        filter->paused_time = 0;
++        filter->clock_state = MFCLOCK_STATE_PAUSED;
++    }
++
+     if (!filter->mixer) return;
+ 
+     if (SUCCEEDED(IMFTransform_ProcessMessage(filter->mixer, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)))
+@@ -525,12 +682,21 @@ static void evr_start_stream(struct strmbase_renderer *iface)
+ 
+     if (filter->mixer)
+         IMFTransform_ProcessMessage(filter->mixer, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
++
++    /* (wine-sg 6532) running, from where the clock stood */
++    filter->clock_state = MFCLOCK_STATE_RUNNING;
++    evr_notify_clock(filter, MFCLOCK_STATE_RUNNING);
+ }
+ 
+ static void evr_stop_stream(struct strmbase_renderer *iface)
+ {
+     struct evr *filter = impl_from_strmbase_renderer(iface);
+ 
++    /* (wine-sg 6532) paused where it is */
++    filter->paused_time = evr_presentation_time(filter);
++    filter->clock_state = MFCLOCK_STATE_PAUSED;
++    evr_notify_clock(filter, MFCLOCK_STATE_PAUSED);
++
+     if (!filter->mixer) return;
+ 
+     if (SUCCEEDED(IMFTransform_ProcessMessage(filter->mixer, MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)))
+@@ -700,7 +866,19 @@ static HRESULT WINAPI filter_get_service_GetService(IMFGetService *iface, REFGUI
+ 
+     EnterCriticalSection(&filter->renderer.filter.filter_cs);
+ 
+-    if (IsEqualGUID(service, &MR_VIDEO_RENDER_SERVICE))
++    if (IsEqualGUID(service, &MR_VIDEO_RENDER_SERVICE) && IsEqualGUID(riid, &IID_IMFVideoRenderer))
++    {
++        /* Stained Glass OS (wine-sg 6532): the renderer itself, as Windows answers, before any
++         * mixer or presenter is there: a program asks for it to give the renderer its own
++         * presenter (MPC-HC's EVR custom presenter). It went to the default presenter, which
++         * has no such interface, and the renderer failed to load. */
++#ifndef SG_MUTANT_EVR_RENDERER_SERVICE
++        *obj = &filter->IMFVideoRenderer_iface;
++        IMFVideoRenderer_AddRef(&filter->IMFVideoRenderer_iface);
++        hr = S_OK;
++#endif
++    }
++    else if (IsEqualGUID(service, &MR_VIDEO_RENDER_SERVICE))
+     {
+         if (!filter->presenter)
+             hr = evr_initialize(filter, NULL, NULL);
+@@ -907,6 +1085,17 @@ static HRESULT WINAPI filter_service_lookup_LookupService(IMFTopologyServiceLook
+             *objects = &filter->IMediaEventSink_iface;
+             IUnknown_AddRef((IUnknown *)*objects);
+         }
++        else if (IsEqualIID(riid, &IID_IMFClock))
++        {
++            /* (wine-sg 6532) the graph's clock */
++            *objects = &filter->IMFClock_iface;
++            IUnknown_AddRef((IUnknown *)*objects);
++        }
++        else
++        {
++            WARN("Unsupported interface %s.\n", debugstr_guid(riid));
++            hr = E_NOINTERFACE;
++        }
+     }
+     else if (IsEqualGUID(service, &MR_VIDEO_MIXER_SERVICE))
+     {
+@@ -946,6 +1135,8 @@ HRESULT evr_filter_create(IUnknown *outer, void **out)
+     object->IMFVideoRenderer_iface.lpVtbl = &filter_video_renderer_vtbl;
+     object->IMediaEventSink_iface.lpVtbl = &filter_media_event_sink_vtbl;
+     object->IMFTopologyServiceLookup_iface.lpVtbl = &filter_service_lookup_vtbl;
++    object->IMFClock_iface.lpVtbl = &filter_clock_vtbl;
++    object->clock_state = MFCLOCK_STATE_STOPPED;
+     object->stream_count = 1;
+ 
+     TRACE("Created EVR %p.\n", object);
+diff --git a/dlls/evr/mixer.c b/dlls/evr/mixer.c
+index 5d57bd4..c6189a4 100644
+--- a/dlls/evr/mixer.c
++++ b/dlls/evr/mixer.c
+@@ -1374,7 +1374,7 @@ static void video_mixer_render(struct video_mixer *mixer, IDirect3DSurface9 *rt)
+     struct input_stream *stream;
+     MFVideoArea aperture;
+     HRESULT hr = S_OK;
+-    unsigned int i;
++    unsigned int i, count = 0;
+ 
+     if (FAILED(IMFAttributes_GetBlob(mixer->attributes, &VIDEO_ZOOM_RECT, (UINT8 *)&zoom_rect,
+             sizeof(zoom_rect), NULL)))
+@@ -1389,13 +1389,17 @@ static void video_mixer_render(struct video_mixer *mixer, IDirect3DSurface9 *rt)
+     SetRect(&params.TargetRect, 0, 0, aperture.Area.cx, aperture.Area.cy);
+     OffsetRect(&params.TargetRect, aperture.OffsetX.value, aperture.OffsetY.value);
+ 
+-    for (i = 0; i < mixer->input_count; ++i)
++    for (i = 0, count = 0; i < mixer->input_count; ++i)
+     {
+-        DXVA2_VideoSample *sample = &samples[i];
++        DXVA2_VideoSample *sample = &samples[count];
+         IDirect3DSurface9 *surface;
+ 
+         stream = mixer->zorder[i];
+ 
++        /* (wine-sg 6532) a substream with no frame yet is left out */
++        if (!stream->sample && stream != &mixer->inputs[0]) continue;
++        count++;
++
+         if (FAILED(hr = video_mixer_get_sample_surface(stream->sample, &surface)))
+         {
+             WARN("Failed to get source surface for stream %u, hr %#lx.\n", i, hr);
+@@ -1423,13 +1427,13 @@ static void video_mixer_render(struct video_mixer *mixer, IDirect3DSurface9 *rt)
+         params.Alpha = DXVA2_Fixed32OpaqueAlpha();
+ 
+         if (FAILED(hr = IDirectXVideoProcessor_VideoProcessBlt(mixer->processor, rt, &params, samples,
+-                mixer->input_count, NULL)))
++                count, NULL)))
+         {
+             WARN("Failed to process samples, hr %#lx.\n", hr);
+         }
+     }
+ 
+-    for (i = 0; i < mixer->input_count; ++i)
++    for (i = 0; i < count; ++i)
+     {
+         if (samples[i].SrcSurface)
+             IDirect3DSurface9_Release(samples[i].SrcSurface);
+@@ -1451,10 +1455,17 @@ static HRESULT video_mixer_get_sample_desired_time(IMFSample *sample, LONGLONG *
+     return hr;
+ }
+ 
++/* Stained Glass OS (wine-sg 6532): the reference stream's frame is what the mixer needs; the
++ * substreams (subtitles, overlays) are mixed in when they have one, as Windows' mixer does. A
++ * renderer configured with three streams (MPC-HC's EVR custom presenter) whose substreams never
++ * got a sample was never mixed: the video stayed black. */
+ static BOOL video_mixer_has_input(const struct video_mixer *mixer)
+ {
+     unsigned int i;
+ 
++#ifndef SG_MUTANT_EVR_ALL_INPUTS
++    return mixer->input_count && mixer->inputs[0].sample;
++#endif
+     for (i = 0; i < mixer->input_count; ++i)
+     {
+         if (!mixer->inputs[i].sample) return FALSE;
