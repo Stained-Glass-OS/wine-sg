@@ -8,9 +8,11 @@
 # four coloured quadrants from a file and from a stream, and asks the shell for its thumbnail, as a
 # 64-bit and as a 32-bit program (test/heifdecode-probe.c).
 #   WINE=/opt/wine-sg/bin/wine test/heifdecode-gate.sh
-# Needs libheif1 and libheif-plugin-libde265 (SKIP without them).
+# AVIF (6540): the same decoder for .avif, needing the AV1 plugin (libheif-plugin-dav1d).
+# Needs libheif1 and libheif-plugin-libde265 (SKIP without them); the AVIF checks need libheif-plugin-dav1d.
 # Mutants: SG_MUTANT_HEIF_NOT_REGISTERED (dlls/windowscodecs/regsvr.c),
-#          SG_MUTANT_HEIF_NO_LIBRARY (dlls/windowscodecs/unixlib.c).
+#          SG_MUTANT_HEIF_NO_LIBRARY (dlls/windowscodecs/unixlib.c),
+#          SG_MUTANT_AVIF_NOT_REGISTERED (regsvr.c), SG_MUTANT_HEIF_NO_AV1 (unixlib.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -23,6 +25,7 @@ for t in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do command -v "$t" >/dev/n
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 ls /usr/lib/*/libheif.so.1 >/dev/null 2>&1 || { echo "SKIP: no libheif1"; exit 77; }
 ls /usr/lib/*/libheif/plugins/*de265* >/dev/null 2>&1 || { echo "SKIP: no libheif-plugin-libde265"; exit 77; }
+AVIF=1; ls /usr/lib/*/libheif/plugins/*dav1d* >/dev/null 2>&1 || { AVIF=; echo "      (no libheif-plugin-dav1d: AVIF not checked)"; }
 T=$(mktemp -d /var/tmp/sg-heifdecode.XXXXXX)
 trap 'WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 for b in 64 32; do
@@ -47,6 +50,11 @@ for b in 64 32; do
     check file_pixels    "64x64, 32bpp BGR, the four quadrants' colours (from the file)"
     check stream_pixels  "the same from a stream"
     check thumbnail      "the shell makes its thumbnail"
+    if [ -n "$AVIF" ]; then
+        check avif_extension "AVIF: .avif among the decoder's extensions"
+        check avif_pixels    "AVIF: the same picture decodes (AV1)"
+        check avif_thumbnail "AVIF: the shell makes its thumbnail"
+    fi
     check done           "the probe ran to the end"
 done
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
