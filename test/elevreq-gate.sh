@@ -131,6 +131,18 @@ out=$(SG_USER_ADMIN=1 other "$WINE" "$W/invoker.exe" create "$(zp "$W/highest.ex
     || fail "highestAvailable, administrator: '$out'"
 out=$(SG_USER_ADMIN=1 other "$WINE" "$W/invoker.exe" create "$(zp "$W/invoker.exe")")
 [ "$out" = "CREATE ok 7" ] && pass "and an asInvoker program still runs for an administrator" || fail "asInvoker, administrator: '$out'"
+# __COMPAT_LAYER=RunAsInvoker in the caller's environment: it runs as the
+# caller whatever its manifest asks, as on Windows (5958). SG Store sets it
+# for a per-user install: Kdenlive's NSIS ("highest", /CurrentUser) went to
+# sgsystem's profile. Mutant SG_MUTANT_NO_RUNASINVOKER.
+out=$(SG_USER_ADMIN=1 other env __COMPAT_LAYER=RunAsInvoker "$WINE" "$W/invoker.exe" create "$(zp "$W/highest.exe")")
+[ "$out" = "CREATE ok 7" ] && pass "__COMPAT_LAYER=RunAsInvoker: an administrator's highestAvailable program runs as the invoker" \
+    || fail "RunAsInvoker, highestAvailable: '$out'"
+out=$(other env __COMPAT_LAYER='~ RunAsInvoker' "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
+[ "$out" = "CREATE ok 7" ] && pass "...and a requireAdministrator one, among other layers ('~ RunAsInvoker')" \
+    || fail "RunAsInvoker, requireAdministrator: '$out'"
+out=$(other env __COMPAT_LAYER=RunAsInvokerX "$WINE" "$W/invoker.exe" create "$(zp "$W/admin.exe")")
+[ "$out" = "CREATE err 740" ] && pass "...a layer only named like it does not count" || fail "RunAsInvokerX: '$out'"
 rm -f "$W/out/elevate.log"
 out=$(other "$WINE" "$W/invoker.exe" shell "$(zp "$W/admin.exe")")
 sleep 1
