@@ -293,6 +293,44 @@ int main(void)
     check(ITaskbarList3_UnregisterTab(tbl, tab1) == S_OK, "UnregisterTab");
     check(ITaskbarList3_UnregisterTab(tbl, tab1) == E_INVALIDARG, "UnregisterTab of no tab: E_INVALIDARG");
 
+    /* 6111: a window whose thumbnail is up is destroyed: its tile goes (it pointed at the
+       window's freed button: "(untitled)", its icon read from freed memory) */
+    {
+        HWND gone, keep;
+        char buf[160];
+        int n;
+        ITaskbarList3_UnregisterTab(tbl, tab2);
+        gone = CreateWindowA("SGThumbProbe", "SG Thumb Gone", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 260, 120, 300, 200,
+                             NULL, NULL, GetModuleHandleA(NULL), NULL);
+        keep = CreateWindowA("SGThumbProbe", "SG Thumb Keep", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 300, 160, 300, 200,
+                             NULL, NULL, GetModuleHandleA(NULL), NULL);
+        pump(1500);
+        found = NULL;
+        EnumChildWindows(tray, find_button, (LPARAM)gone);
+        button = found;
+        popup = hover(button);
+        n = !!tile_of(popup, "SG Thumb Gone");
+        sprintf(buf, "a second window's button shows its thumbnail (%d tile)", n);
+        check(popup && n, buf);
+        if (n)
+        {
+            /* the pointer goes onto the thumbnail, as when DOSBox was killed with its preview up */
+            int x, y;
+            center(tile_of(popup, "SG Thumb Gone"), &x, &y, 0);
+            move_to(x, y);
+            pump(600);
+        }
+        DestroyWindow(gone);
+        pump(1500);
+        popup = FindWindowA("SGTaskbarThumbnails", NULL);
+        check(!popup || (!tile_of(popup, "SG Thumb Gone") && !tile_of(popup, "(untitled)")),
+              "the destroyed window's tile is gone (no \"(untitled)\" tile)");
+        /* (its button's other windows, when combined, show again: a 0 ms timer re-shows the
+           popup of the button then under the pointer) */
+        DestroyWindow(keep);
+        pump(500);
+    }
+
     move_to(500, 300);
     pump(500);
     ITaskbarList3_Release(tbl);

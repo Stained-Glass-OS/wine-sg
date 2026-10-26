@@ -12,7 +12,8 @@
 #   WINE=/opt/wine-sg/bin/wine test/thumbbar-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
 # Mutants: SG_MUTANT_NO_THUMBNAILS, SG_MUTANT_NO_THUMB_CLICK
-# (programs/explorer/systray.c), SG_MUTANT_NO_ICONIC (dwmapi/dwmapi_main.c).
+# (programs/explorer/systray.c), SG_MUTANT_NO_ICONIC (dwmapi/dwmapi_main.c),
+# SG_MUTANT_THUMB_OUTLIVES_WINDOW (systray.c, 6111: a window destroyed with its thumbnail up).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
