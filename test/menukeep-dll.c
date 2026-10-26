@@ -2,7 +2,8 @@
  * way WinRAR's RarExt behaves: no IPersist, registered both for its ProgID and for *, and it keeps
  * the IDataObject that IShellExtInit::Initialize gave it WITHOUT a reference of its own, reading
  * the items from it again when its command runs. It adds "SG Keep Action"; invoked, it appends
- * "invoked N: PATH|PATH..." to C:\menukeep-invoked.txt (N = files in CF_HDROP at that time). */
+ * "invoked N: PATH|PATH..." to C:\menukeep-invoked.txt (N = files in CF_HDROP at that time); in a
+ * folder's background menu (no items) it appends "background FOLDER". */
 #define COBJMACROS
 #include <windows.h>
 #include <shlobj.h>
@@ -12,7 +13,7 @@
 static const CLSID CLSID_SgKeepExt = { 0x7d5a0c31, 0x52e4, 0x4b8f, { 0x8e, 0x21, 0x5a, 0x4c, 0x70, 0x00, 0x75, 0x00 } };
 static LONG locks;
 
-typedef struct { IShellExtInit init; IContextMenu menu; LONG ref; IDataObject *data; } ext_t;
+typedef struct { IShellExtInit init; IContextMenu menu; LONG ref; IDataObject *data; WCHAR folder[MAX_PATH]; } ext_t;
 
 static ext_t *from_init(IShellExtInit *i) { return CONTAINING_RECORD(i, ext_t, init); }
 static ext_t *from_menu(IContextMenu *m) { return CONTAINING_RECORD(m, ext_t, menu); }
@@ -32,7 +33,8 @@ static ULONG WINAPI i_addref(IShellExtInit *i) { return InterlockedIncrement(&fr
 static ULONG WINAPI i_release(IShellExtInit *i) { return release(from_init(i)); }
 static HRESULT WINAPI i_initialize(IShellExtInit *i, LPCITEMIDLIST folder, IDataObject *data, HKEY key)
 {
-    if (!data) return E_FAIL;
+    /* a folder's background menu gives the folder and no items (test/menuverbs-gate.sh) */
+    if (!data) return folder && SHGetPathFromIDListW(folder, from_init(i)->folder) ? S_OK : E_FAIL;
     from_init(i)->data = data;   /* no AddRef, as RarExt */
     return S_OK;
 }
@@ -57,6 +59,12 @@ static HRESULT WINAPI m_invoke(IContextMenu *m, CMINVOKECOMMANDINFO *ici)
     FILE *f;
     if (HIWORD(ici->lpVerb) || LOWORD(ici->lpVerb) != 0) return E_INVALIDARG;
     if (!(f = _wfopen(L"C:\\menukeep-invoked.txt", L"a"))) return E_FAIL;
+    if (!e->data)
+    {
+        fwprintf(f, L"background %ls\n", e->folder);
+        fclose(f);
+        return S_OK;
+    }
     if (SUCCEEDED(IDataObject_GetData(e->data, &fmt, &med)))
     {
         n = DragQueryFileW((HDROP)med.hGlobal, ~0u, NULL, 0);

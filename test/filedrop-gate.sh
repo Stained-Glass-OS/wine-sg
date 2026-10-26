@@ -48,7 +48,7 @@ reg 'HKCR\.sgarc' /ve /d 'SGArc.Archive'
 reg 'HKCR\SGArc.Archive\shellex\DropHandler' /ve /d "$G"
 cd "$C"
 run() { timeout -s KILL 60 "$WINE" probe.exe "$@" 2>/dev/null | tr -d '\r'; }
-seen() { tr -d '\r' < "$C/$1" 2>/dev/null; }
+seen() { [ -f "$C/$1" ] && tr -d '\r' < "$C/$1"; }
 has() { printf '%s\n' "$out" | grep -q "$1"; }
 
 out=$(run 'C:\tgt\box.sgarc' 'C:\src dir\a b.txt' 'C:\src dir\c.txt')
