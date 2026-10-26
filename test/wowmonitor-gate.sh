@@ -5,10 +5,12 @@
 # cpwmon64_v40.dll; on Windows the 64-bit spooler loads the monitor. Here the print provider runs in
 # the caller: AddMonitor/AddPort failed (LoadLibrary 193), AddPrinter looked for the driver in the
 # x86 environment, and a port that the monitor keeps to itself (not under the registry's Ports key)
-# found no monitor when printing. test/wowmonitor-mon.c is the monitor, test/wowmonitor-probe.c the
+# found no monitor when printing; and (6116) the monitor's job calls had no thread token, where the
+# spooler impersonates the job's owner (CutePDF's Save As helper got no user: no PDF). test/wowmonitor-mon.c is the monitor, test/wowmonitor-probe.c the
 # 32-bit installer and the 64-bit printer.
 #   WINE=/opt/wine-sg/bin/wine test/wowmonitor-gate.sh
-# Mutants: SG_MUTANT_SPL_NO_HOST, SG_MUTANT_PORT_BY_REGISTRY_ONLY (dlls/localspl/provider.c),
+# Mutants: SG_MUTANT_SPL_NO_HOST, SG_MUTANT_PORT_BY_REGISTRY_ONLY, SG_MUTANT_PORT_NO_IMPERSONATION (6116)
+#          (dlls/localspl/provider.c),
 #          SG_MUTANT_ADDPRINTER_NATIVE_DRIVER (dlls/winspool.drv/info.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -45,5 +47,6 @@ out=$(cd "$WINEPREFIX/drive_c" && timeout -s KILL 120 "$WINE" print64.exe 2>/dev
 printf '%s\n' "$out" | sed 's/^/      /'
 printf '%s\n' "$out" | grep -q '^PRINT 1' && pass "a 64-bit program's job to the monitor's own port ends" || fail "print: $out"
 grep -q SGMON-DATA "$WINEPREFIX/drive_c/sgmon-out.bin" 2>/dev/null && pass "the monitor got the job's data" || fail "sgmon-out.bin: $(cat "$WINEPREFIX/drive_c/sgmon-out.bin" 2>/dev/null | head -c 40)"
+grep -q 'TOKEN=1' "$WINEPREFIX/drive_c/sgmon-out.bin" 2>/dev/null && pass "the monitor runs as the job's owner (its thread has a token, as under the spooler's impersonation)" || fail "no thread token in the monitor"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

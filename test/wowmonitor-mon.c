@@ -1,6 +1,6 @@
 /* test/wowmonitor-gate.sh's port monitor (64-bit): one port, "SGP1:", that it keeps to itself
  * (not under the registry's Ports key, as CutePDF Writer's monitor keeps "CPW4:"); a job sent
- * to it goes to C:\sgmon-out.bin. */
+ * to it goes to C:\sgmon-out.bin, after a line saying whether its thread had a token. */
 #include <windows.h>
 #include <winspool.h>
 #include <winsplp.h>
@@ -36,8 +36,18 @@ static BOOL WINAPI mon_OpenPort(HANDLE mon, LPWSTR name, PHANDLE handle) { *hand
 
 static BOOL WINAPI mon_StartDocPort(HANDLE port, LPWSTR printer, DWORD job, DWORD level, LPBYTE info)
 {
+    HANDLE token;
+    DWORD written;
+    BOOL has_token;
+
+    /* the spooler talks to a monitor as the job's owner: the thread impersonates (6116; CutePDF's
+       monitor takes the user's SID from its thread token for its Save As helper) */
+    has_token = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token);
+    if (has_token) CloseHandle(token);
     out_file = CreateFileW(L"C:\\sgmon-out.bin", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    return out_file != INVALID_HANDLE_VALUE;
+    if (out_file == INVALID_HANDLE_VALUE) return FALSE;
+    WriteFile(out_file, has_token ? "TOKEN=1\n" : "TOKEN=0\n", 8, &written, NULL);
+    return TRUE;
 }
 
 static BOOL WINAPI mon_WritePort(HANDLE port, LPBYTE buf, DWORD size, LPDWORD written)
