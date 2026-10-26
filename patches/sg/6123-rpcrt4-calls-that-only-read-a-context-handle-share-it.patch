@@ -1,0 +1,160 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] rpcrt4: calls that only read a context handle share it
+
+A serialized context handle was a critical section taken by every call, so two calls with the same [in] handle waited for each other. On Windows it is a reader/writer lock: [in]-only calls share it, a call that takes it [in, out] or asks for serialization has it alone, and a [context_handle_noserialize] one is not locked. CCleaner's uninstaller (Icarus) hung at Starting setup: a call held the handle while it waited for a second call that came back on the same handle.
+---
+diff --git a/dlls/rpcrt4/ndr_marshall.c b/dlls/rpcrt4/ndr_marshall.c
+index 2d9ef76..4aa698d 100644
+--- a/dlls/rpcrt4/ndr_marshall.c
++++ b/dlls/rpcrt4/ndr_marshall.c
+@@ -7391,6 +7391,10 @@ void WINAPI NdrServerContextNewMarshall(PMIDL_STUB_MESSAGE pStubMsg,
+     pStubMsg->Buffer += cbNDRContext;
+ }
+ 
++#ifndef SG_CONTEXT_HANDLE_SHARED
++#define SG_CONTEXT_HANDLE_SHARED 0x01000000  /* as in rpc_assoc.h */
++#endif
++
+ NDR_SCONTEXT WINAPI NdrServerContextNewUnmarshall(PMIDL_STUB_MESSAGE pStubMsg,
+                                                   PFORMAT_STRING pFormat)
+ {
+@@ -7418,6 +7422,9 @@ NDR_SCONTEXT WINAPI NdrServerContextNewUnmarshall(PMIDL_STUB_MESSAGE pStubMsg,
+         RPC_SERVER_INTERFACE *sif = pStubMsg->StubDesc->RpcInterfaceInformation;
+         if_id = &sif->InterfaceId;
+     }
++    /* an [in]-only handle: the call shares it with other readers (see rpc_assoc.c) */
++    if ((pFormat[1] & (HANDLE_PARAM_IS_IN | HANDLE_PARAM_IS_OUT)) == HANDLE_PARAM_IS_IN)
++        flags |= SG_CONTEXT_HANDLE_SHARED;
+ 
+     ContextHandle = NDRSContextUnmarshall2(pStubMsg->RpcMsg->Handle,
+                                            pStubMsg->Buffer,
+diff --git a/dlls/rpcrt4/rpc_assoc.c b/dlls/rpcrt4/rpc_assoc.c
+index f14d849..6a082a0 100644
+--- a/dlls/rpcrt4/rpc_assoc.c
++++ b/dlls/rpcrt4/rpc_assoc.c
+@@ -55,7 +55,12 @@ typedef struct _RpcContextHandle
+     NDR_RUNDOWN rundown_routine;
+     void *ctx_guard;
+     UUID uuid;
+-    CRITICAL_SECTION lock;
++    CRITICAL_SECTION lock;      /* guards the reader/writer state below */
++    CONDITION_VARIABLE lock_cv;
++    LONG readers;               /* calls holding it shared ([in] only) */
++    DWORD writer;               /* thread holding it exclusively, and how often */
++    LONG writer_depth;
++    BOOL noserialize;           /* [context_handle_noserialize]: calls do not wait for each other */
+     unsigned int refs;
+     /* the interface of the call that made the handle */
+     RPC_SYNTAX_IDENTIFIER if_id;
+@@ -491,6 +496,56 @@ void RpcAssoc_ConnectionReleased(RpcAssoc *assoc)
+     assoc->assoc_group_id = 0;
+ }
+ 
++/* Stained Glass OS: a serialized context handle is a reader/writer lock, as on Windows: calls that
++ * only read the handle ([in]) share it, a call that may change or close it ([in, out], [out], or one
++ * asking for serialization) has it alone, and a [context_handle_noserialize] one is not locked.  It
++ * was a critical section for every call: two [in] calls on one handle waited for each other, and
++ * CCleaner's uninstaller (Icarus: the UI's pending asynchronous request on its handle, while the
++ * master asked the UI something that came back on the same handle) never got past "Starting setup".
++ * The holder of the exclusive lock may take it again, as it could the critical section. */
++enum ctx_lock_mode { CTX_LOCK_NONE, CTX_LOCK_SHARED, CTX_LOCK_EXCLUSIVE };
++
++static void ctx_lock(RpcContextHandle *context_handle, enum ctx_lock_mode mode)
++{
++    DWORD tid = GetCurrentThreadId();
++
++    if (mode == CTX_LOCK_NONE) return;
++    EnterCriticalSection(&context_handle->lock);
++#ifdef SG_MUTANT_CTX_IN_EXCLUSIVE
++    mode = CTX_LOCK_EXCLUSIVE;
++#endif
++    if (context_handle->writer == tid)
++        context_handle->writer_depth++;
++    else if (mode == CTX_LOCK_SHARED)
++    {
++        while (context_handle->writer)
++            SleepConditionVariableCS(&context_handle->lock_cv, &context_handle->lock, INFINITE);
++        context_handle->readers++;
++    }
++    else
++    {
++        while (context_handle->writer || context_handle->readers)
++            SleepConditionVariableCS(&context_handle->lock_cv, &context_handle->lock, INFINITE);
++        context_handle->writer = tid;
++        context_handle->writer_depth = 1;
++    }
++    LeaveCriticalSection(&context_handle->lock);
++}
++
++static void ctx_unlock(RpcContextHandle *context_handle)
++{
++    if (context_handle->noserialize) return;
++    EnterCriticalSection(&context_handle->lock);
++    if (context_handle->writer == GetCurrentThreadId())
++    {
++        if (!--context_handle->writer_depth) context_handle->writer = 0;
++    }
++    else if (context_handle->readers)
++        context_handle->readers--;
++    LeaveCriticalSection(&context_handle->lock);
++    WakeAllConditionVariable(&context_handle->lock_cv);
++}
++
+ RPC_STATUS RpcServerAssoc_AllocateContextHandle(RpcAssoc *assoc, void *CtxGuard,
+                                                 const RPC_SYNTAX_IDENTIFIER *if_id, NDR_SCONTEXT *SContext)
+ {
+@@ -504,11 +559,12 @@ RPC_STATUS RpcServerAssoc_AllocateContextHandle(RpcAssoc *assoc, void *CtxGuard,
+     context_handle->ctx_guard = CtxGuard;
+     InitializeCriticalSectionEx(&context_handle->lock, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     context_handle->lock.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": RpcContextHandle.lock");
++    InitializeConditionVariable(&context_handle->lock_cv);
+     context_handle->refs = 1;
+ 
+     /* lock here to mirror unmarshall, so we don't need to special-case the
+      * freeing of a non-marshalled context handle */
+-    EnterCriticalSection(&context_handle->lock);
++    ctx_lock(context_handle, CTX_LOCK_EXCLUSIVE);
+ 
+     EnterCriticalSection(&assoc->cs);
+     list_add_tail(&assoc->context_handle_list, &context_handle->entry);
+@@ -538,9 +594,16 @@ RPC_STATUS RpcServerAssoc_FindContextHandle(RpcAssoc *assoc, const UUID *uuid,
+             *SContext = (NDR_SCONTEXT)context_handle;
+             if (context_handle->refs++)
+             {
++                enum ctx_lock_mode mode;
++
++                if (Flags & RPC_CONTEXT_HANDLE_DONT_SERIALIZE) mode = CTX_LOCK_NONE;
++                else if ((Flags & SG_CONTEXT_HANDLE_SHARED) && !(Flags & RPC_CONTEXT_HANDLE_SERIALIZE))
++                    mode = CTX_LOCK_SHARED;
++                else mode = CTX_LOCK_EXCLUSIVE;
++                if (mode == CTX_LOCK_NONE) context_handle->noserialize = TRUE;
+                 LeaveCriticalSection(&assoc->cs);
+-                TRACE("found %p\n", context_handle);
+-                EnterCriticalSection(&context_handle->lock);
++                TRACE("found %p, lock %d\n", context_handle, mode);
++                ctx_lock(context_handle, mode);
+                 return RPC_S_OK;
+             }
+         }
+@@ -642,7 +705,7 @@ unsigned int RpcServerAssoc_ReleaseContextHandle(RpcAssoc *assoc, NDR_SCONTEXT S
+     unsigned int refs;
+ 
+     if (release_lock)
+-        LeaveCriticalSection(&context_handle->lock);
++        ctx_unlock(context_handle);
+ 
+     EnterCriticalSection(&assoc->cs);
+     refs = --context_handle->refs;
+diff --git a/dlls/rpcrt4/rpc_assoc.h b/dlls/rpcrt4/rpc_assoc.h
+index b5c83b6..6b9cc45 100644
+--- a/dlls/rpcrt4/rpc_assoc.h
++++ b/dlls/rpcrt4/rpc_assoc.h
+@@ -57,6 +57,8 @@ ULONG RpcAssoc_Release(RpcAssoc *assoc);
+ RPC_STATUS RpcServerAssoc_GetAssociation(LPCSTR Protseq, LPCSTR NetworkAddr, LPCSTR Endpoint, LPCWSTR NetworkOptions, ULONG assoc_gid, RpcAssoc **assoc_out);
+ RPC_STATUS RpcServerAssoc_AllocateContextHandle(RpcAssoc *assoc, void *CtxGuard, const RPC_SYNTAX_IDENTIFIER *if_id, NDR_SCONTEXT *SContext);
+ void RpcServerAssoc_RundownInterface(const RPC_SYNTAX_IDENTIFIER *if_id, BOOL call_rundown);
++/* Stained Glass OS: NDRSContextUnmarshall2 flag of our own: the handle is an [in]-only parameter */
++#define SG_CONTEXT_HANDLE_SHARED 0x01000000
+ RPC_STATUS RpcServerAssoc_FindContextHandle(RpcAssoc *assoc, const UUID *uuid, void *CtxGuard, ULONG Flags, NDR_SCONTEXT *SContext);
+ RPC_STATUS RpcServerAssoc_UpdateContextHandle(RpcAssoc *assoc, NDR_SCONTEXT SContext, void *CtxGuard, NDR_RUNDOWN rundown_routine);
+ unsigned int RpcServerAssoc_ReleaseContextHandle(RpcAssoc *assoc, NDR_SCONTEXT SContext, BOOL release_lock);
