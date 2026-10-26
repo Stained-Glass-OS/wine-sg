@@ -9,7 +9,7 @@
 #   WINESERVER=... when it is not beside $WINE (a build tree)
 # Mutants (dwmapi_main.c; build with x86_64_CFLAGS="-g -O2 -DSG_MUTANT_X" i386_CFLAGS=...):
 # SG_MUTANT_NO_OWNER_CHECK (fails 2), SG_MUTANT_NO_OPACITY (4), SG_MUTANT_NO_RENDER (16),
-# SG_MUTANT_NO_ERASE (6).
+# SG_MUTANT_NO_ERASE (6). 6121: SG_MUTANT_THUMB_IDLE_SECOND (live-after-quiet, live-right).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -52,7 +52,7 @@ DISPLAY= timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer\Desktops' /v shell /d 1280x800 /f >/dev/null 2>&1
 
-EXPECT="setup register not-before-update visible-inside outside-untouched outside-untouched-2 live-left live-right
+EXPECT="setup register not-before-update visible-inside outside-untouched outside-untouched-2 live-left live-right live-after-quiet
 source-rect opacity-half opacity-stable hidden shown-again unregister gone-after-unregister stays-gone
 other-process-dest desktop-dest remote-source"
 for bits in 64 32; do

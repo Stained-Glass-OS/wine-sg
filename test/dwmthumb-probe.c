@@ -229,6 +229,26 @@ int main(int argc, char **argv)
     c = pixel(dest, 130, 100);
     check("live-right", near_color(c, 0, 255, 0, 8), "pixel %06lx", c);
 
+    /* (6121) a source that changes after a quiet spell: shown within 400 ms each time
+     * (idle rounds were a second, and a change took up to a second to show) */
+    {
+        int k, worst = 0;
+        for (k = 0; k < 6; k++)
+        {
+            DWORD start, waited;
+            COLORREF want = (k % 2) ? GREEN : RED;
+            pump(1500);                 /* the thread goes quiet */
+            right_color = want;
+            InvalidateRect(src, NULL, TRUE);
+            start = GetTickCount();
+            do { pump(20); c = pixel(dest, 130, 100); }
+            while (!near_color(c, GetRValue(want), GetGValue(want), GetBValue(want), 8) && GetTickCount() - start < 1500);
+            waited = GetTickCount() - start;
+            if ((int)waited > worst) worst = waited;
+        }
+        check("live-after-quiet", worst < 400, "slowest of 6 changes after a quiet spell: %d ms", worst);
+    }
+
     /* only the right half of the source shown: all green */
     SetRect(&src_rect, 100, 0, 200, 150);
     update(thumbnail, DWM_TNP_RECTSOURCE, all, src_rect, 255, TRUE);
