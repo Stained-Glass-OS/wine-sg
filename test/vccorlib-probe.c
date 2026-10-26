@@ -12,12 +12,19 @@
 
 typedef HRESULT (__cdecl *init_fn)(int);
 typedef HRESULT (__cdecl *factory_fn)(void *, GUID *, void **);
-typedef HSTRING (__cdecl *message_fn)(void *);
-typedef HRESULT (__cdecl *hresult_fn)(void *);
+#ifdef _WIN64
+#define MEMBER __cdecl
+#define NAME(n64, n32) n64
+#else
+#define MEMBER __thiscall   /* member functions and the C++ runtime's copy/destroy calls */
+#define NAME(n64, n32) n32
+#endif
+typedef HSTRING (MEMBER *message_fn)(void *);
+typedef HRESULT (MEMBER *hresult_fn)(void *);
 typedef void (__cdecl *raise_fn)(void);
 typedef void (__cdecl *raise_hr_fn)(HRESULT);
-typedef void * (__cdecl *copy_fn)(void **, void **);
-typedef void (__cdecl *dtor_fn)(void **);
+typedef void * (MEMBER *copy_fn)(void **, void **);
+typedef void (MEMBER *dtor_fn)(void **);
 typedef ULONG (__stdcall *addref_fn)(void *);
 
 static message_fn get_message;
@@ -75,12 +82,12 @@ static LONG CALLBACK handler(EXCEPTION_POINTERS *ptrs)
     HSTRING msg;
     UINT32 len;
 
-    if (rec->ExceptionCode != 0xe06d7363 || rec->NumberParameters < 4) return EXCEPTION_CONTINUE_SEARCH;
+    if (rec->ExceptionCode != 0xe06d7363 || rec->NumberParameters < 3) return EXCEPTION_CONTINUE_SEARCH;
     r.seen = 1;
     r.magic_ok = rec->ExceptionInformation[0] == 0x19930520;
     object = (void **)rec->ExceptionInformation[1];
     info = (const struct throw_info *)rec->ExceptionInformation[2];
-    base = (char *)rec->ExceptionInformation[3];
+    base = rec->NumberParameters >= 4 ? (char *)rec->ExceptionInformation[3] : NULL;   /* 32-bit: pointers */
     t = (const struct table *)(base + info->table);
     if (t->count)
     {
@@ -151,13 +158,16 @@ int main(void)
 
     printf("loaded=%d\n", mod != NULL);
     if (!mod) return 1;
-    init = (void *)GetProcAddress(mod, "?InitializeData@Details@Platform@@YAJH@Z");
-    factory = (void *)GetProcAddress(mod, "?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid@Platform@@PEAPEAX@Z");
-    get_message = (void *)GetProcAddress(mod, "?get@Message@Exception@Platform@@QE$AAAPE$AAVString@3@XZ");
-    get_hresult = (void *)GetProcAddress(mod, "?get@HResult@Exception@Platform@@QE$AAAHXZ");
+    init = (void *)GetProcAddress(mod, NAME("?InitializeData@Details@Platform@@YAJH@Z", "?InitializeData@Details@Platform@@YAJH@Z"));
+    factory = (void *)GetProcAddress(mod, NAME("?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid@Platform@@PEAPEAX@Z", "?GetActivationFactoryByPCWSTR@@YAJPAXAAVGuid@Platform@@PAPAX@Z"));
+    get_message = (void *)GetProcAddress(mod, NAME("?get@Message@Exception@Platform@@QE$AAAPE$AAVString@3@XZ", "?get@Message@Exception@Platform@@Q$AAEP$AAVString@3@XZ"));
+    get_hresult = (void *)GetProcAddress(mod, NAME("?get@HResult@Exception@Platform@@QE$AAAHXZ", "?get@HResult@Exception@Platform@@Q$AAEHXZ"));
     raise_hr = (void *)GetProcAddress(mod, "?__abi_WinRTraiseCOMException@@YAXJ@Z");
     printf("exports=%d\n", init && factory && get_message && get_hresult && raise_hr &&
-           GetProcAddress(mod, "?UninitializeData@Details@Platform@@YAXH@Z"));
+           GetProcAddress(mod, "?UninitializeData@Details@Platform@@YAXH@Z") &&
+           NAME(1, GetProcAddress(mod, "?InitializeData@Details@Platform@@YGJH@Z") &&
+                   GetProcAddress(mod, "?__abi_WinRTraiseCOMException@@YGXJ@Z") &&
+                   GetProcAddress(mod, "?__abi_WinRTraiseOutOfMemoryException@@YGXXZ")));
     if (!(init && factory && get_message && get_hresult && raise_hr)) return 1;
     printf("init=%d\n", init(0) == S_OK);
 
