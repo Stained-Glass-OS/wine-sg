@@ -9,7 +9,7 @@
 # spooler impersonates the job's owner (CutePDF's Save As helper got no user: no PDF). test/wowmonitor-mon.c is the monitor, test/wowmonitor-probe.c the
 # 32-bit installer and the 64-bit printer.
 #   WINE=/opt/wine-sg/bin/wine test/wowmonitor-gate.sh
-# Mutants: SG_MUTANT_SPL_NO_HOST, SG_MUTANT_PORT_BY_REGISTRY_ONLY, SG_MUTANT_PORT_NO_IMPERSONATION (6116)
+# Mutants: SG_MUTANT_SPL_NO_HOST, SG_MUTANT_SPL_JOB_IN_WOW64 (6118), SG_MUTANT_PORT_BY_REGISTRY_ONLY, SG_MUTANT_PORT_NO_IMPERSONATION (6116)
 #          (dlls/localspl/provider.c),
 #          SG_MUTANT_ADDPRINTER_NATIVE_DRIVER (dlls/winspool.drv/info.c).
 set -u
@@ -48,5 +48,13 @@ printf '%s\n' "$out" | sed 's/^/      /'
 printf '%s\n' "$out" | grep -q '^PRINT 1' && pass "a 64-bit program's job to the monitor's own port ends" || fail "print: $out"
 grep -q SGMON-DATA "$WINEPREFIX/drive_c/sgmon-out.bin" 2>/dev/null && pass "the monitor got the job's data" || fail "sgmon-out.bin: $(cat "$WINEPREFIX/drive_c/sgmon-out.bin" 2>/dev/null | head -c 40)"
 grep -q 'TOKEN=1' "$WINEPREFIX/drive_c/sgmon-out.bin" 2>/dev/null && pass "the monitor runs as the job's owner (its thread has a token, as under the spooler's impersonation)" || fail "no thread token in the monitor"
+# (6118) a 32-bit program's job to that port: its spooler cannot load the 64-bit monitor; the
+# job goes to the 64-bit print host, which spools and prints it (CutePDF Writer from 32-bit apps)
+rm -f "$WINEPREFIX/drive_c/sgmon-out.bin"
+cp "$T/install32.exe" "$WINEPREFIX/drive_c/print32.exe"
+out=$(cd "$WINEPREFIX/drive_c" && timeout -s KILL 120 "$WINE" print32.exe print 2>/dev/null </dev/null | tr -d '\r')
+printf '%s\n' "$out" | sed 's/^/      /'
+printf '%s\n' "$out" | grep -q '^PRINT 1' && pass "a 32-bit program's job to the 64-bit monitor's port ends" || fail "print32: $out"
+grep -q SGMON-DATA "$WINEPREFIX/drive_c/sgmon-out.bin" 2>/dev/null && pass "the monitor got the 32-bit program's data (through the print host)" || fail "32-bit job: sgmon-out.bin: $(head -c 40 "$WINEPREFIX/drive_c/sgmon-out.bin" 2>/dev/null)"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
