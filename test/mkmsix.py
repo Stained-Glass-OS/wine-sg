@@ -14,6 +14,8 @@
 #             package: uap10:AllowExternalContent, the applications win32 ones;
 #             --extensions: the first application's <Extensions> are FILE's XML,
 #             with the com, desktop4, desktop5 and desktop10 prefixes declared)
+#             [--package-extensions FILE]: the package's own <Extensions> (after
+#             <Applications>; a framework's activatable classes) are FILE's XML
 #   mkmsix.py bundle OUT --name N --version V [--publisher P] [--unmapped-payload]
 #             --pkg FILE:application:ARCH ... --pkg FILE:resource:LANGUAGE ...
 #             (--unmapped-payload: the block map leaves the packages out, as
@@ -136,6 +138,9 @@ def manifest(a):
         body += '<Capabilities><rescap:Capability Name="runFullTrust"/></Capabilities>'
     if apps:
         body += f'<Applications>{"".join(apps)}</Applications>'
+    if getattr(a, 'package_extensions', None):
+        with open(a.package_extensions) as f:
+            body += '<Extensions>' + f.read() + '</Extensions>'
     body += '</Package>\n'
     return body.encode()
 
@@ -198,6 +203,7 @@ def main():
     p.add_argument('--unmapped-payload', action='store_true')
     p.add_argument('--allow-external', action='store_true')
     p.add_argument('--extensions')
+    p.add_argument('--package-extensions')   # the package's own <Extensions> (activatable classes)
     a = p.parse_args()
     (cmd_package if a.kind == 'package' else cmd_bundle)(a)
 
