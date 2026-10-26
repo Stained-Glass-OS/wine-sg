@@ -72,8 +72,12 @@ static HRESULT blit(HWND h, DWORD color)
     return hr;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* norestore (6113): back to DDSCL_NORMAL with no RestoreDisplayMode, as DOSBox does, the
+       window then where a 640x480 front buffer does not reach */
+    BOOL norestore = argc > 1 && !strcmp(argv[1], "norestore");
+    int x = norestore ? 600 : 50, y = norestore ? 440 : 50;
     WNDCLASSW wc = {0};
     COLORREF c;
     HRESULT hr;
@@ -102,10 +106,10 @@ int main(void)
     if (SUCCEEDED(hr)) hr = IDirectDraw7_SetDisplayMode(dd, 640, 480, 32, 0, 0);
     printf("fullscreen=%d hr=%#lx\n", SUCCEEDED(hr), hr);
     pump(500);
-    IDirectDraw7_RestoreDisplayMode(dd);
+    if (!norestore) IDirectDraw7_RestoreDisplayMode(dd);
     IDirectDraw7_SetCooperativeLevel(dd, h, DDSCL_NORMAL);
     SetWindowLongW(h, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-    SetWindowPos(h, HWND_NOTOPMOST, 50, 50, 400, 300, SWP_FRAMECHANGED);
+    SetWindowPos(h, HWND_NOTOPMOST, x, y, 400, 300, SWP_FRAMECHANGED);
     pump(500);
     GetWindowRect(h, &wr);
     printf("restored=%d rect=%ld,%ld-%ld,%ld\n", wr.right - wr.left == 400 && wr.bottom - wr.top == 300,

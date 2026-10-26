@@ -8,7 +8,9 @@
 # test/glresize-probe.c: blit, exclusive fullscreen with a mode change, back to NORMAL while the
 # window is still screen-sized, shrink the window, blit again; read the pixel back from the screen.
 #   WINE=/opt/wine-sg/bin/wine test/glresize-gate.sh
-# Mutant: SG_MUTANT_GL_NO_REBIND_ON_RESIZE (dlls/wined3d/context_gl.c).
+# Mutants: SG_MUTANT_GL_NO_REBIND_ON_RESIZE (dlls/wined3d/context_gl.c); SG_MUTANT_DDRAW_MODE_AFTER_SWAPCHAIN
+# (dlls/ddraw/ddraw.c, 6113: back to NORMAL with no RestoreDisplayMode, as DOSBox does -- the desktop mode
+# comes back before the swapchain is made again, or the window front buffer is the 640x480 mode's size).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -36,18 +38,21 @@ for arch in x86_64 i686; do
     command -v "$CC" >/dev/null || { echo "SKIP $arch: $CC missing"; continue; }
     TMPDIR=/var/tmp "$CC" -O1 -o "$WINEPREFIX/drive_c/glresize-$arch.exe" "$HERE/glresize-probe.c" -lddraw -ldxguid -lgdi32 -luser32 ||
         { fail "probe did not build ($arch)"; continue; }
-    out=$(cd "$WINEPREFIX/drive_c" && timeout -s KILL 120 "$WINE" "C:\\glresize-$arch.exe" 2>/dev/null | tr -d '\r')
-    echo "== $arch"
+    for mode in "" norestore; do
+    out=$(cd "$WINEPREFIX/drive_c" && timeout -s KILL 120 "$WINE" "C:\\glresize-$arch.exe" $mode 2>/dev/null | tr -d '\r')
+    L="$arch${mode:+ (no RestoreDisplayMode, as DOSBox)}"
+    echo "== $L"
     printf '%s\n' "$out" | sed 's/^/      /'
     check() {
-        if printf '%s\n' "$out" | grep -Eq "(^| )$1=1( |$)"; then pass "$arch: $2"
-        else fail "$arch: $2 ($(printf '%s\n' "$out" | grep -o "$1=[^ ]*" | head -1 || echo none))"; fi
+        if printf '%s\n' "$out" | grep -Eq "(^| )$1=1( |$)"; then pass "$L: $2"
+        else fail "$L: $2 ($(printf '%s\n' "$out" | grep -o "$1=[^ ]*" | head -1 || echo none))"; fi
     }
     check windowed_blit "a windowed primary blit reaches the screen"
     check fullscreen    "exclusive fullscreen with a 640x480 mode"
     check restored      "the window is back at 400x300"
     check shown         "a primary blit after the round trip reaches the shrunk window"
     check done          "the probe ran to the end"
+    done
 done
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
