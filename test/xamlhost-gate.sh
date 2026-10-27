@@ -3,9 +3,10 @@
 # Windows.UI.Xaml hosting (patches/sg/6129): WindowsXamlManager, Window.Current over the thread's
 # CoreWindow, DesktopWindowXamlSource (a XAML Island in a child window of its host) and Application,
 # aggregated by an outer object as an application's App class does. There was no Windows.UI.Xaml
-# at all: NanaZip stopped at Windows.UI.Xaml.Application. test/xamlhost-probe.c.
+# at all: NanaZip stopped at Windows.UI.Xaml.Application. 6131: off unless switched on per
+# program. test/xamlhost-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/xamlhost-gate.sh
-# Mutant (dlls/windows.ui.xaml/application.c): SG_MUTANT_XAML_APP_NOT_AGGREGATED.
+# Mutants: SG_MUTANT_XAML_APP_NOT_AGGREGATED (application.c), SG_MUTANT_XAML_ALWAYS_ON (main.c, 6131).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -36,10 +37,24 @@ DISPLAY= timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 rm -f "$WINEPREFIX/dosdevices/z:"
 cp "$T/xamlhost-probe.exe" "$WINEPREFIX/drive_c/"
-out=$(cd "$WINEPREFIX/drive_c" && timeout -s KILL 120 "$WINE" xamlhost-probe.exe 2>/dev/null </dev/null | tr -d '\r')
+# XAML is off unless switched on for the program (6131): a program that probes for it and falls
+# back to Win32 still gets "not registered"
+off=$(cd "$WINEPREFIX/drive_c" && timeout -s KILL 120 "$WINE" xamlhost-probe.exe 2>/dev/null </dev/null | tr -d '\r')
+printf '%s\n' "$off" | sed 's/^/      off: /'
+"$WINE" reg add 'HKCU\Software\Wine\AppDefaults\xamlhost-probe.exe' /v SgXaml /t REG_DWORD /d 1 /f >/dev/null 2>&1
+perapp=$(cd "$WINEPREFIX/drive_c" && timeout -s KILL 120 "$WINE" xamlhost-probe.exe 2>/dev/null </dev/null | tr -d '\r' | head -1)
+"$WINE" reg delete 'HKCU\Software\Wine\AppDefaults\xamlhost-probe.exe' /f >/dev/null 2>&1
+printf '%s\n' "$perapp" | sed 's/^/      per-app: /'
+"$WINESERVER" -w
+out=$(cd "$WINEPREFIX/drive_c" && WINE_SG_XAML=1 timeout -s KILL 120 "$WINE" xamlhost-probe.exe 2>/dev/null </dev/null | tr -d '\r')
 printf '%s\n' "$out" | sed 's/^/      /'
 RC=0
 chk() { if printf '%s\n' "$out" | grep -q "$1"; then printf 'PASS  %s\n' "$2"; else printf 'FAIL  %s\n' "$2"; RC=1; fi; }
+if printf '%s\n' "$off" | grep -q '^factory Windows.UI.Xaml.Hosting.WindowsXamlManager=80040154$'; then
+    echo "PASS  XAML off unless switched on: its classes are not registered (REGDB_E_CLASSNOTREG)"
+else echo "FAIL  XAML off unless switched on: its classes are not registered (REGDB_E_CLASSNOTREG)"; RC=1; fi
+if [ "$perapp" = "manager=00000000" ]; then echo "PASS  on for one program (AppDefaults\\<exe>\\SgXaml)"
+else echo "FAIL  on for one program (AppDefaults\\<exe>\\SgXaml)"; RC=1; fi
 chk '^manager=00000000$' "WindowsXamlManager.InitializeForCurrentThread"
 chk '^manager_same=1$' "one per thread: a second call gets the same manager"
 chk '^closable=00000000$' "the manager closes (IClosable)"
