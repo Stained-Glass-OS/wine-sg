@@ -170,9 +170,11 @@ int main(void)
     ((HRESULT (WINAPI *)(obj *, HWND))SLOT(native, 3))(native, host);
     ((HRESULT (WINAPI *)(obj *, HWND *))SLOT(native, 4))(native, &island);
     SetWindowPos(island, NULL, 0, 0, 300, 220, SWP_NOZORDER | SWP_SHOWWINDOW);
+    /* the window's focus before the content: nothing focused yet (patches/sg/6162 focuses the first
+     * element when the window of an island with content takes the focus) */
+    SetFocus(island);
     ((putobj_fn)SLOT(src, 7))(src, as(grid, &IID_UIE));
     pump(800); UpdateWindow(island); pump(300);
-    SetFocus(island);
 
     /* Tab: TabIndex 0 first, then tree order; no B (IsTabStop False), no C (disabled); round */
     for (i = 0; i < 5; i++) { key(island, VK_TAB); order[i] = focused_one(&state); }
