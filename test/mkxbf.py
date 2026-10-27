@@ -23,6 +23,9 @@
 #                   "Plain" (#FFFFFF00), and "Cond" chosen by conditional XAML between #FFFF00FF
 #                   (IsApiContractPresent) and #FFFF0000 (IsApiContractNotPresent); its brushes' type
 #                   given by XML namespace (type flag 2), as compiled App.xaml files have it
+#   TemplConn.xbf   a Page whose Button's compiled ControlTemplate has an x:ConnectionId of its own (2,
+#                   its x:Bind scope) and one (5) on its root Border ({TemplateBinding Background}) and members and an object of framework IDs
+#                   newer than our table (dropped, not fatal)
 #   ThemeDict.xbf   a ResourceDictionary whose ResourceDictionary.ThemeDictionaries (owner named, as
 #                   compilers write it) holds a "Default" dictionary (keyed item, node 0x0A) with
 #                   "ThemeBrush" (#FF00FFFF)
@@ -179,6 +182,20 @@ def themedict():
     n += u8(0x21)
     return strings, n + brush, [(0, len(n)), (len(n), len(n) + len(brush))]
 
+def templconn():
+    strings = [PRESENTATION]
+    left_top = prop(P_HALIGN, v_enum(0x0263, 0)) + prop(P_VALIGN, v_enum(0x0264, 0))
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_PAGE)
+    n += u8(0x14) + u16(T_BUTTON) + prop(P_CONTROL_BACKGROUND, v_color(0xFF0000FF)) + left_top
+    n += prop(P_WIDTH, v_float(80)) + prop(P_HEIGHT, v_float(40)) + prop(P_MARGIN, v_thickness(10, 10, 0, 0))
+    n += u8(0x14) + u16(T_CONTROLTEMPLATE) + u8(0x0C) + v_int(2) + u8(0x11) + u16(0) + v7(1) + v7(0) + v7(0) + u8(0x21)
+    n += u8(0x07) + u16(P_CONTROL_TEMPLATE) + prop(0x8FFD, v_float(2)) + u8(0x21) + u8(0x08)
+    n += u8(0x21)
+    s1 = u8(0x17) + u16(T_BORDER) + u8(0x1F) + u16(P_BORDER_BACKGROUND) + u16(P_CONTROL_BACKGROUND) + u8(0x0C) + v_int(5)
+    s1 += u8(0x14) + u16(0x83FF) + prop(0x8FFF, v_float(1)) + u8(0x21) + u8(0x07) + u16(P_BORDER_CHILD)
+    s1 += prop(0x8FFE, v_int(3)) + u8(0x21)
+    return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
+
 def loop():
     strings = [PRESENTATION]
     n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID) + u8(0x0F) + v7(1) + u16(0) + v7(6) + u16(0) + v7(0) + u8(0x21)
@@ -207,3 +224,5 @@ st, nd, sc, ty = appdict()
 write('AppDict.xbf', xbf(st, nd, sc, ty))
 st, nd, sc = themedict()
 write('ThemeDict.xbf', xbf(st, nd, sc))
+st, nd, sc = templconn()
+write('TemplConn.xbf', xbf(st, nd, sc))
