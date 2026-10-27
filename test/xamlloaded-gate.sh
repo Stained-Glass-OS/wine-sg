@@ -52,6 +52,7 @@ chk '^template_component=1$' "XamlBindingHelper.Set/GetDataTemplateComponent"
 chk '^load=00000000$' "compiled markup with newer framework IDs loads"
 chk '^binding_connector=2,1$' "IComponentConnector2.GetBindingConnector(the template's own ID, the control)"
 chk '^connected=5,5$' "the component and its binding connector connect the template's element"
+chk '^scope_connected=2$' "the x:Bind scope connected to its data root, the control (Connect(2, control))"
 chk '^template=1$' "the template drawn ({TemplateBinding})"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

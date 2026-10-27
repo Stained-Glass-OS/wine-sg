@@ -47,6 +47,7 @@ typedef HRESULT (WINAPI *putobj_fn)(obj *, obj *);
 typedef HRESULT (WINAPI *getd_fn)(obj *, double *);
 typedef HRESULT (WINAPI *load_fn)(obj *, HSTRING, obj **);
 
+static obj *as_any(void *o, REFIID iid) { obj *r = NULL; if (o) ((HRESULT (WINAPI *)(obj *, REFIID, void **))((obj *)o)->vtbl[0])(o, iid, (void **)&r); return r; }
 static HSTRING hs(const WCHAR *s) { HSTRING h; WindowsCreateString(s, lstrlenW(s), &h); return h; }
 static obj *factory(const WCHAR *name, REFIID iid)
 {
@@ -81,14 +82,20 @@ static HRESULT WINAPI h_invoke(struct handler *h, IInspectable *sender, IInspect
 static void *h_vtbl[] = { h_qi, h_addref, h_release, h_invoke };
 
 /* a connector: records the IDs it is given */
-struct conn { void **vtbl; LONG ref; int id; IInspectable *target; };
+struct conn { void **vtbl; LONG ref; int id; IInspectable *target; int scope_id; };
 static HRESULT WINAPI c_qi(struct conn *c, REFIID iid, void **out) { *out = c; return S_OK; }
 static ULONG WINAPI c_addref(struct conn *c) { return ++c->ref; }
 static ULONG WINAPI c_release(struct conn *c) { return --c->ref; }
 static HRESULT WINAPI c_iids(struct conn *c, ULONG *n, IID **iids) { return E_NOTIMPL; }
 static HRESULT WINAPI c_name(struct conn *c, HSTRING *name) { return E_NOTIMPL; }
 static HRESULT WINAPI c_trust(struct conn *c, TrustLevel *level) { *level = BaseTrust; return S_OK; }
-static HRESULT WINAPI c_connect(struct conn *c, INT32 id, IInspectable *target) { c->id = id; c->target = target; return S_OK; }
+static obj *as_any(void *o, REFIID iid);
+static HRESULT WINAPI c_connect(struct conn *c, INT32 id, IInspectable *target)
+{
+    if (as_any(target, &IID_Control)) c->scope_id = id;   /* the scope connected to its data root, the control */
+    else { c->id = id; c->target = target; }
+    return S_OK;
+}
 static void *c_vtbl[] = { c_qi, c_addref, c_release, c_iids, c_name, c_trust, c_connect };
 static struct conn binding = { c_vtbl, 1 };
 
@@ -224,6 +231,7 @@ int main(void)
         island = make_island((obj *)&app.IInspectable_iface);
         printf("binding_connector=%d,%d\n", app.bind_id, as(app.bind_target, &IID_Control) != NULL);
         printf("connected=%d,%d\n", app.id, binding.id);
+        printf("scope_connected=%d\n", binding.scope_id);
         hdc = GetDC(island);
         printf("template=%d\n", close_to(GetPixel(hdc, 50, 30), 0, 0, 255));
         ReleaseDC(island, hdc);
