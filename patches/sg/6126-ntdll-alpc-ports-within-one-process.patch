@@ -1,0 +1,674 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll: ALPC ports within one process
+
+None of the ALPC calls existed. The Windows App SDK's CoreMessagingXP (the dispatcher under WinUI 3) creates its registrar port and connects to it from the same process: App Installer died at NtAlpcCreatePort. Implemented for ports whose server and clients are in one process: named server ports, connection requests and accept with a port context, synchronous requests and their replies (a reply may come with the release flag), datagrams, releases, disconnect notices, the message-attribute helpers, client impersonation (the process's own token). Each port is a handle that is signalled while messages wait on it.
+---
+diff --git a/dlls/ntdll/Makefile.in b/dlls/ntdll/Makefile.in
+index d8a20b0..e937d1e 100644
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -12,6 +12,7 @@ x86_64_EXTRADLLFLAGS = -Wl,--image-base,0x170000000
+ 
+ SOURCES = \
+ 	actctx.c \
++	alpc.c \
+ 	atom.c \
+ 	crypt.c \
+ 	debugbuffer.c \
+diff --git a/dlls/ntdll/alpc.c b/dlls/ntdll/alpc.c
+new file mode 100644
+index 0000000..e0086d6
+--- /dev/null
++++ b/dlls/ntdll/alpc.c
+@@ -0,0 +1,631 @@
++/*
++ * Advanced local procedure call (ALPC) ports, within one process
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Stained Glass OS: the Windows App SDK's CoreMessagingXP (the dispatcher under WinUI 3) creates
++ * an ALPC server port ("CoreMessagingRegistrar-<pid>:...") and connects to it from the same
++ * process.  This is ALPC for ports whose server and clients are in one process: a server
++ * connection port with a name, the communication ports a connection makes on either side, and
++ * messages queued on them -- connection requests, synchronous requests with their replies,
++ * datagrams, and port-closed notices.  Each port is a handle (an event stands in for it) that is
++ * signalled while messages wait on it, so it can be waited on, also through a wait completion
++ * packet.  Ports of other processes are not reached (STATUS_OBJECT_NAME_NOT_FOUND).
++ *
++ * The message header and attribute layouts follow the public descriptions of the interface.
++ */
++
++#include <stdarg.h>
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "wine/debug.h"
++#include "wine/list.h"
++#include "ntdll_misc.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(alpc);
++
++/* the message header */
++struct port_message
++{
++    USHORT data_length;
++    USHORT total_length;
++    USHORT type;
++    USHORT data_info_offset;
++    CLIENT_ID client_id;
++    ULONG message_id;
++    union
++    {
++        SIZE_T client_view_size;
++        ULONG callback_id;
++    } u;
++};
++
++#define LPC_REQUEST            1
++#define LPC_REPLY              2
++#define LPC_DATAGRAM           3
++#define LPC_PORT_CLOSED        5
++#define LPC_CONNECTION_REQUEST 10
++
++#define ALPC_MSGFLG_REPLY_MESSAGE 0x00000001
++#define ALPC_MSGFLG_RELEASE_MESSAGE 0x00010000
++#define ALPC_MSGFLG_SYNC_REQUEST  0x00020000
++
++#define ALPC_ATTR_CONTEXT 0x20000000
++
++enum port_kind { PORT_CONNECTION, PORT_CLIENT, PORT_SERVER };
++
++struct alpc_port;
++
++struct alpc_msg
++{
++    struct list entry;
++    USHORT type;
++    ULONG id;
++    CLIENT_ID client_id;
++    struct alpc_port *sender;         /* the communication port it came through */
++    USHORT length;
++    BYTE data[1];
++};
++
++struct alpc_port
++{
++    struct list entry;
++    HANDLE handle;
++    enum port_kind kind;
++    WCHAR *name;                      /* a connection port's */
++    struct list queue;                /* messages waiting to be received here */
++    struct alpc_port *server;         /* a communication port's connection port */
++    struct alpc_port *peer;           /* the other side of a connection */
++    void *context;                    /* a server communication port's context (given at accept) */
++    BOOL closed;
++};
++
++/* a sender waiting: for its connection to be accepted, or for the reply to its request */
++struct alpc_wait
++{
++    struct list entry;
++    ULONG id;
++    HANDLE event;
++    BOOL done;
++    NTSTATUS status;
++    struct alpc_port *client;         /* connection: the client port; accept fills its peer */
++    struct alpc_msg *reply;           /* the reply message (or the accepted connection's message) */
++};
++
++void * WINAPI AlpcGetMessageAttribute( void *buffer, ULONG flag );
++
++static struct list ports = LIST_INIT( ports );
++static struct list waits = LIST_INIT( waits );
++static ULONG next_message_id = 1;
++static RTL_CRITICAL_SECTION alpc_cs;
++static RTL_CRITICAL_SECTION_DEBUG alpc_cs_debug =
++{
++    0, 0, &alpc_cs,
++    { &alpc_cs_debug.ProcessLocksList, &alpc_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": alpc_cs") }
++};
++static RTL_CRITICAL_SECTION alpc_cs = { &alpc_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct alpc_port *find_port( HANDLE handle )
++{
++    struct alpc_port *port;
++
++    LIST_FOR_EACH_ENTRY( port, &ports, struct alpc_port, entry )
++        if (port->handle == handle) return port;
++    return NULL;
++}
++
++static struct alpc_port *find_named_port( const UNICODE_STRING *name )
++{
++    struct alpc_port *port;
++
++    LIST_FOR_EACH_ENTRY( port, &ports, struct alpc_port, entry )
++        if (port->kind == PORT_CONNECTION && !port->closed && port->name &&
++            wcslen( port->name ) * sizeof(WCHAR) == name->Length &&
++            !wcsnicmp( port->name, name->Buffer, name->Length / sizeof(WCHAR) ))
++            return port;
++    return NULL;
++}
++
++static struct alpc_wait *find_wait( ULONG id )
++{
++    struct alpc_wait *wait;
++
++    LIST_FOR_EACH_ENTRY( wait, &waits, struct alpc_wait, entry )
++        if (wait->id == id && !wait->done) return wait;
++    return NULL;
++}
++
++static struct alpc_port *new_port( enum port_kind kind )
++{
++    struct alpc_port *port;
++
++    if (!(port = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*port) ))) return NULL;
++    if (NtCreateEvent( &port->handle, EVENT_ALL_ACCESS, NULL, NotificationEvent, FALSE ))
++    {
++        RtlFreeHeap( GetProcessHeap(), 0, port );
++        return NULL;
++    }
++    port->kind = kind;
++    list_init( &port->queue );
++    list_add_tail( &ports, &port->entry );
++    return port;
++}
++
++static struct alpc_msg *new_msg( USHORT type, struct alpc_port *sender, const void *data, USHORT length )
++{
++    struct alpc_msg *msg;
++
++    if (!(msg = RtlAllocateHeap( GetProcessHeap(), 0, offsetof( struct alpc_msg, data[length] ) + 1 ))) return NULL;
++    msg->type = type;
++    msg->id = 0;
++    msg->client_id.UniqueProcess = ULongToHandle( GetCurrentProcessId() );
++    msg->client_id.UniqueThread = ULongToHandle( GetCurrentThreadId() );
++    msg->sender = sender;
++    msg->length = length;
++    if (length) memcpy( msg->data, data, length );
++    return msg;
++}
++
++static void post_msg( struct alpc_port *port, struct alpc_msg *msg )
++{
++    list_add_tail( &port->queue, &msg->entry );
++    NtSetEvent( port->handle, NULL );
++}
++
++static struct alpc_wait *new_wait( ULONG id, struct alpc_port *client )
++{
++    struct alpc_wait *wait;
++
++    if (!(wait = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*wait) ))) return NULL;
++    if (NtCreateEvent( &wait->event, EVENT_ALL_ACCESS, NULL, NotificationEvent, FALSE ))
++    {
++        RtlFreeHeap( GetProcessHeap(), 0, wait );
++        return NULL;
++    }
++    wait->id = id;
++    wait->client = client;
++    list_add_tail( &waits, &wait->entry );
++    return wait;
++}
++
++static void finish_wait( struct alpc_wait *wait, NTSTATUS status, struct alpc_msg *reply )
++{
++    wait->done = TRUE;
++    wait->status = status;
++    wait->reply = reply;
++    NtSetEvent( wait->event, NULL );
++}
++
++/* wait for a sender's wait to finish, outside the lock; the wait is freed */
++static NTSTATUS wait_for( struct alpc_wait *wait, LARGE_INTEGER *timeout, struct alpc_msg **reply )
++{
++    NTSTATUS status = NtWaitForSingleObject( wait->event, FALSE, timeout );
++
++    RtlEnterCriticalSection( &alpc_cs );
++    if (wait->done)
++    {
++        status = wait->status;
++        if (reply) *reply = wait->reply;
++        else if (wait->reply) RtlFreeHeap( GetProcessHeap(), 0, wait->reply );
++    }
++    else if (status == STATUS_SUCCESS) status = STATUS_PORT_DISCONNECTED;
++    list_remove( &wait->entry );
++    RtlLeaveCriticalSection( &alpc_cs );
++    NtClose( wait->event );
++    RtlFreeHeap( GetProcessHeap(), 0, wait );
++    return status;
++}
++
++/* copy a message into a receive buffer (header and data) */
++static NTSTATUS deliver( const struct alpc_msg *msg, struct port_message *buffer, SIZE_T *size, void *attrs,
++                         struct alpc_port *receiver )
++{
++    SIZE_T need = sizeof(*buffer) + msg->length;
++
++    if (size && *size < need)
++    {
++        TRACE( "type %u id %lu: buffer %Iu < %Iu\n", msg->type, msg->id, *size, need );
++        *size = need;
++        return STATUS_BUFFER_TOO_SMALL;
++    }
++    memset( buffer, 0, sizeof(*buffer) );
++    buffer->data_length = msg->length;
++    buffer->total_length = need;
++    buffer->type = msg->type;
++    buffer->client_id = msg->client_id;
++    buffer->message_id = msg->id;
++    memcpy( buffer + 1, msg->data, msg->length );
++    if (size) *size = need;
++    TRACE( "delivered type %u id %lu length %u\n", msg->type, msg->id, msg->length );
++
++
++    /* the context attribute: the port context of the communication port it came through */
++    if (attrs && (((ULONG *)attrs)[0] & ALPC_ATTR_CONTEXT))
++    {
++        void **context = AlpcGetMessageAttribute( attrs, ALPC_ATTR_CONTEXT );
++        struct alpc_port *server_side = NULL;
++
++        if (msg->sender && msg->sender->kind == PORT_CLIENT) server_side = msg->sender->peer;
++        else if (msg->sender && msg->sender->kind == PORT_SERVER) server_side = msg->sender;
++        if (context)
++        {
++            memset( context, 0, 2 * sizeof(void *) + 16 );
++            context[0] = server_side && receiver->kind != PORT_CLIENT ? server_side->context : NULL;
++            ((ULONG *)(context + 2))[1] = msg->id;
++            ((ULONG *)attrs)[1] |= ALPC_ATTR_CONTEXT;
++        }
++    }
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
++ *           NtAlpcCreatePort   (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcCreatePort( HANDLE *handle, OBJECT_ATTRIBUTES *attr, void *port_attr )
++{
++    struct alpc_port *port;
++    UNICODE_STRING *name = attr ? attr->ObjectName : NULL;
++
++    TRACE( "%p %s %p\n", handle, name ? debugstr_us(name) : "(null)", port_attr );
++
++    if (!handle) return STATUS_ACCESS_VIOLATION;
++    RtlEnterCriticalSection( &alpc_cs );
++    if (name && name->Length && find_named_port( name ))
++    {
++        RtlLeaveCriticalSection( &alpc_cs );
++        return STATUS_OBJECT_NAME_COLLISION;
++    }
++    if (!(port = new_port( PORT_CONNECTION )))
++    {
++        RtlLeaveCriticalSection( &alpc_cs );
++        return STATUS_NO_MEMORY;
++    }
++    if (name && name->Length && (port->name = RtlAllocateHeap( GetProcessHeap(), 0, name->Length + sizeof(WCHAR) )))
++    {
++        memcpy( port->name, name->Buffer, name->Length );
++        port->name[name->Length / sizeof(WCHAR)] = 0;
++    }
++    *handle = port->handle;
++    RtlLeaveCriticalSection( &alpc_cs );
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
++ *           NtAlpcConnectPort   (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcConnectPort( HANDLE *handle, UNICODE_STRING *name, OBJECT_ATTRIBUTES *attr, void *port_attr,
++                                   ULONG flags, void *sid, struct port_message *msg, SIZE_T *size,
++                                   void *out_attr, void *in_attr, LARGE_INTEGER *timeout )
++{
++    struct alpc_port *server, *client;
++    struct alpc_msg *request, *reply = NULL;
++    struct alpc_wait *wait;
++    NTSTATUS status;
++
++    TRACE( "%p %s %#lx %p %p\n", handle, debugstr_us(name), flags, msg, timeout );
++
++    if (!handle || !name) return STATUS_INVALID_PARAMETER;
++    RtlEnterCriticalSection( &alpc_cs );
++    if (!(server = find_named_port( name )))
++    {
++        RtlLeaveCriticalSection( &alpc_cs );
++        FIXME( "no port %s in this process\n", debugstr_us(name) );
++        return STATUS_OBJECT_NAME_NOT_FOUND;
++    }
++    client = new_port( PORT_CLIENT );
++    request = client ? new_msg( LPC_CONNECTION_REQUEST, client, msg ? (BYTE *)(msg + 1) : NULL,
++                                msg ? msg->data_length : 0 ) : NULL;
++    if (!request || !(wait = new_wait( next_message_id, client )))
++    {
++        RtlLeaveCriticalSection( &alpc_cs );
++        return STATUS_NO_MEMORY;
++    }
++    client->server = server;
++    request->id = next_message_id++;
++    post_msg( server, request );
++    RtlLeaveCriticalSection( &alpc_cs );
++
++    status = wait_for( wait, timeout, &reply );
++    if (status == STATUS_SUCCESS)
++    {
++        if (msg && reply) deliver( reply, msg, NULL, in_attr, client );
++        *handle = client->handle;
++    }
++    else
++    {
++        RtlEnterCriticalSection( &alpc_cs );
++        client->closed = TRUE;
++        RtlLeaveCriticalSection( &alpc_cs );
++    }
++    if (reply) RtlFreeHeap( GetProcessHeap(), 0, reply );
++    return status;
++}
++
++/***********************************************************************
++ *           NtAlpcAcceptConnectPort   (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcAcceptConnectPort( HANDLE *handle, HANDLE connection, ULONG flags, OBJECT_ATTRIBUTES *attr,
++                                         void *port_attr, void *context, struct port_message *msg,
++                                         void *msg_attr, BOOLEAN accept )
++{
++    struct alpc_port *server, *port;
++    struct alpc_wait *wait;
++    struct alpc_msg *reply;
++
++    TRACE( "%p %p %#lx %p %p %d\n", handle, connection, flags, context, msg, accept );
++
++    if (!msg) return STATUS_INVALID_PARAMETER;
++    RtlEnterCriticalSection( &alpc_cs );
++    if (!(server = find_port( connection )) || server->kind != PORT_CONNECTION ||
++        !(wait = find_wait( msg->message_id )))
++    {
++        RtlLeaveCriticalSection( &alpc_cs );
++        return STATUS_INVALID_PARAMETER;
++    }
++    reply = new_msg( LPC_REPLY, NULL, msg + 1, msg->data_length );
++    if (accept)
++    {
++        if (!(port = new_port( PORT_SERVER )))
++        {
++            RtlLeaveCriticalSection( &alpc_cs );
++            return STATUS_NO_MEMORY;
++        }
++        port->server = server;
++        port->context = context;
++        port->peer = wait->client;
++        wait->client->peer = port;
++        if (handle) *handle = port->handle;
++        finish_wait( wait, STATUS_SUCCESS, reply );
++    }
++    else finish_wait( wait, STATUS_PORT_CONNECTION_REFUSED, reply );
++    RtlLeaveCriticalSection( &alpc_cs );
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
++ *           NtAlpcSendWaitReceivePort   (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcSendWaitReceivePort( HANDLE handle, ULONG flags, struct port_message *send, void *send_attr,
++                                           struct port_message *recv, SIZE_T *size, void *recv_attr,
++                                           LARGE_INTEGER *timeout )
++{
++    struct alpc_port *port, *target = NULL;
++    struct alpc_wait *wait = NULL, *request;
++    struct alpc_msg *msg, *reply = NULL;
++    NTSTATUS status = STATUS_SUCCESS;
++
++    TRACE( "%p %#lx %p %p %p %p\n", handle, flags, send, recv, size, timeout );
++
++    RtlEnterCriticalSection( &alpc_cs );
++    if (!(port = find_port( handle )))
++    {
++        RtlLeaveCriticalSection( &alpc_cs );
++        return STATUS_INVALID_HANDLE;
++    }
++
++    if (send)
++        TRACE( "send: port kind %d type %#x id %lu length %u\n", port->kind, send->type, send->message_id,
++               send->data_length );
++    if (send)
++    {
++        ULONG reply_id = send->message_id;
++
++        /* releasing a received message (its data view, handles; nothing is kept here) -- unless it
++         * names a request waiting for its reply: a reply is sent and its request released at once */
++        if ((flags & ALPC_MSGFLG_RELEASE_MESSAGE) && !(reply_id && port->kind != PORT_CLIENT && find_wait( reply_id )))
++        {
++            RtlLeaveCriticalSection( &alpc_cs );
++            send = NULL;
++            goto receive;
++        }
++        /* a reply to a request that was received: its sender waits for it */
++        if (port->kind != PORT_CLIENT && reply_id && (request = find_wait( reply_id )) &&
++            !(flags & ALPC_MSGFLG_SYNC_REQUEST))
++        {
++            if (!(msg = new_msg( LPC_REPLY, port, send + 1, send->data_length ))) status = STATUS_NO_MEMORY;
++            else
++            {
++                msg->id = reply_id;
++#ifndef SG_MUTANT_ALPC_REPLY_LOST
++                finish_wait( request, STATUS_SUCCESS, msg );
++#endif
++            }
++        }
++        else
++        {
++            /* a client's message goes to the server's connection port; a server's to its client */
++            if (port->closed || (port->kind != PORT_CONNECTION && !port->peer)) status = STATUS_PORT_DISCONNECTED;
++            else if (port->kind == PORT_CLIENT) target = port->server;
++            else if (port->kind == PORT_SERVER) target = port->peer;
++            else status = STATUS_INVALID_PARAMETER;
++            if (!status && target->closed) status = STATUS_PORT_DISCONNECTED;
++            if (!status && !(msg = new_msg( (flags & ALPC_MSGFLG_SYNC_REQUEST) ? LPC_REQUEST : LPC_DATAGRAM,
++                                            port, send + 1, send->data_length )))
++                status = STATUS_NO_MEMORY;
++            if (!status)
++            {
++                msg->id = next_message_id++;
++                if ((flags & ALPC_MSGFLG_SYNC_REQUEST) && !(wait = new_wait( msg->id, port )))
++                {
++                    RtlFreeHeap( GetProcessHeap(), 0, msg );
++                    status = STATUS_NO_MEMORY;
++                }
++                else
++                {
++                    send->message_id = msg->id;
++                    post_msg( target, msg );
++                }
++            }
++        }
++    }
++    RtlLeaveCriticalSection( &alpc_cs );
++    if (status) return status;
++
++receive:
++    /* a synchronous request: the reply is what is received */
++    if (wait)
++    {
++        status = wait_for( wait, timeout, &reply );
++        TRACE( "sync request: %#lx, reply %p\n", status, reply );
++        if (!status && reply)
++        {
++            if (recv) status = deliver( reply, recv, size, recv_attr, port );
++            RtlFreeHeap( GetProcessHeap(), 0, reply );
++        }
++        return status;
++    }
++    if (!recv) return STATUS_SUCCESS;
++
++    for (;;)
++    {
++        RtlEnterCriticalSection( &alpc_cs );
++        if (!list_empty( &port->queue ))
++        {
++            msg = LIST_ENTRY( list_head( &port->queue ), struct alpc_msg, entry );
++            status = deliver( msg, recv, size, recv_attr, port );
++            if (!status)
++            {
++                list_remove( &msg->entry );
++                RtlFreeHeap( GetProcessHeap(), 0, msg );
++            }
++            if (list_empty( &port->queue )) NtResetEvent( port->handle, NULL );
++            RtlLeaveCriticalSection( &alpc_cs );
++            return status;
++        }
++        NtResetEvent( port->handle, NULL );
++        RtlLeaveCriticalSection( &alpc_cs );
++        status = NtWaitForSingleObject( port->handle, (flags & 0x200000) != 0, timeout );
++        if (status) return status;   /* STATUS_TIMEOUT, STATUS_USER_APC, ... */
++    }
++}
++
++/***********************************************************************
++ *           NtAlpcDisconnectPort   (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcDisconnectPort( HANDLE handle, ULONG flags )
++{
++    struct alpc_port *port, *other = NULL;
++    struct alpc_wait *wait, *next;
++    struct alpc_msg *msg;
++
++    TRACE( "%p %#lx\n", handle, flags );
++
++    RtlEnterCriticalSection( &alpc_cs );
++    if (!(port = find_port( handle )))
++    {
++        RtlLeaveCriticalSection( &alpc_cs );
++        return STATUS_INVALID_HANDLE;
++    }
++    if (!port->closed)
++    {
++        port->closed = TRUE;
++        /* the other side is told; requests it waits for end */
++        if (port->kind == PORT_CLIENT && port->peer) other = port->server;
++        else if (port->kind == PORT_SERVER) other = port->peer;
++        if (other && !other->closed && (msg = new_msg( LPC_PORT_CLOSED, port, NULL, 0 )))
++        {
++            msg->id = next_message_id++;
++            post_msg( other, msg );
++        }
++        LIST_FOR_EACH_ENTRY_SAFE( wait, next, &waits, struct alpc_wait, entry )
++            if (!wait->done && (wait->client == port || (port->peer && wait->client == port->peer)))
++                finish_wait( wait, STATUS_PORT_DISCONNECTED, NULL );
++    }
++    RtlLeaveCriticalSection( &alpc_cs );
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
++ *           NtAlpcImpersonateClientOfPort   (NTDLL.@)
++ *
++ * The client is this process: the thread takes the process's own token, as a server's thread
++ * takes its client's (and opens it, which it could not without a thread token).
++ */
++NTSTATUS WINAPI NtAlpcImpersonateClientOfPort( HANDLE handle, struct port_message *msg, void *reserved )
++{
++    TRACE( "%p %p\n", handle, msg );
++    return RtlImpersonateSelf( SecurityImpersonation );
++}
++
++/***********************************************************************
++ *           NtAlpcQueryInformation   (NTDLL.@)
++ */
++NTSTATUS WINAPI NtAlpcQueryInformation( HANDLE handle, ULONG class, void *info, ULONG length, ULONG *ret_length )
++{
++    FIXME( "%p %lu %p %lu %p: not supported\n", handle, class, info, length, ret_length );
++    return STATUS_NOT_SUPPORTED;
++}
++
++/* ALPC message attributes: a header (allocated and valid flags), then one structure per allocated
++ * attribute, highest flag first */
++static const struct { ULONG flag; SIZE_T size; } alpc_attrs[] =
++{
++    { 0x80000000, 3 * sizeof(void *) },          /* security: flags, QoS, context handle */
++    { 0x40000000, 4 * sizeof(void *) },          /* data view: flags, section, base, size */
++    { 0x20000000, 2 * sizeof(void *) + 16 },     /* context: port and message context, sequence, id, callback id */
++    { 0x10000000, 4 * sizeof(void *) },          /* handle: flags, handle, object type, access */
++    { 0x08000000, 24 },                          /* token: token id, authentication id, modified id */
++    { 0x04000000, sizeof(void *) },              /* direct: event */
++    { 0x02000000, 8 },                           /* work on behalf: ticket */
++};
++
++static SIZE_T attr_size( unsigned int i )
++{
++    return (alpc_attrs[i].size + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
++}
++
++/***********************************************************************
++ *           AlpcInitializeMessageAttribute   (NTDLL.@)
++ */
++NTSTATUS WINAPI AlpcInitializeMessageAttribute( ULONG flags, void *buffer, SIZE_T size, SIZE_T *required )
++{
++    SIZE_T need = 2 * sizeof(ULONG);
++    unsigned int i;
++
++    TRACE( "%#lx %p %Iu %p\n", flags, buffer, size, required );
++    for (i = 0; i < ARRAY_SIZE(alpc_attrs); i++)
++        if (flags & alpc_attrs[i].flag) need += attr_size( i );
++    if (required) *required = need;
++    if (flags & ~0xfe000000) return STATUS_INVALID_PARAMETER;
++    if (!buffer || size < need) return STATUS_BUFFER_TOO_SMALL;
++    memset( buffer, 0, need );
++    ((ULONG *)buffer)[0] = flags;
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
++ *           AlpcGetMessageAttribute   (NTDLL.@)
++ */
++void * WINAPI AlpcGetMessageAttribute( void *buffer, ULONG flag )
++{
++    ULONG allocated = ((ULONG *)buffer)[0];
++    SIZE_T offset = 2 * sizeof(ULONG);
++    unsigned int i;
++
++    if (!(allocated & flag) || (flag & (flag - 1))) return NULL;
++    for (i = 0; i < ARRAY_SIZE(alpc_attrs); i++)
++    {
++        if (alpc_attrs[i].flag == flag) return (char *)buffer + offset;
++        if (allocated & alpc_attrs[i].flag) offset += attr_size( i );
++    }
++    return NULL;
++}
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 253ac5c..f214ff0 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -404,6 +404,15 @@
+ @ stdcall -syscall NtSetInformationToken(long long ptr long)
+ @ stdcall -syscall NtSetInformationVirtualMemory(long long ptr ptr ptr long)
+ @ stdcall -syscall NtSetIntervalProfile(long long)
++@ stdcall AlpcGetMessageAttribute(ptr long)
++@ stdcall AlpcInitializeMessageAttribute(long ptr long ptr)
++@ stdcall NtAlpcAcceptConnectPort(ptr ptr long ptr ptr ptr ptr ptr long)
++@ stdcall NtAlpcConnectPort(ptr ptr ptr ptr long ptr ptr ptr ptr ptr ptr)
++@ stdcall NtAlpcCreatePort(ptr ptr ptr)
++@ stdcall NtAlpcDisconnectPort(ptr long)
++@ stdcall NtAlpcImpersonateClientOfPort(ptr ptr ptr)
++@ stdcall NtAlpcQueryInformation(ptr long ptr long ptr)
++@ stdcall NtAlpcSendWaitReceivePort(ptr long ptr ptr ptr ptr ptr ptr)
+ @ stdcall NtAssociateWaitCompletionPacket(ptr ptr ptr ptr ptr long ptr ptr)
+ @ stdcall NtCancelWaitCompletionPacket(ptr long)
+ @ stdcall NtCreateWaitCompletionPacket(ptr long ptr)
