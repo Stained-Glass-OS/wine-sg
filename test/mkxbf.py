@@ -9,6 +9,16 @@
 #   BadString.xbf   a string index past the string table
 #   BadSection.xbf  a node section reaching past the end of the file
 #   BadNode.xbf     an unknown node
+#   TestStyles.xbf  Grid.Resources compiled (a dictionary section): a brush "Accent", a Style "BoxStyle"
+#                   for Border (setters: Width/Height inline, Background from {StaticResource Accent}),
+#                   an implicit Style for TextBlock (FontSize 40); a Border with Style="{StaticResource
+#                   BoxStyle}" (x:Name Styled), a Border with Background="{StaticResource Accent}", one
+#                   from a missing resource, a TextBlock (x:Name Label), a Button whose ControlTemplate (a
+#                   template section) is a Border x:Name Frame with {TemplateBinding Background}
+#   BadDict.xbf     a dictionary entry past its section
+#   BadSetter.xbf   an unknown setter kind
+#   BadTemplate.xbf a template's section past the table
+#   LoopSection.xbf a deferred element whose section refers to itself
 import struct, sys, os
 
 def u8(v): return struct.pack('<B', v)
@@ -24,6 +34,16 @@ T_GRID, T_BORDER, T_TEXTBLOCK, T_PAGE, T_ROWDEF = 0x81BA, 0x811E, 0x818C, 0x820D
 P_PANEL_BACKGROUND, P_BORDER_BACKGROUND, P_WIDTH, P_HEIGHT, P_MARGIN = 0x8287, 0x81F7, 0x8199, 0x8189, 0x818D
 P_HALIGN, P_VALIGN, P_ROW, P_TEXT, P_FONTSIZE, P_CONTROL_BACKGROUND = 0x818A, 0x8198, 0x835C, 0x8320, 0x8310, 0x821D
 P_ROWDEFS, P_ROWDEF_HEIGHT = 0x835D, 0x80E3
+T_SCB, T_STYLE, T_CONTROLTEMPLATE, T_PRESENTER, T_BUTTON = 0x8109, 0x8072, 0x80BF, 0x8128, 0x821C
+P_RESOURCES, P_STYLE, P_SCB_COLOR, P_SETTER_VALUE, P_CONTROL_TEMPLATE, P_BORDER_CHILD = 0x8194, 0x8195, 0x81DC, 0x81DB, 0x8230, 0x81FA
+
+def v7(v):
+    out = b''
+    while True:
+        b = v & 0x7f
+        v >>= 7
+        if v: out += u8(b | 0x80)
+        else: return out + u8(b)
 
 def v_color(argb): return u8(0x08) + bytes([argb & 0xff, (argb >> 8) & 0xff, (argb >> 16) & 0xff, argb >> 24])
 def v_float(f): return u8(0x03) + f32(f)
@@ -76,6 +96,63 @@ def page():
     n += u8(0x21)
     return strings, n
 
+# strings of the styles file
+S_ACCENT, S_BOXSTYLE, S_STYLED, S_LABEL, S_TEXT, S_FRAME, S_NOPE = 1, 2, 3, 4, 5, 6, 7
+
+def styles(bad=None):
+    strings = [PRESENTATION, 'Accent', 'BoxStyle', 'Styled', 'Label', 'XXXX', 'Frame', 'Nope']
+    left_top = prop(P_HALIGN, v_enum(0x0263, 0)) + prop(P_VALIGN, v_enum(0x0264, 0))
+    # section 1: the dictionary's resources
+    brush = u8(0x14) + u16(T_SCB) + prop(P_SCB_COLOR, v_color(0xFF00FF00)) + u8(0x21)
+    if bad == 'setter': setters = v7(1) + u8(0x55) + u16(P_WIDTH)
+    else:
+        setters = v7(3) + u8(0x30) + u16(P_WIDTH) + v_float(100) + u8(0x30) + u16(P_HEIGHT) + v_float(50)
+        setters += u8(0x11) + u16(P_BORDER_BACKGROUND) + v7(0)
+    box_style = u8(0x14) + u16(T_STYLE) + u8(0x1D) + u16(0) + u16(T_BORDER) + u8(0x0F) + v7(3) + u16(0) + v7(2) + setters + u8(0x21)
+    implicit = u8(0x14) + u16(T_STYLE) + u8(0x1D) + u16(0) + u16(T_TEXTBLOCK)
+    implicit += u8(0x0F) + v7(3) + u16(0) + v7(2) + v7(1) + u8(0x30) + u16(P_FONTSIZE) + v_float(40) + u8(0x21)
+    s1 = brush + box_style + implicit
+    # section 2: the Button's template
+    s2 = u8(0x17) + u16(T_BORDER) + u8(0x1F) + u16(P_BORDER_BACKGROUND) + u16(P_CONTROL_BACKGROUND) + u8(0x0D) + v_str(S_FRAME)
+    s2 += u8(0x14) + u16(T_PRESENTER) + u8(0x21) + u8(0x07) + u16(P_BORDER_CHILD) + u8(0x21)
+    # section 3: the setters' resource values
+    s3 = u8(0x1E) + u16(P_SETTER_VALUE) + v_str(S_ACCENT)
+    # section 0: the page
+    dict_ref = u8(0x0F) + v7(1) + u16(0) + v7(7)
+    style_offset = len(brush) + (4096 if bad == 'dict' else 0)
+    dict_ref += v7(2) + u16(S_ACCENT) + v7(0) + u16(S_BOXSTYLE) + v7(style_offset)   # keyed
+    dict_ref += v7(0)                                                                 # (keys of styles)
+    dict_ref += v7(1) + u16(T_TEXTBLOCK) + v7(len(brush) + len(box_style))           # implicit styles
+    dict_ref += v7(0)
+    n = u8(0x12) + u16(0) + s16('')
+    n += u8(0x17) + u16(T_GRID) + prop(P_PANEL_BACKGROUND, v_color(0xFFFFFFFF))
+    n += u8(0x13) + u16(P_RESOURCES) + dict_ref + u8(0x02)
+    n += u8(0x14) + u16(T_BORDER) + u8(0x1E) + u16(P_STYLE) + v_str(S_BOXSTYLE) + left_top
+    n += prop(P_MARGIN, v_thickness(10, 10, 0, 0)) + u8(0x0D) + v_str(S_STYLED) + u8(0x21) + u8(0x08)
+    n += u8(0x14) + u16(T_BORDER) + u8(0x1E) + u16(P_BORDER_BACKGROUND) + v_str(S_ACCENT) + left_top
+    n += prop(P_WIDTH, v_float(40)) + prop(P_HEIGHT, v_float(40)) + prop(P_MARGIN, v_thickness(200, 10, 0, 0)) + u8(0x21) + u8(0x08)
+    n += u8(0x14) + u16(T_BORDER) + u8(0x1E) + u16(P_BORDER_BACKGROUND) + v_str(S_NOPE) + prop(P_WIDTH, v_float(10)) + u8(0x21) + u8(0x08)
+    n += u8(0x14) + u16(T_TEXTBLOCK) + prop(P_TEXT, v_str(S_TEXT)) + left_top + prop(P_MARGIN, v_thickness(150, 100, 0, 0))
+    n += u8(0x0D) + v_str(S_LABEL) + u8(0x21) + u8(0x08)
+    template_section = 99 if bad == 'template' else 2
+    n += u8(0x14) + u16(T_BUTTON) + prop(P_CONTROL_BACKGROUND, v_color(0xFF0000FF)) + left_top
+    n += prop(P_WIDTH, v_float(80)) + prop(P_HEIGHT, v_float(40)) + prop(P_MARGIN, v_thickness(10, 120, 0, 0))
+    n += u8(0x14) + u16(T_CONTROLTEMPLATE) + u8(0x11) + u16(0) + v7(template_section) + v7(0) + v7(0) + u8(0x21)
+    n += u8(0x07) + u16(P_CONTROL_TEMPLATE) + u8(0x21) + u8(0x08)
+    n += u8(0x21)
+    nodes, sections, pos = b'', [], 0
+    for sec in (n, s1, s2, s3):
+        sections.append((pos, pos + len(sec)))
+        nodes += sec
+        pos += len(sec)
+    return strings, nodes, sections
+
+def loop():
+    strings = [PRESENTATION]
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID) + u8(0x0F) + v7(1) + u16(0) + v7(6) + u16(0) + v7(0) + u8(0x21)
+    s1 = u8(0x14) + u16(T_GRID) + u8(0x0F) + v7(1) + u16(0) + v7(6) + u16(0) + v7(0) + u8(0x21)
+    return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
+
 d = sys.argv[1]
 def write(name, data):
     with open(os.path.join(d, name), 'wb') as f: f.write(data)
@@ -89,3 +166,8 @@ write('Trunc.xbf', good[:len(good) - len(n) // 2])
 write('BadString.xbf', xbf(s, n.replace(u8(0x0D) + v_str(1), u8(0x0D) + v_str(999))))
 write('BadSection.xbf', xbf(s, n, [(0, len(n) + 4096)]))
 write('BadNode.xbf', xbf(s, n.replace(u8(0x21) + u8(0x08), u8(0x7E) + u8(0x08), 1)))
+for name, bad in (('TestStyles', None), ('BadDict', 'dict'), ('BadSetter', 'setter'), ('BadTemplate', 'template')):
+    st, nd, sc = styles(bad)
+    write(name + '.xbf', xbf(st, nd, sc))
+st, nd, sc = loop()
+write('LoopSection.xbf', xbf(st, nd, sc))
