@@ -28,6 +28,8 @@
 #                   newer than our table (dropped, not fatal)
 #   Deferred.xbf    a Grid with a deferred element (x:Load; section reference kind 9, as newer compilers
 #                   write it) left unrealized, and a Border after it (x:Name After)
+#   DataList.xbf    a Page with a ListView whose compiled ItemTemplate (a DataTemplate section) is a Border
+#                   with x:ConnectionId 7 (a compiled x:Bind data template's root)
 #   ThemeDict.xbf   a ResourceDictionary whose ResourceDictionary.ThemeDictionaries (owner named, as
 #                   compilers write it) holds a "Default" dictionary (keyed item, node 0x0A) with
 #                   "ThemeBrush" (#FF00FFFF)
@@ -206,6 +208,15 @@ def deferred():
     n += u8(0x14) + u16(T_BORDER) + u8(0x0D) + v_str(2) + u8(0x21) + u8(0x08) + u8(0x21)
     return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
 
+def datalist():
+    strings = [PRESENTATION, 'List']
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_PAGE)
+    n += u8(0x14) + u16(0x823B) + u8(0x0D) + v_str(1)
+    n += u8(0x14) + u16(0x80C2) + u8(0x11) + u16(0) + v7(1) + v7(0) + v7(0) + u8(0x21) + u8(0x07) + u16(0x837B)
+    n += u8(0x21) + u8(0x08) + u8(0x21)
+    s1 = u8(0x17) + u16(T_BORDER) + u8(0x0C) + v_int(7) + prop(P_HEIGHT, v_float(20)) + u8(0x21)
+    return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
+
 def loop():
     strings = [PRESENTATION]
     n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID) + u8(0x0F) + v7(1) + u16(0) + v7(6) + u16(0) + v7(0) + u8(0x21)
@@ -238,3 +249,5 @@ st, nd, sc = templconn()
 write('TemplConn.xbf', xbf(st, nd, sc))
 st, nd, sc = deferred()
 write('Deferred.xbf', xbf(st, nd, sc))
+st, nd, sc = datalist()
+write('DataList.xbf', xbf(st, nd, sc))
