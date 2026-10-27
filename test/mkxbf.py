@@ -23,6 +23,9 @@
 #                   "Plain" (#FFFFFF00), and "Cond" chosen by conditional XAML between #FFFF00FF
 #                   (IsApiContractPresent) and #FFFF0000 (IsApiContractNotPresent); its brushes' type
 #                   given by XML namespace (type flag 2), as compiled App.xaml files have it
+#   ThemeDict.xbf   a ResourceDictionary whose ResourceDictionary.ThemeDictionaries (owner named, as
+#                   compilers write it) holds a "Default" dictionary (keyed item, node 0x0A) with
+#                   "ThemeBrush" (#FF00FFFF)
 import struct, sys, os
 
 def u8(v): return struct.pack('<B', v)
@@ -167,6 +170,15 @@ def appdict():
     n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(0x8173) + ref + u8(0x21)
     return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))], types
 
+def themedict():
+    strings = [PRESENTATION, 'ThemeBrush', 'Default']
+    brush = u8(0x14) + u16(T_SCB) + prop(P_SCB_COLOR, v_color(0xFF00FFFF)) + u8(0x21)
+    ref = u8(0x0F) + v7(1) + u16(0) + v7(7) + v7(1) + u16(1) + v7(0) + v7(0) + v7(0) + v7(0)
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(0x8173)
+    n += u8(0x13) + u16(0x82B1) + u8(0x14) + u16(0x8173) + ref + u8(0x21) + u8(0x0A) + v_str(2) + u8(0x02)
+    n += u8(0x21)
+    return strings, n + brush, [(0, len(n)), (len(n), len(n) + len(brush))]
+
 def loop():
     strings = [PRESENTATION]
     n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID) + u8(0x0F) + v7(1) + u16(0) + v7(6) + u16(0) + v7(0) + u8(0x21)
@@ -193,3 +205,5 @@ st, nd, sc = loop()
 write('LoopSection.xbf', xbf(st, nd, sc))
 st, nd, sc, ty = appdict()
 write('AppDict.xbf', xbf(st, nd, sc, ty))
+st, nd, sc = themedict()
+write('ThemeDict.xbf', xbf(st, nd, sc))
