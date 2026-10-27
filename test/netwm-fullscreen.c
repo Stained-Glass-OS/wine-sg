@@ -4,6 +4,12 @@
  * for Firefox's F11 or its restored maximized window.
  * netwm-fullscreen WINDOW preset-maximized -- _NET_WM_STATE maximized on
  * the window, as a window manager leaves a window it maximized.
+ * netwm-fullscreen WINDOW preset-fullscreen -- _NET_WM_STATE full screen on
+ * the window, as the compositor's window manager leaves one that asked as it
+ * was mapped (an SFML game).
+ * netwm-fullscreen WINDOW watch SECONDS -- prints "size WxH" for each size
+ * the window is given (ConfigureNotify) for SECONDS: an SFML game takes any
+ * size it did not ask for as a new video mode.
  * netwm-fullscreen WINDOW iconify -- ask to be minimized, as a program's own
  * minimize button does (XIconifyWindow: WM_CHANGE_STATE, ICCCM).
  * netwm-fullscreen WINDOW activate -- ask to be the active window, as GTK's
@@ -12,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/select.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
@@ -30,6 +38,43 @@ int main( int argc, char **argv )
                           XInternAtom( d, "_NET_WM_STATE_MAXIMIZED_HORZ", False ) };
         XChangeProperty( d, w, XInternAtom( d, "_NET_WM_STATE", False ), XA_ATOM, 32, PropModeReplace,
                          (unsigned char *)atoms, 2 );
+        XCloseDisplay( d );
+        return 0;
+    }
+    if (!strcmp( argv[2], "preset-fullscreen" ))
+    {
+        Atom atom = XInternAtom( d, "_NET_WM_STATE_FULLSCREEN", False );
+        XChangeProperty( d, w, XInternAtom( d, "_NET_WM_STATE", False ), XA_ATOM, 32, PropModeReplace,
+                         (unsigned char *)&atom, 1 );
+        XCloseDisplay( d );
+        return 0;
+    }
+    if (!strcmp( argv[2], "watch" ))
+    {
+        int secs = argc > 3 ? atoi( argv[3] ) : 5, lw = -1, lh = -1;
+        time_t end = time( NULL ) + secs;
+        XSelectInput( d, w, StructureNotifyMask );
+        XFlush( d );
+        printf( "watching\n" );
+        fflush( stdout );
+        while (time( NULL ) < end)
+        {
+            fd_set fds;
+            struct timeval tv = { 0, 100000 };
+            FD_ZERO( &fds );
+            FD_SET( ConnectionNumber( d ), &fds );
+            select( ConnectionNumber( d ) + 1, &fds, NULL, NULL, &tv );
+            while (XPending( d ))
+            {
+                XNextEvent( d, &ev );
+                if (ev.type == ConfigureNotify && (ev.xconfigure.width != lw || ev.xconfigure.height != lh))
+                {
+                    lw = ev.xconfigure.width; lh = ev.xconfigure.height;
+                    printf( "size %dx%d\n", lw, lh );
+                    fflush( stdout );
+                }
+            }
+        }
         XCloseDisplay( d );
         return 0;
     }

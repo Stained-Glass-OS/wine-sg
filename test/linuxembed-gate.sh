@@ -38,6 +38,11 @@
 #  11. one opening while a Wine window is active is active and has the keys;
 #      the window that was active is not made active again meanwhile (its
 #      program, told late, took the X focus back: 0853)
+#  12. one full screen before it was framed (an SFML game asks as it maps
+#      its window: Extreme Tux Racer) gets a full-screen frame, not a
+#      maximized one, and is given no other size meanwhile -- any size it
+#      did not ask for it took for a new video mode and made its window
+#      again, for ever (dlls/winex11.drv/sg_embed.c, attach)
 #   9. a hung one (stopped) does not close when asked; Task Manager's End
 #      task then (SgLinuxWindowEnd) ends its process (patches/sg/0772; CPU-X
 #      could not be ended, David 2026-10-02)
@@ -48,7 +53,8 @@
 # machine the keys then go to it); SG_MUTANT_EMBED_NO_ICONIFY fails 5d;
 # SG_MUTANT_EMBED_NO_FOCUSED_STATE fails 4b; SG_MUTANT_EMBED_NO_ACTIVE_WINDOW
 # fails 5e; SG_MUTANT_GONE_XWIN_BUTTON (programs/explorer/systray.c) fails
-# 8's "nothing comes back".
+# 8's "nothing comes back". SG_MUTANT_EMBED_PRE_FULLSCREEN_LOST and
+# SG_MUTANT_EMBED_PRE_FULLSCREEN_RESIZED fail 12.
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -348,6 +354,30 @@ tr -d '\r' < "$T/fglog" 2>/dev/null | sed -n '/^fg SgLinuxWindow|New Terminal/,$
     || fail "...the X focus is on $(xdotool getwindowfocus 2>/dev/null), not $X3"
 xdotool type --delay 40 'touch typed-new'; xdotool key Return; sleep 1.5
 [ -e "$T/typed-new" ] && pass "...and keys reach it without a click" || fail "typed keys did not reach the new window"
+kill "$XT" 2>/dev/null; XT=
+# 12. full screen before it was framed: its frame is the whole screen
+printf 'END\n' > "$T/list"; sleep 1.5
+xterm -geometry 50x12+100+100 -bg '#a03060' -fg white -title 'Full Terminal' & XT=$!
+i=0; while [ -z "$(xwininfo -root -children | awk '/"Full Terminal"/ {print $1; exit}')" ] && [ $i -lt 100 ]; do sleep 0.2; i=$((i + 1)); done
+X4=$(xwininfo -root -children | awk '/"Full Terminal"/ {print $1; exit}')
+if [ -z "$X4" ]; then
+    fail "the full-screen xterm's window never showed (test broken)"
+else
+    xdotool windowsize "$X4" 1024 700; sleep 0.5   # the whole screen, as the game's window
+    "$T/netwm-fullscreen" "$X4" preset-fullscreen   # as the compositor's window manager leaves it
+    "$T/netwm-fullscreen" "$X4" watch 8 > "$T/sizes" & WP=$!
+    i=0; while ! grep -q watching "$T/sizes" 2>/dev/null && [ $i -lt 40 ]; do sleep 0.1; i=$((i + 1)); done
+    printf '%d shown - XTerm\tFull Terminal\nEND\n' "$X4" > "$T/list"
+    framed "$X4" || fail "the full-screen window was never framed"
+    sleep 3
+    r=$("$WINE" probe.exe rect SgLinuxWindow "Full Terminal" 2>/dev/null | tr -d '\r')
+    [ "$r" = "0 0 1024 700" ] && pass "a window full screen before it was framed gets a full-screen frame (0 0 1024 700)" \
+        || fail "full screen before framed: its frame $r (want 0 0 1024 700)"
+    wait "$WP"
+    other=$(grep '^size ' "$T/sizes" | grep -v '^size 1024x700$' | tr '\n' ' ')
+    [ -z "$other" ] && pass "...and it is given no other size meanwhile" \
+        || fail "framed, it was given ${other}before its full screen (an SFML game makes its window again for each)"
+fi
 kill "$XT" 2>/dev/null; XT=
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
