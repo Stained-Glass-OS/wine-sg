@@ -19,6 +19,10 @@
 #   BadSetter.xbf   an unknown setter kind
 #   BadTemplate.xbf a template's section past the table
 #   LoopSection.xbf a deferred element whose section refers to itself
+#   AppDict.xbf     a ResourceDictionary root as newer compilers write it (dictionary reference kind 10):
+#                   "Plain" (#FFFFFF00), and "Cond" chosen by conditional XAML between #FFFF00FF
+#                   (IsApiContractPresent) and #FFFF0000 (IsApiContractNotPresent); its brushes' type
+#                   given by XML namespace (type flag 2), as compiled App.xaml files have it
 import struct, sys, os
 
 def u8(v): return struct.pack('<B', v)
@@ -55,12 +59,12 @@ def v_enum(eid, v): return u8(0x0B) + u16(eid) + u32(v)
 
 def prop(pid, value): return u8(0x1A) + u16(pid) + value
 
-def xbf(strings, nodes, sections=None):
+def xbf(strings, nodes, sections=None, types=()):
     out = b'XBF\0' + u32(0) + u32(0) + u32(2) + u32(1) + b'\0' * 48 + b'\0' * 64
     out += u32(len(strings)) + b''.join(s16(s) + u16(0) for s in strings)
     out += u32(0)                      # assemblies
     out += u32(0)                      # type namespaces
-    out += u32(0)                      # types
+    out += u32(len(types)) + b''.join(u32(f) + u32(ns) + u32(name) for f, ns, name in types)   # types
     out += u32(0)                      # properties
     out += u32(1) + u32(0)             # XML namespaces: strings[0]
     if sections is None: sections = [(0, len(nodes))]
@@ -147,6 +151,22 @@ def styles(bad=None):
         pos += len(sec)
     return strings, nodes, sections
 
+def appdict():
+    strings = [PRESENTATION, 'Plain', 'Cond', 'SolidColorBrush', 'Windows.Foundation.UniversalApiContract,13']
+    types = [(2, 0, 3)]                # SolidColorBrush in XML namespace 0
+    def brush(argb): return u8(0x14) + u16(0) + prop(P_SCB_COLOR, v_color(argb)) + u8(0x21)
+    plain, present, absent = brush(0xFFFFFF00), brush(0xFFFF00FF), brush(0xFFFF0000)
+    s1 = plain + present + absent
+    a, b = len(plain), len(plain) + len(present)
+    ref = u8(0x0F) + v7(1) + u16(0) + v7(10)
+    ref += v7(1) + u16(1) + v7(0)                       # keyed: Plain
+    ref += v7(0) + v7(0)                                # (keys of styles), implicit styles
+    ref += v7(1) + u16(2) + v7(2) + v7(b) + v7(a)       # Cond: two alternatives
+    ref += v7(0)
+    ref += v7(2) + v7(a) + v7(1) + u16(0x8369) + u16(4) + v7(b) + v7(1) + u16(0x836a) + u16(4)
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(0x8173) + ref + u8(0x21)
+    return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))], types
+
 def loop():
     strings = [PRESENTATION]
     n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID) + u8(0x0F) + v7(1) + u16(0) + v7(6) + u16(0) + v7(0) + u8(0x21)
@@ -171,3 +191,5 @@ for name, bad in (('TestStyles', None), ('BadDict', 'dict'), ('BadSetter', 'sett
     write(name + '.xbf', xbf(st, nd, sc))
 st, nd, sc = loop()
 write('LoopSection.xbf', xbf(st, nd, sc))
+st, nd, sc, ty = appdict()
+write('AppDict.xbf', xbf(st, nd, sc, ty))
