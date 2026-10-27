@@ -1,11 +1,13 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# Windows.ApplicationModel.Resources.Core.ResourceManager (patches/sg/6128): Current, the main
+# Windows.ApplicationModel.Resources.Core.ResourceManager (patches/sg/6128, 6130): Current, the main
 # resource map, values and subtrees, a candidate's string, a missing resource, resource references,
-# over the application's resources.pri (test/mkpri.py). NanaZip's file manager gets its strings this
-# way; the class did not exist. test/resman-probe.c.
+# a map as a map view (HasKey, Lookup, a named resource's candidates, 6130), over the
+# application's resources.pri (test/mkpri.py). NanaZip's file manager gets its strings this way;
+# the class did not exist. test/resman-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/resman-gate.sh
-# Mutant (dlls/windows.applicationmodel/resource_manager.c): SG_MUTANT_RESMAN_NOT_FOUND.
+# Mutant (dlls/windows.applicationmodel/resource_manager.c): SG_MUTANT_RESMAN_NOT_FOUND,
+# SG_MUTANT_RESMAP_NO_KEYS (6130).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -50,6 +52,9 @@ expect "$out" farewell Goodbye "a value in a subtree"
 expect "$out" deep "Deep value" "a nested value in a subtree"
 expect "$out" fromroot "Custom map" "a path from the root, in a subtree"
 expect "$out" utf8 "Grüße" "another map's value, stored as UTF-8"
+expect "$out" mapview_qi 00000000 "a map is a map view (IMapView<String, NamedResource>)"
+expect "$out" lookup "has 1 n 1 Goodbye" "HasKey, then Lookup(key).Candidates().GetAt(0).ValueAsString(), as NanaZip reads its strings"
+expect "$out" lookup_missing "has 0 hr 8000000b" "a key that is not there: HasKey false, Lookup E_BOUNDS"
 expect "$out" isref 1 "an ms-resource: URI is a resource reference"
 expect "$out" notref 0 "plain text is not"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
