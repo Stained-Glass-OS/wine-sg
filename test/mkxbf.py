@@ -33,6 +33,9 @@
 #   ThemeDict.xbf   a ResourceDictionary whose ResourceDictionary.ThemeDictionaries (owner named, as
 #                   compilers write it) holds a "Default" dictionary (keyed item, node 0x0A) with
 #                   "ThemeBrush" (#FF00FFFF)
+#   ColorDict.xbf   a ResourceDictionary with a literal Color "DictColor" (#FF0080FF; node 0x15, as
+#                   compiled <Color x:Key> entries are) and a SolidColorBrush "DictBrush" whose Color is
+#                   {StaticResource DictColor}
 import struct, sys, os
 
 def u8(v): return struct.pack('<B', v)
@@ -186,6 +189,15 @@ def themedict():
     n += u8(0x21)
     return strings, n + brush, [(0, len(n)), (len(n), len(n) + len(brush))]
 
+def colordict():
+    strings = [PRESENTATION, 'DictColor', 'DictBrush']
+    color = u8(0x15) + u16(0x802A) + v_color(0xFF0080FF) + u8(0x21)
+    brush = u8(0x14) + u16(T_SCB) + u8(0x1E) + u16(P_SCB_COLOR) + v_str(1) + u8(0x21)
+    s1 = color + brush
+    ref = u8(0x0F) + v7(1) + u16(0) + v7(7) + v7(2) + u16(1) + v7(0) + u16(2) + v7(len(color)) + v7(0) + v7(0) + v7(0)
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(0x8173) + ref + u8(0x21)
+    return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
+
 def templconn():
     strings = [PRESENTATION]
     left_top = prop(P_HALIGN, v_enum(0x0263, 0)) + prop(P_VALIGN, v_enum(0x0264, 0))
@@ -251,3 +263,5 @@ st, nd, sc = deferred()
 write('Deferred.xbf', xbf(st, nd, sc))
 st, nd, sc = datalist()
 write('DataList.xbf', xbf(st, nd, sc))
+st, nd, sc = colordict()
+write('ColorDict.xbf', xbf(st, nd, sc))
