@@ -3,7 +3,8 @@
 # Windows.UI.Xaml keyboard (patches/sg/6153): a TextBox clicked takes the focus (GotFocus), typed
 # characters and editing keys (Left, Back, Home, End, Delete) change its text, KeyDown routes up to
 # its parents and a handler setting Handled keeps the box from using the key, Control.Focus moves the
-# focus (LostFocus) -- NanaZip's address bar takes a path. test/xamlkeys-probe.c.
+# focus (LostFocus), PreviewKeyDown tunnels from the root first (patches/sg/6154) -- NanaZip's address
+# bar takes a path. test/xamlkeys-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/xamlkeys-gate.sh
 # Mutant (dlls/windows.ui.xaml/textinput.c): SG_MUTANT_TEXTBOX_NO_KEYS.
 set -u
@@ -49,6 +50,7 @@ chk '^back=abc$' "Back deletes before the caret"
 chk '^routed=1,8$' "KeyDown routed up to the Grid (VK_BACK)"
 chk '^handled=abZc$' "a KeyDown handler setting Handled keeps Home from the box (the caret stays)"
 chk '^delete=abZ$' "End, Delete at the end, Left, Delete"
+chk '^preview=1,0,abZ$' "PreviewKeyDown on the Grid handled first: no KeyDown, the box keeps its text"
 chk '^moved=00000000,1,1,o$' "Control.Focus: the other box takes the keys, LostFocus"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

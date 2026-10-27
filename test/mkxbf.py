@@ -26,6 +26,8 @@
 #   TemplConn.xbf   a Page whose Button's compiled ControlTemplate has an x:ConnectionId of its own (2,
 #                   its x:Bind scope) and one (5) on its root Border ({TemplateBinding Background}) and members and an object of framework IDs
 #                   newer than our table (dropped, not fatal)
+#   Deferred.xbf    a Grid with a deferred element (x:Load; section reference kind 9, as newer compilers
+#                   write it) left unrealized, and a Border after it (x:Name After)
 #   ThemeDict.xbf   a ResourceDictionary whose ResourceDictionary.ThemeDictionaries (owner named, as
 #                   compilers write it) holds a "Default" dictionary (keyed item, node 0x0A) with
 #                   "ThemeBrush" (#FF00FFFF)
@@ -196,6 +198,14 @@ def templconn():
     s1 += prop(0x8FFE, v_int(3)) + u8(0x21)
     return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
 
+def deferred():
+    strings = [PRESENTATION, 'Lazy', 'After']
+    s1 = u8(0x14) + u16(T_BORDER) + u8(0x0D) + v_str(1) + u8(0x21)
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID)
+    n += u8(0x0F) + v7(1) + u16(0) + v7(9) + u16(1) + v7(0) + v7(1)
+    n += u8(0x14) + u16(T_BORDER) + u8(0x0D) + v_str(2) + u8(0x21) + u8(0x08) + u8(0x21)
+    return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
+
 def loop():
     strings = [PRESENTATION]
     n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID) + u8(0x0F) + v7(1) + u16(0) + v7(6) + u16(0) + v7(0) + u8(0x21)
@@ -226,3 +236,5 @@ st, nd, sc = themedict()
 write('ThemeDict.xbf', xbf(st, nd, sc))
 st, nd, sc = templconn()
 write('TemplConn.xbf', xbf(st, nd, sc))
+st, nd, sc = deferred()
+write('Deferred.xbf', xbf(st, nd, sc))

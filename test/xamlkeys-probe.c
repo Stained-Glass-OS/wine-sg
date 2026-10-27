@@ -36,6 +36,7 @@ DEFINE_GUID(IID_RD,             0xc1ea4f24, 0xd6de, 0x4191, 0x8e, 0x3a, 0xf4, 0x
 DEFINE_GUID(IID_PVStatics,      0x629bdbc8, 0xd932, 0x4ff4, 0x96, 0xb9, 0x8d, 0x96, 0xc5, 0xc1, 0xe8, 0x58);
 DEFINE_GUID(IID_TextBox,        0xe48f5a8b, 0x1dff, 0x4352, 0xa1, 0xf4, 0xe5, 0x16, 0x51, 0x4e, 0xc8, 0x82);
 DEFINE_GUID(IID_ItemsControl,   0xf4a91dd8, 0xd979, 0x4381, 0x86, 0x52, 0xbd, 0xa0, 0x34, 0x2a, 0x76, 0x5e);
+DEFINE_GUID(IID_UIE7,           0xcafc4968, 0x6369, 0x4249, 0x80, 0xf9, 0x3d, 0x65, 0x63, 0x19, 0xe8, 0x11);
 DEFINE_GUID(IID_KeyArgs,        0xd4cd3dfe, 0x4079, 0x42e9, 0xa3, 0x9a, 0x30, 0x95, 0xd3, 0xf0, 0x49, 0xc6);
 DEFINE_GUID(IID_Connector,      0xf6790987, 0xe6e5, 0x47f2, 0x92, 0xc6, 0xec, 0xcc, 0xe4, 0xba, 0x15, 0x9a);
 
@@ -175,6 +176,15 @@ int main(void)
     key(island, VK_LEFT);
     key(island, VK_DELETE);
     printf("delete=%ls\n", text_of(as(box, &IID_TextBox), &s));
+
+    /* PreviewKeyDown tunnels from the root first: the Grid handles Back, the box keeps its text */
+    {
+        struct handler preview = { h_vtbl, 1, 0, 0, VK_BACK };
+        int before = box_keys.calls;
+        ((HRESULT (WINAPI *)(obj *, void *, INT64 *))SLOT(as(grid, &IID_UIE7), 11))(as(grid, &IID_UIE7), &preview, &token);
+        key(island, VK_BACK);
+        printf("preview=%d,%d,%ls\n", preview.calls > 0, box_keys.calls - before, text_of(as(box, &IID_TextBox), &s));
+    }
 
     /* Control.Focus moves the focus */
     hr = ((HRESULT (WINAPI *)(obj *, int, boolean *))SLOT(as(other, &IID_Control), 46))(as(other, &IID_Control), 3, &focused);
