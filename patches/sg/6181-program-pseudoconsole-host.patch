@@ -1,0 +1,228 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll, kernelbase, conhost: a program's own pseudoconsole host
+
+Windows Terminal brings its own ConPTY code and console host: it opens the console driver's server and the "\Reference" below it itself, starts its OpenConsole.exe as the host with "--headless --textMeasurement graphemes --width --height --signal --server", then starts the shell on the pseudoconsole. Each step failed: a name with a leading backslash relative to a device's open file was refused (STATUS_INVALID_PARAMETER); OpenConsole serves the Windows console driver's protocol, which ours does not speak; our conhost refused the options it did not know; it read the signal pipe asynchronously, which blocks on Windows Terminal's synchronous pipe, so no console request was ever served; and GetModuleFileNameEx of the shell, asked right after CreateProcess before its loader had run, failed (ERROR_INVALID_HANDLE). Now such a name goes to the device without its separator; OpenConsole.exe started as a pseudoconsole host runs as our conhost.exe, detached, which takes the same command line; conhost takes and ignores the other hosts' options; a synchronous signal pipe is read by a thread that passes the signals on; and GetModuleFileNameEx of a process image falls back to its image name.
+---
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 0ab2192..4e88847 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -1809,7 +1809,17 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetModuleFileNameExW( HANDLE process, HMODULE mod
+     {
+         LDR_DATA_TABLE_ENTRY ldr_module;
+ 
+-        if (!get_ldr_module(process, module, &ldr_module)) return 0;
++        if (!get_ldr_module(process, module, &ldr_module))
++        {
++            DWORD image_len = size;
++
++#ifndef SG_MUTANT_NO_IMAGE_NAME_FALLBACK
++            /* the process image of a process whose loader has not run yet (just created): its
++             * image name, as Windows gives it (Windows Terminal names its new shell so) */
++            if (!module && QueryFullProcessImageNameW( process, 0, name, &image_len )) return image_len;
++#endif
++            return 0;
++        }
+         len = ldr_module.FullDllName.Length / sizeof(WCHAR);
+         if (!ReadProcessMemory( process, ldr_module.FullDllName.Buffer,
+                                 name, min( len, size ) * sizeof(WCHAR), NULL ))
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index ab7e690..4be112e 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -856,6 +856,38 @@ static BOOL sg_elevation_required( const WCHAR *app_name, HANDLE token )
+ /**********************************************************************
+  *           CreateProcessInternalW   (kernelbase.@)
+  */
++/* Stained Glass OS: a program bringing its own console host (Windows Terminal's OpenConsole.exe) starts it
++ * as a pseudoconsole's host, "--headless ... --server 0x<handle>".  That host serves the Windows console
++ * driver's protocol, which ours does not speak; our conhost.exe takes the same command line and serves
++ * our console driver, so it is started in its place.  Returns the new command line (heap) and the host's
++ * path in path, or NULL. */
++static WCHAR *sg_console_host_redirect( const WCHAR *app_name, const WCHAR *cmd_line, WCHAR *path, DWORD size )
++{
++    const WCHAR *base, *args;
++    WCHAR *ret;
++    size_t len;
++
++#ifdef SG_MUTANT_NO_CONSOLE_HOST_REDIRECT
++    return NULL;
++#endif
++    if (!app_name || !cmd_line) return NULL;
++    base = wcsrchr( app_name, '\\' );
++    base = base ? base + 1 : app_name;
++    if (wcsicmp( base, L"OpenConsole.exe" )) return NULL;
++    if (!wcsstr( cmd_line, L" --headless" ) || !wcsstr( cmd_line, L" --server " )) return NULL;
++    /* the arguments: past the program's (quoted) name */
++    args = cmd_line;
++    if (*args == '"') { args = wcschr( args + 1, '"' ); if (!args) return NULL; args++; }
++    else while (*args && *args != ' ') args++;
++    if (!GetSystemDirectoryW( path, size - 13 )) return NULL;
++    lstrcatW( path, L"\\conhost.exe" );
++    len = lstrlenW( path ) + lstrlenW( args ) + 3;
++    if (!(ret = HeapAlloc( GetProcessHeap(), 0, len * sizeof(WCHAR) ))) return NULL;
++    swprintf( ret, len, L"\"%s\"%s", path, args );
++    TRACE( "console host %s started as %s\n", debugstr_w(app_name), debugstr_w(ret) );
++    return ret;
++}
++
+ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR *app_name, WCHAR *cmd_line,
+                                                       SECURITY_ATTRIBUTES *process_attr,
+                                                       SECURITY_ATTRIBUTES *thread_attr,
+@@ -903,6 +935,16 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
+         tidy_cmdline = p;
+     }
+ 
++    /* a pseudoconsole's host: ours */
++    if ((p = sg_console_host_redirect( app_name, tidy_cmdline, alias_target, ARRAY_SIZE(alias_target) )))
++    {
++        if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
++        tidy_cmdline = p;
++        app_name = alias_target;
++        /* a host has no console of its own, as ours is started for our pseudoconsoles */
++        flags = (flags & ~(CREATE_NEW_CONSOLE | CREATE_NO_WINDOW)) | DETACHED_PROCESS;
++    }
++
+     if (sg_elevation_required( app_name, token ))
+     {
+         status = STATUS_ELEVATION_REQUIRED;
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index ae1901c..c0c54df 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -2324,7 +2324,11 @@ static unsigned int server_open_file_object( HANDLE *handle, ACCESS_MASK access,
+         req->sharing    = sharing;
+         req->options    = options;
+         req->unix_fd    = unix_fd;
+-        wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
++        if (attr->RootDirectory && attr->ObjectName->Length && attr->ObjectName->Buffer[0] == '\\')
++            /* a path below a device's open file: its name without the separator */
++            wine_server_add_data( req, attr->ObjectName->Buffer + 1, attr->ObjectName->Length - sizeof(WCHAR) );
++        else
++            wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
+         status = wine_server_call( req );
+         *handle = wine_server_ptr_handle( reply->handle );
+     }
+@@ -4070,7 +4074,22 @@ NTSTATUS nt_to_unix_file_name( const OBJECT_ATTRIBUTES *attr, char **name_ret, U
+     name     = attr->ObjectName->Buffer;
+     name_len = attr->ObjectName->Length / sizeof(WCHAR);
+ 
+-    if (name_len && name[0] == '\\') return STATUS_INVALID_PARAMETER;
++    if (name_len && name[0] == '\\')
++    {
++        /* a device's own path below an open file of it (ConDrv's "\\Reference" below its server):
++         * the device takes it; below a directory such a name is invalid */
++        int fd, close_fd;
++        enum server_fd_type root_type;
++        if (!server_get_unix_fd( attr->RootDirectory, 0, &fd, &close_fd, &root_type, NULL ))
++        {
++            if (close_fd) close( fd );
++            if (root_type == FD_TYPE_DIR || root_type == FD_TYPE_FILE) return STATUS_INVALID_PARAMETER;
++        }
++#ifdef SG_MUTANT_DEVICE_RELATIVE_BACKSLASH
++        return STATUS_INVALID_PARAMETER;
++#endif
++        return STATUS_BAD_DEVICE_TYPE;
++    }
+ 
+     unix_len = name_len * 3 + MAX_DIR_ENTRY_LEN + 3;
+     if (!(unix_name = malloc( unix_len ))) return STATUS_NO_MEMORY;
+diff --git a/programs/conhost/conhost.c b/programs/conhost/conhost.c
+index 82c4f67..2813d03 100644
+--- a/programs/conhost/conhost.c
++++ b/programs/conhost/conhost.c
+@@ -3948,6 +3948,61 @@ static void clear_pseudo_console( struct console *console )
+ #endif
+ }
+ 
++/* A signal pipe opened for synchronous I/O (Windows Terminal's) cannot be read asynchronously, as
++ * the main loop does: a thread reads it and passes what it reads on through a pipe of ours. */
++struct signal_relay { HANDLE from, to; };
++
++static DWORD WINAPI signal_relay_thread( void *arg )
++{
++    struct signal_relay *relay = arg;
++    char buffer[256];
++    DWORD count, written;
++
++    while (ReadFile( relay->from, buffer, sizeof(buffer), &count, NULL ) && count)
++        if (!WriteFile( relay->to, buffer, count, &written, NULL )) break;
++    CloseHandle( relay->to );   /* the main loop reads its end: the host quits */
++    free( relay );
++    return 0;
++}
++
++static HANDLE async_signal( HANDLE signal )
++{
++    FILE_MODE_INFORMATION mode;
++    struct signal_relay *relay;
++    IO_STATUS_BLOCK io;
++    WCHAR name[64];
++    HANDLE read_end, thread;
++
++    if (NtQueryInformationFile( signal, &io, &mode, sizeof(mode), FileModeInformation ) ||
++        !(mode.Mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)))
++        return signal;
++#ifdef SG_MUTANT_CONHOST_SYNC_SIGNAL
++    return signal;
++#endif
++    swprintf( name, ARRAY_SIZE(name), L"\\\\.\\pipe\\wine_conhost_signal_%lx", GetCurrentProcessId() );
++    read_end = CreateNamedPipeW( name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED, PIPE_TYPE_BYTE, 1,
++                                 4096, 4096, NMPWAIT_USE_DEFAULT_WAIT, NULL );
++    if (read_end == INVALID_HANDLE_VALUE) return signal;
++    if (!(relay = malloc( sizeof(*relay) )) ||
++        (relay->to = CreateFileW( name, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL )) == INVALID_HANDLE_VALUE)
++    {
++        free( relay );
++        CloseHandle( read_end );
++        return signal;
++    }
++    relay->from = signal;
++    if (!(thread = CreateThread( NULL, 0, signal_relay_thread, relay, 0, NULL )))
++    {
++        CloseHandle( relay->to );
++        free( relay );
++        CloseHandle( read_end );
++        return signal;
++    }
++    CloseHandle( thread );
++    TRACE( "signals of %p relayed\n", signal );
++    return read_end;
++}
++
+ static int main_loop( struct console *console, HANDLE signal )
+ {
+     HANDLE signal_event = NULL;
+@@ -3960,6 +4015,7 @@ static int main_loop( struct console *console, HANDLE signal )
+ 
+     if (signal)
+     {
++        signal = async_signal( signal );
+         if (!(signal_event = CreateEventW( NULL, TRUE, FALSE, NULL ))) return 1;
+         status = NtReadFile( signal, signal_event, NULL, NULL, &signal_io, &signal_id,
+                              sizeof(signal_id), NULL, NULL );
+@@ -4122,6 +4178,24 @@ int __cdecl wmain(int argc, WCHAR *argv[])
+             if (*end) return 1;
+             continue;
+         }
++#ifndef SG_MUTANT_CONHOST_STRICT_OPTIONS
++        /* other pseudoconsole hosts' options (Windows Terminal's): our output and input are the same
++         * whatever they ask for, so they are taken and ignored */
++        if (!wcscmp( argv[i], L"--inheritcursor" ) || !wcscmp( argv[i], L"--ambiguousIsWide" ) ||
++            !wcscmp( argv[i], L"--resizeQuirk" ) || !wcscmp( argv[i], L"--win32input" ) ||
++            !wcscmp( argv[i], L"--passthrough" ))
++        {
++            FIXME( "option %s ignored\n", debugstr_w(argv[i]) );
++            continue;
++        }
++        if (!wcscmp( argv[i], L"--textMeasurement" ) || !wcscmp( argv[i], L"--vtmode" ) ||
++            !wcscmp( argv[i], L"--feature" ))
++        {
++            if (++i == argc) return 1;
++            FIXME( "option %s %s ignored\n", debugstr_w(argv[i - 1]), debugstr_w(argv[i]) );
++            continue;
++        }
++#endif
+         FIXME( "unknown option %s\n", debugstr_w(argv[i]) );
+         return 1;
+     }
