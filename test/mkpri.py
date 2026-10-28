@@ -12,6 +12,8 @@
 #   Resources/Nested/Deep   neutral "Deep value"
 #   custom/Title            neutral "Custom map"
 #   custom/Utf8             neutral "Grüße" stored as UTF-8
+#   Resources/UidButton/Content  neutral "Localized button"  (x:Uid="UidButton", test/xamluid-gate.sh)
+#   custom/UidText/Text          neutral "Localized text"    (x:Uid="/custom/UidText")
 #
 # Layout as documented by independent readers of the format (see
 # dlls/windows.applicationmodel/pri.c in the patched tree).
@@ -37,9 +39,9 @@ def section(ident, content):
 
 
 # ---- the tree: scopes and items ------------------------------------------
-scopes = ['', 'Resources', 'Nested', 'custom']           # index 0 is the root
-scope_parent = [0, 0, 1, 0]
-items = [('Greeting', 1), ('Farewell', 1), ('Deep', 2), ('Title', 3), ('Utf8', 3)]
+scopes = ['', 'Resources', 'Nested', 'custom', 'UidButton', 'UidText']   # index 0 is the root
+scope_parent = [0, 0, 1, 0, 1, 3]
+items = [('Greeting', 1), ('Farewell', 1), ('Deep', 2), ('Title', 3), ('Utf8', 3), ('Content', 4), ('Text', 5)]
 
 
 def hschema():
@@ -130,6 +132,8 @@ values = [
     (1, [(STRING, utf16z('Deep value'), True)]),
     (1, [(STRING, utf16z('Custom map'), True)]),
     (1, [(UTF8, 'Grüße'.encode('utf-8') + b'\0', True)]),
+    (1, [(STRING, utf16z('Localized button'), True)]),
+    (1, [(STRING, utf16z('Localized text'), True)]),
 ]
 SEC_DESC, SEC_SCHEMA, SEC_DECN, SEC_MAP, SEC_DATA = range(5)
 
