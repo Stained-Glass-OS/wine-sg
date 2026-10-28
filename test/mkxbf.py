@@ -39,6 +39,13 @@
 #   ColorDict.xbf   a ResourceDictionary with a literal Color "DictColor" (#FF0080FF; node 0x15, as
 #                   compiled <Color x:Key> entries are) and a SolidColorBrush "DictBrush" whose Color is
 #                   {StaticResource DictColor}
+#   DeferLoad.xbf   a Grid with an x:Load element as compilers write it: a DeferredElement object (0x82EA)
+#                   holding a section reference of kind 9; its section is a Border x:Name Lazy (Background
+#                   #FFFF0000); a Border x:Name After follows (realized when found by name, patches/sg/6177)
+#   NestedRoot.xbf  a Grid whose first child is written as a root object (node 0x17, as compilers write
+#                   objects of other namespaces), x:Name Inner, then a Border x:Name Tail
+#   NamedBrush.xbf  a Grid whose Background is a SolidColorBrush with an x:Name (objects without a Name
+#                   member are named in markup only), then a Border x:Name Tail2
 import struct, sys, os
 
 def u8(v): return struct.pack('<B', v)
@@ -248,6 +255,30 @@ def loop():
     s1 = u8(0x14) + u16(T_GRID) + u8(0x0F) + v7(1) + u16(0) + v7(6) + u16(0) + v7(0) + u8(0x21)
     return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
 
+T_DEFERRED = 0x82EA
+
+def deferload():
+    strings = [PRESENTATION, 'Lazy', 'After']
+    s1 = u8(0x14) + u16(T_BORDER) + u8(0x0D) + v_str(1) + prop(P_BORDER_BACKGROUND, v_color(0xFFFF0000)) + u8(0x21)
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID)
+    n += u8(0x14) + u16(T_DEFERRED) + u8(0x0F) + v7(1) + u16(0) + v7(9) + u16(1) + v7(0) + v7(1) + u8(0x21) + u8(0x08)
+    n += u8(0x14) + u16(T_BORDER) + u8(0x0D) + v_str(2) + u8(0x21) + u8(0x08) + u8(0x21)
+    return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
+
+def nestedroot():
+    strings = [PRESENTATION, 'Inner', 'Tail']
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID)
+    n += u8(0x17) + u16(T_BORDER) + u8(0x0D) + v_str(1) + u8(0x21) + u8(0x08)
+    n += u8(0x14) + u16(T_BORDER) + u8(0x0D) + v_str(2) + u8(0x21) + u8(0x08) + u8(0x21)
+    return strings, n
+
+def namedbrush():
+    strings = [PRESENTATION, 'Fill', 'Tail2']
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID)
+    n += u8(0x14) + u16(T_SCB) + u8(0x0D) + v_str(1) + prop(P_SCB_COLOR, v_color(0xFF00FF00)) + u8(0x21) + u8(0x07) + u16(P_PANEL_BACKGROUND)
+    n += u8(0x14) + u16(T_BORDER) + u8(0x0D) + v_str(2) + u8(0x21) + u8(0x08) + u8(0x21)
+    return strings, n
+
 d = sys.argv[1]
 def write(name, data):
     with open(os.path.join(d, name), 'wb') as f: f.write(data)
@@ -280,3 +311,9 @@ st, nd, sc = colordict()
 write('ColorDict.xbf', xbf(st, nd, sc))
 st, nd, sc = conddict()
 write('CondDict.xbf', xbf(st, nd, sc))
+st, nd, sc = deferload()
+write('DeferLoad.xbf', xbf(st, nd, sc))
+st, nd = nestedroot()
+write('NestedRoot.xbf', xbf(st, nd))
+st, nd = namedbrush()
+write('NamedBrush.xbf', xbf(st, nd))
