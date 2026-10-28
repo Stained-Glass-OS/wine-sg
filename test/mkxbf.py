@@ -33,6 +33,9 @@
 #   ThemeDict.xbf   a ResourceDictionary whose ResourceDictionary.ThemeDictionaries (owner named, as
 #                   compilers write it) holds a "Default" dictionary (keyed item, node 0x0A) with
 #                   "ThemeBrush" (#FF00FFFF)
+#   CondDict.xbf    a ResourceDictionary with a SolidColorBrush "CondBrush" whose Color is set in two conditional
+#                   XAML blocks (nodes 0x26/0x27): #FFFF0000 under IsApiContractNotPresent, #FF00FF00 under
+#                   IsApiContractPresent
 #   ColorDict.xbf   a ResourceDictionary with a literal Color "DictColor" (#FF0080FF; node 0x15, as
 #                   compiled <Color x:Key> entries are) and a SolidColorBrush "DictBrush" whose Color is
 #                   {StaticResource DictColor}
@@ -198,6 +201,16 @@ def colordict():
     n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(0x8173) + ref + u8(0x21)
     return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
 
+def conddict():
+    strings = [PRESENTATION, 'CondBrush', 'Windows.Foundation.UniversalApiContract,5']
+    brush = u8(0x14) + u16(T_SCB)
+    brush += u8(0x26) + u16(0x836a) + u16(2) + prop(P_SCB_COLOR, v_color(0xFFFF0000)) + u8(0x27)
+    brush += u8(0x26) + u16(0x8369) + u16(2) + prop(P_SCB_COLOR, v_color(0xFF00FF00)) + u8(0x27)
+    brush += u8(0x21)
+    ref = u8(0x0F) + v7(1) + u16(0) + v7(7) + v7(1) + u16(1) + v7(0) + v7(0) + v7(0) + v7(0)
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(0x8173) + ref + u8(0x21)
+    return strings, n + brush, [(0, len(n)), (len(n), len(n) + len(brush))]
+
 def templconn():
     strings = [PRESENTATION]
     left_top = prop(P_HALIGN, v_enum(0x0263, 0)) + prop(P_VALIGN, v_enum(0x0264, 0))
@@ -265,3 +278,5 @@ st, nd, sc = datalist()
 write('DataList.xbf', xbf(st, nd, sc))
 st, nd, sc = colordict()
 write('ColorDict.xbf', xbf(st, nd, sc))
+st, nd, sc = conddict()
+write('CondDict.xbf', xbf(st, nd, sc))
