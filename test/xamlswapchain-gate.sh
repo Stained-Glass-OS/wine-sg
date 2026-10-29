@@ -7,7 +7,8 @@
 # test/xamlswapchain-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/xamlswapchain-gate.sh
 # Mutants: SG_MUTANT_DXGI_NO_FACTORY_MEDIA (dlls/dxgi/factory.c), SG_MUTANT_DXGI_SURFACE_HANDLE_UNKNOWN
-# (dlls/dxgi/composition.c), SG_MUTANT_SWAP_PANEL_NOT_PRESENTED (dlls/windows.ui.xaml/panel.c).
+# (dlls/dxgi/composition.c), SG_MUTANT_SWAP_PANEL_NOT_PRESENTED (dlls/windows.ui.xaml/panel.c),
+# SG_MUTANT_SURFACE_NOT_UNSCALED (dlls/dxgi/composition.c, 6183).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -43,6 +44,7 @@ printf '%s\n' "$out" | sed 's/^/      /'
 RC=0
 chk() { if printf '%s\n' "$out" | grep -q "$1"; then printf 'PASS  %s\n' "$2"; else printf 'FAIL  %s\n' "$2"; RC=1; fi; }
 chk '^media=1,1,00000000,1$' "IDXGIFactoryMedia makes a composition swap chain for a surface handle (none without one)"
+chk '^unscaled=00000000,887a0001$' "DXGI_SCALING_NONE: taken for a surface handle (6183), refused for CreateSwapChainForComposition"
 chk '^load=00000000$' "markup with two SwapChainPanels"
 chk '^set=00000000,00000000$' "SetSwapChainHandle and SetSwapChain taken"
 chk '^byhandle=1,1$' "the frame presented to the handle's swap chain shows in its panel's place, not beyond"

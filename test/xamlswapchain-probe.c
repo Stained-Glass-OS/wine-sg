@@ -2,7 +2,7 @@
  * for a DirectComposition surface handle (IDXGIFactoryMedia::CreateSwapChainForCompositionSurfaceHandle,
  * as Windows Terminal's renderer makes it) given to a SwapChainPanel by ISwapChainPanelNative2::
  * SetSwapChainHandle, and one made by CreateSwapChainForComposition given by ISwapChainPanelNative::
- * SetSwapChain: what is presented shows in the panel's place in a hosted island, and again after the
+ * SetSwapChain (an unscaled one only for a surface handle, patches/sg/6183): what is presented shows in the panel's place in a hosted island, and again after the
  * island paints over it. Interface identity per windows-rs 0.30.0 (MIT); DXGI/D3D11 from mingw-w64. */
 #define COBJMACROS
 #include <windows.h>
@@ -128,6 +128,20 @@ int main(void)
         hr_none = IDXGIFactoryMedia_CreateSwapChainForCompositionSurfaceHandle(media, (IUnknown *)device, NULL, &desc, NULL, &none);
     }
     printf("media=%d,%d,%08lx,%d\n", media != NULL, surface != NULL, hr, hr_none == E_INVALIDARG && !none);
+    /* unscaled (Windows Terminal's): for a surface handle only */
+    {
+        DXGI_SWAP_CHAIN_DESC1 unscaled = desc;
+        IDXGISwapChain1 *u1 = NULL, *u2 = NULL;
+        HANDLE surface2 = NULL;
+        HRESULT hr1 = E_FAIL, hr2 = E_FAIL;
+        unscaled.Scaling = DXGI_SCALING_NONE;
+        DCompositionCreateSurfaceHandle(0x0003, NULL, &surface2);
+        if (media) hr1 = IDXGIFactoryMedia_CreateSwapChainForCompositionSurfaceHandle(media, (IUnknown *)device, surface2, &unscaled, NULL, &u1);
+        if (dxgi) hr2 = IDXGIFactory2_CreateSwapChainForComposition(dxgi, (IUnknown *)device, &unscaled, NULL, &u2);
+        printf("unscaled=%08lx,%08lx\n", hr1, hr2);
+        if (u1) IDXGISwapChain1_Release(u1);
+        if (u2) IDXGISwapChain1_Release(u2);
+    }
     if (dxgi) IDXGIFactory2_CreateSwapChainForComposition(dxgi, (IUnknown *)device, &desc, NULL, &chain2);
 
     if (!(rs = factory(L"Windows.UI.Xaml.Markup.XamlReader", &IID_ReaderStatics))) return 1;
