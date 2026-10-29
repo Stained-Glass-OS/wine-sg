@@ -3,7 +3,7 @@
  * taken back when another state is entered (an animated value above the local one) -- a composable
  * VisualStateManager, a Storyboard of the program's own with Storyboard.SetTarget: Begin, Completed,
  * Stop; a DependencyObject's Dispatcher asked from another thread (Windows Terminal's render thread),
- * ElementCompositionPreview.GetElementVisual.  Interface identity per windows-rs 0.30.0 (MIT). */
+ * ElementCompositionPreview.GetElementVisual; a KeySpline written "0,0,0,1" (6187).  Interface identity per windows-rs 0.30.0 (MIT). */
 #define COBJMACROS
 #include <windows.h>
 #include <initguid.h>
@@ -80,6 +80,10 @@ static const WCHAR page_xaml[] =
     L"<VisualState x:Name=\"Tall\"><Storyboard>"
     L"<DoubleAnimation Storyboard.TargetName=\"Box\" Storyboard.TargetProperty=\"Height\" To=\"33\" Duration=\"0\"/>"
     L"</Storyboard></VisualState>"
+    L"<VisualState x:Name=\"Spline\"><Storyboard>"
+    L"<DoubleAnimationUsingKeyFrames Storyboard.TargetName=\"Box\" Storyboard.TargetProperty=\"Width\">"
+    L"<SplineDoubleKeyFrame KeyTime=\"0:0:0.1\" Value=\"55\" KeySpline=\"0,0,0,1\"/>"
+    L"</DoubleAnimationUsingKeyFrames></Storyboard></VisualState>"
     L"</VisualStateGroup>"
     L"</VisualStateManager.VisualStateGroups>"
     L"<Border x:Name=\"Box\" Width=\"20\" Height=\"10\" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\"/>"
@@ -173,6 +177,9 @@ int main(void)
     ok3 = go(uc, L"Normal");
     printf("normal=%d,%.0f,%.0f\n", ok3, fe_double(box, 15), fe_double(box, 17));
     printf("nostate=%d\n", go(uc, L"NoSuchState"));
+    ok1 = go(uc, L"Spline");
+    printf("spline=%d,%.0f\n", ok1, fe_double(box, 15));
+    go(uc, L"Normal");
 
     vsmf = factory(L"Windows.UI.Xaml.VisualStateManager", &IID_VSMFactory);
     hr = vsmf ? ((HRESULT (WINAPI *)(obj *, IInspectable *, IInspectable **, obj **))SLOT(vsmf, 6))(vsmf, NULL, &inner, &made) : E_FAIL;
