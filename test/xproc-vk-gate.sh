@@ -8,6 +8,10 @@
 # second process makes a Direct3D 11 (DXVK: Vulkan) swap chain for each and
 # presents. Xvfb shows nothing of a Vulkan surface, so the gate asks whether
 # the swap chain was made (render=0), not what it drew.
+# "frame": the host's window gains a caption after the other process made its
+# surface (Opera's "Quit Opera?" dialog); the other process's X window must
+# move to the new client area, or clicks land 20-odd pixels from what is
+# drawn. Mutant SG_MUTANT_FOREIGN_CLIENT_STAYS (window.c) must fail it.
 #
 #   WINE=/opt/wine-sg/bin/wine DXVK=/opt/sg-d3d/dxvk/x64 test/xproc-vk-gate.sh
 set -u
@@ -18,7 +22,7 @@ WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 [ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 DXVK="${DXVK:-/opt/sg-d3d/dxvk/x64}"
 MINGWXX="${MINGWXX:-x86_64-w64-mingw32-g++}"
-for t in Xvfb "$MINGWXX"; do command -v "$t" >/dev/null || { echo "SKIP: $t missing"; exit 77; }; done
+for t in Xvfb xwininfo "$MINGWXX"; do command -v "$t" >/dev/null || { echo "SKIP: $t missing"; exit 77; }; done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 [ -f "$DXVK/dxgi.dll" ] && [ -f "$DXVK/d3d11.dll" ] || { echo "SKIP: no DXVK at $DXVK"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-xprocvk.XXXXXX); XP=
@@ -43,5 +47,18 @@ for m in child top; do
     *) echo "FAIL  another process could not make a swap chain for the $m window"; fail=1 ;;
     esac
 done
+# no window manager: Wine draws the caption itself, so the client area moves
+"$WINE" reg add 'HKCU\Software\Wine\X11 Driver' /v Decorated /d N /f >/dev/null 2>&1; "$WINESERVER" -w
+timeout 60 "$WINE" 'C:\xproc-vk-probe.exe' host frame > "$T/frame.out" 2>/dev/null & FP=$!
+i=0; while ! grep -q '^frame' "$T/frame.out" 2>/dev/null && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+sleep 0.5
+want=$(tr -d '\r' < "$T/frame.out" | sed -n 's/^frame red=[01] offset=\([0-9]*\),\([0-9]*\)$/+\1+\2/p')
+got=$(xwininfo -root -tree 2>/dev/null | grep -A3 '"xproc"' | sed -n 's/^ *0x[0-9a-f]* (has no name): ()  [0-9]*x[0-9]*\(+[0-9]*+[0-9]*\) .*/\1/p' | head -1)
+echo "      frame: $(tr -d '\r' < "$T/frame.out"), the other process's X window at $got"
+if [ -z "$want" ]; then echo "FAIL  frame: the other process did not present, or the host found no frame"; fail=1
+elif [ "$want" = "+0+0" ]; then echo "FAIL  frame: the caption did not move the client area (no test)"; fail=1
+elif [ "$got" = "$want" ]; then echo "PASS  the other process's surface follows the client area when the window gains a frame"
+else echo "FAIL  the other process's surface stayed at $got, the client area is at $want"; fail=1; fi
+wait "$FP"
 [ $fail = 0 ] && { echo "RESULT: PASS"; exit 0; }
 echo "RESULT: FAIL"; exit 1
