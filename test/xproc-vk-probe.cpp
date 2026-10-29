@@ -5,7 +5,9 @@
 // into that child with Direct3D 11 (DXVK: Vulkan). "host frame": the top-level
 // gains a caption after the other process has presented (Opera's "Quit
 // Opera?" dialog) and prints where its client area now is, for the gate to
-// compare with the other process's X window.
+// compare with the other process's X window. "host race": the caption comes
+// while the other process is making its surface (the gate widens that moment
+// with WINE_SG_FOREIGN_CLIENT_DELAY_MS).
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -27,7 +29,9 @@ int main(int argc, char **argv)
         char cmd[512];
         /* "host top": render into the top-level itself (Chromium draws there
          * when it has no DirectComposition); otherwise into its child */
-        bool frame = argc > 2 && !strcmp(argv[2], "frame");
+        bool race = argc > 2 && !strcmp(argv[2], "race");
+        bool frame = (argc > 2 && !strcmp(argv[2], "frame")) || race;
+        HANDLE making = CreateEventA(NULL, TRUE, FALSE, "XprocMakingSurface");
         HWND target = (argc > 2 && (strstr(argv[2], "top") || frame)) ? top : child;
         snprintf(cmd, sizeof(cmd), "\"%s\" render %p%s", argv[0], (void *)target, frame ? " long" : "");
         STARTUPINFOA si = { sizeof(si) }; PROCESS_INFORMATION pi = {};
@@ -36,7 +40,8 @@ int main(int argc, char **argv)
         else if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) { printf("xproc=FAIL spawn\n"); return 1; }
         DWORD t0 = GetTickCount();
         COLORREF c = 0; bool red = false;
-        while (GetTickCount() - t0 < (frame ? 3000u : 8000u))   /* Xvfb shows no Vulkan surface: frame waits less */
+        if (race && WaitForSingleObject(making, 10000) == WAIT_OBJECT_0) Sleep(300);
+        while (!race && GetTickCount() - t0 < (frame ? 3000u : 8000u))   /* Xvfb shows no Vulkan surface: frame waits less */
         {
             MSG msg;
             while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
@@ -51,7 +56,7 @@ int main(int argc, char **argv)
             SetWindowPos(top, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
             GetWindowRect(top, &wr); ClientToScreen(top, &o);
             printf("frame red=%d offset=%ld,%ld\n", red, o.x - wr.left, o.y - wr.top); fflush(stdout);
-            for (DWORD t1 = GetTickCount(); GetTickCount() - t1 < 4000; Sleep(20))
+            for (DWORD t1 = GetTickCount(); GetTickCount() - t1 < (race ? 6000u : 4000u); Sleep(20))
             {
                 MSG msg;
                 while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
@@ -83,6 +88,8 @@ static int render(HWND child, int frames)
         d.SampleDesc.Count = 1; d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = 2;
         d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         IDXGISwapChain1 *sc;
+        HANDLE making = OpenEventA(EVENT_MODIFY_STATE, FALSE, "XprocMakingSurface");
+        if (making) SetEvent(making);
         if (FAILED(f->CreateSwapChainForHwnd(dev, child, &d, nullptr, nullptr, &sc))) return 3;
         ID3D11Texture2D *bb; ID3D11RenderTargetView *rtv;
         sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb); dev->CreateRenderTargetView(bb, nullptr, &rtv);
