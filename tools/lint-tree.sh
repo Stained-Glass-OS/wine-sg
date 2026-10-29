@@ -21,5 +21,11 @@ if [[ ! -f "$dest/.done" ]]; then
         patch -d "$dest/wine-$WINE_VERSION" -p1 -s -i "$HERE/patches/$p" >&2
     done < "$HERE/patches/series"
     touch "$dest/.done"
+    # one tree (~350 MB) per series: every commit made another, and 927 of
+    # them filled the build host's disk. Keep the trees used in the last two
+    # hours (another worktree's lint may be reading one); the rest go.
+    find "${TMPDIR:-/var/tmp}" -maxdepth 1 -name 'sg-lint-tree-*' -type d ! -path "$dest" -mmin +120 \
+        -exec rm -rf {} + 2>/dev/null || true
 fi
+touch "$dest"   # in use: not pruned by another series' lint
 echo "$dest/wine-$WINE_VERSION"
