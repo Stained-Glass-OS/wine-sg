@@ -1,12 +1,15 @@
 /* WTSQueryUserToken (patches/sg/1708), run by test/wtstoken-gate.sh as
  * several Unix users against one wineserver:
- *   hold        stay 240 s (the user is logged on to its session)
- *   query N     WTSQueryUserToken(N) (N = "cur" for WTS_CURRENT_SESSION):
- *               "QUERY 1 <user SID> <session> <type>" or "QUERY 0 <error>" */
+ *   hold [S]    stay S s, default 240 (the user is logged on to its session)
+ *   query N     WTSQueryUserToken(N) (N = "cur" for WTS_CURRENT_SESSION,
+ *               "console" for WTSGetActiveConsoleSessionId's, 5964):
+ *               "QUERY 1 <user SID> <session> <type>" or "QUERY 0 <error>"
+ *   console     "CONSOLE <WTSGetActiveConsoleSessionId>" */
 #include <windows.h>
 #include <wtsapi32.h>
 #include <sddl.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 int main( int argc, char **argv )
 {
@@ -20,12 +23,18 @@ int main( int argc, char **argv )
     {
         printf( "HELD 1\n" );
         fflush( stdout );
-        Sleep( 240000 );
+        Sleep( (argc > 2 ? atoi( argv[2] ) : 240) * 1000 );
+        return 0;
+    }
+    if (!strcmp( argv[1], "console" ))
+    {
+        printf( "CONSOLE %lu\n", WTSGetActiveConsoleSessionId() );
         return 0;
     }
     if (!strcmp( argv[1], "query" ) && argc > 2)
     {
-        ULONG id = !strcmp( argv[2], "cur" ) ? WTS_CURRENT_SESSION : strtoul( argv[2], NULL, 10 );
+        ULONG id = !strcmp( argv[2], "cur" ) ? WTS_CURRENT_SESSION :
+                   !strcmp( argv[2], "console" ) ? WTSGetActiveConsoleSessionId() : strtoul( argv[2], NULL, 10 );
         HANDLE token = NULL;
         char buf[256], *sid = NULL;
         DWORD len, tsession = 0xdeadbeef;

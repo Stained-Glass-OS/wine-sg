@@ -10,8 +10,13 @@
 #  2. its own session has no user (ERROR_NO_TOKEN), a session that does not
 #     exist is ERROR_CTX_WINSTATION_NOT_FOUND
 #  3. a standard user gets ERROR_PRIVILEGE_NOT_HELD, even for its own session
+#  4. (5964) the console (WTSGetActiveConsoleSessionId) is the session of the
+#     user who logged on last, back to the one still logged on when that user
+#     leaves; SYSTEM gets its user's token, as services ask for it (GOG
+#     Galaxy's: ERROR_NO_TOKEN while the console stayed SYSTEM's)
 # Exit 77 without the accounts or passwordless sudo.
-# Mutant: SG_MUTANT_SESSION_TOKEN_FOR_ALL (server/token.c).
+# Mutants: SG_MUTANT_SESSION_TOKEN_FOR_ALL (server/token.c),
+# SG_MUTANT_CONSOLE_STAYS_SYSTEM (server/process.c).
 #   WINE=... WINESERVER=... test/wtstoken-gate.sh
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -84,6 +89,7 @@ done
 probe() { local u=$1; shift; as "$u" timeout -s KILL 90 "$WINE" 'C:\wtstoken-probe.exe' "$@" 2>/dev/null | tr -d '\r'; }
 v() { printf '%s\n' "$1" | sed -n "s/^$2 //p" | head -1; }
 
+c0=$(v "$(probe "$SG_SYSTEM" console)" CONSOLE)
 as "$SG_USER1" timeout -s KILL 400 "$WINE" 'C:\wtstoken-probe.exe' hold > "$W/hold.out" 2>/dev/null &
 for i in $(seq 240); do grep -q HELD "$W/hold.out" 2>/dev/null && break; sleep 1; done
 s1=$(v "$(tr -d '\r' < "$W/hold.out")" SESSION)
@@ -106,6 +112,27 @@ own=$(as "$SG_USER1" timeout -s KILL 90 "$WINE" cmd /c whoami /user 2>/dev/null 
     || fail "$SG_USER2, session $s1: $(v "$(probe "$SG_USER2" query "$s1")" QUERY)"
 [ "$(v "$(probe "$SG_USER1" query cur)" QUERY)" = "0 1314" ] && pass "...nor $SG_USER1 its own" \
     || fail "$SG_USER1, its session: $(v "$(probe "$SG_USER1" query cur)" QUERY)"
+
+# 4. the console follows logons
+c1=$(v "$(probe "$SG_SYSTEM" console)" CONSOLE)
+[ "$c1" = "$s1" ] && pass "the console is $SG_USER1's session ($s1), not SYSTEM's ($c0 before)" \
+    || fail "the console is session $c1 with $SG_USER1 logged on to $s1 (before: $c0)"
+qc=$(v "$(probe "$SG_SYSTEM" query console)" QUERY)
+case "$qc" in
+    "1 $own $s1 primary") pass "SYSTEM gets the console user's token: $qc";;
+    *) fail "SYSTEM, the console's session: $qc (a service's WTSQueryUserToken(WTSGetActiveConsoleSessionId()))";;
+esac
+as "$SG_USER2" timeout -s KILL 120 "$WINE" 'C:\wtstoken-probe.exe' hold 20 > "$W/hold2.out" 2>/dev/null &
+h2=$!
+for i in $(seq 90); do grep -q HELD "$W/hold2.out" 2>/dev/null && break; sleep 1; done
+s2=$(v "$(tr -d '\r' < "$W/hold2.out")" SESSION)
+c2=$(v "$(probe "$SG_SYSTEM" console)" CONSOLE)
+[ -n "$s2" ] && [ "$c2" = "$s2" ] && pass "$SG_USER2 logs on (session $s2): the console is $SG_USER2's" \
+    || fail "the console is $c2 with $SG_USER2 logged on to $s2"
+wait "$h2"
+for i in $(seq 30); do c3=$(v "$(probe "$SG_SYSTEM" console)" CONSOLE); [ "$c3" = "$s1" ] && break; sleep 1; done
+[ "$c3" = "$s1" ] && pass "$SG_USER2 leaves: the console is back with $SG_USER1 ($s1)" \
+    || fail "after $SG_USER2 left the console is $c3, $SG_USER1 is $s1"
 
 as "$SG_USER1" "$WINESERVER" -k 2>/dev/null; wait
 echo
