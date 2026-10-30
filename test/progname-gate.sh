@@ -7,6 +7,9 @@
 # browser kept for programs that start it -- is kept out of Open with (NoOpenWith), as the
 # Applications Windows hides are.
 #   WINE=/opt/wine-sg/bin/wine test/progname-gate.sh
+# What people meet says no "Wine" either (patches/sg/5970): the old browser's frame ("Web
+# Browser"), Help, the C runtime's error box, the sound mapper. (The desktop window keeps
+# "<name> - Wine Desktop": nobody sees it, and the compositor knows it by it.)
 # Mutation: an rc's description put back to "Wine ..." / the NoOpenWith line taken out.
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -47,6 +50,22 @@ for p in regedit.exe:"Registry Editor" taskmgr.exe:"Task Manager" explorer.exe:"
     for f in "$@"; do [ "$(basename "$f")" = "$e" ] && got=$(desc "$f") && break; done
     [ "$got" = "$want" ] && pass "$e is \"$want\"" || fail "$e is \"$got\", not \"$want\""
 done
+# what people meet: window titles, error boxes, device names (patches/sg/5970) -- the old
+# browser's frame, Help, the C runtime's error box, the sound mapper
+if [ -d "$W/../lib/wine/x86_64-windows" ]; then L="$W/../lib/wine/x86_64-windows"/*
+else L="$W/dlls/*/x86_64-windows/*.dll $W/dlls/*/x86_64-windows/*.cpl $W/programs/*/x86_64-windows/*.exe"; fi
+seen=$(python3 -I -c '
+import sys
+bad = ["Wine Internet Explorer", "Wine C++ Runtime Library", "Wine Help", "Wine Sound Mapper",
+       "Wine File Manager", "Wine Wordpad", "Wine Application Uninstaller", "start the Wine debugger"]
+hits = set()
+for f in sys.argv[1:]:
+    try: d = open(f, "rb").read()
+    except OSError: continue
+    for b in bad:
+        if b.encode("utf-16-le") in d: hits.add(b + " (" + f.rsplit("/", 1)[-1] + ")")
+print("; ".join(sorted(hits)))' $L)
+[ -z "$seen" ] && pass "no window title, error box or device says \"Wine ...\"" || fail "still says Wine: $seen"
 T=$(mktemp -d /var/tmp/sg-progname.XXXXXX)
 trap 'WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null; [ -n "$XP" ] && kill "$XP" 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp 3>"$T/display" >/dev/null 2>&1 & XP=$!
