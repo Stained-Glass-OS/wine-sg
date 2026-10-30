@@ -2,7 +2,8 @@
  * there asks for an administrator ("Destination Folder Access Denied"); the
  * probe answers Cancel. "noerrorui": with FOF_NOERRORUI nothing asks and the
  * copy fails, not 0. "paste": files put on the clipboard without a drop effect
- * are pasted (copied) into C:\pastedst by the folder's Paste. */
+ * are pasted (copied) into C:\pastedst by the folder's Paste. "delitem": a
+ * delete there names the item (name, type, date); "delmany": several, their folder. */
 #define COBJMACROS
 #include <windows.h>
 #include <shlobj.h>
@@ -10,6 +11,7 @@
 #include <stdio.h>
 
 static BOOL found;
+static WCHAR item_name[MAX_PATH], item_type[MAX_PATH], item_date[MAX_PATH];
 
 static DWORD WINAPI answer( void *arg )
 {
@@ -19,6 +21,9 @@ static DWORD WINAPI answer( void *arg )
     if (!hwnd) return 0;
     found = TRUE;
     Sleep( 300 );
+    GetDlgItemTextW( hwnd, 200, item_name, MAX_PATH );
+    GetDlgItemTextW( hwnd, 201, item_type, MAX_PATH );
+    GetDlgItemTextW( hwnd, 202, item_date, MAX_PATH );
     PostMessageW( hwnd, WM_COMMAND, IDCANCEL, 0 );
     return 0;
 }
@@ -39,6 +44,21 @@ int main( int argc, char **argv )
         ret = SHFileOperationW( &op );
         printf( "denied: asked=%d ret=%d aborted=%d\n", found, ret, op.fAnyOperationsAborted );
         return !(found && ret == ERROR_CANCELLED && op.fAnyOperationsAborted);
+    }
+    /* a delete there names the one item, as Windows does: its name, type and date (5969) */
+    if (argc > 1 && (!strcmp( argv[1], "delitem" ) || !strcmp( argv[1], "delmany" )))
+    {
+        BOOL many = !strcmp( argv[1], "delmany" );
+        op.wFunc = FO_DELETE;
+        op.pFrom = many ? L"C:\\readonly\\keep.txt\0C:\\readonly\\keep2.txt\0" : L"C:\\readonly\\keep.txt\0";
+        op.pTo = NULL;
+        CloseHandle( CreateThread( NULL, 0, answer, NULL, 0, NULL ) );
+        ret = SHFileOperationW( &op );
+        printf( "%s: asked=%d ret=%d name=[%ls] type=[%ls] date=[%ls] kept=%d\n", argv[1], found, ret, item_name,
+                item_type, item_date, GetFileAttributesW( L"C:\\readonly\\keep.txt" ) != INVALID_FILE_ATTRIBUTES );
+        if (many) return !(found && ret == ERROR_CANCELLED && !item_name[0]);
+        return !(found && ret == ERROR_CANCELLED && !wcsncmp( item_name, L"keep", 4 ) &&
+                 !wcsncmp( item_type, L"Type: ", 6 ) && !wcsncmp( item_date, L"Date modified: ", 15 ));
     }
     if (argc > 1 && !strcmp( argv[1], "noerrorui" ))
     {

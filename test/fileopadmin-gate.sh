@@ -8,7 +8,8 @@
 # cancels; with FOF_NOERRORUI the copy fails instead of returning 0; and a
 # paste of files put on the clipboard without a drop effect copies them (it
 # did nothing). The elevated copy itself needs the session's elevation
-# broker: QA VM.
+# broker: QA VM. A delete there names the one item, its type and date
+# (patches/sg/5969), as Windows' does; several, their folder.
 #
 #   WINE=/opt/wine-sg/bin/wine test/fileopadmin-gate.sh
 set -u
@@ -31,15 +32,17 @@ i=0; while [ ! -s "$T/display" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); d
 export DISPLAY=":$(cat "$T/display")"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
 cp "$T/fileopadmin-probe.exe" "$WINEPREFIX/drive_c/"
-mkdir -p "$WINEPREFIX/drive_c/readonly"; chmod 555 "$WINEPREFIX/drive_c/readonly"
+mkdir -p "$WINEPREFIX/drive_c/readonly"; echo k > "$WINEPREFIX/drive_c/readonly/keep.txt"; echo k > "$WINEPREFIX/drive_c/readonly/keep2.txt"; chmod 555 "$WINEPREFIX/drive_c/readonly"
 cd "$WINEPREFIX/drive_c"
 rc=0
-for m in denied noerrorui paste; do
+for m in denied delitem delmany noerrorui paste; do
     timeout 60 "$WINE" 'C:\fileopadmin-probe.exe' $m > "$T/out" 2>/dev/null; r=$?
     out=$(tr -d '\r' < "$T/out")
     echo "      $out"
     case "$m:$r" in
     denied:0) echo "PASS  a copy into a folder the user may not write to asks for an administrator" ;;
+    delitem:0) echo "PASS  a delete there names the item -- name, type, date -- as Windows does (mutant DENIED_FOLDER_ONLY)" ;;
+    delmany:0) echo "PASS  a delete of several there names their folder" ;;
     noerrorui:0) echo "PASS  without error UI the copy fails, not 0" ;;
     paste:0) echo "PASS  files on the clipboard without a drop effect are pasted" ;;
     *) echo "FAIL  $m ($r)"; rc=1 ;;
