@@ -14,6 +14,8 @@
 #   custom/Utf8             neutral "Grüße" stored as UTF-8
 #   Resources/UidButton/Content  neutral "Localized button"  (x:Uid="UidButton", test/xamluid-gate.sh)
 #   custom/UidText/Text          neutral "Localized text"    (x:Uid="/custom/UidText")
+#   Lib/Resources/LibUid/Text    neutral "Library text"      (x:Uid="LibUid" in ms-appx:///Lib/ markup,
+#   Resources/LibUid/Text        neutral "Application text"   test/xamlnavmenu-gate.sh: the library's wins)
 #
 # Layout as documented by independent readers of the format (see
 # dlls/windows.applicationmodel/pri.c in the patched tree).
@@ -39,9 +41,10 @@ def section(ident, content):
 
 
 # ---- the tree: scopes and items ------------------------------------------
-scopes = ['', 'Resources', 'Nested', 'custom', 'UidButton', 'UidText']   # index 0 is the root
-scope_parent = [0, 0, 1, 0, 1, 3]
-items = [('Greeting', 1), ('Farewell', 1), ('Deep', 2), ('Title', 3), ('Utf8', 3), ('Content', 4), ('Text', 5)]
+scopes = ['', 'Resources', 'Nested', 'custom', 'UidButton', 'UidText', 'Lib', 'Resources', 'LibUid', 'LibUid']   # index 0 is the root
+scope_parent = [0, 0, 1, 0, 1, 3, 0, 6, 7, 1]
+items = [('Greeting', 1), ('Farewell', 1), ('Deep', 2), ('Title', 3), ('Utf8', 3), ('Content', 4), ('Text', 5),
+         ('Text', 8), ('Text', 9)]
 
 
 def hschema():
@@ -134,6 +137,8 @@ values = [
     (1, [(UTF8, 'Grüße'.encode('utf-8') + b'\0', True)]),
     (1, [(STRING, utf16z('Localized button'), True)]),
     (1, [(STRING, utf16z('Localized text'), True)]),
+    (1, [(STRING, utf16z('Library text'), True)]),
+    (1, [(STRING, utf16z('Application text'), True)]),
 ]
 SEC_DESC, SEC_SCHEMA, SEC_DECN, SEC_MAP, SEC_DATA = range(5)
 

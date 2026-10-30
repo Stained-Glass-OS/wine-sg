@@ -46,6 +46,9 @@
 #                   objects of other namespaces), x:Name Inner, then a Border x:Name Tail
 #   NamedBrush.xbf  a Grid whose Background is a SolidColorBrush with an x:Name (objects without a Name
 #                   member are named in markup only), then a Border x:Name Tail2
+#   TemplOwner.xbf  a Grid with a Button x:Name TheButton (AutomationProperties.Name "Btn") whose compiled
+#                   ControlTemplate is a Border x:Name Frame with {TemplateBinding AutomationProperties.Name}
+#                   on AutomationProperties.Name (owner-named, as compilers write it; patches/sg/6197)
 import struct, sys, os
 
 def u8(v): return struct.pack('<B', v)
@@ -279,6 +282,21 @@ def namedbrush():
     n += u8(0x14) + u16(T_BORDER) + u8(0x0D) + v_str(2) + u8(0x21) + u8(0x08) + u8(0x21)
     return strings, n
 
+P_AUTOMATION_NAME = 0x8010
+
+def templowner():
+    strings = [PRESENTATION, 'TheButton', 'Btn', 'Frame']
+    left_top = prop(P_HALIGN, v_enum(0x0263, 0)) + prop(P_VALIGN, v_enum(0x0264, 0))
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(T_GRID)
+    n += u8(0x14) + u16(T_BUTTON) + prop(P_CONTROL_BACKGROUND, v_color(0xFF0000FF)) + left_top
+    n += prop(P_WIDTH, v_float(80)) + prop(P_HEIGHT, v_float(40)) + prop(P_AUTOMATION_NAME, v_str(2)) + u8(0x0D) + v_str(1)
+    n += u8(0x14) + u16(T_CONTROLTEMPLATE) + u8(0x11) + u16(0) + v7(1) + v7(0) + v7(0) + u8(0x21)
+    n += u8(0x07) + u16(P_CONTROL_TEMPLATE) + u8(0x21) + u8(0x08)
+    n += u8(0x21)
+    s1 = u8(0x17) + u16(T_BORDER) + u8(0x1F) + u16(P_BORDER_BACKGROUND) + u16(P_CONTROL_BACKGROUND)
+    s1 += u8(0x1F) + u16(P_AUTOMATION_NAME) + u16(P_AUTOMATION_NAME) + u8(0x0D) + v_str(3) + u8(0x21)
+    return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
+
 d = sys.argv[1]
 def write(name, data):
     with open(os.path.join(d, name), 'wb') as f: f.write(data)
@@ -317,3 +335,5 @@ st, nd = nestedroot()
 write('NestedRoot.xbf', xbf(st, nd))
 st, nd = namedbrush()
 write('NamedBrush.xbf', xbf(st, nd))
+st, nd, sc = templowner()
+write('TemplOwner.xbf', xbf(st, nd, sc))
