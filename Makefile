@@ -5736,3 +5736,6 @@ test-applang:
 
 test-xamlrnprops:
 	WINE=$(PREFIX)/bin/wine test/xamlrnprops-gate.sh
+
+test-logondomain:
+	WINE=$(PREFIX)/bin/wine test/logondomain-gate.sh
