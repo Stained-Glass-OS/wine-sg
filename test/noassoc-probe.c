@@ -22,6 +22,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static HWND host;
 static IExplorerBrowser *browser;
@@ -270,6 +271,16 @@ static DWORD WINAPI worker( void *arg )
         WaitForSingleObject( t, 5000 );
         printf( "program_open_with=%d program_own_process=%d program_ok=%d error_box=%d\n", kind == 1,
                 kind == 1 && pid && pid != GetCurrentProcessId(), program_ret, kind == 2 );
+        /* rundll32's hidden window is no owner: centred on the screen, a taskbar window */
+        if (kind == 1)
+        {
+            RECT rc, wa;
+            GetWindowRect( w, &rc );
+            SystemParametersInfoW( SPI_GETWORKAREA, 0, &wa, 0 );
+            printf( "program_unowned=%d program_centred=%d (x %ld..%ld of %ld..%ld)\n", !GetWindow( w, GW_OWNER ),
+                    abs( (int)((rc.left + rc.right) / 2 - (wa.left + wa.right) / 2) ) < (wa.right - wa.left) / 20,
+                    rc.left, rc.right, wa.left, wa.right );
+        }
     }
     if (kind == 1) PostMessageW( w, WM_COMMAND, IDCANCEL, 0 );
     if (kind == 2) close_box( w );

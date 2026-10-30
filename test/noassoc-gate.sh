@@ -10,7 +10,8 @@
 # Made-up types .sgzq/.sgzr/.sgzs; real mouse double-clicks (test/noassoc-probe.c).
 #   WINE=/opt/wine-sg/bin/wine test/noassoc-gate.sh
 # Mutants: SG_MUTANT_NOASSOC_ERROR_BOX (dlls/shell32/shlexec.c: the shell's open as a program's),
-# SG_MUTANT_PROGRAM_NOASSOC_ERROR (a program's open keeps the error box).
+# SG_MUTANT_PROGRAM_NOASSOC_ERROR (a program's open keeps the error box),
+# SG_MUTANT_OPENWITH_HIDDEN_OWNER (dlls/shell32/openwith.c: rundll32's hidden window owns it, 5968).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -55,6 +56,8 @@ check cancel_quiet       "Cancel shows nothing more"
 check program_open_with  "a program's own ShellExecuteEx of it asks too (mutant PROGRAM_NOASSOC_ERROR)"
 check program_own_process "and Open with runs in a process of its own (rundll32 OpenAs_RunDLL), not the caller's"
 check program_ok         "and ShellExecuteEx succeeds"
+check program_unowned    "and is a window of its own (rundll32's hidden window is no owner; mutant OPENWITH_HIDDEN_OWNER)"
+check program_centred    "centred on the screen"
 check noui_error         "with SEE_MASK_FLAG_NO_UI it fails with SE_ERR_NOASSOC"
 check noui_quiet         "and shows nothing"
 check done               "the probe ran to the end"
