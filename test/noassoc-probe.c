@@ -12,7 +12,9 @@
  *             sg-store.exe: this probe as C:\store.exe) searching for the
  *             type (--search sgzr) and chooses nothing;
  *   doc.sgzs: Cancel shows nothing more; a program's own ShellExecuteEx of it
- *             still gets the error box.
+ *             succeeds and Open with comes up in a process of its own (as
+ *             Windows' OpenWith does, patches/sg/5965); with
+ *             SEE_MASK_FLAG_NO_UI it fails with SE_ERR_NOASSOC, nothing shown.
  * Modes: "opened FILE" (the test app), and as store.exe (the Store). */
 #define COBJMACROS
 #include <windows.h>
@@ -158,12 +160,30 @@ static void close_box( HWND box )
     PostMessageW( box, WM_CLOSE, 0, 0 );
 }
 
+static BOOL program_ret, noui_ret;
+static DWORD noui_err;
+static INT_PTR noui_inst;
+
 static DWORD WINAPI program_open( void *arg )
 {
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
     sei.lpFile = L"C:\\sgow\\doc.sgzs";
     sei.nShow = SW_SHOWNORMAL;
-    return ShellExecuteExW( &sei );
+    program_ret = ShellExecuteExW( &sei );
+    return program_ret;
+}
+
+static DWORD WINAPI noui_open( void *arg )
+{
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.fMask = SEE_MASK_FLAG_NO_UI;
+    sei.lpFile = L"C:\\sgow\\doc.sgzs";
+    sei.nShow = SW_SHOWNORMAL;
+    SetLastError( 0 );
+    noui_ret = ShellExecuteExW( &sei );
+    noui_err = GetLastError();
+    noui_inst = (INT_PTR)sei.hInstApp;
+    return noui_ret;
 }
 
 static DWORD WINAPI worker( void *arg )
@@ -241,13 +261,27 @@ static DWORD WINAPI worker( void *arg )
     Sleep( 1500 );
     printf( "cancel_quiet=%d\n", kind == 1 && !find_error_box() && !FindWindowW( L"SGOpenWith", NULL ) );
 
-    /* D: a program's own ShellExecuteEx keeps the error */
+    /* D: a program's own ShellExecuteEx asks too, from a process of its own */
     t = CreateThread( NULL, 0, program_open, NULL, 0, NULL );
     kind = wait_window( &w, 10000 );
-    printf( "program_error_kept=%d\n", kind == 2 );
+    {
+        DWORD pid = 0;
+        if (kind == 1) GetWindowThreadProcessId( w, &pid );
+        WaitForSingleObject( t, 5000 );
+        printf( "program_open_with=%d program_own_process=%d program_ok=%d error_box=%d\n", kind == 1,
+                kind == 1 && pid && pid != GetCurrentProcessId(), program_ret, kind == 2 );
+    }
     if (kind == 1) PostMessageW( w, WM_COMMAND, IDCANCEL, 0 );
     if (kind == 2) close_box( w );
-    WaitForSingleObject( t, 5000 );
+    Sleep( 1500 );
+    /* and with SEE_MASK_FLAG_NO_UI: the error, nothing shown */
+    t = CreateThread( NULL, 0, noui_open, NULL, 0, NULL );
+    WaitForSingleObject( t, 10000 );
+    kind = wait_window( &w, 2000 );
+    printf( "noui_error=%d (ret %d err %lu inst %Id) noui_quiet=%d\n", !noui_ret && noui_inst == SE_ERR_NOASSOC,
+            noui_ret, noui_err, noui_inst, kind == 0 );
+    if (kind == 1) PostMessageW( w, WM_COMMAND, IDCANCEL, 0 );
+    if (kind == 2) close_box( w );
     printf( "done=1\n" );
     fflush( stdout );
     PostMessageW( host, WM_CLOSE, 0, 0 );

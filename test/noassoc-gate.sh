@@ -5,10 +5,12 @@
 # program configured to open this type of file."; Windows asks "How do you want to open this
 # file?" (Open with). Now the shell's own open shows Open with, with "Look for an app in the
 # Store" (SG Store, --search EXT); "Always use this app" makes the choice the type's (UserChoice and the user's
-# class, as Settings' Default apps), and a program's own ShellExecuteEx keeps the error.
+# class, as Settings' Default apps). A program's own ShellExecuteEx asks too, in a process of
+# its own (patches/sg/5965), unless it passes SEE_MASK_FLAG_NO_UI.
 # Made-up types .sgzq/.sgzr/.sgzs; real mouse double-clicks (test/noassoc-probe.c).
 #   WINE=/opt/wine-sg/bin/wine test/noassoc-gate.sh
-# Mutant: SG_MUTANT_NOASSOC_ERROR_BOX (dlls/shell32/shlexec.c: the shell's open as a program's).
+# Mutants: SG_MUTANT_NOASSOC_ERROR_BOX (dlls/shell32/shlexec.c: the shell's open as a program's),
+# SG_MUTANT_PROGRAM_NOASSOC_ERROR (a program's open keeps the error box).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -50,7 +52,11 @@ check store_search       "SG Store searches for the type (--search sgzr)"
 check store_no_choice    "the Store chooses no app for the type"
 check dialog_closed      "the dialog closes for the Store"
 check cancel_quiet       "Cancel shows nothing more"
-check program_error_kept "a program's own ShellExecuteEx still reports no program"
+check program_open_with  "a program's own ShellExecuteEx of it asks too (mutant PROGRAM_NOASSOC_ERROR)"
+check program_own_process "and Open with runs in a process of its own (rundll32 OpenAs_RunDLL), not the caller's"
+check program_ok         "and ShellExecuteEx succeeds"
+check noui_error         "with SEE_MASK_FLAG_NO_UI it fails with SE_ERR_NOASSOC"
+check noui_quiet         "and shows nothing"
 check done               "the probe ran to the end"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
