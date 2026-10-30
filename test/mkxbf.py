@@ -49,6 +49,10 @@
 #   TemplOwner.xbf  a Grid with a Button x:Name TheButton (AutomationProperties.Name "Btn") whose compiled
 #                   ControlTemplate is a Border x:Name Frame with {TemplateBinding AutomationProperties.Name}
 #                   on AutomationProperties.Name (owner-named, as compilers write it; patches/sg/6197)
+#   ThemeAlias.xbf  a ResourceDictionary whose ThemeDictionaries "Default" and "Light" each hold a brush "Base"
+#                   (Default #FF0000FF, Light #FF00FF00) and "Alias", a resource reference as an object
+#                   (node 0x22, <StaticResource x:Key="Alias" ResourceKey="Base"/>), as WinUI's theme
+#                   dictionaries alias their colours, "Alias" listed first (patches/sg/6217)
 import struct, sys, os
 
 def u8(v): return struct.pack('<B', v)
@@ -297,6 +301,21 @@ def templowner():
     s1 += u8(0x1F) + u16(P_AUTOMATION_NAME) + u16(P_AUTOMATION_NAME) + u8(0x0D) + v_str(3) + u8(0x21)
     return strings, n + s1, [(0, len(n)), (len(n), len(n) + len(s1))]
 
+def themealias():
+    strings = [PRESENTATION, 'Base', 'Alias', 'Default', 'Light']
+    alias = u8(0x22) + v_str(1) + u8(0x21)     # listed before the key it refers to
+    def entries(argb): return alias + u8(0x14) + u16(T_SCB) + prop(P_SCB_COLOR, v_color(argb)) + u8(0x21)
+    s1, s2 = entries(0xFF0000FF), entries(0xFF00FF00)
+    def ref(section, unused): return u8(0x0F) + v7(section) + u16(0) + v7(7) + v7(2) + u16(2) + v7(0) + u16(1) + v7(len(alias)) + v7(0) + v7(0) + v7(0)
+    base_d = base_l = None
+    n = u8(0x12) + u16(0) + s16('') + u8(0x17) + u16(0x8173)
+    n += u8(0x13) + u16(0x82B1)
+    n += u8(0x14) + u16(0x8173) + ref(1, base_d) + u8(0x21) + u8(0x0A) + v_str(3)
+    n += u8(0x14) + u16(0x8173) + ref(2, base_l) + u8(0x21) + u8(0x0A) + v_str(4)
+    n += u8(0x02) + u8(0x21)
+    a, b = len(n), len(n) + len(s1)
+    return strings, n + s1 + s2, [(0, a), (a, b), (b, b + len(s2))]
+
 d = sys.argv[1]
 def write(name, data):
     with open(os.path.join(d, name), 'wb') as f: f.write(data)
@@ -337,3 +356,5 @@ st, nd = namedbrush()
 write('NamedBrush.xbf', xbf(st, nd))
 st, nd, sc = templowner()
 write('TemplOwner.xbf', xbf(st, nd, sc))
+st, nd, sc = themealias()
+write('ThemeAlias.xbf', xbf(st, nd, sc))
