@@ -25,7 +25,7 @@ unset WAYLAND_DISPLAY
 T=$(mktemp -d /var/tmp/sg-envreload.XXXXXX); XP=
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 trap '"$WINESERVER" -k 2>/dev/null; [ -n "$XP" ] && kill "$XP" 2>/dev/null; [ -n "${SG_KEEP:-}" ] || rm -rf "$T"' EXIT INT TERM
-TMPDIR=/var/tmp "$MINGW" -O2 -municode -o "$T/envprobe.exe" "$HERE/envreload-probe.c" -lntdll || { fail "probe did not build"; exit 1; }
+TMPDIR=/var/tmp "$MINGW" -O2 -municode -o "$T/envprobe.exe" "$HERE/envreload-probe.c" -luserenv -ladvapi32 -lntdll || { fail "probe did not build"; exit 1; }
 Xvfb -displayfd 3 -screen 0 1024x700x24 -nolisten tcp 3>"$T/display" >/dev/null 2>&1 & XP=$!
 i=0; while [ ! -s "$T/display" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 export DISPLAY=":$(cat "$T/display")"
@@ -45,6 +45,30 @@ p set SG_ENV_GATE added >/dev/null; sleep 1
 p set Path 'C:\sg-gate-bin' >/dev/null; sleep 1
 case "$(p get PATH)" in *';C:\sg-gate-bin') pass "the user's Path is added after the system's ($(p get PATH | cut -c1-60)...)";;
     *) fail "PATH: $(p get PATH)";; esac
+# an expandable value naming another variable (the Default User profile's
+# TEMP=%USERPROFILE%\AppData\Local\Temp) reaches programs expanded: the shell
+# handed out the text itself, and Prism Launcher -- started from Start, the
+# desktop or Run -- exited at once (qa4, release 621)
+p setx TEMP '%USERPROFILE%\AppData\Local\Temp' >/dev/null; sleep 1
+case "$(p get TEMP)" in *%*) fail "TEMP reached programs unexpanded: $(p get TEMP)";;
+    'TEMP=C:\users\'*'\AppData\Local\Temp') pass "an expandable TEMP reaches programs expanded ($(p get TEMP))";;
+    *) fail "TEMP: $(p get TEMP)";; esac
+# CreateEnvironmentBlock for an account with no ProfileList entry and no
+# Volatile Environment (a shared prefix's users have neither): it gave no USERNAME or USERPROFILE -- its account
+# lookup had no buffer for the domain -- so TEMP stayed "%USERPROFILE%\..."
+# and the shell handed that out after a broadcast (qa4: Prism Launcher from
+# Start exited at once). Mutant SG_MUTANT_CEB_NO_DOMAIN.
+sid=$(p ceb >/dev/null; "$WINE" reg query 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\ProfileList' 2>/dev/null | tr -d '\r' | grep -o 'S-1-5-21-[0-9-]*' | head -1)
+"$WINE" reg delete 'HKCU\Volatile Environment' /f >/dev/null 2>&1   # a shared prefix's users have none either
+[ -n "$sid" ] && "$WINE" reg delete "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\$sid" /f >/dev/null 2>&1
+out=$(p ceb | tr '\n' ' ')
+case "$out" in *"USERNAME=(none)"*|*"USERPROFILE=(none)"*|*%*) fail "with no ProfileList entry the block lacks the user: $out";;
+    *"USERPROFILE=C:"*"TEMP=C:"*) pass "with no ProfileList entry the block has USERNAME, USERPROFILE and an expanded TEMP";;
+    *) fail "block: $out";; esac
+p set SG_ENV_GATE2 x >/dev/null; sleep 1
+case "$(p get TEMP)" in *%*) fail "after a broadcast the shell hands out TEMP unexpanded: $(p get TEMP)";;
+    'TEMP=C:\users\'*) pass "and after a broadcast the shell hands programs a real TEMP";;
+    *) fail "TEMP after broadcast: $(p get TEMP)";; esac
 p del SG_ENV_GATE >/dev/null; sleep 1
 [ "$(p get SG_ENV_GATE)" = "SG_ENV_GATE=(none)" ] && pass "and one removed goes" || fail "after removing: $(p get SG_ENV_GATE)"
 [ "$(p get SG_SESSION_ONLY)" = "SG_SESSION_ONLY=kept" ] && pass "the session's own variables stay" || fail "session variable: $(p get SG_SESSION_ONLY)"

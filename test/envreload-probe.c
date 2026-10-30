@@ -1,6 +1,9 @@
 /* The shell's environment after a change (patches/sg/0749).
  *   envreload-probe.exe set NAME VALUE   HKCU\Environment, then the broadcast
+ *   envreload-probe.exe setx NAME VALUE  the same as REG_EXPAND_SZ
  *   envreload-probe.exe del NAME         removed, then the broadcast
+ *   envreload-probe.exe ceb              CreateEnvironmentBlock for this process's
+ *                                        token: its USERNAME, USERPROFILE, TEMP
  *   envreload-probe.exe get NAME         prints "NAME=<value in the shell's
  *                                        environment>" or "NAME=(none)": read
  *                                        out of explorer's process (the one
@@ -10,6 +13,7 @@
 #include <winternl.h>
 #include <stdio.h>
 #include <wchar.h>
+#include <userenv.h>
 
 static void broadcast(void)
 {
@@ -48,13 +52,32 @@ done:
     return 0;
 }
 
+static int ceb(void)
+{
+    HANDLE t;
+    WCHAR *b, *p;
+    const WCHAR *want[] = { L"USERNAME=", L"USERPROFILE=", L"TEMP=" };
+    int i;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, &t) ||
+        !CreateEnvironmentBlock((void **)&b, t, FALSE)) { wprintf(L"ceb failed %lu\n", GetLastError()); return 1; }
+    for (i = 0; i < 3; i++)
+    {
+        const WCHAR *v = L"(none)";
+        for (p = b; *p; p += lstrlenW(p) + 1) if (!_wcsnicmp(p, want[i], lstrlenW(want[i]))) v = p + lstrlenW(want[i]);
+        wprintf(L"%ls%ls\n", want[i], v);
+    }
+    DestroyEnvironmentBlock(b);
+    return 0;
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     HKEY k;
-    if (argc >= 4 && !wcscmp(argv[1], L"set"))
+    if (argc >= 2 && !wcscmp(argv[1], L"ceb")) return ceb();
+    if (argc >= 4 && (!wcscmp(argv[1], L"set") || !wcscmp(argv[1], L"setx")))
     {
         RegCreateKeyExW(HKEY_CURRENT_USER, L"Environment", 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL);
-        RegSetValueExW(k, argv[2], 0, REG_SZ, (const BYTE *)argv[3], (wcslen(argv[3]) + 1) * sizeof(WCHAR));
+        RegSetValueExW(k, argv[2], 0, wcscmp(argv[1], L"setx") ? REG_SZ : REG_EXPAND_SZ, (const BYTE *)argv[3], (wcslen(argv[3]) + 1) * sizeof(WCHAR));
         RegCloseKey(k);
         broadcast();
         return 0;
