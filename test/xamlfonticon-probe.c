@@ -90,6 +90,8 @@ static const WCHAR page_xaml[] =
     L"<TextBlock" AT(L"120") REF L" Text=\"&#x2315;\"/>"
     L"<FontIcon" AT(L"160")  REF L" Glyph=\"A\"/>"
     L"<TextBlock" AT(L"200") REF L" Text=\"A\"/>"
+    L"<FontIcon" AT(L"280") L" Glyph=\"&#xE0A0;\"/>"
+    L"<TextBlock" AT(L"320") L" FontFamily=\"Segoe MDL2 Assets\" Text=\"&#xE0A0;\"/>"
     L"<AppBarButton x:Name=\"Cmd\" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Margin=\"0,240,0,0\" Width=\"68\">"
     L"<AppBarButton.Icon><FontIcon Glyph=\"&#xE710;\"/></AppBarButton.Icon></AppBarButton>"
     L"</Grid>";
@@ -166,5 +168,7 @@ int main(void)
     for (y = 240; y < 280; y++) for (x = 10; x < 58; x++) dark += shot[y][x];
     cmd = find(grid, L"Cmd");
     printf("appbar=%d,%d\n", cmd != NULL, dark > 10);
+    /* an icon glyph with no stand-in: nothing drawn, not the missing-glyph box (6226) */
+    printf("unknown=%d,%d\n", dark_in(7), dark_in(8));
     return 0;
 }

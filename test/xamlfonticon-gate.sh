@@ -5,6 +5,7 @@
 # character in DejaVu Sans), a FontFamily of its own honoured, and as an AppBarButton's Icon.
 # test/xamlfonticon-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/xamlfonticon-gate.sh
+# 6226 mutant: SG_MUTANT_ICON_GLYPH_TOFU (text.c, buttons.c).
 # Mutant (dlls/windows.ui.xaml/buttons.c): SG_MUTANT_FONTICON_NO_STANDIN.
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -50,5 +51,6 @@ chk '^row0=1,1,0$' "E74A drawn as U+2191 without the icon font"
 chk '^row1=1,1,0$' "Segoe Fluent Icons E721 drawn as U+2315"
 chk '^row2=1,1,0$' "a FontIcon in DejaVu Sans draws its glyph as it is"
 chk '^appbar=1,1$' "an AppBarButton's FontIcon drawn"
+chk '^unknown=[0-2],[0-2]$' "an icon glyph with no stand-in draws nothing, not the missing-glyph box (6226)"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
