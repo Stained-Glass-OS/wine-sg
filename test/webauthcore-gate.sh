@@ -16,7 +16,8 @@
 # anything below 11644473600) and the wamcompat_* names.
 #
 #   WINE=/opt/wine-sg/bin/wine test/webauthcore-gate.sh
-# Mutants: SG_MUTANT_WAM_NO_EXPIRES_ON, SG_MUTANT_WAM_NO_WAMCOMPAT
+# Mutants: SG_MUTANT_WAM_NO_EXPIRES_ON, SG_MUTANT_WAM_NO_WAMCOMPAT, SG_MUTANT_WAM_NO_ACCOUNT_PROPERTIES,
+# SG_MUTANT_WAM_SIGNOUT_NOTIMPL
 # (windows.security.authentication.web.core broker.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -54,6 +55,11 @@ p() { sed -n "s/^prop $1 //p" "$T/out" | head -n 1; }
 [ "$(v token)" = "tok-ABC123" ] && pass "the response's Token is the helper's access_token" || fail "token: $(v token)"
 [ "$(v accountid)" = "uid.utid" ] && [ "$(v username)" = "jane@contoso.com" ] \
     && pass "the response's WebAccount has the helper's home_account_id and username" || fail "account: $(v accountid) / $(v username)"
+[ "$(p Authority)" = "https://login.microsoftonline.com/utid/" ] && [ "$(p TenantId)" = utid ] && [ "$(p OID)" = uid ] && [ "$(p UPN)" = "jane@contoso.com" ] \
+    && pass "the WebAccount's Properties: Authority, TenantId, OID, UPN (MSAL builds its AAD account from them; 6221)" \
+    || fail "account properties: $(p Authority) / $(p TenantId) / $(p OID) / $(p UPN)"
+[ "$(v signout)" = "0 1" ] && [ "$(v invalidate)" = "0 1" ] \
+    && pass "WebAccount.SignOutAsync and InvalidateCacheAsync complete (they were E_NOTIMPL; 6221)" || fail "signout: $(v signout) / invalidate: $(v invalidate)"
 [ "$(v expireson)" = ok ] && pass "TokenExpiresOn is seconds since 1601 (> 11644473600)" || fail "TokenExpiresOn: $(v expireson)"
 [ "$(p expires_in)" = 3599 ] && pass "expires_in property" || fail "expires_in: $(p expires_in)"
 [ "$(p wamcompat_id_token)" = "idtok.payload.sig" ] && [ "$(p wamcompat_client_info)" = "eyJ1aWQiOiJ4In0" ] && [ "$(p wamcompat_scopes)" = "User.Read openid" ] \

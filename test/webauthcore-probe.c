@@ -209,6 +209,13 @@ int main(void)
         void *vec = NULL, *resp = NULL, *props = NULL, *acct = NULL, *acct2 = NULL;
         UINT n = 0;
 
+        {
+            void *iop = NULL, *info = NULL;
+            HRESULT h = CALL(res, 9, ptr_t, &iop);
+            int st = -1;
+            if (iop && SUCCEEDED(CALL(iop, 0, qi_t, &IID_IAsyncInfo_, &info))) CALL(info, 7, status_t, &st);
+            printf("invalidate %#lx %d\n", h, st);
+        }
         CALL(res, 6, ptr_t, &vec);
         if (vec) CALL(vec, 7, u32_t, &n);
         printf("responses %u\n", n);
@@ -231,6 +238,25 @@ int main(void)
                     {
                         s = NULL; CALL(acct2, 6, str_t, &s);
                         printf("accountid %ls\n", txt(s));
+                        /* its Properties, as an AAD account's (wine-sg 6221) */
+                        {
+                            void *aprops = NULL;
+                            if (SUCCEEDED(CALL(acct2, 7, ptr_t, &aprops)) && aprops)
+                            {
+                                prop(aprops, L"Authority");
+                                prop(aprops, L"TenantId");
+                                prop(aprops, L"OID");
+                                prop(aprops, L"UPN");
+                            }
+                        }
+                        /* signing out: an action that completes (wine-sg 6221) */
+                        {
+                            void *sop = NULL, *info = NULL;
+                            HRESULT h = CALL(acct2, 9, ptr_t, &sop);
+                            int st = -1;
+                            if (sop && SUCCEEDED(CALL(sop, 0, qi_t, &IID_IAsyncInfo_, &info))) CALL(info, 7, status_t, &st);
+                            printf("signout %#lx %d\n", h, st);
+                        }
                     }
                 }
                 else printf("account (none)\n");
