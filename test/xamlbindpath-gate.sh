@@ -6,7 +6,7 @@
 # top bar); a ContentPresenter's text is at its left by default. test/xamlbindpath-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/xamlbindpath-gate.sh
 # Mutants: SG_MUTANT_NO_BINDING_PATHS (templates.c), SG_MUTANT_PRESENTER_CONTENT_CENTRED (control.c),
-# SG_MUTANT_NO_MARKUP_BINDING (markup.c).
+# SG_MUTANT_NO_MARKUP_BINDING (markup.c); 6224: SG_MUTANT_PRESENTER_VCONTENT_IGNORED (control.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -51,6 +51,7 @@ chk '^collapsed=white$' "bound through Tag.Visibility: collapsed"
 chk '^visible=red$' "the Tag's Visibility set Visible: the bound element shows"
 chk '^retagged=white$' "another (collapsed) Tag: followed"
 chk '^text_left=[0-9]$' "a ContentPresenter's text at its left"
+chk '^vcontent=white,red$' "a ContentPresenter's VerticalContentAlignment Center places an element content in its middle (6224)"
 chk '^done=1$' "the probe finished"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

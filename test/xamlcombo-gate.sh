@@ -8,6 +8,7 @@
 # raised every frame with its time; LayoutInformation gives an element's layout slot. Windows
 # Terminal's settings pages (Startup and others) failed to be made without them. test/xamlcombo-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/xamlcombo-gate.sh
+# Mutants (6224, textinput.c/control.c): SG_MUTANT_COMBO_FACE_TOP, SG_MUTANT_PRESENTER_VCONTENT_IGNORED.
 # Mutants (dlls/windows.ui.xaml): SG_MUTANT_COMBO_NO_DROP, SG_MUTANT_TOGGLE_SWITCH_NO_TOGGLED,
 # SG_MUTANT_TOGGLE_SWITCH_NOT_DRAWN_ON, SG_MUTANT_NO_INPUT_SCOPE_NAME, SG_MUTANT_NO_RENDERING_FRAMES,
 # SG_MUTANT_LAYOUT_SLOT_EMPTY.
@@ -61,5 +62,10 @@ chk '^toggle=1 toggled=1 drawn=1$' "a ToggleSwitch: a click turns it on, Toggled
 chk '^input_scope=29,1$' "InputScopeName keeps its value, InputScope its Names"
 chk '^rendering=1 time=1$' "CompositionTarget.Rendering every frame, with a time"
 chk '^layout_slot=0,0,300,200$' "LayoutInformation.GetLayoutSlot: the area its parent gave"
+ft=$(printf '%s\n' "$out" | sed -n 's/^face_text=//p' | head -n 1)
+ftop=${ft%%,*}; fleft=${ft##*,}; fbottom=${ft#*,}; fbottom=${fbottom%%,*}
+if [ -n "$ft" ] && [ $((ftop + fbottom)) -ge 26 ] && [ $((ftop + fbottom)) -le 38 ] && [ "$fleft" -ge 8 ] && [ "$fleft" -le 30 ]; then
+    echo "PASS  the selected item's text in the middle of the box, at its left (6224)"
+else echo "FAIL  the selected item's text in the middle of the box, at its left (6224): $ft"; RC=1; fi
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

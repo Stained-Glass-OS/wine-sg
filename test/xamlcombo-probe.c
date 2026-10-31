@@ -162,6 +162,26 @@ int main(void)
     SendMessageW(island, WM_KEYUP, VK_UP, 0xc0000001);
     pump(100);
     printf("key_up=%d\n", selected(cb));
+    /* the selected item's text: in the middle of the box, after its padding (patches/sg/6224) */
+    {
+        HDC dc;
+        int x, y, top = -1, bottom = -1, left = 999;
+        pump(200); UpdateWindow(island); pump(100);
+        dc = GetDC(island);
+        for (y = 1; y < 31; y++)
+            for (x = 1; x < 115; x++)
+            {
+                COLORREF c = GetPixel(dc, x, y);
+                if (GetRValue(c) < 110 && GetGValue(c) < 110 && GetBValue(c) < 110)
+                {
+                    if (top < 0) top = y;
+                    bottom = y;
+                    if (x < left) left = x;
+                }
+            }
+        ReleaseDC(island, dc);
+        printf("face_text=%d,%d,%d\n", top, bottom, left);
+    }
 
     /* the toggle switch */
     hdc = GetDC(island);

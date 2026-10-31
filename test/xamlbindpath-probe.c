@@ -79,6 +79,8 @@ static const WCHAR page_xaml[] =
     L"</ControlTemplate></ContentControl.Template></ContentControl>"
     L"<ContentPresenter Content=\"MMMM\" Foreground=\"Red\" FontSize=\"20\" Width=\"240\" Height=\"40\" Margin=\"0,60,0,0\""
     L" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\"/>"
+    L"<ContentPresenter VerticalContentAlignment=\"Center\" Width=\"40\" Height=\"60\" Margin=\"0,110,0,0\""
+    L" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\"><Border Background=\"Red\"><Rectangle Width=\"40\" Height=\"20\"/></Border></ContentPresenter>"
     L"</Grid>";
 
 int main(void)
@@ -129,6 +131,8 @@ int main(void)
         for (y = 62; y < 98; y++) if (!strcmp(colour(GetPixel(hdc, x, y)), "red") || !strcmp(colour(GetPixel(hdc, x, y)), "other")) { left = x; break; }
     }
     printf("text_left=%d\n", left);
+    /* a presenter's VerticalContentAlignment places an element content too (6224) */
+    printf("vcontent=%s,%s\n", colour(GetPixel(hdc, 20, 115)), colour(GetPixel(hdc, 20, 140)));
     ReleaseDC(island, hdc);
     printf("done=1\n");
     return 0;
