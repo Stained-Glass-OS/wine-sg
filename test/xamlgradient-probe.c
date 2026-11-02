@@ -72,6 +72,15 @@ static const WCHAR page_xaml[] =
     L"<LinearGradientBrush StartPoint=\"0,0\" EndPoint=\"0,1\"><LinearGradientBrush.GradientStops>"
     L"<GradientStop Offset=\"0\" Color=\"#FFFFFFFF\"/><GradientStop Offset=\"1.0\" Color=\"#FF000000\"/>"
     L"</LinearGradientBrush.GradientStops></LinearGradientBrush></Border.Background></Border>"
+    L"<Border" TL L" Width=\"100\" Height=\"50\" Margin=\"0,120,0,0\" BorderThickness=\"6\"><Border.BorderBrush>"
+    L"<LinearGradientBrush StartPoint=\"0,0\" EndPoint=\"0,1\"><LinearGradientBrush.RelativeTransform><ScaleTransform ScaleY=\"-1\" CenterY=\"0.5\"/>"
+    L"</LinearGradientBrush.RelativeTransform><GradientStop Offset=\"0\" Color=\"#FFFF0000\"/><GradientStop Offset=\"1\" Color=\"#FF0000FF\"/>"
+    L"</LinearGradientBrush></Border.BorderBrush></Border>"
+    L"<Rectangle" TL L" Width=\"60\" Height=\"50\" Margin=\"120,0,0,0\"><Rectangle.Fill><LinearGradientBrush StartPoint=\"0,0\" EndPoint=\"0,1\">"
+    L"<GradientStop Offset=\"0\" Color=\"#FFFFFFFF\"/><GradientStop Offset=\"1\" Color=\"#FF000000\"/></LinearGradientBrush></Rectangle.Fill></Rectangle>"
+    L"<TextBlock" TL L" Width=\"170\" Margin=\"120,60,0,0\" FontSize=\"40\" Text=\"MMMMMM\"><TextBlock.Foreground>"
+    L"<LinearGradientBrush StartPoint=\"0,0\" EndPoint=\"1,0\"><GradientStop Offset=\"0\" Color=\"#FFFF0000\"/>"
+    L"<GradientStop Offset=\"1\" Color=\"#FF0000FF\"/></LinearGradientBrush></TextBlock.Foreground></TextBlock>"
     L"</Grid>";
 
 int main(void)
@@ -115,6 +124,35 @@ int main(void)
     printf("%d,", GetRValue(c) > 60 && GetRValue(c) < 200);
     c = GetPixel(hdc, 50, 108);
     printf("%d\n", GetRValue(c) < 60);
+    /* RelativeTransform ScaleY -1 about the middle: blue at the top, red at the bottom (6231) */
+    c = GetPixel(hdc, 2, 123);
+    printf("relative=%d,", GetBValue(c) > 180 && GetRValue(c) < 80);
+    c = GetPixel(hdc, 2, 167);
+    printf("%d\n", GetRValue(c) > 180 && GetBValue(c) < 80);
+    /* a Rectangle's Fill: white at its top, black at its bottom (6231) */
+    c = GetPixel(hdc, 150, 3);
+    printf("shape=%d,", GetRValue(c) > 200);
+    c = GetPixel(hdc, 150, 47);
+    printf("%d\n", GetRValue(c) < 60);
+    /* the text: red on its left, blue on its right (6231) */
+    {
+        int x, y, left = -1, right = -1;
+        for (x = 120; x < 290; x++)
+            for (y = 60; y < 115; y++)
+            {
+                COLORREF p = GetPixel(hdc, x, y);
+                if (GetRValue(p) < 200 || GetBValue(p) < 200) { if (left < 0) left = x; right = x; break; }
+            }
+        c = left >= 0 ? 0 : 0;
+        if (left >= 0)
+        {
+            COLORREF lc = 0, rc = 0;
+            for (y = 60; y < 115; y++) { COLORREF p = GetPixel(hdc, left + 2, y); if (GetGValue(p) < 100) { lc = p; break; } }
+            for (y = 60; y < 115; y++) { COLORREF p = GetPixel(hdc, right - 2, y); if (GetGValue(p) < 100) { rc = p; break; } }
+            printf("text=%d,%d\n", GetRValue(lc) > GetBValue(lc) + 60, GetBValue(rc) > GetRValue(rc) + 60);
+        }
+        else printf("text=none\n");
+    }
     ReleaseDC(island, hdc);
     printf("done=1\n");
     return 0;

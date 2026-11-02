@@ -4,7 +4,8 @@
 # as GradientStops), a Border's BorderBrush and Background drawn in the gradient's mean colour (WinUI 2's
 # control borders were the desktop's grey). test/xamlgradient-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/xamlgradient-gate.sh
-# Mutants: SG_MUTANT_GRADIENT_NOT_DRAWN (6230), SG_MUTANT_GRADIENT_STOPS_REPLACED (markup.c); media.c.
+# Mutants: SG_MUTANT_NO_RELATIVE_TRANSFORM, SG_MUTANT_SHAPE_GRADIENT_FLAT, SG_MUTANT_TEXT_GRADIENT_FLAT (6231),
+# SG_MUTANT_GRADIENT_NOT_DRAWN (6230), SG_MUTANT_GRADIENT_STOPS_REPLACED (markup.c); media.c.
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -57,6 +58,9 @@ chk '^loaded=1$' "markup with LinearGradientBrushes and GradientStops"
 chk '^border_top=1$' "a red-to-blue BorderBrush: red at the top"
 chk '^border_bottom=1$' "and blue at the bottom (a gradient, 6230)"
 chk '^background=1,1,1$' "a white-to-black Background (GradientStops as a property element) drawn as a gradient"
+chk '^relative=1,1$' "a RelativeTransform (ScaleY -1 about the middle) flips the gradient (6231)"
+chk '^shape=1,1$' "a Rectangle's Fill drawn as a gradient (6231)"
+chk '^text=1,1$' "a TextBlock's Foreground drawn as a gradient (6231)"
 chk '^done=1$' "the probe finished"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
