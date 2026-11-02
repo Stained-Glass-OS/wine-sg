@@ -4,7 +4,7 @@
 # as GradientStops), a Border's BorderBrush and Background drawn in the gradient's mean colour (WinUI 2's
 # control borders were the desktop's grey). test/xamlgradient-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/xamlgradient-gate.sh
-# Mutants: SG_MUTANT_GRADIENT_NO_COLOR (media.c), SG_MUTANT_GRADIENT_STOPS_REPLACED (markup.c).
+# Mutants: SG_MUTANT_GRADIENT_NOT_DRAWN (6230), SG_MUTANT_GRADIENT_STOPS_REPLACED (markup.c); media.c.
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -54,8 +54,9 @@ RC=0
 chk() { if printf '%s\n' "$out" | grep -q "$1"; then printf 'PASS  %s\n' "$2"; else printf 'FAIL  %s\n' "$2"; RC=1; fi; }
 chk '^activate=00000000,1$' "LinearGradientBrush activates, is a GradientBrush"
 chk '^loaded=1$' "markup with LinearGradientBrushes and GradientStops"
-chk '^border=1,1,1$' "a red-to-blue BorderBrush drawn in their mean"
-chk '^background=1$' "a white-to-black Background (GradientStops as a property element): mid grey"
+chk '^border_top=1$' "a red-to-blue BorderBrush: red at the top"
+chk '^border_bottom=1$' "and blue at the bottom (a gradient, 6230)"
+chk '^background=1,1,1$' "a white-to-black Background (GradientStops as a property element) drawn as a gradient"
 chk '^done=1$' "the probe finished"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC

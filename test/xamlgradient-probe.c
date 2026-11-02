@@ -2,8 +2,8 @@
  *
  * LinearGradientBrush, GradientBrush and GradientStop were missing: WinUI 2's control styles draw
  * their borders with gradients (ControlElevationBorderBrush), which then fell back to the
- * desktop's grey (Windows Terminal's buttons and boxes had grey frames). A gradient is drawn in
- * the mean of its colours along it for now.
+ * desktop's grey (Windows Terminal's buttons and boxes had grey frames). Backgrounds and borders
+ * are drawn as gradients (6230); where a single colour is needed, the mean of its colours.
  *
  * Prints name=value lines; see test/xamlgradient-gate.sh.
  *
@@ -69,7 +69,7 @@ static const WCHAR page_xaml[] =
     L"<LinearGradientBrush StartPoint=\"0,0\" EndPoint=\"0,1\"><GradientStop Offset=\"0\" Color=\"#FFFF0000\"/>"
     L"<GradientStop Offset=\"1\" Color=\"#FF0000FF\"/></LinearGradientBrush></Border.BorderBrush></Border>"
     L"<Border" TL L" Width=\"100\" Height=\"50\" Margin=\"0,60,0,0\"><Border.Background>"
-    L"<LinearGradientBrush MappingMode=\"Absolute\" EndPoint=\"0,3\"><LinearGradientBrush.GradientStops>"
+    L"<LinearGradientBrush StartPoint=\"0,0\" EndPoint=\"0,1\"><LinearGradientBrush.GradientStops>"
     L"<GradientStop Offset=\"0\" Color=\"#FFFFFFFF\"/><GradientStop Offset=\"1.0\" Color=\"#FF000000\"/>"
     L"</LinearGradientBrush.GradientStops></LinearGradientBrush></Border.Background></Border>"
     L"</Grid>";
@@ -103,12 +103,18 @@ int main(void)
     pump(600); UpdateWindow(island); pump(200);
 
     hdc = GetDC(island);
-    /* the border: between red and blue (their mean), not grey */
-    c = GetPixel(hdc, 2, 25);
-    printf("border=%d,%d,%d\n", GetRValue(c) > 90 && GetRValue(c) < 170, GetGValue(c) < 40, GetBValue(c) > 90 && GetBValue(c) < 170);
-    /* white to black: their mean, mid grey */
+    /* the border, red at its top and blue at its bottom (6230) */
+    c = GetPixel(hdc, 2, 3);
+    printf("border_top=%d\n", GetRValue(c) > 180 && GetBValue(c) < 80);
+    c = GetPixel(hdc, 2, 47);
+    printf("border_bottom=%d\n", GetBValue(c) > 180 && GetRValue(c) < 80);
+    /* white to black down the background */
+    c = GetPixel(hdc, 50, 62);
+    printf("background=%d,", GetRValue(c) > 200);
     c = GetPixel(hdc, 50, 85);
-    printf("background=%d\n", GetRValue(c) > 100 && GetRValue(c) < 160 && GetRValue(c) == GetBValue(c));
+    printf("%d,", GetRValue(c) > 60 && GetRValue(c) < 200);
+    c = GetPixel(hdc, 50, 108);
+    printf("%d\n", GetRValue(c) < 60);
     ReleaseDC(island, hdc);
     printf("done=1\n");
     return 0;
