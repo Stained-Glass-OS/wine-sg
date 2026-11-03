@@ -5,7 +5,8 @@
 #
 #   WINE=/opt/wine-sg/bin/wine test/oleaut32-recinfo-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
-# Mutant: SG_MUTANT_RECINFO_SHALLOW, SG_MUTANT_RECINFO_NOCOPY_COPIES (oleaut32/recinfo.c).
+# Mutant: SG_MUTANT_RECINFO_SHALLOW, SG_MUTANT_RECINFO_NOCOPY_COPIES, SG_MUTANT_RECORD_NESTED_IGNORED (6233)
+# (oleaut32/recinfo.c), SG_MUTANT_INVOKE_NO_RECORD (6233, oleaut32/typelib.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
