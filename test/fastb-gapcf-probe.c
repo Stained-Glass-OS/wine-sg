@@ -40,6 +40,7 @@ static HRESULT (WINAPI *pUpdate)(HANDLE, const void *, const void *, DWORD, cons
 static HRESULT (WINAPI *pRevert)(HANDLE, DWORD, void *);
 static HRESULT (WINAPI *pConvert)(HANDLE, const void *, DWORD, DWORD, void *, void *);
 static DWORD (WINAPI *pState)(DWORD, DWORD);
+static HRESULT (WINAPI *pPlat)(DWORD *);
 
 static int fetch_calls, fail_mode, last_len, ident_ok;
 static LONGLONG last_off;
@@ -106,7 +107,17 @@ int main(void)
     G("CfGetPlaceholderRangeInfo", pRange); G("CfSetInSyncState", pSync); G("CfSetPinState", pPin);
     G("CfHydratePlaceholder", pHydrate); G("CfExecute", pExecute); G("CfGetTransferKey", pTkey);
     G("CfUpdatePlaceholder", pUpdate); G("CfRevertPlaceholder", pRevert); G("CfConvertToPlaceholder", pConvert);
-    G("CfGetPlaceholderStateFromAttributeTag", pState);
+    G("CfGetPlaceholderStateFromAttributeTag", pState); G("CfGetPlatformInfo", pPlat);
+
+    /* the platform level: the 0x500 capabilities (always-full placeholders, forced conversion) */
+    {
+        DWORD plat[3] = {0, 0, 0}, ubr = 0, sz = sizeof(ubr);
+        RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion", L"UBR",
+                RRF_RT_REG_DWORD, NULL, &ubr, &sz);
+        hr = pPlat(plat);
+        printf("platform build %lu revision %lu integration %#lx\n", plat[0], plat[1], plat[2]);
+        CHECK(hr == S_OK && plat[0] >= 16299 && plat[2] >= 0x500 && plat[2] < 0x600 && plat[1] == ubr);
+    }
 
     CreateDirectoryW(L"C:\\sgcf", NULL);
     CreateDirectoryW(root, NULL);
@@ -224,6 +235,41 @@ int main(void)
     CHECK(hr == S_OK && info.IdLen == 4 && info.InSync == 1);
     hr = pRange(h2, 1, 0, 100, rng, sizeof(rng), &ret);
     CHECK(hr == S_OK && ret == sizeof(RANGE) && rng[0].Len.QuadPart == 5);
+    CloseHandle(h2);
+
+    /* always-full placeholders: never dehydrated once full, until the state is cleared */
+    h2 = CreateFileW(L"C:\\sgcf\\root\\full.txt", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+    WriteFile(h2, "always", 6, &ret, NULL);
+    hr = pConvert(h2, "ID-F", 4, 0x8 | 0x2, NULL, NULL);
+    CHECK(hr == E32(434));
+    hr = pConvert(h2, "ID-F", 4, 0x8 | 0x10, NULL, NULL);
+    CHECK(hr == S_OK);
+    hr = pUpdate(h2, NULL, NULL, 0, NULL, 0, 0x4, NULL, NULL);
+    CHECK(hr == E32(434));
+    CHECK(GetFileSize(h2, NULL) == 6);
+    hr = pRange(h2, 1, 0, 100, rng, sizeof(rng), &ret);
+    CHECK(hr == S_OK && ret == sizeof(RANGE) && rng[0].Len.QuadPart == 6);
+    hr = pUpdate(h2, NULL, NULL, 0, NULL, 0, 0x200 | 0x400, NULL, NULL);
+    CHECK(hr == E32(380));
+    hr = pUpdate(h2, NULL, NULL, 0, NULL, 0, 0x400, NULL, NULL);
+    CHECK(hr == S_OK);
+    hr = pUpdate(h2, NULL, NULL, 0, NULL, 0, 0x4, NULL, NULL);
+    CHECK(hr == S_OK);
+    hr = pRange(h2, 1, 0, 100, rng, sizeof(rng), &ret);
+    CHECK(hr == S_OK && ret == 0);
+    hr = pUpdate(h2, NULL, NULL, 0, NULL, 0, 0x200, NULL, NULL);
+    CHECK(hr == S_OK);
+    hr = pUpdate(h2, NULL, NULL, 0, NULL, 0, 0x4, NULL, NULL);
+    CHECK(hr == E32(434));
+    CloseHandle(h2);
+    memset(ph, 0, sizeof(ph));
+    ph[0].Name = L"fullph.txt"; ph[0].Size.QuadPart = 100; ph[0].Id = "ID-G"; ph[0].IdLen = 4; ph[0].Flags = 0x8;
+    hr = pCreate(root, ph, 1, 0, &processed);
+    CHECK(hr == S_OK && ph[0].Result == S_OK);
+    h2 = CreateFileW(L"C:\\sgcf\\root\\fullph.txt", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(h2 != INVALID_HANDLE_VALUE);
+    hr = pUpdate(h2, NULL, NULL, 0, NULL, 0, 0x4, NULL, NULL);
+    CHECK(hr == E32(434));
     CloseHandle(h2);
 
     CHECK(pState(0, 0x80000007) == 0);
