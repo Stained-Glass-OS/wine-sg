@@ -1,0 +1,155 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll, mountmgr: report the volume features that exist; FSCTL_QUERY_ALLOCATED_RANGES, FSCTL_SET_ZERO_DATA
+
+A volume reported only FILE_CASE_PRESERVED_NAMES and FILE_PERSISTENT_ACLS, although names are kept in Unicode, symbolic link and mount point reparse points, object ids, hard links and opening by file id all work, so a program that checks for an NTFS-class volume before using them (a cloud sync provider choosing Files On-Demand, for one) took the volume for a lesser file system. The volume now also reports FILE_UNICODE_ON_DISK, FILE_SUPPORTS_REPARSE_POINTS, FILE_SUPPORTS_OBJECT_IDS, FILE_SUPPORTS_HARD_LINKS, FILE_SUPPORTS_OPEN_BY_FILE_ID and FILE_SUPPORTS_SPARSE_FILES, the same through a file handle and through the volume, and the sparse file controls that were missing exist: FSCTL_QUERY_ALLOCATED_RANGES lists the parts holding data (from the host file system's holes, keeping the handle's position) and FSCTL_SET_ZERO_DATA zeroes a range, punching a hole where the host can, without growing the file. Named streams, the change journal, transactions and encryption are still not claimed.
+---
+diff --git a/dlls/mountmgr.sys/device.c b/dlls/mountmgr.sys/device.c
+index 856ea17..3896693 100644
+--- a/dlls/mountmgr.sys/device.c
++++ b/dlls/mountmgr.sys/device.c
+@@ -1820,7 +1820,14 @@ static NTSTATUS WINAPI harddisk_query_volume( DEVICE_OBJECT *device, IRP *irp )
+             break;
+         default:
+             fsname = L"NTFS";
+-            info->FileSystemAttributes = FILE_CASE_PRESERVED_NAMES | FILE_PERSISTENT_ACLS;
++            /* as ntdll reports for a file on the volume: what the volume really does */
++            info->FileSystemAttributes = FILE_CASE_PRESERVED_NAMES | FILE_PERSISTENT_ACLS
++#ifndef SG_MUTANT_VOLUME_FLAGS_BARE
++                                       | FILE_UNICODE_ON_DISK | FILE_SUPPORTS_SPARSE_FILES
++                                       | FILE_SUPPORTS_REPARSE_POINTS | FILE_SUPPORTS_OBJECT_IDS
++                                       | FILE_SUPPORTS_HARD_LINKS | FILE_SUPPORTS_OPEN_BY_FILE_ID
++#endif
++                                       ;
+             info->MaximumComponentNameLength = 255;
+             break;
+         }
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index c0c54df..553953f 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -7793,6 +7793,92 @@ static NTSTATUS sg_delete_reparse_point( HANDLE handle, const void *in, ULONG in
+ }
+ 
+ 
++/* FSCTL_QUERY_ALLOCATED_RANGES: the parts of [offset, offset + length) that hold data, from the
++ * holes the host file system keeps (a file system without holes reports the whole file) */
++static NTSTATUS query_allocated_ranges( HANDLE handle, const void *in, ULONG in_size, void *out, ULONG out_size,
++                                        ULONG_PTR *ret_size )
++{
++    struct range { LARGE_INTEGER offset, length; } req, *ranges = out;
++    ULONG count = 0, max = out_size / sizeof(*ranges);
++    off_t pos, end, data, hole, cur;
++    NTSTATUS status = STATUS_SUCCESS;
++    int fd, needs_close;
++    struct stat st;
++
++    *ret_size = 0;
++    if (!in || in_size < sizeof(req)) return STATUS_INVALID_PARAMETER;
++    memcpy( &req, in, sizeof(req) );
++    if (req.offset.QuadPart < 0 || req.length.QuadPart < 0 ||
++        req.offset.QuadPart > (LONGLONG)(((ULONGLONG)1 << 63) - 1) - req.length.QuadPart)
++        return STATUS_INVALID_PARAMETER;
++    if (out_size && !out) return STATUS_INVALID_USER_BUFFER;
++    if ((status = server_get_unix_fd( handle, FILE_READ_DATA, &fd, &needs_close, NULL, NULL ))) return status;
++    if (fstat( fd, &st ) == -1) { status = errno_to_status( errno ); goto done; }
++    if (S_ISDIR( st.st_mode )) { status = STATUS_INVALID_PARAMETER; goto done; }
++
++    cur = lseek( fd, 0, SEEK_CUR ); /* the handle's file position: SEEK_DATA moves it */
++    pos = req.offset.QuadPart;
++    end = min( (ULONGLONG)st.st_size, (ULONGLONG)req.offset.QuadPart + req.length.QuadPart );
++    while (pos < end)
++    {
++#if defined(SEEK_DATA) && defined(SEEK_HOLE) && !defined(SG_MUTANT_RANGES_WHOLE_FILE)
++        if ((data = lseek( fd, pos, SEEK_DATA )) == -1)
++        {
++            if (errno == ENXIO) break; /* only a hole is left */
++            data = pos; hole = end; /* no hole information: all data */
++        }
++        else if ((hole = lseek( fd, data, SEEK_HOLE )) == -1) hole = end;
++#else
++        data = pos; hole = end;
++#endif
++        if (data >= end) break;
++        if (hole > end) hole = end;
++        if (count == max) { status = count ? STATUS_BUFFER_OVERFLOW : STATUS_BUFFER_TOO_SMALL; break; }
++        ranges[count].offset.QuadPart = data;
++        ranges[count].length.QuadPart = hole - data;
++        count++;
++        pos = hole;
++    }
++    *ret_size = count * sizeof(*ranges);
++    if (cur != -1) lseek( fd, cur, SEEK_SET );
++done:
++    if (needs_close) close( fd );
++    return status;
++}
++
++/* FSCTL_SET_ZERO_DATA: zero [offset, beyond) inside the file, giving the space back where the host
++ * file system can make a hole */
++static NTSTATUS set_zero_data( HANDLE handle, const void *in, ULONG in_size )
++{
++    struct { LARGE_INTEGER offset, beyond; } req;
++    static const char zeros[65536];
++    NTSTATUS status = STATUS_SUCCESS;
++    int fd, needs_close;
++    struct stat st;
++    off_t pos, end;
++
++    if (!in || in_size < sizeof(req)) return STATUS_INVALID_PARAMETER;
++    memcpy( &req, in, sizeof(req) );
++    if (req.offset.QuadPart < 0 || req.beyond.QuadPart < req.offset.QuadPart) return STATUS_INVALID_PARAMETER;
++    if ((status = server_get_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL ))) return status;
++    if (fstat( fd, &st ) == -1) { status = errno_to_status( errno ); goto done; }
++    pos = req.offset.QuadPart;
++    end = min( (ULONGLONG)st.st_size, (ULONGLONG)req.beyond.QuadPart ); /* never grows the file */
++    if (pos >= end) goto done;
++#if defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
++    if (!fallocate( fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, pos, end - pos )) goto done;
++#endif
++    while (pos < end)
++    {
++        ssize_t n = pwrite( fd, zeros, min( sizeof(zeros), (size_t)(end - pos) ), pos );
++        if (n <= 0) { status = n ? errno_to_status( errno ) : STATUS_DISK_FULL; break; }
++        pos += n;
++    }
++done:
++    if (needs_close) close( fd );
++    return status;
++}
++
+ /******************************************************************************
+  *              NtFsControlFile   (NTDLL.@)
+  */
+@@ -7900,6 +7986,14 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
+         TRACE("FSCTL_SET_SPARSE: Ignoring request\n");
+         status = STATUS_SUCCESS;
+         break;
++
++    case FSCTL_QUERY_ALLOCATED_RANGES:
++        status = query_allocated_ranges( handle, in_buffer, in_size, out_buffer, out_size, &size );
++        break;
++
++    case FSCTL_SET_ZERO_DATA:
++        status = set_zero_data( handle, in_buffer, in_size );
++        break;
+     default:
+         return server_ioctl_file( handle, event, apc, apc_context, io, code,
+                                   in_buffer, in_size, out_buffer, out_size );
+@@ -8711,7 +8805,16 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
+             memcpy(info->FileSystemName, fat32W, info->FileSystemNameLength);
+             break;
+         default:
+-            info->FileSystemAttributes = FILE_CASE_PRESERVED_NAMES | FILE_PERSISTENT_ACLS;
++            /* what this volume really does: names in Unicode, holes (FSCTL_SET_SPARSE,
++             * FSCTL_QUERY_ALLOCATED_RANGES, FSCTL_SET_ZERO_DATA), symbolic link and mount point
++             * reparse points, object ids, hard links and opening by file id */
++            info->FileSystemAttributes = FILE_CASE_PRESERVED_NAMES | FILE_PERSISTENT_ACLS
++#ifndef SG_MUTANT_VOLUME_FLAGS_BARE
++                                       | FILE_UNICODE_ON_DISK | FILE_SUPPORTS_SPARSE_FILES
++                                       | FILE_SUPPORTS_REPARSE_POINTS | FILE_SUPPORTS_OBJECT_IDS
++                                       | FILE_SUPPORTS_HARD_LINKS | FILE_SUPPORTS_OPEN_BY_FILE_ID
++#endif
++                                       ;
+             info->MaximumComponentNameLength = 255;
+             info->FileSystemNameLength = min( sizeof(ntfsW), length - offsetof( FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName ) );
+             memcpy(info->FileSystemName, ntfsW, info->FileSystemNameLength);
