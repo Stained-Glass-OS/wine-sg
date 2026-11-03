@@ -151,6 +151,20 @@ int main(void)
     CHECK(hr == E32(390));
     CHECK(GetFileAttributesW(L"C:\\sgcf\\root\\sub") & FILE_ATTRIBUTE_DIRECTORY);
 
+    /* the base may be given as a \\?\ path, into a placeholder folder (6238) */
+    memset(ph, 0, sizeof(ph));
+    ph[0].Name = L"in-sub.txt"; ph[0].Size.QuadPart = 3; ph[0].Id = "ID-L"; ph[0].IdLen = 4;
+    hr = pCreate(L"\\\\?\\C:\\sgcf\\root\\sub", ph, 1, 1, &processed);
+    CHECK(hr == S_OK && processed == 1 && ph[0].Result == S_OK);
+    CHECK(GetFileAttributesW(L"C:\\sgcf\\root\\sub\\in-sub.txt") != INVALID_FILE_ATTRIBUTES);
+    memset(ph, 0, sizeof(ph));
+    ph[0].Name = L"v1..2.txt"; ph[0].Size.QuadPart = 1; ph[1].Name = L"..\\out.txt"; ph[1].Size.QuadPart = 1;
+    hr = pCreate(root, ph, 2, 0, &processed);
+    CHECK(ph[0].Result == S_OK && ph[1].Result == E_INVALIDARG && processed == 1);
+    CHECK(GetFileAttributesW(L"C:\\sgcf\\out.txt") == INVALID_FILE_ATTRIBUTES);
+    hr = pRegister(L"\\\\?\\C:\\sgcf\\root", &reg, &pol, 1);
+    CHECK(hr == S_OK);
+
     h = CreateFileW(L"C:\\sgcf\\root\\a.txt", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     CHECK(h != INVALID_HANDLE_VALUE);
     CHECK(GetFileSize(h, NULL) == 10000);
