@@ -171,6 +171,83 @@ static void invoke_record(IRecordInfo *ri)
     IRecordInfo_RecordDestroy(ri, rec);
 }
 
+/* a record with a SAFEARRAY field after a pointer field: copied deep, cleared to NULL (6237) */
+static void arrfield(void)
+{
+    ICreateTypeLib2 *ctl;
+    ICreateTypeInfo *cti;
+    ITypeInfo *ti;
+    IRecordInfo *ri = NULL;
+    VARDESC vd, *got;
+    static TYPEDESC elem;
+    WCHAR path[MAX_PATH];
+    ULONG off_a = 0;
+    SAFEARRAYBOUND b = {2, 0};
+    SAFEARRAY *sa, *copy;
+    BYTE *src, *dst, *recs;
+    BSTR str;
+    LONG i;
+
+    GetTempPathW(MAX_PATH, path);
+    lstrcatW(path, L"sg-recinfo3.tlb");
+    if (FAILED(CreateTypeLib2(sizeof(void *) == 8 ? SYS_WIN64 : SYS_WIN32, path, &ctl))) { check(0, "typelib made"); return; }
+    ICreateTypeLib2_CreateTypeInfo(ctl, (LPOLESTR)L"witharr", TKIND_RECORD, &cti);
+    memset(&vd, 0, sizeof(vd));
+    vd.varkind = VAR_PERINSTANCE;
+    vd.memid = 0x40000000; vd.elemdescVar.tdesc.vt = VT_BSTR;
+    ICreateTypeInfo_AddVarDesc(cti, 0, &vd); ICreateTypeInfo_SetVarName(cti, 0, (LPOLESTR)L"s");
+    elem.vt = VT_BSTR;
+    vd.memid = 0x40000001; vd.elemdescVar.tdesc.vt = VT_SAFEARRAY; vd.elemdescVar.tdesc.lptdesc = &elem;
+    ICreateTypeInfo_AddVarDesc(cti, 1, &vd); ICreateTypeInfo_SetVarName(cti, 1, (LPOLESTR)L"a");
+    ICreateTypeInfo_LayOut(cti);
+    ICreateTypeInfo_QueryInterface(cti, &IID_ITypeInfo, (void **)&ti);
+    if (SUCCEEDED(ITypeInfo_GetVarDesc(ti, 1, &got))) { off_a = got->oInst; ITypeInfo_ReleaseVarDesc(ti, got); }
+    GetRecordInfoFromTypeInfo(ti, &ri);
+    ITypeInfo_Release(ti);
+    ICreateTypeInfo_Release(cti);
+    ICreateTypeLib2_Release(ctl);
+    check(ri != NULL && off_a == sizeof(void *), "a record with a SAFEARRAY field made (offset %lu)", off_a);
+    if (!ri) return;
+
+    src = IRecordInfo_RecordCreate(ri);
+    dst = IRecordInfo_RecordCreate(ri);
+    sa = SafeArrayCreate(VT_BSTR, 1, &b);
+    for (i = 0; i < 2; i++) { str = SysAllocString(i ? L"two" : L"one"); SafeArrayPutElement(sa, &i, str); SysFreeString(str); }
+    *(BSTR *)src = SysAllocString(L"head");
+    *(SAFEARRAY **)(src + off_a) = sa;
+    check(IRecordInfo_RecordCopy(ri, src, dst) == S_OK, "RecordCopy of a record with an array");
+    copy = *(SAFEARRAY **)(dst + off_a);
+    check(copy && copy != sa, "the array field copied deep");
+    if (copy && copy != sa)
+    {
+        i = 1; str = NULL;
+        check(SafeArrayGetElement(copy, &i, &str) == S_OK && str && !lstrcmpW(str, L"two"), "the copy holds the elements");
+        SysFreeString(str);
+    }
+    check(IRecordInfo_RecordClear(ri, dst) == S_OK && !*(SAFEARRAY **)(dst + off_a) && !*(BSTR *)dst,
+          "RecordClear destroys the array and clears the field");
+    check(*(SAFEARRAY **)(src + off_a) == sa, "the source array untouched");
+    IRecordInfo_RecordDestroy(ri, src);
+    IRecordInfo_RecordDestroy(ri, dst);
+
+    /* an array of such records: destroying it clears each record */
+    recs = NULL;
+    sa = SafeArrayCreateEx(VT_RECORD, 1, &b, ri);
+    check(sa != NULL, "an array of records made");
+    if (sa && SUCCEEDED(SafeArrayAccessData(sa, (void **)&recs)))
+    {
+        SAFEARRAYBOUND b1 = {1, 0};
+        ULONG size = 0;
+
+        IRecordInfo_GetSize(ri, &size);
+        *(SAFEARRAY **)(recs + off_a) = SafeArrayCreate(VT_BSTR, 1, &b1); /* the first record's array */
+        *(BSTR *)(recs + size) = SysAllocString(L"second");             /* the second record's string */
+        SafeArrayUnaccessData(sa);
+        check(SafeArrayDestroy(sa) == S_OK, "an array of records with array fields destroyed");
+    }
+    IRecordInfo_Release(ri);
+}
+
 static void nested(void)
 {
     ULONG off_inner = 0, off_e = 0, off_t = 0;
@@ -198,6 +275,7 @@ static void nested(void)
     IRecordInfo_RecordDestroy(ri, dst);
     invoke_record(ri);
     IRecordInfo_Release(ri);
+    arrfield();
 }
 
 int main(void)
