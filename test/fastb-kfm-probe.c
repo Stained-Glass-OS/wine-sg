@@ -173,6 +173,39 @@ int main(void)
         IKnownFolder_Release(kf);
     }
 
+    /* the Pictures subfolders: a path with KF_FLAG_DONT_VERIFY even before they exist (6241) */
+    {
+        static const struct { const KNOWNFOLDERID *id; const WCHAR *name; } subs[] =
+        {
+            { &FOLDERID_Screenshots, L"Screenshots" },
+            { &FOLDERID_CameraRoll, L"Camera Roll" },
+            { &FOLDERID_SavedPictures, L"Saved Pictures" },
+        };
+        WCHAR *pics = NULL, *p2, want[MAX_PATH];
+        unsigned int i;
+
+        CHECK(SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DONT_VERIFY, NULL, &pics) == S_OK, "Pictures");
+        for (i = 0; pics && i < ARRAYSIZE(subs); i++)
+        {
+            swprintf(want, MAX_PATH, L"%ls\\%ls", pics, subs[i].name);
+            RemoveDirectoryW(want);
+            p2 = NULL;
+            hr = SHGetKnownFolderPath(subs[i].id, KF_FLAG_DONT_VERIFY, NULL, &p2);
+            CHECK(hr == S_OK && p2 && !wcsicmp(p2, want), "%ls: %lx %ls", subs[i].name, hr, p2 ? p2 : L"-");
+            CoTaskMemFree(p2);
+            p2 = NULL;
+            hr = SHGetKnownFolderPath(subs[i].id, 0, NULL, &p2);
+            CHECK(FAILED(hr) && !p2, "%ls absent, verified: %lx", subs[i].name, hr);
+            CoTaskMemFree(p2);
+            p2 = NULL;
+            hr = SHGetKnownFolderPath(subs[i].id, KF_FLAG_CREATE, NULL, &p2);
+            CHECK(hr == S_OK && GetFileAttributesW(want) != INVALID_FILE_ATTRIBUTES, "%ls created: %lx", subs[i].name, hr);
+            CoTaskMemFree(p2);
+            RemoveDirectoryW(want);
+        }
+        CoTaskMemFree(pics);
+    }
+
     CoTaskMemFree(path);
     IKnownFolderManager_Release(mgr);
     printf("%d checks, %d failures\n", checks, fails);
