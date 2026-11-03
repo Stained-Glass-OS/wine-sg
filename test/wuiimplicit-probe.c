@@ -40,6 +40,7 @@ DEFINE_GUID(probe_IID_ICompositionObject2, 0xef874ea1, 0x5cff, 0x4b68, 0x9e, 0x3
 DEFINE_GUID(probe_IID_IKeyFrameAnimation, 0x126e7f22, 0x3ae9, 0x4540, 0x9a, 0x8a, 0xde, 0xae, 0x8a, 0x4a, 0x4a, 0x84);
 DEFINE_GUID(probe_IID_ICompositionAnimation, 0x464c4c2c, 0x1caa, 0x4061, 0x9b, 0x40, 0xe1, 0x3f, 0xde, 0x15, 0x03, 0xca);
 DEFINE_GUID(probe_IID_ICompositionAnimation2, 0x369b603e, 0xa80f, 0x4948, 0x93, 0xe3, 0xed, 0x23, 0xfb, 0x38, 0xc6, 0xcb);
+DEFINE_GUID(probe_IID_ICompositionAnimation4, 0x770137be, 0x76bc, 0x4e23, 0xbf, 0xed, 0xfe, 0x9c, 0xc2, 0x0f, 0x6e, 0xc9);
 DEFINE_GUID(probe_IID_ICompositionAnimationBase, 0x1c2c2999, 0xe818, 0x48d3, 0xa6, 0xdd, 0xd7, 0x8c, 0x82, 0xf8, 0xac, 0xe9);
 DEFINE_GUID(probe_IID_ICompositionEasingFunction, 0x5145e356, 0xbf79, 0x4ea8, 0x8c, 0xc2, 0x6b, 0x5b, 0x47, 0x2e, 0x6c, 0x9a);
 DEFINE_GUID(probe_IID_IStepEasingFunction, 0xd0caa74b, 0x560c, 0x4a0b, 0xa5, 0xf6, 0x20, 0x6c, 0xa8, 0xc3, 0xec, 0xd6);
@@ -209,6 +210,19 @@ static void *offset_animation( double ms )
         SLOT( anim2, ANIMATION2_GET_TARGET, HRESULT (WINAPI *)( void *, HSTRING * ) )( anim2, &got );
         printf( "target=%ls\n", WindowsGetStringRawBuffer( got, NULL ) );
         WindowsDeleteString( got );
+    }
+    {
+        /* ICompositionAnimation4.SetExpressionReferenceParameter (6240): React Native asks for it */
+        void *anim4 = qi( anim, &probe_IID_ICompositionAnimation4 );
+        HRESULT hr_ref = E_FAIL, hr_null = E_FAIL;
+        if (anim4)
+        {
+            s = hs( L"src" );
+            hr_ref = SLOT( anim4, 6, HRESULT (WINAPI *)( void *, HSTRING, void * ) )( anim4, s, anim );
+            hr_null = SLOT( anim4, 6, HRESULT (WINAPI *)( void *, HSTRING, void * ) )( anim4, s, NULL );
+            WindowsDeleteString( s );
+        }
+        printf( "animation4=%d ref=%#lx null=%#lx\n", anim4 != NULL, hr_ref, hr_null );
     }
     s = hs( L"this.FinalValue" );
     hr = SLOT( qi( anim, &probe_IID_IKeyFrameAnimation ), KF_INSERT_EXPRESSION, HRESULT (WINAPI *)( void *, float, HSTRING ) )(

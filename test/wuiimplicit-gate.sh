@@ -63,6 +63,7 @@ check() {
 check 'compositor2=1'                        "the compositor answers ICompositor2"
 check 'collection=1'                         "CreateImplicitAnimationCollection makes an ImplicitAnimationCollection"
 check 'animation2=1'                         "a key frame animation answers ICompositionAnimation2"
+check 'animation4=1 ref=0 null=0x80070057'   "ICompositionAnimation4 takes a reference parameter, refuses none"
 check 'target=Offset'                        "and keeps its Target"
 check 'insert=1 replaced=0'                  "Insert of a new name replaces nothing"
 check 'again replaced=1 size=1 has=1 missing=0 lookup=1 lookup_missing=0x8000000b' "again it replaces; Size, HasKey, Lookup; a missing name is out of bounds"
