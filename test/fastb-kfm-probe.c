@@ -1,4 +1,5 @@
-/* IKnownFolderManager::FindFolderFromPath / FindFolderFromIDList and IKnownFolder::GetFolderType (patch 3601). */
+/* IKnownFolderManager::FindFolderFromPath / FindFolderFromIDList and IKnownFolder::GetFolderType (patch 3601);
+ * no match is a failure, IKnownFolder::GetRedirectionCapabilities (6239). */
 #define COBJMACROS
 #define INITGUID
 #include <windows.h>
@@ -54,7 +55,7 @@ int main(void)
     swprintf(sub, MAX_PATH, L"%ls\\some\\child", path);
     kf = (void *)1;
     hr = IKnownFolderManager_FindFolderFromPath(mgr, sub, FFFP_EXACTMATCH, &kf);
-    CHECK(hr == S_FALSE && !kf, "no exact match for a child: %lx %p", hr, kf);
+    CHECK(hr == E_FAIL && !kf, "no exact match for a child: %lx %p", hr, kf);
     kf = NULL;
     hr = IKnownFolderManager_FindFolderFromPath(mgr, sub, FFFP_NEARESTPARENTMATCH, &kf);
     CHECK(hr == S_OK && kf, "nearest parent %lx", hr);
@@ -71,12 +72,12 @@ int main(void)
     /* a path that matches nothing */
     kf = (void *)1;
     hr = IKnownFolderManager_FindFolderFromPath(mgr, L"Q:\\nowhere\\at all", FFFP_NEARESTPARENTMATCH, &kf);
-    CHECK(hr == S_FALSE && !kf, "no match: %lx %p", hr, kf);
+    CHECK(hr == E_FAIL && !kf, "no match: %lx %p", hr, kf);
 
     /* a prefix that is not on a component boundary is not a parent */
     swprintf(sub, MAX_PATH, L"%lsXYZ", path);
     hr = IKnownFolderManager_FindFolderFromPath(mgr, sub, FFFP_EXACTMATCH, &kf);
-    CHECK(hr == S_FALSE && !kf, "sibling name: %lx", hr);
+    CHECK(hr == E_FAIL && !kf, "sibling name: %lx", hr);
 
     swprintf(sub, MAX_PATH, L"%lsXYZ\\child", path);
     kf = NULL;
@@ -106,6 +107,53 @@ int main(void)
         ILFree(pidl);
     }
     CHECK(IKnownFolderManager_FindFolderFromIDList(mgr, NULL, &kf) == E_INVALIDARG, "NULL pidl");
+    /* an id list of a folder that is no known folder */
+    swprintf(sub, MAX_PATH, L"%ls\\system32\\drivers", path);
+    if (SUCCEEDED(SHParseDisplayName(sub, NULL, &pidl, 0, NULL)))
+    {
+        kf = (void *)1;
+        hr = IKnownFolderManager_FindFolderFromIDList(mgr, pidl, &kf);
+        CHECK(FAILED(hr) && !kf, "no known folder for an id list: %lx %p", hr, kf);
+        ILFree(pidl);
+    }
+
+    /* redirection: per-user folders can move, unless policy says no; virtual ones cannot */
+    {
+        static const WCHAR pol[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer";
+        KF_REDIRECTION_CAPABILITIES caps;
+        DWORD one = 1;
+        HKEY key;
+        BOOL hklm_ok;
+
+        caps = 0xdead;
+        CHECK(IKnownFolderManager_GetFolder(mgr, &FOLDERID_Documents, &kf) == S_OK, "Documents");
+        CHECK(IKnownFolder_GetRedirectionCapabilities(kf, &caps) == S_OK && caps == KF_REDIRECTION_CAPABILITIES_ALLOW_ALL,
+              "Documents redirectable: %#x", caps);
+        RegCreateKeyExW(HKEY_CURRENT_USER, pol, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL);
+        RegSetValueExW(key, L"DisablePersonalDirChange", 0, REG_DWORD, (BYTE *)&one, sizeof(one));
+        caps = 0xdead;
+        CHECK(IKnownFolder_GetRedirectionCapabilities(kf, &caps) == S_OK && caps == KF_REDIRECTION_CAPABILITIES_DENY_POLICY,
+              "policy denies: %#x", caps);
+        RegDeleteValueW(key, L"DisablePersonalDirChange");
+        RegCloseKey(key);
+        IKnownFolder_Release(kf);
+
+        caps = 0xdead;
+        CHECK(IKnownFolderManager_GetFolder(mgr, &FOLDERID_ComputerFolder, &kf) == S_OK, "Computer");
+        CHECK(IKnownFolder_GetRedirectionCapabilities(kf, &caps) == S_OK && caps == KF_REDIRECTION_CAPABILITIES_DENY_ALL,
+              "virtual folder not redirectable: %#x", caps);
+        IKnownFolder_Release(kf);
+
+        hklm_ok = !RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+                                 0, KEY_SET_VALUE, &key);
+        if (hklm_ok) RegCloseKey(key);
+        caps = 0xdead;
+        CHECK(IKnownFolderManager_GetFolder(mgr, &FOLDERID_PublicDocuments, &kf) == S_OK, "Public Documents");
+        CHECK(IKnownFolder_GetRedirectionCapabilities(kf, &caps) == S_OK &&
+              caps == (hklm_ok ? KF_REDIRECTION_CAPABILITIES_ALLOW_ALL : KF_REDIRECTION_CAPABILITIES_DENY_PERMISSIONS),
+              "common folder by HKLM access (%d): %#x", hklm_ok, caps);
+        IKnownFolder_Release(kf);
+    }
 
     /* folder type */
     hr = IKnownFolderManager_GetFolder(mgr, &FOLDERID_Documents, &kf);
