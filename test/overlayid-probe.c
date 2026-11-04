@@ -1,6 +1,7 @@
 /* Icon overlay handlers (patch 6245): the registered handlers in sorted order, at most 15; an item's
  * overlay from the first handler (by priority) that says it is a member; SHGetIconOverlayIndex; the
- * file view's items carry the overlay. */
+ * file view's items carry the overlay.  6248: a handler that cannot be made takes no slot, and COM
+ * gives the loader's error for a server it cannot load (missing; 32-bit in a 64-bit process). */
 #define COBJMACROS
 #include <windows.h>
 #include <shlobj.h>
@@ -50,7 +51,7 @@ static void pump(int ms)
 int main(void)
 {
     IShellFolder *desktop, *folder = NULL;
-    LPITEMIDLIST dir, a, b, c;
+    LPITEMIDLIST dir, a, b, c, d;
     WCHAR shell32[MAX_PATH];
     void *ov = NULL;
     int index, image, icon, i;
@@ -65,6 +66,7 @@ int main(void)
     IShellFolder_BindToObject(desktop, dir, NULL, &IID_IShellFolder, (void **)&folder);
     if (!folder) { printf("no folder\nRESULT: FAIL\n"); return 1; }
     a = child_of(folder, L"x.ova"); b = child_of(folder, L"y.ovb"); c = child_of(folder, L"z.txt");
+    d = child_of(folder, L"w.ovc");
     IShellFolder_QueryInterface(folder, &IID_Overlay, &ov);
     CHECK(ov != NULL, "the folder answers IShellIconOverlay");
     if (!ov) { printf("RESULT: FAIL\n"); return 1; }
@@ -74,6 +76,9 @@ int main(void)
     CHECK(hr == S_OK && index == 1, "a member of the first handler (four spaces sort first): %#lx %d", hr, index);
     index = -7;
     hr = ((ov_fn)SLOT(ov, 3))(ov, b, &index);
+    CHECK(hr == S_OK && index == 15, "the handler after one that failed has the 15th slot: %#lx %d", hr, index);
+    index = -7;
+    hr = ((ov_fn)SLOT(ov, 3))(ov, d, &index);
     CHECK(hr == S_FALSE, "the 16th handler is not loaded: %#lx %d", hr, index);
     hr = ((ov_fn)SLOT(ov, 3))(ov, c, &index);
     CHECK(hr == S_FALSE, "no handler marks it: %#lx", hr);
@@ -87,7 +92,16 @@ int main(void)
     lstrcatW(shell32, L"\\shell32.dll");
     image = SHGetIconOverlayIndexW(shell32, 1);
     CHECK(image >= 0, "SHGetIconOverlayIndex of a loaded handler's picture: %d", image);
-    CHECK(SHGetIconOverlayIndexW(shell32, 2) == -1, "a picture of no loaded handler: %d", SHGetIconOverlayIndexW(shell32, 2));
+    CHECK(SHGetIconOverlayIndexW(shell32, 4) == -1, "a picture of no loaded handler: %d", SHGetIconOverlayIndexW(shell32, 4));
+    {
+        static const GUID missing = { 0x7b1d0e11, 0x2b6d, 0x4c11, { 0x9a, 0x01, 0x0e, 0x57, 0xa1, 0x10, 0x0e, 0x0e } };
+        static const GUID x86 = { 0x7b1d0e11, 0x2b6d, 0x4c11, { 0x9a, 0x01, 0x0e, 0x57, 0xa1, 0x10, 0x0e, 0x0d } };
+        void *unk = NULL;
+        hr = CoCreateInstance(&missing, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, &unk);
+        CHECK(hr == HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND), "a missing in-process server: %#lx", hr);
+        hr = CoCreateInstance(&x86, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, &unk);
+        CHECK(hr == HRESULT_FROM_WIN32(ERROR_BAD_EXE_FORMAT), "a 32-bit in-process server in a 64-bit process: %#lx", hr);
+    }
     icon = -7;
     hr = ((ov_fn)SLOT(ov, 4))(ov, a, &icon);
     CHECK(hr == S_OK && icon == image, "GetOverlayIconIndex: %#lx %d (%d)", hr, icon, image);
