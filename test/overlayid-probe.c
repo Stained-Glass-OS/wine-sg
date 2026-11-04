@@ -37,6 +37,25 @@ static HWND find_list(HWND parent)
     return NULL;
 }
 
+/* another thread: does the view's list answer a message within a second? */
+static HWND probe_list;
+static LONG probe_ok = -1;
+static DWORD WINAPI responsive_thread(void *arg)
+{
+    DWORD_PTR result;
+    Sleep(200);
+    probe_ok = SendMessageTimeoutW(probe_list, WM_NULL, 0, 0, SMTO_NORMAL, 1000, &result) ? 1 : 0;
+    return 0;
+}
+
+static int item_state(HWND list, const WCHAR *name, const WCHAR *bare)
+{
+    LVFINDINFOW find = { LVFI_STRING, name };
+    int i = list ? (int)SendMessageW(list, LVM_FINDITEMW, -1, (LPARAM)&find) : -1;
+    if (i < 0 && list) { find.psz = bare; i = (int)SendMessageW(list, LVM_FINDITEMW, -1, (LPARAM)&find); }
+    return i >= 0 ? (int)SendMessageW(list, LVM_GETITEMSTATE, i, LVIS_OVERLAYMASK) : -1;
+}
+
 static void pump(int ms)
 {
     DWORD end = GetTickCount() + ms;
@@ -76,7 +95,7 @@ int main(void)
     CHECK(hr == S_OK && index == 1, "a member of the first handler (four spaces sort first): %#lx %d", hr, index);
     index = -7;
     hr = ((ov_fn)SLOT(ov, 3))(ov, b, &index);
-    CHECK(hr == S_OK && index == 15, "the handler after one that failed has the 15th slot: %#lx %d", hr, index);
+    CHECK(hr == S_OK && index == 15, "the handler after one that failed (and the slow one) has the 15th slot: %#lx %d", hr, index);
     index = -7;
     hr = ((ov_fn)SLOT(ov, 3))(ov, d, &index);
     CHECK(hr == S_FALSE, "the 16th handler is not loaded: %#lx %d", hr, index);
@@ -120,8 +139,29 @@ int main(void)
         {
             IExplorerBrowser_Initialize(browser, top, &rc, &fs);
             IExplorerBrowser_BrowseToIDList(browser, dir, 0);
-            pump(1500);
+            pump(300);
             list = find_list(top);
+            /* 6251: the slow handler is asked beside the view, which keeps answering */
+            if (list)
+            {
+                HANDLE t;
+                DWORD start = GetTickCount(), took;
+                probe_list = list;
+                t = CreateThread(NULL, 0, responsive_thread, NULL, 0, NULL);
+                InvalidateRect(list, NULL, TRUE);
+                pump(1500);
+                index = item_state(list, L"v.ovs", L"v");
+                took = GetTickCount() - start;
+                WaitForSingleObject(t, 5000);
+                CloseHandle(t);
+                CHECK(probe_ok == 1, "the view answers while a handler takes 5 s: %ld", probe_ok);
+                CHECK(took < 4000, "and its thread is not held: %lu ms", took);
+                CHECK(index == 0, "the slow handler's item has no overlay yet: %#x", index);
+                pump(6500);
+                index = item_state(list, L"v.ovs", L"v");
+                CHECK(index == INDEXTOOVERLAYMASK(14), "it has it when the answer comes: %#x", index);
+            }
+            else CHECK(0, "no list");
             find.psz = L"x.ova";
             i = list ? (int)SendMessageW(list, LVM_FINDITEMW, -1, (LPARAM)&find) : -1;
             if (i < 0 && list)  /* names may be shown without extensions */

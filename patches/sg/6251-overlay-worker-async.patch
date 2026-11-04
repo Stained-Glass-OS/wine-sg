@@ -1,0 +1,520 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] shell32: overlay handlers asked on a worker thread, views get overlays asynchronously
+
+The file view asked the icon overlay handlers on its window thread while drawing, so OneDrive's IsMemberOf, which waits, left Explorer's window blank for good. As on Windows the handlers are now made and asked on a worker thread of their own (a single-threaded apartment that pumps its messages between jobs). The view asks the folder with OI_ASYNC, gets E_PENDING, shows no overlay, and the overlay is posted to it when the handlers answer. A caller that waits for an answer stops waiting after ten seconds, so a handler that never answers holds only the worker.
+---
+diff --git a/dlls/shell32/iconcache.c b/dlls/shell32/iconcache.c
+index 8d70589..cdad3ab 100644
+--- a/dlls/shell32/iconcache.c
++++ b/dlls/shell32/iconcache.c
+@@ -31,6 +31,7 @@
+ #include "winuser.h"
+ #include "winreg.h"
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ #include "shellapi.h"
+ #include "objbase.h"
+@@ -1232,41 +1233,298 @@ static void overlays_apply(void)
+     overlay_lists_made = shell_imagelists[0];
+ }
+ 
+-/* the overlay (1..15) of a file, from the handlers by priority; 0 when none marks it */
+-int SHELL32_OverlayForPath( const WCHAR *path, DWORD attributes, int *image )
++/* Stained Glass OS 6251: as on Windows the handlers are never asked on a window's thread.
++ * One worker thread (a single-threaded apartment that pumps its messages between jobs) makes
++ * the handlers and asks them; a file view asks for an item's overlay with OI_ASYNC, gets
++ * E_PENDING, and the answer is posted to it when the handlers have given it.  OneDrive's
++ * IsMemberOf waited on Explorer's window thread and its window stayed blank (qa4 637).  A
++ * handler that never answers holds the worker only: views show no overlay, and a caller
++ * that asks and waits (IShellIconOverlay without OI_ASYNC) stops waiting after a while. */
++
++#define OVERLAY_WAIT_MS 10000
++
++enum overlay_job_kind { OVERLAY_JOB_LOAD, OVERLAY_JOB_PATH, OVERLAY_JOB_ITEM };
++
++struct overlay_job
++{
++    struct list entry;
++    LONG refs;
++    enum overlay_job_kind kind;
++    WCHAR *path;                    /* OVERLAY_JOB_PATH */
++    DWORD attributes;
++    IShellIconOverlay *folder;      /* OVERLAY_JOB_ITEM */
++    LPITEMIDLIST child;
++    HWND hwnd;                      /* the answer is posted to it ... */
++    UINT msg;
++    void *cookie;
++    void (*free_cookie)(void *);    /* ... or the cookie freed when it cannot be */
++    HANDLE done;                    /* set when answered, for a caller that waits */
++    int overlay, image;
++};
++
++static struct list overlay_jobs = LIST_INIT( overlay_jobs );
++static HANDLE overlay_wake;
++static DWORD overlay_tid;
++static BOOL overlays_ready;         /* the handlers are made (by the worker) */
++
++static void overlay_job_release( struct overlay_job *job )
++{
++    if (InterlockedDecrement( &job->refs )) return;
++    free( job->path );
++    if (job->folder) IShellIconOverlay_Release( job->folder );
++    ILFree( job->child );
++    if (job->done) CloseHandle( job->done );
++    free( job );
++}
++
++/* on the worker: the handlers made, their pictures in the shell's lists */
++static void overlays_ensure(void)
++{
++    if (!overlays_ready)
++    {
++        overlays_load();
++        EnterCriticalSection( &overlay_cs );
++        overlays_ready = TRUE;
++        LeaveCriticalSection( &overlay_cs );
++    }
++    EnterCriticalSection( &overlay_cs );
++    overlays_apply();
++    LeaveCriticalSection( &overlay_cs );
++}
++
++/* on the worker: ask the handlers by priority */
++static int overlay_ask( const WCHAR *path, DWORD attributes, int *image )
+ {
+     int best = 0, best_priority = INT_MAX;
+     unsigned int i;
+ 
+     if (image) *image = -1;
+     if (!path || !path[0]) return 0;
+-    EnterCriticalSection( &overlay_cs );
+-    overlays_load();
+-    overlays_apply();
++    overlays_ensure();
+     for (i = 0; i < overlay_count; i++)
+     {
+         struct overlay_handler *h = &overlay_handlers[i];
+ 
++        DWORD start, took;
++        HRESULT hr;
++
+         if (!h->obj || h->image < 0 || h->priority >= best_priority) continue;
+-        if (IShellIconOverlayIdentifier_IsMemberOf( h->obj, path, attributes ) == S_OK)
++        start = GetTickCount();
++        hr = IShellIconOverlayIdentifier_IsMemberOf( h->obj, path, attributes );
++        if ((took = GetTickCount() - start) >= 1000)
++            WARN( "overlay handler %s took %lu ms for %s\n", debugstr_w(h->name), took, debugstr_w(path) );
++        if (hr == S_OK)
+         {
+             best = h->overlay;
+             best_priority = h->priority;
+             if (image) *image = h->image;
+         }
+     }
+-    LeaveCriticalSection( &overlay_cs );
+     return best;
+ }
+ 
++static DWORD WINAPI overlay_worker( void *arg )
++{
++    struct overlay_job *job;
++    struct list *next;
++    MSG msg;
++
++    CoInitializeEx( NULL, COINIT_APARTMENTTHREADED );
++    for (;;)
++    {
++        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE ))
++        {
++            TranslateMessage( &msg );
++            DispatchMessageW( &msg );
++        }
++        EnterCriticalSection( &overlay_cs );
++        if ((next = list_head( &overlay_jobs ))) list_remove( next );
++        LeaveCriticalSection( &overlay_cs );
++        if (!next)
++        {
++            MsgWaitForMultipleObjects( 1, &overlay_wake, FALSE, INFINITE, QS_ALLINPUT );
++            continue;
++        }
++        job = LIST_ENTRY( next, struct overlay_job, entry );
++        TRACE( "job %p kind %u path %s\n", job, job->kind, debugstr_w(job->path) );
++        switch (job->kind)
++        {
++        case OVERLAY_JOB_LOAD:
++            overlays_ensure();
++            break;
++        case OVERLAY_JOB_PATH:
++            job->overlay = overlay_ask( job->path, job->attributes, &job->image );
++            break;
++        case OVERLAY_JOB_ITEM:
++            job->overlay = 0;
++            if (IShellIconOverlay_GetOverlayIndex( job->folder, job->child, &job->overlay ) != S_OK)
++                job->overlay = 0;
++            break;
++        }
++        if (job->hwnd && (!IsWindow( job->hwnd ) ||
++                          !PostMessageW( job->hwnd, job->msg, (WPARAM)job->cookie, job->overlay )))
++            job->free_cookie( job->cookie );
++        if (job->done) SetEvent( job->done );
++        overlay_job_release( job );
++    }
++    return 0;
++}
++
++static BOOL overlay_queue( struct overlay_job *job )
++{
++    BOOL ok = TRUE;
++
++    EnterCriticalSection( &overlay_cs );
++    if (!overlay_wake)
++    {
++        HANDLE thread;
++        if ((overlay_wake = CreateEventW( NULL, FALSE, FALSE, NULL )) &&
++            (thread = CreateThread( NULL, 0, overlay_worker, NULL, 0, &overlay_tid )))
++            CloseHandle( thread );
++        else
++        {
++            if (overlay_wake) CloseHandle( overlay_wake );
++            overlay_wake = NULL;
++            ok = FALSE;
++        }
++    }
++    if (ok) list_add_tail( &overlay_jobs, &job->entry );
++    LeaveCriticalSection( &overlay_cs );
++    if (ok) SetEvent( overlay_wake );
++    return ok;
++}
++
++static BOOL on_overlay_worker(void)
++{
++    return overlay_tid && GetCurrentThreadId() == overlay_tid;
++}
++
++/* queue a job and wait for it a while; FALSE if it was not answered in time */
++static BOOL overlay_wait( struct overlay_job *job )
++{
++    BOOL answered;
++
++    job->refs = 2;
++    if (!(job->done = CreateEventW( NULL, TRUE, FALSE, NULL )) || !overlay_queue( job ))
++    {
++        job->refs = 1;
++        return FALSE;
++    }
++#ifndef SG_MUTANT_OVERLAY_WAIT_FOREVER
++    answered = WaitForSingleObject( job->done, OVERLAY_WAIT_MS ) == WAIT_OBJECT_0;
++#else
++    answered = WaitForSingleObject( job->done, INFINITE ) == WAIT_OBJECT_0;
++#endif
++    if (!answered) WARN( "the overlay handlers did not answer in %u ms\n", OVERLAY_WAIT_MS );
++    return answered;
++}
++
++/* the handlers made, for a caller that is not the worker */
++static BOOL overlays_wait_ready(void)
++{
++    struct overlay_job *job;
++    BOOL ready;
++
++    EnterCriticalSection( &overlay_cs );
++    ready = overlays_ready;
++    LeaveCriticalSection( &overlay_cs );
++    if (ready) return TRUE;
++    if (on_overlay_worker()) { overlays_ensure(); return TRUE; }
++    if (!(job = calloc( 1, sizeof(*job) ))) return FALSE;
++    job->kind = OVERLAY_JOB_LOAD;
++    overlay_wait( job );
++    overlay_job_release( job );
++    EnterCriticalSection( &overlay_cs );
++    ready = overlays_ready;
++    LeaveCriticalSection( &overlay_cs );
++    return ready;
++}
++
++/* the overlay (1..15) of a file, from the handlers by priority; 0 when none marks it.
++ * Asked on the worker; another thread waits for its answer a while. */
++int SHELL32_OverlayForPath( const WCHAR *path, DWORD attributes, int *image )
++{
++    struct overlay_job *job;
++    int overlay = 0;
++
++    if (image) *image = -1;
++    if (!path || !path[0]) return 0;
++#ifdef SG_MUTANT_OVERLAY_ON_CALLER
++    EnterCriticalSection( &overlay_cs );
++    overlays_load();
++    overlays_ready = TRUE;
++    overlays_apply();
++    LeaveCriticalSection( &overlay_cs );
++    {
++        int best = 0, best_priority = INT_MAX;
++        unsigned int i;
++        for (i = 0; i < overlay_count; i++)
++        {
++            struct overlay_handler *h = &overlay_handlers[i];
++            if (!h->obj || h->image < 0 || h->priority >= best_priority) continue;
++            if (IShellIconOverlayIdentifier_IsMemberOf( h->obj, path, attributes ) == S_OK)
++            {
++                best = h->overlay; best_priority = h->priority;
++                if (image) *image = h->image;
++            }
++        }
++        return best;
++    }
++#endif
++    if (on_overlay_worker()) return overlay_ask( path, attributes, image );
++    if (!(job = calloc( 1, sizeof(*job) ))) return 0;
++    job->kind = OVERLAY_JOB_PATH;
++    job->attributes = attributes;
++    job->image = -1;
++    if (!(job->path = wcsdup( path ))) { free( job ); return 0; }
++    if (overlay_wait( job ))
++    {
++        overlay = job->overlay;
++        if (image) *image = job->image;
++    }
++    overlay_job_release( job );
++    return overlay;
++}
++
++/* whether a caller should get E_PENDING for OI_ASYNC: always, except on the worker itself */
++BOOL SHELL32_OverlayIsSlow(void)
++{
++#ifdef SG_MUTANT_OVERLAY_ON_CALLER
++    return FALSE;
++#endif
++    return !on_overlay_worker();
++}
++
++/* ask a folder for an item's overlay on the worker; the answer is posted to HWND as
++ * MSG (wparam the cookie, lparam the overlay), or the cookie freed if it cannot be */
++BOOL SHELL32_OverlayRequest( IShellIconOverlay *folder, LPCITEMIDLIST child, HWND hwnd, UINT msg,
++                             void *cookie, void (*free_cookie)(void *) )
++{
++    struct overlay_job *job;
++
++    if (!(job = calloc( 1, sizeof(*job) ))) return FALSE;
++    job->kind = OVERLAY_JOB_ITEM;
++    job->refs = 1;
++    if (!(job->child = ILClone( child ))) { free( job ); return FALSE; }
++    job->folder = folder;
++    IShellIconOverlay_AddRef( folder );
++    job->hwnd = hwnd;
++    job->msg = msg;
++    job->cookie = cookie;
++    job->free_cookie = free_cookie;
++    if (overlay_queue( job )) return TRUE;
++    job->free_cookie = NULL;
++    overlay_job_release( job );
++    return FALSE;
++}
++
+ /* the system image list index of an overlay (1..15), -1 when it has none */
+ int SHELL32_OverlayImage( int overlay )
+ {
+     int image = -1;
+ 
++    if (!overlays_wait_ready()) return -1;
+     EnterCriticalSection( &overlay_cs );
+-    overlays_load();
+-    overlays_apply();
+     if (overlay >= 1 && overlay <= (int)overlay_count) image = overlay_handlers[overlay - 1].image;
+     LeaveCriticalSection( &overlay_cs );
+     return image;
+@@ -1301,9 +1559,8 @@ INT WINAPI SHGetIconOverlayIndexW(LPCWSTR pszIconPath, INT iIconIndex)
+ 
+   /* the reserved overlays (share, shortcut, slow file): a shortcut's arrow is drawn into its icon here */
+   if (!pszIconPath) return -1;
++  if (!overlays_wait_ready()) return -1;
+   EnterCriticalSection( &overlay_cs );
+-  overlays_load();
+-  overlays_apply();
+   for (i = 0; i < overlay_count; i++)
+       if (overlay_handlers[i].obj && overlay_handlers[i].icon_index == iIconIndex &&
+           !wcsicmp( overlay_handlers[i].icon_file, pszIconPath ))
+diff --git a/dlls/shell32/shell32_main.h b/dlls/shell32/shell32_main.h
+index 1c5d7bd..1ab1c4e 100644
+--- a/dlls/shell32/shell32_main.h
++++ b/dlls/shell32/shell32_main.h
+@@ -54,6 +54,9 @@ INT SIC_GetIconIndex (LPCWSTR sSourceFile, INT dwSourceIndex, DWORD dwFlags );
+ HRESULT SIC_get_location( int list_idx, WCHAR *file, DWORD *size, int *res_idx );
+ int SHELL32_OverlayForPath( const WCHAR *path, DWORD attributes, int *image );
+ int SHELL32_OverlayImage( int overlay );
++BOOL SHELL32_OverlayIsSlow(void);
++BOOL SHELL32_OverlayRequest( IShellIconOverlay *folder, LPCITEMIDLIST child, HWND hwnd, UINT msg,
++                             void *cookie, void (*free_cookie)(void *) );
+ 
+ /* Classes Root */
+ BOOL HCR_MapTypeToValueW(LPCWSTR szExtension, LPWSTR szFileType, LONG len, BOOL bPrependDot);
+diff --git a/dlls/shell32/shfldr_fs.c b/dlls/shell32/shfldr_fs.c
+index 93eaeda..5e4be0c 100644
+--- a/dlls/shell32/shfldr_fs.c
++++ b/dlls/shell32/shfldr_fs.c
+@@ -1578,6 +1578,9 @@ static HRESULT WINAPI overlay_GetOverlayIndex(IShellIconOverlay *iface, PCUITEMI
+ 
+     TRACE("(%p)->(%p %p)\n", This, pidl, index);
+     if (!index) return E_INVALIDARG;
++    /* Stained Glass OS 6251: as on Windows, OI_ASYNC asks whether the answer is quick; the
++     * handlers are asked on their own thread, so a view asks again from there */
++    if (*index == (int)OI_ASYNC && SHELL32_OverlayIsSlow()) return E_PENDING;
+     if (!(overlay = item_overlay(This, pidl, NULL))) return S_FALSE;
+     *index = overlay;
+     return S_OK;
+diff --git a/dlls/shell32/shlview.c b/dlls/shell32/shlview.c
+index c482b45..d214392 100644
+--- a/dlls/shell32/shlview.c
++++ b/dlls/shell32/shlview.c
+@@ -195,6 +195,7 @@ typedef struct
+         BOOL            overlay_asked;      /* the folder was asked for it */
+         struct view_overlay *overlays;      /* items' overlays, asked once */
+         UINT            n_overlays, max_overlays;
++        UINT            overlay_gen;        /* answers asked before the overlays were forgotten are dropped */
+         BOOL            own_overlay_set[16]; /* the own list holds overlay image n */
+         int             n_sys_to_own;
+         BOOL            thumbnails;     /* the mode shows pictures of files */
+@@ -243,6 +244,14 @@ struct view_overlay
+ {
+     LPITEMIDLIST child;     /* a copy */
+     int overlay;            /* 0 none, 1..15 */
++    BOOL pending;           /* Stained Glass OS 6251: asked of the overlay worker, no answer yet */
++};
++
++/* an overlay asked for beside the view (6251) */
++struct overlay_answer
++{
++    LPITEMIDLIST child;
++    UINT gen;
+ };
+ static void ShellView_Sort(IShellViewImpl *This);
+ 
+@@ -358,6 +367,7 @@ static struct tile_prop *find_tile_prop(IShellViewImpl *This, LPCITEMIDLIST pidl
+ #define WM_SV_REGROUP    (WM_USER + 0x5a1)
+ #define WM_SV_DIRCHANGED (WM_USER + 0x5a2)
+ #define WM_SV_ICON       (WM_USER + 0x5a4)
++#define WM_SV_OVERLAY    (WM_USER + 0x5a5)
+ #define SV_DIR_TIMER     0x5a3
+ 
+ struct thumb_request
+@@ -875,11 +885,34 @@ static int ShellView_OwnIcon(IShellViewImpl *This, int sys)
+     return own;
+ }
+ 
+-/* an item's overlay (1..15, 0 for none), asked of the folder once and kept */
++static void overlay_answer_free(void *cookie)
++{
++    struct overlay_answer *answer = cookie;
++    ILFree(answer->child);
++    free(answer);
++}
++
++/* the view's own list (large icons, thumbnails) holds the picture too */
++static void ShellView_OwnOverlay(IShellViewImpl *This, int overlay)
++{
++    if (overlay > 0 && overlay < 16 && This->own_icons && !This->own_overlay_set[overlay])
++    {
++        int own = ShellView_OwnIcon(This, SHELL32_OverlayImage(overlay));
++        if (own >= 0) ImageList_SetOverlayImage(This->own_icons, own, overlay);
++        This->own_overlay_set[overlay] = TRUE;
++    }
++}
++
++/* an item's overlay (1..15, 0 for none), asked of the folder once and kept.  As on Windows
++ * the folder is asked with OI_ASYNC; when the answer would be slow (the overlay handlers are
++ * asked on their own thread) the item shows none until it comes (WM_SV_OVERLAY). */
+ static int ShellView_Overlay(IShellViewImpl *This, LPCITEMIDLIST pidl)
+ {
++    struct overlay_answer *answer;
+     UINT size, i;
+     int overlay = 0;
++    BOOL pending = FALSE;
++    HRESULT hr;
+ 
+     if (!pidl) return 0;
+     if (!This->overlay_asked)
+@@ -894,8 +927,23 @@ static int ShellView_Overlay(IShellViewImpl *This, LPCITEMIDLIST pidl)
+         if (ILGetSize(This->overlays[i].child) == size && !memcmp(This->overlays[i].child, pidl, size))
+             return This->overlays[i].overlay;
+ 
+-    if (IShellIconOverlay_GetOverlayIndex(This->icon_overlay, pidl, &overlay) != S_OK) overlay = 0;
+-    if (overlay < 0 || overlay > 15) overlay = 0;
++#ifndef SG_MUTANT_VIEW_OVERLAY_SYNC
++    overlay = OI_ASYNC;
++#endif
++    hr = IShellIconOverlay_GetOverlayIndex(This->icon_overlay, pidl, &overlay);
++    if (hr == E_PENDING && (answer = calloc(1, sizeof(*answer))))
++    {
++        answer->gen = This->overlay_gen;
++        if ((answer->child = ILClone(pidl)) &&
++            SHELL32_OverlayRequest(This->icon_overlay, pidl, This->hWnd, WM_SV_OVERLAY, answer, overlay_answer_free))
++            pending = TRUE;
++        else
++        {
++            ILFree(answer->child);
++            free(answer);
++        }
++    }
++    if (hr != S_OK || overlay < 0 || overlay > 15) overlay = 0;
+     if (This->n_overlays == This->max_overlays)
+     {
+         UINT n = max(64, This->max_overlays * 2);
+@@ -905,16 +953,36 @@ static int ShellView_Overlay(IShellViewImpl *This, LPCITEMIDLIST pidl)
+         This->max_overlays = n;
+     }
+     if ((This->overlays[This->n_overlays].child = ILClone(pidl)))
++    {
++        This->overlays[This->n_overlays].pending = pending;
+         This->overlays[This->n_overlays++].overlay = overlay;
++    }
++    ShellView_OwnOverlay(This, overlay);
++    return overlay;
++}
++
++/* the overlay worker's answer for an item */
++static void ShellView_OnOverlay(IShellViewImpl *This, struct overlay_answer *answer, int overlay)
++{
++    UINT size, i;
++    int item;
+ 
+-    /* the view's own list (large icons, thumbnails) holds the picture too */
+-    if (overlay && This->own_icons && !This->own_overlay_set[overlay])
++    if (answer->gen == This->overlay_gen && overlay >= 0 && overlay <= 15)
+     {
+-        int own = ShellView_OwnIcon(This, SHELL32_OverlayImage(overlay));
+-        if (own >= 0) ImageList_SetOverlayImage(This->own_icons, own, overlay);
+-        This->own_overlay_set[overlay] = TRUE;
++        size = ILGetSize(answer->child);
++        for (i = 0; i < This->n_overlays; i++)
++            if (This->overlays[i].pending && ILGetSize(This->overlays[i].child) == size &&
++                !memcmp(This->overlays[i].child, answer->child, size))
++            {
++                This->overlays[i].pending = FALSE;
++                This->overlays[i].overlay = overlay;
++                ShellView_OwnOverlay(This, overlay);
++                if (overlay && (item = LV_FindItemByPidl(This, answer->child)) >= 0)
++                    SendMessageW(This->hWndList, LVM_REDRAWITEMS, item, item);
++                break;
++            }
+     }
+-    return overlay;
++    overlay_answer_free(answer);
+ }
+ 
+ /* an item's overlay asked again (its state changed) */
+@@ -939,6 +1007,7 @@ static void ShellView_FreeOverlays(IShellViewImpl *This)
+     free(This->overlays);
+     This->overlays = NULL;
+     This->n_overlays = This->max_overlays = 0;
++    This->overlay_gen++;
+ }
+ 
+ /* a thumbnail has come: centred on a square the size of the view's icons */
+@@ -3517,6 +3586,7 @@ static LRESULT CALLBACK ShellView_WndProc(HWND hWnd, UINT uMessage, WPARAM wPara
+ 	  /* Stained Glass: pictures of files, and groups */
+ 	  case WM_SV_THUMBNAIL: ShellView_OnThumbnail(pThis, (struct thumb_result *)lParam); return 0;
+ 	  case WM_SV_ICON: ShellView_OnIcon(pThis, (struct thumb_result *)lParam); return 0;
++	  case WM_SV_OVERLAY: ShellView_OnOverlay(pThis, (struct overlay_answer *)wParam, (int)lParam); return 0;
+ 	  case WM_SV_REGROUP:   ShellView_Regroup(pThis); return 0;
+ 	  /* Stained Glass: the folder changed: read it again once it settles */
+ 	  case WM_SV_DIRCHANGED: SetTimer(hWnd, SV_DIR_TIMER, 300, NULL); return 0;
