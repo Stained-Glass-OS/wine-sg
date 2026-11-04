@@ -707,10 +707,42 @@ static void check_animations( void )
     DestroyWindow( hwnd );
 }
 
+/* a compositor released more often than the program held it (6242): it ends once, and what is
+ * released after that -- objects of it still alive, the extra releases -- finds it ended, not freed */
+static void check_nested_release( void )
+{
+    void *saved = compositor, *inspectable = NULL, *sprite = NULL, *visual;
+    HSTRING s = hs( L"Windows.UI.Composition.Compositor" );
+    ULONG first, second, third;
+    float opacity = -1;
+
+    RoActivateInstance( s, (IInspectable **)&inspectable );
+    WindowsDeleteString( s );
+    if (!inspectable || !(compositor = qi( inspectable, &probe_IID_ICompositor )))
+    {
+        printf( "nested_release=0 (no compositor)\n" );
+        compositor = saved;
+        return;
+    }
+    IUnknown_Release( (IUnknown *)inspectable );
+    SLOT( compositor, COMPOSITOR_CREATE_SPRITE_VISUAL, get_fn )( compositor, &sprite );   /* holds it */
+    first = IUnknown_Release( (IUnknown *)compositor );     /* the program's own */
+    second = IUnknown_Release( (IUnknown *)compositor );    /* once too often: it ends */
+    third = IUnknown_Release( (IUnknown *)compositor );     /* and again */
+    visual = qi( sprite, &probe_IID_IVisual );              /* the visual still answers */
+    if (visual) SLOT( visual, VISUAL_GET_OPACITY, HRESULT (WINAPI *)( void *, float * ) )( visual, &opacity );
+    if (visual) IUnknown_Release( (IUnknown *)visual );
+    IUnknown_Release( (IUnknown *)sprite );                 /* its reference to the ended compositor */
+    printf( "nested_release=%d (%lu %lu %lu, opacity %.1f)\n", first == 1 && !second && !third && opacity == 1.0f,
+            first, second, third, opacity );
+    compositor = saved;
+}
+
 int main( void )
 {
     RoInitialize( RO_INIT_SINGLETHREADED );
     check_animations();
+    check_nested_release();
     printf( "done=1\n" );
     fflush( stdout );
     return 0;

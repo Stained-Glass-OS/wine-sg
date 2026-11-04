@@ -105,6 +105,7 @@ check 'expr_stopped=1'          "StopAnimation stops it following"
 check 'expr_scalar=1'           "scalar parameters, Clamp, a property set entry and ?: are evaluated, again on change"
 check 'expr_keyframe=1'         "an expression key frame is evaluated with its animation's parameters"
 check 'expr_malformed=1'        "a malformed expression key frame is refused"
+check 'nested_release=1'        "a compositor released once too often ends once; later releases find it ended"
 check 'done=1'                  "the probe ran to the end"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
