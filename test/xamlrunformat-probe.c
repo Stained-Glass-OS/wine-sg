@@ -24,6 +24,8 @@ DEFINE_GUID(IID_SourceNative,   0x3cbcf1bf, 0x2f76, 0x4e9c, 0x96, 0xab, 0xe8, 0x
 DEFINE_GUID(IID_UIE,            0x676d0be9, 0xb65c, 0x41c6, 0xba, 0x40, 0x58, 0xcf, 0x87, 0xf2, 0x01, 0xc1);
 DEFINE_GUID(IID_FE,             0xa391d09b, 0x4a99, 0x4b7c, 0x9d, 0x8d, 0x6f, 0xa5, 0xd0, 0x1f, 0x6f, 0xbf);
 DEFINE_GUID(IID_PanelX,         0xa50a4bbd, 0x8361, 0x469c, 0x90, 0xda, 0xe9, 0xa4, 0x0c, 0x74, 0x74, 0xdf);
+DEFINE_GUID(IID_TextBlock,      0xae2d9271, 0x3b4a, 0x45fc, 0x84, 0x68, 0xf7, 0x94, 0x95, 0x48, 0xf4, 0xd5);
+DEFINE_GUID(IID_Hyperlink,      0x0fe2363b, 0x14e9, 0x4152, 0x9e, 0x58, 0x5a, 0xea, 0x5b, 0x21, 0xf0, 0x8d);
 DEFINE_GUID(IID_ReaderStatics,  0x9891c6bd, 0x534f, 0x4955, 0xb8, 0x5a, 0x8a, 0x8d, 0xc0, 0xdc, 0xa6, 0x02);
 
 typedef struct { void **vtbl; } obj;
@@ -68,7 +70,7 @@ static const WCHAR page_xaml[] =
     L"<TextBlock x:Name=\"Heavy\"" TL L" Margin=\"0,30,0,0\"><Bold>MMMM</Bold></TextBlock>"
     L"<TextBlock x:Name=\"Big\"" TL L" Margin=\"0,60,0,0\"><Run FontSize=\"30\" Text=\"MMMM\"/></TextBlock>"
     L"<TextBlock" TL L" Margin=\"150,0,0,0\"><Run Foreground=\"#FFFF0000\" Text=\"MMMM\"/></TextBlock>"
-    L"<TextBlock" TL L" Margin=\"150,40,0,0\"><Hyperlink>MMMM</Hyperlink></TextBlock>"
+    L"<TextBlock x:Name=\"LinkBlock\"" TL L" Margin=\"150,40,0,0\"><Hyperlink>MMMM</Hyperlink></TextBlock>"
     L"<TextBlock" TL L" Margin=\"150,80,0,0\" Width=\"140\"><Run Text=\"MMMMMMMM\"><Run.Foreground><LinearGradientBrush StartPoint=\"0,0\" EndPoint=\"1,0\">"
     L"<GradientStop Offset=\"0\" Color=\"#FFFF0000\"/><GradientStop Offset=\"1\" Color=\"#FF0000FF\"/></LinearGradientBrush></Run.Foreground></Run></TextBlock>"
     L"</Grid>";
@@ -80,6 +82,16 @@ static double width_of(obj *root, const WCHAR *name)
     if (e) CALL(e, 13, HRESULT (WINAPI *)(obj *, double *))(e, &w);
     return w;
 }
+
+/* a Hyperlink's Click handler (6247) */
+static int link_clicks;
+static obj *link_sender;
+static HRESULT WINAPI lh_qi(obj *o, REFIID r, void **out) { *out = o; return S_OK; }
+static ULONG WINAPI lh_ar(obj *o) { return 2; }
+static ULONG WINAPI lh_rl(obj *o) { return 1; }
+static HRESULT WINAPI lh_invoke(obj *o, obj *sender, obj *args) { link_clicks++; link_sender = sender; return S_OK; }
+static void *lh_vtbl[] = { lh_qi, lh_ar, lh_rl, lh_invoke };
+static obj link_handler = { lh_vtbl };
 
 /* the colour of the first strongly coloured pixel in a box: r, b, k (black), - */
 static char tint(HDC hdc, int x0, int y0, int x1, int y1)
@@ -146,6 +158,26 @@ int main(void)
         }
     }
     ReleaseDC(island, hdc);
+
+    /* clicking the Hyperlink raises its Click; clicking beside it does not (6247) */
+    {
+        obj *tb = as(find(root, L"LinkBlock"), &IID_TextBlock), *inlines = NULL, *first = NULL, *link;
+        INT64 token = 0;
+        int on, off;
+        if (tb) CALL(tb, 28, get_fn)(tb, &inlines);
+        if (inlines) CALL(inlines, 6, HRESULT (WINAPI *)(obj *, UINT32, obj **))(inlines, 0, &first);
+        link = as(first, &IID_Hyperlink);
+        if (link) CALL(link, 8, HRESULT (WINAPI *)(obj *, obj *, INT64 *))(link, &link_handler, &token);
+        SendMessageW(island, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(165, 52));
+        SendMessageW(island, WM_LBUTTONUP, 0, MAKELPARAM(165, 52));
+        pump(100);
+        on = link_clicks;
+        SendMessageW(island, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(20, 160));
+        SendMessageW(island, WM_LBUTTONUP, 0, MAKELPARAM(20, 160));
+        pump(100);
+        off = link_clicks - on;
+        printf("link_click=%d,%d,%d\n", link != NULL, on, off);
+    }
     printf("done=1\n");
     return 0;
 }

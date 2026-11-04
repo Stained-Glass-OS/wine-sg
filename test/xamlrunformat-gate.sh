@@ -59,6 +59,7 @@ chk '^size_wider=1$' "a Run's FontSize 30 is wider than 20"
 chk '^run_red=r$' "a Run's Foreground"
 chk '^hyperlink=1$' "a Hyperlink in the accent (highlight) colour"
 chk '^gradient=r,b$' "a Run's gradient Foreground: red to blue"
+chk '^link_click=1,1,0$' "a Hyperlink clicked raises its Click; beside it, nothing (6247)"
 chk '^done=1$' "the probe finished"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
