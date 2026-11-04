@@ -1,12 +1,16 @@
 /* File Explorer's cloud status (patch 6246): in a registered sync root the file system folder's Status
  * column is on by default and says each placeholder's state -- online only, on this device, always on
- * this device, sync pending -- with System.StorageProviderState; outside one it is off by default. */
+ * this device, sync pending -- with System.StorageProviderState; outside one it is off by default.
+ * 6248: the real file view (ExplorerBrowser, details) shows it -- it walks all the folder's columns,
+ * not only up to the first one that is off -- and hides a hidden system file (desktop.ini) unless
+ * protected operating system files are shown. */
 #define COBJMACROS
 #include <windows.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <shlwapi.h>
 #include <stdio.h>
+#include <commctrl.h>
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -61,6 +65,118 @@ static HANDLE make_file(const WCHAR *path, const char *data)
     HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
     WriteFile(h, data, lstrlenA(data), &n, NULL);
     return h;
+}
+
+static HWND find_list(HWND parent)
+{
+    HWND child = NULL, found;
+    WCHAR cls[64];
+    while ((child = FindWindowExW(parent, child, NULL, NULL)))
+    {
+        GetClassNameW(child, cls, 64);
+        if (!lstrcmpW(cls, L"SysListView32")) return child;
+        if ((found = find_list(child))) return found;
+    }
+    return NULL;
+}
+
+static void pump(int ms)
+{
+    DWORD end = GetTickCount() + ms;
+    MSG msg;
+    while ((int)(end - GetTickCount()) > 0)
+    {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+        Sleep(10);
+    }
+}
+
+static void set_advanced(const WCHAR *name, DWORD value)
+{
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+                    name, REG_DWORD, &value, sizeof(value));
+}
+
+/* the item's row in the list (by its name with or without the extension), -1 if none */
+static int find_row(HWND list, const WCHAR *name)
+{
+    WCHAR base[64];
+    LVFINDINFOW find = { LVFI_STRING, name };
+    int i = (int)SendMessageW(list, LVM_FINDITEMW, -1, (LPARAM)&find);
+    if (i >= 0) return i;
+    lstrcpyW(base, name);
+    if (wcsrchr(base, '.')) *wcsrchr(base, '.') = 0;
+    find.psz = base;
+    return (int)SendMessageW(list, LVM_FINDITEMW, -1, (LPARAM)&find);
+}
+
+struct view { IExplorerBrowser *browser; HWND top, list; };
+
+static void view_open(struct view *v, const WCHAR *path)
+{
+    FOLDERSETTINGS fs = { FVM_DETAILS, 0 };
+    RECT rc = { 0, 0, 900, 400 };
+    LPITEMIDLIST pidl = NULL;
+
+    memset(v, 0, sizeof(*v));
+    v->top = CreateWindowExW(0, L"STATIC", L"syncstatus", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 940, 480,
+                             NULL, NULL, NULL, NULL);
+    CoCreateInstance(&CLSID_ExplorerBrowser, NULL, CLSCTX_INPROC_SERVER, &IID_IExplorerBrowser, (void **)&v->browser);
+    if (!v->browser) return;
+    IExplorerBrowser_Initialize(v->browser, v->top, &rc, &fs);
+    SHParseDisplayName(path, NULL, &pidl, 0, NULL);
+    IExplorerBrowser_BrowseToIDList(v->browser, pidl, 0);
+    pump(1500);
+    v->list = find_list(v->top);
+}
+
+static void view_close(struct view *v)
+{
+    if (v->browser) { IExplorerBrowser_Destroy(v->browser); IExplorerBrowser_Release(v->browser); }
+    DestroyWindow(v->top);
+}
+
+/* the headers, "|"-separated; the index of one named so in *at */
+static void view_headers(struct view *v, WCHAR *out, const WCHAR *want, int *at)
+{
+    HWND header = v->list ? (HWND)SendMessageW(v->list, LVM_GETHEADER, 0, 0) : NULL;
+    int i, n = header ? (int)SendMessageW(header, HDM_GETITEMCOUNT, 0, 0) : 0;
+    WCHAR text[64];
+    HDITEMW item;
+
+    out[0] = 0;
+    *at = -1;
+    for (i = 0; i < n; i++)
+    {
+        item.mask = HDI_TEXT;
+        item.pszText = text;
+        item.cchTextMax = 64;
+        text[0] = 0;
+        SendMessageW(header, HDM_GETITEMW, i, (LPARAM)&item);
+        if (i) lstrcatW(out, L"|");
+        lstrcatW(out, text);
+        if (!lstrcmpW(text, want)) *at = i;
+    }
+}
+
+static int enum_has(IShellFolder2 *folder, DWORD flags, const WCHAR *name)
+{
+    IEnumIDList *list = NULL;
+    LPITEMIDLIST child;
+    STRRET str;
+    WCHAR text[MAX_PATH];
+    int found = 0;
+
+    if (FAILED(IShellFolder2_EnumObjects(folder, NULL, flags, &list)) || !list) return -1;
+    while (IEnumIDList_Next(list, 1, &child, NULL) == S_OK)
+    {
+        if (SUCCEEDED(IShellFolder2_GetDisplayNameOf(folder, child, SHGDN_INFOLDER | SHGDN_FORPARSING, &str)) &&
+            SUCCEEDED(StrRetToBufW(&str, child, text, MAX_PATH)) && !lstrcmpiW(text, name))
+            found = 1;
+        CoTaskMemFree(child);
+    }
+    IEnumIDList_Release(list);
+    return found;
 }
 
 int main(void)
@@ -129,6 +245,70 @@ int main(void)
     CHECK(!lstrcmpW(text, L"Sync pending") && state == 4, "pending.bin: %ls %lu", text, state);
     status_of(root, L"plain.txt", text, &state);
     CHECK(!text[0] && state == 0, "a file that is no placeholder: '%ls' %lu", text, state);
+
+    /* desktop.ini as OneDrive leaves it: hidden and system */
+    CloseHandle(make_file(L"C:\\sroot\\desktop.ini", "[.ShellClassInfo]\r\n"));
+    SetFileAttributesW(L"C:\\sroot\\desktop.ini", FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+    CloseHandle(make_file(L"C:\\sroot\\hidden.txt", "h"));
+    SetFileAttributesW(L"C:\\sroot\\hidden.txt", FILE_ATTRIBUTE_HIDDEN);
+    CHECK((GetFileAttributesW(L"C:\\sroot\\desktop.ini") & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) ==
+          (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM),
+          "desktop.ini keeps hidden+system: %#lx", GetFileAttributesW(L"C:\\sroot\\desktop.ini"));
+    CHECK(enum_has(root, SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN, L"hidden.txt") == 1, "a hidden file is enumerated with SHCONTF_INCLUDEHIDDEN");
+    CHECK(enum_has(root, SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN, L"desktop.ini") == 0, "a hidden system file is not, without SHCONTF_INCLUDESUPERHIDDEN");
+    CHECK(enum_has(root, SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN | SHCONTF_INCLUDESUPERHIDDEN, L"desktop.ini") == 1,
+          "it is with SHCONTF_INCLUDESUPERHIDDEN");
+
+    /* the real file view, details, with hidden items shown */
+    set_advanced(L"Hidden", 1);
+    set_advanced(L"ShowSuperHidden", 0);
+    {
+        struct view v;
+        WCHAR headers[256], cell[128];
+        int status = -1, row;
+        LVITEMW item;
+
+        view_open(&v, L"C:\\sroot");
+        CHECK(v.list != NULL, "the view of the sync root has a list");
+        view_headers(&v, headers, L"Status", &status);
+        printf("headers: %ls\n", headers);
+        CHECK(status > 0, "the view shows the Status column: %ls", headers);
+        CHECK(!wcsstr(headers, L"Attributes"), "and not Attributes, which is off by default: %ls", headers);
+        row = v.list ? find_row(v.list, L"local.txt") : -1;
+        cell[0] = 0;
+        if (row >= 0 && status > 0)
+        {
+            item.iSubItem = status;
+            item.pszText = cell;
+            item.cchTextMax = 128;
+            SendMessageW(v.list, LVM_GETITEMTEXTW, row, (LPARAM)&item);
+        }
+        CHECK(!lstrcmpW(cell, L"Available on this device"), "local.txt's Status cell: row %d '%ls'", row, cell);
+        row = v.list ? find_row(v.list, L"online.bin") : -1;
+        cell[0] = 0;
+        if (row >= 0 && status > 0)
+        {
+            item.iSubItem = status;
+            item.pszText = cell;
+            item.cchTextMax = 128;
+            SendMessageW(v.list, LVM_GETITEMTEXTW, row, (LPARAM)&item);
+        }
+        CHECK(!lstrcmpW(cell, L"Available when online"), "online.bin's Status cell: row %d '%ls'", row, cell);
+        CHECK(v.list && find_row(v.list, L"hidden.txt") >= 0, "a hidden file is listed (hidden items shown)");
+        CHECK(v.list && find_row(v.list, L"desktop.ini") < 0, "desktop.ini is not (protected files hidden)");
+        view_close(&v);
+
+        view_open(&v, L"C:\\windows");
+        view_headers(&v, headers, L"Status", &status);
+        CHECK(v.list && status < 0 && wcsstr(headers, L"Size"), "outside a sync root no Status column: %ls", headers);
+        view_close(&v);
+
+        set_advanced(L"ShowSuperHidden", 1);
+        view_open(&v, L"C:\\sroot");
+        CHECK(v.list && find_row(v.list, L"desktop.ini") >= 0, "with protected files shown desktop.ini is listed");
+        view_close(&v);
+        set_advanced(L"ShowSuperHidden", 0);
+    }
 
     printf("RESULT: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

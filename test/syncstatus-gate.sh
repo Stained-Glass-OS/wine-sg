@@ -1,6 +1,8 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# File Explorer's cloud status column (patch 6246); mutant SG_MUTANT_NO_CLOUD_STATUS (dlls/shell32/shfldr_fs.c)
+# File Explorer's cloud status column (patch 6246); mutant SG_MUTANT_NO_CLOUD_STATUS (dlls/shell32/shfldr_fs.c).
+# 6248: the real file view shows it (mutant SG_MUTANT_COLUMN_STOP, shlview.c), and hides desktop.ini
+# (hidden+system) unless protected operating system files are shown (SG_MUTANT_SUPERHIDDEN_LISTED, enumidlist.c).
 #
 #   WINE=/opt/wine-sg/bin/wine test/syncstatus-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
@@ -18,7 +20,7 @@ T=$(mktemp -d /var/tmp/sg-syncstatus.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
-TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/syncstatus-probe.c" -lshell32 -lole32 -luuid -lshlwapi -loleaut32 -luser32 \
+TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/syncstatus-probe.c" -lshell32 -lole32 -luuid -lshlwapi -loleaut32 -luser32 -lcomctl32 -ladvapi32 \
     || { echo "FAIL  probe did not build"; exit 1; }
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
