@@ -179,6 +179,48 @@ static int enum_has(IShellFolder2 *folder, DWORD flags, const WCHAR *name)
     return found;
 }
 
+/* 6256: the Status glyph drawn in a row's Status cell: how many pixels are mostly blue, mostly green */
+static void status_glyph(HWND list, int row, int col, int *image, int *blue, int *green)
+{
+    RECT rc, client;
+    BITMAPINFO bmi = {{ sizeof(BITMAPINFOHEADER) }};
+    LVITEMW item = { LVIF_IMAGE };
+    DWORD *bits;
+    HBITMAP bmp, old;
+    HDC dc;
+    int x, y;
+
+    *image = -9; *blue = *green = 0;
+    if (row < 0 || col <= 0) return;
+    item.iItem = row;
+    item.iSubItem = col;
+    if (SendMessageW(list, LVM_GETITEMW, 0, (LPARAM)&item)) *image = item.iImage;
+    rc.top = col;
+    rc.left = LVIR_ICON;
+    SendMessageW(list, LVM_GETSUBITEMRECT, row, (LPARAM)&rc);
+    GetClientRect(list, &client);
+    bmi.bmiHeader.biWidth = client.right;
+    bmi.bmiHeader.biHeight = -client.bottom;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    dc = CreateCompatibleDC(NULL);
+    if (!(bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, (void **)&bits, NULL, 0))) { DeleteDC(dc); return; }
+    old = SelectObject(dc, bmp);
+    SendMessageW(list, WM_PRINTCLIENT, (WPARAM)dc, PRF_CLIENT | PRF_ERASEBKGND);
+    GdiFlush();
+    for (y = max(rc.top, 0); y < min(rc.bottom, client.bottom); y++)
+        for (x = max(rc.left, 0); x < min(rc.left + 20, client.right); x++)
+        {
+            DWORD p = bits[y * client.right + x];
+            int r = (p >> 16) & 0xff, g = (p >> 8) & 0xff, b = p & 0xff;
+            if (b > 120 && b > r + 60 && b > g + 20) (*blue)++;
+            if (g > 90 && g > r + 40 && g > b + 40) (*green)++;
+        }
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+}
+
 int main(void)
 {
     HMODULE m = LoadLibraryA("cldapi.dll");
@@ -294,6 +336,18 @@ int main(void)
             SendMessageW(v.list, LVM_GETITEMTEXTW, row, (LPARAM)&item);
         }
         CHECK(!lstrcmpW(cell, L"Available when online"), "online.bin's Status cell: row %d '%ls'", row, cell);
+        {
+            int image, blue, green, image2, blue2, green2, image3, blue3, green3;
+            status_glyph(v.list, find_row(v.list, L"online.bin"), status, &image, &blue, &green);
+            status_glyph(v.list, find_row(v.list, L"local.txt"), status, &image2, &blue2, &green2);
+            status_glyph(v.list, find_row(v.list, L"pinned.txt"), status, &image3, &blue3, &green3);
+            printf("glyphs: online %d (blue %d green %d), local %d (%d %d), pinned %d (%d %d)\n",
+                   image, blue, green, image2, blue2, green2, image3, blue3, green3);
+            CHECK(image >= 0 && image2 >= 0 && image3 >= 0 && image != image2 && image2 != image3,
+                  "each state has its own Status glyph: %d %d %d", image, image2, image3);
+            CHECK(blue > 8 && green == 0, "online only: a blue cloud is drawn (%d blue, %d green)", blue, green);
+            CHECK(green2 > 8 && green3 > green2, "on this device: a green check; always: a filled one (%d, %d)", green2, green3);
+        }
         CHECK(v.list && find_row(v.list, L"hidden.txt") >= 0, "a hidden file is listed (hidden items shown)");
         CHECK(v.list && find_row(v.list, L"desktop.ini") < 0, "desktop.ini is not (protected files hidden)");
         view_close(&v);
