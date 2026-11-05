@@ -102,6 +102,52 @@ static int find_row(HWND list, const WCHAR *name, const WCHAR *bare)
     return i;
 }
 
+/* 6255: where the red overlay is drawn on an item's icon: is the pixel at (fx, fy) of the icon's
+ * box (fractions) red, and how many red pixels lie below the box (on the label) */
+static int red_px(DWORD p) { return ((p >> 16) & 0xff) > 180 && ((p >> 8) & 0xff) < 80 && (p & 0xff) < 80; }
+static void icon_red(HWND list, int row, double fx, double fy, int *at, int *below, int *size)
+{
+    RECT ri = { LVIR_ICON }, client;
+    BITMAPINFO bmi = {{ sizeof(BITMAPINFOHEADER) }};
+    HIMAGELIST himl;
+    DWORD *bits;
+    HBITMAP bmp, old;
+    HDC dc;
+    int x, y, cx = 0, cy = 0, ox, oy;
+
+    *at = *below = -1; *size = 0;
+    if (row < 0) return;
+    himl = (HIMAGELIST)SendMessageW(list, LVM_GETIMAGELIST,
+                                    (GetWindowLongW(list, GWL_STYLE) & LVS_TYPEMASK) == LVS_ICON ||
+                                    SendMessageW(list, LVM_GETVIEW, 0, 0) == LV_VIEW_ICON ? LVSIL_NORMAL : LVSIL_SMALL, 0);
+    ImageList_GetIconSize(himl, &cx, &cy);
+    *size = cx;
+    SendMessageW(list, LVM_GETITEMRECT, row, (LPARAM)&ri);
+    GetClientRect(list, &client);
+    bmi.bmiHeader.biWidth = client.right;
+    bmi.bmiHeader.biHeight = -client.bottom;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    dc = CreateCompatibleDC(NULL);
+    if (!(bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, (void **)&bits, NULL, 0))) { DeleteDC(dc); return; }
+    old = SelectObject(dc, bmp);
+    SendMessageW(list, WM_PRINTCLIENT, (WPARAM)dc, PRF_CLIENT | PRF_ERASEBKGND);
+    GdiFlush();
+    /* the image is centred in the icon box */
+    ox = ri.left + (ri.right - ri.left - cx) / 2;
+    oy = ri.top + (ri.bottom - ri.top - cy) / 2;
+    if (SendMessageW(list, LVM_GETVIEW, 0, 0) == LV_VIEW_DETAILS) { ox = ri.left; oy = ri.top + (ri.bottom - ri.top - cy) / 2; }
+    x = ox + (int)(fx * cx); y = oy + (int)(fy * cy);
+    *at = (x >= 0 && y >= 0 && x < client.right && y < client.bottom) ? red_px(bits[y * client.right + x]) : -1;
+    *below = 0;
+    for (y = oy + cy; y < min(oy + cy + 20, client.bottom); y++)
+        for (x = max(ox, 0); x < min(ox + cx, client.right); x++)
+            if (red_px(bits[y * client.right + x])) (*below)++;
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+}
+
 static void pump(int ms)
 {
     DWORD end = GetTickCount() + ms;
@@ -161,7 +207,7 @@ int main(void)
 
     GetSystemDirectoryW(shell32, MAX_PATH);
     lstrcatW(shell32, L"\\shell32.dll");
-    image = SHGetIconOverlayIndexW(shell32, 1);
+    image = SHGetIconOverlayIndexW(L"C:\\ovred.ico", 0);
     CHECK(image >= 0, "SHGetIconOverlayIndex of a loaded handler's picture: %d", image);
     CHECK(SHGetIconOverlayIndexW(shell32, 4) == -1, "a picture of no loaded handler: %d", SHGetIconOverlayIndexW(shell32, 4));
     {
@@ -247,6 +293,27 @@ int main(void)
                     d1 = icon_diff(list, marked, q); d0 = icon_diff(list, q, r);
                     printf("large icons: %d pixels of the marked icon differ, %d of an unmarked one\n", d1, d0);
                     CHECK(d0 == 0 && d1 > 4, "large icons: the overlay is drawn on the marked item (%d pixels differ; unmarked %d)", d1, d0);
+                    {
+                        IFolderView2 *fv2 = NULL;
+                        int sizes[2] = { 48, 96 }, k, at, below, size, right;
+                        IFolderView_QueryInterface(fv, &IID_IFolderView2, (void **)&fv2);
+                        for (k = 0; k < 2 && fv2; k++)
+                        {
+                            IFolderView2_SetViewModeAndIconSize(fv2, FVM_ICON, sizes[k]);
+                            pump(1500);
+                            list = find_list(top);
+                            marked = find_row(list, L"x.ova", L"x");
+                            icon_red(list, marked, 1.0 / 6, 5.0 / 6, &at, &below, &size);
+                            icon_red(list, marked, 5.0 / 6, 5.0 / 6, &right, &below, &size);
+                            printf("icons at %d: red at the bottom-left %d, bottom-right %d, below the icon %d (list %d px)\n",
+                                   sizes[k], at, right, below, size);
+                            CHECK(at == 1 && right == 0 && below == 0,
+                                  "icons at %d: the overlay covers the icon's bottom-left quarter at its size: %d %d %d (list %d)",
+                                  sizes[k], at, right, below, size);
+                        }
+                        if (fv2) IFolderView2_Release(fv2);
+                        else CHECK(0, "no IFolderView2");
+                    }
                     IFolderView_Release(fv);
                 }
                 else CHECK(0, "no IFolderView");

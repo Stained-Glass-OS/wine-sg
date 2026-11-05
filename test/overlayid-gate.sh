@@ -9,6 +9,7 @@
 # its overlay when the answer comes (OneDrive's IsMemberOf blocked Explorer's window thread, qa4 637).
 # 6253: IsMemberOf gets the file's FILE_ATTRIBUTE_* flags (as documented), not SFGAO flags
 # (mutant SG_MUTANT_OVERLAY_SFGAO, shfldr_fs.c). 6254: the overlay is drawn, in details and large icons.
+# 6255: at the icon's size and over its bottom-left (test/overlayid-mkico.py: a red quarter in every frame).
 # test/overlayid-dll.c (the handlers), test/overlayid-probe.c.
 # Mutants (dlls/shell32): SG_MUTANT_NO_OVERLAY_HANDLERS, SG_MUTANT_FAILED_SLOT (iconcache.c),
 # SG_MUTANT_OVERLAY_ON_CALLER (iconcache.c), SG_MUTANT_NO_FOLDER_OVERLAY (shfldr_fs.c),
@@ -38,6 +39,7 @@ i686-w64-mingw32-gcc -O2 -municode -shared -o "$T/overlay32.dll" "$HERE/overlayi
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
 C="$WINEPREFIX/drive_c"
 cp "$T/overlayid.dll" "$T/overlay32.dll" "$T/probe.exe" "$C/"
+python3 -I "$HERE/overlayid-mkico.py" "$C/ovred.ico" || { echo "FAIL  no overlay icon"; exit 1; }
 mkdir -p "$C/ovtest"; : > "$C/ovtest/x.ova"; : > "$C/ovtest/y.ovb"; : > "$C/ovtest/z.txt"; : > "$C/ovtest/w.ovc"; : > "$C/ovtest/v.ovs"; : > "$C/ovtest/q.ovq"; : > "$C/ovtest/r.ovr"
 {
   printf 'Windows Registry Editor Version 5.00\n\n'

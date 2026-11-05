@@ -39,6 +39,13 @@ static HRESULT WINAPI h_member(struct handler *h, const WCHAR *path, DWORD attri
 }
 static HRESULT WINAPI h_info(struct handler *h, WCHAR *file, int max, int *index, DWORD *flags)
 {
+    if (h->kind == 'a')  /* 6255: a picture like a real overlay's: a red bottom-left quarter in every size */
+    {
+        lstrcpynW(file, L"C:\\ovred.ico", max);
+        *index = 0;
+        *flags = 3;
+        return S_OK;
+    }
     GetSystemDirectoryW(file, max);
     lstrcatW(file, L"\\shell32.dll");
     *index = h->kind == 'a' ? 1 : h->kind == 'b' ? 2 : h->kind == 'c' ? 4 : h->kind == 's' ? 5 : 3;
