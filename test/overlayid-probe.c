@@ -56,6 +56,52 @@ static int item_state(HWND list, const WCHAR *name, const WCHAR *bare)
     return i >= 0 ? (int)SendMessageW(list, LVM_GETITEMSTATE, i, LVIS_OVERLAYMASK) : -1;
 }
 
+/* 6254: how many pixels of two items' icons differ, as the list draws them (WM_PRINTCLIENT) */
+static int icon_diff(HWND list, int a, int b)
+{
+    RECT ra = { LVIR_ICON }, rb = { LVIR_ICON }, client;
+    BITMAPINFO bmi = {{ sizeof(BITMAPINFOHEADER) }};
+    DWORD *bits;
+    HBITMAP bmp, old;
+    HDC dc;
+    int x, y, w, h, diff = 0;
+
+    if (a < 0 || b < 0) return -1;
+    SendMessageW(list, LVM_GETITEMRECT, a, (LPARAM)&ra);
+    SendMessageW(list, LVM_GETITEMRECT, b, (LPARAM)&rb);
+    GetClientRect(list, &client);
+    bmi.bmiHeader.biWidth = client.right;
+    bmi.bmiHeader.biHeight = -client.bottom;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    dc = CreateCompatibleDC(NULL);
+    if (!(bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, (void **)&bits, NULL, 0))) { DeleteDC(dc); return -1; }
+    old = SelectObject(dc, bmp);
+    SendMessageW(list, WM_PRINTCLIENT, (WPARAM)dc, PRF_CLIENT | PRF_ERASEBKGND);
+    GdiFlush();
+    w = min(ra.right - ra.left, rb.right - rb.left);
+    h = min(ra.bottom - ra.top, rb.bottom - rb.top);
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++)
+        {
+            int ya = ra.top + y, xa = ra.left + x, yb = rb.top + y, xb = rb.left + x;
+            if (ya < 0 || yb < 0 || ya >= client.bottom || yb >= client.bottom || xa >= client.right || xb >= client.right) continue;
+            if ((bits[ya * client.right + xa] & 0xffffff) != (bits[yb * client.right + xb] & 0xffffff)) diff++;
+        }
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    return diff;
+}
+
+static int find_row(HWND list, const WCHAR *name, const WCHAR *bare)
+{
+    LVFINDINFOW find = { LVFI_STRING, name };
+    int i = (int)SendMessageW(list, LVM_FINDITEMW, -1, (LPARAM)&find);
+    if (i < 0) { find.psz = bare; i = (int)SendMessageW(list, LVM_FINDITEMW, -1, (LPARAM)&find); }
+    return i;
+}
+
 static void pump(int ms)
 {
     DWORD end = GetTickCount() + ms;
@@ -182,6 +228,29 @@ int main(void)
             if (i < 0 && list) { find.psz = L"z"; i = (int)SendMessageW(list, LVM_FINDITEMW, -1, (LPARAM)&find); }
             index = i >= 0 ? (int)SendMessageW(list, LVM_GETITEMSTATE, i, LVIS_OVERLAYMASK) : -1;
             CHECK(i >= 0 && index == 0, "an unmarked item has none: item %d state %#x", i, index);
+            /* 6254: the overlay is drawn: the marked item's icon differs from an unmarked one of the
+             * same type, which two unmarked ones do not -- in details and in large icons */
+            if (list)
+            {
+                IFolderView *fv = NULL;
+                int marked = find_row(list, L"x.ova", L"x"), q = find_row(list, L"q.ovq", L"q"), r = find_row(list, L"r.ovr", L"r");
+                int d1 = icon_diff(list, marked, q), d0 = icon_diff(list, q, r);
+                printf("details: %d pixels of the marked icon differ, %d of an unmarked one\n", d1, d0);
+                CHECK(d0 == 0 && d1 > 4, "details: the overlay is drawn on the marked item (%d pixels differ; unmarked %d)", d1, d0);
+                IExplorerBrowser_GetCurrentView(browser, &IID_IFolderView, (void **)&fv);
+                if (fv)
+                {
+                    IFolderView_SetCurrentViewMode(fv, FVM_ICON);
+                    pump(1500);
+                    list = find_list(top);
+                    marked = find_row(list, L"x.ova", L"x"); q = find_row(list, L"q.ovq", L"q"); r = find_row(list, L"r.ovr", L"r");
+                    d1 = icon_diff(list, marked, q); d0 = icon_diff(list, q, r);
+                    printf("large icons: %d pixels of the marked icon differ, %d of an unmarked one\n", d1, d0);
+                    CHECK(d0 == 0 && d1 > 4, "large icons: the overlay is drawn on the marked item (%d pixels differ; unmarked %d)", d1, d0);
+                    IFolderView_Release(fv);
+                }
+                else CHECK(0, "no IFolderView");
+            }
             IExplorerBrowser_Destroy(browser);
         }
         else CHECK(0, "no ExplorerBrowser: %#lx", hr);

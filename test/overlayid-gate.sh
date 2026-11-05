@@ -8,7 +8,7 @@
 # worker thread; a handler that takes 5 s ("Slow", *.ovs) leaves the view answering, and the item gets
 # its overlay when the answer comes (OneDrive's IsMemberOf blocked Explorer's window thread, qa4 637).
 # 6253: IsMemberOf gets the file's FILE_ATTRIBUTE_* flags (as documented), not SFGAO flags
-# (mutant SG_MUTANT_OVERLAY_SFGAO, shfldr_fs.c).
+# (mutant SG_MUTANT_OVERLAY_SFGAO, shfldr_fs.c). 6254: the overlay is drawn, in details and large icons.
 # test/overlayid-dll.c (the handlers), test/overlayid-probe.c.
 # Mutants (dlls/shell32): SG_MUTANT_NO_OVERLAY_HANDLERS, SG_MUTANT_FAILED_SLOT (iconcache.c),
 # SG_MUTANT_OVERLAY_ON_CALLER (iconcache.c), SG_MUTANT_NO_FOLDER_OVERLAY (shfldr_fs.c),
@@ -33,12 +33,12 @@ printf 'LIBRARY overlayid.dll\nEXPORTS\n    DllGetClassObject PRIVATE\n    DllCa
 command -v i686-w64-mingw32-gcc >/dev/null || { echo "SKIP: i686 mingw-w64 not installed"; exit 77; }
 i686-w64-mingw32-gcc -O2 -municode -shared -o "$T/overlay32.dll" "$HERE/overlayid-dll.c" "$T/h.def" -lole32 -luuid -lshlwapi \
     || { echo "FAIL  32-bit handler did not build"; exit 1; }
-"$MINGW" -O2 -o "$T/probe.exe" "$HERE/overlayid-probe.c" -lshell32 -lole32 -luuid -lcomctl32 -luser32 \
+"$MINGW" -O2 -o "$T/probe.exe" "$HERE/overlayid-probe.c" -lshell32 -lole32 -luuid -lcomctl32 -luser32 -lgdi32 \
     || { echo "FAIL  probe did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
 C="$WINEPREFIX/drive_c"
 cp "$T/overlayid.dll" "$T/overlay32.dll" "$T/probe.exe" "$C/"
-mkdir -p "$C/ovtest"; : > "$C/ovtest/x.ova"; : > "$C/ovtest/y.ovb"; : > "$C/ovtest/z.txt"; : > "$C/ovtest/w.ovc"; : > "$C/ovtest/v.ovs"
+mkdir -p "$C/ovtest"; : > "$C/ovtest/x.ova"; : > "$C/ovtest/y.ovb"; : > "$C/ovtest/z.txt"; : > "$C/ovtest/w.ovc"; : > "$C/ovtest/v.ovs"; : > "$C/ovtest/q.ovq"; : > "$C/ovtest/r.ovr"
 {
   printf 'Windows Registry Editor Version 5.00\n\n'
   for c in A B C F D E S; do
