@@ -4,7 +4,9 @@
 # 6248: the real file view shows it (mutant SG_MUTANT_COLUMN_STOP, shlview.c), and hides desktop.ini
 # (hidden+system) unless protected operating system files are shown (SG_MUTANT_SUPERHIDDEN_LISTED, enumidlist.c).
 # 6256: the Status cell shows a glyph per state (SG_MUTANT_NO_STATUS_GLYPH, iconcache.c;
-# SG_MUTANT_NO_STATUS_IMAGES, shlview.c).
+# SG_MUTANT_NO_STATUS_IMAGES, shlview.c). 6257: placeholders carry PINNED / UNPINNED /
+# RECALL_ON_DATA_ACCESS as file attributes (SG_MUTANT_NO_CLOUD_ATTRIBS, ntdll/unix/file.c;
+# SG_MUTANT_NO_RECALL_ATTRIB, cldapi/main.c).
 #
 #   WINE=/opt/wine-sg/bin/wine test/syncstatus-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)

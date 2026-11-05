@@ -285,6 +285,22 @@ int main(void)
     CHECK(!lstrcmpW(text, L"Always available on this device") && state == 3, "pinned.txt: %ls %lu", text, state);
     status_of(root, L"pending.bin", text, &state);
     CHECK(!lstrcmpW(text, L"Sync pending") && state == 4, "pending.bin: %ls %lu", text, state);
+    /* 6257: the cloud attributes are the file's own, as on Windows */
+    {
+        DWORD pinned = GetFileAttributesW(L"C:\\sroot\\pinned.txt"), online = GetFileAttributesW(L"C:\\sroot\\online.bin");
+        DWORD local = GetFileAttributesW(L"C:\\sroot\\local.txt"), unpinned;
+        HANDLE f;
+        CHECK(pinned != INVALID_FILE_ATTRIBUTES && (pinned & 0x00080000), "a pinned file has FILE_ATTRIBUTE_PINNED: %#lx", pinned);
+        CHECK(online != INVALID_FILE_ATTRIBUTES && (online & 0x00400000), "an online-only file has RECALL_ON_DATA_ACCESS: %#lx", online);
+        CHECK(local != INVALID_FILE_ATTRIBUTES && !(local & 0x00480000), "a local one has neither: %#lx", local);
+        f = CreateFileW(L"C:\\sroot\\local.txt", FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        NULL, OPEN_EXISTING, 0, NULL);
+        CHECK(pPin(f, 2, 0, NULL) == S_OK, "unpinned local.txt");
+        CloseHandle(f);
+        unpinned = GetFileAttributesW(L"C:\\sroot\\local.txt");
+        CHECK(unpinned != INVALID_FILE_ATTRIBUTES && (unpinned & 0x00100000) && !(unpinned & 0x00080000),
+              "an unpinned file has FILE_ATTRIBUTE_UNPINNED: %#lx", unpinned);
+    }
     status_of(root, L"plain.txt", text, &state);
     CHECK(!text[0] && state == 0, "a file that is no placeholder: '%ls' %lu", text, state);
 
