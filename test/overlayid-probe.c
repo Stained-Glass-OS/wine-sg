@@ -106,6 +106,12 @@ int main(void)
     last_path = dll ? (void *)GetProcAddress(dll, "last_path") : NULL;
     CHECK(last_path && !lstrcmpiW(last_path(), L"C:\\ovtest\\z.txt"), "IsMemberOf gets the file's path: %ls",
           last_path ? last_path() : L"(not loaded)");
+    {
+        DWORD (*last_attrib)(void) = dll ? (void *)GetProcAddress(dll, "last_attrib") : NULL;
+        DWORD want = GetFileAttributesW(L"C:\\ovtest\\z.txt");
+        CHECK(last_attrib && last_attrib() == want, "IsMemberOf gets the file's attributes: %#lx, want %#lx",
+              last_attrib ? last_attrib() : 0xdeadUL, want);
+    }
 
     GetSystemDirectoryW(shell32, MAX_PATH);
     lstrcatW(shell32, L"\\shell32.dll");

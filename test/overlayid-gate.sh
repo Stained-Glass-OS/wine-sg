@@ -7,6 +7,8 @@
 # 0x800700c1 a 32-bit DLL in a 64-bit process), not E_ACCESSDENIED.  6251: the handlers are asked on a
 # worker thread; a handler that takes 5 s ("Slow", *.ovs) leaves the view answering, and the item gets
 # its overlay when the answer comes (OneDrive's IsMemberOf blocked Explorer's window thread, qa4 637).
+# 6253: IsMemberOf gets the file's FILE_ATTRIBUTE_* flags (as documented), not SFGAO flags
+# (mutant SG_MUTANT_OVERLAY_SFGAO, shfldr_fs.c).
 # test/overlayid-dll.c (the handlers), test/overlayid-probe.c.
 # Mutants (dlls/shell32): SG_MUTANT_NO_OVERLAY_HANDLERS, SG_MUTANT_FAILED_SLOT (iconcache.c),
 # SG_MUTANT_OVERLAY_ON_CALLER (iconcache.c), SG_MUTANT_NO_FOLDER_OVERLAY (shfldr_fs.c),
@@ -25,7 +27,7 @@ unset DISPLAY WAYLAND_DISPLAY
 T=$(mktemp -d /var/tmp/sg-overlayid.XXXXXX)
 export WINEPREFIX="$T/pfx" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
-printf 'LIBRARY overlayid.dll\nEXPORTS\n    DllGetClassObject PRIVATE\n    DllCanUnloadNow PRIVATE\n    last_path\n' > "$T/h.def"
+printf 'LIBRARY overlayid.dll\nEXPORTS\n    DllGetClassObject PRIVATE\n    DllCanUnloadNow PRIVATE\n    last_path\n    last_attrib\n' > "$T/h.def"
 "$MINGW" -O2 -municode -shared -o "$T/overlayid.dll" "$HERE/overlayid-dll.c" "$T/h.def" -lole32 -luuid -lshlwapi \
     || { echo "FAIL  handler did not build"; exit 1; }
 command -v i686-w64-mingw32-gcc >/dev/null || { echo "SKIP: i686 mingw-w64 not installed"; exit 77; }

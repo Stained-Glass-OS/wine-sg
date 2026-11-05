@@ -12,7 +12,9 @@ static const GUID CLSID_C = { 0x7b1d0e11, 0x2b6d, 0x4c11, { 0x9a, 0x01, 0x0e, 0x
 static const GUID CLSID_S = { 0x7b1d0e11, 0x2b6d, 0x4c11, { 0x9a, 0x01, 0x0e, 0x57, 0xa1, 0x10, 0x0e, 0x10 } };
 
 static WCHAR last[MAX_PATH];
+static DWORD last_attrib_value;
 __declspec(dllexport) const WCHAR *last_path(void) { return last; }
+__declspec(dllexport) DWORD last_attrib(void) { return last_attrib_value; }
 
 struct handler { void **vtbl; char kind; };
 
@@ -27,6 +29,7 @@ static HRESULT WINAPI h_member(struct handler *h, const WCHAR *path, DWORD attri
 {
     const WCHAR *ext = PathFindExtensionW(path);
     lstrcpynW(last, path, MAX_PATH);
+    last_attrib_value = attrib;
     if (h->kind == 'a') return !lstrcmpiW(ext, L".ova") ? S_OK : S_FALSE;
     if (h->kind == 'b') return !lstrcmpiW(ext, L".ovb") ? S_OK : S_FALSE;
     if (h->kind == 'c') return !lstrcmpiW(ext, L".ovc") ? S_OK : S_FALSE;
