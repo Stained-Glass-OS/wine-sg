@@ -1,7 +1,7 @@
 /* Windows.UI and Windows.UI.Composition for WinUI 2 controls (patches/sg/6182): the thread's CoreWindow
  * gives weak references (C++/WinRT's make_weak, MUX's AnimatedVisualPlayer), and the compositor is an
- * ICompositor5: its Comment and GlobalPlaybackRate kept, RequestCommitAsync done, shapes not made
- * (E_NOTIMPL, so Lottie animations fall back). Interface identity per windows-rs (MIT). */
+ * ICompositor5: its Comment and GlobalPlaybackRate kept, RequestCommitAsync done, shape visuals made
+ * (6265; test/compshapes draws them). Interface identity per windows-rs (MIT). */
 #define COBJMACROS
 #include <windows.h>
 #include <initguid.h>
