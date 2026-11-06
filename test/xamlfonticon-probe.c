@@ -93,6 +93,7 @@ static const WCHAR page_xaml[] =
     L"<FontIcon" AT(L"280") L" Glyph=\"&#xE0A0;\"/>"
     L"<TextBlock" AT(L"320") L" FontFamily=\"Segoe MDL2 Assets\" Text=\"&#xE0A0;\"/>"
     L"<FontIcon" AT(L"360") L" Glyph=\"&#xEDDA;\"/>"
+    L"<FontIcon HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Margin=\"80,360,0,0\" FontSize=\"20\" Glyph=\"&#xEA18;\"/>"
     L"<AppBarButton x:Name=\"Cmd\" HorizontalAlignment=\"Left\" VerticalAlignment=\"Top\" Margin=\"0,240,0,0\" Width=\"68\">"
     L"<AppBarButton.Icon><FontIcon Glyph=\"&#xE710;\"/></AppBarButton.Icon></AppBarButton>"
     L"</Grid>";
@@ -173,5 +174,11 @@ int main(void)
     printf("unknown=%d,%d\n", dark_in(7), dark_in(8));
     /* a named one Windows Terminal uses (CaretRightSolid8): its stand-in drawn (6228) */
     printf("caret=%d\n", dark_in(9) > 5);
+    /* Shield (EA18, Windows Terminal's elevated tabs): its stand-in, beside it (6264) */
+    {
+        int n = 0;
+        for (y = 360; y < 400; y++) for (x = 75; x < 120; x++) n += shot[y][x];
+        printf("shield=%d\n", n > 5);
+    }
     return 0;
 }

@@ -52,6 +52,7 @@ chk '^row1=1,1,0$' "Segoe Fluent Icons E721 drawn as U+2315"
 chk '^row2=1,1,0$' "a FontIcon in DejaVu Sans draws its glyph as it is"
 chk '^appbar=1,1$' "an AppBarButton's FontIcon drawn"
 chk '^caret=1$' "CaretRightSolid8 (EDDA, Windows Terminal) drawn as its stand-in (6228)"
+chk '^shield=1$' "Shield (EA18, Windows Terminal) drawn as its stand-in (6264)"
 chk '^unknown=[0-2],[0-2]$' "an icon glyph with no stand-in draws nothing, not the missing-glyph box (6226)"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
