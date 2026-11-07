@@ -1,0 +1,380 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] quartz, dsound: the audio renderer's clock follows the sound's play position; the play cursor is what has played
+
+The DirectSound renderer gives the graph a clock that runs with what the sound device has played, as Windows' audio renderer does, so video follows the sound when the device's clock drifts from the system's or the device holds a long, changing backlog (Bluetooth). A DirectSound buffer's play cursor is what the device has played, behind the mix position by what the device still holds.
+---
+diff --git a/dlls/dsound/buffer.c b/dlls/dsound/buffer.c
+index 98dc1be..3b4914f 100644
+--- a/dlls/dsound/buffer.c
++++ b/dlls/dsound/buffer.c
+@@ -321,6 +321,8 @@ static HRESULT WINAPI IDirectSoundBufferImpl_Play(IDirectSoundBuffer8 *iface, DW
+ 	if (This->state == STATE_STOPPED) {
+ 		This->leadin = TRUE;
+ 		This->state = STATE_STARTING;
++		This->mixed_bytes = This->played_bytes = 0;
++		This->play_cursor = This->sec_mixpos;
+ 	}
+ 
+ 	for (i = 0; i < This->num_filters; i++) {
+@@ -407,10 +409,20 @@ static HRESULT WINAPI IDirectSoundBufferImpl_GetCurrentPosition(IDirectSoundBuff
+ 		pos %= This->buflen;
+ 	}
+ 
+-	if (playpos)
+-		*playpos = pos;
+ 	if (writepos)
+ 		*writepos = pos;
++	if (playpos)
++	{
++		/* the play cursor is what is playing, as the hardware's is on Windows: the mixer keeps it
++		 * behind the mix position by what the device holds and has not played (wine-sg 6267;
++		 * DirectShow's audio renderer clocks video by it) */
++#ifndef SG_MUTANT_DS_PLAY_IS_MIXPOS
++		if (This->state == STATE_PLAYING && This->play_cursor < This->buflen)
++			*playpos = This->play_cursor;
++		else
++#endif
++			*playpos = pos;
++	}
+ 
+ 	if (writepos && This->state != STATE_STOPPED) {
+ 		/* apply the documented 10ms lead to writepos */
+@@ -591,6 +603,8 @@ static HRESULT WINAPI IDirectSoundBufferImpl_SetCurrentPosition(IDirectSoundBuff
+ 	/* start mixing from this new location instead */
+ 	newpos -= newpos%This->pwfx->nBlockAlign;
+ 	This->sec_mixpos = newpos;
++	This->mixed_bytes = This->played_bytes = 0;
++	This->play_cursor = newpos;
+ 
+ 	This->use_committed = FALSE;
+ 	This->committed_mixpos = 0;
+diff --git a/dlls/dsound/dsound_private.h b/dlls/dsound/dsound_private.h
+index c210c0a..b1d9fac 100644
+--- a/dlls/dsound/dsound_private.h
++++ b/dlls/dsound/dsound_private.h
+@@ -153,6 +153,10 @@ struct IDirectSoundBufferImpl
+     LONG64                      freqAccNum;
+     /* used for mixing */
+     DWORD                       sec_mixpos;
++    /* the play cursor is what the device has played (wine-sg 6267): */
++    UINT64                      mixed_bytes;    /* mixed since it started playing */
++    UINT64                      played_bytes;   /* of those, the device has played */
++    DWORD                       play_cursor;    /* where that is in the buffer */
+     /* Holds a copy of the next 'writelead' bytes, to be used for mixing. This makes it
+      * so that these bytes get played once even if this region of the buffer gets overwritten,
+      * which is more in-line with native DirectSound behavior. */
+diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
+index 71a3c84..50bb50c 100644
+--- a/dlls/dsound/mixer.c
++++ b/dlls/dsound/mixer.c
+@@ -457,6 +457,7 @@ static void cp_fields(IDirectSoundBufferImpl *dsb, UINT count, LONG64 *freqAccNu
+     else
+         adv = cp_fields_resample(dsb, count, freqAccNum);
+ 
++    dsb->mixed_bytes += adv * dsb->pwfx->nBlockAlign;
+     ipos = dsb->sec_mixpos + adv * dsb->pwfx->nBlockAlign;
+     if (ipos >= dsb->buflen) {
+         if (dsb->playflags & DSBPLAY_LOOPING)
+@@ -647,6 +648,24 @@ static DWORD DSOUND_MixOne(IDirectSoundBufferImpl *dsb, float *mix_buffer, DWORD
+  * Returns:  the length beyond the writepos that was mixed to.
+  */
+ 
++/* After a mix: what the device holds, once these frames are queued, has not played. What has is
++ * what was mixed less that (in the buffer's bytes): it only grows, and the play cursor is there. */
++static void update_play_cursor(const DirectSoundDevice *device, IDirectSoundBufferImpl *dsb, DWORD held)
++{
++    UINT64 lag = 0, played, back;
++    DWORD block = dsb->pwfx->nBlockAlign;
++
++    if (device->pwfx->nAvgBytesPerSec)
++        lag = (UINT64)held * dsb->freq / device->pwfx->nAvgBytesPerSec * block;
++    played = dsb->mixed_bytes > lag ? dsb->mixed_bytes - lag : 0;
++    if (played < dsb->played_bytes) played = dsb->played_bytes;
++    dsb->played_bytes = played;
++    back = dsb->mixed_bytes - played;
++    if (back >= dsb->buflen) back = dsb->buflen - block;
++    back -= back % block;
++    dsb->play_cursor = (dsb->sec_mixpos + dsb->buflen - (DWORD)back) % dsb->buflen;
++}
++
+ static void DSOUND_MixToPrimary(const DirectSoundDevice *device, float *mix_buffer, DWORD frames, BOOL *all_stopped)
+ {
+ 	INT i;
+@@ -672,6 +691,7 @@ static void DSOUND_MixToPrimary(const DirectSoundDevice *device, float *mix_buff
+ 
+ 				/* mix next buffer into the main buffer */
+ 				DSOUND_MixOne(dsb, mix_buffer, frames);
++				update_play_cursor(device, dsb, device->pad + frames * device->pwfx->nBlockAlign);
+ 
+ 				*all_stopped = FALSE;
+ 			}
+diff --git a/dlls/quartz/dsoundrender.c b/dlls/quartz/dsoundrender.c
+index 87d8a3e..2f23452 100644
+--- a/dlls/quartz/dsoundrender.c
++++ b/dlls/quartz/dsoundrender.c
+@@ -46,7 +46,21 @@ struct dsound_render
+     IAMDirectSound IAMDirectSound_iface;
+     IBasicAudio IBasicAudio_iface;
+     IQualityControl IQualityControl_iface;
++    IReferenceClock IReferenceClock_iface;
+     IUnknown *system_clock;
++    IReferenceClock *system;            /* system_clock's IReferenceClock (not referenced) */
++
++    /* the clock the renderer gives the graph follows the sound's play position while it streams, as
++     * Windows' does: time is what the device has played, so video follows the sound (wine-sg 6267) */
++    CRITICAL_SECTION clock_cs;
++    IDirectSoundBuffer *clock_buffer;   /* while streaming, referenced */
++    REFERENCE_TIME clock_offset;        /* this clock's time less the system clock's when not following */
++    REFERENCE_TIME clock_anchor;        /* this clock's time when the sound started */
++    UINT64 clock_played;                /* bytes played since then */
++    DWORD clock_cursor;                 /* the play cursor last seen */
++    REFERENCE_TIME clock_change_sys;    /* the system time the played count last grew */
++    REFERENCE_TIME clock_last;          /* the last time given: it never goes back */
++    DWORD clock_bps;
+ 
+     struct strmbase_sink sink;
+ 
+@@ -91,6 +105,152 @@ static struct dsound_render *impl_from_strmbase_filter(struct strmbase_filter *i
+     return CONTAINING_RECORD(iface, struct dsound_render, filter);
+ }
+ 
++static struct dsound_render *impl_from_IReferenceClock(IReferenceClock *iface)
++{
++    return CONTAINING_RECORD(iface, struct dsound_render, IReferenceClock_iface);
++}
++
++/* under clock_cs: this clock's time for a system time */
++static REFERENCE_TIME clock_time(struct dsound_render *filter, REFERENCE_TIME sys)
++{
++    REFERENCE_TIME now;
++
++    if (filter->clock_buffer && filter->clock_bps)
++    {
++        DWORD play = 0, write, adv;
++        REFERENCE_TIME played, ahead;
++
++        IDirectSoundBuffer_GetCurrentPosition(filter->clock_buffer, &play, &write);
++        adv = play >= filter->clock_cursor ? play - filter->clock_cursor : filter->buf_size + play - filter->clock_cursor;
++        filter->clock_cursor = play;
++        if (adv)
++        {
++            filter->clock_played += adv;
++            filter->clock_change_sys = sys;
++        }
++        played = (REFERENCE_TIME)(filter->clock_played * 10000000 / filter->clock_bps);
++        /* between two moves of the cursor (a mix period): on with the system clock, not past 20 ms */
++        ahead = min(sys - filter->clock_change_sys, 20 * 10000);
++        if (ahead < 0) ahead = 0;
++        now = filter->clock_anchor + played + ahead;
++#ifdef SG_MUTANT_CLOCK_IS_SYSTEM
++        now = sys + filter->clock_offset;
++#endif
++    }
++    else now = sys + filter->clock_offset;
++    if (now < filter->clock_last) now = filter->clock_last;
++    filter->clock_last = now;
++    return now;
++}
++
++static HRESULT WINAPI clock_QueryInterface(IReferenceClock *iface, REFIID iid, void **out)
++{
++    struct dsound_render *filter = impl_from_IReferenceClock(iface);
++    return IUnknown_QueryInterface(filter->filter.outer_unk, iid, out);
++}
++
++static ULONG WINAPI clock_AddRef(IReferenceClock *iface)
++{
++    struct dsound_render *filter = impl_from_IReferenceClock(iface);
++    return IUnknown_AddRef(filter->filter.outer_unk);
++}
++
++static ULONG WINAPI clock_Release(IReferenceClock *iface)
++{
++    struct dsound_render *filter = impl_from_IReferenceClock(iface);
++    return IUnknown_Release(filter->filter.outer_unk);
++}
++
++static HRESULT WINAPI clock_GetTime(IReferenceClock *iface, REFERENCE_TIME *time)
++{
++    struct dsound_render *filter = impl_from_IReferenceClock(iface);
++    REFERENCE_TIME sys, last;
++    HRESULT hr;
++
++    if (!time) return E_POINTER;
++    IReferenceClock_GetTime(filter->system, &sys);
++    EnterCriticalSection(&filter->clock_cs);
++    last = filter->clock_last;
++    *time = clock_time(filter, sys);
++    hr = *time == last ? S_FALSE : S_OK;
++    LeaveCriticalSection(&filter->clock_cs);
++    TRACE("filter %p, time %s.\n", filter, debugstr_time(*time));
++    return hr;
++}
++
++/* a time of this clock as the system clock's: what the advises wait on */
++static REFERENCE_TIME system_time_for(struct dsound_render *filter, REFERENCE_TIME time)
++{
++    REFERENCE_TIME sys, now;
++
++    IReferenceClock_GetTime(filter->system, &sys);
++    EnterCriticalSection(&filter->clock_cs);
++    now = clock_time(filter, sys);
++    LeaveCriticalSection(&filter->clock_cs);
++    return time - (now - sys);
++}
++
++static HRESULT WINAPI clock_AdviseTime(IReferenceClock *iface, REFERENCE_TIME base, REFERENCE_TIME offset,
++        HEVENT event, DWORD_PTR *cookie)
++{
++    struct dsound_render *filter = impl_from_IReferenceClock(iface);
++
++    TRACE("filter %p, base %s, offset %s, event %#Ix, cookie %p.\n", filter, debugstr_time(base),
++          debugstr_time(offset), event, cookie);
++    if (base + offset <= 0) return E_INVALIDARG;
++    return IReferenceClock_AdviseTime(filter->system, system_time_for(filter, base + offset), 0, event, cookie);
++}
++
++static HRESULT WINAPI clock_AdvisePeriodic(IReferenceClock *iface, REFERENCE_TIME start, REFERENCE_TIME period,
++        HSEMAPHORE semaphore, DWORD_PTR *cookie)
++{
++    struct dsound_render *filter = impl_from_IReferenceClock(iface);
++
++    TRACE("filter %p, start %s, period %s, semaphore %#Ix, cookie %p.\n", filter, debugstr_time(start),
++          debugstr_time(period), semaphore, cookie);
++    if (start <= 0 || period <= 0) return E_INVALIDARG;
++    return IReferenceClock_AdvisePeriodic(filter->system, system_time_for(filter, start), period, semaphore, cookie);
++}
++
++static HRESULT WINAPI clock_Unadvise(IReferenceClock *iface, DWORD_PTR cookie)
++{
++    struct dsound_render *filter = impl_from_IReferenceClock(iface);
++    return IReferenceClock_Unadvise(filter->system, cookie);
++}
++
++static const IReferenceClockVtbl clock_vtbl =
++{
++    clock_QueryInterface,
++    clock_AddRef,
++    clock_Release,
++    clock_GetTime,
++    clock_AdviseTime,
++    clock_AdvisePeriodic,
++    clock_Unadvise,
++};
++
++/* the clock follows the buffer from now: its time goes on from where it is */
++static void clock_follow(struct dsound_render *filter, IDirectSoundBuffer *buffer)
++{
++    REFERENCE_TIME sys;
++    DWORD write;
++
++    IReferenceClock_GetTime(filter->system, &sys);
++    EnterCriticalSection(&filter->clock_cs);
++    filter->clock_anchor = clock_time(filter, sys);
++    filter->clock_played = 0;
++    filter->clock_change_sys = sys;
++    filter->clock_cursor = 0;
++    if (buffer) IDirectSoundBuffer_GetCurrentPosition(buffer, &filter->clock_cursor, &write);
++    if (buffer) IDirectSoundBuffer_AddRef(buffer);
++    if (filter->clock_buffer) IDirectSoundBuffer_Release(filter->clock_buffer);
++    filter->clock_buffer = buffer;
++    filter->clock_bps = buffer && filter->sink.pin.mt.pbFormat ? ((WAVEFORMATEX *)filter->sink.pin.mt.pbFormat)->nAvgBytesPerSec : 0;
++    /* when it stops following, it goes on with the system clock from its time */
++    filter->clock_offset = filter->clock_anchor - sys;
++    LeaveCriticalSection(&filter->clock_cs);
++}
++
+ static struct dsound_render *impl_from_IBasicAudio(IBasicAudio *iface)
+ {
+     return CONTAINING_RECORD(iface, struct dsound_render, IBasicAudio_iface);
+@@ -345,6 +505,8 @@ static HRESULT configure_buffer(struct dsound_render *filter, IMediaSample *pSam
+                 FreeMediaType(orig);
+                 CopyMediaType(orig, amt);
+                 IMediaSample_SetMediaType(pSample, NULL);
++                /* the bytes played from now count at the new rate */
++                if (filter->clock_buffer) clock_follow(filter, filter->dsbuffer);
+             }
+         }
+         else
+@@ -629,7 +791,10 @@ static void dsound_render_destroy(struct strmbase_filter *iface)
+         IDirectSound8_Release(filter->dsound);
+     filter->dsound = NULL;
+ 
++    clock_follow(filter, NULL);
+     IUnknown_Release(filter->system_clock);
++    filter->clock_cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection(&filter->clock_cs);
+ 
+     if (filter->sink.pin.peer)
+         IPin_Disconnect(filter->sink.pin.peer);
+@@ -671,7 +836,7 @@ static HRESULT dsound_render_query_interface(struct strmbase_filter *iface, REFI
+     else if (IsEqualGUID(iid, &IID_IQualityControl))
+         *out = &filter->IQualityControl_iface;
+     else if (IsEqualGUID(iid, &IID_IReferenceClock))
+-        return IUnknown_QueryInterface(filter->system_clock, iid, out);
++        *out = &filter->IReferenceClock_iface;
+     else
+         return E_NOINTERFACE;
+ 
+@@ -709,7 +874,10 @@ static HRESULT dsound_render_start_stream(struct strmbase_filter *iface, REFEREN
+     SetEvent(filter->state_event);
+ 
+     if (filter->sink.pin.peer)
++    {
+         IDirectSoundBuffer_Play(filter->dsbuffer, 0, 0, DSBPLAY_LOOPING);
++        clock_follow(filter, filter->dsbuffer);
++    }
+ 
+     if ((filter->eos || !filter->sink.pin.peer) && graph
+             && SUCCEEDED(IFilterGraph_QueryInterface(graph,
+@@ -729,6 +897,7 @@ static HRESULT dsound_render_stop_stream(struct strmbase_filter *iface)
+ 
+     if (filter->sink.pin.peer)
+     {
++        clock_follow(filter, NULL);
+         IDirectSoundBuffer_Stop(filter->dsbuffer);
+         filter->writepos = filter->buf_size;
+     }
+@@ -1149,11 +1318,19 @@ HRESULT dsound_render_create(IUnknown *outer, IUnknown **out)
+         free(object);
+         return hr;
+     }
++    /* the system clock is aggregated by the filter: its interface without a reference */
++    IUnknown_QueryInterface(object->system_clock, &IID_IReferenceClock, (void **)&object->system);
++    IReferenceClock_Release(object->system);
++    object->IReferenceClock_iface.lpVtbl = &clock_vtbl;
++    InitializeCriticalSectionEx(&object->clock_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    object->clock_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": dsound_render.clock_cs");
+ 
+     object->focus_audible = TRUE;
+ 
+     if (FAILED(hr = DirectSoundCreate8(NULL, &object->dsound, NULL)))
+     {
++        object->clock_cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection(&object->clock_cs);
+         IUnknown_Release(object->system_clock);
+         strmbase_filter_cleanup(&object->filter);
+         free(object);
+diff --git a/dlls/quartz/filtermapper.c b/dlls/quartz/filtermapper.c
+index 5954d21..634d341 100644
+--- a/dlls/quartz/filtermapper.c
++++ b/dlls/quartz/filtermapper.c
+@@ -1112,7 +1112,8 @@ static HRESULT WINAPI FilterMapper3_EnumMatchingFilters(
+         return hr;
+     }
+ 
+-    while (IEnumMoniker_Next(pEnumCat, 1, &pMonikerCat, NULL) == S_OK)
++    /* S_FALSE: no categories, and no enumerator: an empty list */
++    while (pEnumCat && IEnumMoniker_Next(pEnumCat, 1, &pMonikerCat, NULL) == S_OK)
+     {
+         IPropertyBag * pPropBagCat = NULL;
+         VARIANT var;
+@@ -1261,7 +1262,7 @@ static HRESULT WINAPI FilterMapper3_EnumMatchingFilters(
+     }
+ 
+     delete_vector(&monikers);
+-    IEnumMoniker_Release(pEnumCat);
++    if (pEnumCat) IEnumMoniker_Release(pEnumCat);
+     ICreateDevEnum_Release(pCreateDevEnum);
+ 
+     return hr;
