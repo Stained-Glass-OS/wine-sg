@@ -657,7 +657,7 @@ static void test_activation_and_names(void)
     { ULONG n2 = 0; IID *ids = NULL; check(BASE(val)->GetIids(val, &n2, &ids) == S_OK && n2 == 5 && ids, "GetIids of an array"); CoTaskMemFree(ids); }
     rel(val);
     val = parse(L"{}", &hr);
-    { ULONG n2 = 0; IID *ids = NULL; check(BASE(val)->GetIids(val, &n2, &ids) == S_OK && n2 == 5 && ids, "GetIids of an object"); CoTaskMemFree(ids); }
+    { ULONG n2 = 0; IID *ids = NULL; check(BASE(val)->GetIids(val, &n2, &ids) == S_OK && n2 == 6 && ids, "GetIids of an object (with IJsonObjectWithDefaultValues, 7721)"); CoTaskMemFree(ids); }
     rel(val);
     val = parse(L"5", &hr);
     { void *x = NULL; checkhr(BASE(val)->QueryInterface(val, &IID_Insp, &x), S_OK, "QI IInspectable"); rel(x); }
