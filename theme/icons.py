@@ -9,6 +9,15 @@ corner, a text page with lines, Notepad (a page under our accent band),
 This PC (a monitor), Desktop, Documents, a fixed drive, and the file
 dialogs' toolbar strip.
 
+Accent (wine-sg 6269): every icon we draw follows the accent colour
+Personalization sets. The parts that do are drawn in the key colours --
+KEY, KEY_DARK, KEY_LIGHT, KEY_PALE: one hue (the default accent's,
+BlueViolet), several shades -- and user32 turns that hue into the accent's
+when it loads an icon of one of our own (builtin) modules, keeping each
+shade's place (sg_tint in dlls/user32/cursoricon.c). Nothing else in these
+drawings uses that hue; the error and warning icons keep their red and
+amber, which mean something. Programs' own icons are never touched.
+
 Each icon is one drawing on a 100-unit square, repeated at every size the
 .ico carries (tools/buildimage cuts the rectangles named icon:SIZE-32). Line
 widths are set per size in pixels, so the small sizes stay crisp and the
@@ -25,15 +34,25 @@ if os.environ.get("SG_MUTANT_ICON_FRAMES"):   # test/iconframes-gate.sh's mutant
     SIZES = [256, 48, 32, 16]
 GAP = 8
 
-FOLDER_BACK = "#E3A92E"
-FOLDER_FRONT = "#F7C948"
-FOLDER_EDGE = "#C98D16"
-FOLDER_LIGHT = "#FBDD85"
+# the key colours: the accent's hue at four shades (user32 re-hues them)
+KEY = "#8A2BE2"
+KEY_DARK = "#661EA8"
+KEY_LIGHT = "#C38EF5"
+KEY_PALE = "#E7CFFC"
+if os.environ.get("SG_MUTANT_ICONS_NO_KEY"):   # test/accenticons-gate.sh's mutant: the folders keep manila
+    KEY, KEY_DARK, KEY_LIGHT, KEY_PALE = "#F7C948", "#E3A92E", "#FBDD85", "#FDF0C8"
+FOLDER_BACK = KEY_DARK
+FOLDER_FRONT = KEY
+FOLDER_EDGE = KEY_DARK
+FOLDER_LIGHT = KEY_LIGHT
 PAGE = "#FFFFFF"
 PAGE_EDGE = "#8C8C8C"
-PAGE_FOLD = "#E4E4E4"
+PAGE_FOLD = KEY_PALE
 LINE = "#A0A0A0"
-ACCENT = "#7B3FD0"
+ACCENT = KEY
+NEUTRAL = "#E2E2E2"
+NEUTRAL_DARK = "#C9C9C9"
+NEUTRAL_EDGE = "#8C8C8C"
 
 
 def px(size, pixels):
@@ -104,7 +123,7 @@ def notepad(size):
     return body + band + rings + text_lines(size, 40, 86, left=26, right=74)
 
 
-SCREEN = "#2F86D8"
+SCREEN = KEY
 BEZEL = "#2B2B2B"
 
 
@@ -112,7 +131,7 @@ def monitor(size):
     sw = px(size, stroke_px(size))
     return (f'<rect x="8" y="12" width="84" height="58" rx="4" fill="{BEZEL}"/>'
             f'<rect x="{13}" y="{17}" width="74" height="48" fill="{SCREEN}"/>'
-            f'<path d="M13 65 L60 17 H87 V65 Z" fill="#4A9BE3"/>'
+            f'<path d="M13 65 L60 17 H87 V65 Z" fill="{KEY_LIGHT}"/>'
             f'<rect x="44" y="70" width="12" height="10" fill="#6E6E6E"/>'
             f'<rect x="28" y="80" width="44" height="7" rx="2" fill="#8A8A8A" stroke="#6E6E6E" stroke-width="{sw:.2f}"/>')
 
@@ -121,8 +140,9 @@ def desktop_folder(size):
     sw = px(size, stroke_px(size))
     art = folder(size)
     if size:
-        art += (f'<rect x="30" y="46" width="40" height="28" rx="2" fill="{SCREEN}" stroke="{BEZEL}" '
-                f'stroke-width="{sw:.2f}"/>')
+        art += (f'<rect x="30" y="46" width="40" height="28" rx="2" fill="{PAGE}" stroke="{BEZEL}" '
+                f'stroke-width="{sw:.2f}"/>'
+                f'<rect x="34" y="50" width="32" height="20" fill="{KEY_LIGHT}"/>')
     return art
 
 
@@ -138,13 +158,120 @@ def documents_folder(size):
 
 
 def fixed_drive(size):
-    sw = px(size, stroke_px(size))
-    return (f'<rect x="6" y="34" width="88" height="40" rx="5" fill="#E2E2E2" stroke="#8C8C8C" stroke-width="{sw:.2f}"/>'
-            f'<rect x="6" y="58" width="88" height="16" rx="3" fill="#C9C9C9"/>'
-            f'<rect x="6" y="34" width="88" height="40" rx="5" fill="none" stroke="#8C8C8C" stroke-width="{sw:.2f}"/>'
-            f'<rect x="14" y="63" width="30" height="5" fill="{ACCENT}"/>'
-            f'<circle cx="82" cy="65.5" r="4" fill="#3CB371"/>')
+    return drive_body(size)
 
+
+
+def drive_body(size, top=34, bottom=74):
+    """a drive's case: light grey, a darker base, the accent strip, a green light"""
+    sw = px(size, stroke_px(size))
+    h = bottom - top
+    return (f'<rect x="6" y="{top}" width="88" height="{h}" rx="5" fill="{NEUTRAL}"/>'
+            f'<rect x="6" y="{bottom - 16}" width="88" height="16" rx="3" fill="{NEUTRAL_DARK}"/>'
+            f'<rect x="6" y="{top}" width="88" height="{h}" rx="5" fill="none" stroke="{NEUTRAL_EDGE}" stroke-width="{sw:.2f}"/>'
+            f'<rect x="14" y="{bottom - 11}" width="30" height="5" fill="{KEY}"/>'
+            f'<circle cx="82" cy="{bottom - 8.5}" r="4" fill="#3CB371"/>')
+
+
+def network_drive(size, connected=True):
+    sw = px(size, max(1.0, stroke_px(size)))
+    art = drive_body(size, 18, 58)
+    art += (f'<path d="M50 58 V76 M18 84 H82" stroke="{KEY_DARK}" stroke-width="{max(sw * 2, 5):.2f}" fill="none"/>'
+            f'<rect x="40" y="74" width="20" height="16" rx="2" fill="{KEY}" stroke="{KEY_DARK}" stroke-width="{sw:.2f}"/>')
+    if not connected:
+        w = max(px(size, 2.0), 9)
+        art += (f'<path d="M64 62 L94 92 M94 62 L64 92" stroke="#D13438" stroke-width="{w:.2f}" '
+                f'stroke-linecap="round"/>')
+    return art
+
+
+def optical_drive(size):
+    sw = px(size, stroke_px(size))
+    return (drive_body(size, 40, 80) +
+            f'<rect x="14" y="48" width="72" height="5" rx="2" fill="{NEUTRAL_EDGE}"/>' +
+            f'<circle cx="50" cy="26" r="22" fill="{KEY_PALE}" stroke="{NEUTRAL_EDGE}" stroke-width="{sw:.2f}"/>'
+            f'<circle cx="50" cy="26" r="9" fill="{KEY}"/><circle cx="50" cy="26" r="3.5" fill="{PAGE}"/>')
+
+
+def optical_disc(size):
+    sw = px(size, stroke_px(size))
+    return (f'<circle cx="50" cy="50" r="45" fill="{KEY_PALE}" stroke="{NEUTRAL_EDGE}" stroke-width="{sw:.2f}"/>'
+            f'<path d="M50 5 A45 45 0 0 1 95 50 L50 50 Z" fill="{KEY_LIGHT}" opacity="0.7"/>'
+            f'<circle cx="50" cy="50" r="17" fill="{KEY}"/>'
+            f'<circle cx="50" cy="50" r="7" fill="{PAGE}" stroke="{NEUTRAL_EDGE}" stroke-width="{sw:.2f}"/>')
+
+
+def removable_drive(size):
+    """a USB stick: a grey body under an accent cap"""
+    sw = px(size, stroke_px(size))
+    return (f'<rect x="38" y="6" width="24" height="18" rx="2" fill="{NEUTRAL}" stroke="{NEUTRAL_EDGE}" stroke-width="{sw:.2f}"/>'
+            + (f'<rect x="43" y="11" width="5" height="5" fill="{NEUTRAL_EDGE}"/><rect x="52" y="11" width="5" height="5" fill="{NEUTRAL_EDGE}"/>' if size >= 32 else "")
+            + f'<rect x="28" y="24" width="44" height="70" rx="6" fill="{KEY}" stroke="{KEY_DARK}" stroke-width="{sw:.2f}"/>'
+            f'<rect x="36" y="34" width="28" height="10" rx="2" fill="{KEY_LIGHT}"/>')
+
+
+def network(size):
+    """the network: two computers on an accent line"""
+    sw = px(size, stroke_px(size))
+    def pc(x, y):
+        return (f'<rect x="{x}" y="{y}" width="40" height="28" rx="2" fill="{BEZEL}"/>'
+                f'<rect x="{x + 3}" y="{y + 3}" width="34" height="22" fill="{KEY}"/>'
+                f'<rect x="{x + 15}" y="{y + 28}" width="10" height="6" fill="#6E6E6E"/>')
+    line = max(px(size, 2.0), 5)
+    return (f'<path d="M24 66 V84 H76 V40" stroke="{KEY_DARK}" stroke-width="{line:.2f}" fill="none"/>'
+            + pc(4, 32) + pc(56, 6) + f'<circle cx="50" cy="84" r="{line * 1.2:.2f}" fill="{KEY_DARK}"/>')
+
+
+def internet(size):
+    sw = px(size, max(1.0, stroke_px(size)))
+    w = max(px(size, 1.5), 4)
+    return (f'<circle cx="50" cy="50" r="44" fill="{KEY}" stroke="{KEY_DARK}" stroke-width="{sw:.2f}"/>'
+            f'<ellipse cx="50" cy="50" rx="18" ry="44" fill="none" stroke="{KEY_PALE}" stroke-width="{w:.2f}"/>'
+            f'<path d="M6 50 H94 M14 28 H86 M14 72 H86" stroke="{KEY_PALE}" stroke-width="{w:.2f}" fill="none"/>')
+
+
+def recycle_bin(size, full=False):
+    sw = px(size, stroke_px(size))
+    art = ""
+    if full:
+        art += (f'<path d="M26 26 L40 8 L58 20 L50 30 Z" fill="{PAGE}" stroke="{PAGE_EDGE}" stroke-width="{sw:.2f}"/>'
+                f'<path d="M48 28 L66 10 L80 26 Z" fill="{KEY_PALE}" stroke="{PAGE_EDGE}" stroke-width="{sw:.2f}"/>')
+    art += (f'<path d="M22 30 H78 L72 94 H28 Z" fill="{NEUTRAL}" stroke="{NEUTRAL_EDGE}" stroke-width="{sw:.2f}" stroke-linejoin="round"/>'
+            f'<rect x="16" y="24" width="68" height="10" rx="3" fill="{KEY}" stroke="{KEY_DARK}" stroke-width="{sw:.2f}"/>')
+    if size >= 24:
+        w = max(px(size, 1.0), 3)
+        art += f'<path d="M38 44 L40 84 M50 44 V84 M62 44 L60 84" stroke="{NEUTRAL_EDGE}" stroke-width="{w:.2f}"/>'
+    return art
+
+
+def file_explorer(size):
+    """File Explorer's own icon (explorer.exe's first, its windows' taskbar button): a folder
+    with a pale band, as Windows' carries a band of blue"""
+    art = folder(size)
+    return art + f'<path d="M6 54 H94 V64 H6 Z" fill="{KEY_PALE}"/>'
+
+
+def program_window(size):
+    return application(size)
+
+
+def recent(size):
+    sw = px(size, max(1.0, stroke_px(size)))
+    w = max(px(size, 2.0), 7)
+    return (f'<circle cx="50" cy="50" r="44" fill="{PAGE}" stroke="{KEY}" stroke-width="{max(sw * 3, 8):.2f}"/>'
+            f'<path d="M50 24 V50 L68 62" stroke="{KEY_DARK}" stroke-width="{w:.2f}" stroke-linecap="round" '
+            f'stroke-linejoin="round" fill="none"/>')
+
+
+def favorites(size):
+    import math
+    pts = []
+    for i in range(10):
+        r = 46 if i % 2 == 0 else 19
+        a = math.pi / 2 + i * math.pi / 5
+        pts.append(f"{50 + r * math.cos(a):.2f},{54 - r * math.sin(a):.2f}")
+    sw = px(size, stroke_px(size))
+    return f'<polygon points="{" ".join(pts)}" fill="{KEY}" stroke="{KEY_DARK}" stroke-width="{sw:.2f}" stroke-linejoin="round"/>'
 
 
 # ---- user32's own window icons -------------------------------------------
@@ -154,7 +281,7 @@ def fixed_drive(size):
 # in title bars and on the taskbar; ours is a plain program window, as
 # Windows' generic one is (our own drawing).
 
-MARK = (("50,2 72,24 50,46 28,24", "#7B3FD0"), ("76,28 98,50 76,72 54,50", "#E0409A"),
+MARK = (("50,2 72,24 50,46 28,24", KEY), ("76,28 98,50 76,72 54,50", "#E0409A"),
         ("50,54 72,76 50,98 28,76", "#F0A030"), ("24,28 46,50 24,72 2,50", "#1FB0A0"))
 
 
@@ -187,7 +314,7 @@ def application(size):
 
 ERROR_FILL, ERROR_EDGE = "#D83A3F", "#A3242B"
 WARN_FILL, WARN_EDGE, WARN_INK = "#F7C326", "#B98A00", "#1E1E1E"
-INFO_FILL, INFO_EDGE = "#2C7BD3", "#1A579D"
+INFO_FILL, INFO_EDGE = KEY, KEY_DARK      # information and question follow the accent
 GLYPH = "#FFFFFF"
 
 if os.environ.get("SG_MUTANT_MSGBOX_ICONS"):   # test/msgboxicons-gate.sh's mutant: the shapes swap colours
@@ -275,6 +402,19 @@ ICONS = {
     "dlls/shell32/resources/desktop.svg": desktop_folder,
     "dlls/shell32/resources/mydocs.svg": documents_folder,
     "dlls/shell32/resources/drive.svg": fixed_drive,
+    "dlls/shell32/resources/netdrive.svg": network_drive,
+    "dlls/shell32/resources/netdrive2.svg": lambda s: network_drive(s, False),
+    "dlls/shell32/resources/optical_drive.svg": optical_drive,
+    "dlls/shell32/resources/optical_disc.svg": optical_disc,
+    "dlls/shell32/resources/disk_drive.svg": removable_drive,
+    "dlls/shell32/resources/network.svg": network,
+    "dlls/shell32/resources/internet.svg": internet,
+    "dlls/shell32/resources/trash_file.svg": recycle_bin,
+    "dlls/shell32/resources/trash_full.svg": lambda s: recycle_bin(s, True),
+    "dlls/shell32/resources/window.svg": program_window,
+    "dlls/shell32/resources/recent.svg": recent,
+    "dlls/shell32/resources/favorites.svg": favorites,
+    "programs/explorer/explorer.svg": file_explorer,
     "dlls/user32/resources/oic_winlogo.svg": winlogo,
     "dlls/user32/resources/oic_sample.svg": application,
     **MSGBOX_ICONS,

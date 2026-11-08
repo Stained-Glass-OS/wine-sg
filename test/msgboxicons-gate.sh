@@ -4,7 +4,8 @@
 # own painted error, warning, information and question icons showed in every
 # message box, task dialog and shell stock icon. Ours are flat Windows 10
 # shapes, drawn for every size from 16 to 256 px: a red disc with a white
-# cross, an amber triangle with a dark "!", blue discs with a white "i" and
+# cross, an amber triangle with a dark "!", discs in the accent colour (the
+# default's purple here; wine-sg 6269, they were blue) with a white "i" and
 # "?". shell32's SHGetStockIconInfo gives the same drawings for SIID_ERROR,
 # SIID_WARNING, SIID_INFO and SIID_HELP (it gave the plain file icon).
 #
@@ -67,17 +68,17 @@ mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 
-# class R,G,B: red, amber, blue, white, dark or other
+# class R,G,B: red, amber, accent (the default purple, or a blue), white, dark or other
 class() {
     echo "$1" | awk -F, '{ r = $1; g = $2; b = $3
         if (r >= 230 && g >= 230 && b >= 230) print "white"
         else if (r <= 70 && g <= 70 && b <= 70) print "dark"
         else if (r >= 200 && g >= 150 && b <= 110) print "amber"
         else if (r >= 170 && g <= 110 && b <= 110) print "red"
-        else if (b >= 170 && r <= 110) print "blue"
+        else if (b >= 170 && g <= 120) print "accent"
         else print "other" }'
 }
-want_body() { case $1 in error) echo red ;; warning) echo amber ;; *) echo blue ;; esac; }
+want_body() { case $1 in error) echo red ;; warning) echo amber ;; *) echo accent ;; esac; }
 want_glyph() { case $1 in warning) echo dark ;; *) echo white ;; esac; }
 stock_id() { case $1 in error) echo -1350 ;; warning) echo -1351 ;; information) echo -1352 ;; question) echo -1353 ;; esac; }
 
