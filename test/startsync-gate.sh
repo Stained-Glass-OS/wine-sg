@@ -84,9 +84,12 @@ openssl req -newkey rsa:2048 -nodes -keyout "$T/signer.key" -out "$T/signer.csr"
 printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=codeSigning\n' > "$T/ext.cnf"
 openssl x509 -req -in "$T/signer.csr" -CA "$T/ca.pem" -CAkey "$T/ca.key" -CAcreateserial \
     -out "$T/signer.pem" -days 2 -extfile "$T/ext.cnf" 2>/dev/null
+printf '#include <windows.h>\nint main(void) { Sleep( 120000 ); return 0; }\n' > "$B/sgsleeper.c"
+"$MINGW" -O2 -o "$B/sgsleeper.exe" "$B/sgsleeper.c" || { fail "the sleeper did not build"; exit 1; }
 for p in A B; do
     python3 "$HERE/mkmsix.py" package "$B/$p.msix" --name "StainedGlass.Sync$p" --version 1.0.0.0 \
-        --display-name "Sync $p" --app "App:msixapps-app.exe::Sync $p app" --file "$B/msixapps-app.exe:msixapps-app.exe" &&
+        --display-name "Sync $p" --app "App:msixapps-app.exe::Sync $p app" --file "$B/msixapps-app.exe:msixapps-app.exe" \
+        --file "$B/sgsleeper.exe:sgsleeper.exe" &&
     osslsigncode sign -certs "$T/signer.pem" -key "$T/signer.key" -h sha256 -in "$B/$p.msix" -out "$B/$p-signed.msix" \
         >/dev/null 2>&1 || { fail "package $p could not be made"; exit 1; }
 done
@@ -198,9 +201,20 @@ rm -f "$ALL/Sync B app.lnk"
 have_b() { [ -f "$MINE/Sync B app.lnk" ]; }
 lost_b() { [ ! -f "$MINE/Sync B app.lnk" ]; }
 wait_for 30 have_b && pass "B is in $SG_OTHER's Start menu at once, without signing in again" || fail "no Start entry for B"
+# a program of B runs in $SG_OTHER's session (7720: removing the package ends it)
+(cd "$C" && sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRIDES="$WINEDLLOVERRIDES" \
+    HOME="$T/userhome" DISPLAY=":$XN" timeout -s KILL 150 "$WINE" "C:\\Program Files\\WindowsApps\\$FULL_B\\sgsleeper.exe" \
+    >/dev/null 2>&1 </dev/null &)
+b_runs() { pgrep -u "$SG_OTHER" -f "$FULL_B.sgsleeper.exe" >/dev/null; }
+# ended as Windows programs see it (the person's tasklist). The Unix process of another account goes
+# at its next call to the server: the server cannot signal another user's process (reported, 7720).
+b_ended() { ! user tasklist /fi "imagename eq sgsleeper.exe" | grep -qi sgsleeper; }
+wait_for 20 b_runs && pass "$SG_OTHER runs a program of B" || fail "B's program did not start for $SG_OTHER"
 echo "      removing B at $(date +%T.%N)"
 out=$(owner sparse-probe.exe remove "$FULL_B")
 expect "$out" status 1 "SYSTEM removes B"
+wait_for 10 b_ended && pass "and $SG_OTHER's program of it ends (7720)" || fail "$SG_OTHER's program of B still runs"
+[ -d "$C/Program Files/WindowsApps/$FULL_B" ] && fail "B's files stay" || pass "B's files go"
 wait_for 30 lost_b && pass "and its entry leaves $SG_OTHER's Start menu" || fail "B's entry stays"
 
 # ---- the shell again in the sign-in, the next sign-ins ----------------------------------------

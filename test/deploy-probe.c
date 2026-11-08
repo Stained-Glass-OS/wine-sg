@@ -1,7 +1,8 @@
 /* deploy-probe: MSIX deployment through PackageManager (patch 0060), as a
  * program uses it, for test/appx-gate.sh.
  *
- *   deploy-probe add PATH       AddPackageAsync(file URI), then wait
+ *   deploy-probe add PATH [OPTIONS]     AddPackageAsync(file URI, DeploymentOptions in hex), then wait
+ *   deploy-probe update PATH [OPTIONS]  UpdatePackageAsync, the same
  *   deploy-probe find NAME PUB  FindPackagesByNamePublisher: count, full name, location
  *   deploy-probe remove FULL    RemovePackageAsync, then wait
  *   deploy-probe regfamily FAM  IPackageManager5::RegisterPackageByFamilyNameAndOptionalPackagesAsync, then wait
@@ -15,6 +16,7 @@
 #include <winstring.h>
 #include <shlwapi.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 typedef struct { HRESULT (WINAPI *QI)(void *, REFIID, void **); ULONG (WINAPI *AddRef)(void *); ULONG (WINAPI *Release)(void *);
                  void *GetIids, *GetRuntimeClassName, *GetTrustLevel; } InspVtbl;
@@ -22,7 +24,7 @@ typedef struct { InspVtbl i; HRESULT (WINAPI *ActivateInstance)(void *, void **)
 typedef struct { InspVtbl i; HRESULT (WINAPI *CreateUri)(void *, HSTRING, void **); } UriFactoryVtbl;
 typedef struct { InspVtbl i;
                  HRESULT (WINAPI *AddPackageAsync)(void *, void *, void *, UINT32, void **);
-                 void *UpdatePackageAsync;
+                 HRESULT (WINAPI *UpdatePackageAsync)(void *, void *, void *, UINT32, void **);
                  HRESULT (WINAPI *RemovePackageAsync)(void *, HSTRING, void **);
                  void *StagePackageAsync, *RegisterPackageAsync, *FindPackages, *FindPackagesByUserSecurityId;
                  HRESULT (WINAPI *FindPackagesByNamePublisher)(void *, HSTRING, HSTRING, void **); } ManagerVtbl;
@@ -113,8 +115,10 @@ int main( int argc, char **argv )
     if (argc > 2) MultiByteToWideChar( CP_ACP, 0, argv[2], -1, a1, MAX_PATH );
     if (argc > 3) MultiByteToWideChar( CP_ACP, 0, argv[3], -1, a2, MAX_PATH );
 
-    if (argc == 3 && !strcmp( argv[1], "add" ))
+    if ((argc == 3 || argc == 4) && (!strcmp( argv[1], "add" ) || !strcmp( argv[1], "update" )))
     {
+        UINT32 options = argc == 4 ? strtoul( argv[3], NULL, 16 ) : 0;
+        BOOL update = !strcmp( argv[1], "update" );
         void *uri_factory = activate( L"Windows.Foundation.Uri", &IID_IUriRuntimeClassFactory_ ), *uri = NULL;
         DWORD len = ARRAYSIZE(url);
 
@@ -124,8 +128,9 @@ int main( int argc, char **argv )
             printf( "Uri=none\n" );
             return 1;
         }
-        hr = VT(manager, ManagerVtbl)->AddPackageAsync( manager, uri, NULL, 0, &op );
-        printf( "AddPackageAsync=0x%08lx\n", (unsigned long)hr );
+        if (update) hr = VT(manager, ManagerVtbl)->UpdatePackageAsync( manager, uri, NULL, options, &op );
+        else hr = VT(manager, ManagerVtbl)->AddPackageAsync( manager, uri, NULL, options, &op );
+        printf( "%sPackageAsync=0x%08lx\n", update ? "Update" : "Add", (unsigned long)hr );
         if (SUCCEEDED(hr)) wait_op( "Add", op );
     }
     else if (argc == 4 && !strcmp( argv[1], "find" ))
