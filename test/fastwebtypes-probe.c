@@ -6,6 +6,20 @@
 #include <stdlib.h>
 #include <stddef.h>
 
+/* Declared here, as the documented layouts, so that the probe builds against any webservices.h
+ * (this host's installed wine-sg headers and mingw-w64's lack WS_DURATION and these): own names, no
+ * clash with a header that has them. */
+typedef struct { BOOL negative; ULONG years, months, days, hours, minutes, seconds, milliseconds, ticks; } SG_WS_DURATION;
+typedef HRESULT (CALLBACK *SG_WS_DURATION_COMPARISON_CALLBACK)(const SG_WS_DURATION *, const SG_WS_DURATION *, int *, WS_ERROR *);
+typedef struct { SG_WS_DURATION minValue, maxValue; SG_WS_DURATION_COMPARISON_CALLBACK comparer; } SG_WS_DURATION_DESCRIPTION;
+typedef HRESULT (CALLBACK *SG_WS_READ_TYPE_CALLBACK)(WS_XML_READER *, WS_TYPE_MAPPING, const void *, WS_HEAP *, void *, ULONG, WS_ERROR *);
+typedef HRESULT (CALLBACK *SG_WS_WRITE_TYPE_CALLBACK)(WS_XML_WRITER *, WS_TYPE_MAPPING, const void *, const void *, ULONG, WS_ERROR *);
+typedef HRESULT (CALLBACK *SG_WS_IS_DEFAULT_VALUE_CALLBACK)(const void *, const void *, const void *, ULONG, BOOL *, WS_ERROR *);
+typedef struct { ULONG size, alignment; SG_WS_READ_TYPE_CALLBACK readCallback; SG_WS_WRITE_TYPE_CALLBACK writeCallback;
+                 void *descriptionData; SG_WS_IS_DEFAULT_VALUE_CALLBACK isDefaultValueCallback; } SG_WS_CUSTOM_TYPE_DESCRIPTION;
+HRESULT WINAPI WsReadArray(WS_XML_READER *, const WS_XML_STRING *, const WS_XML_STRING *, WS_VALUE_TYPE, void *, ULONG, ULONG,
+                           ULONG, ULONG *, WS_ERROR *);
+
 static int checks, fails;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { fails++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 #define BADFMT   ((HRESULT)0x803d0000)
@@ -68,14 +82,14 @@ static HRESULT wr(WS_TYPE type, const void *desc, WS_WRITE_OPTION opt, const voi
     return S_OK;
 }
 
-static int dur_eq(const WS_DURATION *a, const WS_DURATION *b)
+static int dur_eq(const SG_WS_DURATION *a, const SG_WS_DURATION *b)
 {
     return a->negative == b->negative && a->years == b->years && a->months == b->months && a->days == b->days &&
            a->hours == b->hours && a->minutes == b->minutes && a->seconds == b->seconds &&
            a->milliseconds == b->milliseconds && a->ticks == b->ticks;
 }
 
-static void check_write(const WS_DURATION *d, const char *expect)
+static void check_write(const SG_WS_DURATION *d, const char *expect)
 {
     char out[128], want[160];
     HRESULT hr = wr(WS_DURATION_TYPE, NULL, WS_WRITE_REQUIRED_VALUE, d, sizeof(*d), out, sizeof(out));
@@ -83,10 +97,10 @@ static void check_write(const WS_DURATION *d, const char *expect)
     CHECK(hr == S_OK && !strcmp(out, want), "write %s: %08lx %s", expect, hr, hr == S_OK ? out : "");
 }
 
-static void check_read(const char *text, const WS_DURATION *expect)
+static void check_read(const char *text, const SG_WS_DURATION *expect)
 {
     char xml[160];
-    WS_DURATION d;
+    SG_WS_DURATION d;
     HRESULT hr;
     memset(&d, 0xcc, sizeof(d));
     sprintf(xml, "<t>%s</t>", text);
@@ -97,13 +111,13 @@ static void check_read(const char *text, const WS_DURATION *expect)
 static HRESULT read_bad(const char *text)
 {
     char xml[160];
-    WS_DURATION d;
+    SG_WS_DURATION d;
     sprintf(xml, "<t>%s</t>", text);
     return rd(xml, WS_DURATION_TYPE, NULL, WS_READ_REQUIRED_VALUE, &d, sizeof(d));
 }
 
 static int comparer_calls;
-static HRESULT CALLBACK my_comparer(const WS_DURATION *a, const WS_DURATION *b, int *result, WS_ERROR *error)
+static HRESULT CALLBACK my_comparer(const SG_WS_DURATION *a, const SG_WS_DURATION *b, int *result, WS_ERROR *error)
 {
     comparer_calls++;
     *result = (int)a->days - (int)b->days;
@@ -112,20 +126,20 @@ static HRESULT CALLBACK my_comparer(const WS_DURATION *a, const WS_DURATION *b, 
 
 static void test_duration(void)
 {
-    WS_DURATION full = {0, 1, 2, 3, 4, 5, 6, 789, 0};
-    WS_DURATION zero = {0};
-    WS_DURATION neg = {1, 0, 0, 1, 0, 0, 0, 0, 0};
-    WS_DURATION tick = {0, 0, 0, 0, 0, 0, 0, 0, 1};
-    WS_DURATION frac = {0, 0, 0, 0, 0, 0, 0, 999, 9999};
-    WS_DURATION hour = {0, 0, 0, 0, 1, 0, 0, 0, 0};
-    WS_DURATION day5 = {0, 0, 0, 5, 0, 0, 0, 0, 0};
-    WS_DURATION minute = {0, 0, 0, 0, 0, 2, 0, 0, 0};
-    WS_DURATION sec3 = {0, 0, 0, 0, 0, 0, 3, 0, 0};
-    WS_DURATION month = {0, 0, 1, 0, 0, 0, 0, 0, 0};
-    WS_DURATION badms = {0, 0, 0, 0, 0, 0, 0, 1000, 0};
-    WS_DURATION badtick = {0, 0, 0, 0, 0, 0, 0, 0, 10000};
-    WS_DURATION d, ptr_val, *pd;
-    WS_DURATION_DESCRIPTION desc;
+    SG_WS_DURATION full = {0, 1, 2, 3, 4, 5, 6, 789, 0};
+    SG_WS_DURATION zero = {0};
+    SG_WS_DURATION neg = {1, 0, 0, 1, 0, 0, 0, 0, 0};
+    SG_WS_DURATION tick = {0, 0, 0, 0, 0, 0, 0, 0, 1};
+    SG_WS_DURATION frac = {0, 0, 0, 0, 0, 0, 0, 999, 9999};
+    SG_WS_DURATION hour = {0, 0, 0, 0, 1, 0, 0, 0, 0};
+    SG_WS_DURATION day5 = {0, 0, 0, 5, 0, 0, 0, 0, 0};
+    SG_WS_DURATION minute = {0, 0, 0, 0, 0, 2, 0, 0, 0};
+    SG_WS_DURATION sec3 = {0, 0, 0, 0, 0, 0, 3, 0, 0};
+    SG_WS_DURATION month = {0, 0, 1, 0, 0, 0, 0, 0, 0};
+    SG_WS_DURATION badms = {0, 0, 0, 0, 0, 0, 0, 1000, 0};
+    SG_WS_DURATION badtick = {0, 0, 0, 0, 0, 0, 0, 0, 10000};
+    SG_WS_DURATION d, ptr_val, *pd;
+    SG_WS_DURATION_DESCRIPTION desc;
     char out[256];
     HRESULT hr;
 
@@ -164,7 +178,7 @@ static void test_duration(void)
     check_read("P1M", &month);
     check_read("  P5D  ", &day5);
     check_read("P0001Y2M3DT4H5M6.7890000S", &full);
-    { WS_DURATION t = {0, 0, 0, 0, 0, 0, 0, 0, 1}; check_read("PT0.00000019S", &t); }   /* digits past 7 are dropped */
+    { SG_WS_DURATION t = {0, 0, 0, 0, 0, 0, 0, 0, 1}; check_read("PT0.00000019S", &t); }   /* digits past 7 are dropped */
 
     CHECK(read_bad("") == BADFMT, "empty");
     CHECK(read_bad("P") == BADFMT, "P alone");
@@ -205,7 +219,7 @@ static void test_duration(void)
     CHECK(hr == BADFMT, "months against days cannot be compared %08lx", hr);
     hr = wr(WS_DURATION_TYPE, &desc, WS_WRITE_REQUIRED_VALUE, &month, sizeof(month), out, sizeof(out));
     CHECK(hr == S_OK, "write in range %08lx", hr);
-    { WS_DURATION three = {0, 3, 0}; hr = wr(WS_DURATION_TYPE, &desc, WS_WRITE_REQUIRED_VALUE, &three, sizeof(three), out, sizeof(out));
+    { SG_WS_DURATION three = {0, 3, 0}; hr = wr(WS_DURATION_TYPE, &desc, WS_WRITE_REQUIRED_VALUE, &three, sizeof(three), out, sizeof(out));
       CHECK(hr == BADFMT, "write above the maximum %08lx", hr); }
     memset(&desc, 0, sizeof(desc));
     desc.maxValue.days = 10;
@@ -227,7 +241,7 @@ static void test_duration(void)
 
     /* a struct with a duration field */
     {
-        struct S { WS_DURATION d; } s = {{0, 0, 0, 7, 0, 0, 0, 0, 0}}, s2 = {{0}};
+        struct S { SG_WS_DURATION d; } s = {{0, 0, 0, 7, 0, 0, 0, 0, 0}}, s2 = {{0}};
         WS_XML_STRING ln = {1, (BYTE *)"d"}, ns = {0, NULL}, sn = {1, (BYTE *)"s"};
         WS_FIELD_DESCRIPTION fd = {WS_ELEMENT_FIELD_MAPPING, &ln, &ns, WS_DURATION_TYPE, NULL, 0, 0, 0};
         WS_FIELD_DESCRIPTION *fields[1] = {&fd};
@@ -244,7 +258,7 @@ static void test_duration(void)
 
     /* arrays of the value type */
     {
-        WS_DURATION arr[2] = {{0, 0, 0, 1, 0, 0, 0, 0, 0}, {0, 0, 0, 2, 0, 0, 0, 0, 0}}, back[2] = {{0}};
+        SG_WS_DURATION arr[2] = {{0, 0, 0, 1, 0, 0, 0, 0, 0}, {0, 0, 0, 2, 0, 0, 0, 0, 0}}, back[2] = {{0}};
         WS_XML_STRING n = {1, (BYTE *)"i"}, ns = {0, NULL}, root = {1, (BYTE *)"r"};
         ULONG got = 0;
         hr = begin_write();
@@ -306,7 +320,7 @@ static HRESULT CALLBACK pair_read(WS_XML_READER *r, WS_TYPE_MAPPING mapping, con
 static void test_custom(void)
 {
     static int marker;
-    WS_CUSTOM_TYPE_DESCRIPTION desc = {sizeof(struct pair), TYPE_ALIGNMENT(struct pair), pair_read, pair_write, &marker, NULL};
+    SG_WS_CUSTOM_TYPE_DESCRIPTION desc = {sizeof(struct pair), TYPE_ALIGNMENT(struct pair), pair_read, pair_write, &marker, NULL};
     struct pair p = {3, 4}, q = {0, 0};
     const struct pair *pp = &p;
     char out[256];
