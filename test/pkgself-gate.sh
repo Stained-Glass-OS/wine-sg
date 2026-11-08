@@ -14,7 +14,7 @@
 #   WINE=/opt/wine-sg/bin/wine test/pkgself-gate.sh
 # Mutants: SG_MUTANT_NO_PROCESS_PACKAGE (kernelbase), SG_MUTANT_CURRENT_PACKAGE_LOCAL,
 # SG_MUTANT_STARTUP_NO_TASKS, SG_MUTANT_STARTUP_ENABLE_NOOP (windows.applicationmodel),
-# SG_MUTANT_AX_ID_NO_OBJECT (appxdeploymentclient).
+# SG_MUTANT_AX_ID_NO_OBJECT (appxdeploymentclient), SG_MUTANT_APPDATA_ONLY1 (windows.storage.applicationdata).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -88,6 +88,14 @@ expect "$out" IdQI 0x00000000 "its Id answers IPackageId"
 expect "$out" IdClass Windows.ApplicationModel.PackageId "and is a PackageId"
 expect "$out" IdOwnObject 1 "an object of its own"
 expect "$out" IdFamily "$FAM" "with the family name"
+
+out=$(run "$APP" appdata)
+expect "$out" Data2 0x00000000 "ApplicationData.Current answers IApplicationData2 (7717)"
+expect "$out" Data3 0x00000000 "and IApplicationData3"
+printf '%s\n' "$out" | grep -q "^LocalCachePath=.*\\\\Packages\\\\$FAM\\\\LocalCache\$" && pass "LocalCacheFolder is the package's LocalCache" || fail "LocalCache: $(printf '%s' "$out" | tr '\n' ' ')"
+printf '%s\n' "$out" | grep -q "^PublisherPath=.*\\\\Publishers\\\\$PUBID\\\\SgShared\$" && pass "a publisher cache folder is under Publishers\\<publisher id>" || fail "publisher folder: $(printf '%s' "$out" | tr '\n' ' ')"
+expect "$out" Shared "0x00000000 1" "SharedLocalFolder: none (the policy is off)"
+expect "$out" BadName 0x80070057 "a folder name with a backslash: E_INVALIDARG"
 
 out=$(run "$APP" tasks)
 expect "$out" Count 2 "StartupTask.GetForCurrentPackageAsync: the manifest's two tasks"

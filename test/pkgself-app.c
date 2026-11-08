@@ -6,6 +6,8 @@
  *   enable ID       GetAsync(ID), RequestEnableAsync: the state it returns
  *   disable ID      GetAsync(ID), Disable, State
  *   get ID          GetAsync(ID): the operation's status
+ *   appdata         ApplicationData.Current: LocalCacheFolder (IApplicationData2), a publisher cache folder,
+ *                   SharedLocalFolder, a bad folder name (IApplicationData3) -- 7717
  *   sleep           waits (the child)
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <windows.h>
@@ -25,6 +27,10 @@ static const GUID iid_asyncinfo = {0x00000036,0,0,{0xc0,0,0,0,0,0,0,0x46}};
 static const GUID iid_package_statics = {0x4e534bdf,0x2960,0x4878,{0x97,0xa4,0x96,0x24,0xde,0xb7,0x2f,0x2d}};
 static const GUID iid_package2 = {0xa6612fb6,0x7688,0x4ace,{0x95,0xfb,0x35,0x95,0x38,0xe7,0xaa,0x01}};
 static const GUID iid_package_id = {0x1adb665e,0x37c7,0x4790,{0x99,0x80,0xdd,0x7a,0xe7,0x4e,0x8b,0xb2}};
+static const GUID iid_appdata_statics = {0x5612147b,0xe843,0x45e3,{0x94,0xd8,0x06,0x16,0x9e,0x3c,0x8e,0x17}};
+static const GUID iid_appdata2 = {0x9e65cd69,0x0ba3,0x4e32,{0xbe,0x29,0xb0,0x2d,0xe6,0x60,0x76,0x38}};
+static const GUID iid_appdata3 = {0xdc222cf4,0x2772,0x4c1d,{0xaa,0x2c,0xc9,0xf7,0x43,0xad,0xe8,0xd1}};
+static const GUID iid_storage_item = {0x4207a996,0xca2f,0x42f7,{0xbd,0xe8,0x8b,0x10,0x45,0x7a,0x7f,0x30}};
 static const GUID iid_task_statics = {0xee5b60bd,0xa148,0x41a7,{0xb2,0x6e,0xe8,0xb8,0x8a,0x1e,0x62,0xf8}};
 
 static void *factory( const WCHAR *class, const GUID *iid )
@@ -116,6 +122,51 @@ static int cmd_package(void)
     return 0;
 }
 
+static void print_folder_path( const char *key, void *folder )
+{
+    void *item = NULL;
+    HSTRING path = NULL;
+    if (folder && SUCCEEDED(QI( folder, &iid_storage_item, &item )))
+        SLOT( item, 12, HRESULT (WINAPI *)( void *, HSTRING * ) )( item, &path );
+    print_hstring( key, path );
+}
+
+static int cmd_appdata(void)
+{
+    void *statics = factory( L"Windows.Storage.ApplicationData", &iid_appdata_statics ), *data = NULL, *d2 = NULL, *d3 = NULL;
+    void *folder = NULL;
+    HSTRING name;
+    HRESULT hr;
+
+    if (!statics) return 1;
+    hr = SLOT( statics, 6, HRESULT (WINAPI *)( void *, void ** ) )( statics, &data );
+    printf( "AppData=0x%08lx\n", hr );
+    if (FAILED(hr)) return 1;
+    printf( "Data2=0x%08lx\n", QI( data, &iid_appdata2, &d2 ) );
+    printf( "Data3=0x%08lx\n", QI( data, &iid_appdata3, &d3 ) );
+    if (d2)
+    {
+        hr = SLOT( d2, 6, HRESULT (WINAPI *)( void *, void ** ) )( d2, &folder );
+        printf( "LocalCache=0x%08lx\n", hr );
+        print_folder_path( "LocalCachePath", folder );
+    }
+    if (d3)
+    {
+        folder = NULL;
+        WindowsCreateString( L"SgShared", 8, &name );
+        hr = SLOT( d3, 6, HRESULT (WINAPI *)( void *, HSTRING, void ** ) )( d3, name, &folder );
+        printf( "Publisher=0x%08lx\n", hr );
+        print_folder_path( "PublisherPath", folder );
+        folder = (void *)1;
+        hr = SLOT( d3, 8, HRESULT (WINAPI *)( void *, void ** ) )( d3, &folder );
+        printf( "Shared=0x%08lx %d\n", hr, folder == NULL );
+        WindowsCreateString( L"a\\b", 3, &name );
+        folder = NULL;
+        printf( "BadName=0x%08lx\n", SLOT( d3, 6, HRESULT (WINAPI *)( void *, HSTRING, void ** ) )( d3, name, &folder ) );
+    }
+    return 0;
+}
+
 static void *op_results( void *op )
 {
     void *result = NULL;
@@ -162,6 +213,7 @@ int wmain( int argc, WCHAR **argv )
     if (!wcscmp( argv[1], L"sleep" )) { Sleep( 30000 ); return 0; }
     if (!wcscmp( argv[1], L"family" )) return cmd_family( argv[0] );
     if (!wcscmp( argv[1], L"package" )) return cmd_package();
+    if (!wcscmp( argv[1], L"appdata" )) return cmd_appdata();
     if (!(statics = factory( L"Windows.ApplicationModel.StartupTask", &iid_task_statics ))) return 1;
     if (!wcscmp( argv[1], L"tasks" ))
     {
