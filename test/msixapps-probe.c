@@ -7,6 +7,7 @@
  *   haskey ROOT PATH             "Key=1" or "Key=0"
  *   lnk PATH                     a shortcut's AppUserModel.ID, icon file and the icon's images
  *   icon PATH                    icons ExtractIconEx finds in the file
+ *   findfamily FAMILY FILTER     kernel32 FindPackagesByPackageFamily (FILTER hex): Count=, Name=, Props=
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #define COBJMACROS
@@ -170,6 +171,22 @@ int wmain( int argc, WCHAR **argv )
             GetObjectW( info.hbmColor ? info.hbmColor : info.hbmMask, sizeof(bm), &bm );
             printf( "Width=%ld\n", bm.bmWidth );
         }
+    }
+    else if (!wcscmp( argv[1], L"findfamily" ) && argc >= 4)
+    {
+        typedef LONG (WINAPI *find_func)( const WCHAR *, UINT32, UINT32 *, WCHAR **, UINT32 *, WCHAR *, UINT32 * );
+        find_func find = (find_func)GetProcAddress( GetModuleHandleW( L"kernel32" ), "FindPackagesByPackageFamily" );
+        UINT32 count = 0, len = 0, props[8], i, filter = wcstoul( argv[3], NULL, 16 );
+        WCHAR *names[8], buffer[1024];
+        LONG ret;
+
+        if (!find) { printf( "Find=(missing)\n" ); return 1; }
+        ret = find( argv[2], filter, &count, NULL, &len, NULL, NULL );
+        printf( "Sizing=%ld\nCount=%u\n", ret, count );
+        if (count > 8 || len > ARRAYSIZE(buffer)) return 1;
+        ret = find( argv[2], filter, &count, names, &len, buffer, props );
+        printf( "Find=%ld\n", ret );
+        for (i = 0; !ret && i < count; i++) printf( "Name=%ls\nProps=%#x\n", names[i], props[i] );
     }
     else return 2;
     return 0;

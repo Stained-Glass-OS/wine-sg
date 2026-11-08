@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# A package's applications in the shell (patches/sg/7700, 7701):
+# A package's applications in the shell (patches/sg/7700, 7701, 7704):
 #
 #   integration  what the manifest's applications declare is registered for
 #                the user: windows.protocol schemes (default "%1", or the
@@ -18,6 +18,8 @@
 #                and explorer.exe start shell:AppsFolder\<AUMID>; a scheme and
 #                a file type start it with the URI or the file; an AUMID of no
 #                package starts nothing
+#   lookup       FindPackagesByPackageFamily (7704) finds the package by
+#                family and filter
 #   removal      RemovePackageAsync takes all of it away and leaves other
 #                programs' registrations as they were
 #   download     a package downloaded from an address that does not end in
@@ -196,6 +198,15 @@ LNK="$(cd "$C/users" && ls -d */AppData/Roaming/Microsoft/Windows/Start\ Menu/Pr
 out=$(run msixapps-probe.exe lnk "C:\\users\\$(printf '%s' "$LNK" | tr '/' '\\')\\Apps test.lnk")
 expect "$out" AUMID "$AUMID" "the Start menu entry carries the application's AUMID"
 expect "$out" IconImages 3 "the Start menu entry's icon is the logo at its three sizes"
+
+out=$(run msixapps-probe.exe findfamily "$PFN" 10)
+expect "$out" Sizing 122 "FindPackagesByPackageFamily sizes its result (ERROR_INSUFFICIENT_BUFFER)"
+expect "$out" Name "$FULL" "... and finds the family's main package (PACKAGE_FILTER_HEAD)"
+expect "$out" Props 0 "... with its properties"
+out=$(run msixapps-probe.exe findfamily "$PFN" 40)
+expect "$out" Count 0 "... and no resource package (PACKAGE_FILTER_RESOURCE)"
+out=$(run msixapps-probe.exe findfamily "StainedGlass.Nothing_$PUBID" 10)
+expect "$out" Count 0 "... and nothing of another family"
 
 # ---- activation ---------------------------------------------------------------
 rm -f "$C/msixapps-out.txt"
