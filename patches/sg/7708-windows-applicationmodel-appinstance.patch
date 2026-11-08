@@ -1,0 +1,815 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] windows.applicationmodel: AppInstance -- a packaged app's instances by key
+
+---
+diff --git a/dlls/windows.applicationmodel/Makefile.in b/dlls/windows.applicationmodel/Makefile.in
+index 94389d6..a808335 100644
+--- a/dlls/windows.applicationmodel/Makefile.in
++++ b/dlls/windows.applicationmodel/Makefile.in
+@@ -1,7 +1,8 @@
+ MODULE  = windows.applicationmodel.dll
+-IMPORTS = combase kernelbase
++IMPORTS = combase kernelbase advapi32
+ 
+ SOURCES = \
++	app_instance.c \
+ 	classes.idl \
+ 	main.c \
+ 	core_application.c \
+diff --git a/dlls/windows.applicationmodel/app_instance.c b/dlls/windows.applicationmodel/app_instance.c
+new file mode 100644
+index 0000000..4c0029b
+--- /dev/null
++++ b/dlls/windows.applicationmodel/app_instance.c
+@@ -0,0 +1,683 @@
++/* WinRT Windows.ApplicationModel.AppInstance
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Stained Glass OS 7708: a packaged app's instances by key (multi-instancing). A process registers
++ * itself under a key of its choice with FindOrRegisterInstanceForKey; another process of the same
++ * package that asks for that key gets the registered instance (IsCurrentInstance FALSE) and may
++ * pass its activation on (RedirectActivationTo). The registrations of the user's processes are kept
++ * in the volatile registry key HKCU\Software\Wine\AppModel\Instances\<family>\<key> (Pid, Started:
++ * the process's creation time, so that a reused process id is not taken for the instance); a
++ * registration whose process is gone does not count. One key per process: registering another
++ * replaces it. A process without package identity has no instances
++ * (APPMODEL_ERROR_NO_PACKAGE). Activation redirection needs the shell's activation, which is not
++ * there: RedirectActivationTo fails (E_NOTIMPL), GetActivatedEventArgs and RecommendedInstance are
++ * empty.
++ */
++
++#include <stdlib.h>
++#define WIDL_using_Windows_ApplicationModel_Activation
++#include "private.h"
++#include "windows.applicationmodel.activation.h"
++#include "winreg.h"
++#include "appmodel.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(model);
++
++static const WCHAR instances_keyW[] = L"Software\\Wine\\AppModel\\Instances";
++
++static WCHAR *own_key;                  /* this process's registered key */
++static CRITICAL_SECTION instance_cs;
++static CRITICAL_SECTION_DEBUG instance_cs_debug =
++{
++    0, 0, &instance_cs,
++    { &instance_cs_debug.ProcessLocksList, &instance_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": instance_cs") }
++};
++static CRITICAL_SECTION instance_cs = { &instance_cs_debug, -1, 0, 0, 0, 0 };
++
++static HRESULT current_family( WCHAR *family, UINT32 size )
++{
++    LONG ret = GetCurrentPackageFamilyName( &size, family );
++    return ret ? HRESULT_FROM_WIN32( ret ) : S_OK;
++}
++
++static UINT64 process_started( DWORD pid )
++{
++    FILETIME created, exited, kernel, user;
++    HANDLE process;
++    UINT64 ret = 0;
++
++    if (!(process = OpenProcess( PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid ))) return 0;
++    if (WaitForSingleObject( process, 0 ) == WAIT_TIMEOUT && GetProcessTimes( process, &created, &exited, &kernel, &user ))
++        ret = ((UINT64)created.dwHighDateTime << 32) | created.dwLowDateTime;
++    CloseHandle( process );
++    return ret;
++}
++
++/* the key's name in the registry: '\' is not allowed in a key name */
++static void key_name( const WCHAR *family, const WCHAR *key, WCHAR *out, size_t size )
++{
++    WCHAR *p;
++    swprintf( out, size, L"%s\\%s\\%s", instances_keyW, family, key );
++    for (p = out + wcslen( instances_keyW ) + 1 + wcslen( family ) + 1; *p; p++) if (*p == '\\') *p = '/';
++}
++
++/* the live process registered under a key, 0 if none */
++static DWORD registered_pid( const WCHAR *family, const WCHAR *key )
++{
++    WCHAR path[1024];
++    DWORD pid = 0, size = sizeof(pid);
++    UINT64 started = 0;
++    DWORD qsize = sizeof(started);
++
++    key_name( family, key, path, ARRAY_SIZE(path) );
++    if (RegGetValueW( HKEY_CURRENT_USER, path, L"Pid", RRF_RT_REG_DWORD, NULL, &pid, &size )) return 0;
++    if (RegGetValueW( HKEY_CURRENT_USER, path, L"Started", RRF_RT_REG_QWORD, NULL, &started, &qsize )) return 0;
++    if (!pid || process_started( pid ) != started) return 0;
++    return pid;
++}
++
++static void unregister_own( const WCHAR *family )
++{
++    WCHAR path[1024];
++
++    if (!own_key) return;
++    key_name( family, own_key, path, ARRAY_SIZE(path) );
++    if (registered_pid( family, own_key ) == GetCurrentProcessId()) RegDeleteKeyW( HKEY_CURRENT_USER, path );
++    free( own_key );
++    own_key = NULL;
++}
++
++static HRESULT register_own( const WCHAR *family, const WCHAR *key )
++{
++    WCHAR path[1024];
++    DWORD pid = GetCurrentProcessId();
++    UINT64 started = process_started( pid );
++    HKEY hkey;
++    LSTATUS res;
++
++    key_name( family, key, path, ARRAY_SIZE(path) );
++    /* volatile: the registrations go with the session */
++    if ((res = RegCreateKeyExW( HKEY_CURRENT_USER, instances_keyW, 0, NULL, REG_OPTION_VOLATILE, KEY_ALL_ACCESS, NULL, &hkey, NULL )))
++        return HRESULT_FROM_WIN32( res );
++    RegCloseKey( hkey );
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", instances_keyW, family );
++    if ((res = RegCreateKeyExW( HKEY_CURRENT_USER, path, 0, NULL, REG_OPTION_VOLATILE, KEY_ALL_ACCESS, NULL, &hkey, NULL )))
++        return HRESULT_FROM_WIN32( res );
++    RegCloseKey( hkey );
++    key_name( family, key, path, ARRAY_SIZE(path) );
++    if ((res = RegCreateKeyExW( HKEY_CURRENT_USER, path, 0, NULL, REG_OPTION_VOLATILE, KEY_ALL_ACCESS, NULL, &hkey, NULL )))
++        return HRESULT_FROM_WIN32( res );
++    RegSetValueExW( hkey, L"Pid", 0, REG_DWORD, (const BYTE *)&pid, sizeof(pid) );
++    RegSetValueExW( hkey, L"Started", 0, REG_QWORD, (const BYTE *)&started, sizeof(started) );
++    RegCloseKey( hkey );
++    if (!(own_key = wcsdup( key ))) return E_OUTOFMEMORY;
++    return S_OK;
++}
++
++/* ---- AppInstance ---- */
++
++struct app_instance
++{
++    IAppInstance IAppInstance_iface;
++    LONG ref;
++    HSTRING key;
++    DWORD pid;
++};
++
++static inline struct app_instance *impl_from_IAppInstance( IAppInstance *iface )
++{
++    return CONTAINING_RECORD( iface, struct app_instance, IAppInstance_iface );
++}
++
++static HRESULT WINAPI instance_QueryInterface( IAppInstance *iface, REFIID iid, void **out )
++{
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAppInstance ))
++    {
++        *out = iface;
++        IAppInstance_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI instance_AddRef( IAppInstance *iface )
++{
++    return InterlockedIncrement( &impl_from_IAppInstance( iface )->ref );
++}
++
++static ULONG WINAPI instance_Release( IAppInstance *iface )
++{
++    struct app_instance *impl = impl_from_IAppInstance( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        WindowsDeleteString( impl->key );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI instance_GetIids( IAppInstance *iface, ULONG *count, IID **iids )
++{
++    INSPECTABLE_IIDS( count, iids, &IID_IAppInstance );
++}
++
++static HRESULT WINAPI instance_GetRuntimeClassName( IAppInstance *iface, HSTRING *name )
++{
++    return inspectable_name( RuntimeClass_Windows_ApplicationModel_AppInstance, name );
++}
++
++static HRESULT WINAPI instance_GetTrustLevel( IAppInstance *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI instance_get_Key( IAppInstance *iface, HSTRING *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    return WindowsDuplicateString( impl_from_IAppInstance( iface )->key, value );
++}
++
++static HRESULT WINAPI instance_get_IsCurrentInstance( IAppInstance *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = impl_from_IAppInstance( iface )->pid == GetCurrentProcessId();
++    return S_OK;
++}
++
++static HRESULT WINAPI instance_RedirectActivationTo( IAppInstance *iface )
++{
++    FIXME( "iface %p: there is no activation to pass on.\n", iface );
++    return E_NOTIMPL;
++}
++
++static const struct IAppInstanceVtbl instance_vtbl =
++{
++    instance_QueryInterface, instance_AddRef, instance_Release,
++    instance_GetIids, instance_GetRuntimeClassName, instance_GetTrustLevel,
++    instance_get_Key, instance_get_IsCurrentInstance, instance_RedirectActivationTo,
++};
++
++static HRESULT instance_create( const WCHAR *key, DWORD pid, IAppInstance **out )
++{
++    struct app_instance *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAppInstance_iface.lpVtbl = &instance_vtbl;
++    impl->ref = 1;
++    impl->pid = pid;
++    if (FAILED(hr = WindowsCreateString( key, wcslen( key ), &impl->key )))
++    {
++        free( impl );
++        return hr;
++    }
++    *out = &impl->IAppInstance_iface;
++    return S_OK;
++}
++
++/* ---- IVector<AppInstance> (read-only list of the instances) ---- */
++
++struct instance_list
++{
++    IVector_AppInstance IVector_AppInstance_iface;
++    IIterable_AppInstance IIterable_AppInstance_iface;
++    LONG ref;
++    UINT32 count;
++    IAppInstance **items;
++};
++
++struct instance_iterator
++{
++    IIterator_AppInstance IIterator_AppInstance_iface;
++    LONG ref;
++    struct instance_list *list;
++    UINT32 index;
++};
++
++static inline struct instance_list *impl_from_IVector_AppInstance( IVector_AppInstance *iface )
++{
++    return CONTAINING_RECORD( iface, struct instance_list, IVector_AppInstance_iface );
++}
++
++static HRESULT WINAPI list_QueryInterface( IVector_AppInstance *iface, REFIID iid, void **out )
++{
++    struct instance_list *impl = impl_from_IVector_AppInstance( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IVector_AppInstance ))
++        *out = &impl->IVector_AppInstance_iface;
++    else if (IsEqualGUID( iid, &IID_IIterable_AppInstance ))
++        *out = &impl->IIterable_AppInstance_iface;
++    else
++    {
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI list_AddRef( IVector_AppInstance *iface )
++{
++    return InterlockedIncrement( &impl_from_IVector_AppInstance( iface )->ref );
++}
++
++static ULONG WINAPI list_Release( IVector_AppInstance *iface )
++{
++    struct instance_list *impl = impl_from_IVector_AppInstance( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    UINT32 i;
++
++    if (!ref)
++    {
++        for (i = 0; i < impl->count; i++) IAppInstance_Release( impl->items[i] );
++        free( impl->items );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI list_GetIids( IVector_AppInstance *iface, ULONG *count, IID **iids )
++{
++    INSPECTABLE_IIDS( count, iids, &IID_IVector_AppInstance, &IID_IIterable_AppInstance );
++}
++
++static HRESULT WINAPI list_GetRuntimeClassName( IVector_AppInstance *iface, HSTRING *name )
++{
++    return inspectable_name( L"Windows.Foundation.Collections.IVector`1<Windows.ApplicationModel.AppInstance>", name );
++}
++
++static HRESULT WINAPI list_GetTrustLevel( IVector_AppInstance *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI list_GetAt( IVector_AppInstance *iface, UINT32 index, IAppInstance **value )
++{
++    struct instance_list *impl = impl_from_IVector_AppInstance( iface );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    if (index >= impl->count) return E_BOUNDS;
++    IAppInstance_AddRef( (*value = impl->items[index]) );
++    return S_OK;
++}
++
++static HRESULT WINAPI list_get_Size( IVector_AppInstance *iface, UINT32 *value )
++{
++    if (!value) return E_POINTER;
++    *value = impl_from_IVector_AppInstance( iface )->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI list_GetView( IVector_AppInstance *iface, IVectorView_AppInstance **value )
++{
++    FIXME( "iface %p, value %p: no view.\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI list_IndexOf( IVector_AppInstance *iface, IAppInstance *element, UINT32 *index, boolean *found )
++{
++    struct instance_list *impl = impl_from_IVector_AppInstance( iface );
++    UINT32 i;
++
++    if (!index || !found) return E_POINTER;
++    for (i = 0; i < impl->count; i++)
++        if (impl->items[i] == element) break;
++    *found = i < impl->count;
++    *index = *found ? i : 0;
++    return S_OK;
++}
++
++/* a list of the instances as they were when it was asked for: the caller's copy */
++static HRESULT WINAPI list_SetAt( IVector_AppInstance *iface, UINT32 index, IAppInstance *value ) { return E_ACCESSDENIED; }
++static HRESULT WINAPI list_InsertAt( IVector_AppInstance *iface, UINT32 index, IAppInstance *value ) { return E_ACCESSDENIED; }
++static HRESULT WINAPI list_RemoveAt( IVector_AppInstance *iface, UINT32 index ) { return E_ACCESSDENIED; }
++static HRESULT WINAPI list_Append( IVector_AppInstance *iface, IAppInstance *value ) { return E_ACCESSDENIED; }
++static HRESULT WINAPI list_RemoveAtEnd( IVector_AppInstance *iface ) { return E_ACCESSDENIED; }
++static HRESULT WINAPI list_Clear( IVector_AppInstance *iface ) { return E_ACCESSDENIED; }
++
++static HRESULT WINAPI list_GetMany( IVector_AppInstance *iface, UINT32 start, UINT32 size, IAppInstance **items, UINT32 *count )
++{
++    struct instance_list *impl = impl_from_IVector_AppInstance( iface );
++    UINT32 i;
++
++    if (!count) return E_POINTER;
++    *count = 0;
++    if (start > impl->count) return E_BOUNDS;
++    for (i = start; i < impl->count && *count < size; i++)
++        IAppInstance_AddRef( (items[(*count)++] = impl->items[i]) );
++    return S_OK;
++}
++
++static HRESULT WINAPI list_ReplaceAll( IVector_AppInstance *iface, UINT32 count, IAppInstance **items ) { return E_ACCESSDENIED; }
++
++static const struct IVector_AppInstanceVtbl list_vtbl =
++{
++    list_QueryInterface, list_AddRef, list_Release,
++    list_GetIids, list_GetRuntimeClassName, list_GetTrustLevel,
++    list_GetAt, list_get_Size, list_GetView, list_IndexOf, list_SetAt, list_InsertAt, list_RemoveAt,
++    list_Append, list_RemoveAtEnd, list_Clear, list_GetMany, list_ReplaceAll,
++};
++
++DEFINE_IINSPECTABLE( list_iterable, IIterable_AppInstance, struct instance_list, IVector_AppInstance_iface )
++
++static inline struct instance_iterator *impl_from_IIterator_AppInstance( IIterator_AppInstance *iface )
++{
++    return CONTAINING_RECORD( iface, struct instance_iterator, IIterator_AppInstance_iface );
++}
++
++static HRESULT WINAPI iterator_QueryInterface( IIterator_AppInstance *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IIterator_AppInstance ))
++    {
++        *out = iface;
++        IIterator_AppInstance_AddRef( iface );
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI iterator_AddRef( IIterator_AppInstance *iface )
++{
++    return InterlockedIncrement( &impl_from_IIterator_AppInstance( iface )->ref );
++}
++
++static ULONG WINAPI iterator_Release( IIterator_AppInstance *iface )
++{
++    struct instance_iterator *impl = impl_from_IIterator_AppInstance( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        IVector_AppInstance_Release( &impl->list->IVector_AppInstance_iface );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI iterator_GetIids( IIterator_AppInstance *iface, ULONG *count, IID **iids )
++{
++    INSPECTABLE_IIDS( count, iids, &IID_IIterator_AppInstance );
++}
++
++static HRESULT WINAPI iterator_GetRuntimeClassName( IIterator_AppInstance *iface, HSTRING *name )
++{
++    return inspectable_name( L"Windows.Foundation.Collections.IIterator`1<Windows.ApplicationModel.AppInstance>", name );
++}
++
++static HRESULT WINAPI iterator_GetTrustLevel( IIterator_AppInstance *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI iterator_get_Current( IIterator_AppInstance *iface, IAppInstance **value )
++{
++    struct instance_iterator *impl = impl_from_IIterator_AppInstance( iface );
++    return list_GetAt( &impl->list->IVector_AppInstance_iface, impl->index, value );
++}
++
++static HRESULT WINAPI iterator_get_HasCurrent( IIterator_AppInstance *iface, boolean *value )
++{
++    struct instance_iterator *impl = impl_from_IIterator_AppInstance( iface );
++    if (!value) return E_POINTER;
++    *value = impl->index < impl->list->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI iterator_MoveNext( IIterator_AppInstance *iface, boolean *value )
++{
++    struct instance_iterator *impl = impl_from_IIterator_AppInstance( iface );
++    if (impl->index < impl->list->count) impl->index++;
++    return iterator_get_HasCurrent( iface, value );
++}
++
++static HRESULT WINAPI iterator_GetMany( IIterator_AppInstance *iface, UINT32 size, IAppInstance **items, UINT32 *count )
++{
++    struct instance_iterator *impl = impl_from_IIterator_AppInstance( iface );
++    HRESULT hr = list_GetMany( &impl->list->IVector_AppInstance_iface, impl->index, size, items, count );
++    if (SUCCEEDED(hr)) impl->index += *count;
++    return hr;
++}
++
++static const struct IIterator_AppInstanceVtbl iterator_vtbl =
++{
++    iterator_QueryInterface, iterator_AddRef, iterator_Release,
++    iterator_GetIids, iterator_GetRuntimeClassName, iterator_GetTrustLevel,
++    iterator_get_Current, iterator_get_HasCurrent, iterator_MoveNext, iterator_GetMany,
++};
++
++static HRESULT WINAPI list_iterable_First( IIterable_AppInstance *iface, IIterator_AppInstance **value )
++{
++    struct instance_list *impl = impl_from_IIterable_AppInstance( iface );
++    struct instance_iterator *iter;
++
++    if (!value) return E_POINTER;
++    if (!(iter = calloc( 1, sizeof(*iter) ))) return E_OUTOFMEMORY;
++    iter->IIterator_AppInstance_iface.lpVtbl = &iterator_vtbl;
++    iter->ref = 1;
++    iter->list = impl;
++    IVector_AppInstance_AddRef( &impl->IVector_AppInstance_iface );
++    *value = &iter->IIterator_AppInstance_iface;
++    return S_OK;
++}
++
++static const struct IIterable_AppInstanceVtbl list_iterable_vtbl =
++{
++    list_iterable_QueryInterface, list_iterable_AddRef, list_iterable_Release,
++    list_iterable_GetIids, list_iterable_GetRuntimeClassName, list_iterable_GetTrustLevel,
++    list_iterable_First,
++};
++
++/* ---- the statics ---- */
++
++struct app_instance_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IAppInstanceStatics IAppInstanceStatics_iface;
++};
++
++static inline struct app_instance_statics *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct app_instance_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct app_instance_statics *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IAppInstanceStatics ))
++        *out = &impl->IAppInstanceStatics_iface;
++    else
++    {
++        WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( IActivationFactory *iface ) { return 2; }
++static ULONG WINAPI factory_Release( IActivationFactory *iface ) { return 1; }
++
++static HRESULT WINAPI factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    INSPECTABLE_IIDS( count, iids, &IID_IAppInstanceStatics );
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{
++    return inspectable_name( RuntimeClass_Windows_ApplicationModel_AppInstance, name );
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_GetIids, factory_GetRuntimeClassName, factory_GetTrustLevel,
++    factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( statics, IAppInstanceStatics, struct app_instance_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI statics_get_RecommendedInstance( IAppInstanceStatics *iface, IAppInstance **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if (!value) return E_POINTER;
++    /* only the shell's activation recommends one */
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_GetActivatedEventArgs( IAppInstanceStatics *iface, IActivatedEventArgs **result )
++{
++    TRACE( "iface %p, result %p.\n", iface, result );
++    if (!result) return E_POINTER;
++    /* a process started directly, not activated by the shell */
++    *result = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_FindOrRegisterInstanceForKey( IAppInstanceStatics *iface, HSTRING key, IAppInstance **result )
++{
++    WCHAR family[128];
++    const WCHAR *str = WindowsGetStringRawBuffer( key, NULL );
++    DWORD pid;
++    HRESULT hr;
++
++    TRACE( "iface %p, key %s, result %p.\n", iface, debugstr_hstring( key ), result );
++
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if (!str || !str[0] || wcslen( str ) > 256) return E_INVALIDARG;
++    if (FAILED(hr = current_family( family, ARRAY_SIZE(family) ))) return hr;
++
++    EnterCriticalSection( &instance_cs );
++#ifndef SG_MUTANT_APPINSTANCE_ALWAYS_OWN
++    pid = registered_pid( family, str );
++#else
++    pid = 0;
++#endif
++    if (!pid || pid == GetCurrentProcessId())
++    {
++        if (!own_key || wcscmp( own_key, str ))
++        {
++            unregister_own( family );
++            hr = register_own( family, str );
++        }
++        pid = GetCurrentProcessId();
++    }
++    if (SUCCEEDED(hr)) hr = instance_create( str, pid, result );
++    LeaveCriticalSection( &instance_cs );
++    return hr;
++}
++
++static HRESULT WINAPI statics_Unregister( IAppInstanceStatics *iface )
++{
++    WCHAR family[128];
++    HRESULT hr;
++
++    TRACE( "iface %p.\n", iface );
++    if (FAILED(hr = current_family( family, ARRAY_SIZE(family) ))) return hr;
++    EnterCriticalSection( &instance_cs );
++    unregister_own( family );
++    LeaveCriticalSection( &instance_cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI statics_GetInstances( IAppInstanceStatics *iface, IVector_AppInstance **result )
++{
++    WCHAR family[128], path[512], name[300];
++    struct instance_list *list;
++    DWORD index = 0, len, pid;
++    HKEY hkey;
++    HRESULT hr;
++
++    TRACE( "iface %p, result %p.\n", iface, result );
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if (FAILED(hr = current_family( family, ARRAY_SIZE(family) ))) return hr;
++    if (!(list = calloc( 1, sizeof(*list) ))) return E_OUTOFMEMORY;
++    list->IVector_AppInstance_iface.lpVtbl = &list_vtbl;
++    list->IIterable_AppInstance_iface.lpVtbl = &list_iterable_vtbl;
++    list->ref = 1;
++
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", instances_keyW, family );
++    EnterCriticalSection( &instance_cs );
++    if (!RegOpenKeyExW( HKEY_CURRENT_USER, path, 0, KEY_READ, &hkey ))
++    {
++        while (len = ARRAY_SIZE(name), !RegEnumKeyExW( hkey, index++, name, &len, NULL, NULL, NULL, NULL ))
++        {
++            IAppInstance **grown, *instance;
++
++            if (!(pid = registered_pid( family, name ))) continue;
++            if (!(grown = realloc( list->items, (list->count + 1) * sizeof(*grown) ))) break;
++            list->items = grown;
++            if (FAILED(instance_create( name, pid, &instance ))) break;
++            list->items[list->count++] = instance;
++        }
++        RegCloseKey( hkey );
++    }
++    LeaveCriticalSection( &instance_cs );
++    *result = &list->IVector_AppInstance_iface;
++    return S_OK;
++}
++
++static const struct IAppInstanceStaticsVtbl statics_vtbl =
++{
++    statics_QueryInterface, statics_AddRef, statics_Release,
++    statics_GetIids, statics_GetRuntimeClassName, statics_GetTrustLevel,
++    statics_get_RecommendedInstance, statics_GetActivatedEventArgs, statics_FindOrRegisterInstanceForKey,
++    statics_Unregister, statics_GetInstances,
++};
++
++static struct app_instance_statics app_instance_statics =
++{
++    {&factory_vtbl},
++    {&statics_vtbl},
++};
++
++IActivationFactory *app_instance_factory = &app_instance_statics.IActivationFactory_iface;
+diff --git a/dlls/windows.applicationmodel/main.c b/dlls/windows.applicationmodel/main.c
+index a53a3ee..78fe9ea 100644
+--- a/dlls/windows.applicationmodel/main.c
++++ b/dlls/windows.applicationmodel/main.c
+@@ -76,6 +76,11 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+     if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_LimitedAccessFeatures ))
+         IActivationFactory_QueryInterface( limited_access_factory, &IID_IActivationFactory, (void **)factory );
+ 
++#ifndef SG_MUTANT_NO_APP_INSTANCE
++    if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_AppInstance ))
++        IActivationFactory_QueryInterface( app_instance_factory, &IID_IActivationFactory, (void **)factory );
++#endif
++
+ #ifndef SG_MUTANT_NO_DESIGN_MODE
+     if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_DesignMode ))
+         IActivationFactory_QueryInterface( design_mode_factory, &IID_IActivationFactory, (void **)factory );
+diff --git a/dlls/windows.applicationmodel/private.h b/dlls/windows.applicationmodel/private.h
+index 6642554..fc0dc89 100644
+--- a/dlls/windows.applicationmodel/private.h
++++ b/dlls/windows.applicationmodel/private.h
+@@ -57,6 +57,7 @@ extern IActivationFactory *resource_context_factory;
+ extern IActivationFactory *package_catalog_factory;
+ extern IActivationFactory *limited_access_factory;
+ extern IActivationFactory *design_mode_factory;
++extern IActivationFactory *app_instance_factory;
+ 
+ extern HRESULT property_set_create( IPropertySet **out );
+ extern IActivationFactory *property_set_factory;
+diff --git a/include/windows.applicationmodel.idl b/include/windows.applicationmodel.idl
+index 68ccd13..948c668 100644
+--- a/include/windows.applicationmodel.idl
++++ b/include/windows.applicationmodel.idl
+@@ -32,6 +32,10 @@ namespace Windows.ApplicationModel.Core {
+     runtimeclass AppListEntry;
+ }
+ 
++namespace Windows.ApplicationModel.Activation {
++    interface IActivatedEventArgs;
++}
++
+ namespace Windows.ApplicationModel {
+     typedef enum AppExecutionContext AppExecutionContext;
+     typedef enum PackageSignatureKind PackageSignatureKind;
+@@ -49,6 +53,9 @@ namespace Windows.ApplicationModel {
+     interface IEnteredBackgroundEventArgs;
+     interface ILimitedAccessFeatureRequestResult;
+     interface ILimitedAccessFeaturesStatics;
++    interface IAppInstance;
++    interface IAppInstanceStatics;
++    runtimeclass AppInstance;
+     interface ILeavingBackgroundEventArgs;
+     interface IPackage;
+     interface IPackage2;
+@@ -82,6 +89,13 @@ namespace Windows.ApplicationModel {
+     runtimeclass LeavingBackgroundEventArgs;
+     runtimeclass LimitedAccessFeatureRequestResult;
+     runtimeclass LimitedAccessFeatures;
++
++    declare {
++        interface Windows.Foundation.Collections.IVector<Windows.ApplicationModel.AppInstance *>;
++        interface Windows.Foundation.Collections.IVectorView<Windows.ApplicationModel.AppInstance *>;
++        interface Windows.Foundation.Collections.IIterable<Windows.ApplicationModel.AppInstance *>;
++        interface Windows.Foundation.Collections.IIterator<Windows.ApplicationModel.AppInstance *>;
++    }
+     runtimeclass Package;
+     runtimeclass PackageId;
+     runtimeclass PackageStatus;
+@@ -817,4 +831,40 @@ namespace Windows.ApplicationModel {
+     {
+     }
+ 
++    /* Stained Glass OS 7708: identities and method order from Microsoft's published metadata via the MIT windows crate */
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        exclusiveto(Windows.ApplicationModel.AppInstance),
++        uuid(675f2b47-f25f-4532-9fd6-3633e0634d01)
++    ]
++    interface IAppInstance : IInspectable
++    {
++        [propget] HRESULT Key([out, retval] HSTRING *value);
++        [propget] HRESULT IsCurrentInstance([out, retval] boolean *value);
++        HRESULT RedirectActivationTo();
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        exclusiveto(Windows.ApplicationModel.AppInstance),
++        uuid(9d11e77f-9ea6-47af-a6ec-46784c5ba254)
++    ]
++    interface IAppInstanceStatics : IInspectable
++    {
++        [propget] HRESULT RecommendedInstance([out, retval] Windows.ApplicationModel.AppInstance **value);
++        HRESULT GetActivatedEventArgs([out, retval] Windows.ApplicationModel.Activation.IActivatedEventArgs **result);
++        HRESULT FindOrRegisterInstanceForKey([in] HSTRING key, [out, retval] Windows.ApplicationModel.AppInstance **result);
++        HRESULT Unregister();
++        HRESULT GetInstances([out, retval] Windows.Foundation.Collections.IVector<Windows.ApplicationModel.AppInstance *> **result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 5.0),
++        marshaling_behavior(agile),
++        static(Windows.ApplicationModel.IAppInstanceStatics, Windows.Foundation.UniversalApiContract, 5.0)
++    ]
++    runtimeclass AppInstance
++    {
++        [default] interface Windows.ApplicationModel.IAppInstance;
++    }
+ }
