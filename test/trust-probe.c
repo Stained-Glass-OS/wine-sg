@@ -4,6 +4,7 @@
  *
  *   trust-probe FILE             verify FILE
  *   trust-probe --root CERT.der  add a (test) root to the machine's Root store
+ *   trust-probe --store LM|CU NAME CERT.der   add a certificate to that system store
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
@@ -37,6 +38,26 @@ int main( int argc, char **argv )
         { printf( "root=ERROR %#lx\n", GetLastError() ); return 1; }
         CertCloseStore( store, 0 );
         printf( "root=added\n" );
+        return 0;
+    }
+    if (!strcmp( argv[1], "--store" ) && argc > 4)
+    {
+        BYTE der[8192];
+        DWORD len;
+        WCHAR name[64];
+        FILE *f = fopen( argv[4], "rb" );
+        HCERTSTORE store;
+        if (!f) { printf( "store=ERROR open\n" ); return 1; }
+        len = fread( der, 1, sizeof(der), f );
+        fclose( f );
+        MultiByteToWideChar( CP_UTF8, 0, argv[3], -1, name, ARRAYSIZE(name) );
+        store = CertOpenStore( CERT_STORE_PROV_SYSTEM_W, 0, 0, !strcmp( argv[2], "LM" ) ?
+                               CERT_SYSTEM_STORE_LOCAL_MACHINE : CERT_SYSTEM_STORE_CURRENT_USER, name );
+        if (!store || !CertAddEncodedCertificateToStore( store, X509_ASN_ENCODING, der, len,
+                                                          CERT_STORE_ADD_REPLACE_EXISTING, NULL ))
+        { printf( "store=ERROR %#lx\n", GetLastError() ); return 1; }
+        CertCloseStore( store, 0 );
+        printf( "store=added\n" );
         return 0;
     }
     MultiByteToWideChar( CP_UTF8, 0, argv[1], -1, path, MAX_PATH );
