@@ -13,7 +13,8 @@
 #             (--allow-external: a package with external location, a "sparse"
 #             package: uap10:AllowExternalContent, the applications win32 ones;
 #             --extensions: the first application's <Extensions> are FILE's XML,
-#             with the com, desktop4, desktop5 and desktop10 prefixes declared)
+#             with the uap, uap3, uap5, com, desktop, desktop4, desktop5 and desktop10
+#             prefixes declared)
 #             [--package-extensions FILE]: the package's own <Extensions> (after
 #             <Applications>; a framework's activatable classes) are FILE's XML
 #   mkmsix.py bundle OUT --name N --version V [--publisher P] [--unmapped-payload]
@@ -121,9 +122,11 @@ def manifest(a):
     body = (f'<?xml version="1.0" encoding="utf-8"?>\n'
             f'<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" '
             f'xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" '
+            f'xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3" '
             f'xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5" '
             f'xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10" '
             f'xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10" '
+            f'xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10" '
             f'xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4" '
             f'xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5" '
             f'xmlns:desktop10="http://schemas.microsoft.com/appx/manifest/desktop/windows10/10" '
