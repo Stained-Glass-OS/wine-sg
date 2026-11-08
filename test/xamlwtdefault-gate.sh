@@ -1,6 +1,7 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# Windows.UI.Xaml on by default for Windows Terminal (patches/sg/6192) and OneDrive (6219): wine.inf gives
+# Windows.UI.Xaml on by default for Windows Terminal (patches/sg/6192), OneDrive (6219) and NanaZip's file
+# manager (7710: without it "K7ModernInitialize Failed"): wine.inf gives
 # HKLM\Software\Wine\AppDefaults\WindowsTerminal.exe SgXaml=1, so a new (or updated) prefix runs
 # WindowsTerminal.exe with XAML (6131 keeps it off for other programs); OneDrive.exe likewise (its
 # sign-in window is XAML: without it only the tray icon showed).  Windows Terminal has no
@@ -41,6 +42,7 @@ mkdir -p "$WINEPREFIX/drive_c/wt"
 cp "$T/probe.exe" "$WINEPREFIX/drive_c/wt/WindowsTerminal.exe"
 cp "$T/probe.exe" "$WINEPREFIX/drive_c/wt/other.exe"
 cp "$T/probe.exe" "$WINEPREFIX/drive_c/wt/OneDrive.exe"
+cp "$T/probe.exe" "$WINEPREFIX/drive_c/wt/NanaZip.Modern.FileManager.exe"
 RC=0
 reg=$("$WINE" reg query 'HKLM\Software\Wine\AppDefaults\WindowsTerminal.exe' /v SgXaml 2>/dev/null | tr -d '\r')
 printf '%s\n' "$reg" | grep -v '^$' | sed 's/^/      /'
@@ -52,6 +54,9 @@ other=$(cd "$WINEPREFIX/drive_c/wt" && timeout -s KILL 120 "$WINE" other.exe 2>/
 "$WINESERVER" -w
 od=$(cd "$WINEPREFIX/drive_c/wt" && timeout -s KILL 120 "$WINE" OneDrive.exe 2>/dev/null </dev/null | tr -d '\r' | head -1)
 "$WINESERVER" -w
+nz=$(cd "$WINEPREFIX/drive_c/wt" && timeout -s KILL 120 "$WINE" NanaZip.Modern.FileManager.exe 2>/dev/null </dev/null | tr -d '\r' | head -1)
+"$WINESERVER" -w
+echo "      NanaZip.Modern.FileManager.exe: $nz"
 echo "      WindowsTerminal.exe: $wt"
 echo "      OneDrive.exe: $od"
 echo "      other.exe: $other"
@@ -59,6 +64,8 @@ if [ "$wt" = "manager=00000000" ]; then echo "PASS  XAML is on for WindowsTermin
 else echo "FAIL  XAML is on for WindowsTerminal.exe without WINE_SG_XAML"; RC=1; fi
 if [ "$od" = "manager=00000000" ]; then echo "PASS  XAML is on for OneDrive.exe without WINE_SG_XAML"
 else echo "FAIL  XAML is on for OneDrive.exe without WINE_SG_XAML"; RC=1; fi
+if [ "$nz" = "manager=00000000" ]; then echo "PASS  XAML is on for NanaZip.Modern.FileManager.exe without WINE_SG_XAML"
+else echo "FAIL  XAML is on for NanaZip.Modern.FileManager.exe without WINE_SG_XAML"; RC=1; fi
 if [ "$other" = "factory Windows.UI.Xaml.Hosting.WindowsXamlManager=80040154" ]; then echo "PASS  and still off for other programs (REGDB_E_CLASSNOTREG)"
 else echo "FAIL  and still off for other programs (REGDB_E_CLASSNOTREG)"; RC=1; fi
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
