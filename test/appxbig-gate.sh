@@ -6,7 +6,8 @@
 # file (870 s in all; 17 s now), JASP (1.3 GB) more than fifteen minutes. A name twice in the
 # block map (case-insensitively) is still refused.
 #   WINE=/opt/wine-sg/bin/wine test/appxbig-gate.sh
-# Mutant: SG_MUTANT_APPX_LINEAR_NAMES (dlls/appxpackaging: the linear lookups back).
+# Mutants: SG_MUTANT_APPX_LINEAR_NAMES (dlls/appxpackaging: the linear lookups back),
+# SG_MUTANT_APPX_TYPE_LIMIT (the old limit of 4096 content types: JASP could not be read).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -34,7 +35,13 @@ a = argparse.Namespace(name='StainedGlass.BigTest', version='1.0.0.0', arch='x64
                        allow_external=False, extensions=None, package_extensions=None)
 files = [('d%03d\\f%05d.txt' % (i // 100, i), b'x%d' % i, zipfile.ZIP_STORED) for i in range(n)]
 files.append(('AppxManifest.xml', mkmsix.manifest(a), zipfile.ZIP_DEFLATED))
-mkmsix.write_zip(out + '/big.msix', files, mkmsix.CONTENT_TYPES)
+# an Override for every file (JASP has 6653; there was a limit of 4096)
+types = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+         '<Default Extension="xml" ContentType="application/vnd.ms-appx.manifest+xml"/>' +
+         ''.join('<Override PartName="/%s" ContentType="application/x-sg-%d"/>' % (f[0].replace('\\', '/'), i)
+                 for i, f in enumerate(files) if f[0] != 'AppxManifest.xml') + '</Types>').encode()
+mkmsix.write_zip(out + '/big.msix', files, types)
 dup = [('Assets\\dup.txt', b'a', zipfile.ZIP_STORED), ('assets\\DUP.txt', b'b', zipfile.ZIP_STORED),
        ('AppxManifest.xml', mkmsix.manifest(a), zipfile.ZIP_DEFLATED)]
 mkmsix.write_zip(out + '/dup.msix', dup, mkmsix.CONTENT_TYPES)
@@ -44,6 +51,7 @@ out=$(cd "$C" && timeout -s KILL 900 "$WINE" 'C:\probe.exe' 'C:\big.msix' 2>/dev
 printf '%s\n' "$out" | sed 's/^/      /'
 want=$FILES
 printf '%s\n' "$out" | grep -qx "Reader=0x00000000" && echo "PASS  a package of $FILES files opens" || { echo "FAIL  the package did not open"; RC=1; }
+printf '%s\n' "$out" | grep -qx "Type0=application/x-sg-0" && echo "PASS  with an Override content type for each of them (more than 4096)" || { echo "FAIL  content type of the first file"; RC=1; }
 printf '%s\n' "$out" | grep -qx "Files=$want" && printf '%s\n' "$out" | grep -qx "Found=$want" \
     && echo "PASS  every payload file, each found in the block map" || { echo "FAIL  files/found"; RC=1; }
 ms=$(printf '%s\n' "$out" | sed -n 's/^Ms=//p')

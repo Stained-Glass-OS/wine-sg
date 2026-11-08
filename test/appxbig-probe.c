@@ -1,6 +1,6 @@
 /* test/appxbig-gate.sh's probe (7718): a package of many files, read as AddPackageAsync reads it.
  *   appxbig-probe FILE   CreatePackageReader, every payload file, each looked up in the block map:
- *                        Reader=hr, Files=n, Found=n, Ms=elapsed
+ *                        Reader=hr, Type0=the first file's content type, Files=n, Found=n, Ms=elapsed
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <windows.h>
 #include <shlwapi.h>
@@ -35,6 +35,13 @@ int wmain( int argc, WCHAR **argv )
     {
         if (FAILED(SLOT( files, 3, HRESULT (WINAPI *)( void *, void ** ) )( files, &file ))) break;
         count++;
+        if (count == 1)
+        {
+            WCHAR *type = NULL;
+            SLOT( file, 4, HRESULT (WINAPI *)( void *, WCHAR ** ) )( file, &type );
+            printf( "Type0=%ls\n", type ? type : L"" );
+            CoTaskMemFree( type );
+        }
         if (SUCCEEDED(SLOT( file, 5, HRESULT (WINAPI *)( void *, WCHAR ** ) )( file, &name )))
         {
             if (SUCCEEDED(SLOT( blockmap, 3, HRESULT (WINAPI *)( void *, const WCHAR *, void ** ) )( blockmap, name, &bmfile )))
