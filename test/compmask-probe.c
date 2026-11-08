@@ -28,6 +28,10 @@ DEFINE_GUID(probe_IID_ICompositionBrush, 0xab0d7608, 0x30c0, 0x40e9, 0xb5, 0x68,
 DEFINE_GUID(probe_IID_ICompositionSurface, 0x1527540d, 0x42c7, 0x47a6, 0xa4, 0x08, 0x66, 0x8f, 0x79, 0xa9, 0x0d, 0xfb);
 DEFINE_GUID(probe_IID_ICompositionMaskBrush, 0x522cf09e, 0xbe6b, 0x4f41, 0xbe, 0x49, 0xf9, 0x22, 0x6d, 0x47, 0x1b, 0x4a);
 DEFINE_GUID(probe_IID_ICompositionCapabilities, 0x8253353e, 0xb517, 0x48bc, 0xb1, 0xe8, 0x4b, 0x35, 0x61, 0xa2, 0xe1, 0x81);
+DEFINE_GUID(probe_IID_ICompositionEffectSourceParameter, 0x858ab13a, 0x3292, 0x4e4e, 0xb3, 0xbb, 0x2b, 0x6c, 0x65, 0x44, 0xa6, 0xee);
+DEFINE_GUID(probe_IID_ICompositionEffectSourceParameterFactory, 0xb3d9f276, 0xaba3, 0x4724, 0xac, 0xf3, 0xd0, 0x39, 0x74, 0x64, 0xdb, 0x1c);
+DEFINE_GUID(probe_IID_IGraphicsEffectSource, 0x2d8f9ddc, 0x4339, 0x4eb9, 0x92, 0x16, 0xf9, 0xde, 0xb7, 0x56, 0x58, 0xa2);
+DEFINE_GUID(probe_IID_ICompositionSupportsSystemBackdrop, 0x397dafe4, 0xb6c2, 0x5bb9, 0x95, 0x1d, 0xf5, 0x70, 0x7d, 0xe8, 0xb7, 0xbc);
 DEFINE_GUID(probe_IID_ICompositionCapabilitiesStatics, 0xf7b7a86e, 0x6416, 0x49e5, 0x8d, 0xdf, 0xaf, 0xe9, 0x49, 0xe2, 0x05, 0x62);
 
 #define COMPOSITOR_CREATE_COLOR_BRUSH_WITH_COLOR 8
@@ -133,6 +137,29 @@ static void capabilities( void )
             SUCCEEDED( SLOT( iface, 9, HRESULT (WINAPI *)( void *, INT64 ) )( iface, token ) ) );
 }
 
+static void source_parameter( void )
+{
+    static const WCHAR name[] = L"Windows.UI.Composition.CompositionEffectSourceParameter", source[] = L"Backdrop";
+    void *factory = NULL, *param = NULL, *iface, *effect;
+    HSTRING hs, src, got = NULL;
+    HRESULT hr;
+
+    WindowsCreateString( name, (UINT32)wcslen( name ), &hs );
+    hr = RoGetActivationFactory( hs, &probe_IID_ICompositionEffectSourceParameterFactory, &factory );
+    WindowsDeleteString( hs );
+    printf( "param_factory=%d (%#lx)\n", SUCCEEDED(hr) && factory, hr );
+    if (!factory) return;
+    WindowsCreateString( source, (UINT32)wcslen( source ), &src );
+    hr = SLOT( factory, 6, HRESULT (WINAPI *)( void *, HSTRING, void ** ) )( factory, src, &param );
+    iface = qi( param, &probe_IID_ICompositionEffectSourceParameter );
+    printf( "param_made=%d (%#lx)\n", SUCCEEDED(hr) && iface, hr );
+    if (!iface) return;
+    SLOT( iface, 6, HRESULT (WINAPI *)( void *, HSTRING * ) )( iface, &got );
+    printf( "param_name=%d\n", got && !wcscmp( WindowsGetStringRawBuffer( got, NULL ), source ) );
+    effect = qi( param, &probe_IID_IGraphicsEffectSource );
+    printf( "param_effect_source=%d\n", effect != NULL );
+}
+
 int main( void )
 {
     static const WCHAR name[] = L"Windows.UI.Composition.Compositor";
@@ -154,6 +181,7 @@ int main( void )
 
     RoInitialize( RO_INIT_SINGLETHREADED );
     capabilities();
+    source_parameter();
     if (FAILED( hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                         levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d, NULL, NULL ) ))
     {
@@ -242,6 +270,33 @@ int main( void )
     printf( "surface_mask_opaque=%d (%06lx)\n", close_to( b, 255, 0, 0 ), b );
     printf( "surface_mask_clear=%d (%06lx)\n", close_to( c, 255, 255, 255 ), c );
     DestroyWindow( hwnd );
+
+    /* a window's system backdrop: under the root, over its client area */
+    {
+        struct ui_color blue = { 255, 0, 0, 255 };
+        void *target2 = NULL, *ctarget2, *backdrop, *root2 = NULL, *got2 = NULL;
+        HWND hwnd2 = CreateWindowExW( 0, L"compmask", L"backdrop", WS_POPUP | WS_VISIBLE, 300, 50, 100, 100, NULL, NULL, NULL, NULL );
+
+        pump( 300 );
+        SLOT( desktop, DESKTOP_INTEROP_CREATE_TARGET, HRESULT (WINAPI *)( void *, HWND, BOOL, void ** ) )( desktop, hwnd2, FALSE, &target2 );
+        backdrop = qi( target2, &probe_IID_ICompositionSupportsSystemBackdrop );
+        printf( "backdrop_iface=%d\n", backdrop != NULL );
+        if (backdrop)
+        {
+            SLOT( backdrop, 7, put_fn )( backdrop, color_brush( compositor, blue ) );
+            SLOT( backdrop, 6, get_fn )( backdrop, &got2 );
+            printf( "backdrop_roundtrip=%d\n", got2 != NULL );
+            ctarget2 = qi( target2, &probe_IID_ICompositionTarget );
+            SLOT( compositor, COMPOSITOR_CREATE_CONTAINER_VISUAL, get_fn )( compositor, &root2 );
+            SLOT( ctarget2, TARGET_PUT_ROOT, put_fn )( ctarget2, qi( root2, &probe_IID_IVisual ) );
+            pump( 1500 );
+            dc = GetDC( hwnd2 );
+            a = GetPixel( dc, 50, 50 );
+            ReleaseDC( hwnd2, dc );
+            printf( "backdrop_drawn=%d (%06lx)\n", close_to( a, 0, 0, 255 ), a );
+        }
+        DestroyWindow( hwnd2 );
+    }
     printf( "done=1\n" );
     return 0;
 }

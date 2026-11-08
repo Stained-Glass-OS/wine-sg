@@ -8,8 +8,12 @@
 # does -- no effect brushes, so effects are neither supported nor fast -- and Changed takes a handler.
 # test/compmask-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/compmask-gate.sh
+# 6272: CompositionEffectSourceParameter (an effect's named source) is made, and a window target
+# supports a system backdrop (Teams asks it for ICompositionSupportsSystemBackdrop): a brush of ours
+# set as the backdrop fills the client area under the root.
 # Mutants (dlls/dcomp): SG_MUTANT_NO_MASK_BRUSH, SG_MUTANT_MASK_IGNORED (composition.c),
-# SG_MUTANT_NO_CAPABILITIES (composition.c), SG_MUTANT_EFFECTS_CLAIMED (capabilities.c).
+# SG_MUTANT_NO_CAPABILITIES (composition.c), SG_MUTANT_EFFECTS_CLAIMED (capabilities.c);
+# 6272: SG_MUTANT_NO_SOURCE_PARAMETER (capabilities.c), SG_MUTANT_NO_SYSTEM_BACKDROP (composition.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -54,6 +58,10 @@ check 'caps_factory=1'      "CompositionCapabilities has an activation factory (
 check 'caps_for_view=1'     "GetForCurrentView gives the capabilities"
 check 'caps_effects=0,0'    "effects are neither supported nor fast (the renderer makes no effect brushes)"
 check 'caps_changed=1'      "Changed takes a handler and gives it back"
+check 'param_factory=1'     "CompositionEffectSourceParameter has its factory (6272)"
+check 'param_made=1'        "it makes a source parameter with a name"
+check 'param_name=1'        "which keeps its name"
+check 'param_effect_source=1' "and is an IGraphicsEffectSource"
 if printf '%s\n' "$out" | grep -q '^no_d3d11='; then
     echo "SKIP: no Direct3D 11 device here for the drawing part"
 else
@@ -64,6 +72,9 @@ else
     check 'color_mask=1'          "a colour mask at half alpha: half the red source on white"
     check 'surface_mask_opaque=1' "a surface mask: the source where the picture is opaque"
     check 'surface_mask_clear=1'  "and nothing where it is clear"
+    check 'backdrop_iface=1'      "a window target supports a system backdrop (ICompositionSupportsSystemBackdrop, 6272)"
+    check 'backdrop_roundtrip=1'  "its SystemBackdrop is kept"
+    check 'backdrop_drawn=1'      "a colour brush as the backdrop fills the window under the root"
 fi
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
