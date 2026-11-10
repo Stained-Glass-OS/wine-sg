@@ -1,0 +1,480 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] rpcrt4: interface security callbacks and local-only are enforced; RpcServerInqCallAttributes
+
+gaps3 queue RPC-SEC. RpcServerRegisterIf2/3/Ex stored the interface's
+security callback and never called it, and ignored RPC_IF_ALLOW_LOCAL_ONLY
+and RPC_IF_ALLOW_SECURE_ONLY: every interface took every caller.
+Before a call reaches its manager the runtime now turns away network
+transports for a local-only interface and unauthenticated callers for a
+secure-only one; with a callback, unauthenticated callers are turned away
+(unless RPC_IF_ALLOW_CALLBACKS_WITH_NO_AUTH) and the callback decides -- any
+answer but RPC_S_OK fails the call with RPC_S_ACCESS_DENIED. ncalrpc counts
+as authenticated (PKT_PRIVACY, as rpcrt4 already reports it).
+RpcServerInqCallAttributesA/W (stubs) answer V1-V3: authentication level and
+service, server and client principal (DOMAIN\name; ERROR_MORE_DATA and the
+size for a short buffer), protocol sequence, client locality and PID (LRPC),
+call status, opnum and interface.
+A procedure number past the dispatch table sent the fault and then called
+past the table anyway; the call now ends with the fault.
+---
+diff --git a/dlls/rpcrt4/rpc_binding.c b/dlls/rpcrt4/rpc_binding.c
+index caea913..1ae2042 100644
+--- a/dlls/rpcrt4/rpc_binding.c
++++ b/dlls/rpcrt4/rpc_binding.c
+@@ -35,6 +35,9 @@
+ 
+ #include "rpc.h"
+ #include "rpcndr.h"
++#include "rpcasync.h"
++#define SECURITY_WIN32
++#include "security.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -1663,6 +1666,150 @@ RpcBindingInqAuthClientExW( RPC_BINDING_HANDLE ClientBinding, RPC_AUTHZ_HANDLE *
+                                            AuthnSvc, AuthzSvc, Flags);
+ }
+ 
++/* the caller's account as DOMAIN\name: the authentication context's client
++ * name, or for ncalrpc (no SSPI context; the kernel knows the caller) the
++ * account of the token the call impersonates */
++static WCHAR *conn_client_principal(RpcConnection *conn)
++{
++    SecPkgContext_NamesW names;
++    WCHAR *ret = NULL;
++
++    if (conn->AuthInfo && SecIsValidHandle(&conn->ctx) &&
++        QueryContextAttributesW(&conn->ctx, SECPKG_ATTR_NAMES, &names) == SEC_E_OK)
++    {
++        ret = wcsdup(names.sUserName);
++        FreeContextBuffer(names.sUserName);
++        return ret;
++    }
++    if (!strcmp(conn->ops->name, "ncalrpc") && rpcrt4_conn_impersonate_client(conn) == RPC_S_OK)
++    {
++        HANDLE token;
++        char buf[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
++        DWORD len;
++
++        if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token))
++        {
++            if (GetTokenInformation(token, TokenUser, buf, sizeof(buf), &len))
++            {
++                WCHAR name[256], domain[256];
++                DWORD name_len = ARRAY_SIZE(name), domain_len = ARRAY_SIZE(domain);
++                SID_NAME_USE use;
++
++                if (LookupAccountSidW(NULL, ((TOKEN_USER *)buf)->User.Sid, name, &name_len, domain, &domain_len, &use)
++                    && (ret = malloc((domain_len + name_len + 2) * sizeof(WCHAR))))
++                {
++                    if (domain_len) swprintf(ret, domain_len + name_len + 2, L"%s\\%s", domain, name);
++                    else wcscpy(ret, name);
++                }
++            }
++            CloseHandle(token);
++        }
++        rpcrt4_conn_revert_to_self(conn);
++    }
++    return ret;
++}
++
++/* copies a name into a caller's buffer of *len bytes; a missing or short buffer
++ * gets the size needed and ERROR_MORE_DATA */
++static RPC_STATUS copy_principal(const WCHAR *src, BOOL ansi, void *dst, ULONG *len)
++{
++    ULONG need;
++
++    if (!src) { *len = 0; return RPC_S_OK; }
++    need = ansi ? WideCharToMultiByte(CP_ACP, 0, src, -1, NULL, 0, NULL, NULL)
++                : (wcslen(src) + 1) * sizeof(WCHAR);
++    if (!dst || *len < need) { *len = need; return ERROR_MORE_DATA; }
++    if (ansi) WideCharToMultiByte(CP_ACP, 0, src, -1, dst, need, NULL, NULL);
++    else memcpy(dst, src, need);
++    *len = need;
++    return RPC_S_OK;
++}
++
++static RPC_STATUS inq_call_attributes(RPC_BINDING_HANDLE handle, void *attributes, BOOL ansi)
++{
++    /* the A and W structures share their layout; only the name types differ */
++    RPC_CALL_ATTRIBUTES_V3_W *attr = attributes;
++    RpcBinding *bind = handle;
++    RpcConnection *conn;
++    ULONG level = RPC_C_AUTHN_LEVEL_NONE, svc = RPC_C_AUTHN_NONE;
++    BOOL authenticated;
++    RPC_STATUS status = RPC_S_OK, st;
++
++    TRACE("%p %p %d\n", handle, attributes, ansi);
++
++    if (!attr || attr->Version < 1 || attr->Version > 3) return ERROR_INVALID_PARAMETER;
++    if (!bind && !(bind = I_RpcGetCurrentCallHandle())) return RPC_S_NO_CALL_ACTIVE;
++    if (!bind->server || !(conn = bind->FromConn)) return RPC_S_INVALID_BINDING;
++
++    authenticated = rpcrt4_conn_inquire_auth_client(conn, NULL, NULL, &level, &svc, NULL, 0) == RPC_S_OK
++                    && level > RPC_C_AUTHN_LEVEL_NONE;
++    if (!authenticated)
++    {
++        if (attr->Version == 1 || !(attr->Flags & RPC_QUERY_NO_AUTH_REQUIRED))
++            return RPC_S_BINDING_HAS_NO_AUTH;
++        level = RPC_C_AUTHN_LEVEL_NONE;
++        svc = RPC_C_AUTHN_NONE;
++    }
++    attr->AuthenticationLevel = level;
++    attr->AuthenticationService = svc;
++    attr->NullSession = FALSE;
++
++    if (attr->Flags & RPC_QUERY_SERVER_PRINCIPAL_NAME)
++    {
++        const WCHAR *server = (conn->AuthInfo && authenticated) ? conn->AuthInfo->server_principal_name : NULL;
++        if ((st = copy_principal(server, ansi, attr->ServerPrincipalName, &attr->ServerPrincipalNameBufferLength)))
++            status = st;
++    }
++    if (attr->Flags & RPC_QUERY_CLIENT_PRINCIPAL_NAME)
++    {
++        WCHAR *client = authenticated ? conn_client_principal(conn) : NULL;
++        if ((st = copy_principal(client, ansi, attr->ClientPrincipalName, &attr->ClientPrincipalNameBufferLength)))
++            status = st;
++        free(client);
++    }
++
++    if (attr->Version >= 2)
++    {
++        const char *protseq = conn->ops->name;
++        ULONG pid = 0;
++
++        attr->KernelModeCaller = FALSE;
++        if (!strcmp(protseq, "ncalrpc")) attr->ProtocolSequence = RPC_PROTSEQ_LRPC;
++        else if (!strcmp(protseq, "ncacn_np")) attr->ProtocolSequence = RPC_PROTSEQ_NMP;
++        else if (!strcmp(protseq, "ncacn_ip_tcp")) attr->ProtocolSequence = RPC_PROTSEQ_TCP;
++        else attr->ProtocolSequence = RPC_PROTSEQ_HTTP;
++        if (attr->Flags & RPC_QUERY_IS_CLIENT_LOCAL)
++            attr->IsClientLocal = attr->ProtocolSequence == RPC_PROTSEQ_LRPC ? rcclLocal : rcclClientUnknownLocality;
++        if (attr->Flags & RPC_QUERY_CLIENT_PID)
++            attr->ClientPID = (attr->ProtocolSequence == RPC_PROTSEQ_LRPC && conn->ops->inquire_client_pid &&
++                               conn->ops->inquire_client_pid(conn, &pid) == RPC_S_OK) ? ULongToHandle(pid) : NULL;
++        attr->CallStatus = conn->call_cancelled ? RPC_CALL_STATUS_CANCELLED : RPC_CALL_STATUS_IN_PROGRESS;
++        attr->CallType = rctNormal;
++        attr->OpNum = conn->current_opnum;
++        attr->InterfaceUuid = conn->ActiveInterface.SyntaxGUID;
++    }
++    if (attr->Version >= 3 && (attr->Flags & RPC_QUERY_CLIENT_ID))
++        attr->ClientIdentifierBufferLength = 0;
++
++    return status;
++}
++
++/***********************************************************************
++ *             RpcServerInqCallAttributesW (RPCRT4.@)
++ */
++RPC_STATUS WINAPI RpcServerInqCallAttributesW( RPC_BINDING_HANDLE handle, void *attributes )
++{
++    return inq_call_attributes( handle, attributes, FALSE );
++}
++
++/***********************************************************************
++ *             RpcServerInqCallAttributesA (RPCRT4.@)
++ */
++RPC_STATUS WINAPI RpcServerInqCallAttributesA( RPC_BINDING_HANDLE handle, void *attributes )
++{
++    return inq_call_attributes( handle, attributes, TRUE );
++}
++
+ /***********************************************************************
+  *             RpcBindingServerFromClient (RPCRT4.@)
+  */
+diff --git a/dlls/rpcrt4/rpc_binding.h b/dlls/rpcrt4/rpc_binding.h
+index bebe683..4634087 100644
+--- a/dlls/rpcrt4/rpc_binding.h
++++ b/dlls/rpcrt4/rpc_binding.h
+@@ -98,6 +98,7 @@ typedef struct _RpcConnection
+    * whether the client cancelled the call being served */
+   RPC_ASYNC_STATE *volatile server_async;
+   volatile LONG call_cancelled;
++  USHORT current_opnum; /* the procedure being served, for RpcServerInqCallAttributes */
+ } RpcConnection;
+ 
+ struct connection_ops {
+diff --git a/dlls/rpcrt4/rpc_server.c b/dlls/rpcrt4/rpc_server.c
+index 57297ac..78967d7 100644
+--- a/dlls/rpcrt4/rpc_server.c
++++ b/dlls/rpcrt4/rpc_server.c
+@@ -32,6 +32,9 @@
+ 
+ #include "rpc.h"
+ #include "rpcndr.h"
++#include "rpcasync.h"
++#define SECURITY_WIN32
++#include "security.h"
+ #include "excpt.h"
+ 
+ #include "wine/debug.h"
+@@ -360,6 +363,68 @@ static RPC_STATUS process_bind_packet(RpcConnection *conn, RpcPktBindHdr *hdr,
+ }
+ 
+ 
++/* whether the call on this connection is authenticated: ncalrpc always is (the
++ * kernel knows the caller), others when the binding carries authentication */
++static BOOL conn_is_authenticated(RpcConnection *conn)
++{
++  ULONG level = RPC_C_AUTHN_LEVEL_NONE;
++
++  if (rpcrt4_conn_inquire_auth_client(conn, NULL, NULL, &level, NULL, NULL, 0) != RPC_S_OK)
++    return FALSE;
++  return level > RPC_C_AUTHN_LEVEL_NONE;
++}
++
++/* The interface's own admission rules, before the call reaches its manager:
++ * RPC_IF_ALLOW_LOCAL_ONLY turns away network transports, RPC_IF_ALLOW_SECURE_ONLY
++ * unauthenticated callers, and a security callback (RpcServerRegisterIf2 and
++ * later) decides for every call -- after the runtime has already turned away
++ * unauthenticated callers, unless RPC_IF_ALLOW_CALLBACKS_WITH_NO_AUTH says the
++ * callback wants to see them too. A callback that answers anything but RPC_S_OK
++ * fails the call with access denied. Wine stored the callback and never called
++ * it, so every interface was open to every caller. */
++static RPC_STATUS check_interface_security(RpcConnection *conn, RpcServerInterface *sif, RPC_MESSAGE *msg)
++{
++  BOOL authenticated;
++  RPC_STATUS status;
++
++#ifdef SG_MUTANT_RPC_NO_IF_SECURITY
++  return RPC_S_OK;
++#endif
++  if (!(sif->Flags & (RPC_IF_ALLOW_LOCAL_ONLY | RPC_IF_ALLOW_SECURE_ONLY)) && !sif->IfCallbackFn)
++    return RPC_S_OK;
++
++  if ((sif->Flags & RPC_IF_ALLOW_LOCAL_ONLY) &&
++      (!strcmp(conn->ops->name, "ncacn_ip_tcp") || !strcmp(conn->ops->name, "ncacn_http")))
++  {
++    WARN("local-only interface %s called over %s\n", debugstr_guid(&sif->If->InterfaceId.SyntaxGUID), conn->ops->name);
++    return RPC_S_ACCESS_DENIED;
++  }
++
++  authenticated = conn_is_authenticated(conn);
++  if ((sif->Flags & RPC_IF_ALLOW_SECURE_ONLY) && !authenticated)
++    return RPC_S_ACCESS_DENIED;
++
++  if (!sif->IfCallbackFn) return RPC_S_OK;
++  if (!authenticated && !(sif->Flags & RPC_IF_ALLOW_CALLBACKS_WITH_NO_AUTH))
++    return RPC_S_ACCESS_DENIED;
++
++  RPCRT4_SetThreadCurrentCallHandle(msg->Handle);
++  __TRY
++  {
++    status = sif->IfCallbackFn(sif->If, msg->Handle);
++  }
++  __EXCEPT_ALL
++  {
++    WARN("security callback raised %#lx\n", GetExceptionCode());
++    status = RPC_S_ACCESS_DENIED;
++  }
++  __ENDTRY
++  RPCRT4_SetThreadCurrentCallHandle(NULL);
++
++  TRACE("security callback for %s opnum %u: %ld\n", debugstr_guid(&sif->If->InterfaceId.SyntaxGUID), msg->ProcNum, status);
++  return status == RPC_S_OK ? RPC_S_OK : RPC_S_ACCESS_DENIED;
++}
++
+ static RPC_STATUS process_request_packet(RpcConnection *conn, RpcPktRequestHdr *hdr, RPC_MESSAGE *msg)
+ {
+   RPC_STATUS status;
+@@ -420,9 +485,19 @@ static RPC_STATUS process_request_packet(RpcConnection *conn, RpcPktRequestHdr *
+ 
+       RPCRT4_Send(conn, response, NULL, 0);
+       free(response);
++      return RPC_S_OK;  /* the call ends with the fault: there is no such procedure to run */
+     }
+     func = sif->If->DispatchTable->DispatchTable[msg->ProcNum];
+   }
++  conn->current_opnum = msg->ProcNum;
++
++  if ((status = check_interface_security(conn, sif, msg)) != RPC_S_OK)
++  {
++    response = RPCRT4_BuildFaultHeader(NDR_LOCAL_DATA_REPRESENTATION, RPC2NCA_STATUS(status));
++    RPCRT4_Send(conn, response, NULL, 0);
++    free(response);
++    return RPC_S_OK;
++  }
+ 
+   /* put in the drep. FIXME: is this more universally applicable?
+     perhaps we should move this outward... */
+diff --git a/dlls/rpcrt4/rpcrt4.spec b/dlls/rpcrt4/rpcrt4.spec
+index bc9501b..7ddd702 100644
+--- a/dlls/rpcrt4/rpcrt4.spec
++++ b/dlls/rpcrt4/rpcrt4.spec
+@@ -429,8 +429,8 @@
+ @ stdcall RpcRevertToSelf()
+ @ stdcall RpcRevertToSelfEx(ptr)
+ @ stdcall RpcServerInqBindings(ptr)
+-@ stub RpcServerInqCallAttributesA
+-@ stub RpcServerInqCallAttributesW
++@ stdcall RpcServerInqCallAttributesA(ptr ptr)
++@ stdcall RpcServerInqCallAttributesW(ptr ptr)
+ @ stdcall RpcServerInqDefaultPrincNameA(long ptr)
+ @ stdcall RpcServerInqDefaultPrincNameW(long ptr)
+ @ stub RpcServerInqIf
+diff --git a/include/rpcasync.h b/include/rpcasync.h
+index f0bcb6d..6b0f2ed 100644
+--- a/include/rpcasync.h
++++ b/include/rpcasync.h
+@@ -187,6 +187,161 @@ RPCRTAPI RPC_STATUS RPC_ENTRY RpcErrorAddRecord(RPC_EXTENDED_ERROR_INFO*);
+ RPCRTAPI RPC_STATUS RPC_ENTRY RpcErrorClearInformation(void);
+ RPCRTAPI RPC_STATUS RPC_ENTRY RpcGetAuthorizationContextForClient(RPC_BINDING_HANDLE,BOOL,LPVOID,PLARGE_INTEGER,LUID,DWORD,PVOID,PVOID*);
+ RPCRTAPI RPC_STATUS RPC_ENTRY RpcFreeAuthorizationContext(PVOID*);
++#define RPC_QUERY_SERVER_PRINCIPAL_NAME 0x02
++#define RPC_QUERY_CLIENT_PRINCIPAL_NAME 0x04
++#define RPC_QUERY_CALL_LOCAL_ADDRESS    0x08
++#define RPC_QUERY_CLIENT_PID            0x10
++#define RPC_QUERY_IS_CLIENT_LOCAL       0x20
++#define RPC_QUERY_NO_AUTH_REQUIRED      0x40
++#define RPC_QUERY_CLIENT_ID             0x80
++
++#define RPC_PROTSEQ_TCP  0x1
++#define RPC_PROTSEQ_NMP  0x2
++#define RPC_PROTSEQ_LRPC 0x3
++#define RPC_PROTSEQ_HTTP 0x4
++
++#define RPC_CALL_STATUS_IN_PROGRESS  0x01
++#define RPC_CALL_STATUS_CANCELLED    0x02
++#define RPC_CALL_STATUS_DISCONNECTED 0x03
++
++typedef enum tagRpcCallType { rctInvalid = 0, rctNormal, rctTraining, rctGuaranteed } RpcCallType;
++typedef enum tagRpcCallClientLocality { rcclInvalid = 0, rcclLocal, rcclRemote, rcclClientUnknownLocality } RpcCallClientLocality;
++typedef enum tagRpcLocalAddressFormat { rlafInvalid = 0, rlafIPv4, rlafIPv6 } RpcLocalAddressFormat;
++
++typedef struct _RPC_CALL_LOCAL_ADDRESS_V1
++{
++    unsigned int Version;
++    void *Buffer;
++    ULONG BufferSize;
++    RpcLocalAddressFormat AddressFormat;
++} RPC_CALL_LOCAL_ADDRESS_V1, *RPC_CALL_LOCAL_ADDRESS;
++
++typedef struct tagRPC_CALL_ATTRIBUTES_V1_W
++{
++    unsigned int Version;
++    ULONG Flags;
++    ULONG ServerPrincipalNameBufferLength;
++    unsigned short *ServerPrincipalName;
++    ULONG ClientPrincipalNameBufferLength;
++    unsigned short *ClientPrincipalName;
++    ULONG AuthenticationLevel;
++    ULONG AuthenticationService;
++    BOOL NullSession;
++} RPC_CALL_ATTRIBUTES_V1_W;
++
++typedef struct tagRPC_CALL_ATTRIBUTES_V1_A
++{
++    unsigned int Version;
++    ULONG Flags;
++    ULONG ServerPrincipalNameBufferLength;
++    unsigned char *ServerPrincipalName;
++    ULONG ClientPrincipalNameBufferLength;
++    unsigned char *ClientPrincipalName;
++    ULONG AuthenticationLevel;
++    ULONG AuthenticationService;
++    BOOL NullSession;
++} RPC_CALL_ATTRIBUTES_V1_A;
++
++typedef struct tagRPC_CALL_ATTRIBUTES_V2_W
++{
++    unsigned int Version;
++    ULONG Flags;
++    ULONG ServerPrincipalNameBufferLength;
++    unsigned short *ServerPrincipalName;
++    ULONG ClientPrincipalNameBufferLength;
++    unsigned short *ClientPrincipalName;
++    ULONG AuthenticationLevel;
++    ULONG AuthenticationService;
++    BOOL NullSession;
++    BOOL KernelModeCaller;
++    ULONG ProtocolSequence;
++    RpcCallClientLocality IsClientLocal;
++    HANDLE ClientPID;
++    ULONG CallStatus;
++    RpcCallType CallType;
++    RPC_CALL_LOCAL_ADDRESS_V1 *CallLocalAddress;
++    unsigned short OpNum;
++    UUID InterfaceUuid;
++} RPC_CALL_ATTRIBUTES_V2_W;
++
++typedef struct tagRPC_CALL_ATTRIBUTES_V2_A
++{
++    unsigned int Version;
++    ULONG Flags;
++    ULONG ServerPrincipalNameBufferLength;
++    unsigned char *ServerPrincipalName;
++    ULONG ClientPrincipalNameBufferLength;
++    unsigned char *ClientPrincipalName;
++    ULONG AuthenticationLevel;
++    ULONG AuthenticationService;
++    BOOL NullSession;
++    BOOL KernelModeCaller;
++    ULONG ProtocolSequence;
++    ULONG IsClientLocal;
++    HANDLE ClientPID;
++    ULONG CallStatus;
++    RpcCallType CallType;
++    RPC_CALL_LOCAL_ADDRESS_V1 *CallLocalAddress;
++    unsigned short OpNum;
++    UUID InterfaceUuid;
++} RPC_CALL_ATTRIBUTES_V2_A;
++
++typedef struct tagRPC_CALL_ATTRIBUTES_V3_W
++{
++    unsigned int Version;
++    ULONG Flags;
++    ULONG ServerPrincipalNameBufferLength;
++    unsigned short *ServerPrincipalName;
++    ULONG ClientPrincipalNameBufferLength;
++    unsigned short *ClientPrincipalName;
++    ULONG AuthenticationLevel;
++    ULONG AuthenticationService;
++    BOOL NullSession;
++    BOOL KernelModeCaller;
++    ULONG ProtocolSequence;
++    RpcCallClientLocality IsClientLocal;
++    HANDLE ClientPID;
++    ULONG CallStatus;
++    RpcCallType CallType;
++    RPC_CALL_LOCAL_ADDRESS_V1 *CallLocalAddress;
++    unsigned short OpNum;
++    UUID InterfaceUuid;
++    ULONG ClientIdentifierBufferLength;
++    unsigned char *ClientIdentifier;
++} RPC_CALL_ATTRIBUTES_V3_W;
++
++typedef struct tagRPC_CALL_ATTRIBUTES_V3_A
++{
++    unsigned int Version;
++    ULONG Flags;
++    ULONG ServerPrincipalNameBufferLength;
++    unsigned char *ServerPrincipalName;
++    ULONG ClientPrincipalNameBufferLength;
++    unsigned char *ClientPrincipalName;
++    ULONG AuthenticationLevel;
++    ULONG AuthenticationService;
++    BOOL NullSession;
++    BOOL KernelModeCaller;
++    ULONG ProtocolSequence;
++    ULONG IsClientLocal;
++    HANDLE ClientPID;
++    ULONG CallStatus;
++    RpcCallType CallType;
++    RPC_CALL_LOCAL_ADDRESS_V1 *CallLocalAddress;
++    unsigned short OpNum;
++    UUID InterfaceUuid;
++    ULONG ClientIdentifierBufferLength;
++    unsigned char *ClientIdentifier;
++} RPC_CALL_ATTRIBUTES_V3_A;
++
++typedef RPC_CALL_ATTRIBUTES_V3_W RPC_CALL_ATTRIBUTES_W;
++typedef RPC_CALL_ATTRIBUTES_V3_A RPC_CALL_ATTRIBUTES_A;
++#define RPC_CALL_ATTRIBUTES_VERSION 3
++DECL_WINELIB_TYPE_AW(RPC_CALL_ATTRIBUTES_)
++
++RPCRTAPI RPC_STATUS RPC_ENTRY RpcServerInqCallAttributesW(RPC_BINDING_HANDLE,void*);
++RPCRTAPI RPC_STATUS RPC_ENTRY RpcServerInqCallAttributesA(RPC_BINDING_HANDLE,void*);
++#define RpcServerInqCallAttributes WINELIB_NAME_AW(RpcServerInqCallAttributes)
+ RPCRTAPI RPC_STATUS RPC_ENTRY RpcSsContextLockExclusive(RPC_BINDING_HANDLE,PVOID);
+ RPCRTAPI RPC_STATUS RPC_ENTRY RpcSsContextLockShared(RPC_BINDING_HANDLE,PVOID);
+ 
