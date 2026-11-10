@@ -15,8 +15,12 @@ WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 [ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
-WIDL="${WIDL:-/opt/wine-sg/bin/widl}"
-SVCCTL_INC="${SVCCTL_INC:-/opt/wine-sg/include}"
+# widl and svcctl.idl from the Wine under test (the installed /opt/wine-sg can be far older: its
+# svcctl.idl had no struct service_failure_actions and the probe stopped compiling)
+WIDL="${WIDL:-$(dirname "$WINE")/widl}"
+[ -x "$WIDL" ] || WIDL="$(dirname "$WINE")/tools/widl/widl"
+SVCCTL_INC="${SVCCTL_INC:-$(dirname "$WINE")/../include}"
+[ -f "$SVCCTL_INC/wine/svcctl.idl" ] || SVCCTL_INC="$(cd "$(dirname "$WINE")" && pwd)/../wine-10.0/include"
 command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW not installed"; exit 77; }
 command -v xvfb-run >/dev/null || { echo "SKIP: needs xvfb-run"; exit 77; }
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }

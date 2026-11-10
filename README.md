@@ -46,15 +46,25 @@ Debian does not strip its Wine; `build.sh` does, using the matching mingw
 The cost is symbolised `winedbg` backtraces — build with `STRIP=0` when chasing
 a crash inside Wine.
 
-## Not a fork
+## A patch series, not a fork
 
-Every patch here is carried from Debian's Wine packaging with its original
-author attribution intact. `patches/fixes/binutils2.44.patch` is load-bearing:
-without it, Wine built on Debian trixie faults during module load and cannot
-start a process at all (WineHQ bug 57819).
+There is no copy of Wine's history here. The build fetches the Wine 10.0
+release tarball named in `wine-version`, checks its SHA-256, and applies the
+patches in `patches/` in the order `patches/series` gives:
 
-Patches of our own will live in `patches/sg/` when they exist, kept separate so
-that what we owe upstream stays obvious.
+- `patches/fixes/`: a few fixes carried from Debian's Wine packaging, with
+  their original authors' attribution intact. `binutils2.44.patch` is
+  load-bearing: without it, Wine built on Debian trixie faults during module
+  load and cannot start a process at all (WineHQ bug 57819).
+- `patches/sg/`: Stained Glass OS's own work, about 2,500 patches, one change
+  each with its reason in the patch header. They cover the desktop shell's
+  needs, multiple users on one machine, the elevation broker, installers and
+  applications that did not run, and stubs implemented.
+
+Because each change is its own patch on an unmodified release, what differs
+from upstream Wine is always visible and reviewable patch by patch. Moving to
+a newer Wine release means changing `wine-version` and re-checking the series
+against it.
 
 ## License
 
