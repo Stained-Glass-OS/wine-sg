@@ -17,6 +17,9 @@ static const GUID IID_IPropertyValueStatics_ = {0x629bdbc8, 0xd932, 0x4ff4, {0x9
 /* IMap<HSTRING, IInspectable> */
 static const GUID IID_IMap_ = {0x1b0d3570, 0x0877, 0x5ec2, {0x8a, 0x2c, 0x3b, 0x95, 0x39, 0x50, 0x6a, 0xca}};
 
+static const GUID IID_IPropertyValue_ = {0x4bd682dd, 0x7554, 0x40e9, {0x9a, 0x9b, 0x82, 0x65, 0x4e, 0xde, 0x7e, 0x62}};
+static const GUID IID_IActivationFactory_ = {0x00000035, 0x0000, 0x0000, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+
 static HSTRING_ mk(WCS create, const WCHAR *s) { HSTRING_ h = NULL; create(s, wcslen(s), &h); return h; }
 
 static int child(void)
@@ -51,6 +54,64 @@ static int child(void)
     hr = CALL(map, 6, HRESULT, key, &got); CHECK(hr == S_OK && got, "Lookup %lx", hr);
     hr = CALL(map, 11, HRESULT, key); CHECK(hr == S_OK, "Remove %lx", hr);
     hr = CALL(map, 11, HRESULT, key); CHECK(hr == (HRESULT)0x8000000b, "Remove again %lx", hr);
+
+    /* ApplicationDataCompositeValue (wine-sg 7731): settings stored and read back as one value --
+     * LanguageTool for Desktop's settings; it found no class and never showed its window */
+    {
+        void *factory = NULL, *comp = NULL, *cmap = NULL, *got2 = NULL, *gmap = NULL, *v = NULL, *pv = NULL, *inner = NULL;
+        HSTRING_ name = NULL, str = NULL;
+        INT32 i32 = 0;
+        unsigned char rep = 0;
+
+        hr = get_factory(mk(create, L"Windows.Storage.ApplicationDataCompositeValue"), &IID_IActivationFactory_, &factory);
+        CHECK(hr == S_OK && factory, "composite factory %lx", hr);
+        if (factory)
+        {
+            hr = CALL(factory, 6, HRESULT, &comp); CHECK(hr == S_OK && comp, "ActivateInstance %lx", hr);
+        }
+        if (comp)
+        {
+            hr = CALL(comp, 0, HRESULT, &IID_IMap_, &cmap); CHECK(hr == S_OK && cmap, "composite IMap %lx", hr);
+            hr = CALL(comp, 4, HRESULT, &name);
+            CHECK(hr == S_OK && name, "class name %lx", hr);
+        }
+        if (cmap)
+        {
+            boxed = NULL;
+            CALL(vs, 10, HRESULT, 7, &boxed);
+            hr = CALL(cmap, 10, HRESULT, mk(create, L"width"), boxed, &rep); CHECK(hr == S_OK, "composite Insert int %lx", hr);
+            boxed = NULL;
+            CALL(vs, 18, HRESULT, mk(create, L"en-GB"), &boxed);
+            hr = CALL(cmap, 10, HRESULT, mk(create, L"language"), boxed, &rep); CHECK(hr == S_OK, "composite Insert string %lx", hr);
+            hr = CALL(cmap, 7, HRESULT, &size); CHECK(hr == S_OK && size == 2, "composite Size %lx %u", hr, size);
+            /* a composite value inside a composite value is not stored */
+            hr = CALL(factory, 6, HRESULT, &inner);
+            if (inner) { hr = CALL(cmap, 10, HRESULT, mk(create, L"nested"), inner, &rep); CHECK(FAILED(hr), "nested composite stored %lx", hr); }
+            /* stored in the settings as one value, and read back as a composite */
+            hr = CALL(map, 10, HRESULT, mk(create, L"group"), comp, &rep); CHECK(hr == S_OK, "settings Insert composite %lx", hr);
+            hr = CALL(map, 6, HRESULT, mk(create, L"group"), &got2); CHECK(hr == S_OK && got2, "settings Lookup composite %lx", hr);
+            if (got2) { hr = CALL(got2, 0, HRESULT, &IID_IMap_, &gmap); CHECK(hr == S_OK && gmap, "read-back IMap %lx", hr); }
+            if (gmap)
+            {
+                size = 0;
+                hr = CALL(gmap, 7, HRESULT, &size); CHECK(hr == S_OK && size == 2, "read-back Size %lx %u", hr, size);
+                hr = CALL(gmap, 6, HRESULT, mk(create, L"width"), &v); CHECK(hr == S_OK && v, "read-back width %lx", hr);
+                if (v && SUCCEEDED(CALL(v, 0, HRESULT, &IID_IPropertyValue_, &pv)) && pv)
+                {
+                    CALL(pv, 11, HRESULT, &i32); CHECK(i32 == 7, "width %d", i32);
+                }
+                v = pv = NULL;
+                hr = CALL(gmap, 6, HRESULT, mk(create, L"language"), &v); CHECK(hr == S_OK && v, "read-back language %lx", hr);
+                if (v && SUCCEEDED(CALL(v, 0, HRESULT, &IID_IPropertyValue_, &pv)) && pv)
+                {
+                    const WCHAR *(WINAPI *raw)(HSTRING_, UINT32 *) = (void *)GetProcAddress(LoadLibraryA("combase.dll"), "WindowsGetStringRawBuffer");
+                    CALL(pv, 19, HRESULT, &str);
+                    CHECK(str && !wcscmp(raw(str, NULL), L"en-GB"), "language read back");
+                }
+            }
+            CALL(map, 11, HRESULT, mk(create, L"group"));
+        }
+    }
     return fails;
 }
 
