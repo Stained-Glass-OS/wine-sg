@@ -1,0 +1,320 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] kernelbase, explorer: a browser an elevated program starts runs unelevated, as the person
+
+David 2026-11-11: "A browser can run with the system account's rights.
+seems like a bad idea, prhpas we block or de-eleavet that."
+
+7736 hands the pages an elevated program opens to the person's own shell.
+A browser started by name was not covered: SeaMonkey's installer (elevated
+through consent) ends with "launch SeaMonkey now", a CreateProcess of
+seamonkey.exe, and SeaMonkey ran as the system account on the person's
+desktop.
+
+- kernelbase: CreateProcess from an elevated token, without a token of
+  its own, of a browser (a program registered under
+  Clients\StartMenuInternet, machine or user, either registry view; or
+  winebrowser, the person's Linux browser) goes to the person's shell over
+  7736's pipe, checked the same way (the server is that person, not
+  elevated; identification-level impersonation only). The shell starts it
+  and answers its process and thread ids, which it keeps open until they
+  are opened here, so CreateProcess's handles are the browser's. A start
+  that cannot be handed over (suspended, debugged, inherited standard
+  handles, extended attributes) and a start with no such shell fail with
+  access denied: a browser never starts elevated.
+- explorer: the pipe's server takes that request (1, the show state, the
+  command line, the directory) from the same person and starts the
+  program as them.
+
+Gate test-elevurl (now 13 checks); mutant SG_MUTANT_ELEVATED_BROWSER_EXE
+(kernelbase).
+---
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -30,6 +30,7 @@
+ #include "wincontypes.h"
+ #include "winternl.h"
+ #include "processsnapshot.h"
++#include "winioctl.h"
+ 
+ #include "kernelbase.h"
+ #include "wine/debug.h"
+@@ -910,6 +911,206 @@
+     return ret;
+ }
+ 
++/* Stained Glass OS: a browser an elevated program starts is started by the
++ * person's own, unelevated shell (David, 2026-11-11): an installer's "run
++ * it now" started the browser as the system account (SeaMonkey). shell32
++ * hands over the pages an elevated program opens (wine-sg 7736); this is
++ * the same for a browser started by name. The browsers are the programs
++ * registered under Clients\StartMenuInternet, and winebrowser (the person's
++ * Linux browser). The person's shell (explorer.exe) serves
++ * \\.\pipe\sg-unelevated-open-<SID>; the pipe's server must be that person,
++ * unelevated. It answers the new process's and thread's ids, and keeps them
++ * open until they are opened here. With no such shell, or a start asking
++ * for what cannot be handed over (suspended, debugged, inherited handles),
++ * the browser is not started at all. */
++static BOOL sg_same_program( const WCHAR *a, const WCHAR *b )
++{
++    WCHAR la[MAX_PATH], lb[MAX_PATH];
++
++    if (!wcsicmp( a, b )) return TRUE;
++    if (!GetLongPathNameW( a, la, MAX_PATH )) lstrcpynW( la, a, MAX_PATH );
++    if (!GetLongPathNameW( b, lb, MAX_PATH )) lstrcpynW( lb, b, MAX_PATH );
++    return !wcsicmp( la, lb );
++}
++
++/* the program of a "shell\open\command": "C:\path\browser.exe" -args */
++static BOOL sg_command_program( const WCHAR *command, WCHAR *program, DWORD size )
++{
++    WCHAR expanded[MAX_PATH * 2];
++    const WCHAR *p = expanded, *end;
++
++    if (!ExpandEnvironmentStringsW( command, expanded, ARRAY_SIZE(expanded) )) return FALSE;
++    while (*p == ' ') p++;
++    if (*p == '"') { p++; end = wcschr( p, '"' ); }
++    else if (!(end = wcsstr( p, L".exe" )) && !(end = wcsstr( p, L".EXE" ))) end = wcschr( p, ' ' );
++    else end += 4;
++    if (!end) end = p + lstrlenW( p );
++    if (end - p >= size) return FALSE;
++    memcpy( program, p, (end - p) * sizeof(WCHAR) );
++    program[end - p] = 0;
++    return TRUE;
++}
++
++static BOOL sg_is_browser( const WCHAR *app_name )
++{
++    static const struct { HKEY root; REGSAM view; } places[] =
++    {
++        { HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY }, { HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY },
++        { HKEY_CURRENT_USER, 0 },
++    };
++    const WCHAR *base = wcsrchr( app_name, '\\' );
++    WCHAR client[256], command[MAX_PATH * 2], program[MAX_PATH];
++    DWORD i, j, len;
++    BOOL ret = FALSE;
++    HKEY key;
++
++    base = base ? base + 1 : app_name;
++    if (!wcsicmp( base, L"winebrowser.exe" )) return TRUE;
++    for (i = 0; i < ARRAY_SIZE(places) && !ret; i++)
++    {
++        if (RegOpenKeyExW( places[i].root, L"Software\\Clients\\StartMenuInternet", 0,
++                           KEY_READ | places[i].view, &key )) continue;
++        for (j = 0; !ret; j++)
++        {
++            WCHAR sub[300];
++            DWORD client_len = ARRAY_SIZE(client);
++
++            if (RegEnumKeyExW( key, j, client, &client_len, NULL, NULL, NULL, NULL )) break;
++
++            swprintf( sub, ARRAY_SIZE(sub), L"%s\\shell\\open\\command", client );
++            len = sizeof(command);
++            if (RegGetValueW( key, sub, NULL, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
++                              NULL, command, &len )) continue;
++            if (sg_command_program( command, program, ARRAY_SIZE(program) ) && sg_same_program( program, app_name ))
++                ret = TRUE;
++        }
++        RegCloseKey( key );
++    }
++    return ret;
++}
++
++static BOOL sg_token_elevated( HANDLE token, BYTE *user, DWORD size )
++{
++    TOKEN_ELEVATION elevation = { 0 };
++    DWORD len;
++
++    if (user && !GetTokenInformation( token, TokenUser, user, size, &len )) memset( user, 0, size );
++    return GetTokenInformation( token, TokenElevation, &elevation, sizeof(elevation), &len ) &&
++           elevation.TokenIsElevated;
++}
++
++/* TRUE when the browser was handed over or refused; *status is the start's answer */
++static BOOL sg_browser_unelevated( HANDLE token, const WCHAR *app_name, const WCHAR *cmdline,
++                                   const WCHAR *cur_dir, DWORD flags, const STARTUPINFOW *startup,
++                                   PROCESS_INFORMATION *info, NTSTATUS *status )
++{
++    BYTE me[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER)], them[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER)];
++    WCHAR name[128], sid[128], *request = NULL;
++    UNICODE_STRING sid_str = { 0, sizeof(sid), sid };
++    struct { DWORD error, pid, tid; } answer;
++    DWORD mode = PIPE_READMODE_MESSAGE, done, cmd_len, dir_len, opened = 0;
++    HANDLE pipe = INVALID_HANDLE_VALUE, server, server_token;
++    IO_STATUS_BLOCK iosb;
++    HANDLE mine;
++    BOOL elevated;
++    ULONG pid;
++
++#ifdef SG_MUTANT_ELEVATED_BROWSER_EXE
++    return FALSE;
++#endif
++
++    if (token || !app_name) return FALSE;
++    if (!OpenThreadToken( GetCurrentThread(), TOKEN_QUERY, TRUE, &mine ) &&
++        !OpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &mine ))
++        return FALSE;
++    elevated = sg_token_elevated( mine, NULL, 0 ) && sg_token_elevated( mine, me, sizeof(me) );
++    CloseHandle( mine );
++    if (!elevated || !sg_is_browser( app_name )) return FALSE;
++    *status = STATUS_ACCESS_DENIED;
++    info->hThread = info->hProcess = 0;
++    info->dwProcessId = info->dwThreadId = 0;
++    if (flags & (CREATE_SUSPENDED | DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS | EXTENDED_STARTUPINFO_PRESENT) ||
++        (startup && (startup->dwFlags & STARTF_USESTDHANDLES)))
++        goto refused;
++    if (!((TOKEN_USER *)me)->User.Sid || RtlConvertSidToUnicodeString( &sid_str, ((TOKEN_USER *)me)->User.Sid, FALSE ))
++        goto refused;
++    swprintf( name, ARRAY_SIZE(name), L"\\\\.\\pipe\\sg-unelevated-open-%s", sid );
++    /* identification only: the person's shell may see who asks, not act as them */
++    pipe = CreateFileW( name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
++                        SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, NULL );
++    if (pipe == INVALID_HANDLE_VALUE)
++    {
++        TRACE( "%s: %lu\n", debugstr_w(name), GetLastError() );
++        goto refused;
++    }
++    if (NtFsControlFile( pipe, NULL, NULL, NULL, &iosb, FSCTL_PIPE_GET_CONNECTION_ATTRIBUTE,
++                         (void *)"ServerProcessId", sizeof("ServerProcessId"), &pid, sizeof(pid) ) ||
++        !(server = OpenProcess( PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid )))
++        goto refused;
++    if (!OpenProcessToken( server, TOKEN_QUERY, &server_token ))
++    {
++        CloseHandle( server );
++        goto refused;
++    }
++    CloseHandle( server );
++    if (sg_token_elevated( server_token, them, sizeof(them) ) || !((TOKEN_USER *)them)->User.Sid ||
++        !EqualSid( ((TOKEN_USER *)them)->User.Sid, ((TOKEN_USER *)me)->User.Sid ))
++    {
++        CloseHandle( server_token );
++        goto refused;
++    }
++    CloseHandle( server_token );
++
++    /* a start: 1, how to show it (0xffff: as it likes), then the command line and the directory */
++    cmd_len = lstrlenW( cmdline ) + 1;
++    dir_len = cur_dir ? lstrlenW( cur_dir ) + 1 : 1;
++    if (!(request = HeapAlloc( GetProcessHeap(), 0, (2 + cmd_len + dir_len) * sizeof(WCHAR) ))) goto refused;
++    request[0] = 1;
++    request[1] = startup && (startup->dwFlags & STARTF_USESHOWWINDOW) ? startup->wShowWindow : 0xffff;   /* none asked */
++    memcpy( request + 2, cmdline, cmd_len * sizeof(WCHAR) );
++    if (cur_dir) memcpy( request + 2 + cmd_len, cur_dir, dir_len * sizeof(WCHAR) );
++    else request[2 + cmd_len] = 0;
++    SetNamedPipeHandleState( pipe, &mode, NULL, NULL );
++    if (!WriteFile( pipe, request, (2 + cmd_len + dir_len) * sizeof(WCHAR), &done, NULL ) ||
++        !ReadFile( pipe, &answer, sizeof(answer), &done, NULL ) || done != sizeof(answer))
++        goto refused;
++    HeapFree( GetProcessHeap(), 0, request );
++    request = NULL;
++    if (answer.error)
++    {
++        CloseHandle( pipe );
++        TRACE( "the person's shell could not start %s: %lu\n", debugstr_w(cmdline), answer.error );
++        switch (answer.error)
++        {
++        case ERROR_FILE_NOT_FOUND: *status = STATUS_OBJECT_NAME_NOT_FOUND; break;
++        case ERROR_PATH_NOT_FOUND: *status = STATUS_OBJECT_PATH_NOT_FOUND; break;
++        case ERROR_BAD_EXE_FORMAT: *status = STATUS_INVALID_IMAGE_FORMAT; break;
++        case ERROR_ACCESS_DENIED: *status = STATUS_ACCESS_DENIED; break;
++        default: *status = STATUS_UNSUCCESSFUL; break;
++        }
++        return TRUE;
++    }
++    if (!(info->hProcess = OpenProcess( PROCESS_ALL_ACCESS, FALSE, answer.pid )))
++        info->hProcess = OpenProcess( PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, answer.pid );
++    if (!(info->hThread = OpenThread( THREAD_ALL_ACCESS, FALSE, answer.tid )))
++        info->hThread = OpenThread( THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, answer.tid );
++    info->dwProcessId = answer.pid;
++    info->dwThreadId = answer.tid;
++    opened = 1;
++    WriteFile( pipe, &opened, sizeof(opened), &done, NULL );   /* the shell may let go of them now */
++    CloseHandle( pipe );
++    TRACE( "%s started by the person's shell, unelevated: pid %04lx\n", debugstr_w(cmdline), answer.pid );
++    *status = STATUS_SUCCESS;
++    return TRUE;
++
++refused:
++    HeapFree( GetProcessHeap(), 0, request );
++    if (pipe != INVALID_HANDLE_VALUE) CloseHandle( pipe );
++    ERR( "not starting the browser %s elevated: no unelevated shell of this person to start it\n",
++         debugstr_w(app_name) );
++    return TRUE;
++}
++
+ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR *app_name, WCHAR *cmd_line,
+                                                       SECURITY_ATTRIBUTES *process_attr,
+                                                       SECURITY_ATTRIBUTES *thread_attr,
+@@ -973,6 +1174,10 @@
+         goto done;
+     }
+ 
++    /* a browser never runs elevated */
++    if (sg_browser_unelevated( token, app_name, tidy_cmdline, cur_dir, flags, startup_info, info, &status ))
++        goto done;
++
+     /* Warn if unsupported features are used */
+ 
+     if (flags & (IDLE_PRIORITY_CLASS | HIGH_PRIORITY_CLASS | REALTIME_PRIORITY_CLASS |
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -3716,6 +3716,46 @@
+     return ret;
+ }
+ 
++/* a browser an elevated program starts (kernelbase's sg_browser_unelevated):
++ * 1, how to show it, the command line, the directory. The answer is the
++ * error and the new process's and thread's ids; they stay open here until
++ * the program that asked has opened them, so the ids are not reused. */
++static void start_for_elevated( HANDLE pipe, const WCHAR *request, DWORD count )
++{
++    struct { DWORD error, pid, tid; } answer = { ERROR_INVALID_PARAMETER };
++    STARTUPINFOW si = { sizeof(si) };
++    PROCESS_INFORMATION pi = { 0 };
++    const WCHAR *cmdline, *dir, *end = request + count;
++    WCHAR *cmd = NULL;
++    DWORD done, opened = 0;
++
++    cmdline = dir = request + 2;
++    if (count >= 4 && request[count - 1] == 0)
++        while (dir < end && *dir) dir++;
++    if (count >= 4 && request[count - 1] == 0 && ++dir < end && (cmd = wcsdup( cmdline )))
++    {
++        if (request[1] != 0xffff)
++        {
++            si.dwFlags = STARTF_USESHOWWINDOW;
++            si.wShowWindow = request[1];
++        }
++        TRACE( "starting %s for an elevated program\n", debugstr_w(cmd) );
++        if (CreateProcessW( NULL, cmd, NULL, NULL, FALSE, 0, NULL, *dir ? dir : NULL, &si, &pi ))
++        {
++            answer.error = 0;
++            answer.pid = pi.dwProcessId;
++            answer.tid = pi.dwThreadId;
++        }
++        else answer.error = GetLastError();
++        free( cmd );
++    }
++    WriteFile( pipe, &answer, sizeof(answer), &done, NULL );
++    FlushFileBuffers( pipe );
++    if (!answer.error) ReadFile( pipe, &opened, sizeof(opened), &done, NULL );   /* or the asker is gone */
++    if (pi.hProcess) CloseHandle( pi.hProcess );
++    if (pi.hThread) CloseHandle( pi.hThread );
++}
++
+ static DWORD WINAPI unelevated_open_thread( void *arg )
+ {
+     BYTE me[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER)];
+@@ -3758,6 +3798,12 @@
+             url[got / sizeof(WCHAR)] = 0;
+             if (!request_from_person( pipe, ((TOKEN_USER *)me)->User.Sid ))
+                 WARN( "a request from someone else: refused\n" );
++            else if (url[0] == 1)
++            {
++                start_for_elevated( pipe, url, got / sizeof(WCHAR) );
++                DisconnectNamedPipe( pipe );
++                continue;
++            }
+             else if (!PathIsURLW( url ) || !wcsnicmp( url, L"file:", 5 ) || !wcsnicmp( url, L"shell:", 6 ))
+                 WARN( "not a page: %s\n", debugstr_w(url) );
+             else

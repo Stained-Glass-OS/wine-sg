@@ -21,8 +21,16 @@
 #     page (shell32 checks the server is the person, unelevated)
 #  6. another account cannot ask the person's shell to open a page (the
 #     shell checks who asks; refused, SE_ERR_ACCESSDENIED)
+#  7. a browser the elevated program starts by name (CreateProcess; an
+#     installer's "run it now", patches/sg/7741) is started by the person's
+#     shell, unelevated; the handle CreateProcess gives back is the
+#     browser's (waited on, its exit code read)
+#  8. a program that is not a browser still starts elevated, as before
+#  9. a browser asked for suspended is not started (it cannot be handed over)
+# 10. with no shell of the person's the browser is not started (access denied)
 # Exit 77 without the accounts or passwordless sudo.
 # Mutants: SG_MUTANT_ELEVATED_BROWSER (dlls/shell32/shlexec.c),
+#          SG_MUTANT_ELEVATED_BROWSER_EXE (dlls/kernelbase/process.c),
 #          SG_MUTANT_UNELEVATED_OPEN_ANYONE (programs/explorer/desktop.c).
 #   WINE=... WINESERVER=... test/elevurl-gate.sh
 set -u
@@ -74,6 +82,9 @@ as "$SG_SYSTEM" sh -c "umask 002; '$WINESERVER' -p"
 as "$SG_SYSTEM" sh -c "umask 002; timeout -s KILL 300 '$WINE' cmd /c exit" >/dev/null 2>&1
 sudo -n chmod -R g+rwX "$PFX" 2>/dev/null
 sudo -n install -o "$SG_SYSTEM" -g "$SG_GROUP" -m 755 "$W/elevurl-probe.exe" "$PFX/drive_c/elevurl-probe.exe"
+sudo -n install -d -o "$SG_SYSTEM" -g "$SG_GROUP" -m 2775 "$PFX/drive_c/sgbrowser"
+sudo -n install -o "$SG_SYSTEM" -g "$SG_GROUP" -m 755 "$W/elevurl-probe.exe" "$PFX/drive_c/sgbrowser/sgbrowser.exe"
+as "$SG_SYSTEM" timeout -s KILL 120 "$WINE" reg add 'HKLM\Software\Clients\StartMenuInternet\SGGate\shell\open\command' /ve /d '"C:\sgbrowser\sgbrowser.exe"' /f >/dev/null 2>&1
 as "$SG_SYSTEM" timeout -s KILL 120 "$WINE" reg add 'HKLM\Software\Classes\https\shell\open\command' /ve /d '"C:\elevurl-probe.exe" handle "%1"' /f >/dev/null 2>&1
 as "$SG_USER1" timeout -s KILL 120 "$WINE" reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d null /f >/dev/null 2>&1
 uid1=$(id -u "$SG_USER1")
@@ -115,6 +126,23 @@ echo "      elevated: $out / handler: $got"
     || fail "elevated program's page: '$got' ($out)"
 [ "$out" = "OPEN ok 0" ] && pass "...and ShellExecuteEx says it was opened" || fail "elevated ShellExecuteEx: $out"
 
+B='C:\sgbrowser\sgbrowser.exe'
+out=$(elevated 'C:\elevurl-probe.exe' start "$B" "$U/7")
+got=$(opened "$U/7")
+echo "      elevated start: $out / browser: $got"
+[ "$got" = "$U/7 elevated 0 $sid1" ] && pass "a browser the elevated program starts by name runs as $SG_USER1, unelevated" \
+    || fail "elevated program's browser: '$got' ($out)"
+[ "$out" = "START ok 0 0" ] && pass "...and CreateProcess's handle is the browser's (waited on, exit code 0)" \
+    || fail "elevated CreateProcess of the browser: $out"
+out=$(elevated 'C:\elevurl-probe.exe' start 'C:\elevurl-probe.exe' "$U/8")
+got=$(opened "$U/8")
+case "$got" in "$U/8 elevated 1 "*) pass "a program that is not a browser still starts elevated ($out)" ;;
+    *) fail "not a browser: '$got' ($out)" ;; esac
+out=$(elevated 'C:\elevurl-probe.exe' startsusp "$B" "$U/9")
+got=$(opened "$U/9")
+[ -z "$got" ] && [ "$out" = "START fail 5" ] && pass "a browser asked for suspended is not started (access denied)" \
+    || fail "suspended browser: '$got' ($out)"
+
 
 out=$(as "$SG_USER2" timeout -s KILL 90 "$WINE" 'C:\elevurl-probe.exe' send "$sid1" "$U/6" 2>/dev/null | tr -d '\r')
 got=$(opened "$U/6")
@@ -129,6 +157,11 @@ out=$(elevated 'C:\elevurl-probe.exe' open "$U/3")
 got=$(opened "$U/3")
 [ -z "$got" ] && [ "$out" = "OPEN fail 5" ] && pass "with no shell of $SG_USER1's the page is not opened (access denied), not opened elevated" \
     || fail "no shell: handler '$got', $out"
+
+out=$(elevated 'C:\elevurl-probe.exe' start "$B" "$U/10")
+got=$(opened "$U/10")
+[ -z "$got" ] && [ "$out" = "START fail 5" ] && pass "with no shell of $SG_USER1's the browser is not started (access denied), not elevated" \
+    || fail "no shell, browser: '$got' ($out)"
 
 out=$(as "$SG_SYSTEM" timeout -s KILL 90 "$WINE" 'C:\elevurl-probe.exe' open "$U/4" 2>/dev/null | tr -d '\r')
 got=$(opened "$U/4")

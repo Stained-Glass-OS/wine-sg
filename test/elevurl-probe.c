@@ -7,7 +7,11 @@
  *   elevurl-probe squat SID  (another account) serves SID's pipe for 60 s,
  *                            logging "squatter <URL>" for what it is sent
  *   elevurl-probe send SID URL (another account) sends SID's shell a URL;
- *                            prints "SEND ok <answer>" or "SEND fail <error>" */
+ *                            prints "SEND ok <answer>" or "SEND fail <error>"
+ *   elevurl-probe start|startsusp EXE URL  CreateProcess("EXE" handle URL),
+ *                            suspended for startsusp; prints "START ok <wait>
+ *                            <exit code>" (its handle waited on) or
+ *                            "START fail <error>" (patches/sg/7741) */
 #include <windows.h>
 #include <shellapi.h>
 #include <sddl.h>
@@ -24,6 +28,26 @@ int wmain(int argc, WCHAR **argv)
         sei.nShow = SW_SHOWNORMAL;
         ok = ShellExecuteExW(&sei);
         printf("OPEN %s %lu\n", ok ? "ok" : "fail", ok ? 0 : GetLastError());
+        return 0;
+    }
+    if (argc == 4 && (!wcscmp(argv[1], L"start") || !wcscmp(argv[1], L"startsusp")))
+    {
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi;
+        WCHAR cmd[1024];
+        DWORD wait, code = 99;
+        swprintf(cmd, 1024, L"\"%ls\" handle %ls", argv[2], argv[3]);
+        if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, argv[1][5] ? CREATE_SUSPENDED : 0, NULL, NULL, &si, &pi))
+        {
+            printf("START fail %lu\n", GetLastError());
+            return 0;
+        }
+        if (argv[1][5]) ResumeThread(pi.hThread);
+        wait = WaitForSingleObject(pi.hProcess, 30000);
+        GetExitCodeProcess(pi.hProcess, &code);
+        printf("START ok %lu %lu\n", wait, code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
         return 0;
     }
     if (argc == 3 && !wcscmp(argv[1], L"handle"))
