@@ -3,8 +3,9 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <stdio.h>
+#include <string.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
     SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
     TOKEN_ELEVATION_TYPE type = 0; TOKEN_ELEVATION elev = {0}; TOKEN_LINKED_TOKEN linked = {0};
@@ -14,6 +15,44 @@ int main(void)
     BOOL member = FALSE;
     DWORD len, i, attrs = 0xffffffff;
 
+    if (argc > 2 && !strcmp(argv[1], "create"))
+    {
+        /* a program whose manifest says requireAdministrator: a filtered administrator gets
+         * ERROR_ELEVATION_REQUIRED (consent), as on Windows, not an unelevated run */
+        STARTUPINFOA si = { sizeof(si) };
+        PROCESS_INFORMATION pi;
+        DWORD code = 0;
+
+        if (CreateProcessA(argv[2], NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+        {
+            WaitForSingleObject(pi.hProcess, 60000);
+            GetExitCodeProcess(pi.hProcess, &code);
+            printf("CREATE ok %lu\n", code);
+        }
+        else printf("CREATE err %lu\n", GetLastError());
+        fflush(stdout);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "exit7")) return 7;
+    if (argc > 1 && !strcmp(argv[1], "runas"))
+    {
+        /* "Run as administrator", as an installer relaunches itself */
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        DWORD code = 0;
+        BOOL ok;
+
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+        sei.lpVerb = L"runas";
+        sei.lpFile = L"C:\\windows\\system32\\cmd.exe";
+        sei.lpParameters = L"/c exit 7";
+        sei.nShow = SW_HIDE;
+        ok = ShellExecuteExW(&sei);
+        printf("RUNAS ok %d err %lu", ok, ok ? 0 : GetLastError());
+        if (ok && sei.hProcess) { WaitForSingleObject(sei.hProcess, 60000); GetExitCodeProcess(sei.hProcess, &code); }
+        printf(" code %lu\n", code);
+        fflush(stdout);
+        return 0;
+    }
     OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token);
     AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0,0,0,0,0,0, &admins);
     GetTokenInformation(token, TokenElevationType, &type, sizeof(type), &len);
