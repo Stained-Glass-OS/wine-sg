@@ -9,6 +9,7 @@
  *     work L T R B                         each display's work area, from left to right
  *     mainbutton TITLE                     the main bar's visible buttons for our windows
  *     thumbs L T R B                       the thumbnails, when they are up
+ *     menu L T R B taskbar|program          a menu that is up, and whose
  */
 #include <windows.h>
 #include <stdio.h>
@@ -72,6 +73,14 @@ int main( int argc, char **argv )
         EnumDisplayMonitors( NULL, NULL, work, 0 );
         if (tray) EnumChildWindows( tray, button, 0 );
         printf( "mainpins %d\n", mainpins );
+        /* a menu that is up, and whose: the taskbar's (explorer, as the tray) or a program's */
+        if ((bar = FindWindowW( L"#32768", NULL )) && IsWindowVisible( bar ) && GetWindowRect( bar, &r ))
+        {
+            DWORD menu_pid = 0, tray_pid = 0;
+            GetWindowThreadProcessId( bar, &menu_pid );
+            if (tray) GetWindowThreadProcessId( tray, &tray_pid );
+            printf( "menu %ld %ld %ld %ld %s\n", r.left, r.top, r.right, r.bottom, menu_pid == tray_pid ? "taskbar" : "program" );
+        }
         /* the taskbar's thumbnails, when they are up */
         if ((bar = FindWindowW( L"SGTaskbarThumbnails", NULL )) && IsWindowVisible( bar ) && GetWindowRect( bar, &r ))
             printf( "thumbs %ld %ld %ld %ld\n", r.left, r.top, r.right, r.bottom );

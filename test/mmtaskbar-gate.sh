@@ -14,8 +14,8 @@
 #   WINE=/opt/wine-sg/bin/wine test/mmtaskbar-gate.sh
 #   SG_COMPOSITOR_BUILD=<dir with sg-compositor>, or SG_COMPOSITOR_SRC=<checkout> to build one
 # Mutants: SG_MUTANT_NO_SECOND_BARS, SG_MUTANT_MM_MAIN_SHOWS_ALL (explorer/systray.c),
-# SG_MUTANT_SECOND_NO_PINS, SG_MUTANT_SECOND_NO_AUTOHIDE, SG_MUTANT_SECOND_NO_THUMBNAILS (7761,
-# explorer/systray.c),
+# SG_MUTANT_SECOND_NO_PINS, SG_MUTANT_SECOND_NO_AUTOHIDE, SG_MUTANT_SECOND_NO_THUMBNAILS (7761),
+# SG_MUTANT_SECOND_SYSTEM_MENU (7762, explorer/systray.c),
 # SG_MUTANT_ICONS_AT_DESKTOP_ORIGIN (explorer/desktop.c), SG_MUTANT_DISPLAYCHANGE_DESKTOP_ONLY
 # (win32u/sysparams.c).
 set -u
@@ -130,6 +130,13 @@ echo "$t" | awk '{ exit !($2 >= 1280 && $4 <= 2560 && $5 <= 682) }' &&
     pass "thumbnails for a button on another display's bar, above it on that display ($t)" ||
     fail "thumbnails on display 2: '$t'"
 xdotool mousemove 1900 300; sleep 1
+# a right click on it: the window's jump list (the taskbar's menu), on that display
+xdotool mousemove 1400 701; sleep 0.3; xdotool click 3; sleep 1.5
+state menu
+m=$(grep '^menu' "$T/menu.txt")
+echo "$m" | awk '{ exit !($2 >= 1280 && $4 <= 2560 && $6 == "taskbar") }' &&
+    pass "a right click on it: the window's jump list, on that display ($m)" || fail "right click on display 2: '$m'"
+xdotool key Escape; sleep 0.5; xdotool mousemove 1900 300; sleep 1
 
 # auto-hide: the other displays' bars tuck away too, and come back at the edge
 R "$ADV" MMTaskbarMode 0; R 'HKCU\Software\Stained Glass\Taskbar' AutoHide 1; P apply
