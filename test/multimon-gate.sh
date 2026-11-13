@@ -86,6 +86,11 @@ case "$(xwininfo -root 2>/dev/null | awk '/Width:/ {w=$2} /Height:/ {h=$2} END {
     *) echo "SKIP: the compositor did not make two 1280x720 outputs: $(xwininfo -root | grep -E 'Width|Height' | tr -d ' \n')"; exit 77 ;;
 esac
 
+# the two outputs, as the X server lists them (xrandr --listmonitors puts the
+# primary one first, so it cannot tell which is which after a change)
+OUT1=$(xrandr 2>/dev/null | awk '/ connected/ {print $1}' | sed -n 1p)
+OUT2=$(xrandr 2>/dev/null | awk '/ connected/ {print $1}' | sed -n 2p)
+
 # --- the shell's desktop over both monitors ---
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v HostMonitors /d Y /f >/dev/null 2>&1; "$WINESERVER" -w
 desktop span.txt
@@ -98,6 +103,46 @@ grep -q '2560x720+0+0' "$T/span.txt.x" && pass "the desktop's X window is both m
 grep -q '^max 0 [0-9]* [0-9]* 12[0-9][0-9] ' "$T/span.txt" && grep -q '^max 1 128[0-9] [0-9]* 25[0-9][0-9] ' "$T/span.txt" &&
     pass "a window maximized on either monitor fills that one ($(grep '^max' "$T/span.txt" | tr '\n' ' '))" ||
     fail "maximized: $(grep '^max' "$T/span.txt" | tr '\n' ' ')"
+
+# --- the main display on the right (Settings: "Make this my main display",
+# sg-settingsctl display primary: the X server's primary output) -- as on
+# Windows the main display is at 0,0 and the one left of it at -1280 ---
+if [ -n "$OUT2" ] && xrandr --output "$OUT2" --primary 2>/dev/null; then
+    desktop right.txt
+    grep -q '^monitors 2 virtual -1280 0 2560 720' "$T/right.txt" && grep -q '^monitor [^ ]* 0 0 1280 720 primary' "$T/right.txt" &&
+        grep -q '^monitor [^ ]* -1280 0 0 720 -' "$T/right.txt" &&
+        pass "the main display on the right: it is at 0,0, the other left of it ($(grep '^monitor' "$T/right.txt" | tr '\n' ' '))" ||
+        fail "the main display on the right: $(grep -E '^monitor' "$T/right.txt" | tr '\n' ' ')"
+    grep -q '2560x720+0+0' "$T/right.txt.x" && pass "the desktop's X window still covers both" ||
+        fail "the desktop's X window with the main display on the right: $(cat "$T/right.txt.x")"
+    xrandr --output "$OUT1" --primary 2>/dev/null
+else
+    fail "could not make the second output primary"
+fi
+
+# --- the main display changed while programs run (Settings' "Make this my
+# main display" in a session: xrandr --primary, which sends only RandR's screen
+# change, wine-sg 7752): a running program sees it, and what it shows at 0,0
+# is on the new main display, the right one -- it stayed on the left ---
+rm -f "$WINEPREFIX/drive_c/live.txt" "$WINEPREFIX/drive_c/live.txt.after" "$WINEPREFIX/drive_c/go"
+timeout -s KILL 180 "$WINE" explorer /desktop=shell,2560x720 'C:\multimon-probe.exe' 'C:\live.txt' 'C:\go' >/dev/null 2>&1 &
+i=0; while ! grep -q '^ready' "$WINEPREFIX/drive_c/live.txt" 2>/dev/null && [ $i -lt 240 ]; do sleep 0.5; i=$((i + 1)); done
+xrandr --output "$OUT2" --primary 2>/dev/null
+sleep 2
+: > "$WINEPREFIX/drive_c/go"
+i=0; while ! grep -q '^ready' "$WINEPREFIX/drive_c/live.txt.after" 2>/dev/null && [ $i -lt 120 ]; do sleep 0.5; i=$((i + 1)); done
+tr -d '\r' < "$WINEPREFIX/drive_c/live.txt.after" > "$T/live.after" 2>/dev/null
+mm=$(xwininfo -root -tree 2>/dev/null | grep '"mmafter"' | head -1)
+mb=$(xwininfo -root -tree 2>/dev/null | grep '"mmbefore"' | head -1)
+grep -q '^monitor [^ ]* 0 0 1280 720 primary' "$T/live.after" && grep -q '^monitor [^ ]* -1280 0 0 720 -' "$T/live.after" &&
+    pass "a running program sees the new main display ($(grep '^monitor' "$T/live.after" | tr '\n' ' '))" ||
+    fail "a running program after the main display changed: $(grep '^monitor' "$T/live.after" | tr '\n' ' ')"
+echo "$mm" | grep -q '+1290+10' && pass "and its window at 0,0 is on the main display, now the right one ($(echo "$mm" | sed 's/.*) *//'))" ||
+    fail "its window at 10,10: '$mm'"
+echo "$mb" | grep -q '+1290+10' && pass "and its window from before moved with the main display ($(echo "$mb" | sed 's/.*) *//'))" ||
+    fail "its window from before the change: '$mb'"
+"$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null
+xrandr --output "$OUT1" --primary 2>/dev/null
 
 # --- without HostMonitors: Wine's own virtual desktop, one monitor ---
 "$WINE" reg delete 'HKCU\Software\Wine\Explorer' /v HostMonitors /f >/dev/null 2>&1; "$WINESERVER" -w

@@ -5,6 +5,12 @@
  *     monitor NAME L T R B primary|- HZ
  *     max MONITOR-INDEX L T R B     a window shown maximized on that monitor
  *     ready
+ *   multimon-probe.exe OUT TRIGGER   then, once the file TRIGGER is there (the main display
+ *     changed while it ran), writes to OUT.after:
+ *     monitor ... as above, as this running program now sees them
+ *     ready
+ *   and shows a window "mmafter" at 10,10 for a few seconds; a window "mmbefore", also at
+ *   10,10, is there from before the change
  */
 #include <windows.h>
 #include <stdio.h>
@@ -59,5 +65,47 @@ int main(int argc, char **argv)
     }
     fprintf(out, "ready\n");
     fclose(out);
+    if (argc >= 3)
+    {
+        char after[MAX_PATH];
+        HWND w;
+        MSG msg;
+        DWORD start = GetTickCount();
+        HWND before = CreateWindowA("multimon", "mmbefore", WS_POPUP | WS_VISIBLE, 10, 10, 150, 80, NULL, NULL,
+                                    wc.hInstance, NULL);
+        /* a running program, its message loop going, while the displays change */
+        while (GetFileAttributesA(argv[2]) == INVALID_FILE_ATTRIBUTES && GetTickCount() - start < 90000)
+        {
+            while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+            Sleep(100);
+        }
+        start = GetTickCount();
+        while (GetTickCount() - start < 3000)
+        {
+            while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+            Sleep(50);
+        }
+        snprintf(after, sizeof(after), "%s.after", argv[1]);
+        if (!(out = fopen(after, "w"))) return 2;
+        nmons = 0;
+        EnumDisplayMonitors(NULL, NULL, each, 0);
+        w = CreateWindowA("multimon", "mmafter", WS_POPUP | WS_VISIBLE, 10, 10, 200, 100, NULL, NULL, wc.hInstance, NULL);
+        start = GetTickCount();
+        while (GetTickCount() - start < 1500)
+        {
+            while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+            Sleep(50);
+        }
+        fprintf(out, "ready\n");
+        fclose(out);
+        start = GetTickCount();
+        while (GetTickCount() - start < 4000)
+        {
+            while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+            Sleep(50);
+        }
+        DestroyWindow(w);
+        DestroyWindow(before);
+    }
     return 0;
 }
