@@ -4,9 +4,11 @@
  *   mmtaskbar-probe.exe apply              WM_SETTINGCHANGE "TraySettings", as Settings sends it
  *   mmtaskbar-probe.exe state              prints:
  *     main L T R B
- *     second L T R B                       each other display's bar (Shell_SecondaryTrayWnd)
+ *     second L T R B pins N windows N      each other display's bar (Shell_SecondaryTrayWnd):
+ *                                          its pinned programs not running, its windows' buttons
  *     work L T R B                         each display's work area, from left to right
  *     mainbutton TITLE                     the main bar's visible buttons for our windows
+ *     thumbs L T R B                       the thumbnails, when they are up
  */
 #include <windows.h>
 #include <stdio.h>
@@ -20,9 +22,13 @@ static BOOL CALLBACK work( HMONITOR m, HDC dc, LPRECT r, LPARAM p )
     return TRUE;
 }
 
+static int mainpins;
+
 static BOOL CALLBACK button( HWND child, LPARAM p )
 {
     HWND win = (HWND)GetWindowLongPtrW( child, GWLP_ID );
+    /* a pinned program's button (explorer's SG_PIN_FIRST + its index) */
+    if (IsWindowVisible( child ) && (ULONG_PTR)win >= 0x5700 && (ULONG_PTR)win < 0x5700 + 48) mainpins++;
     char title[64];
     if (IsWindowVisible( child ) && IsWindow( win ) && GetWindowTextA( win, title, sizeof(title) ) &&
         !strncmp( title, "mmwin", 5 ))
@@ -58,9 +64,17 @@ int main( int argc, char **argv )
         if (tray && GetWindowRect( tray, &r )) printf( "main %ld %ld %ld %ld\n", r.left, r.top, r.right, r.bottom );
         while ((bar = FindWindowExW( NULL, bar, L"Shell_SecondaryTrayWnd", NULL )))
             if (IsWindowVisible( bar ) && GetWindowRect( bar, &r ))
-                printf( "second %ld %ld %ld %ld\n", r.left, r.top, r.right, r.bottom );
+            {
+                ULONG_PTR n = (ULONG_PTR)GetPropW( bar, L"SgSecondButtons" );
+                printf( "second %ld %ld %ld %ld pins %u windows %u\n", r.left, r.top, r.right, r.bottom,
+                        (unsigned)LOWORD(n), (unsigned)HIWORD(n) );
+            }
         EnumDisplayMonitors( NULL, NULL, work, 0 );
         if (tray) EnumChildWindows( tray, button, 0 );
+        printf( "mainpins %d\n", mainpins );
+        /* the taskbar's thumbnails, when they are up */
+        if ((bar = FindWindowW( L"SGTaskbarThumbnails", NULL )) && IsWindowVisible( bar ) && GetWindowRect( bar, &r ))
+            printf( "thumbs %ld %ld %ld %ld\n", r.left, r.top, r.right, r.bottom );
         return 0;
     }
     return 2;

@@ -14,6 +14,8 @@
 #   WINE=/opt/wine-sg/bin/wine test/mmtaskbar-gate.sh
 #   SG_COMPOSITOR_BUILD=<dir with sg-compositor>, or SG_COMPOSITOR_SRC=<checkout> to build one
 # Mutants: SG_MUTANT_NO_SECOND_BARS, SG_MUTANT_MM_MAIN_SHOWS_ALL (explorer/systray.c),
+# SG_MUTANT_SECOND_NO_PINS, SG_MUTANT_SECOND_NO_AUTOHIDE, SG_MUTANT_SECOND_NO_THUMBNAILS (7761,
+# explorer/systray.c),
 # SG_MUTANT_ICONS_AT_DESKTOP_ORIGIN (explorer/desktop.c), SG_MUTANT_DISPLAYCHANGE_DESKTOP_ONLY
 # (win32u/sysparams.c).
 set -u
@@ -25,7 +27,8 @@ MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 RC=0; CP=""
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
-command -v "$MINGW" >/dev/null && command -v xwininfo >/dev/null || { echo "SKIP: needs mingw-w64 and xwininfo"; exit 77; }
+command -v "$MINGW" >/dev/null && command -v xwininfo >/dev/null && command -v xdotool >/dev/null ||
+    { echo "SKIP: needs mingw-w64, xwininfo and xdotool"; exit 77; }
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 SRC="${SG_COMPOSITOR_SRC:-$HERE/../../sg-compositor}"
 [ -d "$SRC" ] || SRC="${SG_REAL_HOME:-$HOME}/Stained-Glass-OS/sg-compositor"
@@ -75,6 +78,8 @@ R() { "$WINE" reg add "$1" /v "$2" /t REG_DWORD /d "$3" /f >/dev/null 2>&1; }
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer\Desktops' /v shell /d 3840x720 /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v HostMonitors /d Y /f >/dev/null 2>&1
+# a pinned program, as the image's default pins give every account
+"$WINE" reg add 'HKLM\Software\Stained Glass\Taskbar' /v DefaultPins /t REG_MULTI_SZ /d 'Notepad|%SystemRoot%\system32\notepad.exe' /f >/dev/null 2>&1
 "$WINESERVER" -w
 
 P() { "$WINE" 'C:\mmtaskbar-probe.exe' "$@" 2>/dev/null | tr -d '\r'; }
@@ -99,6 +104,10 @@ grep -q '^main 0 680 1280 720' "$T/default.txt" && pass "the main taskbar on the
     pass "a bar at the bottom of each other display ($(seconds default))" || fail "other displays' bars: '$(seconds default)'"
 [ "$(works default)" = "0,0,1280,680 1280,0,2560,680 2560,0,3840,680 " ] &&
     pass "each display's work area stops at its own bar" || fail "work areas: '$(works default)'"
+# the pinned programs (the defaults) on the other displays' bars too, and the two windows
+grep -q '^mainpins [1-9]' "$T/default.txt" && [ "$(grep '^second' "$T/default.txt" | awk '$7 > 0 && $9 == 2' | wc -l)" = 2 ] &&
+    pass "the other displays' bars have the pinned programs and both windows ($(grep '^second' "$T/default.txt" | head -1 | cut -d' ' -f6-))" ||
+    fail "other displays' bars' buttons: $(grep -E '^(second|mainpins)' "$T/default.txt" | tr '\n' ' ')"
 [ "$(grep -c '^mainbutton' "$T/default.txt")" = 2 ] &&
     pass "Show taskbar buttons on all taskbars: the main bar has both windows" || fail "main bar buttons (all): $(grep '^mainbutton' "$T/default.txt" | tr '\n' ' ')"
 
@@ -107,6 +116,33 @@ state where
 grep -q '^mainbutton mmwin1' "$T/where.txt" && ! grep -q '^mainbutton mmwin3' "$T/where.txt" &&
     pass "taskbar where the window is open: the main bar has only the main display's window" ||
     fail "main bar buttons (where): $(grep '^mainbutton' "$T/where.txt" | tr '\n' ' ')"
+
+grep '^second' "$T/where.txt" | awk '$7 == 0' | grep -q . && pass "taskbar where the window is open: no pinned programs on the other bars" ||
+    fail "pins on the other bars (where): $(grep '^second' "$T/where.txt" | tr '\n' ' ')"
+
+# thumbnails: the pointer resting on a window's button on display 2's bar
+# (Start, the pinned program, then the windows) shows them above that bar
+R "$ADV" MMTaskbarMode 0; P apply; sleep 2
+xdotool mousemove 1395 700; sleep 0.3; xdotool mousemove 1400 701; sleep 2
+state thumbs
+t=$(grep '^thumbs' "$T/thumbs.txt")
+echo "$t" | awk '{ exit !($2 >= 1280 && $4 <= 2560 && $5 <= 682) }' &&
+    pass "thumbnails for a button on another display's bar, above it on that display ($t)" ||
+    fail "thumbnails on display 2: '$t'"
+xdotool mousemove 1900 300; sleep 1
+
+# auto-hide: the other displays' bars tuck away too, and come back at the edge
+R "$ADV" MMTaskbarMode 0; R 'HKCU\Software\Stained Glass\Taskbar' AutoHide 1; P apply
+xdotool mousemove 1900 300; sleep 3
+state hidden
+[ "$(seconds hidden)" = "1280,718,2560,758 2560,718,3840,758 " ] && pass "auto-hide: the other displays' bars tuck away" ||
+    fail "auto-hide: '$(seconds hidden)'"
+xdotool mousemove 1900 719; sleep 2
+state shown
+[ "$(seconds shown)" = "1280,680,2560,720 2560,718,3840,758 " ] &&
+    pass "and the one whose edge the pointer reaches comes back, the other stays away" || fail "auto-hide shown: '$(seconds shown)'"
+xdotool mousemove 1900 300
+R 'HKCU\Software\Stained Glass\Taskbar' AutoHide 0; P apply; sleep 2
 
 R "$ADV" MMTaskbarMode 0; R "$ADV" MMTaskbarEnabled 0; P apply; sleep 2
 state off
