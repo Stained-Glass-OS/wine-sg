@@ -76,6 +76,16 @@ desktop() {
     xwininfo -root -children 2>/dev/null | grep 'Wine Desktop' > "$T/$1.x"
     "$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null
 }
+# band X1 Y1 X2 Y2 OUT: a rubber band dragged with the left button, the desktop's dump while it is held into OUT
+band() {
+    xdotool mousemove "$1" "$2" click 1; sleep 0.5   # the desktop active first
+    xdotool mousemove "$1" "$2" mousedown 1; sleep 0.3
+    xdotool mousemove $(( $1 + ($3 - $1) / 8 )) $(( $2 + ($4 - $2) / 8 )); sleep 0.3
+    xdotool mousemove $(( $1 + ($3 - $1) / 2 )) $(( $2 + ($4 - $2) / 2 )); sleep 0.3
+    xdotool mousemove "$3" "$4"; sleep 0.3; xdotool mousemove $(( $3 + 1 )) $(( $4 + 1 )); sleep 0.6
+    tr -d '\r' < "$T/live.dump" > "$5" 2>/dev/null
+    xdotool mouseup 1; sleep 1
+}
 start
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
 "$WINE" reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d x11 /f >/dev/null 2>&1
@@ -125,8 +135,13 @@ fi
 # change, wine-sg 7752): a running program sees it, and what it shows at 0,0
 # is on the new main display, the right one -- it stayed on the left ---
 rm -f "$WINEPREFIX/drive_c/live.txt" "$WINEPREFIX/drive_c/live.txt.after" "$WINEPREFIX/drive_c/go"
-timeout -s KILL 180 "$WINE" explorer /desktop=shell,2560x720 'C:\multimon-probe.exe' 'C:\live.txt' 'C:\go' >/dev/null 2>&1 &
+rm -f "$T/live.dump"
+SG_DESKTOP_DUMP="Z:$T/live.dump" timeout -s KILL 180 "$WINE" explorer /desktop=shell,2560x720 'C:\multimon-probe.exe' 'C:\live.txt' 'C:\go' >/dev/null 2>&1 &
 i=0; while ! grep -q '^ready' "$WINEPREFIX/drive_c/live.txt" 2>/dev/null && [ $i -lt 240 ]; do sleep 0.5; i=$((i + 1)); done
+if command -v xdotool >/dev/null; then
+    sleep 3
+    band 800 450 1100 640 "$T/live.band0"   # (clear of the probe's console, top left)
+fi
 xrandr --output "$OUT2" --primary 2>/dev/null
 sleep 2
 : > "$WINEPREFIX/drive_c/go"
@@ -141,6 +156,23 @@ echo "$mm" | grep -q '+1290+10' && pass "and its window at 0,0 is on the main di
     fail "its window at 10,10: '$mm'"
 echo "$mb" | grep -q '+1290+10' && pass "and its window from before moved with the main display ($(echo "$mb" | sed 's/.*) *//'))" ||
     fail "its window from before the change: '$mb'"
+# the desktop's window is over both displays again, from the new origin, and
+# the mouse's points in it are where they are: a rubber band dragged out on the
+# main display (now the right one) is drawn there -- it kept its old place, so
+# the band was a display's width off, on the other display (David 2026-11-13)
+if command -v xdotool >/dev/null; then
+    band 2000 450 2300 640 "$T/live.band"
+    grep -q 'deskrect=-1280,0,1280,720' "$T/live.band" && grep -q 'bandrect=2000,450,2302,642' "$T/live.band" &&
+        pass "the desktop over both displays again, and a band dragged on the main display drawn there ($(grep -o 'bandrect=[^ ]*' "$T/live.band"), $(grep -o 'deskrect=[^ ]*' "$T/live.band"))" ||
+        fail "the desktop after the main display changed: $(head -1 "$T/live.band" 2>/dev/null)"
+    # and a click on an icon there selects it (it missed: the point was a display's width off)
+    set -- $(tr -d '\r' < "$T/live.dump" | sed -n 's/^item 0 \([0-9-]*\),\([0-9-]*\) .*/\1 \2/p')
+    if [ $# -eq 2 ]; then
+        xdotool mousemove "$1" "$2"; sleep 0.5; xdotool click 1; sleep 0.5; xdotool click 1; sleep 1   # (the first may only activate the desktop)
+        tr -d '\r' < "$T/live.dump" | head -1 | grep -q ' sel=0,' && pass "a click on an icon on the main display selects it (at $1,$2)" ||
+            fail "a click on the first icon at $1,$2: $(tr -d '\r' < "$T/live.dump" | head -1)"
+    else fail "no icon in the desktop's dump"; fi
+fi
 "$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null
 xrandr --output "$OUT1" --primary 2>/dev/null
 
