@@ -188,6 +188,44 @@ static void restricted(void)
     else printf("CreateRestrictedToken(chrome) failed %lu\n", GetLastError());
 }
 
+/* a sandbox's token, as Chrome's audio service has it (USER_LIMITED): only Everyone, Users,
+ * Interactive, Authenticated Users, the logon SID and the user enabled, every other group deny-only.
+ * HKLM\Software\Classes -- SYSTEM re-creates it at boot -- must open for reading: it did not
+ * (its DACL granted read only to Domain Users), CoCreateInstance(MMDeviceEnumerator) failed and the
+ * Windows build of Chrome had no sound (wine-sg 7768) */
+static void sandbox_read(const WCHAR *path)
+{
+    HANDLE token, r = NULL, imp = NULL;
+    TOKEN_GROUPS *groups;
+    SID_AND_ATTRIBUTES disable[64];
+    DWORD len = 0, i, n = 0;
+    HKEY key;
+    LONG err;
+
+    OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &token);
+    GetTokenInformation(token, TokenGroups, NULL, 0, &len);
+    groups = malloc(len);
+    GetTokenInformation(token, TokenGroups, groups, len, &len);
+    for (i = 0; i < groups->GroupCount && n < ARRAY_SIZE(disable); i++)
+    {
+        PSID sid = groups->Groups[i].Sid;
+        if ((groups->Groups[i].Attributes & SE_GROUP_LOGON_ID) || IsWellKnownSid(sid, WinWorldSid) ||
+            IsWellKnownSid(sid, WinBuiltinUsersSid) || IsWellKnownSid(sid, WinInteractiveSid) ||
+            IsWellKnownSid(sid, WinAuthenticatedUserSid)) continue;
+        disable[n].Sid = sid; disable[n].Attributes = 0; n++;
+    }
+    if (!CreateRestrictedToken(token, DISABLE_MAX_PRIVILEGE, n, disable, 0, NULL, 0, NULL, &r) ||
+        !DuplicateToken(r, SecurityImpersonation, &imp) || !SetThreadToken(NULL, imp))
+    {
+        printf("SANDBOXREAD setup failed %lu\n", GetLastError());
+        return;
+    }
+    err = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key);
+    if (!err) RegCloseKey(key);
+    RevertToSelf();
+    printf("SANDBOXREAD %ls (%lu groups off) -> %ld\n", path, n, err);
+}
+
 /* a child writes 200 lines to a pipe, the parent reads them all: with a shared server that cannot
  * signal another user's thread, the reader's I/O APC was dropped and ReadFile failed with
  * ERROR_ALERTED (5926) */
@@ -261,6 +299,7 @@ int main(int argc, char **argv)
         RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\MACHINE\\SgUserMade");
     }
     else if (!strcmp(m, "restricted")) restricted();
+    else if (!strcmp(m, "sandboxread")) sandbox_read(argc > 2 && !strcmp(argv[2], "probe") ? L"Software\\SgTokProbe" : L"Software\\Classes");
     else if (!strcmp(m, "pipe")) pipe_test();
     else if (!strcmp(m, "lines"))
     {

@@ -15,7 +15,7 @@
 #     System; another user does not see it
 #   a 64-bit program, and a 32-bit one with requestedExecutionLevel: denied; SYSTEM's 32-bit program: no store
 #   WINE=... WINESERVER=... test/hklmsd-gate.sh
-# Mutants: server SG_MUTANT_MKEY_NODEFAULT, SG_MUTANT_MKEY_AU_WRITE, SG_MUTANT_C2R_HIVE_READONLY; kernelbase SG_MUTANT_VIRT_ANY_LEVEL,
+# Mutants: server SG_MUTANT_NO_BUILTIN_USERS_READ, SG_MUTANT_MKEY_NODEFAULT, SG_MUTANT_MKEY_AU_WRITE, SG_MUTANT_C2R_HIVE_READONLY; kernelbase SG_MUTANT_VIRT_ANY_LEVEL,
 # SG_MUTANT_VIRT_64BIT, SG_MUTANT_VIRT_NOT_EXCLUDED, SG_MUTANT_VIRT_NO_STORE_READ.
 # Needs passwordless sudo and the accounts of usersessions-gate.sh; exit 77 otherwise.
 set -u
@@ -136,6 +136,13 @@ done
 out=$(run "$SG_SYSTEM" 'C:\tok.exe' iw)
 [ "$(v "$out" ELEVATED)" = 1 ] && [ "$(v "$out" "CREATE hklm Software\\SgTokProbe ->")" = 0 ] && [ "$(v "$out" "OPENW hklm Software\\Microsoft\\Windows\\CurrentVersion\\Run ->")" = 0 ] \
     && pass "SYSTEM (elevated) writes HKLM\\Software and Run" || fail "SYSTEM: $out"
+# a sandbox's token (Chrome's audio service: only Everyone, Users, Interactive, Authenticated Users,
+# the logon SID and the user enabled) reads a key SYSTEM created -- as HKLM\Software\Classes, which it
+# re-creates at boot: their DACL granted read to Domain Users alone, Windows Chrome had no sound (7768)
+run "$SG_SYSTEM" reg add 'HKLM\Software\SgTokProbe' /f >/dev/null 2>&1
+out=$(run "$SG_USER1" 'C:\tok.exe' sandboxread probe)
+echo "$out" | grep -q '^SANDBOXREAD Software\\SgTokProbe (.*) -> 0' && pass "a sandbox's token reads a key SYSTEM created" \
+    || fail "a sandbox's token on a key SYSTEM created: $(echo "$out" | grep SANDBOXREAD)"
 
 # --- legacy 32-bit program of the standard user: virtualized
 out=$(run "$SG_USER1" 'C:\reg32.exe' keep)
