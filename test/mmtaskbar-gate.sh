@@ -108,6 +108,15 @@ grep -q '^main 0 680 1280 720' "$T/default.txt" && pass "the main taskbar on the
 grep -q '^mainpins [1-9]' "$T/default.txt" && [ "$(grep '^second' "$T/default.txt" | awk '$7 > 0 && $9 == 2' | wc -l)" = 2 ] &&
     pass "the other displays' bars have the pinned programs and both windows ($(grep '^second' "$T/default.txt" | head -1 | cut -d' ' -f6-))" ||
     fail "other displays' bars' buttons: $(grep -E '^(second|mainpins)' "$T/default.txt" | tr '\n' ' ')"
+# the windows' buttons on display 2's bar show an icon -- the plain program
+# icon when the program has none of its own, as the main bar does; they were
+# empty whenever the window's WM_GETICON came too late (David 2026-11-13)
+WAYLAND_DISPLAY="$T/priv.sock" XDG_RUNTIME_DIR="$T/comp-xdg" grim "$T/all.png" >/dev/null 2>&1
+convert "$T/all.png" -crop 400x34+1330+682 +repage "$T/bar2.png" 2>/dev/null
+# (the plain program icon's coloured title bar: the only such pixels there, the labels being white on grey)
+n=$(convert "$T/bar2.png" -fx '(b-g)>0.25 ? 1 : 0' -format '%[fx:int(mean*w*h)]\n' info: 2>/dev/null | tail -1)
+[ "${n:-0}" -ge 60 ] && pass "the windows' buttons on another display's bar have icons ($n icon pixels)" ||
+    fail "the windows' buttons on another display's bar: no icons (${n:-?} icon pixels)"
 [ "$(grep -c '^mainbutton' "$T/default.txt")" = 2 ] &&
     pass "Show taskbar buttons on all taskbars: the main bar has both windows" || fail "main bar buttons (all): $(grep '^mainbutton' "$T/default.txt" | tr '\n' ' ')"
 
