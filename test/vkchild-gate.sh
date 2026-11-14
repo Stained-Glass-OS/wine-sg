@@ -8,7 +8,8 @@
 # a dialog closing over the window, or painting nearby. Windows' compositor
 # keeps a child swap chain's last frame: Excel's formula bar, sheet tabs and
 # status bar, Outlook's panes, whole Office windows stayed white. The probe
-# clears a child to red once; a window then covers it for a second and goes.
+# clears a child to red once; a window then covers it for a second and goes. A resized
+# top-level's child is asked to paint again (7780).
 #
 #   WINE=/opt/wine-sg/bin/wine test/vkchild-gate.sh
 set -u
@@ -55,6 +56,10 @@ sleep 9
 "$WINE" 'C:\\vkchild.exe' cover
 sleep 3
 import -window root "$T/d.png"
+"$WINE" 'C:\\vkchild.exe' resize > "$T/resize.out" 2>/dev/null &
+sleep 6
+import -window root "$T/e.png"
+sleep 6
 EOS
 chmod +x "$T/session.sh"
 timeout -s KILL 240 xvfb-run -a -s '-screen 0 800x600x24' "$T/session.sh"
@@ -80,6 +85,16 @@ echo "      nested: inner $N, outer $NR"
 R="$(px d 250,225) $(px d 151,151)"
 echo "      after a restack and a cover: $R ($(tr '\n' ' ' < "$T/restack.out" 2>/dev/null))"
 [ "$R" = "$red $red" ] && pass "a restacked top-level's child frame is shown again after an expose" || fail "after a restack: $R"
+# 7780: the top-level was resized after its child presented (Restore Down): the frame kept for the
+# child is dropped, and the child is asked to paint, which presents again
+Z="$(px e 250,225) $(px e 300,250)"; ZN="$(sed -n 's/^repaints=//p' "$T/resize.out" 2>/dev/null | tr -d '\r ')"
+echo "      after a resize: $Z, repaints ${ZN:-none}"
+[ "${ZN:-0}" -ge 1 ] 2>/dev/null && pass "a resized top-level's child is asked to paint again" || fail "no WM_PAINT for the child after the resize (${ZN:-none})"
+[ "$Z" = "$red $red" ] && pass "and its frame is shown again" || fail "after a resize: $Z"
+ZL="$(sed -n 's/^later=//p' "$T/resize.out" 2>/dev/null | tr -d '\r ')"; ZM="$(sed -n 's/^moved=//p' "$T/resize.out" 2>/dev/null | tr -d '\r ')"
+echo "      repaints in the 2 s after: ${ZL:-none}; after a plain move: ${ZM:-none}"
+[ "${ZL:-x}" = 0 ] && pass "the repaint's present does not ask for another (no feedback loop)" || fail "repaints kept coming: ${ZL:-none}"
+[ "${ZM:-x}" = 0 ] && pass "a plain move of the top-level asks for no repaint" || fail "a plain move repainted: ${ZM:-none}"
 echo
 [ "$RC" -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"

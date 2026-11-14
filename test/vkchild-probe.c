@@ -10,6 +10,9 @@
  * With "nest" a window inside the child presents green before the child
  * presents red (patches/sg/1524): the inner frame stays over the outer one.
  *
+ * With "resize" the top-level is resized after the child presented (7780): the child is asked to
+ * paint again and presents again (prints "repaints=<n>").
+ *
  * Usage: vkchild-probe.exe [nest] -- opens "vkchild" (400x300 white) with a child
  * (200x150 at 50,50) cleared red once by Vulkan, prints "presented=<0|1>",
  * then keeps running (the gate covers and uncovers it, and reads pixels). */
@@ -21,9 +24,23 @@
 
 #define LOAD(name) PFN_##name p##name = (PFN_##name)pvkGetInstanceProcAddr(inst, #name)
 
+static HWND repaint_child;
+static int repaints;
+static int present_color(HWND child, float red_c, float green_c, float blue_c);
+
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_DESTROY) PostQuitMessage(0);
+    if (msg == WM_PAINT && hwnd == repaint_child)
+    {
+        /* as Office's panes do: a WM_PAINT presents the frame again */
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps);
+        repaints++;
+        present_color(hwnd, 1.0f, 0.0f, 0.0f);
+        return 0;
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -151,6 +168,31 @@ int main(int argc, char **argv)
     }
     ok = present_color(child, 1.0f, 0.0f, 0.0f);
     printf("presented=%d\n", ok); fflush(stdout);
+    if (argc > 1 && !strcmp(argv[1], "resize"))
+    {
+        /* the top-level is resized (what Restore Down does): the child's frame kept for it is
+         * dropped, and the child is asked to paint again (it presents a new one) */
+        DWORD end;
+        Sleep(1000);
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        repaint_child = child;
+        repaints = 0;
+        SetWindowPos(top, NULL, 0, 0, 420, 300, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        end = GetTickCount() + 2000;
+        while (GetTickCount() < end) { while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg); Sleep(20); }
+        printf("repaints=%d\n", repaints);
+        /* no feedback: the repaint's present does not drop the frame again */
+        repaints = 0;
+        end = GetTickCount() + 2000;
+        while (GetTickCount() < end) { while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg); Sleep(20); }
+        printf("later=%d\n", repaints);
+        /* a plain move keeps the frame where it is relative to the window: no repaint */
+        repaints = 0;
+        SetWindowPos(top, NULL, 120, 110, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        end = GetTickCount() + 2000;
+        while (GetTickCount() < end) { while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg); Sleep(20); }
+        printf("moved=%d\n", repaints); fflush(stdout);
+    }
     if (argc > 1 && !strcmp(argv[1], "restack"))
     {
         /* the top-level is restacked (what showing an owned dialog does to
