@@ -88,20 +88,20 @@ int main(void)
     tmp = NULL;
     check(QI(tr, &IID_Rot3D, &tmp) == E_NOINTERFACE && !tmp, "translate3d: not a rotation");
 
-    check(((f_float)SLOT(tr, 3))(tr, 1.0f) == S_OK && ((f_float)SLOT(tr, 5))(tr, 2.0f) == S_OK
-          && ((f_float)SLOT(tr, 7))(tr, 3.0f) == S_OK, "translate3d: offsets x, y, z");
-    check(((f_float)SLOT(tr, 7))(tr, nan) == E_INVALIDARG, "translate3d: SetOffsetZ(NaN) is E_INVALIDARG");
-    check(((f_ptr)SLOT(tr, 8))(tr, anim) == S_OK, "translate3d: SetOffsetZAnimation");
-    check(((f_ptr)SLOT(tr, 8))(tr, &foreign_obj) == E_INVALIDARG, "translate3d: a foreign animation is E_INVALIDARG");
-    check(((f_float)SLOT(sc, 9))(sc, 2.0f) == S_OK && ((f_float)SLOT(sc, 13))(sc, 1.0f) == S_OK, "scale3d: Z and center Z");
-    check(((f_float)SLOT(ro, 3))(ro, 45.0f) == S_OK && ((f_float)SLOT(ro, 9))(ro, 1.0f) == S_OK
-          && ((f_float)SLOT(ro, 15))(ro, 0.5f) == S_OK, "rotate3d: angle, axis Z, center Z");
-    check(((f_float)SLOT(ro, 3))(ro, nan) == E_INVALIDARG, "rotate3d: SetAngle(NaN) is E_INVALIDARG");
+    check(((f_float)SLOT(tr, 4))(tr, 1.0f) == S_OK && ((f_float)SLOT(tr, 6))(tr, 2.0f) == S_OK
+          && ((f_float)SLOT(tr, 8))(tr, 3.0f) == S_OK, "translate3d: offsets x, y, z");
+    check(((f_float)SLOT(tr, 8))(tr, nan) == E_INVALIDARG, "translate3d: SetOffsetZ(NaN) is E_INVALIDARG");
+    check(((f_ptr)SLOT(tr, 7))(tr, anim) == S_OK, "translate3d: SetOffsetZAnimation");
+    check(((f_ptr)SLOT(tr, 7))(tr, &foreign_obj) == E_INVALIDARG, "translate3d: a foreign animation is E_INVALIDARG");
+    check(((f_float)SLOT(sc, 10))(sc, 2.0f) == S_OK && ((f_float)SLOT(sc, 14))(sc, 1.0f) == S_OK, "scale3d: Z and center Z");
+    check(((f_float)SLOT(ro, 4))(ro, 45.0f) == S_OK && ((f_float)SLOT(ro, 10))(ro, 1.0f) == S_OK
+          && ((f_float)SLOT(ro, 16))(ro, 0.5f) == S_OK, "rotate3d: angle, axis Z, center Z");
+    check(((f_float)SLOT(ro, 4))(ro, nan) == E_INVALIDARG, "rotate3d: SetAngle(NaN) is E_INVALIDARG");
 
-    check(((f_int2f)SLOT(ma, 4))(ma, 3, 3, 2.0f) == S_OK, "matrix3d: SetMatrixElement(3, 3)");
-    check(((f_int2f)SLOT(ma, 4))(ma, 4, 0, 2.0f) == E_INVALIDARG, "matrix3d: row 4 is E_INVALIDARG");
-    check(((f_int2f)SLOT(ma, 4))(ma, 0, 4, 2.0f) == E_INVALIDARG, "matrix3d: column 4 is E_INVALIDARG");
-    check(((f_int2p)SLOT(ma, 5))(ma, 2, 3, anim) == S_OK, "matrix3d: SetMatrixElementAnimation");
+    check(((f_int2f)SLOT(ma, 5))(ma, 3, 3, 2.0f) == S_OK, "matrix3d: SetMatrixElement(3, 3)");
+    check(((f_int2f)SLOT(ma, 5))(ma, 4, 0, 2.0f) == E_INVALIDARG, "matrix3d: row 4 is E_INVALIDARG");
+    check(((f_int2f)SLOT(ma, 5))(ma, 0, 4, 2.0f) == E_INVALIDARG, "matrix3d: column 4 is E_INVALIDARG");
+    check(((f_int2p)SLOT(ma, 4))(ma, 2, 3, anim) == S_OK, "matrix3d: SetMatrixElementAnimation");
     {
         float m[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 

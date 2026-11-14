@@ -106,23 +106,23 @@ int main(void)
     if (tmp) RELEASE(tmp);
 
     /* numbers */
-    check(((f_float)SLOT(translate, 3))(translate, 12.5f) == S_OK, "translate: SetOffsetX");
-    check(((f_float)SLOT(translate, 3))(translate, nan) == E_INVALIDARG, "translate: SetOffsetX(NaN) is E_INVALIDARG");
-    check(((f_float)SLOT(translate, 5))(translate, inf) == E_INVALIDARG, "translate: SetOffsetY(inf) is E_INVALIDARG");
-    check(((f_float)SLOT(scale, 9))(scale, 3.0f) == S_OK, "scale: SetCenterY");
-    check(((f_float)SLOT(rotate, 3))(rotate, 90.0f) == S_OK, "rotate: SetAngle");
-    check(((f_float)SLOT(clip, 3))(clip, 1.0f) == S_OK && ((f_float)SLOT(clip, 9))(clip, 8.0f) == S_OK, "clip: SetLeft/SetBottom");
-    check(((f_float)SLOT(clip, 3))(clip, nan) == E_INVALIDARG, "clip: SetLeft(NaN) is E_INVALIDARG");
-    check(((f_float)SLOT(effect, 3))(effect, 0.5f) == S_OK, "effect group: SetOpacity");
-    check(((f_float)SLOT(effect, 3))(effect, nan) == E_INVALIDARG, "effect group: SetOpacity(NaN) is E_INVALIDARG");
+    check(((f_float)SLOT(translate, 4))(translate, 12.5f) == S_OK, "translate: SetOffsetX");
+    check(((f_float)SLOT(translate, 4))(translate, nan) == E_INVALIDARG, "translate: SetOffsetX(NaN) is E_INVALIDARG");
+    check(((f_float)SLOT(translate, 6))(translate, inf) == E_INVALIDARG, "translate: SetOffsetY(inf) is E_INVALIDARG");
+    check(((f_float)SLOT(scale, 10))(scale, 3.0f) == S_OK, "scale: SetCenterY");
+    check(((f_float)SLOT(rotate, 4))(rotate, 90.0f) == S_OK, "rotate: SetAngle");
+    check(((f_float)SLOT(clip, 4))(clip, 1.0f) == S_OK && ((f_float)SLOT(clip, 10))(clip, 8.0f) == S_OK, "clip: SetLeft/SetBottom");
+    check(((f_float)SLOT(clip, 4))(clip, nan) == E_INVALIDARG, "clip: SetLeft(NaN) is E_INVALIDARG");
+    check(((f_float)SLOT(effect, 4))(effect, 0.5f) == S_OK, "effect group: SetOpacity");
+    check(((f_float)SLOT(effect, 4))(effect, nan) == E_INVALIDARG, "effect group: SetOpacity(NaN) is E_INVALIDARG");
 
     /* animations */
-    check(((f_ptr)SLOT(translate, 4))(translate, NULL) == E_INVALIDARG, "SetOffsetXAnimation(NULL) is E_INVALIDARG");
-    check(((f_ptr)SLOT(translate, 4))(translate, &foreign_obj) == E_INVALIDARG, "SetOffsetXAnimation(foreign) is E_INVALIDARG");
+    check(((f_ptr)SLOT(translate, 3))(translate, NULL) == E_INVALIDARG, "SetOffsetXAnimation(NULL) is E_INVALIDARG");
+    check(((f_ptr)SLOT(translate, 3))(translate, &foreign_obj) == E_INVALIDARG, "SetOffsetXAnimation(foreign) is E_INVALIDARG");
     before = refcount_of(anim);
-    check(((f_ptr)SLOT(translate, 4))(translate, anim) == S_OK, "SetOffsetXAnimation(animation)");
+    check(((f_ptr)SLOT(translate, 3))(translate, anim) == S_OK, "SetOffsetXAnimation(animation)");
     check(refcount_of(anim) == before + 1, "the transform holds the animation (%ld -> %ld)", before, refcount_of(anim));
-    check(((f_float)SLOT(translate, 3))(translate, 1.0f) == S_OK && refcount_of(anim) == before,
+    check(((f_float)SLOT(translate, 4))(translate, 1.0f) == S_OK && refcount_of(anim) == before,
           "SetOffsetX releases the animation");
     check(((f_cubic)SLOT(anim, 5))(anim, 0.0, 1.0f, 2.0f, 0.0f, 0.0f) == S_OK, "AddCubic at 0");
     check(((f_cubic)SLOT(anim, 5))(anim, 1.0, 0.0f, 0.0f, 0.0f, 0.0f) == S_OK, "AddCubic at 1");
@@ -139,12 +139,12 @@ int main(void)
     check(((f_cubic)SLOT(anim, 5))(anim, 0.0, 1.0f, 0.0f, 0.0f, 0.0f) == S_OK, "AddCubic after Reset");
 
     /* the matrix transform */
-    check(((f_int2f)SLOT(matrix, 4))(matrix, 2, 1, 7.0f) == S_OK, "SetMatrixElement(2, 1)");
-    check(((f_int2f)SLOT(matrix, 4))(matrix, 3, 0, 7.0f) == E_INVALIDARG, "SetMatrixElement(3, 0) is E_INVALIDARG");
-    check(((f_int2f)SLOT(matrix, 4))(matrix, 0, 2, 7.0f) == E_INVALIDARG, "SetMatrixElement(0, 2) is E_INVALIDARG");
-    check(((f_int2f)SLOT(matrix, 4))(matrix, -1, 0, 7.0f) == E_INVALIDARG, "SetMatrixElement(-1, 0) is E_INVALIDARG");
-    check(((f_int2p)SLOT(matrix, 5))(matrix, 1, 1, anim) == S_OK, "SetMatrixElementAnimation");
-    check(((f_int2p)SLOT(matrix, 5))(matrix, 5, 1, anim) == E_INVALIDARG, "SetMatrixElementAnimation row 5 is E_INVALIDARG");
+    check(((f_int2f)SLOT(matrix, 5))(matrix, 2, 1, 7.0f) == S_OK, "SetMatrixElement(2, 1)");
+    check(((f_int2f)SLOT(matrix, 5))(matrix, 3, 0, 7.0f) == E_INVALIDARG, "SetMatrixElement(3, 0) is E_INVALIDARG");
+    check(((f_int2f)SLOT(matrix, 5))(matrix, 0, 2, 7.0f) == E_INVALIDARG, "SetMatrixElement(0, 2) is E_INVALIDARG");
+    check(((f_int2f)SLOT(matrix, 5))(matrix, -1, 0, 7.0f) == E_INVALIDARG, "SetMatrixElement(-1, 0) is E_INVALIDARG");
+    check(((f_int2p)SLOT(matrix, 4))(matrix, 1, 1, anim) == S_OK, "SetMatrixElementAnimation");
+    check(((f_int2p)SLOT(matrix, 4))(matrix, 5, 1, anim) == E_INVALIDARG, "SetMatrixElementAnimation row 5 is E_INVALIDARG");
     check(((f_ptr)SLOT(matrix, 3))(matrix, NULL) == E_INVALIDARG, "SetMatrix(NULL) is E_INVALIDARG");
     {
         float m[6] = { 1, 0, 0, 1, 4, 5 };
