@@ -17,6 +17,12 @@ typedef struct HSTRING__ *HSTRING;
 typedef struct { float X, Y, Width, Height; } RECTF;
 typedef struct { INT64 value; } TOKEN;
 
+/* a touch going down, as wine-sg 1150 stamps it on the desktop window */
+static void touch_now(void)
+{
+    SetPropW(GetDesktopWindow(), L"__wine_sg_touch_time", ULongToHandle(GetTickCount() | 1));
+}
+
 static const GUID IID_IUIViewSettingsInterop = {0x3694dbf9,0x8f68,0x44be,{0x8f,0xf5,0x19,0x5c,0x98,0xed,0xe8,0xa6}};
 static const GUID IID_IUIViewSettings = {0xc63657f6,0x8850,0x470d,{0x88,0xf8,0x45,0x5e,0x16,0xea,0x2c,0x26}};
 static const GUID IID_IInputPaneInterop = {0x75cf2c57,0x9195,0x4931,{0x83,0x32,0xf0,0xb4,0x09,0xe9,0x16,0xaf}};
@@ -245,6 +251,24 @@ int main(void)
     hr = ((HRESULT (WINAPI *)(void *, unsigned char *))METHOD(pane2, 1))(pane2, &ok);
     check(hr == S_OK && ok == 0, "TryHide without a keyboard is false");
 
+    /* the last input not a touch -- a touch, then the mouse moved (Word's
+     * Copilot box clicked: Chromium asks for the keyboard on every focus) --
+     * TryShow shows nothing, as on Windows */
+    touch_now();
+    Sleep(700);
+    {
+        INPUT in = { INPUT_MOUSE };
+        in.mi.dx = 5; in.mi.dy = 5; in.mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, &in, sizeof(in));
+        Sleep(300);
+    }
+    ok = 9;
+    hr = ((HRESULT (WINAPI *)(void *, unsigned char *))METHOD(pane2, 0))(pane2, &ok);
+    Sleep(1500);
+    check(hr == S_OK && ok == 0 && !FindWindowW(L"OSKMainClass", NULL), "after the mouse, TryShow shows no keyboard");
+
+    /* a touch the last input: it does */
+    touch_now();
     ok = 9;
     hr = ((HRESULT (WINAPI *)(void *, unsigned char *))METHOD(pane2, 0))(pane2, &ok);
     check(hr == S_OK && ok == 1, "TryShow starts the on-screen keyboard");
@@ -260,6 +284,7 @@ int main(void)
     check(rect_is(&hide.rect, 0, 0, 0, 0), "with nothing occluded");
 
     ok = 9;
+    touch_now();
     hr = ((HRESULT (WINAPI *)(void *, unsigned char *))METHOD(pane2, 0))(pane2, &ok);
     check(hr == S_OK && ok == 1 && wait(show.event, 10000), "TryShow brings it back");
 
@@ -267,6 +292,7 @@ int main(void)
     check(hr == S_OK, "the Showing handler is removed");
     ((HRESULT (WINAPI *)(void *, unsigned char *))METHOD(pane2, 1))(pane2, &ok);
     check(wait(hide.event, 10000), "Hiding is raised again");
+    touch_now();
     ((HRESULT (WINAPI *)(void *, unsigned char *))METHOD(pane2, 0))(pane2, &ok);
     check(!wait(show.event, 2000) && show.calls == 2, "the removed handler is not called");
     ((HRESULT (WINAPI *)(void *, TOKEN))METHOD(pane, 3))(pane, hide_token);
