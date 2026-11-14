@@ -18,7 +18,8 @@
 # Mutants: SG_MUTANT_THEME_ACCENT_FIXED (uxtheme/msstyles.c), SG_MUTANT_THEME_KEEPS_ACCENT
 # (uxtheme/system.c), SG_MUTANT_SHELL_ICONS_FIXED (user32/cursoricon.c, shell32/iconcache.c),
 # SG_MUTANT_TITLE_ICONS_KEEP, SG_MUTANT_SMALL_ICON_KEEP (user32/cursoricon.c), SG_MUTANT_WINE_SHADE_FIXED
-# (programs/notepad/main.c), SG_MUTANT_PINS_KEEP_ACCENT (explorer/systray.c).
+# (programs/notepad/main.c), SG_MUTANT_PINS_KEEP_ACCENT (explorer/systray.c), SG_MUTANT_FE_TITLE_ICON_KEPT
+# (explorer/fileexplorer.c).
 set -u
 unset DISPLAY XAUTHORITY
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -139,12 +140,24 @@ for y in range(t, b):
 print(-1 if n < 20 else round(math.degrees(math.atan2(sy, sx)) % 360))" "\$T/\$1.png" "\$2"
 }
 near() { python3 -c "import sys; a, b = float(sys.argv[1]), float(sys.argv[2]); d = abs(a - b); d = min(d, 360 - d); sys.exit(0 if a >= 0 and d <= 14 else 1)" "\$1" "\$2"; }
+# File Explorer open under the green accent (its title bar's folder icon)
+(cd "\$C" && "\$WINE" explorer.exe 'C:\\' >/dev/null 2>&1 &)
+i=0; while [ -z "\$(xdotool search --name 'Local Disk|C:' 2>/dev/null | head -1)" ] && [ \$i -lt 60 ]; do sleep 0.5; i=\$((i + 1)); done
+sleep 3
+few=\$(xdotool search --name 'Local Disk|C:' 2>/dev/null | head -1)
+fexy=\$(xdotool getwindowgeometry "\$few" 2>/dev/null | sed -n 's/.*Position: \([0-9]*\),\([0-9]*\).*/\1 \2/p')
 h1=\$(pinhue pin-green "\$rect")
 near "\$h1" 143 && pass "pins: a pinned program of our shell, in the accent (hue \$h1, want 143)" || fail "pins: a pinned program of our shell, in the accent (hue \$h1, want 143)"
 "\$WINE" accentall.exe announce ca5010 >/dev/null 2>&1
 sleep 5
 h2=\$(pinhue pin-orange "\$rect")
 near "\$h2" 21 && pass "pins: a new accent, the pin's icon follows it without a restart (hue \$h2, want 21)" || fail "pins: a new accent, the pin's icon follows it without a restart (hue \$h2, want 21)"
+# ...and File Explorer's title bar icon, already open, takes the new accent too
+# (David 2026-11-13: "some in the explorer upper corner")
+set -- \$fexy
+h3=-1; [ \$# -eq 2 ] && h3=\$(pinhue fe-orange "\$(( \$1 + 2 )),\$(( \$2 + 2 )),\$(( \$1 + 26 )),\$(( \$2 + 26 ))")
+near "\$h3" 21 && pass "File Explorer open: its title bar's icon takes the new accent (hue \$h3, want 21)" \
+    || fail "File Explorer open: its title bar's icon takes the new accent (hue \$h3, want 21; the green is 143; window at \$fexy)"
 EOF
 chmod +x "$T/session.sh"
 N=$(( 400 + $$ % 500 ))

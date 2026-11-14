@@ -231,6 +231,18 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "theme")) return do_theme();
     if (argc > 2 && !strcmp(argv[1], "icons")) return do_icons(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "title")) return do_title();
+    if (argc > 2 && !strcmp(argv[1], "classicon"))   /* another program's window class's small icon: its hue */
+    {
+        WCHAR cls[64];
+        HWND w;
+        MultiByteToWideChar(CP_ACP, 0, argv[2], -1, cls, 64);
+        w = FindWindowW(cls, NULL);
+        HICON icon = NULL;
+        /* (a class's icon is its process's own: asked of the window, as the taskbar does) */
+        if (w) SendMessageTimeoutW(w, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 2000, (DWORD_PTR *)&icon);
+        printf("hue %.0f window %p icon %p\n", icon ? icon_hue(icon) : -1.0, w, icon);
+        return 0;
+    }
     printf("usage: accentall.exe accent RRGGBB | theme | icons DIR | title\n");
     return 2;
 }
