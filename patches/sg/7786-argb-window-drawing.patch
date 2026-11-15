@@ -1,0 +1,460 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winex11: frames and other processes' drawing reach a top-level with alpha without an X error
+
+A top-level that is a sheet of DWM glass or layered has an X window of
+32 bits. A child's Vulkan or OpenGL frame (24 bits) was put there with
+XCopyArea, and another process drew into it through a DC as 24 bits:
+BadMatch, an X error that ends the process. DevToys 2 (WPF with Mica and
+a WebView2 control) lost its renderer and Chromium's GPU process at the
+first frame. Such frames are now copied with XRender, and a DC knows the
+depth of the X window it draws into.
+---
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index f11d0b9..49b2513 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -465,6 +465,12 @@ static INT X11DRV_ExtEscape( PHYSDEV dev, INT escape, INT in_count, LPCVOID in_d
+                     const struct x11drv_escape_set_drawable *data = in_data;
+                     physDev->dc_rect = data->dc_rect;
+                     physDev->drawable = data->drawable;
++#ifndef SG_MUTANT_DC_DEPTH
++                    /* Stained Glass OS: a top-level with alpha (layered, glass) has
++                     * a 32-bit X window; another process draws into it through its
++                     * DC (DXVK's composition swap chains, Chromium's GPU process) */
++                    physDev->depth = data->depth ? data->depth : default_visual.depth;
++#endif
+                     XFreeGC( gdi_display, physDev->gc );
+                     physDev->gc = XCreateGC( gdi_display, physDev->drawable, 0, NULL );
+                     XSetGraphicsExposures( gdi_display, physDev->gc, False );
+diff --git a/dlls/winex11.drv/opengl.c b/dlls/winex11.drv/opengl.c
+index 9db6e52..c806431 100644
+--- a/dlls/winex11.drv/opengl.c
++++ b/dlls/winex11.drv/opengl.c
+@@ -1954,6 +1954,33 @@ static void present_gl_drawable( HWND hwnd, HDC hdc, struct gl_drawable *gl, BOO
+         release_win_data( data );
+     }
+ 
++#ifndef SG_MUTANT_GL_DEPTH_COPY
++    /* Stained Glass OS: a top-level that is layered or a sheet of glass has an X
++     * window with alpha (32 bits, bitblt.c); the frame (24 bits) cannot be put
++     * there with XCopyArea -- BadMatch, an X error that ends the process. WPF's
++     * Direct3D 9 in a window with Mica (DevToys 2) died at its first frame. It
++     * is copied with XRender, opaque. */
++    if (gl->format->visual && rect_dst.right - rect_dst.left == gl->rect.right &&
++        rect_dst.bottom - rect_dst.top == gl->rect.bottom)
++    {
++        int depth = 0;
++
++        if ((data = get_win_data( toplevel )))
++        {
++            if (data->whole_window == window) depth = data->vis.depth;
++            release_win_data( data );
++        }
++        if (depth && depth != gl->format->visual->depth &&
++            xrender_copy_frame( drawable, window, &rect_dst, region ))
++        {
++            TRACE( "%p: frame copied with XRender into %lx (depth %d from %d)\n", hwnd, window, depth,
++                   gl->format->visual->depth );
++            gl->presented = TRUE;
++            if (region) NtGdiDeleteObjectApp( region );
++            return;
++        }
++    }
++#endif
+     if (get_dc_drawable( gl->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
+         set_dc_drawable( gl->hdc_dst, window, &rect_dst, IncludeInferiors );
+     if (region) NtGdiExtSelectClipRgn( gl->hdc_dst, region, RGN_COPY );
+@@ -2377,6 +2404,7 @@ static HDC X11DRV_wglGetPbufferDCARB( struct wgl_pbuffer *object )
+     escape.code = X11DRV_SET_DRAWABLE;
+     escape.drawable = object->gl->drawable;
+     escape.mode = IncludeInferiors;
++    escape.depth = 0;
+     SetRect( &escape.dc_rect, 0, 0, object->width, object->height );
+     NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
+ 
+diff --git a/dlls/winex11.drv/vulkan.c b/dlls/winex11.drv/vulkan.c
+index 3a92cee..47ef903 100644
+--- a/dlls/winex11.drv/vulkan.c
++++ b/dlls/winex11.drv/vulkan.c
+@@ -82,6 +82,10 @@ struct x11drv_vulkan_surface
+     XRectangle *shown_clip;
+     int shown_clip_count;
+     int shown_depth;       /* how many windows it is below its top-level */
++    int shown_target_depth;        /* the bits per pixel of SHOWN_ON (0: not known) */
++    /* the X window frames went to last, and its depth (see target_window_depth) */
++    Window target_window;
++    int target_depth;
+ };
+ 
+ /* Stained Glass OS (wine-sg 1523): a child window's frames are rendered
+@@ -97,6 +101,47 @@ struct x11drv_vulkan_surface
+ static pthread_mutex_t shown_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static struct list shown_surfaces = LIST_INIT( shown_surfaces );
+ 
++static int blend_error( Display *display, XErrorEvent *event, void *arg );
++
++/* Stained Glass OS: the frames come from an X window of the default depth (one
++ * of glass, 32 bits); a top-level that is layered or a sheet of glass has an X
++ * window with alpha (bitblt.c), and XCopyArea between drawables of different
++ * depths fails with BadMatch -- an error that ends the process. A WebView2
++ * control in such a window (DevToys 2: WPF with Mica) took its GPU process
++ * down at the first frame, and the page never showed. Such frames are copied
++ * with XRender. */
++static int source_depth( const struct x11drv_vulkan_surface *surface )
++{
++    return surface->blend ? 32 : default_visual.depth;
++}
++
++static int target_window_depth( struct x11drv_vulkan_surface *surface, HWND toplevel, Window window )
++{
++    struct x11drv_win_data *data;
++
++    if (surface->target_window == window) return surface->target_depth;
++    surface->target_depth = 0;
++    if ((data = get_win_data( toplevel )))
++    {
++        if (data->whole_window == window) surface->target_depth = data->vis.depth;
++        release_win_data( data );
++    }
++    if (!surface->target_depth)  /* another process's top-level (0586) */
++    {
++        Window root;
++        int x, y;
++        unsigned int w, h, border, depth;
++
++        X11DRV_expect_error( gdi_display, blend_error, NULL );
++        if (!XGetGeometry( gdi_display, window, &root, &x, &y, &w, &h, &border, &depth )) depth = 0;
++        if (X11DRV_check_error()) depth = 0;
++        surface->target_depth = depth;
++    }
++    surface->target_window = window;
++    TRACE( "window %lx: depth %d\n", window, surface->target_depth );
++    return surface->target_depth;
++}
++
+ static void surface_forget_shown( struct x11drv_vulkan_surface *surface )
+ {
+     pthread_mutex_lock( &shown_mutex );
+@@ -156,6 +201,34 @@ static void surface_remember_shown( HWND hwnd, struct x11drv_vulkan_surface *sur
+     surface->shown_clip_count = region ? count : -1;
+     surface->shown_depth = depth;
+     surface->shown_hwnd = hwnd;
++    surface->shown_target_depth = surface->target_window == window ? surface->target_depth : 0;
++    pthread_mutex_unlock( &shown_mutex );
++}
++
++/* the frame just remembered (surface_remember_shown), put into its top-level
++ * X window of another depth */
++static void copy_shown_frame( struct x11drv_vulkan_surface *surface )
++{
++    XRectangle full;
++    Region clip;
++    int i;
++
++    pthread_mutex_lock( &shown_mutex );
++    if (surface->shown_on && (clip = XCreateRegion()))
++    {
++        full.x = surface->shown_rect.left;
++        full.y = surface->shown_rect.top;
++        full.width = surface->shown_rect.right - surface->shown_rect.left;
++        full.height = surface->shown_rect.bottom - surface->shown_rect.top;
++        if (surface->shown_clip_count < 0) XUnionRectWithRegion( &full, clip, clip );
++        else for (i = 0; i < surface->shown_clip_count; i++)
++            XUnionRectWithRegion( &surface->shown_clip[i], clip, clip );
++        if (!XEmptyRegion( clip ))
++        {
++            xrender_copy_area( surface->window, surface->shown_on, clip, 0, 0, full.x, full.y, full.width, full.height );
++        }
++        XDestroyRegion( clip );
++    }
+     pthread_mutex_unlock( &shown_mutex );
+ }
+ 
+@@ -263,6 +336,11 @@ void vulkan_surfaces_reshow( Window window, const RECT *rect )
+                 }
+                 XSetGraphicsExposures( gdi_display, gc, False );
+                 XSetRegion( gdi_display, gc, clip );
++#ifndef SG_MUTANT_VK_DEPTH_COPY
++                if (surface->shown_target_depth && surface->shown_target_depth != source_depth( surface ))
++                    xrender_copy_area( surface->window, window, clip, 0, 0, full.x, full.y, full.width, full.height );
++                else
++#endif
+                 XCopyArea( gdi_display, surface->window, window, gc, 0, 0, full.width, full.height, full.x, full.y );
+                 TRACE( "flush %s: frame of depth %d at %s shown again\n", wine_dbgstr_rect( rect ), depth,
+                        wine_dbgstr_rect( &surface->shown_rect ) );
+@@ -632,6 +710,21 @@ static void X11DRV_vulkan_surface_presented( HWND hwnd, void *private, VkResult
+         NtUserReleaseDC( hwnd, hdc );
+         return;
+     }
++#ifndef SG_MUTANT_VK_DEPTH_COPY
++    if (target_window_depth( surface, toplevel, window ) && surface->target_depth != source_depth( surface ))
++    {
++        if (usexcomposite && rect_dst.right - rect_dst.left == surface->rect.right &&
++            rect_dst.bottom - rect_dst.top == surface->rect.bottom)
++        {
++            surface_remember_shown( hwnd, surface, window, &rect_dst, region );
++            copy_shown_frame( surface );
++        }
++        else surface_forget_shown( surface );
++        if (region) NtGdiDeleteObjectApp( region );
++        NtUserReleaseDC( hwnd, hdc );
++        return;
++    }
++#endif
+     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
+         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
+     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index ebd1433..1bd7c0a 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -3193,6 +3193,11 @@ Window X11DRV_get_whole_window( HWND hwnd )
+ /***********************************************************************
+  *		X11DRV_GetDC   (X11DRV.@)
+  */
++static int getdc_depth_error( Display *display, XErrorEvent *event, void *arg )
++{
++    return 1;
++}
++
+ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
+                    const RECT *top_rect, DWORD flags )
+ {
+@@ -3201,6 +3206,7 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
+     escape.code = X11DRV_SET_DRAWABLE;
+     escape.mode = IncludeInferiors;
+     escape.drawable = 0;
++    escape.depth = 0;
+ 
+     escape.dc_rect.left         = win_rect->left - top_rect->left;
+     escape.dc_rect.top          = win_rect->top - top_rect->top;
+@@ -3215,14 +3221,37 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
+ 
+         /* special case: when repainting the root window, clip out top-level windows */
+         if (data && data->whole_window == root_window) escape.mode = ClipByChildren;
++        if (data && data->whole_window == escape.drawable) escape.depth = data->vis.depth;
+         release_win_data( data );
+     }
+     else
+     {
++        struct x11drv_win_data *data = get_win_data( top );
++
+         escape.drawable = X11DRV_get_whole_window( top );
++        if (data && data->whole_window == escape.drawable) escape.depth = data->vis.depth;
++        release_win_data( data );
+     }
+ 
+     if (!escape.drawable) return; /* don't create a GC for foreign windows */
++#ifndef SG_MUTANT_DC_DEPTH
++    /* Stained Glass OS: another process's top-level may have an X window with
++     * alpha (32 bits: layered, a sheet of glass); drawing into it as 24 bits
++     * is an X error that ends this process (Chromium's GPU process drawing a
++     * WebView2 control in a window with Mica) */
++    if (!escape.depth && escape.drawable != root_window)
++    {
++        Window root;
++        int x, y;
++        unsigned int w, h, border, depth;
++
++        X11DRV_expect_error( gdi_display, getdc_depth_error, NULL );
++        if (!XGetGeometry( gdi_display, escape.drawable, &root, &x, &y, &w, &h, &border, &depth )) depth = 0;
++        if (X11DRV_check_error()) depth = 0;
++        if (depth == 32 && argb_visual.visualid) escape.depth = 32;
++    }
++#endif
++    if (escape.depth == default_visual.depth) escape.depth = 0;
+     NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
+ }
+ 
+@@ -3237,6 +3266,7 @@ void X11DRV_ReleaseDC( HWND hwnd, HDC hdc )
+     escape.code = X11DRV_SET_DRAWABLE;
+     escape.drawable = root_window;
+     escape.mode = IncludeInferiors;
++    escape.depth = 0;
+     escape.dc_rect = NtUserGetVirtualScreenRect( MDT_DEFAULT );
+     OffsetRect( &escape.dc_rect, -2 * escape.dc_rect.left, -2 * escape.dc_rect.top );
+     NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index e2d6469..a3dfb82 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -287,6 +287,9 @@ extern BOOL client_side_graphics;
+ extern BOOL client_side_with_render;
+ extern BOOL shape_layered_windows;
+ extern const struct gdi_dc_funcs *X11DRV_XRender_Init(void);
++extern BOOL xrender_copy_area( Drawable src, Drawable dst, Region clip, int src_x, int src_y, int dst_x, int dst_y,
++                               unsigned int width, unsigned int height );
++extern BOOL xrender_copy_frame( Drawable src, Window window, const RECT *rect, HRGN region );
+ 
+ extern struct opengl_funcs *get_glx_driver(UINT);
+ extern UINT X11DRV_VulkanInit( UINT, void *, const struct vulkan_driver_funcs ** );
+@@ -407,6 +410,7 @@ struct x11drv_escape_set_drawable
+     Drawable                 drawable;     /* X drawable */
+     int                      mode;         /* ClipByChildren or IncludeInferiors */
+     RECT                     dc_rect;      /* DC rectangle relative to drawable */
++    int                      depth;        /* the drawable's depth if not the default visual's (0) */
+ };
+ 
+ struct x11drv_escape_get_drawable
+diff --git a/dlls/winex11.drv/xrender.c b/dlls/winex11.drv/xrender.c
+index 2491ced..6e4c5cf 100644
+--- a/dlls/winex11.drv/xrender.c
++++ b/dlls/winex11.drv/xrender.c
+@@ -184,6 +184,7 @@ MAKE_FUNCPTR(XRenderFindVisualFormat)
+ MAKE_FUNCPTR(XRenderFreeGlyphSet)
+ MAKE_FUNCPTR(XRenderFreePicture)
+ MAKE_FUNCPTR(XRenderSetPictureClipRectangles)
++MAKE_FUNCPTR(XRenderSetPictureClipRegion)
+ #ifdef HAVE_XRENDERCREATELINEARGRADIENT
+ MAKE_FUNCPTR(XRenderCreateLinearGradient)
+ #endif
+@@ -195,6 +196,7 @@ MAKE_FUNCPTR(XRenderQueryExtension)
+ #undef MAKE_FUNCPTR
+ 
+ static pthread_mutex_t xrender_mutex = PTHREAD_MUTEX_INITIALIZER;
++static BOOL xrender_up;
+ 
+ #define MS_MAKE_TAG( _x1, _x2, _x3, _x4 ) \
+           ( ( (ULONG)_x4 << 24 ) |     \
+@@ -340,6 +342,7 @@ const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
+     LOAD_FUNCPTR(XRenderFreeGlyphSet);
+     LOAD_FUNCPTR(XRenderFreePicture);
+     LOAD_FUNCPTR(XRenderSetPictureClipRectangles);
++    LOAD_FUNCPTR(XRenderSetPictureClipRegion);
+     LOAD_FUNCPTR(XRenderQueryExtension);
+ #ifdef HAVE_XRENDERCREATELINEARGRADIENT
+     LOAD_OPTIONAL_FUNCPTR(XRenderCreateLinearGradient);
+@@ -351,6 +354,7 @@ const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
+ #undef LOAD_FUNCPTR
+ 
+     if (!pXRenderQueryExtension(gdi_display, &event_base, &xrender_error_base)) return NULL;
++    xrender_up = TRUE;
+ 
+     TRACE("Xrender is up and running error_base = %d\n", xrender_error_base);
+     if(!load_xrender_formats()) /* This fails in buggy versions of libXrender.so */
+@@ -1012,6 +1016,12 @@ static INT xrenderdrv_ExtEscape( PHYSDEV dev, INT escape, INT in_count, LPCVOID
+             if (ret)
+             {
+                 free_xrender_picture( physdev );
++#ifndef SG_MUTANT_DC_DEPTH
++                if (in_count >= sizeof(struct x11drv_escape_set_drawable) &&
++                    ((const struct x11drv_escape_set_drawable *)in_data)->depth == 32 && pict_formats[WXR_FORMAT_A8R8G8B8])
++                    set_physdev_format( physdev, WXR_FORMAT_A8R8G8B8 );
++                else
++#endif
+                 set_physdev_format( physdev, default_format );
+             }
+             return ret;
+@@ -2266,12 +2276,112 @@ static const struct gdi_dc_funcs xrender_funcs =
+     GDI_PRIORITY_GRAPHICS_DRV + 10      /* priority */
+ };
+ 
++/* Stained Glass OS: copy between drawables of different depths -- a child window's
++ * frame (24 bits) into a top-level X window with alpha (32 bits: layered, or a
++ * sheet of DWM glass), where XCopyArea fails with BadMatch. Opaque where the
++ * source has no alpha. CLIP, in the destination's coordinates, may be NULL. */
++static int format_error( Display *display, XErrorEvent *event, void *arg )
++{
++    return 1;
++}
++
++/* a window's picture format is its visual's; a pixmap's its depth's */
++static XRenderPictFormat *format_for_drawable( Drawable drawable )
++{
++    XWindowAttributes attr;
++    Window root;
++    int x, y;
++    unsigned int w, h, border, depth;
++    BOOL is_window;
++
++    X11DRV_expect_error( gdi_display, format_error, NULL );
++    is_window = XGetWindowAttributes( gdi_display, drawable, &attr );
++    if (X11DRV_check_error()) is_window = FALSE;
++    if (is_window) return pXRenderFindVisualFormat( gdi_display, attr.visual );
++    if (!XGetGeometry( gdi_display, drawable, &root, &x, &y, &w, &h, &border, &depth )) return NULL;
++    if (depth == 32 && argb_visual.visual) return pXRenderFindVisualFormat( gdi_display, argb_visual.visual );
++    if (depth == default_visual.depth) return pXRenderFindVisualFormat( gdi_display, default_visual.visual );
++    return NULL;
++}
++
++BOOL xrender_copy_area( Drawable src, Drawable dst, Region clip, int src_x, int src_y, int dst_x, int dst_y,
++                        unsigned int width, unsigned int height )
++{
++    XRenderPictureAttributes pa;
++    XRenderPictFormat *src_format, *dst_format;
++    Picture src_pict, dst_pict;
++
++    if (!xrender_up) return FALSE;
++    if (!(src_format = format_for_drawable( src )) || !(dst_format = format_for_drawable( dst ))) return FALSE;
++    pa.subwindow_mode = IncludeInferiors;
++    /* either may go away meanwhile (another process's window): no error that
++     * would end the process */
++    X11DRV_expect_error( gdi_display, format_error, NULL );
++    src_pict = pXRenderCreatePicture( gdi_display, src, src_format, CPSubwindowMode, &pa );
++    dst_pict = pXRenderCreatePicture( gdi_display, dst, dst_format, 0, &pa );
++    if (clip) pXRenderSetPictureClipRegion( gdi_display, dst_pict, clip );
++    pXRenderComposite( gdi_display, PictOpSrc, src_pict, 0, dst_pict, src_x, src_y, 0, 0,
++                       dst_x, dst_y, width, height );
++    pXRenderFreePicture( gdi_display, src_pict );
++    pXRenderFreePicture( gdi_display, dst_pict );
++    XSync( gdi_display, False );
++    if (X11DRV_check_error())
++    {
++        WARN( "copy %lx -> %lx failed\n", src, dst );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/* the frame in SRC put into WINDOW at RECT, clipped by REGION (relative to RECT's
++ * corner; 0: none) -- xrender_copy_area with a GDI region */
++BOOL xrender_copy_frame( Drawable src, Window window, const RECT *rect, HRGN region )
++{
++    Region clip = 0;
++    RGNDATA *data;
++    DWORD size, i;
++    BOOL ret;
++
++    if (region && (size = NtGdiGetRegionData( region, 0, NULL )) && (data = malloc( size )))
++    {
++        if (NtGdiGetRegionData( region, size, data ) && (clip = XCreateRegion()))
++        {
++            const RECT *r = (const RECT *)data->Buffer;
++            for (i = 0; i < data->rdh.nCount; i++)
++            {
++                XRectangle xr;
++                xr.x = r[i].left + rect->left;
++                xr.y = r[i].top + rect->top;
++                xr.width = r[i].right - r[i].left;
++                xr.height = r[i].bottom - r[i].top;
++                XUnionRectWithRegion( &xr, clip, clip );
++            }
++        }
++        free( data );
++    }
++    ret = xrender_copy_area( src, window, clip, 0, 0, rect->left, rect->top,
++                             rect->right - rect->left, rect->bottom - rect->top );
++    if (clip) XDestroyRegion( clip );
++    return ret;
++}
++
+ #else /* SONAME_LIBXRENDER */
+ 
++BOOL xrender_copy_frame( Drawable src, Window window, const RECT *rect, HRGN region )
++{
++    return FALSE;
++}
++
+ const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
+ {
+     TRACE("XRender support not compiled in.\n");
+     return NULL;
+ }
+ 
++BOOL xrender_copy_area( Drawable src, Drawable dst, Region clip, int src_x, int src_y, int dst_x, int dst_y,
++                        unsigned int width, unsigned int height )
++{
++    return FALSE;
++}
++
+ #endif /* SONAME_LIBXRENDER */
