@@ -50,7 +50,8 @@
 #   WINE=/opt/wine-sg/bin/wine test/linuxembed-gate.sh
 # Mutants (0853-0855, dlls/winex11.drv/sg_embed.c): SG_MUTANT_EMBED_REPARENT_HIDES
 # fails 11 (the window behind made active while it is framed; on a busy
-# machine the keys then go to it); SG_MUTANT_EMBED_NO_ICONIFY fails 5d;
+# machine the keys then go to it); SG_MUTANT_EMBED_NO_ICONIFY fails 5d; SG_MUTANT_EMBED_MINIMIZED_RESIZED (7770)
+# fails 5d's size check;
 # SG_MUTANT_EMBED_NO_FOCUSED_STATE fails 4b; SG_MUTANT_EMBED_NO_ACTIVE_WINDOW
 # fails 5e; SG_MUTANT_GONE_XWIN_BUTTON (programs/explorer/systray.c) fails
 # 8's "nothing comes back". SG_MUTANT_EMBED_PRE_FULLSCREEN_LOST and
@@ -225,8 +226,14 @@ read -r l t r b < "$T/rect0"
 
 # 5d. its own minimize button (XIconifyWindow)
 "$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1
+xsize() { xwininfo -id "$XID" 2>/dev/null | awk '/Width:/ { w = $2 } /Height:/ { h = $2 } END { print w "x" h }'; }
+s0=$(xsize)
 "$T/netwm-fullscreen" "$XID" iconify; sleep 2
+s1=$(xsize)
 i1=$("$WINE" probe.exe iconic SgLinuxWindow "Linux Terminal" | tr -d '\r'); w1=$(xprop -id "$XID" WM_STATE 2>/dev/null | sed -n 's/.*window state: //p')
+# minimized, it keeps its size (made 1x1, Qt laid OBS's docks out for that, 2026-11-15)
+[ -n "$s0" ] && [ "$s1" = "$s0" ] && pass "minimized, the program's window keeps its size ($s0)" \
+    || fail "minimized, the program's window is $s1 (was $s0)"
 "$WINE" probe.exe activate SgLinuxWindow "Linux Terminal" > /dev/null 2>&1; sleep 1.5
 i2=$("$WINE" probe.exe iconic SgLinuxWindow "Linux Terminal" | tr -d '\r'); w2=$(xprop -id "$XID" WM_STATE 2>/dev/null | sed -n 's/.*window state: //p')
 [ "$i1" = iconic=1 ] && [ "$w1" = Iconic ] && [ "$i2" = iconic=0 ] && [ "$w2" = Normal ] \
