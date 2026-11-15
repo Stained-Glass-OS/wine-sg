@@ -37,7 +37,7 @@ done
 T=$(mktemp -d /var/tmp/sg-appx.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
 # shellcheck disable=SC2317  # invoked via trap
-cleanup() { "$(dirname "$WINE")/wineserver" -k 2>/dev/null; rm -rf "$T"; }
+cleanup() { "$(sg_wineserver)" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 mkdir -p "$WINEPREFIX"
 

@@ -20,7 +20,7 @@ curl -fsI --max-time 15 https://cdn.winget.microsoft.com/cache/source2.msix >/de
 T=$(mktemp -d /var/tmp/sg-winget.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
 # shellcheck disable=SC2317  # invoked via trap
-cleanup() { "$(dirname "$WINE")/wineserver" -k 2>/dev/null; rm -rf "$T"; }
+cleanup() { "$(sg_wineserver)" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1

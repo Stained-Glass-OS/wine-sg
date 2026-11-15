@@ -21,7 +21,7 @@ mountpoint -q "$UNC" && { echo "SKIP: $UNC is in use"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-uncdir.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
 cleanup() {
-    "$(dirname "$WINE")/wineserver" -k 2>/dev/null
+    "$(sg_wineserver)" -k 2>/dev/null
     [ -z "${WINESERVER:-}" ] || "$WINESERVER" -k 2>/dev/null
     sudo -n umount "$UNC" 2>/dev/null
     sudo -n rmdir "$UNC" /run/stained-glass-net/unc/sgtestsrv 2>/dev/null

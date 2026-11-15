@@ -51,7 +51,7 @@ HTTP_PID=
 # shellcheck disable=SC2317  # invoked via trap
 cleanup() {
     [ -n "$HTTP_PID" ] && kill "$HTTP_PID" 2>/dev/null
-    "$(dirname "$WINE")/wineserver" -k 2>/dev/null
+    "$(sg_wineserver)" -k 2>/dev/null
     [ -n "${KEEP:-}" ] || rm -rf "$T"
 }
 trap cleanup EXIT INT TERM

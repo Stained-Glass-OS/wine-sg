@@ -19,7 +19,7 @@ command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW not installed"; exit 77; 
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-winord.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all
-cleanup() { "$(dirname "$WINE")/wineserver" -k 2>/dev/null; rm -rf "$T"; }
+cleanup() { "$(sg_wineserver)" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 "$MINGW" -O2 -I"$HERE" -o "$T/p64.exe" "$HERE/winord-probe.c" || { fail "probe did not build"; exit 1; }
 "$MINGW32" -O2 -I"$HERE" -o "$T/p32.exe" "$HERE/winord-probe.c" 2>/dev/null || true

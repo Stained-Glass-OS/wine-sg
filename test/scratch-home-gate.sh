@@ -7,13 +7,13 @@
 WINE=${WINE:-wine}
 T=$(mktemp -d "${TMPDIR:-/var/tmp}/scratch-home-gate.XXXXXX")
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;$WINEDLLOVERRIDES"
-cleanup() { "${WINE%/wine}/wineserver" -k 2>/dev/null; rm -rf "$T" "$SG_GATE_HOME"; }
+cleanup() { "$(sg_wineserver)" -k 2>/dev/null; rm -rf "$T" "$SG_GATE_HOME"; }
 trap cleanup EXIT INT TERM
 rc=0
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; rc=1; }
 "$WINE" wineboot -i >/dev/null 2>&1
-"${WINE%/wine}/wineserver" -w
+"$(sg_wineserver)" -w
 [ -d "$WINEPREFIX/drive_c/users" ] && pass "prefix created" || fail "no prefix"
 case "$HOME" in "${TMPDIR:-/var/tmp}"/sg-gate-home.*) pass "HOME is the gate's own ($HOME)" ;; *) fail "HOME is $HOME" ;; esac
 n=0

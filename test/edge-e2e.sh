@@ -35,7 +35,7 @@ for t in "$MINGW" xvfb-run; do command -v "$t" >/dev/null || { echo "SKIP: $t no
 T=$(mktemp -d /var/tmp/sg-edge.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all
 # shellcheck disable=SC2317  # invoked via trap
-cleanup() { "$(dirname "$WINE")/wineserver" -k 2>/dev/null; rm -rf "$T"; }
+cleanup() { "$(sg_wineserver)" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 
 "$MINGW" -O2 -o "$T/edgeapi-probe.exe" "$HERE/edgeapi-probe.c" -lwininet -ladvapi32 || { fail "the probe did not build"; exit 1; }
@@ -84,7 +84,7 @@ else
     printf '<html><body style="background:#129A3C"><h1 style="color:white">Stained Glass</h1><script>document.title="SGTEST-"+(40+2)</script></body></html>' > "$T/page.html"
     cat > "$T/run.sh" <<EOF
 #!/bin/sh
-"$WINE" wineboot -i >/dev/null 2>&1; "$(dirname "$WINE")/wineserver" -w
+"$WINE" wineboot -i >/dev/null 2>&1; "$(sg_wineserver)" -w
 cp "$T/page.html" "$C/sgtest.html"
 timeout 1200 "$WINE" msiexec /i "$T/edge.msi" /qn >/dev/null 2>&1
 echo "msiexec=\$?" > "$T/msiexec.rc"
@@ -100,10 +100,10 @@ edge_title() { # edge_title FLAGS...: start Edge, wait for the page's title, scr
 }
 edge_title --no-sandbox --disable-gpu > "$T/unsandboxed"
 import -window root "$T/unsandboxed.png" 2>/dev/null
-"$(dirname "$WINE")/wineserver" -k; sleep 2
+"$(sg_wineserver)" -k; sleep 2
 edge_title --disable-gpu > "$T/sandboxed"
 import -window root "$T/sandboxed.png" 2>/dev/null
-"$(dirname "$WINE")/wineserver" -k
+"$(sg_wineserver)" -k
 EOF
     chmod +x "$T/run.sh"
     timeout 2400 xvfb-run -a -s "-screen 0 1024x768x24" "$T/run.sh"

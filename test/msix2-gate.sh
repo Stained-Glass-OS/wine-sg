@@ -24,7 +24,7 @@ done
 T=$(mktemp -d /var/tmp/sg-msix2.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 cleanup() {
-    "$(dirname "$WINE")/wineserver" -k 2>/dev/null
+    "$(sg_wineserver)" -k 2>/dev/null
     [ -n "${KEEP:-}" ] || rm -rf "$T"
 }
 trap cleanup EXIT INT TERM

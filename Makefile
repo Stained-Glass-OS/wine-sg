@@ -32,6 +32,8 @@ lint:
 	@for f in $$(grep -l WINEPREFIX test/*.sh); do \
 	    sed -n 2p "$$f" | grep -q '^\. "$$(dirname "$$0")/scratch-home.sh"$$' || \
 	    { echo "$$f: line 2 must be: . \"\$$(dirname \"\$$0\")/scratch-home.sh\""; exit 1; }; done
+	@! grep -nF -e 'dirname "$$WINE")/wineserver"' -e '$${WINE%/wine}/wineserver' test/*.sh || \
+	    { echo 'a build tree has no wineserver beside wine: use "$$(sg_wineserver)" (test/scratch-home.sh)'; exit 1; }
 	@T=$$(tools/lint-tree.sh) && \
 	python3 tools/trademark-check.py --allow tools/trademark-allow.txt --patches patches/sg --root "$$T" \
 	    --brand 'dlls/shell32/*' Wine --brand 'dlls/comdlg32/*' Wine --brand 'dlls/user32/*' Wine \

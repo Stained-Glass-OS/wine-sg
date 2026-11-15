@@ -23,7 +23,7 @@ command -v python3 >/dev/null || { echo "SKIP: python3 not installed"; exit 77; 
 T=$(mktemp -d /var/tmp/sg-resman.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
 # shellcheck disable=SC2317  # invoked via trap
-cleanup() { "$(dirname "$WINE")/wineserver" -k 2>/dev/null; rm -rf "$T"; }
+cleanup() { "$(sg_wineserver)" -k 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 
 "$MINGW" -O2 -o "$T/resman-probe.exe" "$HERE/resman-probe.c" -lruntimeobject || { fail "probe did not build"; exit 1; }

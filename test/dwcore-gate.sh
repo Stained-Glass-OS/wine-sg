@@ -22,7 +22,7 @@ fc-list : family | grep -qx 'Liberation Sans' || { echo "SKIP: no Liberation fon
 T=$(mktemp -d /var/tmp/sg-dwcore.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d"
 unset DISPLAY WAYLAND_DISPLAY
-cleanup() { "$(dirname "$WINE")/wineserver" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"; }
+cleanup() { "$(sg_wineserver)" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 TMPDIR=/var/tmp "$MINGW" -O2 -municode -o "$T/probe.exe" "$HERE/dwcore-probe.c" -ldwrite || { fail "the probe did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
@@ -45,7 +45,7 @@ has "$out" "Found=Segoe UI 1" "and Segoe UI (the interface font)"
 out=$(run NoSuchFamilyAnywhere)
 has "$out" "Found=NoSuchFamilyAnywhere 0" "a name no font has is still not found"
 "$WINE" reg add 'HKCU\Software\Wine\Fonts\Replacements' /v Arial /d 'DejaVu Sans' /f >/dev/null 2>&1
-"$(dirname "$WINE")/wineserver" -w
+"$(sg_wineserver)" -w
 out=$(run Arial)
 if fc-list : family | grep -qx 'DejaVu Sans'; then
     has "$out" "FontOwn=Arial DejaVu Sans" "a Replacements entry the person set still wins"

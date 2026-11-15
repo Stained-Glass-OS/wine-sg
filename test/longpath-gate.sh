@@ -26,7 +26,7 @@ export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;w
 unset DISPLAY WAYLAND_DISPLAY
 cleanup() {
     chmod -R u+w "$T" 2>/dev/null
-    "$(dirname "$WINE")/wineserver" -k 2>/dev/null
+    "$(sg_wineserver)" -k 2>/dev/null
     [ -n "${KEEP:-}" ] || rm -rf "$T"
 }
 trap cleanup EXIT INT TERM

@@ -48,3 +48,14 @@ sg_prefix_safe() {
     echo "$_bad" >&2
     return 1
 }
+# sg_wineserver: the wineserver that goes with $WINE -- $WINESERVER, the one
+# beside wine (installed), or server/wineserver (a build tree, which has none
+# beside wine). A gate's "-k" on a path that does not exist kills nothing: its
+# prefix was deleted and the prefix's winedevice.exe and services ran on for
+# days (57 of them, 4 to 20 days old, on 2026-11-14). Gates call
+# "$(sg_wineserver)" -k in their cleanup.
+sg_wineserver() {
+    if [ -n "${WINESERVER:-}" ] && [ -x "$WINESERVER" ]; then echo "$WINESERVER"; return; fi
+    _sg_wd=$(dirname "${WINE:-/opt/wine-sg/bin/wine}")
+    if [ -x "$_sg_wd/wineserver" ]; then echo "$_sg_wd/wineserver"; else echo "$_sg_wd/server/wineserver"; fi
+}

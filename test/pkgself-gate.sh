@@ -29,7 +29,7 @@ done
 T=$(mktemp -d /var/tmp/sg-pkgself.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 unset DISPLAY WAYLAND_DISPLAY
-cleanup() { "$(dirname "$WINE")/wineserver" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"; }
+cleanup() { "$(sg_wineserver)" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 mkdir -p "$WINEPREFIX" "$T/b"
 B="$T/b"

@@ -22,7 +22,7 @@ done
 T=$(mktemp -d /var/tmp/sg-aliasexe.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 unset DISPLAY WAYLAND_DISPLAY
-cleanup() { "$(dirname "$WINE")/wineserver" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"; }
+cleanup() { "$(sg_wineserver)" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 mkdir -p "$WINEPREFIX" "$T/b"
 B="$T/b"
@@ -62,7 +62,7 @@ out=$(run trust-probe.exe --store LM TrustedPeople 'C:\pub.cer')
 expect "$out" store added "the publisher is trusted (TrustedPeople)"
 out=$(run deploy-probe.exe add 'C:\alias.msix')
 expect "$out" AddStatus 1 "the package installs"
-"$(dirname "$WINE")/wineserver" -k 2>/dev/null; sleep 1
+"$(sg_wineserver)" -k 2>/dev/null; sleep 1
 rm -f "$C/msixapps-out.txt"
 printf '@echo off\r\nsgrealtool.exe one two\r\n' > "$C/alias.bat"
 run cmd /c 'C:\alias.bat' >/dev/null

@@ -20,7 +20,7 @@ for t in "$MINGW" python3; do command -v "$t" >/dev/null || { echo "SKIP: $t mis
 T=$(mktemp -d /var/tmp/sg-appxbig.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d"
 unset DISPLAY WAYLAND_DISPLAY
-trap '"$(dirname "$WINE")/wineserver" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
+trap '"$(sg_wineserver)" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 TMPDIR=/var/tmp "$MINGW" -O2 -municode -o "$T/probe.exe" "$HERE/appxbig-probe.c" -lole32 -lshlwapi || { echo "FAIL  the probe did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 C="$WINEPREFIX/drive_c"

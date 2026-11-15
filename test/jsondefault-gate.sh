@@ -15,7 +15,7 @@ command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW missing"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-jsondefault.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d"
 unset DISPLAY WAYLAND_DISPLAY
-trap '"$(dirname "$WINE")/wineserver" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
+trap '"$(sg_wineserver)" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 TMPDIR=/var/tmp "$MINGW" -O2 -o "$T/probe.exe" "$HERE/jsondefault-probe.c" -lruntimeobject || { echo "FAIL  the probe did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 cp "$T/probe.exe" "$WINEPREFIX/drive_c/"
