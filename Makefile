@@ -27,13 +27,21 @@ install:
 # dialogs a user can reach (a series-applied tree, tools/lint-tree.sh).
 # tools/trademark-allow.txt lists the exceptions, each with its reason.
 # And every gate that runs Wine sources test/scratch-home.sh first, so no
-# prefix of a gate links into the real HOME (a gate once emptied a real Desktop).
+# prefix of a gate links into the real HOME (a gate once emptied a real Desktop),
+# and none reaches the person's session: scratch-home.sh gives the gate its own
+# XDG_RUNTIME_DIR and a WAYLAND_DISPLAY that exists nowhere, and no gate names
+# /run/user, SG_REAL_XDG_RUNTIME_DIR, wayland-N or DISPLAY=:0 (2026-11-16).
 lint:
 	@for f in $$(grep -l WINEPREFIX test/*.sh); do \
 	    sed -n 2p "$$f" | grep -q '^\. "$$(dirname "$$0")/scratch-home.sh"$$' || \
 	    { echo "$$f: line 2 must be: . \"\$$(dirname \"\$$0\")/scratch-home.sh\""; exit 1; }; done
 	@! grep -nF -e 'dirname "$$WINE")/wineserver"' -e '$${WINE%/wine}/wineserver' test/*.sh || \
 	    { echo 'a build tree has no wineserver beside wine: use "$$(sg_wineserver)" (test/scratch-home.sh)'; exit 1; }
+	@grep -qx 'export WAYLAND_DISPLAY=sg-gate-no-wayland' test/scratch-home.sh && \
+	    grep -qF 'XDG_RUNTIME_DIR="$$SG_GATE_HOME/run"' test/scratch-home.sh || \
+	    { echo 'test/scratch-home.sh must give each gate its own XDG_RUNTIME_DIR and a WAYLAND_DISPLAY that exists nowhere'; exit 1; }
+	@! grep -nE '(XDG_RUNTIME_DIR="?(/run/user|\$$SG_REAL_XDG_RUNTIME_DIR|\$$\{SG_REAL_XDG_RUNTIME_DIR))|WAYLAND_DISPLAY="?wayland-[0-9]|DISPLAY="?:0([^0-9]|$$)' test/*.sh tools/*.sh 2>/dev/null | grep -v '^test/scratch-home.sh:' || \
+	    { echo "a gate must not reach the person's session (their runtime dir, wayland-0 or DISPLAY=:0)"; exit 1; }
 	@T=$$(tools/lint-tree.sh) && \
 	python3 tools/trademark-check.py --allow tools/trademark-allow.txt --patches patches/sg --root "$$T" \
 	    --brand 'dlls/shell32/*' Wine --brand 'dlls/comdlg32/*' Wine --brand 'dlls/user32/*' Wine \

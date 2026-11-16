@@ -30,18 +30,28 @@ if [ -z "${SG_GATE_HOME:-}" ]; then
     export XDG_CONFIG_HOME="$HOME/.config" XDG_CACHE_HOME="$HOME/.cache" XDG_DATA_HOME="$HOME/.local/share" XDG_DESKTOP_DIR="$HOME/Desktop"
     mkdir -p "$HOME/Desktop" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
     export WINEDLLOVERRIDES="winemenubuilder.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
-    # Nothing a gate runs may reach the person's own session: Wine's Wayland
-    # driver connects to $XDG_RUNTIME_DIR/wayland-0 even with WAYLAND_DISPLAY
-    # unset (2026-10-06: a printing run reached the host's desktop), and
-    # DISPLAY=:0 is the host's X server. A gate starts its own display and
-    # gets a runtime directory of its own; SG_REAL_XDG_RUNTIME_DIR keeps the
-    # person's for the rare gate that must reach their user services.
-    export SG_REAL_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
+fi
+# Nothing a gate runs may reach the person's own session: Wine's Wayland
+# driver connects to $XDG_RUNTIME_DIR/wayland-0 even with WAYLAND_DISPLAY
+# unset (2026-10-06: a printing run reached the host's desktop; 2026-11-16:
+# headless wineboots in agents' ad-hoc runs reached the live sg-compositor
+# and looped on "Failed to read display config"), and DISPLAY=:0 is the
+# host's X server. A gate starts its own display and gets a runtime
+# directory of its own (in its HOME, so it goes with it), and the Wayland
+# display is a name that exists nowhere, so even a gate that points
+# XDG_RUNTIME_DIR somewhere else reaches no compositor by default.
+# SG_REAL_XDG_RUNTIME_DIR keeps the person's for the rare gate that must
+# reach their user services (none does yet). Done even when SG_GATE_HOME was
+# given, unless the runtime directory is already the gate's.
+case "${XDG_RUNTIME_DIR:-}" in
+"$SG_GATE_HOME"/*) ;;
+*)  export SG_REAL_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
     XDG_RUNTIME_DIR="$SG_GATE_HOME/run"
     mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
     export XDG_RUNTIME_DIR
-    unset WAYLAND_DISPLAY DISPLAY
-fi
+    unset DISPLAY ;;
+esac
+export WAYLAND_DISPLAY=sg-gate-no-wayland
 # Vulkan on a gate's own display (Xvfb) is lavapipe's: the host's GPU driver
 # may have no instance there -- NVIDIA's needs its own X server -- and the
 # loader took it first: every Vulkan gate skipped on a host with NVIDIA's
