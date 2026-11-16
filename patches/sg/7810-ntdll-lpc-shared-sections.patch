@@ -1,0 +1,750 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll: shared sections for LPC ports
+
+K-LPC leftover (wine-sg 7810). NtConnectPort and NtAcceptConnectPort
+refused a section with STATUS_NOT_SUPPORTED. Now each side maps a port's
+shared section into its own process, the same range of it: a client's
+section (LPC_SECTION_WRITE) is mapped by the client before connecting and
+by the server in NtAcceptConnectPort (its LPC_SECTION_READ), which tells
+the server where, for the client's TargetViewBase; a server's section is
+mapped by the server on accepting and by the client once the connection
+completes (its LPC_SECTION_READ). The wineserver holds the section objects
+and hands each side a handle (connect_port, accept_port_connect and
+get_port_connect_result carry them; new request set_port_view; protocol
+880). A 32-bit process's views are mapped below 4 GB, and WoW64 copies the
+mapped views back to its LPC_SECTION_WRITE. The server's own
+TargetViewBase stays NULL: the client maps that view only after the server
+has returned from NtAcceptConnectPort.
+---
+ dlls/ntdll/unix/sync.c         | 122 ++++++++++++++++++++++++++++++---
+ dlls/wow64/sync.c              |  12 ++++
+ include/wine/server_protocol.h |  37 ++++++++--
+ server/file.h                  |   1 +
+ server/mapping.c               |   6 ++
+ server/port.c                  |  71 ++++++++++++++++++-
+ server/protocol.def            |  20 ++++++
+ server/request_handlers.h      |  26 +++++--
+ server/request_trace.h         |  22 ++++++
+ 9 files changed, 297 insertions(+), 20 deletions(-)
+
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index e28386e..8264e19 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2511,26 +2511,58 @@ NTSTATUS WINAPI NtCreateWaitablePort( HANDLE *handle, OBJECT_ATTRIBUTES *attr, U
+ }
+ 
+ 
++/* Stained Glass OS (wine-sg 7810): a port's shared section is mapped by each side into its own process,
++ * the same range of the section: the side that gives it, before the connection, the other once it gets
++ * a handle to it from the server */
++static NTSTATUS map_port_view( HANDLE section, ULONG offset, ULONG size, void **base, ULONG *mapped )
++{
++    LARGE_INTEGER off;
++    SIZE_T view_size = size;
++    NTSTATUS status;
++
++    off.QuadPart = offset;
++    *base = NULL;
++    /* (a 32-bit process's view must be where it can reach it) */
++    status = NtMapViewOfSection( section, GetCurrentProcess(), base, in_wow64_call() ? 0x7fffffff : 0, 0, &off,
++                                 &view_size, ViewShare, 0, PAGE_READWRITE );
++    if (!status) *mapped = view_size;
++    return status;
++}
++
+ static NTSTATUS connect_port( HANDLE *handle, UNICODE_STRING *name, LPC_SECTION_WRITE *write, PSID sid,
+                               LPC_SECTION_READ *read, ULONG *max_len, void *info, ULONG *info_len )
+ {
+     char sid_buffer[SECURITY_MAX_SID_SIZE];
+     ULONG in_len = (info && info_len) ? *info_len : 0, sid_len = 0, out_len = 0;
++    ULONG server_offset = 0, server_size = 0;
++    client_ptr_t remote = 0;
++    HANDLE server_section = 0;
+     NTSTATUS status;
+     HANDLE port = 0;
++    void *view = NULL;
+ 
+     if (!handle || !name) return STATUS_INVALID_PARAMETER;
+     *handle = 0;
+     if (write && write->SectionHandle)
+     {
+-        FIXME( "shared sections are not supported\n" );
+-        return STATUS_NOT_SUPPORTED;
++        ULONG mapped = 0;
++        if ((status = map_port_view( write->SectionHandle, write->SectionOffset, write->ViewSize, &view, &mapped )))
++            return status;
++        write->ViewBase = view;
++        write->ViewSize = mapped;
++        write->TargetViewBase = NULL;
+     }
+ 
+     SERVER_START_REQ( connect_port )
+     {
+         req->rootdir  = 0;
+         req->name_len = name->Length;
++        if (view)
++        {
++            req->section        = wine_server_obj_handle( write->SectionHandle );
++            req->section_offset = write->SectionOffset;
++            req->view_size      = write->ViewSize;
++        }
+         wine_server_add_data( req, name->Buffer, name->Length );
+         if (in_len) wine_server_add_data( req, info, in_len );
+         wine_server_set_reply( req, sid_buffer, sizeof(sid_buffer) );
+@@ -2540,7 +2572,11 @@ static NTSTATUS connect_port( HANDLE *handle, UNICODE_STRING *name, LPC_SECTION_
+         sid_len = wine_server_reply_size( reply );
+     }
+     SERVER_END_REQ;
+-    if (status) return status;
++    if (status)
++    {
++        if (view) NtUnmapViewOfSection( GetCurrentProcess(), view );
++        return status;
++    }
+ 
+ #ifndef SG_MUTANT_LPC_NO_SID_CHECK
+     if (sid && (sid_len < offsetof( SID, SubAuthority[0] ) ||
+@@ -2548,6 +2584,7 @@ static NTSTATUS connect_port( HANDLE *handle, UNICODE_STRING *name, LPC_SECTION_
+                 memcmp( sid, sid_buffer, sid_len )))
+     {
+         NtClose( port );
++        if (view) NtUnmapViewOfSection( GetCurrentProcess(), view );
+         return STATUS_SERVER_SID_MISMATCH;
+     }
+ #endif
+@@ -2560,6 +2597,10 @@ static NTSTATUS connect_port( HANDLE *handle, UNICODE_STRING *name, LPC_SECTION_
+             if (in_len) wine_server_set_reply( req, info, in_len );
+             status = wine_server_call( req );
+             out_len = reply->info_len;
++            remote = reply->client_view_remote;
++            server_section = wine_server_ptr_handle( reply->server_section );
++            server_offset = reply->server_offset;
++            server_size = reply->server_size;
+         }
+         SERVER_END_REQ;
+         if (status != STATUS_PENDING) break;
+@@ -2568,14 +2609,28 @@ static NTSTATUS connect_port( HANDLE *handle, UNICODE_STRING *name, LPC_SECTION_
+     if (status)
+     {
+         NtClose( port );
++        if (view) NtUnmapViewOfSection( GetCurrentProcess(), view );
+         return status;
+     }
+     if (info_len) *info_len = min( out_len, in_len );
++    if (view) write->TargetViewBase = wine_server_get_ptr( remote );
+     if (read)
+     {
+         read->ViewSize = 0;
+         read->ViewBase = NULL;
+     }
++    if (server_section)
++    {
++        /* the server's section: mapped here too */
++        void *base = NULL;
++        ULONG mapped = 0;
++        if (read && !map_port_view( server_section, server_offset, server_size, &base, &mapped ))
++        {
++            read->ViewBase = base;
++            read->ViewSize = mapped;
++        }
++        NtClose( server_section );
++    }
+     *handle = port;
+     return STATUS_SUCCESS;
+ }
+@@ -2624,36 +2679,83 @@ NTSTATUS WINAPI NtListenPort( HANDLE handle, LPC_MESSAGE *msg )
+ NTSTATUS WINAPI NtAcceptConnectPort( HANDLE *handle, ULONG id, LPC_MESSAGE *msg, BOOLEAN accept,
+                                      LPC_SECTION_WRITE *write, LPC_SECTION_READ *read )
+ {
++    HANDLE port = 0, client_section = 0;
++    ULONG client_offset = 0, client_size = 0;
++    void *view = NULL;
+     NTSTATUS status;
+ 
+     TRACE( "(%p,%u,%p,%d,%p,%p)\n", handle, (int)id, msg, accept, write, read );
+ 
+     if (!msg) return STATUS_INVALID_PARAMETER;
+     if (accept && (status = check_lpc_message( msg ))) return status;
+-    if (write && write->SectionHandle)
++    if (handle) *handle = 0;
++    if (accept && write && write->SectionHandle)
+     {
+-        FIXME( "shared sections are not supported\n" );
+-        return STATUS_NOT_SUPPORTED;
++        ULONG mapped = 0;
++        if ((status = map_port_view( write->SectionHandle, write->SectionOffset, write->ViewSize, &view, &mapped )))
++            return status;
++        write->ViewBase = view;
++        write->ViewSize = mapped;
++        /* (where the client maps it is not known yet: it maps it when the connection completes) */
++        write->TargetViewBase = NULL;
+     }
+-    if (handle) *handle = 0;
+ 
+     SERVER_START_REQ( accept_port_connect )
+     {
+         req->msg_id  = msg->MessageId;
+         req->context = id;
+         req->accept  = accept;
++        if (view)
++        {
++            req->section        = wine_server_obj_handle( write->SectionHandle );
++            req->section_offset = write->SectionOffset;
++            req->view_size      = write->ViewSize;
++        }
+         if (accept) wine_server_add_data( req, msg->Data, msg->DataSize );
+         status = wine_server_call( req );
+-        if (handle) *handle = wine_server_ptr_handle( reply->handle );
+-        else if (reply->handle) NtClose( wine_server_ptr_handle( reply->handle ));
++        port = wine_server_ptr_handle( reply->handle );
++        client_section = wine_server_ptr_handle( reply->client_section );
++        client_offset = reply->client_offset;
++        client_size = reply->client_size;
+     }
+     SERVER_END_REQ;
+ 
+-    if (!status && read)
++    if (status)
++    {
++        if (view) NtUnmapViewOfSection( GetCurrentProcess(), view );
++        return status;
++    }
++    if (read)
+     {
+         read->ViewSize = 0;
+         read->ViewBase = NULL;
+     }
++    if (client_section)
++    {
++        /* the client's section: mapped here, and the client told where */
++        void *base = NULL;
++        ULONG mapped = 0;
++        if (!map_port_view( client_section, client_offset, client_size, &base, &mapped ))
++        {
++            if (read)
++            {
++                read->ViewBase = base;
++                read->ViewSize = mapped;
++            }
++#ifndef SG_MUTANT_LPC_NO_REMOTE_VIEW
++            SERVER_START_REQ( set_port_view )
++            {
++                req->handle = wine_server_obj_handle( port );
++                req->remote = wine_server_client_ptr( base );
++                wine_server_call( req );
++            }
++            SERVER_END_REQ;
++#endif
++        }
++        NtClose( client_section );
++    }
++    if (handle) *handle = port;
++    else if (port) NtClose( port );
+     return status;
+ }
+ 
+diff --git a/dlls/wow64/sync.c b/dlls/wow64/sync.c
+index 696ce53..2f0604d 100644
+--- a/dlls/wow64/sync.c
++++ b/dlls/wow64/sync.c
+@@ -60,6 +60,15 @@ static LPC_SECTION_WRITE *lpc_section_write_32to64( LPC_SECTION_WRITE *out, cons
+     return out;
+ }
+ 
++/* the views the call mapped (wine-sg 7810) */
++static void lpc_section_write_64to32( LPC_SECTION_WRITE32 *out, const LPC_SECTION_WRITE *in, NTSTATUS status )
++{
++    if (!out || status) return;
++    out->ViewSize       = in->ViewSize;
++    out->ViewBase       = PtrToUlong( in->ViewBase );
++    out->TargetViewBase = PtrToUlong( in->TargetViewBase );
++}
++
+ static void lpc_section_read_64to32( LPC_SECTION_READ32 *out, const LPC_SECTION_READ *in, NTSTATUS status )
+ {
+     if (!out || status) return;
+@@ -186,6 +195,7 @@ NTSTATUS WINAPI wow64_NtAcceptConnectPort( UINT *args )
+     status = NtAcceptConnectPort( handle_ptr ? &handle : NULL, id, msg, accept,
+                                   lpc_section_write_32to64( &write, write32 ), read32 ? &read : NULL );
+     if (handle_ptr) put_handle( handle_ptr, handle );
++    lpc_section_write_64to32( write32, &write, status );
+     lpc_section_read_64to32( read32, &read, status );
+     return status;
+ }
+@@ -261,6 +271,7 @@ NTSTATUS WINAPI wow64_NtConnectPort( UINT *args )
+                             lpc_section_write_32to64( &write, write32 ), read32 ? &read : NULL,
+                             max_len, info, info_len );
+     put_handle( handle_ptr, handle );
++    lpc_section_write_64to32( write32, &write, status );
+     lpc_section_read_64to32( read32, &read, status );
+     return status;
+ }
+@@ -1475,6 +1486,7 @@ NTSTATUS WINAPI wow64_NtSecureConnectPort( UINT *args )
+                                   lpc_section_write_32to64( &write, write32 ), sid, read32 ? &read : NULL,
+                                   max_len, info, info_len );
+     put_handle( handle_ptr, handle );
++    lpc_section_write_64to32( write32, &write, status );
+     lpc_section_read_64to32( read32, &read, status );
+     return status;
+ }
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 8c5282b..b81d06f 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6311,9 +6311,11 @@ struct connect_port_request
+     struct request_header __header;
+     obj_handle_t rootdir;
+     data_size_t  name_len;
++    obj_handle_t section;
++    unsigned int section_offset;
++    unsigned int view_size;
+     /* VARARG(name,unicode_str,name_len); */
+     /* VARARG(info,bytes); */
+-    char __pad_20[4];
+ };
+ struct connect_port_reply
+ {
+@@ -6334,8 +6336,13 @@ struct get_port_connect_result_reply
+ {
+     struct reply_header __header;
+     data_size_t  info_len;
+-    /* VARARG(info,bytes); */
+     char __pad_12[4];
++    client_ptr_t client_view_remote;
++    obj_handle_t server_section;
++    unsigned int server_offset;
++    unsigned int server_size;
++    /* VARARG(info,bytes); */
++    char __pad_36[4];
+ };
+ 
+ 
+@@ -6346,14 +6353,31 @@ struct accept_port_connect_request
+     unsigned int msg_id;
+     client_ptr_t context;
+     int          accept;
++    obj_handle_t section;
++    unsigned int section_offset;
++    unsigned int view_size;
+     /* VARARG(info,bytes); */
+-    char __pad_28[4];
+ };
+ struct accept_port_connect_reply
+ {
+     struct reply_header __header;
+     obj_handle_t handle;
+-    char __pad_12[4];
++    obj_handle_t client_section;
++    unsigned int client_offset;
++    unsigned int client_size;
++};
++
++
++
++struct set_port_view_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++    client_ptr_t remote;
++};
++struct set_port_view_reply
++{
++    struct reply_header __header;
+ };
+ 
+ 
+@@ -6778,6 +6802,7 @@ enum request
+     REQ_connect_port,
+     REQ_get_port_connect_result,
+     REQ_accept_port_connect,
++    REQ_set_port_view,
+     REQ_complete_port_connect,
+     REQ_send_port_message,
+     REQ_receive_port_message,
+@@ -7109,6 +7134,7 @@ union generic_request
+     struct connect_port_request connect_port_request;
+     struct get_port_connect_result_request get_port_connect_result_request;
+     struct accept_port_connect_request accept_port_connect_request;
++    struct set_port_view_request set_port_view_request;
+     struct complete_port_connect_request complete_port_connect_request;
+     struct send_port_message_request send_port_message_request;
+     struct receive_port_message_request receive_port_message_request;
+@@ -7438,6 +7464,7 @@ union generic_reply
+     struct connect_port_reply connect_port_reply;
+     struct get_port_connect_result_reply get_port_connect_result_reply;
+     struct accept_port_connect_reply accept_port_connect_reply;
++    struct set_port_view_reply set_port_view_reply;
+     struct complete_port_connect_reply complete_port_connect_reply;
+     struct send_port_message_reply send_port_message_reply;
+     struct receive_port_message_reply receive_port_message_reply;
+@@ -7446,6 +7473,6 @@ union generic_reply
+     struct sg_chmod_fd_reply sg_chmod_fd_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 879
++#define SERVER_PROTOCOL_VERSION 880
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/file.h b/server/file.h
+index 0d96bcf..ebe4618 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -196,6 +196,7 @@ extern struct mapping *create_fd_mapping( struct object *root, const struct unic
+                                           unsigned int attr, const struct security_descriptor *sd );
+ extern struct object *create_user_data_mapping( struct object *root, const struct unicode_str *name,
+                                                 unsigned int attr, const struct security_descriptor *sd );
++extern struct object *get_section_obj( struct process *process, obj_handle_t handle, unsigned int access );
+ extern struct mapping *create_session_mapping( struct object *root, const struct unicode_str *name,
+                                                unsigned int attr, const struct security_descriptor *sd );
+ extern void set_session_mapping( struct mapping *mapping );
+diff --git a/server/mapping.c b/server/mapping.c
+index 05eef19..5cd566a 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -1187,6 +1187,12 @@ static struct mapping *get_mapping_obj( struct process *process, obj_handle_t ha
+     return (struct mapping *)get_handle_obj( process, handle, access, &mapping_ops );
+ }
+ 
++/* Stained Glass OS: a section object, for the LPC ports' shared views (wine-sg 7810) */
++struct object *get_section_obj( struct process *process, obj_handle_t handle, unsigned int access )
++{
++    return get_handle_obj( process, handle, access, &mapping_ops );
++}
++
+ /* open a new file for the file descriptor backing the view */
+ struct file *get_view_file( const struct memory_view *view, unsigned int access, unsigned int sharing )
+ {
+diff --git a/server/port.c b/server/port.c
+index 39dcc95..253af70 100644
+--- a/server/port.c
++++ b/server/port.c
+@@ -47,6 +47,7 @@
+ #include "process.h"
+ #include "request.h"
+ #include "security.h"
++#include "file.h"
+ 
+ #define PORT_CONNECT     0x0001
+ #define PORT_ALL_ACCESS  (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | PORT_CONNECT)
+@@ -99,8 +100,16 @@ struct port
+     struct sid        *server_sid;     /* connection port: the user of the process that created it */
+     int                closed;         /* the last handle was closed */
+     int                connect_done;   /* client port: accepted or refused, the client was not told yet */
++    /* client port: the shared sections of the connection (wine-sg 7810) */
++    struct object     *client_view;    /* the client's section, for the server to map (holds a ref) */
++    unsigned int       client_view_offset, client_view_size;
++    client_ptr_t       client_view_remote; /* where the server mapped it */
++    struct object     *server_view;    /* the server's section, for the client to map (holds a ref) */
++    unsigned int       server_view_offset, server_view_size;
+ };
+ 
++#define PORT_SECTION_ACCESS  (SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE)
++
+ struct port_msg
+ {
+     struct list    entry;
+@@ -183,6 +192,9 @@ static void init_port( struct port *port, enum port_kind kind )
+     port->server_sid = NULL;
+     port->closed     = 0;
+     port->connect_done = 0;
++    port->client_view = NULL;
++    port->client_view_remote = 0;
++    port->server_view = NULL;
+ }
+ 
+ static struct port *alloc_port( enum port_kind kind )
+@@ -414,6 +426,8 @@ static void port_destroy( struct object *obj )
+     if (port->connection) release_object( port->connection );
+     free( port->info );
+     free( port->server_sid );
++    if (port->client_view) release_object( port->client_view );
++    if (port->server_view) release_object( port->server_view );
+ }
+ 
+ static struct port *get_port_obj( struct process *process, obj_handle_t handle, unsigned int access )
+@@ -519,6 +533,15 @@ DECL_HANDLER(connect_port)
+     {
+         client->connection = (struct port *)grab_object( connection );
+         client->max_data   = connection->max_data;
++        if (req->section && !(client->client_view = get_section_obj( current->process, req->section,
++                                                                     PORT_SECTION_ACCESS )))
++        {
++            release_object( client );
++            release_object( connection );
++            return;
++        }
++        client->client_view_offset = req->section_offset;
++        client->client_view_size   = req->view_size;
+         if ((msg = alloc_msg( LPC_CONNECTION_REQUEST, info, info_len )))
+         {
+             msg->id     = new_msg_id();
+@@ -554,6 +577,17 @@ DECL_HANDLER(get_port_connect_result)
+         break;
+     case CLIENT_CONNECTED:
+         reply->info_len = port->info_len;
++        reply->client_view_remote = port->client_view_remote;
++        if (port->server_view)
++        {
++            /* the server's section, once, for the client to map */
++            reply->server_section = alloc_handle_no_access_check( current->process, port->server_view,
++                                                                  PORT_SECTION_ACCESS, 0 );
++            reply->server_offset  = port->server_view_offset;
++            reply->server_size    = port->server_view_size;
++            release_object( port->server_view );
++            port->server_view = NULL;
++        }
+         if (port->info_len) set_reply_data( port->info, min( port->info_len, get_reply_max_size() ));
+         break;
+     case CLIENT_REFUSED:
+@@ -572,6 +606,7 @@ DECL_HANDLER(accept_port_connect)
+ {
+     struct port_msg *msg, *found = NULL;
+     struct port *client, *server, *connection;
++    struct object *server_view = NULL;
+ 
+     LIST_FOR_EACH_ENTRY( msg, &awaiting, struct port_msg, entry )
+     {
+@@ -610,7 +645,13 @@ DECL_HANDLER(accept_port_connect)
+         set_error( STATUS_PORT_MESSAGE_TOO_LONG );
+         return;
+     }
+-    if (!(server = alloc_port( PORT_KIND_SERVER ))) return;
++    if (req->section && !(server_view = get_section_obj( current->process, req->section, PORT_SECTION_ACCESS )))
++        return;
++    if (!(server = alloc_port( PORT_KIND_SERVER )))
++    {
++        if (server_view) release_object( server_view );
++        return;
++    }
+     server->connection = (struct port *)grab_object( connection );
+     server->max_data   = connection->max_data;
+     server->context    = req->context;
+@@ -621,13 +662,41 @@ DECL_HANDLER(accept_port_connect)
+         client->info = client->info_len ? memdup( get_req_data(), client->info_len ) : NULL;
+         server->peer = client;
+         client->peer = server;
++        /* the shared sections: the client's for this process to map now, the server's for the client */
++        if (client->client_view)
++        {
++            reply->client_section = alloc_handle_no_access_check( current->process, client->client_view,
++                                                                  PORT_SECTION_ACCESS, 0 );
++            reply->client_offset  = client->client_view_offset;
++            reply->client_size    = client->client_view_size;
++        }
++        if (client->server_view) release_object( client->server_view );
++        client->server_view = server_view;
++        client->server_view_offset = req->section_offset;
++        client->server_view_size   = req->view_size;
++        server_view = NULL;
+         list_add_tail( &connection->servers, &server->server_entry );
+         list_remove( &found->entry );
+         free_msg( found );
+     }
++    if (server_view) release_object( server_view );
+     release_object( server );
+ }
+ 
++/* where the server mapped the client's section: the client's NtConnectPort reports it */
++DECL_HANDLER(set_port_view)
++{
++    struct port *port;
++
++    if (!(port = get_port_obj( current->process, req->handle, 0 ))) return;
++
++    if (port->kind != PORT_KIND_SERVER) set_error( STATUS_INVALID_PORT_HANDLE );
++    else if (!port->peer) set_error( STATUS_PORT_DISCONNECTED );
++    else if (port->peer->state != CLIENT_CONNECTING) set_error( STATUS_INVALID_PARAMETER );
++    else port->peer->client_view_remote = req->remote;
++    release_object( port );
++}
++
+ /* the server is ready: the client's NtConnectPort returns */
+ DECL_HANDLER(complete_port_connect)
+ {
+diff --git a/server/protocol.def b/server/protocol.def
+index e56e267..5c88132 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4365,6 +4365,9 @@ struct handle_info
+ @REQ(connect_port)
+     obj_handle_t rootdir;       /* root directory */
+     data_size_t  name_len;      /* length of the port name */
++    obj_handle_t section;       /* the client's shared section, or 0 */
++    unsigned int section_offset; /* its offset and view size */
++    unsigned int view_size;
+     VARARG(name,unicode_str,name_len); /* port name */
+     VARARG(info,bytes);         /* connection information */
+ @REPLY
+@@ -4379,6 +4382,10 @@ struct handle_info
+     obj_handle_t handle;        /* client communication port */
+ @REPLY
+     data_size_t  info_len;      /* length of the server's connection information */
++    client_ptr_t client_view_remote; /* where the server mapped the client's shared section */
++    obj_handle_t server_section; /* the server's shared section, to map, or 0 */
++    unsigned int server_offset; /* its offset and view size */
++    unsigned int server_size;
+     VARARG(info,bytes);         /* the server's connection information */
+ @END
+ 
+@@ -4388,9 +4395,22 @@ struct handle_info
+     unsigned int msg_id;        /* id of the connection request */
+     client_ptr_t context;       /* port context given back with each message */
+     int          accept;        /* accept or refuse */
++    obj_handle_t section;       /* the server's shared section, or 0 */
++    unsigned int section_offset; /* its offset and view size */
++    unsigned int view_size;
+     VARARG(info,bytes);         /* connection information for the client */
+ @REPLY
+     obj_handle_t handle;        /* server communication port */
++    obj_handle_t client_section; /* the client's shared section, to map, or 0 */
++    unsigned int client_offset; /* its offset and view size */
++    unsigned int client_size;
++@END
++
++
++/* Where the server mapped the client's shared section (before completing the connection) */
++@REQ(set_port_view)
++    obj_handle_t handle;        /* server communication port */
++    client_ptr_t remote;        /* the server's address of the client's view */
+ @END
+ 
+ 
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 6588f1c..c650158 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -325,6 +325,7 @@ DECL_HANDLER(create_port);
+ DECL_HANDLER(connect_port);
+ DECL_HANDLER(get_port_connect_result);
+ DECL_HANDLER(accept_port_connect);
++DECL_HANDLER(set_port_view);
+ DECL_HANDLER(complete_port_connect);
+ DECL_HANDLER(send_port_message);
+ DECL_HANDLER(receive_port_message);
+@@ -653,6 +654,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_connect_port,
+     (req_handler)req_get_port_connect_result,
+     (req_handler)req_accept_port_connect,
++    (req_handler)req_set_port_view,
+     (req_handler)req_complete_port_connect,
+     (req_handler)req_send_port_message,
+     (req_handler)req_receive_port_message,
+@@ -2465,20 +2467,36 @@ C_ASSERT( offsetof(struct create_port_reply, handle) == 8 );
+ C_ASSERT( sizeof(struct create_port_reply) == 16 );
+ C_ASSERT( offsetof(struct connect_port_request, rootdir) == 12 );
+ C_ASSERT( offsetof(struct connect_port_request, name_len) == 16 );
+-C_ASSERT( sizeof(struct connect_port_request) == 24 );
++C_ASSERT( offsetof(struct connect_port_request, section) == 20 );
++C_ASSERT( offsetof(struct connect_port_request, section_offset) == 24 );
++C_ASSERT( offsetof(struct connect_port_request, view_size) == 28 );
++C_ASSERT( sizeof(struct connect_port_request) == 32 );
+ C_ASSERT( offsetof(struct connect_port_reply, handle) == 8 );
+ C_ASSERT( offsetof(struct connect_port_reply, max_data) == 12 );
+ C_ASSERT( sizeof(struct connect_port_reply) == 16 );
+ C_ASSERT( offsetof(struct get_port_connect_result_request, handle) == 12 );
+ C_ASSERT( sizeof(struct get_port_connect_result_request) == 16 );
+ C_ASSERT( offsetof(struct get_port_connect_result_reply, info_len) == 8 );
+-C_ASSERT( sizeof(struct get_port_connect_result_reply) == 16 );
++C_ASSERT( offsetof(struct get_port_connect_result_reply, client_view_remote) == 16 );
++C_ASSERT( offsetof(struct get_port_connect_result_reply, server_section) == 24 );
++C_ASSERT( offsetof(struct get_port_connect_result_reply, server_offset) == 28 );
++C_ASSERT( offsetof(struct get_port_connect_result_reply, server_size) == 32 );
++C_ASSERT( sizeof(struct get_port_connect_result_reply) == 40 );
+ C_ASSERT( offsetof(struct accept_port_connect_request, msg_id) == 12 );
+ C_ASSERT( offsetof(struct accept_port_connect_request, context) == 16 );
+ C_ASSERT( offsetof(struct accept_port_connect_request, accept) == 24 );
+-C_ASSERT( sizeof(struct accept_port_connect_request) == 32 );
++C_ASSERT( offsetof(struct accept_port_connect_request, section) == 28 );
++C_ASSERT( offsetof(struct accept_port_connect_request, section_offset) == 32 );
++C_ASSERT( offsetof(struct accept_port_connect_request, view_size) == 36 );
++C_ASSERT( sizeof(struct accept_port_connect_request) == 40 );
+ C_ASSERT( offsetof(struct accept_port_connect_reply, handle) == 8 );
+-C_ASSERT( sizeof(struct accept_port_connect_reply) == 16 );
++C_ASSERT( offsetof(struct accept_port_connect_reply, client_section) == 12 );
++C_ASSERT( offsetof(struct accept_port_connect_reply, client_offset) == 16 );
++C_ASSERT( offsetof(struct accept_port_connect_reply, client_size) == 20 );
++C_ASSERT( sizeof(struct accept_port_connect_reply) == 24 );
++C_ASSERT( offsetof(struct set_port_view_request, handle) == 12 );
++C_ASSERT( offsetof(struct set_port_view_request, remote) == 16 );
++C_ASSERT( sizeof(struct set_port_view_request) == 24 );
+ C_ASSERT( offsetof(struct complete_port_connect_request, handle) == 12 );
+ C_ASSERT( sizeof(struct complete_port_connect_request) == 16 );
+ C_ASSERT( offsetof(struct send_port_message_request, handle) == 12 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index cf81a6a..98b98d8 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3618,6 +3618,9 @@ static void dump_connect_port_request( const struct connect_port_request *req )
+ {
+     fprintf( stderr, " rootdir=%04x", req->rootdir );
+     fprintf( stderr, ", name_len=%u", req->name_len );
++    fprintf( stderr, ", section=%04x", req->section );
++    fprintf( stderr, ", section_offset=%08x", req->section_offset );
++    fprintf( stderr, ", view_size=%08x", req->view_size );
+     dump_varargs_unicode_str( ", name=", min( cur_size, req->name_len ));
+     dump_varargs_bytes( ", info=", cur_size );
+ }
+@@ -3637,6 +3640,10 @@ static void dump_get_port_connect_result_request( const struct get_port_connect_
+ static void dump_get_port_connect_result_reply( const struct get_port_connect_result_reply *req )
+ {
+     fprintf( stderr, " info_len=%u", req->info_len );
++    dump_uint64( ", client_view_remote=", &req->client_view_remote );
++    fprintf( stderr, ", server_section=%04x", req->server_section );
++    fprintf( stderr, ", server_offset=%08x", req->server_offset );
++    fprintf( stderr, ", server_size=%08x", req->server_size );
+     dump_varargs_bytes( ", info=", cur_size );
+ }
+ 
+@@ -3645,12 +3652,24 @@ static void dump_accept_port_connect_request( const struct accept_port_connect_r
+     fprintf( stderr, " msg_id=%08x", req->msg_id );
+     dump_uint64( ", context=", &req->context );
+     fprintf( stderr, ", accept=%d", req->accept );
++    fprintf( stderr, ", section=%04x", req->section );
++    fprintf( stderr, ", section_offset=%08x", req->section_offset );
++    fprintf( stderr, ", view_size=%08x", req->view_size );
+     dump_varargs_bytes( ", info=", cur_size );
+ }
+ 
+ static void dump_accept_port_connect_reply( const struct accept_port_connect_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", client_section=%04x", req->client_section );
++    fprintf( stderr, ", client_offset=%08x", req->client_offset );
++    fprintf( stderr, ", client_size=%08x", req->client_size );
++}
++
++static void dump_set_port_view_request( const struct set_port_view_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    dump_uint64( ", remote=", &req->remote );
+ }
+ 
+ static void dump_complete_port_connect_request( const struct complete_port_connect_request *req )
+@@ -4040,6 +4059,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_connect_port_request,
+     (dump_func)dump_get_port_connect_result_request,
+     (dump_func)dump_accept_port_connect_request,
++    (dump_func)dump_set_port_view_request,
+     (dump_func)dump_complete_port_connect_request,
+     (dump_func)dump_send_port_message_request,
+     (dump_func)dump_receive_port_message_request,
+@@ -4369,6 +4389,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_port_connect_result_reply,
+     (dump_func)dump_accept_port_connect_reply,
+     NULL,
++    NULL,
+     (dump_func)dump_send_port_message_reply,
+     (dump_func)dump_receive_port_message_reply,
+     (dump_func)dump_port_request_data_reply,
+@@ -4696,6 +4717,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "connect_port",
+     "get_port_connect_result",
+     "accept_port_connect",
++    "set_port_view",
+     "complete_port_connect",
+     "send_port_message",
+     "receive_port_message",
+-- 
+2.47.3
+
