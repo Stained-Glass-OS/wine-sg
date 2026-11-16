@@ -1274,6 +1274,11 @@ test-embedconf:
 test-xprocdc:
 	WINE=$(PREFIX)/bin/wine test/xprocdc-gate.sh
 
+# The taskbar's hover preview of a framed Linux program shows it; a right-click
+# on a button puts the preview away while its menu is up (7802).
+test-embedthumb:
+	WINE=$(PREFIX)/bin/wine test/embedthumb-gate.sh
+
 # A self-managed stack grows read-write; SD-less objects have an owner (0081, 0082).
 test-stackgrow:
 	WINE=$(PREFIX)/bin/wine test/stackgrow-gate.sh
