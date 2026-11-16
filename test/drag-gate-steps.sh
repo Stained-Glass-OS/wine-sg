@@ -158,6 +158,8 @@ else fail "no desktop menu for Sort by"; fi
 cp "$DUMP" "$T/dump-desktop-end.txt"
 
 # --- File Explorer: rubber bands -------------------------------------------------------------------------
+# the rows by name (Sub, d.txt, f1.txt, f2.txt): a folder never sorted is by date (7769)
+"$WINE" reg add 'HKCU\Software\Stained Glass\Explorer\FolderSorts' /v "C:\\users\\$U\\Documents" /t REG_DWORD /d 10 /f >/dev/null 2>&1
 "$WINE" explorer "C:\\users\\$U\\Documents" >/dev/null 2>&1 &
 wait_for 30 title_is Documents; sleep 2
 dprobe place Documents 300 0 700 330 >/dev/null; dprobe view Documents details >/dev/null; sleep 1
