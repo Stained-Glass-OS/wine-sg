@@ -7,6 +7,7 @@
  *   vdesk-probe new | switch I | close I | taskview
  *   vdesk-probe move TITLE I       move the window with that title to desktop I
  *   vdesk-probe state TITLE        visible= cloaked= desktop= (and the API's view)
+ *   vdesk-probe cstate CLASS       the same for any program's window, by class
  *   vdesk-probe hotkey KEYS        type Win+Ctrl(+Shift)+KEY with SendInput:
  *                                  new, left, right, close, moveleft, moveright, taskview
  *   vdesk-probe key VK             press and release one key (decimal VK)
@@ -185,6 +186,18 @@ int main( int argc, char **argv )
         DwmGetWindowAttribute( hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked) );
         printf( "visible=%d cloaked=%#lx desktop=%d\n", IsWindowVisible( hwnd ), cloaked,
                 (int)(INT_PTR)GetPropW( hwnd, L"__sg_vdesk" ) - 1 );
+        return 0;
+    }
+    if (argc == 3 && !strcmp( argv[1], "cstate" ))   /* the same for any program's window, by class (test/vdopen-gate.sh) */
+    {
+        HWND hwnd, root;
+        DWORD cloaked = 0;
+        MultiByteToWideChar( CP_ACP, 0, argv[2], -1, wtitle, 64 );
+        if (!(hwnd = FindWindowW( wtitle, NULL ))) { printf( "no window\n" ); return 1; }
+        root = GetAncestor( hwnd, GA_ROOTOWNER );
+        DwmGetWindowAttribute( hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked) );
+        printf( "visible=%d cloaked=%#lx desktop=%d\n", IsWindowVisible( hwnd ), cloaked,
+                (int)(INT_PTR)GetPropW( root, L"__sg_vdesk" ) - 1 );
         return 0;
     }
     if (argc == 3 && !strcmp( argv[1], "api" ))

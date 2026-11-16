@@ -1279,6 +1279,11 @@ test-xprocdc:
 test-embedthumb:
 	WINE=$(PREFIX)/bin/wine test/embedthumb-gate.sh
 
+# A program opened on desktop 2 opens there and the shell stays: the focus never
+# falls to a cloaked window when Start goes away (7803).
+test-vdopen:
+	WINE=$(PREFIX)/bin/wine test/vdopen-gate.sh
+
 # A self-managed stack grows read-write; SD-less objects have an owner (0081, 0082).
 test-stackgrow:
 	WINE=$(PREFIX)/bin/wine test/stackgrow-gate.sh
