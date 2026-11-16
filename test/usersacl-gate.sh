@@ -11,7 +11,14 @@
 # it. Here the prefix's owner makes a folder and grants it; another account
 # in the group then writes in it.
 #
-#   WINE=/opt/wine-sg/bin/wine test/usersacl-gate.sh
+# And where the folder already has an ACL -- made under a directory whose
+# default ACL names the system's account and gives the group r-x (Program
+# Files) -- the grant reaches the ACL's group entry, not only its mask
+# (patches/sg/7793; David 2026-11-15, GOG GALAXY: "Could not create directory
+# ... Dependencies-Temp\__redist"): another user makes folders in it and in a
+# folder made there after the grant.
+#
+#   WINE=/opt/wine-sg/bin/wine test/usersacl-gate.sh   (mutant SG_MUTANT_ACL_GROUP_UNTOUCHED, server/file.c)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -56,5 +63,26 @@ sudo -n -u "$SG_OTHER" sh -c "echo z >> '$D/logs/bootstrap_log.txt' && mkdir '$D
     && pass "what the administrator's program makes later is the users' to write (inherited, as on Windows)" \
     || fail "made after the grant: $(stat -c '%A %G' "$D/logs" "$D/logs/bootstrap_log.txt" | tr '\n' ' ')"
 sudo -n -u "$SG_OTHER" rm -rf "$D/package" "$D/bin/new" "$D/logs/sub" 2>/dev/null
+
+# under a default ACL, as Program Files has (the system's account named, the group r-x)
+if command -v setfacl >/dev/null; then
+    P="$WINEPREFIX/drive_c/PF"
+    mkdir "$P"; chmod 755 "$P"
+    setfacl -m "u:$(id -un):rwx" -d -m "u::rwx,u:$(id -un):rwx,g::r-x,o::r-x" "$P"
+    mkdir "$P/GOG"
+    out=$("$WINE" "$T/usersacl-probe.exe" 'C:\PF\GOG' 2>/dev/null | tr -d '\r')
+    "$WINESERVER" -w
+    acl=$(getfacl -cp "$P/GOG" 2>/dev/null | grep -E '^(group::|mask::|default:group::)' | tr '\n' ' ')
+    echo "      $out; $acl"
+    sudo -n -u "$SG_OTHER" mkdir "$P/GOG/Dependencies-Temp" 2>/dev/null \
+        && pass "with an inherited ACL, another user makes a folder in it ($acl)" || fail "inherited ACL: another user cannot write ($acl)"
+    (umask 022; mkdir "$P/GOG/redist")
+    sudo -n -u "$SG_OTHER" mkdir "$P/GOG/redist/__redist" 2>/dev/null \
+        && pass "and in a folder made there after the grant" \
+        || fail "made after the grant: $(getfacl -cp "$P/GOG/redist" 2>/dev/null | grep -E '^(group::|mask::)' | tr '\n' ' ')"
+    sudo -n -u "$SG_OTHER" rm -rf "$P/GOG/Dependencies-Temp" "$P/GOG/redist/__redist" 2>/dev/null
+else
+    echo "NOTE  no setfacl: the inherited-ACL case skipped"
+fi
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
