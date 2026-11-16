@@ -9,10 +9,14 @@
 #  - the credential goes only with a scheme the caller allows: a channel allowing NTLM alone does not send it
 #    to a Basic challenge, and the user's own (default) credentials never go to Basic or Digest;
 #  - HTTP 404: WS_E_ENDPOINT_NOT_FOUND;
-#  - an unknown credential type: E_NOTIMPL; scheme bits that do not exist: E_INVALIDARG.
+#  - an unknown credential type: E_NOTIMPL; scheme bits that do not exist: E_INVALIDARG;
+#  - (7812) WsCreateServiceProxy hands its security description to the channel (it was ignored), and
+#    WsCreateServiceProxyFromTemplate takes the HTTP header auth templates (E_NOTIMPL before): with the
+#    template's credential the call succeeds; without one, the user's own goes only to Negotiate/NTLM.
 # The account is a made-up test pair checked by a local Python server (wsauth-server.py). Runs in a network
 # namespace of its own (unshare -rn, loopback only).
-#   WINE=/opt/wine-sg/bin/wine test/wsauth-gate.sh   (mutant SG_MUTANT_WS_AUTH_ANY_SCHEME, webservices channel.c)
+#   WINE=/opt/wine-sg/bin/wine test/wsauth-gate.sh   (mutants SG_MUTANT_WS_AUTH_ANY_SCHEME, webservices channel.c;
+#   SG_MUTANT_WS_PROXY_NO_DESC, proxy.c)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -63,9 +67,12 @@ expect Deny "0x803d0005 0" "a server that refuses everyone: WS_E_ENDPOINT_ACCESS
 expect Missing "0x803d000d 0" "HTTP 404: WS_E_ENDPOINT_NOT_FOUND"
 expect BadCred "create 0x80004001" "an unknown credential type: E_NOTIMPL"
 expect BadScheme "create 0x80070057" "scheme bits that do not exist: E_INVALIDARG"
+expect Proxy "0 4321" "WsCreateServiceProxy passes its security description to the channel (7812)"
+expect Template "0 4321" "WsCreateServiceProxyFromTemplate, header auth template with a credential (7812)"
+expect TemplateDefaults "0x803d0005 0" "the template without a credential uses the user's own: not sent to Basic (7812)"
 expect Done 1 "the probe ran to the end"
 good=$(grep -c '^/svc Basic c2d0ZXN0OnNncGFzcw==$' "$T/server.log" 2>/dev/null)
-[ "$good" = 1 ] && pass "the right credential reached the server once, for the Basic channel only" \
-    || fail "the right credential reached the server $good times (wanted 1)"
+[ "$good" = 3 ] && pass "the right credential reached the server three times: the Basic channel, proxy and template" \
+    || fail "the right credential reached the server $good times (wanted 3)"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"

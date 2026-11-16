@@ -71,6 +71,67 @@ static void call(const char *tag, const WCHAR *path, SG_CRED *cred, ULONG scheme
     WsFreeHeap(heap);
 }
 
+/* the same through a service proxy: WsCreateServiceProxy with the security description (how 0), or
+ * WsCreateServiceProxyFromTemplate with the header auth template, its credential (1) or none (2) */
+typedef struct { WS_SECURITY_BINDING_PROPERTIES props; void *clientCredential; } SG_AUTH_TMPL;
+typedef struct { WS_CHANNEL_PROPERTIES channel; WS_SECURITY_PROPERTIES security; SG_AUTH_TMPL auth; } SG_HEADER_AUTH_TMPL;
+#define SG_HTTP_HEADER_AUTH_BINDING_TEMPLATE_TYPE 2   /* after HTTP and HTTP_SSL */
+
+static void proxy_call(const char *tag, const WCHAR *path, SG_CRED *cred, ULONG schemes, int how)
+{
+    WS_ENVELOPE_VERSION env = WS_ENVELOPE_VERSION_SOAP_1_2;
+    WS_CHANNEL_PROPERTY prop = { WS_CHANNEL_PROPERTY_ENVELOPE_VERSION, &env, sizeof(env) };
+    WS_SECURITY_BINDING_PROPERTY bprop = { SG_PROP_SCHEME, &schemes, sizeof(schemes) };
+    SG_HTTP_HEADER_AUTH_BINDING binding;
+    WS_SECURITY_BINDING *bindings[1] = { (WS_SECURITY_BINDING *)&binding };
+    WS_SECURITY_DESCRIPTION desc = { bindings, 1, NULL, 0 };
+    WS_PARAMETER_DESCRIPTION param[2] = {{WS_PARAMETER_TYPE_NORMAL, 0, 0xffff}, {WS_PARAMETER_TYPE_NORMAL, 0xffff, 0}};
+    WS_OPERATION_DESCRIPTION op = {1, &m_in, &m_in, 0, 0, 2, param, NULL, WS_NON_RPC_LITERAL_OPERATION};
+    SG_HEADER_AUTH_TMPL tmpl;
+    BYTE policy[512];
+    WS_SERVICE_PROXY *proxy = NULL;
+    WS_ENDPOINT_ADDRESS ep;
+    WS_HEAP *heap;
+    WCHAR url[100];
+    INT32 val = 1234, outval = 0, *pout = &outval;
+    const void *args[2] = { &val, &pout };   /* an output parameter's argument points at its pointer */
+    HRESULT hr;
+
+    memset(&binding, 0, sizeof(binding));
+    binding.binding.bindingType = SG_HTTP_HEADER_AUTH_BINDING_TYPE;
+    binding.binding.properties = &bprop;
+    binding.binding.propertyCount = 1;
+    binding.clientCredential = cred;
+    memset(&tmpl, 0, sizeof(tmpl));
+    tmpl.channel.properties = &prop;
+    tmpl.channel.propertyCount = 1;
+    tmpl.auth.props.properties = &bprop;
+    tmpl.auth.props.propertyCount = 1;
+    tmpl.auth.clientCredential = how == 1 ? cred : NULL;
+    memset(policy, 0, sizeof(policy));
+    WsCreateHeap(1 << 16, 0, NULL, 0, &heap, NULL);
+    if (!how)
+        hr = WsCreateServiceProxy(WS_CHANNEL_TYPE_REQUEST, WS_HTTP_CHANNEL_BINDING, &desc, NULL, 0, &prop, 1,
+                                  &proxy, NULL);
+    else
+        hr = WsCreateServiceProxyFromTemplate(WS_CHANNEL_TYPE_REQUEST, NULL, 0,
+                                              SG_HTTP_HEADER_AUTH_BINDING_TEMPLATE_TYPE, &tmpl, sizeof(tmpl),
+                                              policy, sizeof(policy), &proxy, NULL);
+    if (hr) { printf("%s=create %#lx\n", tag, hr); WsFreeHeap(heap); return; }
+    memset(&ep, 0, sizeof(ep));
+    ep.url.length = wsprintfW(url, L"http://127.0.0.1:%u%s", PORT, path);
+    ep.url.chars = url;
+    hr = WsOpenServiceProxy(proxy, &ep, NULL, NULL);
+    if (!hr)
+    {
+        hr = WsCall(proxy, &op, args, heap, NULL, 0, NULL, NULL);
+        WsCloseServiceProxy(proxy, NULL, NULL);
+    }
+    printf("%s=%#lx %d\n", tag, hr, hr ? 0 : outval);
+    WsFreeServiceProxy(proxy);
+    WsFreeHeap(heap);
+}
+
 int main(void)
 {
     SG_STRING_CRED good = { { SG_STRING_CRED_TYPE }, {0}, {0}, {0} }, bad = good;
@@ -95,6 +156,9 @@ int main(void)
     call("Missing", L"/nothing", NULL, 0);
     call("BadCred", L"/svc", &unknown, SG_SCHEME_BASIC);
     call("BadScheme", L"/svc", &good.credential, 0x100);
+    proxy_call("Proxy", L"/svc", &good.credential, SG_SCHEME_BASIC, 0);
+    proxy_call("Template", L"/svc", &good.credential, SG_SCHEME_BASIC, 1);
+    proxy_call("TemplateDefaults", L"/svc", NULL, SG_SCHEME_BASIC, 2);
     printf("Done=1\n");
     return 0;
 }
