@@ -1,11 +1,14 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# ICorDebug over Wine Mono's soft debugger agent (wine-sg 7792, NET-DBG phase 2: processes and threads).
+# ICorDebug over Wine Mono's soft debugger agent (wine-sg 7792/7796, NET-DBG phase 2: processes, threads,
+# stacks and values).
 # A debugger (cordbgsdb-probe.exe, raw ICorDebug) and a managed debuggee (cordbgsdb-app.cs: a background
 # worker and the main thread counting into C:\counter-PID.txt):
 #   launch    ICorDebug::CreateProcess: the CreateProcess callback; Continue starts it; Stop stops its
 #             managed threads (the count holds); EnumerateThreads gives them (at least two, each a thread
-#             of the debuggee, the worker background); GetThread finds one by id; Continue: running, the
+#             of the debuggee, the worker background); GetThread finds one by id; a thread's chain and IL frames
+#             (7796): the frame of App.Inspect, its token, its locals (long, double, bool, string) and arguments
+#             (this, int, string) as they are, out-of-range indexes refused; Continue: running, the
 #             count goes on; EnumerateThreads while running: CORDBG_E_PROCESS_NOT_SYNCHRONIZED
 #   attach    a program running its agent (dt_unix, server, not suspended): DebugActiveProcess stops it,
 #             its threads are enumerated; Detach lets it run on, alive
@@ -14,7 +17,8 @@
 #
 # Needs Wine Mono with the dt_unix transport (SG_MONO_RUNTIME=DIR names one) and mingw. SKIP without.
 #   WINE=/opt/wine-sg/bin/wine test/cordbgsdb-gate.sh
-#   mutants: SG_MUTANT_CDB_STOP_NOOP, SG_MUTANT_CDB_THREAD_ID, SG_MUTANT_CDB_NO_AGENT, SG_MUTANT_CDB_ATTACH_RUNNING (mscoree cordebug.c)
+#   mutants: SG_MUTANT_CDB_STOP_NOOP, SG_MUTANT_CDB_THREAD_ID, SG_MUTANT_CDB_NO_AGENT, SG_MUTANT_CDB_ATTACH_RUNNING,
+#            SG_MUTANT_CDB_VALUE_ZERO, SG_MUTANT_CDB_ARG_SHIFT (mscoree cordebug.c)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -66,6 +70,16 @@ expect Launch.Holds 1 "stopped, its managed threads do not run"
 expect Launch.EnumerateThreads 0 "EnumerateThreads"
 expect Launch.Threads "1 1 1" "its threads: two or more, each the debuggee's, the worker background"
 expect Launch.GetThread "0 1" "GetThread by id"
+expect Inspect 1 "a thread's chain and frames: the frame whose argument 1 is 12345 (App.Inspect)"
+expect Inspect.Token 1 "its function's token is a MethodDef"
+expect Value.big "0xa 1234567890123" "local 0: long 1234567890123"
+expect Value.ratio "0xd 2.50" "local 1: double 2.5"
+expect Value.flag "0x2 1" "local 2: bool true"
+expect Value.text "0xe Grüße ✓" "local 3: a string, dereferenced: Grüße ✓"
+expect Value.label "0xe sg-label" "argument 2: a string"
+expect Value.this "0x12 object" "argument 0: this, an object reference"
+expect Inspect.BadLocal 1 "a local that is not there: E_INVALIDARG (and the debuggee lives)"
+expect Inspect.BadArg 1 "an argument that is not there: E_INVALIDARG"
 expect Launch.Continue2 0 "Continue"
 expect Launch.IsRunning 1 "running again"
 expect Launch.Runs 1 "and its threads run"

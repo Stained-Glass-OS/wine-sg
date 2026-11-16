@@ -14,7 +14,7 @@ typedef struct { void **vtbl; } Obj;
 #define HR(x) ((unsigned)(x))
 
 static const GUID IID_ICorDebug_ = {0x3d6f5f61, 0x7538, 0x11d3, {0x8d, 0x5b, 0x00, 0x10, 0x4b, 0x35, 0xe7, 0xef}};
-static const GUID IID_IUnknown_ = {0, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
+static const GUID IID_ICorDebugILFrame_ = {0x03e26311, 0x4f76, 0x11d3, {0x88, 0xc6, 0x00, 0x60, 0x97, 0x94, 0x54, 0x18}};
 #define CORDBG_E_PROCESS_NOT_SYNCHRONIZED ((HRESULT)0x80131302)
 #define CORDBG_E_DEBUGGING_NOT_POSSIBLE ((HRESULT)0x80131346)
 
@@ -71,6 +71,123 @@ static void threads(const char *tag, Obj *proc, DWORD pid, DWORD *first)
     }
     CALL(en, 2, ULONG)(en);
     printf("%s.Threads=%d %d %d\n", tag, n >= 2, owned == n, bg >= 1);
+}
+
+/* a value's type and, for a primitive, its bytes; for a string reference, its text (UTF-8) */
+static void show_value(const char *name, Obj *v)
+{
+    int type = 0;
+    unsigned char raw[8] = {0};
+    BOOL isnull = TRUE;
+    Obj *str = NULL;
+    WCHAR w[64];
+    char u[128] = "";
+    ULONG32 n = 0;
+    long long ll;
+    double d;
+    int i32;
+
+    if (!v) { printf("Value.%s=none\n", name); return; }
+    CALL(v, 3, HRESULT, int *)(v, &type);
+    switch (type)
+    {
+    case 0x2: case 0x8:
+        CALL(v, 7, HRESULT, void *)(v, raw);
+        memcpy(&i32, raw, 4);
+        printf("Value.%s=%#x %d\n", name, type, type == 2 ? raw[0] : i32);
+        break;
+    case 0xa:
+        CALL(v, 7, HRESULT, void *)(v, raw);
+        memcpy(&ll, raw, 8);
+        printf("Value.%s=%#x %lld\n", name, type, ll);
+        break;
+    case 0xd:
+        CALL(v, 7, HRESULT, void *)(v, raw);
+        memcpy(&d, raw, 8);
+        printf("Value.%s=%#x %.2f\n", name, type, d);
+        break;
+    case 0x12:
+        CALL(v, 7, HRESULT, BOOL *)(v, &isnull);
+        printf("Value.%s=%#x %s\n", name, type, isnull ? "null" : "object");
+        break;
+    case 0xe:
+        CALL(v, 7, HRESULT, BOOL *)(v, &isnull);
+        if (!isnull && CALL(v, 10, HRESULT, Obj **)(v, &str) == S_OK && str)
+        {
+            CALL(str, 10, HRESULT, ULONG32, ULONG32 *, WCHAR *)(str, 63, &n, w);
+            w[n] = 0;
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof(u), NULL, NULL);
+            CALL(str, 2, ULONG)(str);
+        }
+        printf("Value.%s=%#x %s\n", name, type, u);
+        break;
+    default:
+        printf("Value.%s=%#x\n", name, type);
+    }
+    CALL(v, 2, ULONG)(v);
+}
+
+/* stopped: the thread whose frame has argument 1 == 12345 (App.Inspect, argument 0 "this"); its arguments
+ * and locals */
+static void inspect(Obj *proc)
+{
+    Obj *en = NULL, *th = NULL, *chain = NULL, *fen = NULL, *fr = NULL, *il = NULL, *v = NULL;
+    ULONG fetched;
+    unsigned char raw[8];
+    int type, found = 0, frames = 0, i32;
+    unsigned int token = 0, ip = 0, map = 0;
+    HRESULT hr;
+
+    if (CALL(proc, 7, HRESULT, Obj **)(proc, &en) != S_OK) { printf("Inspect=0\n"); return; }
+    while (!found && CALL(en, 7, HRESULT, ULONG, Obj **, ULONG *)(en, 1, &th, &fetched) == S_OK && fetched == 1)
+    {
+        if (CALL(th, 14, HRESULT, Obj **)(th, &chain) == S_OK && chain)
+        {
+            if (CALL(chain, 11, HRESULT, Obj **)(chain, &fen) == S_OK)
+            {
+                while (!found && CALL(fen, 7, HRESULT, ULONG, Obj **, ULONG *)(fen, 1, &fr, &fetched) == S_OK && fetched == 1)
+                {
+                    frames++;
+                    if (CALL(fr, 0, HRESULT, const GUID *, void **)(fr, &IID_ICorDebugILFrame_, (void **)&il) == S_OK)
+                    {
+                        v = NULL;
+                        if (CALL(il, 16, HRESULT, DWORD, Obj **)(il, 1, &v) == S_OK && v)
+                        {
+                            type = 0; CALL(v, 3, HRESULT, int *)(v, &type);
+                            if (type == 8 && CALL(v, 7, HRESULT, void *)(v, raw) == S_OK)
+                            {
+                                memcpy(&i32, raw, 4);
+                                if (i32 == 12345) found = 1;
+                            }
+                            CALL(v, 2, ULONG)(v);
+                        }
+                        if (found)
+                        {
+                            const char *names[] = { "big", "ratio", "flag", "text" };
+                            int k;
+                            CALL(il, 6, HRESULT, unsigned int *)(il, &token);
+                            CALL(il, 11, HRESULT, unsigned int *, unsigned int *)(il, &ip, &map);
+                            printf("Inspect.Token=%d\n", (token >> 24) == 6);
+                            for (k = 0; k < 4; k++) { v = NULL; CALL(il, 14, HRESULT, DWORD, Obj **)(il, k, &v); show_value(names[k], v); }
+                            v = NULL; CALL(il, 16, HRESULT, DWORD, Obj **)(il, 2, &v); show_value("label", v);
+                            v = NULL; CALL(il, 16, HRESULT, DWORD, Obj **)(il, 0, &v); show_value("this", v);
+                            v = NULL; hr = CALL(il, 14, HRESULT, DWORD, Obj **)(il, 99, &v);
+                            printf("Inspect.BadLocal=%d\n", hr == E_INVALIDARG);
+                            v = NULL; hr = CALL(il, 16, HRESULT, DWORD, Obj **)(il, 3, &v);
+                            printf("Inspect.BadArg=%d\n", hr == E_INVALIDARG);
+                        }
+                        CALL(il, 2, ULONG)(il);
+                    }
+                    CALL(fr, 2, ULONG)(fr);
+                }
+                CALL(fen, 2, ULONG)(fen);
+            }
+            CALL(chain, 2, ULONG)(chain);
+        }
+        CALL(th, 2, ULONG)(th);
+    }
+    CALL(en, 2, ULONG)(en);
+    printf("Inspect=%d\n", found);
 }
 
 static void stopped_holds(const char *tag, DWORD pid)
@@ -139,6 +256,7 @@ int main(int argc, char **argv)
     tid = 0;
     if (SUCCEEDED(hr)) { CALL(th, 4, HRESULT, DWORD *)(th, &tid); CALL(th, 2, ULONG)(th); }
     printf("Launch.GetThread=%#x %d\n", HR(hr), tid == first && tid);
+    inspect(proc);
     printf("Launch.Continue2=%#x\n", HR(CALL(proc, 4, HRESULT, BOOL)(proc, FALSE)));
     running = FALSE;
     CALL(proc, 5, HRESULT, BOOL *)(proc, &running);
