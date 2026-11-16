@@ -1269,6 +1269,11 @@ test-embedwheel:
 test-embedconf:
 	WINE=$(PREFIX)/bin/wine test/embedconf-gate.sh
 
+# Another process's child window keeps what it draws (DevToys' WebView2): left
+# out of the parent's surface, its DC following the parent's new X window (7801).
+test-xprocdc:
+	WINE=$(PREFIX)/bin/wine test/xprocdc-gate.sh
+
 # A self-managed stack grows read-write; SD-less objects have an owner (0081, 0082).
 test-stackgrow:
 	WINE=$(PREFIX)/bin/wine test/stackgrow-gate.sh
