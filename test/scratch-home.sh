@@ -1,3 +1,10 @@
+# A gate written for bash (#!/bin/bash) and started as "sh gate.sh" ran under
+# dash, failed at its first bash-only expansion ("Bad substitution") and looked
+# like a regression (sandboxdesk, elevcode and dispcfg, 2026-11-15): it runs
+# again under bash. (Sourced on each gate's line 2, so $0 and $@ are the gate's.)
+if [ -z "${BASH_VERSION:-}" ] && [ -f "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!/bin/bash' && command -v bash >/dev/null; then
+    exec bash "$0" "$@"
+fi
 # Sourced first by every gate that runs Wine. A prefix links
 # C:\users\<user>\Desktop, Documents, Downloads, Music, Pictures, Videos and
 # Templates to $HOME's folders, and winemenubuilder writes menu entries and
