@@ -1,0 +1,203 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] server, ntdll: 7814's rename retry acts on folder fds, for
+ the server's own account only
+
+wine-sg 7817, hardening 7814. The retry of a rename refused with EXDEV
+resolved real paths and then renamed by path names, with the server's
+rights: a symbolic link swapped into a parent folder in between could make
+it act elsewhere. Now:
+- the server retries only for a request from its own account (as before,
+  anyone else's rename is that user's client's, ADR 0013, with its rights);
+- the alternative names are only a hint: each alternative folder is
+  opened one component at a time with O_PATH|O_DIRECTORY|O_NOFOLLOW, must
+  be the original folder (device and inode), the source the same file as
+  the handle's, and the rename is renameat() between the two folder fds.
+---
+ dlls/ntdll/unix/file.c      |  7 +--
+ include/wine/sg_mountpath.h | 92 ++++++++++++++++++++++++++++++++++++-
+ server/fd.c                 | 17 +++++--
+ 3 files changed, 106 insertions(+), 10 deletions(-)
+
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index f97f7fd..a4eff26 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5843,7 +5843,7 @@ static NTSTATUS sg_client_rename( HANDLE handle, HANDLE root, const char *unix_n
+         {
+             /* two mounts of one filesystem (the profile is a bind mount of the home): the same
+              * rename, from the source's path through the target's mount (wine-sg 7814) */
+-            char dst[PATH_MAX], dir[PATH_MAX], alt_src[PATH_MAX], alt_dst[PATH_MAX];
++            char dst[PATH_MAX], dir[PATH_MAX];
+             int ok = 1;
+ 
+             if (unix_name[0] == '/') ok = snprintf( dst, sizeof(dst), "%s", unix_name ) < (int)sizeof(dst);
+@@ -5857,10 +5857,7 @@ static NTSTATUS sg_client_rename( HANDLE handle, HANDLE root, const char *unix_n
+                 else ok = 0;
+                 if (ok) ok = snprintf( dst, sizeof(dst), "%s/%s", dir, unix_name ) < (int)sizeof(dst);
+             }
+-            if (ok && sg_rename_paths_via_mount( src, dst, alt_src, alt_dst ) &&
+-                !(replace ? renameat( AT_FDCWD, alt_src, AT_FDCWD, alt_dst )
+-                          : renameat2( AT_FDCWD, alt_src, AT_FDCWD, alt_dst, RENAME_NOREPLACE )))
+-                goto renamed;
++            if (ok && sg_rename_via_mount( src, dst, replace ? 0 : RENAME_NOREPLACE, &st )) goto renamed;
+             errno = EXDEV;
+         }
+         if (!replace && errno == EINVAL)  /* no RENAME_NOREPLACE on this filesystem */
+diff --git a/include/wine/sg_mountpath.h b/include/wine/sg_mountpath.h
+index 2409ed6..6d910c8 100644
+--- a/include/wine/sg_mountpath.h
++++ b/include/wine/sg_mountpath.h
+@@ -20,6 +20,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <limits.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
+ #include <sys/stat.h>
+ 
+ struct sg_mount { char point[PATH_MAX]; char root[PATH_MAX]; unsigned int major, minor; };
+@@ -131,7 +134,7 @@ static inline int sg_rename_paths_via_mount( const char *src, const char *dst, c
+         /* (it must be the very same file, not one hidden under another mount) */
+         if (lstat( src, &st1 ) || lstat( alt_src, &st2 ) || st1.st_dev != st2.st_dev || st1.st_ino != st2.st_ino)
+             return 0;
+-        snprintf( alt_dst, PATH_MAX, "%s", dst );
++        if (snprintf( alt_dst, PATH_MAX, "%s%s", strcmp( dir, "/" ) ? dir : "", slash ) >= PATH_MAX) return 0;
+         return 1;
+     }
+     if (sg_path_via_mount( dir, src, alt_dir, sizeof(alt_dir) ))
+@@ -145,4 +148,91 @@ static inline int sg_rename_paths_via_mount( const char *src, const char *dst, c
+     return 0;
+ }
+ 
++/* a folder by an absolute path, opened one component at a time, following no symbolic link
++ * (O_PATH|O_DIRECTORY|O_NOFOLLOW at each step): -1 if any component is one, or missing */
++static inline int sg_open_dir_nofollow( const char *path )
++{
++    char buf[PATH_MAX], *comp, *next;
++    int fd, nfd;
++
++    if (path[0] != '/' || snprintf( buf, sizeof(buf), "%s", path ) >= (int)sizeof(buf)) { errno = EINVAL; return -1; }
++    if ((fd = open( "/", O_PATH | O_DIRECTORY | O_CLOEXEC )) == -1) return -1;
++    for (comp = buf + 1; comp && *comp; comp = next)
++    {
++        if ((next = strchr( comp, '/' ))) *next++ = 0;
++        if (!*comp) continue;
++        if (!strcmp( comp, ".." ) || !strcmp( comp, "." )) { close( fd ); errno = EINVAL; return -1; }
++        nfd = openat( fd, comp, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC );
++        close( fd );
++        if (nfd == -1) return -1;
++        fd = nfd;
++    }
++    return fd;
++}
++
++static inline int sg_split_path( const char *path, char *dir, size_t size, const char **name )
++{
++    const char *slash = strrchr( path, '/' );
++    if (!slash || !slash[1]) return 0;
++    *name = slash + 1;
++    return snprintf( dir, size, "%.*s", slash == path ? 1 : (int)(slash - path), path ) < (int)size;
++}
++
++/* the rename of src to dst (absolute paths, refused with EXDEV) made with the alternative names
++ * alt_src and alt_dst: each alternative folder is opened without following symbolic links and must be
++ * the very folder of the original name (device and inode), the source the same file as expect (when
++ * given); then renameat2() between the two folder fds. 1 when renamed; 0 with errno set, EXDEV when an
++ * alternative is not the same folder (a link swapped in between: nothing is followed or renamed) */
++static inline int sg_rename_at_alt( const char *src, const char *dst, const char *alt_src, const char *alt_dst,
++                                    unsigned int flags, const struct stat *expect )
++{
++    char sdir[PATH_MAX], ddir[PATH_MAX], asdir[PATH_MAX], addir[PATH_MAX];
++    const char *sname, *dname, *asname, *adname;
++    int sfd = -1, dfd = -1, asfd = -1, adfd = -1, ret = 0, err = EXDEV;
++    struct stat s1, s2, d1, d2, f;
++
++    if (!sg_split_path( src, sdir, sizeof(sdir), &sname ) || !sg_split_path( dst, ddir, sizeof(ddir), &dname ) ||
++        !sg_split_path( alt_src, asdir, sizeof(asdir), &asname ) ||
++        !sg_split_path( alt_dst, addir, sizeof(addir), &adname ) ||
++        strcmp( sname, asname ) || strcmp( dname, adname ))
++        goto done;
++    /* the original folders, as the refused rename found them */
++    if ((sfd = open( sdir, O_PATH | O_DIRECTORY | O_CLOEXEC )) == -1 ||
++        (dfd = open( ddir, O_PATH | O_DIRECTORY | O_CLOEXEC )) == -1) goto done;
++#ifndef SG_MUTANT_RENAME_FOLLOWS_LINKS
++    asfd = sg_open_dir_nofollow( asdir );
++    adfd = sg_open_dir_nofollow( addir );
++#else
++    asfd = open( asdir, O_PATH | O_DIRECTORY | O_CLOEXEC );
++    adfd = open( addir, O_PATH | O_DIRECTORY | O_CLOEXEC );
++#endif
++    if (asfd == -1 || adfd == -1) goto done;
++    if (fstat( sfd, &s1 ) || fstat( asfd, &s2 ) || fstat( dfd, &d1 ) || fstat( adfd, &d2 )) goto done;
++#ifndef SG_MUTANT_RENAME_FOLLOWS_LINKS
++    if (s1.st_dev != s2.st_dev || s1.st_ino != s2.st_ino || d1.st_dev != d2.st_dev || d1.st_ino != d2.st_ino)
++        goto done;
++#endif
++    if (expect && (fstatat( asfd, asname, &f, AT_SYMLINK_NOFOLLOW ) ||
++                   f.st_dev != expect->st_dev || f.st_ino != expect->st_ino))
++        goto done;
++    if (!(flags ? renameat2( asfd, asname, adfd, adname, flags ) : renameat( asfd, asname, adfd, adname ))) ret = 1;
++    else err = errno;
++done:
++    if (sfd != -1) close( sfd );
++    if (dfd != -1) close( dfd );
++    if (asfd != -1) close( asfd );
++    if (adfd != -1) close( adfd );
++    if (!ret) errno = err;
++    return ret;
++}
++
++/* a rename refused with EXDEV, made through one mount of the filesystem if there is one: 1 when renamed */
++static inline int sg_rename_via_mount( const char *src, const char *dst, unsigned int flags, const struct stat *expect )
++{
++    char alt_src[PATH_MAX], alt_dst[PATH_MAX];
++
++    if (!sg_rename_paths_via_mount( src, dst, alt_src, alt_dst )) { errno = EXDEV; return 0; }
++    return sg_rename_at_alt( src, dst, alt_src, alt_dst, flags, expect );
++}
++
+ #endif /* __WINE_SG_MOUNTPATH_H */
+diff --git a/server/fd.c b/server/fd.c
+index d95aa2b..9a532c4 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -2995,7 +2995,11 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
+     struct stat st, st2;
+     char *name;
+     const unsigned int replace = flags & FILE_RENAME_REPLACE_IF_EXISTS;
++#ifndef SG_MUTANT_RENAME_ANY_UID
+     const int foreign = sg_requester_uid() != getuid();
++#else
++    const int foreign = 0;
++#endif
+ 
+     *client_performs = 0;
+     if (foreign && stage == 0)
+@@ -3138,14 +3142,19 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
+     {
+         /* two mounts of one filesystem (the profile is a bind mount of the home): the same rename,
+          * from the source's path through the target's mount (wine-sg 7814) */
+-        char alt_src[PATH_MAX], alt_dst[PATH_MAX];
+         int renamed = 0;
+ 
++        /* only for the server's own account: anyone else's rename is the client's (ADR 0013), made with
++         * that user's rights (sg_client_rename), never the server's */
++#ifndef SG_MUTANT_RENAME_ANY_UID
++        if (errno == EXDEV && sg_requester_uid() == getuid())
++#else
+         if (errno == EXDEV)
++#endif
+         {
+-            if (sg_rename_paths_via_mount( fd->unix_name, name, alt_src, alt_dst ) && !rename( alt_src, alt_dst ))
+-                renamed = 1;
+-            else errno = EXDEV;
++            struct stat src_st;
++            renamed = !fstat( fd->unix_fd, &src_st ) && sg_rename_via_mount( fd->unix_name, name, 0, &src_st );
++            if (!renamed) errno = EXDEV;
+         }
+         if (!renamed)
+         {
+-- 
+2.47.3
+
