@@ -1,0 +1,1158 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] mscoree: ICorDebug over Wine Mono's soft debugger agent -- processes and threads
+
+NET-DBG phase 2 (first part). Wine Mono has no CLR debugging services; its
+debugger agent speaks Mono's soft debugger protocol (SDB). ICorDebug is now
+its client, over the user's own socket (sgdbgsock.dll, 7791):
+- CreateProcess gives the debuggee the agent (dt_unix, server, suspended)
+  in its environment; the first Continue starts it and connects to the
+  agent as it comes (given up when the process goes or is released).
+- DebugActiveProcess attaches to a program running its agent (server,
+  not suspended), stopped, with the CreateProcess callback; a program
+  without one: CORDBG_E_DEBUGGING_NOT_POSSIBLE.
+- Stop and Continue count as documented and suspend and resume the
+  managed threads (VM SUSPEND/RESUME); Detach lets the program run on
+  (VM DISPOSE); Terminate closes the connection.
+- EnumerateThreads and GetThread (stopped only; else
+  CORDBG_E_PROCESS_NOT_SYNCHRONIZED): ICorDebugThread with the OS thread id,
+  handle, process, debug state and user state (the thread's ThreadState);
+  stacks, values, stepping and evaluation are not there yet.
+sdb.c: the SDB connection -- handshake, protocol version, requests and
+their replies matched by a reader thread.
+---
+diff --git a/dlls/mscoree/Makefile.in b/dlls/mscoree/Makefile.in
+index d65c9c8..6ca4bbb 100644
+--- a/dlls/mscoree/Makefile.in
++++ b/dlls/mscoree/Makefile.in
+@@ -12,6 +12,7 @@ SOURCES = \
+ 	metahost.c \
+ 	mscoree_classes.idl \
+ 	mscoree_main.c \
++	sdb.c \
+ 	shimhash.c \
+ 	strongname.c
+ 
+diff --git a/dlls/mscoree/cordebug.c b/dlls/mscoree/cordebug.c
+index bb29286..58a2c5c 100644
+--- a/dlls/mscoree/cordebug.c
++++ b/dlls/mscoree/cordebug.c
+@@ -36,6 +36,7 @@
+ #include "cordebug.h"
+ #include "wine/list.h"
+ #include "mscoree_private.h"
++#include "sdb.h"
+ #include "wine/debug.h"
+ 
+ 
+@@ -52,6 +53,13 @@ typedef struct DebugProcess
+     HANDLE thread;
+     LONG stop_count;   /* ICorDebugController stop counter: the process starts stopped */
+ 
++    /* Stained Glass OS: Wine Mono's debugger agent in the process (wine-sg 7792, sdb.c) */
++    CRITICAL_SECTION cs;
++    struct sdb_conn *sdb;   /* connected */
++    HANDLE connector;       /* connecting, after the first Continue of a process we started */
++    HANDLE abort;           /* ...given up (the process released or terminated) */
++    BOOL agent;             /* we gave it the agent */
++
+     LONG ref;
+ } DebugProcess;
+ 
+@@ -122,6 +130,16 @@ static ULONG WINAPI cordebugprocess_Release(ICorDebugProcess *iface)
+ 
+     if (ref == 0)
+     {
++        if (This->connector)
++        {
++            SetEvent(This->abort);
++            WaitForSingleObject(This->connector, INFINITE);
++            CloseHandle(This->connector);
++        }
++        if (This->abort) CloseHandle(This->abort);
++        sdb_close(This->sdb, FALSE);
++        DeleteCriticalSection(&This->cs);
++
+         if(This->handle)
+             CloseHandle(This->handle);
+ 
+@@ -137,11 +155,64 @@ static ULONG WINAPI cordebugprocess_Release(ICorDebugProcess *iface)
+     return ref;
+ }
+ 
++/* the agent, once the connection made after the first Continue is there */
++static struct sdb_conn *process_agent(DebugProcess *This)
++{
++    HANDLE connector;
++
++    EnterCriticalSection(&This->cs);
++    connector = This->connector;
++    LeaveCriticalSection(&This->cs);
++    if (connector) WaitForSingleObject(connector, 30000);
++    return sdb_alive(This->sdb) ? This->sdb : NULL;
++}
++
+ static HRESULT WINAPI cordebugprocess_Stop(ICorDebugProcess *iface, DWORD dwTimeoutIgnored)
+ {
+     DebugProcess *This = impl_from_ICorDebugProcess(iface);
+-    FIXME("stub %p\n", This);
+-    return E_NOTIMPL;
++    struct sdb_conn *sdb;
++    HRESULT hr = S_OK;
++
++    TRACE("%p\n", This);
++
++    if (!This->handle)
++        return CORDBG_E_OBJECT_NEUTERED;
++    /* documented: Stop increments the stop counter; the managed threads stop at the first */
++    EnterCriticalSection(&This->cs);
++    if (This->stop_count > 0)
++    {
++        This->stop_count++;
++        LeaveCriticalSection(&This->cs);
++        return S_OK;
++    }
++    LeaveCriticalSection(&This->cs);
++    if (!(sdb = process_agent(This)))
++        return CORDBG_E_PROCESS_TERMINATED;
++    EnterCriticalSection(&This->cs);
++#ifndef SG_MUTANT_CDB_STOP_NOOP
++    if (!This->stop_count && sdb_request(sdb, SDB_SET_VM, SDB_VM_SUSPEND, NULL, 0, NULL, NULL))
++        hr = CORDBG_E_PROCESS_TERMINATED;
++#endif
++    if (hr == S_OK) This->stop_count++;
++    LeaveCriticalSection(&This->cs);
++    return hr;
++}
++
++static DWORD WINAPI connect_thread(void *arg)
++{
++    DebugProcess *This = arg;
++    struct sdb_conn *sdb = sdb_connect(This->dwProcessID, This->handle, This->abort, 30000);
++
++    EnterCriticalSection(&This->cs);
++    This->sdb = sdb;
++    /* the agent holds the program until told to go (suspend=y): it goes unless the debugger stopped it meanwhile */
++    if (sdb && !This->stop_count)
++        sdb_request(sdb, SDB_SET_VM, SDB_VM_RESUME, NULL, 0, NULL, NULL);
++    else if (sdb)
++        TRACE("stopped before the agent came: it stays suspended\n");
++    LeaveCriticalSection(&This->cs);
++    if (!sdb) WARN("no debugger agent in process %lu\n", This->dwProcessID);
++    return 0;
+ }
+ 
+ static HRESULT WINAPI cordebugprocess_Continue(ICorDebugProcess *iface, BOOL fIsOutOfBand)
+@@ -155,8 +226,22 @@ static HRESULT WINAPI cordebugprocess_Continue(ICorDebugProcess *iface, BOOL fIs
+         return CORDBG_E_PROCESS_NOT_SYNCHRONIZED;
+ #endif
+ 
+-    if (!--This->stop_count && This->thread)
+-        ResumeThread(This->thread);
++    EnterCriticalSection(&This->cs);
++    if (!--This->stop_count)
++    {
++        if (This->thread && This->agent && !This->connector && !This->sdb)
++        {
++            /* the first: the program starts, and its agent is connected to as it comes */
++            ResumeThread(This->thread);
++            if ((This->abort = CreateEventW(NULL, TRUE, FALSE, NULL)))
++                This->connector = CreateThread(NULL, 0, connect_thread, This, 0, NULL);
++        }
++        else if (This->sdb)
++            sdb_request(This->sdb, SDB_SET_VM, SDB_VM_RESUME, NULL, 0, NULL, NULL);
++        else if (This->thread && !This->connector)
++            ResumeThread(This->thread);
++    }
++    LeaveCriticalSection(&This->cs);
+ 
+     return S_OK;
+ }
+@@ -193,12 +278,27 @@ static HRESULT WINAPI cordebugprocess_HasQueuedCallbacks(ICorDebugProcess *iface
+     return S_OK;
+ }
+ 
++static HRESULT get_threads(DebugProcess *This, ICorDebugThread ***threads, ULONG *count);
++static HRESULT thread_enum_create(ICorDebugThread **threads, ULONG count, ULONG pos, ICorDebugThreadEnum **ret);
++
+ static HRESULT WINAPI cordebugprocess_EnumerateThreads(ICorDebugProcess *iface,
+                 ICorDebugThreadEnum **ppThreads)
+ {
+     DebugProcess *This = impl_from_ICorDebugProcess(iface);
+-    FIXME("stub %p\n", This);
+-    return E_NOTIMPL;
++    ICorDebugThread **threads;
++    ULONG count, i;
++    HRESULT hr;
++
++    TRACE("%p, %p\n", This, ppThreads);
++
++    if (!ppThreads) return E_INVALIDARG;
++    if (FAILED(hr = get_threads(This, &threads, &count))) return hr;
++    if (FAILED(hr = thread_enum_create(threads, count, 0, ppThreads)))
++    {
++        for (i = 0; i < count; i++) ICorDebugThread_Release(threads[i]);
++        free(threads);
++    }
++    return hr;
+ }
+ 
+ static HRESULT WINAPI cordebugprocess_SetAllThreadsDebugState(ICorDebugProcess *iface,
+@@ -234,7 +334,13 @@ static HRESULT WINAPI cordebugprocess_Detach(ICorDebugProcess *iface)
+             break;
+         }
+     }
+-    if (This->stop_count > 0 && This->thread)
++    /* the agent lets the program go on, unwatched (VM DISPOSE resumes it) */
++    if (process_agent(This))
++    {
++        sdb_close(This->sdb, TRUE);
++        This->sdb = NULL;
++    }
++    else if (This->stop_count > 0 && This->thread)
+         ResumeThread(This->thread);
+     This->stop_count = 0;
+     CloseHandle(This->handle);
+@@ -252,6 +358,13 @@ static HRESULT WINAPI cordebugprocess_Terminate(ICorDebugProcess *iface, UINT ex
+     if(This->handle)
+     {
+         ret = TerminateProcess(This->handle, exitCode);
++        if (This->connector)
++        {
++            SetEvent(This->abort);
++            WaitForSingleObject(This->connector, INFINITE);
++        }
++        sdb_close(This->sdb, FALSE);
++        This->sdb = NULL;
+         CloseHandle(This->handle);
+         This->handle = NULL;
+     }
+@@ -309,8 +422,27 @@ static HRESULT WINAPI cordebugprocess_GetThread(ICorDebugProcess *iface, DWORD d
+                 ICorDebugThread **ppThread)
+ {
+     DebugProcess *This = impl_from_ICorDebugProcess(iface);
+-    FIXME("stub %p\n", This);
+-    return E_NOTIMPL;
++    ICorDebugThread **threads;
++    ULONG count, i;
++    DWORD tid;
++    HRESULT hr;
++
++    TRACE("%p, %#lx, %p\n", This, dwThreadId, ppThread);
++
++    if (!ppThread) return E_INVALIDARG;
++    *ppThread = NULL;
++    if (FAILED(hr = get_threads(This, &threads, &count))) return hr;
++    for (i = 0; i < count; i++)
++    {
++        if (!*ppThread && SUCCEEDED(ICorDebugThread_GetID(threads[i], &tid)) && tid == dwThreadId)
++        {
++            *ppThread = threads[i];
++            continue;
++        }
++        ICorDebugThread_Release(threads[i]);
++    }
++    free(threads);
++    return *ppThread ? S_OK : E_INVALIDARG;
+ }
+ 
+ static HRESULT WINAPI cordebugprocess_EnumerateObjects(ICorDebugProcess *iface,
+@@ -501,6 +633,395 @@ static HRESULT WINAPI cordebugprocess_GetHelperThreadID(ICorDebugProcess *iface,
+ }
+ 
+ 
++/* Stained Glass OS: the debuggee's managed threads, as its agent has them (wine-sg 7792) */
++typedef struct DebugThread
++{
++    ICorDebugThread ICorDebugThread_iface;
++    LONG ref;
++    DebugProcess *process;
++    DWORD tid;
++    UINT32 objid;
++    UINT32 state;
++    CorDebugThreadState debug_state;
++} DebugThread;
++
++static inline DebugThread *impl_from_ICorDebugThread(ICorDebugThread *iface)
++{
++    return CONTAINING_RECORD(iface, DebugThread, ICorDebugThread_iface);
++}
++
++static HRESULT WINAPI cordebugthread_QueryInterface(ICorDebugThread *iface, REFIID riid, void **ppv)
++{
++    DebugThread *This = impl_from_ICorDebugThread(iface);
++
++    if (IsEqualGUID(riid, &IID_ICorDebugThread) || IsEqualGUID(riid, &IID_IUnknown))
++    {
++        *ppv = &This->ICorDebugThread_iface;
++        ICorDebugThread_AddRef(iface);
++        return S_OK;
++    }
++    TRACE("no %s\n", debugstr_guid(riid));
++    *ppv = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI cordebugthread_AddRef(ICorDebugThread *iface)
++{
++    DebugThread *This = impl_from_ICorDebugThread(iface);
++    return InterlockedIncrement(&This->ref);
++}
++
++static ULONG WINAPI cordebugthread_Release(ICorDebugThread *iface)
++{
++    DebugThread *This = impl_from_ICorDebugThread(iface);
++    ULONG ref = InterlockedDecrement(&This->ref);
++
++    if (!ref)
++    {
++        ICorDebugProcess_Release(&This->process->ICorDebugProcess_iface);
++        free(This);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI cordebugthread_GetProcess(ICorDebugThread *iface, ICorDebugProcess **ppProcess)
++{
++    DebugThread *This = impl_from_ICorDebugThread(iface);
++
++    if (!ppProcess) return E_INVALIDARG;
++    *ppProcess = &This->process->ICorDebugProcess_iface;
++    ICorDebugProcess_AddRef(*ppProcess);
++    return S_OK;
++}
++
++static HRESULT WINAPI cordebugthread_GetID(ICorDebugThread *iface, DWORD *pdwThreadId)
++{
++    DebugThread *This = impl_from_ICorDebugThread(iface);
++
++    if (!pdwThreadId) return E_INVALIDARG;
++    *pdwThreadId = This->tid;
++    return S_OK;
++}
++
++static HRESULT WINAPI cordebugthread_GetHandle(ICorDebugThread *iface, HTHREAD *phThreadHandle)
++{
++    DebugThread *This = impl_from_ICorDebugThread(iface);
++
++    if (!phThreadHandle) return E_INVALIDARG;
++    if (!(*phThreadHandle = OpenThread(THREAD_ALL_ACCESS, FALSE, This->tid))) return E_FAIL;
++    return S_OK;
++}
++
++static HRESULT WINAPI cordebugthread_GetAppDomain(ICorDebugThread *iface, ICorDebugAppDomain **ppAppDomain)
++{
++    FIXME("%p: application domains not yet\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI cordebugthread_SetDebugState(ICorDebugThread *iface, CorDebugThreadState state)
++{
++    DebugThread *This = impl_from_ICorDebugThread(iface);
++
++    if (state != THREAD_RUN && state != THREAD_SUSPEND) return E_INVALIDARG;
++    FIXME("%p: %d kept, not applied to the thread yet\n", iface, state);
++    This->debug_state = state;
++    return S_OK;
++}
++
++static HRESULT WINAPI cordebugthread_GetDebugState(ICorDebugThread *iface, CorDebugThreadState *pState)
++{
++    DebugThread *This = impl_from_ICorDebugThread(iface);
++
++    if (!pState) return E_INVALIDARG;
++    *pState = This->debug_state;
++    return S_OK;
++}
++
++static HRESULT WINAPI cordebugthread_GetUserState(ICorDebugThread *iface, CorDebugUserState *pState)
++{
++    DebugThread *This = impl_from_ICorDebugThread(iface);
++
++    if (!pState) return E_INVALIDARG;
++    /* System.Threading.ThreadState's low bits are CorDebugUserState's */
++    *pState = This->state & (USER_STOP_REQUESTED | USER_SUSPEND_REQUESTED | USER_BACKGROUND | USER_UNSTARTED |
++                             USER_STOPPED | USER_WAIT_SLEEP_JOIN | USER_SUSPENDED);
++    return S_OK;
++}
++
++static HRESULT WINAPI cordebugthread_GetCurrentException(ICorDebugThread *iface, ICorDebugValue **ppExceptionObject)
++{
++    if (!ppExceptionObject) return E_INVALIDARG;
++    *ppExceptionObject = NULL;
++    return S_FALSE;   /* none being thrown: exceptions are not reported yet */
++}
++
++static HRESULT WINAPI cordebugthread_ClearCurrentException(ICorDebugThread *iface)
++{
++    FIXME("%p\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI cordebugthread_CreateStepper(ICorDebugThread *iface, ICorDebugStepper **ppStepper)
++{
++    FIXME("%p: stepping not yet\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI cordebugthread_EnumerateChains(ICorDebugThread *iface, ICorDebugChainEnum **ppChains)
++{
++    FIXME("%p: stacks not yet\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI cordebugthread_GetActiveChain(ICorDebugThread *iface, ICorDebugChain **ppChain)
++{
++    FIXME("%p: stacks not yet\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI cordebugthread_GetActiveFrame(ICorDebugThread *iface, ICorDebugFrame **ppFrame)
++{
++    FIXME("%p: stacks not yet\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI cordebugthread_GetRegisterSet(ICorDebugThread *iface, ICorDebugRegisterSet **ppRegisters)
++{
++    FIXME("%p\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI cordebugthread_CreateEval(ICorDebugThread *iface, ICorDebugEval **ppEval)
++{
++    FIXME("%p: evaluation not yet\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI cordebugthread_GetObject(ICorDebugThread *iface, ICorDebugValue **ppObject)
++{
++    FIXME("%p: values not yet\n", iface);
++    return E_NOTIMPL;
++}
++
++static const ICorDebugThreadVtbl cordebugthreadVtbl =
++{
++    cordebugthread_QueryInterface,
++    cordebugthread_AddRef,
++    cordebugthread_Release,
++    cordebugthread_GetProcess,
++    cordebugthread_GetID,
++    cordebugthread_GetHandle,
++    cordebugthread_GetAppDomain,
++    cordebugthread_SetDebugState,
++    cordebugthread_GetDebugState,
++    cordebugthread_GetUserState,
++    cordebugthread_GetCurrentException,
++    cordebugthread_ClearCurrentException,
++    cordebugthread_CreateStepper,
++    cordebugthread_EnumerateChains,
++    cordebugthread_GetActiveChain,
++    cordebugthread_GetActiveFrame,
++    cordebugthread_GetRegisterSet,
++    cordebugthread_CreateEval,
++    cordebugthread_GetObject,
++};
++
++typedef struct ThreadEnum
++{
++    ICorDebugThreadEnum ICorDebugThreadEnum_iface;
++    LONG ref;
++    ICorDebugThread **threads;
++    ULONG count, pos;
++} ThreadEnum;
++
++static inline ThreadEnum *impl_from_ICorDebugThreadEnum(ICorDebugThreadEnum *iface)
++{
++    return CONTAINING_RECORD(iface, ThreadEnum, ICorDebugThreadEnum_iface);
++}
++
++static HRESULT WINAPI thread_enum_QueryInterface(ICorDebugThreadEnum *iface, REFIID riid, void **ppv)
++{
++    ThreadEnum *This = impl_from_ICorDebugThreadEnum(iface);
++
++    if (IsEqualGUID(riid, &IID_ICorDebugThreadEnum) || IsEqualGUID(riid, &IID_ICorDebugEnum) ||
++        IsEqualGUID(riid, &IID_IUnknown))
++    {
++        *ppv = &This->ICorDebugThreadEnum_iface;
++        ICorDebugThreadEnum_AddRef(iface);
++        return S_OK;
++    }
++    *ppv = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI thread_enum_AddRef(ICorDebugThreadEnum *iface)
++{
++    ThreadEnum *This = impl_from_ICorDebugThreadEnum(iface);
++    return InterlockedIncrement(&This->ref);
++}
++
++static ULONG WINAPI thread_enum_Release(ICorDebugThreadEnum *iface)
++{
++    ThreadEnum *This = impl_from_ICorDebugThreadEnum(iface);
++    ULONG ref = InterlockedDecrement(&This->ref), i;
++
++    if (!ref)
++    {
++        for (i = 0; i < This->count; i++) ICorDebugThread_Release(This->threads[i]);
++        free(This->threads);
++        free(This);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI thread_enum_Skip(ICorDebugThreadEnum *iface, ULONG celt)
++{
++    ThreadEnum *This = impl_from_ICorDebugThreadEnum(iface);
++
++    if (celt > This->count - This->pos)
++    {
++        This->pos = This->count;
++        return S_FALSE;
++    }
++    This->pos += celt;
++    return S_OK;
++}
++
++static HRESULT WINAPI thread_enum_Reset(ICorDebugThreadEnum *iface)
++{
++    ThreadEnum *This = impl_from_ICorDebugThreadEnum(iface);
++    This->pos = 0;
++    return S_OK;
++}
++
++static HRESULT thread_enum_create(ICorDebugThread **threads, ULONG count, ULONG pos, ICorDebugThreadEnum **ret);
++
++static HRESULT WINAPI thread_enum_Clone(ICorDebugThreadEnum *iface, ICorDebugEnum **ppEnum)
++{
++    ThreadEnum *This = impl_from_ICorDebugThreadEnum(iface);
++    ICorDebugThread **copy;
++    ULONG i;
++    HRESULT hr;
++
++    if (!ppEnum) return E_INVALIDARG;
++    if (!(copy = calloc(This->count ? This->count : 1, sizeof(*copy)))) return E_OUTOFMEMORY;
++    for (i = 0; i < This->count; i++)
++    {
++        copy[i] = This->threads[i];
++        ICorDebugThread_AddRef(copy[i]);
++    }
++    hr = thread_enum_create(copy, This->count, This->pos, (ICorDebugThreadEnum **)ppEnum);
++    if (FAILED(hr))
++    {
++        for (i = 0; i < This->count; i++) ICorDebugThread_Release(copy[i]);
++        free(copy);
++    }
++    return hr;
++}
++
++static HRESULT WINAPI thread_enum_GetCount(ICorDebugThreadEnum *iface, ULONG *pcelt)
++{
++    ThreadEnum *This = impl_from_ICorDebugThreadEnum(iface);
++
++    if (!pcelt) return E_INVALIDARG;
++    *pcelt = This->count;
++    return S_OK;
++}
++
++static HRESULT WINAPI thread_enum_Next(ICorDebugThreadEnum *iface, ULONG celt, ICorDebugThread **threads,
++                                       ULONG *pceltFetched)
++{
++    ThreadEnum *This = impl_from_ICorDebugThreadEnum(iface);
++    ULONG n = 0;
++
++    if (!threads || (celt > 1 && !pceltFetched)) return E_INVALIDARG;
++    while (n < celt && This->pos < This->count)
++    {
++        threads[n] = This->threads[This->pos++];
++        ICorDebugThread_AddRef(threads[n++]);
++    }
++    if (pceltFetched) *pceltFetched = n;
++    return n == celt ? S_OK : S_FALSE;
++}
++
++static const ICorDebugThreadEnumVtbl thread_enum_vtbl =
++{
++    thread_enum_QueryInterface,
++    thread_enum_AddRef,
++    thread_enum_Release,
++    thread_enum_Skip,
++    thread_enum_Reset,
++    thread_enum_Clone,
++    thread_enum_GetCount,
++    thread_enum_Next,
++};
++
++static HRESULT thread_enum_create(ICorDebugThread **threads, ULONG count, ULONG pos, ICorDebugThreadEnum **ret)
++{
++    ThreadEnum *This = calloc(1, sizeof(*This));
++
++    if (!This) return E_OUTOFMEMORY;
++    This->ICorDebugThreadEnum_iface.lpVtbl = &thread_enum_vtbl;
++    This->ref = 1;
++    This->threads = threads;
++    This->count = count;
++    This->pos = pos;
++    *ret = &This->ICorDebugThreadEnum_iface;
++    return S_OK;
++}
++
++/* the managed threads now, from the agent (the process stopped) */
++static HRESULT get_threads(DebugProcess *This, ICorDebugThread ***threads, ULONG *count)
++{
++    struct sdb_conn *sdb;
++    BYTE *reply = NULL, *info = NULL, id[4];
++    UINT32 len, ilen, n, i;
++    DebugThread *thread;
++
++    *threads = NULL;
++    *count = 0;
++    if (!This->handle) return CORDBG_E_OBJECT_NEUTERED;
++    if (This->stop_count <= 0) return CORDBG_E_PROCESS_NOT_SYNCHRONIZED;
++    if (!(sdb = process_agent(This))) return CORDBG_E_PROCESS_TERMINATED;
++    if (sdb_request(sdb, SDB_SET_VM, SDB_VM_ALL_THREADS, NULL, 0, &reply, &len) || len < 4)
++    {
++        free(reply);
++        return CORDBG_E_PROCESS_TERMINATED;
++    }
++    n = sdb_get32(reply);
++    if (n > (len - 4) / 4 || !(*threads = calloc(n ? n : 1, sizeof(**threads))))
++    {
++        free(reply);
++        return E_OUTOFMEMORY;
++    }
++    for (i = 0; i < n; i++)
++    {
++        if (!(thread = calloc(1, sizeof(*thread)))) break;
++        thread->ICorDebugThread_iface.lpVtbl = &cordebugthreadVtbl;
++        thread->ref = 1;
++        thread->process = This;
++        ICorDebugProcess_AddRef(&This->ICorDebugProcess_iface);
++        thread->objid = sdb_get32(reply + 4 + 4 * i);
++        thread->debug_state = THREAD_RUN;
++        memcpy(id, reply + 4 + 4 * i, 4);
++        if (!sdb_request(sdb, SDB_SET_THREAD, SDB_THREAD_GET_TID, id, 4, &info, &ilen) && ilen >= 8)
++#ifndef SG_MUTANT_CDB_THREAD_ID
++            thread->tid = sdb_get64(info);
++#else
++            thread->tid = thread->objid;
++#endif
++        free(info);
++        info = NULL;
++        if (!sdb_request(sdb, SDB_SET_THREAD, SDB_THREAD_GET_STATE, id, 4, &info, &ilen) && ilen >= 4)
++            thread->state = sdb_get32(info);
++        free(info);
++        info = NULL;
++        (*threads)[(*count)++] = &thread->ICorDebugThread_iface;
++    }
++    free(reply);
++    return S_OK;
++}
++
+ /***************************************/
+ static const ICorDebugProcessVtbl cordebugprocessVtbl = {
+     cordebugprocess_QueryInterface,
+@@ -540,7 +1061,7 @@ static HRESULT CorDebugProcess_Create(CorDebug *cordebug, IUnknown** ppUnk, LPPR
+ {
+     DebugProcess *This;
+ 
+-    This = malloc(sizeof *This);
++    This = calloc(1, sizeof *This);
+     if ( !This )
+         return E_OUTOFMEMORY;
+ 
+@@ -551,7 +1072,7 @@ static HRESULT CorDebugProcess_Create(CorDebug *cordebug, IUnknown** ppUnk, LPPR
+         free(This);
+         return E_FAIL;
+     }
+-    if(!DuplicateHandle(GetCurrentProcess(), lpProcessInformation->hThread,
++    if(lpProcessInformation->hThread && !DuplicateHandle(GetCurrentProcess(), lpProcessInformation->hThread,
+                     GetCurrentProcess(), &This->thread, 0, FALSE, DUPLICATE_SAME_ACCESS))
+     {
+         CloseHandle(This->handle);
+@@ -562,6 +1083,7 @@ static HRESULT CorDebugProcess_Create(CorDebug *cordebug, IUnknown** ppUnk, LPPR
+     }
+ 
+     This->ICorDebugProcess_iface.lpVtbl = &cordebugprocessVtbl;
++    InitializeCriticalSectionEx(&This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     This->ref = 1;
+     This->stop_count = 1;   /* created suspended: the first Continue starts it */
+     This->cordebug = cordebug;
+@@ -882,6 +1404,48 @@ static HRESULT WINAPI CorDebug_SetUnmanagedHandler(ICorDebug *iface, ICorDebugUn
+     return S_OK;
+ }
+ 
++/* Stained Glass OS: the debuggee's environment with Wine Mono's debugger agent waiting for us on the user's
++ * own socket (dt_unix, named after its process id; it holds the program until we resume it) -- ENV as given
++ * (ANSI unless CREATE_UNICODE_ENVIRONMENT), or ours (wine-sg 7792) */
++static WCHAR *agent_environment(const void *env, DWORD flags)
++{
++    static const WCHAR agent[] = L"WINE_MONO_DEBUGGER_AGENT=transport=dt_unix,server=y,suspend=y";
++    static const WCHAR name[] = L"WINE_MONO_DEBUGGER_AGENT=";
++    WCHAR *base, *ours = NULL, *ret, *p, *q;
++    size_t len;
++
++    if (!env) base = ours = GetEnvironmentStringsW();
++    else if (flags & CREATE_UNICODE_ENVIRONMENT) base = (WCHAR *)env;
++    else
++    {
++        const char *a = env;
++        int n;
++
++        for (len = 0; a[len] || a[len + 1]; len++);
++        len += 2;
++        n = MultiByteToWideChar(CP_ACP, 0, a, len, NULL, 0);
++        if (!(base = ours = malloc(n * sizeof(WCHAR)))) return NULL;
++        MultiByteToWideChar(CP_ACP, 0, a, len, base, n);
++    }
++    if (!base) return NULL;
++    for (len = 0, p = base; *p; p += wcslen(p) + 1) len += wcslen(p) + 1;
++    if ((ret = malloc((len + ARRAY_SIZE(agent) + 1) * sizeof(WCHAR))))
++    {
++        for (q = ret, p = base; *p; p += wcslen(p) + 1)
++        {
++            if (!wcsnicmp(p, name, wcslen(name))) continue;   /* only ours */
++            wcscpy(q, p);
++            q += wcslen(p) + 1;
++        }
++        wcscpy(q, agent);
++        q += ARRAY_SIZE(agent);
++        *q = 0;
++    }
++    if (ours && !env) FreeEnvironmentStringsW(ours);
++    else if (ours) free(ours);
++    return ret;
++}
++
+ static HRESULT WINAPI CorDebug_CreateProcess(ICorDebug *iface, LPCWSTR lpApplicationName,
+             LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
+             LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles,
+@@ -891,6 +1455,7 @@ static HRESULT WINAPI CorDebug_CreateProcess(ICorDebug *iface, LPCWSTR lpApplica
+ {
+     CorDebug *This = impl_from_ICorDebug( iface );
+     ICorDebugProcess *pDebugProcess;
++    WCHAR *env = NULL;
+     HRESULT hr;
+ 
+     TRACE("stub %p %s %s %p %p %d %ld %p %s %p %p %d %p\n", This, debugstr_w(lpApplicationName),
+@@ -898,15 +1463,23 @@ static HRESULT WINAPI CorDebug_CreateProcess(ICorDebug *iface, LPCWSTR lpApplica
+             bInheritHandles, dwCreationFlags, lpEnvironment, debugstr_w(lpCurrentDirectory),
+             lpStartupInfo, lpProcessInformation, debuggingFlags, ppProcess);
+ 
++#ifndef SG_MUTANT_CDB_NO_AGENT
++    env = agent_environment(lpEnvironment, dwCreationFlags);
++#endif
+     if(CreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes,
+-            bInheritHandles, dwCreationFlags | CREATE_SUSPENDED, lpEnvironment, lpCurrentDirectory,
+-            lpStartupInfo, lpProcessInformation))
++            bInheritHandles, dwCreationFlags | CREATE_SUSPENDED | (env ? CREATE_UNICODE_ENVIRONMENT : 0),
++            env ? env : lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation))
+     {
++        BOOL agent = env != NULL;
++
++        free(env);
+         hr = CorDebugProcess_Create(This, (IUnknown**)&pDebugProcess, lpProcessInformation);
+         if(hr == S_OK)
+         {
+             struct CorProcess *new_process = malloc(sizeof(CorProcess));
+ 
++            impl_from_ICorDebugProcess(pDebugProcess)->agent = agent;
++
+             new_process->pProcess = pDebugProcess;
+             list_add_tail(&This->processes, &new_process->entry);
+ 
+@@ -922,7 +1495,10 @@ static HRESULT WINAPI CorDebug_CreateProcess(ICorDebug *iface, LPCWSTR lpApplica
+         }
+     }
+     else
++    {
++        free(env);
+         hr = E_FAIL;
++    }
+ 
+     return hr;
+ }
+@@ -931,8 +1507,52 @@ static HRESULT WINAPI CorDebug_DebugActiveProcess(ICorDebug *iface, DWORD id, BO
+             ICorDebugProcess **ppProcess)
+ {
+     CorDebug *This = impl_from_ICorDebug( iface );
+-    FIXME("stub %p %ld %d %p\n", This, id, win32Attach, ppProcess);
+-    return E_NOTIMPL;
++    PROCESS_INFORMATION info = { 0 };
++    ICorDebugProcess *process;
++    struct sdb_conn *sdb;
++    struct CorProcess *entry;
++    DebugProcess *impl;
++    HRESULT hr;
++
++    TRACE("%p %ld %d %p\n", This, id, win32Attach, ppProcess);
++
++    if (!ppProcess) return E_INVALIDARG;
++    *ppProcess = NULL;
++    if (win32Attach)
++    {
++        FIXME("native (interop) debugging is not supported\n");
++        return CORDBG_E_DEBUGGING_NOT_POSSIBLE;
++    }
++    /* Stained Glass OS: a program running Wine Mono's agent (dt_unix, server=y) is attached to through it,
++     * on the user's own socket: stopped, as an attached process is until the debugger continues (7792) */
++    if (!(info.hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, id))) return E_INVALIDARG;
++    if (!(sdb = sdb_connect(id, info.hProcess, NULL, 5000)))
++    {
++        CloseHandle(info.hProcess);
++        return CORDBG_E_DEBUGGING_NOT_POSSIBLE;
++    }
++    info.dwProcessId = id;
++#ifndef SG_MUTANT_CDB_ATTACH_RUNNING
++    sdb_request(sdb, SDB_SET_VM, SDB_VM_SUSPEND, NULL, 0, NULL, NULL);
++#endif
++    hr = CorDebugProcess_Create(This, (IUnknown **)&process, &info);
++    CloseHandle(info.hProcess);
++    if (FAILED(hr) || !(entry = malloc(sizeof(*entry))))
++    {
++        sdb_close(sdb, TRUE);
++        if (SUCCEEDED(hr)) ICorDebugProcess_Release(process);
++        return FAILED(hr) ? hr : E_OUTOFMEMORY;
++    }
++    impl = impl_from_ICorDebugProcess(process);
++    impl->sdb = sdb;
++    impl->stop_count = 1;
++    entry->pProcess = process;
++    list_add_tail(&This->processes, &entry->entry);
++    ICorDebugProcess_AddRef(process);
++    *ppProcess = process;
++    if (This->pCallback)
++        ICorDebugManagedCallback_CreateProcess(This->pCallback, process);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI CorDebug_EnumerateProcesses( ICorDebug *iface, ICorDebugProcessEnum **ppProcess)
+diff --git a/dlls/mscoree/sdb.c b/dlls/mscoree/sdb.c
+new file mode 100644
+index 0000000..6d01d8a
+--- /dev/null
++++ b/dlls/mscoree/sdb.c
+@@ -0,0 +1,269 @@
++/*
++ * Stained Glass OS: ICorDebug's link to Wine Mono's soft debugger agent (wine-sg 7792)
++ *
++ * Wine Mono has no CLR debugging services; its debugger agent speaks Mono's
++ * soft debugger protocol (SDB). ICorDebug (cordebug.c) is a client of it: a
++ * debuggee started by ICorDebug::CreateProcess gets the agent (dt_unix,
++ * server=y, suspend=y), one attached to by DebugActiveProcess has it already;
++ * the connection is the user's own Unix socket named after the debuggee's
++ * process id (sgdbgsock.dll, wine-sg 7791). Packets: a 11-byte header
++ * (length, id, flags, then command set and command, or a reply's error code),
++ * big-endian; a thread here reads them, answers go to the request waiting.
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "wine/list.h"
++#include "wine/debug.h"
++#include "sdb.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL( mscoree );
++
++typedef BOOL (WINAPI *SgDbgConnectFunc)( const char *name, UINT64 *conn );
++typedef int (WINAPI *SgDbgSendFunc)( UINT64 conn, const void *buf, int len );
++typedef int (WINAPI *SgDbgRecvFunc)( UINT64 conn, void *buf, int len );
++typedef void (WINAPI *SgDbgShutdownFunc)( UINT64 conn, int how );
++typedef void (WINAPI *SgDbgCloseFunc)( UINT64 conn );
++
++static SgDbgConnectFunc p_connect;
++static SgDbgSendFunc p_send;
++static SgDbgRecvFunc p_recv;
++static SgDbgShutdownFunc p_shutdown;
++static SgDbgCloseFunc p_close;
++
++struct sdb_pending
++{
++    struct list entry;
++    UINT32 id;
++    HANDLE event;
++    BOOL done;
++    UINT16 error;
++    BYTE *data;
++    UINT32 len;
++};
++
++struct sdb_conn
++{
++    UINT64 sock;
++    CRITICAL_SECTION cs;
++    struct list pending;
++    UINT32 next_id;
++    BOOL dead;
++    HANDLE reader;
++    LONG ref;
++};
++
++static BOOL load_sgdbgsock(void)
++{
++    static HMODULE dll;
++
++    if (dll) return p_connect != NULL;
++    if (!(dll = LoadLibraryW( L"sgdbgsock.dll" ))) return FALSE;
++    p_connect = (void *)GetProcAddress( dll, "SgDbgConnect" );
++    p_send = (void *)GetProcAddress( dll, "SgDbgSend" );
++    p_recv = (void *)GetProcAddress( dll, "SgDbgRecv" );
++    p_shutdown = (void *)GetProcAddress( dll, "SgDbgShutdown" );
++    p_close = (void *)GetProcAddress( dll, "SgDbgClose" );
++    if (!p_connect || !p_send || !p_recv || !p_shutdown || !p_close) p_connect = NULL;
++    return p_connect != NULL;
++}
++
++static void put32( BYTE *p, UINT32 v ) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
++UINT32 sdb_get32( const BYTE *p ) { return (UINT32)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
++UINT64 sdb_get64( const BYTE *p ) { return (UINT64)sdb_get32( p ) << 32 | sdb_get32( p + 4 ); }
++
++static void conn_release( struct sdb_conn *conn )
++{
++    if (InterlockedDecrement( &conn->ref )) return;
++    DeleteCriticalSection( &conn->cs );
++    free( conn );
++}
++
++/* the agent's packets: replies to the requests waiting, events dropped (none asked for) */
++static DWORD WINAPI reader_thread( void *arg )
++{
++    struct sdb_conn *conn = arg;
++    struct sdb_pending *p;
++    BYTE header[11], *data;
++    UINT32 len, id;
++
++    for (;;)
++    {
++        if (p_recv( conn->sock, header, sizeof(header) ) != sizeof(header)) break;
++        len = sdb_get32( header );
++        id = sdb_get32( header + 4 );
++        if (len < sizeof(header) || len > 64 * 1024 * 1024) break;
++        len -= sizeof(header);
++        data = len ? malloc( len ) : NULL;
++        if (len && (!data || p_recv( conn->sock, data, len ) != len)) { free( data ); break; }
++        if (!(header[8] & 0x80))
++        {
++            TRACE( "event packet %u/%u, %u bytes\n", header[9], header[10], len );
++            free( data );
++            continue;
++        }
++        EnterCriticalSection( &conn->cs );
++        LIST_FOR_EACH_ENTRY( p, &conn->pending, struct sdb_pending, entry )
++        {
++            if (p->id != id) continue;
++            p->error = header[9] << 8 | header[10];
++            p->data = data;
++            p->len = len;
++            p->done = TRUE;
++            data = NULL;
++            SetEvent( p->event );
++            break;
++        }
++        LeaveCriticalSection( &conn->cs );
++        free( data );
++    }
++    EnterCriticalSection( &conn->cs );
++    conn->dead = TRUE;
++    LIST_FOR_EACH_ENTRY( p, &conn->pending, struct sdb_pending, entry ) SetEvent( p->event );
++    LeaveCriticalSection( &conn->cs );
++    TRACE( "the agent is gone\n" );
++    conn_release( conn );
++    return 0;
++}
++
++/* a request and its reply (*reply freed by the caller): the agent's error code, or SDB_ERR_GONE */
++UINT16 sdb_request( struct sdb_conn *conn, BYTE set, BYTE cmd, const BYTE *payload, UINT32 len,
++                    BYTE **reply, UINT32 *reply_len )
++{
++    struct sdb_pending p = { .event = CreateEventW( NULL, TRUE, FALSE, NULL ) };
++    BYTE *packet;
++    BOOL sent;
++
++    if (reply) *reply = NULL;
++    if (reply_len) *reply_len = 0;
++    if (!conn || !p.event) return SDB_ERR_GONE;
++    if (!(packet = malloc( 11 + len ))) { CloseHandle( p.event ); return SDB_ERR_GONE; }
++
++    EnterCriticalSection( &conn->cs );
++    if (conn->dead)
++    {
++        LeaveCriticalSection( &conn->cs );
++        free( packet );
++        CloseHandle( p.event );
++        return SDB_ERR_GONE;
++    }
++    p.id = ++conn->next_id;
++    list_add_tail( &conn->pending, &p.entry );
++    put32( packet, 11 + len );
++    put32( packet + 4, p.id );
++    packet[8] = 0;
++    packet[9] = set;
++    packet[10] = cmd;
++    if (len) memcpy( packet + 11, payload, len );
++    sent = p_send( conn->sock, packet, 11 + len ) == 11 + len;
++    LeaveCriticalSection( &conn->cs );
++    free( packet );
++
++    if (sent) WaitForSingleObject( p.event, 30000 );
++    EnterCriticalSection( &conn->cs );
++    list_remove( &p.entry );
++    LeaveCriticalSection( &conn->cs );
++    CloseHandle( p.event );
++    if (!p.done)
++    {
++        free( p.data );
++        return SDB_ERR_GONE;
++    }
++    if (reply) *reply = p.data; else free( p.data );
++    if (reply_len) *reply_len = p.len;
++    return p.error;
++}
++
++/* the agent of process PID, waited for until TIMEOUT ms, PROCESS exits or ABORT is set */
++struct sdb_conn *sdb_connect( DWORD pid, HANDLE process, HANDLE abort, DWORD timeout )
++{
++    struct sdb_conn *conn;
++    char name[16], hs[13];
++    DWORD start = GetTickCount();
++    BYTE version[8];
++    UINT64 sock;
++
++    if (!load_sgdbgsock())
++    {
++        WARN( "no sgdbgsock.dll\n" );
++        return NULL;
++    }
++    sprintf( name, "%lu", pid );
++    for (;;)
++    {
++        HANDLE handles[2];
++        DWORD count = 0;
++
++        if (p_connect( name, &sock )) break;
++        if (GetTickCount() - start >= timeout) return NULL;
++        if (process) handles[count++] = process;
++        if (abort) handles[count++] = abort;
++        if (count ? WaitForMultipleObjects( count, handles, FALSE, 50 ) != WAIT_TIMEOUT : (Sleep( 50 ), FALSE))
++            return NULL;
++    }
++    if (p_send( sock, "DWP-Handshake", 13 ) != 13 || p_recv( sock, hs, 13 ) != 13 || memcmp( hs, "DWP-Handshake", 13 ))
++    {
++        WARN( "no handshake from %s\n", name );
++        p_close( sock );
++        return NULL;
++    }
++    if (!(conn = calloc( 1, sizeof(*conn) )))
++    {
++        p_close( sock );
++        return NULL;
++    }
++    conn->sock = sock;
++    conn->ref = 2;   /* ours and the reader's */
++    list_init( &conn->pending );
++    InitializeCriticalSectionEx( &conn->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    if (!(conn->reader = CreateThread( NULL, 0, reader_thread, conn, 0, NULL )))
++    {
++        p_close( sock );
++        DeleteCriticalSection( &conn->cs );
++        free( conn );
++        return NULL;
++    }
++    put32( version, 2 );
++    put32( version + 4, 50 );
++    sdb_request( conn, SDB_SET_VM, SDB_VM_SET_PROTOCOL_VERSION, version, sizeof(version), NULL, NULL );
++    TRACE( "connected to the agent of %lu\n", pid );
++    return conn;
++}
++
++BOOL sdb_alive( struct sdb_conn *conn )
++{
++    return conn && !conn->dead;
++}
++
++/* VM DISPOSE (the debuggee runs on, unwatched) and the connection closed */
++void sdb_close( struct sdb_conn *conn, BOOL dispose )
++{
++    if (!conn) return;
++    if (dispose) sdb_request( conn, SDB_SET_VM, SDB_VM_DISPOSE, NULL, 0, NULL, NULL );
++    p_shutdown( conn->sock, 2 );
++    WaitForSingleObject( conn->reader, 5000 );
++    CloseHandle( conn->reader );
++    p_close( conn->sock );
++    conn_release( conn );
++}
+diff --git a/dlls/mscoree/sdb.h b/dlls/mscoree/sdb.h
+new file mode 100644
+index 0000000..b510dde
+--- /dev/null
++++ b/dlls/mscoree/sdb.h
+@@ -0,0 +1,48 @@
++/*
++ * Stained Glass OS: ICorDebug's link to Wine Mono's soft debugger agent (wine-sg 7792)
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Mono's soft debugger protocol: command sets and commands used here */
++#define SDB_SET_VM       1
++#define SDB_SET_THREAD   11
++
++#define SDB_VM_VERSION              1
++#define SDB_VM_ALL_THREADS          2
++#define SDB_VM_SUSPEND              3
++#define SDB_VM_RESUME               4
++#define SDB_VM_DISPOSE              6
++#define SDB_VM_SET_PROTOCOL_VERSION 8
++
++#define SDB_THREAD_GET_NAME   2
++#define SDB_THREAD_GET_STATE  3
++#define SDB_THREAD_GET_TID    6
++
++#define SDB_ERR_NONE           0
++#define SDB_ERR_NOT_SUSPENDED  101
++#define SDB_ERR_GONE           0xffff   /* ours: no answer, the agent or its process is gone */
++
++struct sdb_conn;
++
++extern struct sdb_conn *sdb_connect( DWORD pid, HANDLE process, HANDLE abort, DWORD timeout );
++extern UINT16 sdb_request( struct sdb_conn *conn, BYTE set, BYTE cmd, const BYTE *payload, UINT32 len,
++                           BYTE **reply, UINT32 *reply_len );
++extern BOOL sdb_alive( struct sdb_conn *conn );
++extern void sdb_close( struct sdb_conn *conn, BOOL dispose );
++extern UINT32 sdb_get32( const BYTE *p );
++extern UINT64 sdb_get64( const BYTE *p );
