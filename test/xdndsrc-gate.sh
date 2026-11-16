@@ -27,7 +27,7 @@
 #   WINE=/opt/wine-sg/bin/wine test/xdndsrc-gate.sh
 #   mutants: SG_MUTANT_DRAG_NO_XDND (ole32), SG_MUTANT_DRAG_NO_WINE_MARK,
 #            SG_MUTANT_DRAG_NO_LEAVE, SG_MUTANT_DRAG_MOVE_UNCHECKED (winex11),
-#            SG_MUTANT_DRAG_URI_ESCAPED (winex11 clipboard.c)
+#            SG_MUTANT_URI_SLASH_ESCAPED (winex11 clipboard.c, 7789)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
