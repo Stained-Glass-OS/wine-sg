@@ -30,10 +30,14 @@ class App
         string text = "Gr\u00fc\u00dfe \u2713";
         int i;
         for (i = 0; i < 6000; i++)
-        {
-            File.WriteAllText(file, Interlocked.Read(ref count).ToString());
-            Thread.Sleep(50);
-        }
+            Tick(i);
         GC.KeepAlive(big + ratio + (flag ? 1 : 0) + text.Length + marker + label.Length);
+    }
+
+    // called every round: where the debugger sets its breakpoint (its first line) and steps from
+    static void Tick(int round)
+    {
+        File.WriteAllText(file, Interlocked.Read(ref count).ToString());
+        Thread.Sleep(50);
     }
 }

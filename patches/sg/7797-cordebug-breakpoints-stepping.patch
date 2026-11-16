@@ -1,0 +1,1061 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] mscoree: ICorDebug breakpoints and stepping over Wine Mono's
+ debugger agent
+
+NET-DBG phase 2, third part (wine-sg 7797). Breakpoints and steppers are
+the agent's event requests, their hits ICorDebugManagedCallback events:
+- ICorDebugFunction::CreateBreakpoint and GetILCode, ICorDebugCode
+  (IsIL, GetFunction, CreateBreakpoint at an IL offset): an
+  ICorDebugFunctionBreakpoint is a BREAKPOINT request (LOCATION_ONLY at
+  method and offset, suspend all), active when made, Activate(FALSE)
+  clears it.
+- ICorDebugThread::CreateStepper: Step (into or over), StepRange (the
+  same: the agent steps by sequence points), StepOut; a STEP request on
+  the thread, cleared once it completes or on Deactivate.
+- The agent's composite events, from the connection's reader thread, are
+  queued and delivered by a thread of the process: Breakpoint and
+  StepComplete with the thread and a minimal ICorDebugAppDomain (the
+  default domain), the process stopped (as after Stop) until continued.
+  An event whose breakpoint or stepper is gone resumes the program.
+---
+ dlls/mscoree/cordebug.c | 837 ++++++++++++++++++++++++++++++++++++++--
+ dlls/mscoree/sdb.c      |  19 +-
+ dlls/mscoree/sdb.h      |  22 +-
+ 3 files changed, 849 insertions(+), 29 deletions(-)
+
+diff --git a/dlls/mscoree/cordebug.c b/dlls/mscoree/cordebug.c
+index ac3af7c..f51f7a0 100644
+--- a/dlls/mscoree/cordebug.c
++++ b/dlls/mscoree/cordebug.c
+@@ -59,10 +59,19 @@ typedef struct DebugProcess
+     HANDLE connector;       /* connecting, after the first Continue of a process we started */
+     HANDLE abort;           /* ...given up (the process released or terminated) */
+     BOOL agent;             /* we gave it the agent */
++    /* its events (wine-sg 7797) */
++    struct list events;     /* queued, from the reader thread */
++    HANDLE event_ready, event_thread;
++    BOOL events_closing;
++    struct list breakpoints, steppers;   /* active ones */
++    ICorDebugAppDomain *appdomain;
+ 
+     LONG ref;
+ } DebugProcess;
+ 
++static void process_start_events(DebugProcess *This);
++static void process_stop_events(DebugProcess *This);
++
+ static inline CorDebug *impl_from_ICorDebug( ICorDebug *iface )
+ {
+     return CONTAINING_RECORD(iface, CorDebug, ICorDebug_iface);
+@@ -137,6 +146,7 @@ static ULONG WINAPI cordebugprocess_Release(ICorDebugProcess *iface)
+             CloseHandle(This->connector);
+         }
+         if (This->abort) CloseHandle(This->abort);
++        process_stop_events(This);
+         sdb_close(This->sdb, FALSE);
+         DeleteCriticalSection(&This->cs);
+ 
+@@ -205,6 +215,7 @@ static DWORD WINAPI connect_thread(void *arg)
+ 
+     EnterCriticalSection(&This->cs);
+     This->sdb = sdb;
++    process_start_events(This);
+     /* the agent holds the program until told to go (suspend=y): it goes unless the debugger stopped it meanwhile */
+     if (sdb && !This->stop_count)
+         sdb_request(sdb, SDB_SET_VM, SDB_VM_RESUME, NULL, 0, NULL, NULL);
+@@ -337,6 +348,7 @@ static HRESULT WINAPI cordebugprocess_Detach(ICorDebugProcess *iface)
+     /* the agent lets the program go on, unwatched (VM DISPOSE resumes it) */
+     if (process_agent(This))
+     {
++        process_stop_events(This);
+         sdb_close(This->sdb, TRUE);
+         This->sdb = NULL;
+     }
+@@ -363,6 +375,7 @@ static HRESULT WINAPI cordebugprocess_Terminate(ICorDebugProcess *iface, UINT ex
+             SetEvent(This->abort);
+             WaitForSingleObject(This->connector, INFINITE);
+         }
++        process_stop_events(This);
+         sdb_close(This->sdb, FALSE);
+         This->sdb = NULL;
+         CloseHandle(This->handle);
+@@ -761,10 +774,12 @@ static HRESULT WINAPI cordebugthread_ClearCurrentException(ICorDebugThread *ifac
+     return E_NOTIMPL;
+ }
+ 
++static HRESULT stepper_create(DebugThread *thread, ICorDebugStepper **ret);
++
+ static HRESULT WINAPI cordebugthread_CreateStepper(ICorDebugThread *iface, ICorDebugStepper **ppStepper)
+ {
+-    FIXME("%p: stepping not yet\n", iface);
+-    return E_NOTIMPL;
++    if (!ppStepper) return E_INVALIDARG;
++    return stepper_create(impl_from_ICorDebugThread(iface), ppStepper);
+ }
+ 
+ 
+@@ -1379,12 +1394,24 @@ static HRESULT WINAPI function_GetToken(ICorDebugFunction *iface, mdMethodDef *p
+     return S_OK;
+ }
+ 
++static HRESULT code_create(DebugProcess *process, UINT32 method, mdMethodDef token, ICorDebugCode **ret);
++static HRESULT breakpoint_create(DebugProcess *process, UINT32 method, mdMethodDef token, ULONG32 offset,
++                                 ICorDebugFunctionBreakpoint **ret);
++
+ static HRESULT WINAPI function_GetILCode(ICorDebugFunction *iface, ICorDebugCode **ppCode)
+-{ return E_NOTIMPL; }
++{
++    DebugFunction *This = impl_from_ICorDebugFunction(iface);
++    if (!ppCode) return E_INVALIDARG;
++    return code_create(This->process, This->method, This->token, ppCode);
++}
+ static HRESULT WINAPI function_GetNativeCode(ICorDebugFunction *iface, ICorDebugCode **ppCode)
+ { return E_NOTIMPL; }
+ static HRESULT WINAPI function_CreateBreakpoint(ICorDebugFunction *iface, ICorDebugFunctionBreakpoint **ppBreakpoint)
+-{ FIXME("%p: breakpoints not yet\n", iface); return E_NOTIMPL; }
++{
++    DebugFunction *This = impl_from_ICorDebugFunction(iface);
++    if (!ppBreakpoint) return E_INVALIDARG;
++    return breakpoint_create(This->process, This->method, This->token, 0, ppBreakpoint);
++}
+ static HRESULT WINAPI function_GetLocalVarSigToken(ICorDebugFunction *iface, mdSignature *pmdSig)
+ { return E_NOTIMPL; }
+ 
+@@ -2172,11 +2199,40 @@ static HRESULT thread_enum_create(ICorDebugThread **threads, ULONG count, ULONG
+ }
+ 
+ /* the managed threads now, from the agent (the process stopped) */
++/* a thread object for the agent's thread OBJID: its OS thread id and state */
++static DebugThread *new_thread(DebugProcess *This, struct sdb_conn *sdb, UINT32 objid)
++{
++    BYTE *info = NULL, id[4];
++    DebugThread *thread;
++    UINT32 ilen;
++
++    if (!(thread = calloc(1, sizeof(*thread)))) return NULL;
++    thread->ICorDebugThread_iface.lpVtbl = &cordebugthreadVtbl;
++    thread->ref = 1;
++    thread->process = This;
++    ICorDebugProcess_AddRef(&This->ICorDebugProcess_iface);
++    thread->objid = objid;
++    thread->debug_state = THREAD_RUN;
++    id[0] = objid >> 24; id[1] = objid >> 16; id[2] = objid >> 8; id[3] = objid;
++    if (!sdb_request(sdb, SDB_SET_THREAD, SDB_THREAD_GET_TID, id, 4, &info, &ilen) && ilen >= 8)
++#ifndef SG_MUTANT_CDB_THREAD_ID
++        thread->tid = sdb_get64(info);
++#else
++        thread->tid = thread->objid;
++#endif
++    free(info);
++    info = NULL;
++    if (!sdb_request(sdb, SDB_SET_THREAD, SDB_THREAD_GET_STATE, id, 4, &info, &ilen) && ilen >= 4)
++        thread->state = sdb_get32(info);
++    free(info);
++    return thread;
++}
++
+ static HRESULT get_threads(DebugProcess *This, ICorDebugThread ***threads, ULONG *count)
+ {
+     struct sdb_conn *sdb;
+-    BYTE *reply = NULL, *info = NULL, id[4];
+-    UINT32 len, ilen, n, i;
++    BYTE *reply = NULL;
++    UINT32 len, n, i;
+     DebugThread *thread;
+ 
+     *threads = NULL;
+@@ -2197,32 +2253,757 @@ static HRESULT get_threads(DebugProcess *This, ICorDebugThread ***threads, ULONG
+     }
+     for (i = 0; i < n; i++)
+     {
+-        if (!(thread = calloc(1, sizeof(*thread)))) break;
+-        thread->ICorDebugThread_iface.lpVtbl = &cordebugthreadVtbl;
+-        thread->ref = 1;
+-        thread->process = This;
+-        ICorDebugProcess_AddRef(&This->ICorDebugProcess_iface);
+-        thread->objid = sdb_get32(reply + 4 + 4 * i);
+-        thread->debug_state = THREAD_RUN;
+-        memcpy(id, reply + 4 + 4 * i, 4);
+-        if (!sdb_request(sdb, SDB_SET_THREAD, SDB_THREAD_GET_TID, id, 4, &info, &ilen) && ilen >= 8)
+-#ifndef SG_MUTANT_CDB_THREAD_ID
+-            thread->tid = sdb_get64(info);
+-#else
+-            thread->tid = thread->objid;
+-#endif
+-        free(info);
+-        info = NULL;
+-        if (!sdb_request(sdb, SDB_SET_THREAD, SDB_THREAD_GET_STATE, id, 4, &info, &ilen) && ilen >= 4)
+-            thread->state = sdb_get32(info);
+-        free(info);
+-        info = NULL;
++        if (!(thread = new_thread(This, sdb, sdb_get32(reply + 4 + 4 * i)))) break;
+         (*threads)[(*count)++] = &thread->ICorDebugThread_iface;
+     }
+     free(reply);
+     return S_OK;
+ }
+ 
++/***************************************************************************
++ * Stained Glass OS: breakpoints, stepping and the events that report them (wine-sg 7797)
++ *
++ * A breakpoint is the agent's BREAKPOINT event request at a method's IL offset, a stepper its STEP request on
++ * a thread (an instruction, into or over calls, or out of the frame), all with the whole program suspended
++ * when they are hit. The agent's composite events come on the connection's reader thread; they are queued
++ * and a thread of the process delivers them as ICorDebugManagedCallback::Breakpoint and StepComplete, the
++ * process stopped (its stop count up by one, as after Stop) until the debugger continues it.
++ */
++static void put_be64(BYTE *p, UINT64 v) { put_be32(p, v >> 32); put_be32(p + 4, (UINT32)v); }
++
++typedef struct DebugAppDomain
++{
++    ICorDebugAppDomain ICorDebugAppDomain_iface;
++    LONG ref;
++    DebugProcess *process;
++} DebugAppDomain;
++
++static inline DebugAppDomain *impl_from_ICorDebugAppDomain(ICorDebugAppDomain *iface)
++{
++    return CONTAINING_RECORD(iface, DebugAppDomain, ICorDebugAppDomain_iface);
++}
++
++static HRESULT WINAPI appdomain_QueryInterface(ICorDebugAppDomain *iface, REFIID riid, void **ppv)
++{
++    if (IsEqualGUID(riid, &IID_ICorDebugAppDomain) || IsEqualGUID(riid, &IID_ICorDebugController) ||
++        IsEqualGUID(riid, &IID_IUnknown))
++    {
++        *ppv = iface;
++        ICorDebugAppDomain_AddRef(iface);
++        return S_OK;
++    }
++    *ppv = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI appdomain_AddRef(ICorDebugAppDomain *iface)
++{ return InterlockedIncrement(&impl_from_ICorDebugAppDomain(iface)->ref); }
++static ULONG WINAPI appdomain_Release(ICorDebugAppDomain *iface)
++{
++    DebugAppDomain *This = impl_from_ICorDebugAppDomain(iface);
++    ULONG ref = InterlockedDecrement(&This->ref);
++    if (!ref)
++    {
++        ICorDebugProcess_Release(&This->process->ICorDebugProcess_iface);
++        free(This);
++    }
++    return ref;
++}
++#define PROC(This) (&impl_from_ICorDebugAppDomain(This)->process->ICorDebugProcess_iface)
++static HRESULT WINAPI appdomain_Stop(ICorDebugAppDomain *iface, DWORD timeout)
++{ return ICorDebugProcess_Stop(PROC(iface), timeout); }
++static HRESULT WINAPI appdomain_Continue(ICorDebugAppDomain *iface, BOOL oob)
++{ return ICorDebugProcess_Continue(PROC(iface), oob); }
++static HRESULT WINAPI appdomain_IsRunning(ICorDebugAppDomain *iface, BOOL *running)
++{ return ICorDebugProcess_IsRunning(PROC(iface), running); }
++static HRESULT WINAPI appdomain_HasQueuedCallbacks(ICorDebugAppDomain *iface, ICorDebugThread *thread, BOOL *queued)
++{ return ICorDebugProcess_HasQueuedCallbacks(PROC(iface), thread, queued); }
++static HRESULT WINAPI appdomain_EnumerateThreads(ICorDebugAppDomain *iface, ICorDebugThreadEnum **threads)
++{ return ICorDebugProcess_EnumerateThreads(PROC(iface), threads); }
++static HRESULT WINAPI appdomain_SetAllThreadsDebugState(ICorDebugAppDomain *iface, CorDebugThreadState state, ICorDebugThread *except)
++{ return ICorDebugProcess_SetAllThreadsDebugState(PROC(iface), state, except); }
++static HRESULT WINAPI appdomain_Detach(ICorDebugAppDomain *iface)
++{ return ICorDebugProcess_Detach(PROC(iface)); }
++static HRESULT WINAPI appdomain_Terminate(ICorDebugAppDomain *iface, UINT code)
++{ return ICorDebugProcess_Terminate(PROC(iface), code); }
++static HRESULT WINAPI appdomain_CanCommitChanges(ICorDebugAppDomain *iface, ULONG n, ICorDebugEditAndContinueSnapshot *s[], ICorDebugErrorInfoEnum **e)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI appdomain_CommitChanges(ICorDebugAppDomain *iface, ULONG n, ICorDebugEditAndContinueSnapshot *s[], ICorDebugErrorInfoEnum **e)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI appdomain_GetProcess(ICorDebugAppDomain *iface, ICorDebugProcess **ppProcess)
++{
++    if (!ppProcess) return E_INVALIDARG;
++    *ppProcess = PROC(iface);
++    ICorDebugProcess_AddRef(*ppProcess);
++    return S_OK;
++}
++#undef PROC
++static HRESULT WINAPI appdomain_EnumerateAssemblies(ICorDebugAppDomain *iface, ICorDebugAssemblyEnum **e)
++{ FIXME("%p: assemblies not yet\n", iface); return E_NOTIMPL; }
++static HRESULT WINAPI appdomain_GetModuleFromMetaDataInterface(ICorDebugAppDomain *iface, IUnknown *md, ICorDebugModule **m)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI appdomain_EnumerateBreakpoints(ICorDebugAppDomain *iface, ICorDebugBreakpointEnum **e)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI appdomain_EnumerateSteppers(ICorDebugAppDomain *iface, ICorDebugStepperEnum **e)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI appdomain_IsAttached(ICorDebugAppDomain *iface, BOOL *attached)
++{
++    if (!attached) return E_INVALIDARG;
++    *attached = TRUE;
++    return S_OK;
++}
++static HRESULT WINAPI appdomain_GetName(ICorDebugAppDomain *iface, ULONG32 cch, ULONG32 *pcch, WCHAR name[])
++{
++    static const WCHAR domain[] = L"DefaultDomain";
++    ULONG32 n = min(cch, ARRAY_SIZE(domain));
++
++    if (!pcch) return E_INVALIDARG;
++    *pcch = ARRAY_SIZE(domain);
++    if (name && n) { memcpy(name, domain, n * sizeof(WCHAR)); name[n - 1] = 0; }
++    return S_OK;
++}
++static HRESULT WINAPI appdomain_GetObject(ICorDebugAppDomain *iface, ICorDebugValue **v)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI appdomain_Attach(ICorDebugAppDomain *iface)
++{ return S_OK; }
++static HRESULT WINAPI appdomain_GetID(ICorDebugAppDomain *iface, ULONG32 *id)
++{
++    if (!id) return E_INVALIDARG;
++    *id = 1;
++    return S_OK;
++}
++
++static const ICorDebugAppDomainVtbl appdomain_vtbl =
++{
++    appdomain_QueryInterface, appdomain_AddRef, appdomain_Release,
++    appdomain_Stop, appdomain_Continue, appdomain_IsRunning, appdomain_HasQueuedCallbacks,
++    appdomain_EnumerateThreads, appdomain_SetAllThreadsDebugState, appdomain_Detach, appdomain_Terminate,
++    appdomain_CanCommitChanges, appdomain_CommitChanges,
++    appdomain_GetProcess, appdomain_EnumerateAssemblies, appdomain_GetModuleFromMetaDataInterface,
++    appdomain_EnumerateBreakpoints, appdomain_EnumerateSteppers, appdomain_IsAttached, appdomain_GetName,
++    appdomain_GetObject, appdomain_Attach, appdomain_GetID,
++};
++
++/* the process's one application domain (Wine Mono runs programs in the default one) */
++static ICorDebugAppDomain *process_appdomain(DebugProcess *process)
++{
++    DebugAppDomain *domain;
++
++    EnterCriticalSection(&process->cs);
++    if (!process->appdomain && (domain = calloc(1, sizeof(*domain))))
++    {
++        domain->ICorDebugAppDomain_iface.lpVtbl = &appdomain_vtbl;
++        domain->ref = 1;
++        domain->process = process;
++        /* (no reference to the process: the process holds the domain until it goes) */
++        process->appdomain = &domain->ICorDebugAppDomain_iface;
++    }
++    if (process->appdomain) ICorDebugAppDomain_AddRef(process->appdomain);
++    LeaveCriticalSection(&process->cs);
++    return process->appdomain;
++}
++
++/* the agent's event request: its id, or 0 */
++static UINT32 event_request(DebugProcess *process, const BYTE *payload, UINT32 len)
++{
++    struct sdb_conn *sdb = process_agent(process);
++    BYTE *reply = NULL;
++    UINT32 rlen, id = 0;
++
++    if (!sdb) return 0;
++    if (!sdb_request(sdb, SDB_SET_EVENT_REQUEST, SDB_EVENT_REQUEST_SET, payload, len, &reply, &rlen) && rlen >= 4)
++        id = sdb_get32(reply);
++    free(reply);
++    return id;
++}
++
++static void event_request_clear(DebugProcess *process, BYTE kind, UINT32 id)
++{
++    struct sdb_conn *sdb = process_agent(process);
++    BYTE payload[5];
++
++    if (!sdb || !id) return;
++    payload[0] = kind;
++    put_be32(payload + 1, id);
++    sdb_request(sdb, SDB_SET_EVENT_REQUEST, SDB_EVENT_REQUEST_CLEAR, payload, 5, NULL, NULL);
++}
++
++/* ICorDebugFunctionBreakpoint */
++typedef struct DebugBreakpoint
++{
++    ICorDebugFunctionBreakpoint ICorDebugFunctionBreakpoint_iface;
++    LONG ref;
++    struct list entry;          /* in the process's list while active */
++    DebugProcess *process;
++    UINT32 method;
++    mdMethodDef token;
++    ULONG32 offset;
++    UINT32 request;             /* the agent's request, 0: not active */
++} DebugBreakpoint;
++
++static inline DebugBreakpoint *impl_from_ICorDebugFunctionBreakpoint(ICorDebugFunctionBreakpoint *iface)
++{
++    return CONTAINING_RECORD(iface, DebugBreakpoint, ICorDebugFunctionBreakpoint_iface);
++}
++
++static HRESULT WINAPI breakpoint_QueryInterface(ICorDebugFunctionBreakpoint *iface, REFIID riid, void **ppv)
++{
++    if (IsEqualGUID(riid, &IID_ICorDebugFunctionBreakpoint) || IsEqualGUID(riid, &IID_ICorDebugBreakpoint) ||
++        IsEqualGUID(riid, &IID_IUnknown))
++    {
++        *ppv = iface;
++        ICorDebugFunctionBreakpoint_AddRef(iface);
++        return S_OK;
++    }
++    *ppv = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI breakpoint_AddRef(ICorDebugFunctionBreakpoint *iface)
++{ return InterlockedIncrement(&impl_from_ICorDebugFunctionBreakpoint(iface)->ref); }
++static ULONG WINAPI breakpoint_Release(ICorDebugFunctionBreakpoint *iface)
++{
++    DebugBreakpoint *This = impl_from_ICorDebugFunctionBreakpoint(iface);
++    ULONG ref = InterlockedDecrement(&This->ref);
++    if (!ref)
++    {
++        ICorDebugProcess_Release(&This->process->ICorDebugProcess_iface);
++        free(This);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI breakpoint_Activate(ICorDebugFunctionBreakpoint *iface, BOOL bActive)
++{
++    DebugBreakpoint *This = impl_from_ICorDebugFunctionBreakpoint(iface);
++    BYTE payload[3 + 1 + 4 + 8];
++    UINT32 id;
++
++    TRACE("%p, %d\n", iface, bActive);
++    if (bActive && !This->request)
++    {
++        payload[0] = SDB_EVENT_KIND_BREAKPOINT;
++        payload[1] = SDB_SUSPEND_POLICY_ALL;
++        payload[2] = 1;
++        payload[3] = SDB_MOD_LOCATION_ONLY;
++        put_be32(payload + 4, This->method);
++        put_be64(payload + 8, This->offset);
++#ifndef SG_MUTANT_CDB_BP_NOT_SET
++        if (!(id = event_request(This->process, payload, sizeof(payload)))) return CORDBG_E_CODE_NOT_AVAILABLE;
++#else
++        id = 0x7fffffff;
++#endif
++        EnterCriticalSection(&This->process->cs);
++        This->request = id;
++        list_add_tail(&This->process->breakpoints, &This->entry);
++        ICorDebugFunctionBreakpoint_AddRef(iface);   /* the list's */
++        LeaveCriticalSection(&This->process->cs);
++    }
++    else if (!bActive && This->request)
++    {
++        event_request_clear(This->process, SDB_EVENT_KIND_BREAKPOINT, This->request);
++        EnterCriticalSection(&This->process->cs);
++        This->request = 0;
++        list_remove(&This->entry);
++        LeaveCriticalSection(&This->process->cs);
++        ICorDebugFunctionBreakpoint_Release(iface);
++    }
++    return S_OK;
++}
++
++static HRESULT WINAPI breakpoint_IsActive(ICorDebugFunctionBreakpoint *iface, BOOL *pbActive)
++{
++    if (!pbActive) return E_INVALIDARG;
++    *pbActive = impl_from_ICorDebugFunctionBreakpoint(iface)->request != 0;
++    return S_OK;
++}
++
++static HRESULT function_create(DebugProcess *process, UINT32 method, mdMethodDef token, ICorDebugFunction **ret);
++
++static HRESULT WINAPI breakpoint_GetFunction(ICorDebugFunctionBreakpoint *iface, ICorDebugFunction **ppFunction)
++{
++    DebugBreakpoint *This = impl_from_ICorDebugFunctionBreakpoint(iface);
++    if (!ppFunction) return E_INVALIDARG;
++    return function_create(This->process, This->method, This->token, ppFunction);
++}
++
++static HRESULT WINAPI breakpoint_GetOffset(ICorDebugFunctionBreakpoint *iface, ULONG32 *pnOffset)
++{
++    if (!pnOffset) return E_INVALIDARG;
++    *pnOffset = impl_from_ICorDebugFunctionBreakpoint(iface)->offset;
++    return S_OK;
++}
++
++static const ICorDebugFunctionBreakpointVtbl breakpoint_vtbl =
++{
++    breakpoint_QueryInterface, breakpoint_AddRef, breakpoint_Release,
++    breakpoint_Activate, breakpoint_IsActive, breakpoint_GetFunction, breakpoint_GetOffset,
++};
++
++/* an active breakpoint at METHOD's IL OFFSET (as on Windows, made active) */
++static HRESULT breakpoint_create(DebugProcess *process, UINT32 method, mdMethodDef token, ULONG32 offset,
++                                 ICorDebugFunctionBreakpoint **ret)
++{
++    DebugBreakpoint *This = calloc(1, sizeof(*This));
++    HRESULT hr;
++
++    if (!This) return E_OUTOFMEMORY;
++    This->ICorDebugFunctionBreakpoint_iface.lpVtbl = &breakpoint_vtbl;
++    This->ref = 1;
++    This->process = process;
++    ICorDebugProcess_AddRef(&process->ICorDebugProcess_iface);
++    This->method = method;
++    This->token = token;
++    This->offset = offset;
++    if (FAILED(hr = breakpoint_Activate(&This->ICorDebugFunctionBreakpoint_iface, TRUE)))
++    {
++        ICorDebugFunctionBreakpoint_Release(&This->ICorDebugFunctionBreakpoint_iface);
++        return hr;
++    }
++    *ret = &This->ICorDebugFunctionBreakpoint_iface;
++    return S_OK;
++}
++
++/* ICorDebugCode: a function's IL */
++typedef struct DebugCode
++{
++    ICorDebugCode ICorDebugCode_iface;
++    LONG ref;
++    DebugProcess *process;
++    UINT32 method;
++    mdMethodDef token;
++} DebugCode;
++
++static inline DebugCode *impl_from_ICorDebugCode(ICorDebugCode *iface)
++{
++    return CONTAINING_RECORD(iface, DebugCode, ICorDebugCode_iface);
++}
++
++static HRESULT WINAPI code_QueryInterface(ICorDebugCode *iface, REFIID riid, void **ppv)
++{
++    if (IsEqualGUID(riid, &IID_ICorDebugCode) || IsEqualGUID(riid, &IID_IUnknown))
++    {
++        *ppv = iface;
++        ICorDebugCode_AddRef(iface);
++        return S_OK;
++    }
++    *ppv = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI code_AddRef(ICorDebugCode *iface)
++{ return InterlockedIncrement(&impl_from_ICorDebugCode(iface)->ref); }
++static ULONG WINAPI code_Release(ICorDebugCode *iface)
++{
++    DebugCode *This = impl_from_ICorDebugCode(iface);
++    ULONG ref = InterlockedDecrement(&This->ref);
++    if (!ref)
++    {
++        ICorDebugProcess_Release(&This->process->ICorDebugProcess_iface);
++        free(This);
++    }
++    return ref;
++}
++static HRESULT WINAPI code_IsIL(ICorDebugCode *iface, BOOL *pbIL)
++{
++    if (!pbIL) return E_INVALIDARG;
++    *pbIL = TRUE;
++    return S_OK;
++}
++static HRESULT WINAPI code_GetFunction(ICorDebugCode *iface, ICorDebugFunction **ppFunction)
++{
++    DebugCode *This = impl_from_ICorDebugCode(iface);
++    if (!ppFunction) return E_INVALIDARG;
++    return function_create(This->process, This->method, This->token, ppFunction);
++}
++static HRESULT WINAPI code_GetAddress(ICorDebugCode *iface, CORDB_ADDRESS *pStart)
++{
++    if (!pStart) return E_INVALIDARG;
++    *pStart = 0;
++    return S_OK;
++}
++static HRESULT WINAPI code_GetSize(ICorDebugCode *iface, ULONG32 *pcBytes)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI code_CreateBreakpoint(ICorDebugCode *iface, ULONG32 offset, ICorDebugFunctionBreakpoint **ppBreakpoint)
++{
++    DebugCode *This = impl_from_ICorDebugCode(iface);
++    if (!ppBreakpoint) return E_INVALIDARG;
++    return breakpoint_create(This->process, This->method, This->token, offset, ppBreakpoint);
++}
++static HRESULT WINAPI code_GetCode(ICorDebugCode *iface, ULONG32 start, ULONG32 end, ULONG32 cBufferAlloc,
++                                   BYTE buffer[], ULONG32 *pcBufferSize)
++{ return E_NOTIMPL; }
++static HRESULT WINAPI code_GetVersionNumber(ICorDebugCode *iface, ULONG32 *nVersion)
++{
++    if (!nVersion) return E_INVALIDARG;
++    *nVersion = 1;
++    return S_OK;
++}
++static HRESULT WINAPI code_GetILToNativeMapping(ICorDebugCode *iface, ULONG32 cMap, ULONG32 *pcMap,
++                                                COR_DEBUG_IL_TO_NATIVE_MAP map[])
++{ return E_NOTIMPL; }
++static HRESULT WINAPI code_GetEnCRemapSequencePoints(ICorDebugCode *iface, ULONG32 cMap, ULONG32 *pcMap, ULONG32 offsets[])
++{ return E_NOTIMPL; }
++
++static const ICorDebugCodeVtbl code_vtbl =
++{
++    code_QueryInterface, code_AddRef, code_Release,
++    code_IsIL, code_GetFunction, code_GetAddress, code_GetSize, code_CreateBreakpoint, code_GetCode,
++    code_GetVersionNumber, code_GetILToNativeMapping, code_GetEnCRemapSequencePoints,
++};
++
++static HRESULT code_create(DebugProcess *process, UINT32 method, mdMethodDef token, ICorDebugCode **ret)
++{
++    DebugCode *This = calloc(1, sizeof(*This));
++
++    if (!This) return E_OUTOFMEMORY;
++    This->ICorDebugCode_iface.lpVtbl = &code_vtbl;
++    This->ref = 1;
++    This->process = process;
++    ICorDebugProcess_AddRef(&process->ICorDebugProcess_iface);
++    This->method = method;
++    This->token = token;
++    *ret = &This->ICorDebugCode_iface;
++    return S_OK;
++}
++
++/* ICorDebugStepper */
++typedef struct DebugStepper
++{
++    ICorDebugStepper ICorDebugStepper_iface;
++    LONG ref;
++    struct list entry;          /* in the process's list while stepping */
++    DebugThread *thread;
++    UINT32 request;
++} DebugStepper;
++
++static inline DebugStepper *impl_from_ICorDebugStepper(ICorDebugStepper *iface)
++{
++    return CONTAINING_RECORD(iface, DebugStepper, ICorDebugStepper_iface);
++}
++
++static HRESULT WINAPI stepper_QueryInterface(ICorDebugStepper *iface, REFIID riid, void **ppv)
++{
++    if (IsEqualGUID(riid, &IID_ICorDebugStepper) || IsEqualGUID(riid, &IID_IUnknown))
++    {
++        *ppv = iface;
++        ICorDebugStepper_AddRef(iface);
++        return S_OK;
++    }
++    *ppv = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI stepper_AddRef(ICorDebugStepper *iface)
++{ return InterlockedIncrement(&impl_from_ICorDebugStepper(iface)->ref); }
++static ULONG WINAPI stepper_Release(ICorDebugStepper *iface)
++{
++    DebugStepper *This = impl_from_ICorDebugStepper(iface);
++    ULONG ref = InterlockedDecrement(&This->ref);
++    if (!ref)
++    {
++        ICorDebugThread_Release(&This->thread->ICorDebugThread_iface);
++        free(This);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI stepper_IsActive(ICorDebugStepper *iface, BOOL *pbActive)
++{
++    if (!pbActive) return E_INVALIDARG;
++    *pbActive = impl_from_ICorDebugStepper(iface)->request != 0;
++    return S_OK;
++}
++
++/* the step request gone: the stepper is done */
++static void stepper_end(DebugStepper *This)
++{
++    DebugProcess *process = This->thread->process;
++    UINT32 request;
++
++    EnterCriticalSection(&process->cs);
++    request = This->request;
++    This->request = 0;
++    if (request) list_remove(&This->entry);
++    LeaveCriticalSection(&process->cs);
++    if (!request) return;
++    event_request_clear(process, SDB_EVENT_KIND_STEP, request);
++    ICorDebugStepper_Release(&This->ICorDebugStepper_iface);
++}
++
++static HRESULT WINAPI stepper_Deactivate(ICorDebugStepper *iface)
++{
++    stepper_end(impl_from_ICorDebugStepper(iface));
++    return S_OK;
++}
++
++static HRESULT WINAPI stepper_SetInterceptMask(ICorDebugStepper *iface, CorDebugIntercept mask)
++{ return S_OK; }
++static HRESULT WINAPI stepper_SetUnmappedStopMask(ICorDebugStepper *iface, CorDebugUnmappedStop mask)
++{ return S_OK; }
++
++static HRESULT stepper_start(DebugStepper *This, int depth)
++{
++    DebugProcess *process = This->thread->process;
++    BYTE payload[3 + 1 + 4 + 4 + 4 + 4];
++    UINT32 id;
++
++    if (This->request) stepper_end(This);
++    payload[0] = SDB_EVENT_KIND_STEP;
++    payload[1] = SDB_SUSPEND_POLICY_ALL;
++    payload[2] = 1;
++    payload[3] = SDB_MOD_STEP;
++    put_be32(payload + 4, This->thread->objid);
++    put_be32(payload + 8, SDB_STEP_SIZE_MIN);   /* (to the next sequence point: needs no line table) */
++    put_be32(payload + 12, depth);
++    put_be32(payload + 16, 0);   /* no filter */
++    if (!(id = event_request(process, payload, sizeof(payload)))) return CORDBG_E_PROCESS_TERMINATED;
++    EnterCriticalSection(&process->cs);
++    This->request = id;
++    list_add_tail(&process->steppers, &This->entry);
++    ICorDebugStepper_AddRef(&This->ICorDebugStepper_iface);   /* the list's */
++    LeaveCriticalSection(&process->cs);
++    return S_OK;
++}
++
++static HRESULT WINAPI stepper_Step(ICorDebugStepper *iface, BOOL bStepIn)
++{
++    return stepper_start(impl_from_ICorDebugStepper(iface), bStepIn ? SDB_STEP_DEPTH_INTO : SDB_STEP_DEPTH_OVER);
++}
++
++static HRESULT WINAPI stepper_StepRange(ICorDebugStepper *iface, BOOL bStepIn, COR_DEBUG_STEP_RANGE ranges[],
++                                       ULONG32 cRangeCount)
++{
++    /* the agent steps by sequence points: a step leaves a statement's range */
++    return stepper_start(impl_from_ICorDebugStepper(iface), bStepIn ? SDB_STEP_DEPTH_INTO : SDB_STEP_DEPTH_OVER);
++}
++
++static HRESULT WINAPI stepper_StepOut(ICorDebugStepper *iface)
++{
++    return stepper_start(impl_from_ICorDebugStepper(iface), SDB_STEP_DEPTH_OUT);
++}
++
++static HRESULT WINAPI stepper_SetRangeIL(ICorDebugStepper *iface, BOOL bIL)
++{ return S_OK; }
++
++static const ICorDebugStepperVtbl stepper_vtbl =
++{
++    stepper_QueryInterface, stepper_AddRef, stepper_Release,
++    stepper_IsActive, stepper_Deactivate, stepper_SetInterceptMask, stepper_SetUnmappedStopMask,
++    stepper_Step, stepper_StepRange, stepper_StepOut, stepper_SetRangeIL,
++};
++
++static HRESULT stepper_create(DebugThread *thread, ICorDebugStepper **ret)
++{
++    DebugStepper *This = calloc(1, sizeof(*This));
++
++    if (!This) return E_OUTOFMEMORY;
++    This->ICorDebugStepper_iface.lpVtbl = &stepper_vtbl;
++    This->ref = 1;
++    This->thread = thread;
++    ICorDebugThread_AddRef(&thread->ICorDebugThread_iface);
++    *ret = &This->ICorDebugStepper_iface;
++    return S_OK;
++}
++
++/* the agent's events, from the reader thread: queued for the process's event thread */
++struct queued_event
++{
++    struct list entry;
++    BYTE *data;
++    UINT32 len;
++};
++
++static void process_event_func(void *ctx, BYTE *data, UINT32 len)
++{
++    DebugProcess *This = ctx;
++    struct queued_event *ev = malloc(sizeof(*ev));
++
++    if (!ev) { free(data); return; }
++    ev->data = data;
++    ev->len = len;
++    EnterCriticalSection(&This->cs);
++    list_add_tail(&This->events, &ev->entry);
++    LeaveCriticalSection(&This->cs);
++    SetEvent(This->event_ready);
++}
++
++/* one composite event: the process stopped, the callbacks */
++static void deliver_event(DebugProcess *This, const BYTE *p, UINT32 len)
++{
++    struct sdb_conn *sdb = process_agent(This);
++    ICorDebugManagedCallback *callback = This->cordebug ? This->cordebug->pCallback : NULL;
++    const BYTE *end = p + len;
++    UINT32 n, i, request, objid;
++    BYTE policy, kind;
++
++    if (len < 5) return;
++    policy = p[0];
++    n = sdb_get32(p + 1);
++    p += 5;
++    for (i = 0; i < n && end - p >= 9; i++)
++    {
++        kind = p[0];
++        request = sdb_get32(p + 1);
++        objid = sdb_get32(p + 5);
++        p += 9;
++        if (kind == SDB_EVENT_KIND_BREAKPOINT || kind == SDB_EVENT_KIND_STEP)
++        {
++            DebugBreakpoint *bp, *found_bp = NULL;
++            DebugStepper *st, *found_st = NULL;
++            ICorDebugAppDomain *domain;
++            DebugThread *thread;
++
++            if (end - p < 12) break;
++            p += 12;   /* method, IL offset */
++            EnterCriticalSection(&This->cs);
++            if (kind == SDB_EVENT_KIND_BREAKPOINT)
++            {
++                LIST_FOR_EACH_ENTRY(bp, &This->breakpoints, DebugBreakpoint, entry)
++                    if (bp->request == request) { found_bp = bp; ICorDebugFunctionBreakpoint_AddRef(&bp->ICorDebugFunctionBreakpoint_iface); break; }
++            }
++            else
++            {
++                LIST_FOR_EACH_ENTRY(st, &This->steppers, DebugStepper, entry)
++                    if (st->request == request) { found_st = st; ICorDebugStepper_AddRef(&st->ICorDebugStepper_iface); break; }
++            }
++            LeaveCriticalSection(&This->cs);
++            if (!found_bp && !found_st)
++            {
++                /* one gone meanwhile (deactivated as it hit): the agent suspended the program for nothing */
++                if (policy == SDB_SUSPEND_POLICY_ALL && sdb)
++                    sdb_request(sdb, SDB_SET_VM, SDB_VM_RESUME, NULL, 0, NULL, NULL);
++                policy = 0;
++                continue;
++            }
++            if (policy == SDB_SUSPEND_POLICY_ALL)
++            {
++                /* the agent suspended the program for it: synchronized, until continued. (VM_START, which
++                 * the agent sends suspended at the start, is not reported: the first Continue resumes it.) */
++                EnterCriticalSection(&This->cs);
++                This->stop_count++;
++                LeaveCriticalSection(&This->cs);
++                policy = 0;   /* once for the whole composite */
++            }
++#ifndef SG_MUTANT_CDB_STEP_KEEPS
++            if (found_st) stepper_end(found_st);   /* a step is done once it stops */
++#endif
++            if (!sdb || !(thread = new_thread(This, sdb, objid)))
++            {
++                if (found_bp) ICorDebugFunctionBreakpoint_Release(&found_bp->ICorDebugFunctionBreakpoint_iface);
++                if (found_st) ICorDebugStepper_Release(&found_st->ICorDebugStepper_iface);
++                continue;
++            }
++            domain = process_appdomain(This);
++            TRACE("%s, request %u, thread %#lx\n", kind == SDB_EVENT_KIND_BREAKPOINT ? "breakpoint" : "step done",
++                  request, thread->tid);
++            if (callback && found_bp)
++                ICorDebugManagedCallback_Breakpoint(callback, domain, &thread->ICorDebugThread_iface,
++                                                    (ICorDebugBreakpoint *)&found_bp->ICorDebugFunctionBreakpoint_iface);
++            else if (callback && found_st)
++                ICorDebugManagedCallback_StepComplete(callback, domain, &thread->ICorDebugThread_iface,
++                                                      &found_st->ICorDebugStepper_iface, STEP_NORMAL);
++            if (domain) ICorDebugAppDomain_Release(domain);
++            ICorDebugThread_Release(&thread->ICorDebugThread_iface);
++            if (found_bp) ICorDebugFunctionBreakpoint_Release(&found_bp->ICorDebugFunctionBreakpoint_iface);
++            if (found_st) ICorDebugStepper_Release(&found_st->ICorDebugStepper_iface);
++        }
++        else break;   /* (no other kinds are asked for) */
++    }
++}
++
++static DWORD WINAPI event_thread(void *arg)
++{
++    DebugProcess *This = arg;
++    struct queued_event *ev;
++
++    for (;;)
++    {
++        WaitForSingleObject(This->event_ready, INFINITE);
++        for (;;)
++        {
++            EnterCriticalSection(&This->cs);
++            if (This->events_closing)
++            {
++                LeaveCriticalSection(&This->cs);
++                return 0;
++            }
++            ev = list_empty(&This->events) ? NULL : LIST_ENTRY(list_head(&This->events), struct queued_event, entry);
++            if (ev) list_remove(&ev->entry);
++            LeaveCriticalSection(&This->cs);
++            if (!ev) break;
++            deliver_event(This, ev->data, ev->len);
++            free(ev->data);
++            free(ev);
++        }
++    }
++}
++
++/* the agent connected: its events are heard */
++static void process_start_events(DebugProcess *This)
++{
++    if (This->event_thread || !This->sdb) return;
++    if (!(This->event_ready = CreateEventW(NULL, FALSE, FALSE, NULL))) return;
++    if (!(This->event_thread = CreateThread(NULL, 0, event_thread, This, 0, NULL))) return;
++    sdb_set_event_handler(This->sdb, process_event_func, This);
++}
++
++static void process_stop_events(DebugProcess *This)
++{
++    struct queued_event *ev, *next;
++    DebugBreakpoint *bp, *bp2;
++    DebugStepper *st, *st2;
++
++    if (This->sdb) sdb_set_event_handler(This->sdb, NULL, NULL);
++    if (This->event_thread)
++    {
++        EnterCriticalSection(&This->cs);
++        This->events_closing = TRUE;
++        LeaveCriticalSection(&This->cs);
++        SetEvent(This->event_ready);
++        if (GetCurrentThreadId() != GetThreadId(This->event_thread)) WaitForSingleObject(This->event_thread, INFINITE);
++        CloseHandle(This->event_thread);
++        This->event_thread = NULL;
++    }
++    if (This->event_ready) CloseHandle(This->event_ready);
++    This->event_ready = NULL;
++    LIST_FOR_EACH_ENTRY_SAFE(ev, next, &This->events, struct queued_event, entry)
++    {
++        list_remove(&ev->entry);
++        free(ev->data);
++        free(ev);
++    }
++    /* the lists' references */
++    LIST_FOR_EACH_ENTRY_SAFE(bp, bp2, &This->breakpoints, DebugBreakpoint, entry)
++    {
++        list_remove(&bp->entry);
++        bp->request = 0;
++        ICorDebugFunctionBreakpoint_Release(&bp->ICorDebugFunctionBreakpoint_iface);
++    }
++    LIST_FOR_EACH_ENTRY_SAFE(st, st2, &This->steppers, DebugStepper, entry)
++    {
++        list_remove(&st->entry);
++        st->request = 0;
++        ICorDebugStepper_Release(&st->ICorDebugStepper_iface);
++    }
++    if (This->appdomain)
++    {
++        ICorDebugAppDomain_Release(This->appdomain);
++        This->appdomain = NULL;
++    }
++}
++
++static HRESULT function_create(DebugProcess *process, UINT32 method, mdMethodDef token, ICorDebugFunction **ret)
++{
++    DebugFunction *function = calloc(1, sizeof(*function));
++
++    if (!function) return E_OUTOFMEMORY;
++    function->ICorDebugFunction_iface.lpVtbl = &function_vtbl;
++    function->ref = 1;
++    function->process = process;
++    ICorDebugProcess_AddRef(&process->ICorDebugProcess_iface);
++    function->method = method;
++    function->token = token;
++    *ret = &function->ICorDebugFunction_iface;
++    return S_OK;
++}
++
+ /***************************************/
+ static const ICorDebugProcessVtbl cordebugprocessVtbl = {
+     cordebugprocess_QueryInterface,
+@@ -2285,6 +3066,9 @@ static HRESULT CorDebugProcess_Create(CorDebug *cordebug, IUnknown** ppUnk, LPPR
+ 
+     This->ICorDebugProcess_iface.lpVtbl = &cordebugprocessVtbl;
+     InitializeCriticalSectionEx(&This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    list_init(&This->events);
++    list_init(&This->breakpoints);
++    list_init(&This->steppers);
+     This->ref = 1;
+     This->stop_count = 1;   /* created suspended: the first Continue starts it */
+     This->cordebug = cordebug;
+@@ -2747,6 +3531,7 @@ static HRESULT WINAPI CorDebug_DebugActiveProcess(ICorDebug *iface, DWORD id, BO
+     impl = impl_from_ICorDebugProcess(process);
+     impl->sdb = sdb;
+     impl->stop_count = 1;
++    process_start_events(impl);
+     entry->pProcess = process;
+     list_add_tail(&This->processes, &entry->entry);
+     ICorDebugProcess_AddRef(process);
+diff --git a/dlls/mscoree/sdb.c b/dlls/mscoree/sdb.c
+index 6d01d8a..5ee361b 100644
+--- a/dlls/mscoree/sdb.c
++++ b/dlls/mscoree/sdb.c
+@@ -72,6 +72,8 @@ struct sdb_conn
+     BOOL dead;
+     HANDLE reader;
+     LONG ref;
++    sdb_event_func event_func;   /* the agent's events (wine-sg 7797), called on the reader thread */
++    void *event_ctx;
+ };
+ 
+ static BOOL load_sgdbgsock(void)
+@@ -120,7 +122,11 @@ static DWORD WINAPI reader_thread( void *arg )
+         if (!(header[8] & 0x80))
+         {
+             TRACE( "event packet %u/%u, %u bytes\n", header[9], header[10], len );
+-            free( data );
++            EnterCriticalSection( &conn->cs );
++            if (header[9] == SDB_SET_EVENT && header[10] == SDB_EVENT_COMPOSITE && conn->event_func)
++                conn->event_func( conn->event_ctx, data, len );   /* takes DATA */
++            else free( data );
++            LeaveCriticalSection( &conn->cs );
+             continue;
+         }
+         EnterCriticalSection( &conn->cs );
+@@ -251,6 +257,16 @@ struct sdb_conn *sdb_connect( DWORD pid, HANDLE process, HANDLE abort, DWORD tim
+     return conn;
+ }
+ 
++/* events: FUNC gets each composite event's body (malloc'ed, its to free), on the reader thread -- it must not
++ * make requests there (their answers come on that thread) */
++void sdb_set_event_handler( struct sdb_conn *conn, sdb_event_func func, void *ctx )
++{
++    EnterCriticalSection( &conn->cs );
++    conn->event_func = func;
++    conn->event_ctx = ctx;
++    LeaveCriticalSection( &conn->cs );
++}
++
+ BOOL sdb_alive( struct sdb_conn *conn )
+ {
+     return conn && !conn->dead;
+@@ -261,6 +277,7 @@ void sdb_close( struct sdb_conn *conn, BOOL dispose )
+ {
+     if (!conn) return;
+     if (dispose) sdb_request( conn, SDB_SET_VM, SDB_VM_DISPOSE, NULL, 0, NULL, NULL );
++    sdb_set_event_handler( conn, NULL, NULL );
+     p_shutdown( conn->sock, 2 );
+     WaitForSingleObject( conn->reader, 5000 );
+     CloseHandle( conn->reader );
+diff --git a/dlls/mscoree/sdb.h b/dlls/mscoree/sdb.h
+index b510dde..9b2e255 100644
+--- a/dlls/mscoree/sdb.h
++++ b/dlls/mscoree/sdb.h
+@@ -19,8 +19,24 @@
+  */
+ 
+ /* Mono's soft debugger protocol: command sets and commands used here */
+-#define SDB_SET_VM       1
+-#define SDB_SET_THREAD   11
++#define SDB_SET_VM            1
++#define SDB_SET_THREAD        11
++#define SDB_SET_EVENT_REQUEST 15
++#define SDB_SET_EVENT         64
++
++#define SDB_EVENT_COMPOSITE       100
++#define SDB_EVENT_REQUEST_SET     1
++#define SDB_EVENT_REQUEST_CLEAR   2
++
++#define SDB_EVENT_KIND_BREAKPOINT 10
++#define SDB_EVENT_KIND_STEP       11
++#define SDB_SUSPEND_POLICY_ALL    2
++#define SDB_MOD_LOCATION_ONLY     7
++#define SDB_MOD_STEP              10
++#define SDB_STEP_DEPTH_INTO       0
++#define SDB_STEP_DEPTH_OVER       1
++#define SDB_STEP_DEPTH_OUT        2
++#define SDB_STEP_SIZE_MIN         0
+ 
+ #define SDB_VM_VERSION              1
+ #define SDB_VM_ALL_THREADS          2
+@@ -38,11 +54,13 @@
+ #define SDB_ERR_GONE           0xffff   /* ours: no answer, the agent or its process is gone */
+ 
+ struct sdb_conn;
++typedef void (*sdb_event_func)( void *ctx, BYTE *data, UINT32 len );
+ 
+ extern struct sdb_conn *sdb_connect( DWORD pid, HANDLE process, HANDLE abort, DWORD timeout );
+ extern UINT16 sdb_request( struct sdb_conn *conn, BYTE set, BYTE cmd, const BYTE *payload, UINT32 len,
+                            BYTE **reply, UINT32 *reply_len );
+ extern BOOL sdb_alive( struct sdb_conn *conn );
++extern void sdb_set_event_handler( struct sdb_conn *conn, sdb_event_func func, void *ctx );
+ extern void sdb_close( struct sdb_conn *conn, BOOL dispose );
+ extern UINT32 sdb_get32( const BYTE *p );
+ extern UINT64 sdb_get64( const BYTE *p );
+-- 
+2.47.3
+

@@ -18,14 +18,29 @@ static const GUID IID_ICorDebugILFrame_ = {0x03e26311, 0x4f76, 0x11d3, {0x88, 0x
 #define CORDBG_E_PROCESS_NOT_SYNCHRONIZED ((HRESULT)0x80131302)
 #define CORDBG_E_DEBUGGING_NOT_POSSIBLE ((HRESULT)0x80131346)
 
-/* the managed callback: every method answers S_OK; CreateProcess (slot 9) is counted */
-static LONG created;
+/* the managed callback: every method answers S_OK; CreateProcess (slot 9), Breakpoint (3) and StepComplete
+ * (4) are counted, the thread of the last breakpoint kept */
+static LONG created, bp_hits, steps_done;
+static Obj *bp_thread;
 static void *cb_vtbl[32];
 static Obj cb = { cb_vtbl };
 static HRESULT __stdcall cb_qi(Obj *o, const GUID *iid, void **out) { *out = o; return S_OK; }
 static ULONG __stdcall cb_ref(Obj *o) { return 1; }
 static HRESULT __stdcall cb_any(Obj *o, void *a, void *b, void *c, void *d, void *e) { return S_OK; }
 static HRESULT __stdcall cb_createprocess(Obj *o, Obj *proc) { InterlockedIncrement(&created); return S_OK; }
+static HRESULT __stdcall cb_breakpoint(Obj *o, Obj *domain, Obj *thread, Obj *bp)
+{
+    if (!bp_thread && thread) { bp_thread = thread; CALL(thread, 1, ULONG)(thread); }
+    InterlockedIncrement(&bp_hits);
+    return S_OK;
+}
+static HRESULT __stdcall cb_stepcomplete(Obj *o, Obj *domain, Obj *thread, Obj *stepper, int reason)
+{
+    InterlockedIncrement(&steps_done);
+    return S_OK;
+}
+static Obj *g_il, *g_thread, *g_callee;   /* App.Inspect's frame, thread, and the frame it called (App.Tick) */
+static unsigned int g_ip;
 
 static long counter(DWORD pid)
 {
@@ -167,6 +182,12 @@ static void inspect(Obj *proc)
                             int k;
                             CALL(il, 6, HRESULT, unsigned int *)(il, &token);
                             CALL(il, 11, HRESULT, unsigned int *, unsigned int *)(il, &ip, &map);
+                            g_ip = ip;
+                            g_il = il;
+                            CALL(il, 1, ULONG)(il);
+                            g_thread = th;
+                            CALL(th, 1, ULONG)(th);
+                            CALL(il, 9, HRESULT, Obj **)(il, &g_callee);   /* App.Tick's frame */
                             printf("Inspect.Token=%d\n", (token >> 24) == 6);
                             for (k = 0; k < 4; k++) { v = NULL; CALL(il, 14, HRESULT, DWORD, Obj **)(il, k, &v); show_value(names[k], v); }
                             v = NULL; CALL(il, 16, HRESULT, DWORD, Obj **)(il, 2, &v); show_value("label", v);
@@ -188,6 +209,73 @@ static void inspect(Obj *proc)
     }
     CALL(en, 2, ULONG)(en);
     printf("Inspect=%d\n", found);
+}
+
+static int wait_count(LONG *what, LONG want, int ms)
+{
+    for (; ms > 0 && *what < want; ms -= 50) Sleep(50);
+    return *what >= want;
+}
+
+static unsigned int active_ip(Obj *thread)
+{
+    Obj *fr = NULL, *il = NULL;
+    unsigned int ip = ~0u, map;
+    if (CALL(thread, 15, HRESULT, Obj **)(thread, &fr) == S_OK && fr)
+    {
+        if (CALL(fr, 0, HRESULT, const GUID *, void **)(fr, &IID_ICorDebugILFrame_, (void **)&il) == S_OK)
+        {
+            CALL(il, 11, HRESULT, unsigned int *, unsigned int *)(il, &ip, &map);
+            CALL(il, 2, ULONG)(il);
+        }
+        CALL(fr, 2, ULONG)(fr);
+    }
+    return ip;
+}
+
+/* stopped in App.Tick (called by App.Inspect every round): a breakpoint at Tick's first IL offset, continued,
+ * is hit (the Breakpoint callback, the program stopped); from there a step over completes at another IL
+ * offset (StepComplete); the breakpoint off, the program runs on, stopped by nothing */
+static void breakpoint_and_step(Obj *proc, DWORD pid)
+{
+    Obj *fn = NULL, *code = NULL, *bp = NULL, *st = NULL;
+    unsigned int ip1, ip2;
+    long a, b;
+    HRESULT hr;
+
+    if (!g_callee) { printf("BP=0\n"); return; }
+    hr = CALL(g_callee, 5, HRESULT, Obj **)(g_callee, &fn);
+    if (SUCCEEDED(hr)) hr = CALL(fn, 6, HRESULT, Obj **)(fn, &code);
+    if (SUCCEEDED(hr)) hr = CALL(code, 7, HRESULT, unsigned int, Obj **)(code, 0, &bp);
+    printf("BP.Create=%#x\n", HR(hr));
+    if (FAILED(hr)) return;
+    CALL(proc, 4, HRESULT, BOOL)(proc, FALSE);
+    printf("BP.Hit=%d\n", wait_count(&bp_hits, 1, 10000));
+    a = counter(pid); Sleep(1200); b = counter(pid);
+    printf("BP.Holds=%d\n", a >= 0 && a == b);
+    if (!bp_thread) return;
+    CALL(bp, 3, HRESULT, BOOL)(bp, FALSE);   /* off before stepping on */
+    ip1 = active_ip(bp_thread);
+    hr = CALL(bp_thread, 12, HRESULT, Obj **)(bp_thread, &st);
+    if (SUCCEEDED(hr)) hr = CALL(st, 7, HRESULT, BOOL)(st, FALSE);
+    printf("Step.Start=%#x\n", HR(hr));
+    CALL(proc, 4, HRESULT, BOOL)(proc, FALSE);
+    printf("Step.Done=%d\n", wait_count(&steps_done, 1, 10000));
+    ip2 = active_ip(bp_thread);
+    printf("Step.Moved=%d\n", ip1 != ~0u && ip2 != ~0u && ip1 != ip2);
+    {
+        BOOL active = TRUE;
+        hr = CALL(st, 3, HRESULT, BOOL *)(st, &active);
+        printf("Step.Ended=%d\n", hr == S_OK && !active);
+    }
+    CALL(proc, 4, HRESULT, BOOL)(proc, FALSE);
+    a = counter(pid); Sleep(1500); b = counter(pid);
+    printf("BP.Off=%d\n", b > a && bp_hits == 1 && steps_done == 1);
+    CALL(proc, 3, HRESULT, DWORD)(proc, 0);   /* stopped again, for what follows */
+    if (st) CALL(st, 2, ULONG)(st);
+    CALL(bp, 2, ULONG)(bp);
+    CALL(code, 2, ULONG)(code);
+    CALL(fn, 2, ULONG)(fn);
 }
 
 static void stopped_holds(const char *tag, DWORD pid)
@@ -227,6 +315,7 @@ int main(int argc, char **argv)
     swprintf(cmd, ARRAYSIZE(cmd), L"\"%ls\"", app);
     for (i = 0; i < 32; i++) cb_vtbl[i] = cb_any;
     cb_vtbl[0] = cb_qi; cb_vtbl[1] = cb_ref; cb_vtbl[2] = cb_ref; cb_vtbl[9] = cb_createprocess;
+    cb_vtbl[3] = cb_breakpoint; cb_vtbl[4] = cb_stepcomplete;
 
     CoInitialize(NULL);
     create = (PFN_CDI)GetProcAddress(LoadLibraryW(L"mscoree.dll"), "CreateDebuggingInterfaceFromVersion");
@@ -257,6 +346,7 @@ int main(int argc, char **argv)
     if (SUCCEEDED(hr)) { CALL(th, 4, HRESULT, DWORD *)(th, &tid); CALL(th, 2, ULONG)(th); }
     printf("Launch.GetThread=%#x %d\n", HR(hr), tid == first && tid);
     inspect(proc);
+    breakpoint_and_step(proc, pi.dwProcessId);
     printf("Launch.Continue2=%#x\n", HR(CALL(proc, 4, HRESULT, BOOL)(proc, FALSE)));
     running = FALSE;
     CALL(proc, 5, HRESULT, BOOL *)(proc, &running);

@@ -8,7 +8,9 @@
 #             managed threads (the count holds); EnumerateThreads gives them (at least two, each a thread
 #             of the debuggee, the worker background); GetThread finds one by id; a thread's chain and IL frames
 #             (7796): the frame of App.Inspect, its token, its locals (long, double, bool, string) and arguments
-#             (this, int, string) as they are, out-of-range indexes refused; Continue: running, the
+#             (this, int, string) as they are, out-of-range indexes refused; a breakpoint at the start of App.Tick
+#             (called every round) is hit (the Breakpoint callback, the program stopped), a step over from there
+#             completes at another IL offset (StepComplete), and with the breakpoint off the program runs on (7797); Continue: running, the
 #             count goes on; EnumerateThreads while running: CORDBG_E_PROCESS_NOT_SYNCHRONIZED
 #   attach    a program running its agent (dt_unix, server, not suspended): DebugActiveProcess stops it,
 #             its threads are enumerated; Detach lets it run on, alive
@@ -18,7 +20,8 @@
 # Needs Wine Mono with the dt_unix transport (SG_MONO_RUNTIME=DIR names one) and mingw. SKIP without.
 #   WINE=/opt/wine-sg/bin/wine test/cordbgsdb-gate.sh
 #   mutants: SG_MUTANT_CDB_STOP_NOOP, SG_MUTANT_CDB_THREAD_ID, SG_MUTANT_CDB_NO_AGENT, SG_MUTANT_CDB_ATTACH_RUNNING,
-#            SG_MUTANT_CDB_VALUE_ZERO, SG_MUTANT_CDB_ARG_SHIFT (mscoree cordebug.c)
+#            SG_MUTANT_CDB_VALUE_ZERO, SG_MUTANT_CDB_ARG_SHIFT, SG_MUTANT_CDB_BP_NOT_SET, SG_MUTANT_CDB_STEP_KEEPS
+#            (mscoree cordebug.c)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -80,6 +83,14 @@ expect Value.label "0xe sg-label" "argument 2: a string"
 expect Value.this "0x12 object" "argument 0: this, an object reference"
 expect Inspect.BadLocal 1 "a local that is not there: E_INVALIDARG (and the debuggee lives)"
 expect Inspect.BadArg 1 "an argument that is not there: E_INVALIDARG"
+expect BP.Create 0 "a breakpoint at App.Tick's start (ICorDebugCode::CreateBreakpoint)"
+expect BP.Hit 1 "continued, the Breakpoint callback comes (the next round)"
+expect BP.Holds 1 "the program stopped at it"
+expect Step.Start 0 "from there, a stepper's step over"
+expect Step.Done 1 "continued, StepComplete comes"
+expect Step.Moved 1 "at another IL offset"
+expect Step.Ended 1 "the stepper is done (IsActive FALSE)"
+expect BP.Off 1 "the breakpoint off, the program runs on, stopped by nothing"
 expect Launch.Continue2 0 "Continue"
 expect Launch.IsRunning 1 "running again"
 expect Launch.Runs 1 "and its threads run"
