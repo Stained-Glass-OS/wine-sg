@@ -1,0 +1,276 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] server, ntdll: a rename across two mounts of one filesystem
+ is a rename
+
+wine-sg 7814. On a converted machine the profile (C:\users\<name>) is a bind
+mount of /home/<name>, so rename() between it and the rest of C: (Program
+Files, ProgramData) or Z:\home\<name> failed with EXDEV even on one disk:
+MoveFileEx without MOVEFILE_COPY_ALLOWED failed with ERROR_NOT_SAME_DEVICE
+(Rust's fs::rename, Python's os.replace, SetFileInformationByHandle), with
+it the whole file was copied, and a folder could not move at all. On
+Windows C: is one volume and these are renames.
+
+On EXDEV the server (and a client renaming as itself, ADR 0013) now looks
+in /proc/self/mountinfo for the same pair of names within one mount: the
+source as seen through the target's mount, or the target's folder through
+the source's; same device, the very same file (real paths: names may go
+through dosdevices). The rename is made there. Another filesystem still
+gives ERROR_NOT_SAME_DEVICE, or a copy with MOVEFILE_COPY_ALLOWED.
+(include/wine/sg_mountpath.h, shared by both.)
+---
+ dlls/ntdll/unix/file.c      |  25 ++++++
+ include/Makefile.in         |   1 +
+ include/wine/sg_mountpath.h | 148 ++++++++++++++++++++++++++++++++++++
+ server/fd.c                 |  19 ++++-
+ 4 files changed, 191 insertions(+), 2 deletions(-)
+ create mode 100644 include/wine/sg_mountpath.h
+
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 69f3791..f97f7fd 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -123,6 +123,7 @@
+ #include "wine/list.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++#include "wine/sg_mountpath.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(file);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+@@ -5838,6 +5839,30 @@ static NTSTATUS sg_client_rename( HANDLE handle, HANDLE root, const char *unix_n
+     if (replace ? renameat( AT_FDCWD, src, root_fd, unix_name )
+                 : renameat2( AT_FDCWD, src, root_fd, unix_name, RENAME_NOREPLACE ))
+     {
++        if (errno == EXDEV)
++        {
++            /* two mounts of one filesystem (the profile is a bind mount of the home): the same
++             * rename, from the source's path through the target's mount (wine-sg 7814) */
++            char dst[PATH_MAX], dir[PATH_MAX], alt_src[PATH_MAX], alt_dst[PATH_MAX];
++            int ok = 1;
++
++            if (unix_name[0] == '/') ok = snprintf( dst, sizeof(dst), "%s", unix_name ) < (int)sizeof(dst);
++            else
++            {
++                char rlink[64];
++                ssize_t rlen;
++                snprintf( rlink, sizeof(rlink), "/proc/self/fd/%d", root_fd );
++                if (root_fd == AT_FDCWD) ok = getcwd( dir, sizeof(dir) ) != NULL;
++                else if ((rlen = readlink( rlink, dir, sizeof(dir) - 1 )) > 0) dir[rlen] = 0;
++                else ok = 0;
++                if (ok) ok = snprintf( dst, sizeof(dst), "%s/%s", dir, unix_name ) < (int)sizeof(dst);
++            }
++            if (ok && sg_rename_paths_via_mount( src, dst, alt_src, alt_dst ) &&
++                !(replace ? renameat( AT_FDCWD, alt_src, AT_FDCWD, alt_dst )
++                          : renameat2( AT_FDCWD, alt_src, AT_FDCWD, alt_dst, RENAME_NOREPLACE )))
++                goto renamed;
++            errno = EXDEV;
++        }
+         if (!replace && errno == EINVAL)  /* no RENAME_NOREPLACE on this filesystem */
+         {
+             struct stat target;
+diff --git a/include/Makefile.in b/include/Makefile.in
+index c85d14d..d6cb8ab 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -978,6 +978,7 @@ SOURCES = \
+ 	wine/sgnetctl.h \
+ 	wine/sg_accent.h \
+ 	wine/sg_drag.h \
++	wine/sg_mountpath.h \
+ 	wine/sg_smooth.h \
+ 	wine/sgshellnew.h \
+ 	wine/strmbase.h \
+diff --git a/include/wine/sg_mountpath.h b/include/wine/sg_mountpath.h
+new file mode 100644
+index 0000000..2409ed6
+--- /dev/null
++++ b/include/wine/sg_mountpath.h
+@@ -0,0 +1,148 @@
++/*
++ * Stained Glass OS (wine-sg 7814): a rename across two mounts of one filesystem
++ *
++ * A user's profile (C:\users\<name>) is a bind mount of their home, so rename() between it and the rest
++ * of drive C: (Program Files, ProgramData, the Windows folder) or Z:\home\<name> fails with EXDEV even
++ * where both are the same filesystem: the kernel refuses renames between vfsmounts. On Windows all of
++ * C: is one volume and the move is a rename. sg_rename_path_via_mount() finds, from /proc/self/mountinfo,
++ * the source's path as seen through the target's mount (same device, the source inside what that mount
++ * shows), checks it is the same file, and returns it, for the caller to rename from.
++ *
++ * This library is free software; you can redistribute it and/or modify it under the terms of the GNU
++ * Lesser General Public License as published by the Free Software Foundation; either version 2.1 of the
++ * License, or (at your option) any later version.
++ */
++
++#ifndef __WINE_SG_MOUNTPATH_H
++#define __WINE_SG_MOUNTPATH_H
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <limits.h>
++#include <sys/stat.h>
++
++struct sg_mount { char point[PATH_MAX]; char root[PATH_MAX]; unsigned int major, minor; };
++
++/* mountinfo writes space, tab, newline and backslash as \ooo */
++static inline void sg_mount_unescape( char *s )
++{
++    char *d = s;
++    while (*s)
++    {
++        if (s[0] == '\\' && s[1] >= '0' && s[1] <= '3' && s[2] >= '0' && s[2] <= '7' && s[3] >= '0' && s[3] <= '7')
++        {
++            *d++ = (char)((s[1] - '0') * 64 + (s[2] - '0') * 8 + (s[3] - '0'));
++            s += 4;
++        }
++        else *d++ = *s++;
++    }
++    *d = 0;
++}
++
++static inline int sg_path_under( const char *path, const char *dir )
++{
++    size_t len = strlen( dir );
++    if (len == 1 && dir[0] == '/') return path[0] == '/';
++    return !strncmp( path, dir, len ) && (path[len] == '/' || !path[len]);
++}
++
++/* the mount a path is in: the last listed among the longest mount points it is under */
++static inline int sg_find_mount( const char *path, struct sg_mount *ret )
++{
++    char line[3 * PATH_MAX], root[PATH_MAX], point[PATH_MAX];
++    unsigned int major, minor;
++    size_t best = 0;
++    int found = 0;
++    FILE *f;
++
++    if (!(f = fopen( "/proc/self/mountinfo", "r" ))) return 0;
++    while (fgets( line, sizeof(line), f ))
++    {
++        /* id parent major:minor root mountpoint ... */
++        if (sscanf( line, "%*u %*u %u:%u %4095s %4095s", &major, &minor, root, point ) != 4) continue;
++        sg_mount_unescape( root );
++        sg_mount_unescape( point );
++        if (!sg_path_under( path, point ) || strlen( point ) < best) continue;
++        best = strlen( point );
++        strcpy( ret->point, point );
++        strcpy( ret->root, root );
++        ret->major = major;
++        ret->minor = minor;
++        found = 1;
++    }
++    fclose( f );
++    return found;
++}
++
++/* path (absolute) as seen through the mount that holds dir (absolute), in buf; 0 if the two are on
++ * different filesystems, in the same mount already, or path is not visible through that mount */
++static inline int sg_path_via_mount( const char *path, const char *dir, char *buf, size_t size )
++{
++    struct sg_mount mp, md;
++    char under[PATH_MAX];
++    const char *rel;
++    int n;
++
++    if (!sg_find_mount( path, &mp ) || !sg_find_mount( dir, &md )) return 0;
++    if (mp.major != md.major || mp.minor != md.minor) return 0;    /* another filesystem */
++    if (!strcmp( mp.point, md.point )) return 0;                   /* the same mount */
++    /* the path in the filesystem itself, then through the other mount */
++    rel = path + (strcmp( mp.point, "/" ) ? strlen( mp.point ) : 0);
++    n = snprintf( under, sizeof(under), "%s%s", strcmp( mp.root, "/" ) ? mp.root : "", rel );
++    if (n <= 0 || n >= (int)sizeof(under)) return 0;
++    if (!sg_path_under( under, md.root )) return 0;
++    rel = under + (strcmp( md.root, "/" ) ? strlen( md.root ) : 0);
++    n = snprintf( buf, size, "%s%s", strcmp( md.point, "/" ) ? md.point : "", rel );
++    return n > 0 && n < (int)size;
++}
++
++/* for a rename of src to dst (absolute paths) refused with EXDEV: the same pair of names within one
++ * mount, either the source through the target's mount or the target's folder through the source's,
++ * in alt_src and alt_dst (PATH_MAX each); 0 if there is none (another filesystem: only a copy moves it) */
++static inline int sg_rename_paths_via_mount( const char *src, const char *dst, char *alt_src, char *alt_dst )
++{
++    char dir[PATH_MAX], alt_dir[PATH_MAX];
++    const char *slash = strrchr( dst, '/' );
++    struct stat st1, st2;
++
++#ifdef SG_MUTANT_RENAME_NO_MOUNT_PATH
++    return 0;
++#endif
++    char rsrc[PATH_MAX], rdir[PATH_MAX];
++
++    if (!slash || src[0] != '/' || dst[0] != '/') return 0;
++    snprintf( dir, sizeof(dir), "%.*s", slash == dst ? 1 : (int)(slash - dst), dst );
++    /* (names may go through symbolic links, dosdevices\c: for one: the mounts are listed by real paths) */
++    if (!realpath( dir, rdir )) return 0;
++    strcpy( dir, rdir );
++    {
++        /* the source's folder, not the source: a symbolic link is renamed as itself */
++        const char *sslash = strrchr( src, '/' );
++        char sdir[PATH_MAX], rsdir[PATH_MAX];
++        snprintf( sdir, sizeof(sdir), "%.*s", sslash == src ? 1 : (int)(sslash - src), src );
++        if (!realpath( sdir, rsdir )) return 0;
++        if (snprintf( rsrc, sizeof(rsrc), "%s%s", strcmp( rsdir, "/" ) ? rsdir : "", sslash ) >= (int)sizeof(rsrc))
++            return 0;
++        src = rsrc;
++    }
++    if (sg_path_via_mount( src, dir, alt_src, PATH_MAX ))
++    {
++        /* (it must be the very same file, not one hidden under another mount) */
++        if (lstat( src, &st1 ) || lstat( alt_src, &st2 ) || st1.st_dev != st2.st_dev || st1.st_ino != st2.st_ino)
++            return 0;
++        snprintf( alt_dst, PATH_MAX, "%s", dst );
++        return 1;
++    }
++    if (sg_path_via_mount( dir, src, alt_dir, sizeof(alt_dir) ))
++    {
++        if (stat( dir, &st1 ) || stat( alt_dir, &st2 ) || st1.st_dev != st2.st_dev || st1.st_ino != st2.st_ino)
++            return 0;
++        if (snprintf( alt_dst, PATH_MAX, "%s%s", strcmp( alt_dir, "/" ) ? alt_dir : "", slash ) >= PATH_MAX) return 0;
++        snprintf( alt_src, PATH_MAX, "%s", src );
++        return 1;
++    }
++    return 0;
++}
++
++#endif /* __WINE_SG_MOUNTPATH_H */
+diff --git a/server/fd.c b/server/fd.c
+index 83f647a..d95aa2b 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -99,6 +99,7 @@
+ #include "winioctl.h"
+ #include "security.h"
+ #include "ddk/wdm.h"
++#include "wine/sg_mountpath.h"
+ 
+ #if defined(HAVE_SYS_EPOLL_H) && defined(HAVE_EPOLL_CREATE)
+ # include <sys/epoll.h>
+@@ -3135,8 +3136,22 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
+ 
+     if (rename( fd->unix_name, name ))
+     {
+-        file_set_error();
+-        goto failed;
++        /* two mounts of one filesystem (the profile is a bind mount of the home): the same rename,
++         * from the source's path through the target's mount (wine-sg 7814) */
++        char alt_src[PATH_MAX], alt_dst[PATH_MAX];
++        int renamed = 0;
++
++        if (errno == EXDEV)
++        {
++            if (sg_rename_paths_via_mount( fd->unix_name, name, alt_src, alt_dst ) && !rename( alt_src, alt_dst ))
++                renamed = 1;
++            else errno = EXDEV;
++        }
++        if (!renamed)
++        {
++            file_set_error();
++            goto failed;
++        }
+     }
+ 
+     if (is_file_executable( fd->unix_name ) != is_file_executable( name ) && !fstat( fd->unix_fd, &st ))
+-- 
+2.47.3
+
