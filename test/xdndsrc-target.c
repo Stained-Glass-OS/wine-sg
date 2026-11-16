@@ -14,6 +14,7 @@
  * DATA type, DELETE, FINISHED action; LOG.data the dropped data. */
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/cursorfont.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,6 +95,7 @@ int main( int argc, char **argv )
                          atoi( argv[5] ), 0, CopyFromParent, InputOutput, CopyFromParent,
                          CWOverrideRedirect | CWBackPixel | CWEventMask, &attr );
     XStoreName( dpy, win, "sg-xdnd-native" );
+    XDefineCursor( dpy, win, XCreateFontCursor( dpy, XC_pirate ) );  /* its own cursor, unlike any drag's */
     XChangeProperty( dpy, win, A("XdndAware"), XA_ATOM, 32, PropModeReplace, (unsigned char *)&(long){5}, 1 );
     if (argc > 6)
     {

@@ -20,6 +20,9 @@
 #                 converted DELETE gets the move
 #   refuse        a program that does not accept: XdndLeave, effect none
 #   text          CF_UNICODETEXT arrives as text/plain;charset=utf-8, UTF-8
+#   cursor        over the native window the pointer shows the drag's cursor (copy,
+#                 no drop), not the window's own: X shows the cursor of the press's
+#                 automatic grab, Wine's window, outside it
 #   Wine to Wine  a drag onto another Wine process's window goes through OLE
 #                 (a private format comes along), also after passing over the
 #                 native window, which then got XdndLeave
@@ -38,6 +41,7 @@ RC=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
 command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW not installed"; exit 77; }
+[ -f /usr/include/X11/extensions/Xfixes.h ] || { echo "SKIP: needs libxfixes-dev"; exit 77; }
 for t in Xvfb xdotool gcc python3; do command -v $t >/dev/null || { echo "SKIP: needs $t"; exit 77; }; done
 [ -f /usr/include/X11/Xlib.h ] || { echo "SKIP: needs libx11-dev"; exit 77; }
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
@@ -58,6 +62,7 @@ trap cleanup EXIT INT TERM
 "$MINGW" -municode -mwindows -O2 -o "$T/xdndsrc-probe.exe" "$HERE/xdndsrc-probe.c" -lole32 -luuid -lshell32 -lgdi32 \
     || { echo "FAIL  probe did not build"; exit 1; }
 gcc -O2 -o "$T/xdndsrc-target" "$HERE/xdndsrc-target.c" -lX11 || { echo "FAIL  target did not build"; exit 1; }
+gcc -O2 -o "$T/cursor" "$HERE/xdndsrc-cursor.c" -lX11 -lXfixes || { echo "FAIL  cursor tool did not build"; exit 1; }
 
 Xvfb "$DISP" -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 &
 XVFB=$!
@@ -124,7 +129,8 @@ drag() {
     fi
     xdotool mousemove "$ex" "$ey"; sleep 0.4
     xdotool mousemove $(( ex + 3 )) $(( ey + 2 )); sleep 0.6
-    if [ "${1:-}" = esc ]; then
+    case "${1:-}" in sample*) SAMPLE=$("$T/cursor") ;; esac
+    if [ "${1:-}" = esc ] || [ "${1:-}" = sampleesc ]; then
         # the keyboard goes to the X focus: the source's window (with no window
         # manager it might still be PointerRoot, the native window under the pointer)
         xdotool windowfocus "$SRCWIN"; sleep 0.3
@@ -224,6 +230,22 @@ if [ "$(count "$BLOG" WINEDROP)" = 2 ] && tail -1 "$BLOG" | grep -q '^WINEDROP o
    && [ "$(count "$N1" DROP)" = "$D1" ] && echo "$LAST" | grep -q 'effect=1$'; then
     pass "native then Wine: XdndLeave, OLE drop on the Wine window ($LAST)"
 else fail "native then Wine: $LAST / $(tail -2 "$BLOG" | tr '\n' ' ') / leaves $L1->$(count "$N1" LEAVE)"; fi
+
+# 10. the drag's cursor over the native window is the drag's own, as Wine
+# shows it over its windows: the copy cursor where the program accepts (as over
+# the Wine drop target), the no-drop one where it refuses (as over a Wine
+# window that takes no drops) -- not the native window's cursor or a stale one
+xdotool mousemove 550 175; sleep 0.5; OWN=$("$T/cursor")
+drag "$ALOG" 120 120 800 150 sampleesc; WCOPY=$SAMPLE
+drag "$ALOG" 120 120 120 400 sampleesc; WNONE=$SAMPLE
+echo copy > "$N1.mode"
+drag "$ALOG" 120 120 550 175 sample; ACC=$SAMPLE
+echo refuse > "$N1.mode"
+drag "$ALOG" 120 120 550 175 sample; REF=$SAMPLE
+echo copy > "$N1.mode"
+if [ "$ACC" = "$WCOPY" ] && [ "$REF" = "$WNONE" ] && [ "$ACC" != "$OWN" ] && [ "$WCOPY" != "$WNONE" ]; then
+    pass "the drag's cursor over the native window: copy where it accepts ($ACC), no drop where it refuses ($REF)"
+else fail "drag cursor over the native window: accepting $ACC (want $WCOPY), refusing $REF (want $WNONE), its own $OWN"; fi
 
 [ "$RC" = 0 ] && echo "xdndsrc: all checks passed"
 exit $RC
