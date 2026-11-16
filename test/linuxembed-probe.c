@@ -2,6 +2,8 @@
  *   activate CLASS TITLE      SetForegroundWindow (restored first)
  *   move CLASS TITLE X Y W H  SetWindowPos
  *   wmclose CLASS TITLE       SendMessage WM_CLOSE (End task, the close button)
+ *   post CLASS TITLE MSG WP   PostMessage MSG (embedmenu-gate: winex11's own
+ *                             WM_X11DRV_SG_EMBED_ACTIVATE, a click's, late)
  *   endtask CLASS TITLE       SendMessage SgLinuxWindowEnd (Task Manager's End
  *                             task when the program did not close)
  *   exists CLASS TITLE        exists=0|1
@@ -103,6 +105,8 @@ int main( int argc, char **argv )
     else if (!strcmp( argv[1], "restore" )) ShowWindow( hwnd, SW_RESTORE );
     else if (!strcmp( argv[1], "minimize" )) ShowWindow( hwnd, SW_MINIMIZE );
     else if (!strcmp( argv[1], "wmclose" )) SendMessageW( hwnd, WM_CLOSE, 0, 0 );
+    else if (!strcmp( argv[1], "post" ) && argc == 6)   /* post CLASS TITLE MSG WPARAM (numbers: 0x... or decimal) */
+        PostMessageW( hwnd, strtoul( argv[4], NULL, 0 ), strtoul( argv[5], NULL, 0 ), 0 );
     else if (!strcmp( argv[1], "endtask" )) SendMessageW( hwnd, RegisterWindowMessageW( L"SgLinuxWindowEnd" ), 0, 0 );
     else if (!strcmp( argv[1], "rect" ))
     {
