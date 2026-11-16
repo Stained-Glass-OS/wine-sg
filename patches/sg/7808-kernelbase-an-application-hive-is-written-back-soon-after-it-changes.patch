@@ -1,0 +1,193 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: kernelbase: an application hive is written back soon after it changes, and at exit
+
+Visual Studio 2022 keeps its private registry (privateregistry.bin, loaded
+with RegLoadAppKey) open for its whole life, and its VsRegEdit sets a value
+and exits with the hive still open. Our application hives were written only
+when the hive's root handle was closed, so nothing either of them set was
+ever kept: the file stayed empty, every start rebuilt the configuration, and
+the documented first-launch switch (VsRegEdit set ... HKLM Profile
+DisableFirstLaunchDialog dword 1) was lost.
+
+As Windows' lazy writer does, a changed hive is now written about a second
+after the change (a subtree change notification on the hive's root, waited
+on in the thread pool), and every changed hive is written at a normal process
+exit. A hive is written to FILE.sgsave and renamed over FILE, so a process
+killed while saving leaves the last whole copy.
+
+Gate: test-apphive (exit with the hive open; killed seconds after a change;
+whole file; no temporary left). Mutants SG_MUTANT_APPHIVE_NO_EXIT_SAVE,
+SG_MUTANT_APPHIVE_NO_LAZY_SAVE.
+
+--- a/dlls/kernelbase/kernelbase.h
++++ b/dlls/kernelbase/kernelbase.h
+@@ -37,6 +37,7 @@
+ extern void init_startup_info( RTL_USER_PROCESS_PARAMETERS *params );
+ extern void init_locale( HMODULE module );
+ extern void init_console(void);
++extern void app_hives_process_exit(void);
+ extern BOOL alloc_shell_console(void);
+ extern DWORD sg_admin_request( const WCHAR *verb, const WCHAR *arg );
+ 
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -51,6 +51,7 @@
+         init_startup_info( NtCurrentTeb()->Peb->ProcessParameters );
+         init_console();
+     }
++    else if (reason == DLL_PROCESS_DETACH && reserved) app_hives_process_exit();
+     return TRUE;
+ }
+ 
+--- a/dlls/kernelbase/registry.c
++++ b/dlls/kernelbase/registry.c
+@@ -2154,22 +2154,113 @@
+     UNICODE_STRING name;
+     UNICODE_STRING file;
+     BOOL writeback;
++    HANDLE changed;      /* signalled by a change anywhere in the hive */
++    TP_WAIT *wait;       /* writes the hive back after a change */
++    IO_STATUS_BLOCK notify_io;
++    BOOL closing;
+ };
+ static struct list app_hives = LIST_INIT( app_hives );
++static CRITICAL_SECTION app_hive_save_cs;
++static CRITICAL_SECTION_DEBUG app_hive_save_cs_debug =
++{
++    0, 0, &app_hive_save_cs,
++    { &app_hive_save_cs_debug.ProcessLocksList, &app_hive_save_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": app_hive_save_cs") }
++};
++static CRITICAL_SECTION app_hive_save_cs = { &app_hive_save_cs_debug, -1, 0, 0, 0, 0 };
++static BOOL exiting;
+ 
++/* the hive is written to FILE.sgsave and renamed over FILE, so a process
++ * killed while saving leaves the last whole copy */
+ static void save_app_hive( HKEY key, const UNICODE_STRING *file )
+ {
++    static const WCHAR suffix[] = L".sgsave";
++    FILE_RENAME_INFORMATION *rename;
++    UNICODE_STRING tmp;
+     OBJECT_ATTRIBUTES attr;
+     IO_STATUS_BLOCK io;
+     HANDLE handle;
++    ULONG size;
+ 
+-    InitializeObjectAttributes( &attr, (UNICODE_STRING *)file, OBJ_CASE_INSENSITIVE, 0, NULL );
+-    if (NtCreateFile( &handle, GENERIC_WRITE | SYNCHRONIZE, &attr, &io, NULL, FILE_ATTRIBUTE_NORMAL,
+-                      FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OVERWRITE_IF,
+-                      FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 ))
+-        return;
+-    NtSaveKey( key, handle );
+-    NtClose( handle );
++    tmp.MaximumLength = file->Length + sizeof(suffix);
++    if (!(tmp.Buffer = heap_alloc( tmp.MaximumLength ))) return;
++    memcpy( tmp.Buffer, file->Buffer, file->Length );
++    memcpy( tmp.Buffer + file->Length / sizeof(WCHAR), suffix, sizeof(suffix) );
++    tmp.Length = tmp.MaximumLength - sizeof(WCHAR);
++
++    if (exiting)
++    {
++        /* a thread killed at exit may hold the lock */
++        if (!RtlTryEnterCriticalSection( &app_hive_save_cs )) { heap_free( tmp.Buffer ); return; }
++    }
++    else RtlEnterCriticalSection( &app_hive_save_cs );
++    InitializeObjectAttributes( &attr, &tmp, OBJ_CASE_INSENSITIVE, 0, NULL );
++    if (!NtCreateFile( &handle, GENERIC_WRITE | DELETE | SYNCHRONIZE, &attr, &io, NULL, FILE_ATTRIBUTE_NORMAL,
++                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OVERWRITE_IF,
++                       FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 ))
++    {
++        size = offsetof( FILE_RENAME_INFORMATION, FileName[file->Length / sizeof(WCHAR)] );
++        if (!NtSaveKey( key, handle ) && (rename = heap_alloc( size )))
++        {
++            rename->ReplaceIfExists = TRUE;
++            rename->RootDirectory = NULL;
++            rename->FileNameLength = file->Length;
++            memcpy( rename->FileName, file->Buffer, file->Length );
++            NtSetInformationFile( handle, &io, rename, size, FileRenameInformation );
++            heap_free( rename );
++        }
++        else
++        {
++            FILE_DISPOSITION_INFORMATION dispo = { TRUE };
++            NtSetInformationFile( handle, &io, &dispo, sizeof(dispo), FileDispositionInformation );
++        }
++        NtClose( handle );
++    }
++    RtlLeaveCriticalSection( &app_hive_save_cs );
++    heap_free( tmp.Buffer );
++}
++
++/* Stained Glass OS: the hive is written back soon after it changes, as
++ * Windows' lazy writer does, not only when its handle is closed: Visual
++ * Studio keeps its private registry open for its whole life, and what it and
++ * VsRegEdit (which exits without closing it) set was lost, so its first-launch
++ * window came back every time. */
++static void watch_app_hive( struct app_hive *hive )
++{
++#ifndef SG_MUTANT_APPHIVE_NO_LAZY_SAVE
++    NtNotifyChangeKey( hive->key, hive->changed, NULL, NULL, &hive->notify_io,
++                       REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, TRUE, NULL, 0, TRUE );
++    TpSetWait( hive->wait, hive->changed, NULL );
++#endif
++}
++
++static void CALLBACK app_hive_changed( TP_CALLBACK_INSTANCE *instance, void *context, TP_WAIT *wait, TP_WAIT_RESULT result )
++{
++    struct app_hive *hive = context;
++    LARGE_INTEGER delay;
++
++    delay.QuadPart = -10000 * 1000;   /* a burst of changes is written once */
++    NtDelayExecution( FALSE, &delay );
++    RtlEnterCriticalSection( &app_hive_save_cs );
++    if (!hive->closing) watch_app_hive( hive );
++    RtlLeaveCriticalSection( &app_hive_save_cs );
++    if (!hive->closing) save_app_hive( hive->key, &hive->file );
++}
++
++/* at a normal exit, every changed hive is written (VsRegEdit sets a value and
++ * exits with the hive open) */
++void app_hives_process_exit(void)
++{
++    struct app_hive *hive;
++
++    exiting = TRUE;
++#ifdef SG_MUTANT_APPHIVE_NO_EXIT_SAVE
++    return;
++#endif
++    if (list_empty( &app_hives ) || !RtlTryEnterCriticalSection( &classes_cs )) return;
++    LIST_FOR_EACH_ENTRY( hive, &app_hives, struct app_hive, entry )
++        if (hive->writeback) save_app_hive( hive->key, &hive->file );
++    RtlLeaveCriticalSection( &classes_cs );
+ }
+ 
+ /* the app hive whose root handle is key, removed from the table if take */
+@@ -2202,6 +2293,16 @@
+     OBJECT_ATTRIBUTES attr;
+ 
+     if (!hive) return;
++    if (hive->wait)
++    {
++        RtlEnterCriticalSection( &app_hive_save_cs );
++        hive->closing = TRUE;
++        RtlLeaveCriticalSection( &app_hive_save_cs );
++        TpSetWait( hive->wait, NULL, NULL );
++        TpWaitForWait( hive->wait, TRUE );
++        TpReleaseWait( hive->wait );
++    }
++    if (hive->changed) NtClose( hive->changed );
+ #ifndef SG_MUTANT_APPHIVE_NO_SAVE
+     if (hive->writeback) save_app_hive( key, &hive->file );
+ #endif
+@@ -4523,6 +4624,11 @@
+     RtlEnterCriticalSection( &classes_cs );
+     list_add_tail( &app_hives, &hive->entry );
+     RtlLeaveCriticalSection( &classes_cs );
++    if (hive->writeback && !NtCreateEvent( &hive->changed, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE ))
++    {
++        if (!TpAllocWait( &hive->wait, app_hive_changed, hive, NULL )) watch_app_hive( hive );
++        else { NtClose( hive->changed ); hive->changed = NULL; }
++    }
+     *result = key;
+     return ERROR_SUCCESS;
+ }
