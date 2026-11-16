@@ -62,7 +62,10 @@ if [ -z "$NEED_SEM" ] && command -v gcc >/dev/null && gcc -o "$T/native" "$HERE/
     NEED_SEM=1
     echo "NOTE  the host's driver shares timeline semaphores as fds: the semaphore checks are required"
 fi
-if grep -q 'RESULT:' "$T/probegpu.out"; then
+if grep -q '^FAIL  no Vulkan instance' "$T/probegpu.out" && [ -z "$NEED_SEM" ]; then
+    # the host's own driver has no instance on Xvfb (NVIDIA's needs its own X server)
+    echo "NOTE  the host's drivers give no Vulkan instance on this display: the GPU pass was skipped"
+elif grep -q 'RESULT:' "$T/probegpu.out"; then
     sed 's/^/  [gpu] /' "$T/probegpu.out"
     grep -qx 'RESULT: PASS' "$T/probegpu.out" || RC=1
     if grep -q '^SKIP  VK_KHR_external_semaphore_win32' "$T/probegpu.out"; then

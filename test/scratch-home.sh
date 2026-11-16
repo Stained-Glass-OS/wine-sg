@@ -35,6 +35,15 @@ if [ -z "${SG_GATE_HOME:-}" ]; then
     export XDG_RUNTIME_DIR
     unset WAYLAND_DISPLAY DISPLAY
 fi
+# Vulkan on a gate's own display (Xvfb) is lavapipe's: the host's GPU driver
+# may have no instance there -- NVIDIA's needs its own X server -- and the
+# loader took it first: every Vulkan gate skipped on a host with NVIDIA's
+# driver (2026-11-15). A gate that wants the host's driver unsets both.
+if [ -z "${VK_ICD_FILENAMES:-}${VK_DRIVER_FILES:-}" ]; then
+    for _sg_lvp in /usr/share/vulkan/icd.d/lvp_icd*.json; do
+        [ -f "$_sg_lvp" ] && export VK_ICD_FILENAMES="$_sg_lvp" VK_DRIVER_FILES="$_sg_lvp" && break
+    done
+fi
 # sg_prefix_safe PREFIX: fail when any folder of PREFIX's user profiles
 # resolves outside the prefix and the gate's HOME (an old prefix made on the
 # real HOME). Gates that reuse a prefix call it before starting Wine.
