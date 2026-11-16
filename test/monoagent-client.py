@@ -1,30 +1,42 @@
 #!/usr/bin/env python3
-# The debugger side of test/monoagent-gate.sh: speaks Mono's soft debugger protocol (SDB) to the agent at
-# 127.0.0.1:PORT -- handshake, VM VERSION, VM ALL_THREADS, VM RESUME -- and prints KEY=VALUE lines.
+# The debugger side of test/monoagent-gate.sh: speaks Mono's soft debugger protocol (SDB) to the agent on
+# its Unix socket PATH (dt_unix, wine-sg 7791) -- handshake, VM VERSION, VM ALL_THREADS, VM RESUME -- and
+# prints KEY=VALUE lines. "probe" as a second argument stops after the handshake (another user's try).
 # SPDX-License-Identifier: LGPL-2.1-or-later
 import socket, struct, sys, time
 
-port = int(sys.argv[1])
+path = sys.argv[1]
+probe = len(sys.argv) > 2 and sys.argv[2] == 'probe'
 s = None
-for _ in range(100):
+for _ in range(1 if probe else 100):
     try:
-        s = socket.create_connection(('127.0.0.1', port), timeout=2)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(path)
         break
-    except OSError:
+    except OSError as e:
+        s = None
+        if probe:
+            print('Error=%s' % e.__class__.__name__)
         time.sleep(0.2)
 if not s:
     print('Connect=0')
     sys.exit(0)
 print('Connect=1')
-s.settimeout(30)
-s.sendall(b'DWP-Handshake')
+s.settimeout(5 if probe else 30)
 hs = b''
-while len(hs) < 13:
-    chunk = s.recv(13 - len(hs))
-    if not chunk:
-        break
-    hs += chunk
+try:
+    s.sendall(b'DWP-Handshake')
+    while len(hs) < 13:
+        chunk = s.recv(13 - len(hs))
+        if not chunk:
+            break
+        hs += chunk
+except OSError:
+    pass
 print('Handshake=%d' % (hs == b'DWP-Handshake'))
+if probe:
+    sys.exit(0)
 
 def recv_exact(n):
     data = b''
