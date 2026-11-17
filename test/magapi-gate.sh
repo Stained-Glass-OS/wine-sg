@@ -12,6 +12,9 @@
 #   - with no compositor the calls fail (Magnifier then draws its views itself) and nothing hangs
 #   - the compositor is given physical pixels: at 200% (LogPixels 192) a DPI-unaware caller's offsets
 #     are doubled, a per-monitor aware caller's kept; less the virtual screen's top left (7846)
+#   - a magnifier control ("Magnifier" class, MagSetWindowSource/Transform, 7847): the compositor is
+#     told its source and where it is (window ID 10 20 150 100 -> 100 100 300 200 at 200%), what of it
+#     is not covered when a window comes over half of it, its inverted colours, and that it is gone
 #   WINE=/opt/wine-sg/bin/wine test/magapi-gate.sh   (mutants SG_MUTANT_MAG_KEEP_CONNECTION, unixlib.c;
 #   SG_MUTANT_MAG_LOGICAL_COORDS, magnification.c)
 set -u
@@ -25,12 +28,13 @@ fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
 command -v python3 >/dev/null || { echo "SKIP: python3 missing"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-magapi.XXXXXX)
 SP=
-cleanup() { [ -n "$SP" ] && kill "$SP" 2>/dev/null; "$WINESERVER" -k 2>/dev/null; rm -rf "$T" 2>/dev/null; }
+cleanup() { [ -n "${XP:-}" ] && kill "$XP" 2>/dev/null; [ -n "$SP" ] && kill "$SP" 2>/dev/null; "$WINESERVER" -k 2>/dev/null; rm -rf "$T" 2>/dev/null; }
 trap cleanup EXIT INT TERM
 ARCHES=
 for a in x86_64 i686; do
     command -v "$a-w64-mingw32-gcc" >/dev/null || continue
     TMPDIR=/var/tmp "$a-w64-mingw32-gcc" -O1 -o "$T/probe-$a.exe" "$HERE/magapi-probe.c" || { fail "the $a probe did not build"; continue; }
+    TMPDIR=/var/tmp "$a-w64-mingw32-gcc" -O1 -o "$T/ctl-$a.exe" "$HERE/magctl-probe.c" || { fail "the $a control probe did not build"; continue; }
     ARCHES="$ARCHES $a"
 done
 [ -n "$ARCHES" ] || { echo "SKIP: no mingw"; exit 77; }
@@ -95,6 +99,35 @@ took=$(( $(date +%s) - start ))
 printf '%s\n' "$out" | grep -qx "set 0" && printf '%s\n' "$out" | grep -qx "lens 0" && printf '%s\n' "$out" | grep -qx done \
     && pass "with no compositor the calls fail (Magnifier draws its views itself), in ${took} s" \
     || fail "with no compositor: $(printf '%s' "$out" | tr '\n' ' ')"
+# the magnifier control (windows: a display of its own)
+XP=
+if command -v Xvfb >/dev/null; then
+    Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp 3>"$T/display" >/dev/null 2>&1 & XP=$!
+    i=0; while [ ! -s "$T/display" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+fi
+[ -s "$T/display" ] || { echo "SKIP: no Xvfb for the magnifier control"; ARCHES_CTL=; }
+CDISPLAY=":$(cat "$T/display" 2>/dev/null)"
+# the desktop the earlier runs made has no display: a new one with it
+"$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null
+for a in ${ARCHES_CTL-$ARCHES}; do
+    : > "$T/comp.log"
+    out=$(DISPLAY="$CDISPLAY" SG_LOCK_CONTROL="$T/ctl.sock" timeout -s KILL 60 "$WINE" "$T/ctl-$a.exe" 2>/dev/null | tr -d '\r')
+    sleep 0.5
+    printf '%s\n' "$out" | sed "s/^/      $a: /"; sed "s/^/      $a compositor: /" "$T/comp.log"
+    id=$(printf '%s\n' "$out" | awk '/^id / {print $2}')
+    printf '%s\n' "$out" | grep -qx "getsource 10 20 160 120" && printf '%s\n' "$out" | grep -qx done \
+        && pass "$a: the control takes its source and reads it back" || fail "$a: the control probe: $(printf '%s' "$out" | tr '\n' ' ')"
+    grep -qx "LINE window $id 10 20 150.000 100.000 100 100 300 200 0 100 100 300 200" "$T/comp.log" \
+        && pass "$a: the compositor shows 10,20 150x100 at 200% in the control at 100,100 300x200" \
+        || fail "$a: the control's view was not told as it should be"
+    grep -qx "LINE window $id 10 20 150.000 100.000 100 100 300 200 0 100 100 150 200" "$T/comp.log" \
+        && pass "$a: a window over its right half: only its left half is shown" || fail "$a: the covered part was not left out"
+    grep -q "^LINE window $id 10 20 150.000 100.000 100 100 300 200 1 " "$T/comp.log" \
+        && pass "$a: MagSetColorEffect (inverting): the control's view is inverted" || fail "$a: the inverted control was not told"
+    grep -qx "LINE window $id off" "$T/comp.log" && pass "$a: the control destroyed: its view goes" || fail "$a: its view was not ended"
+done
+"$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null
+
 # 200%: a DPI-unaware program's screen point is the physical one halved
 "$WINE" reg add 'HKCU\Control Panel\Desktop' /v LogPixels /t REG_DWORD /d 192 /f >/dev/null 2>&1
 "$WINESERVER" -w

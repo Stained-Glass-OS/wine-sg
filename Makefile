@@ -1291,7 +1291,8 @@ test-startverb:
 	WINE=$(PREFIX)/bin/wine test/startverb-gate.sh
 
 # The Magnification API on the session's compositor: one MAGNIFY connection, what to show a
-# line each, ended by MagUninitialize (7845).
+# line each, ended by MagUninitialize (7845); offsets in physical pixels (7846); the magnifier
+# control (7847).
 test-magapi:
 	WINE=$(PREFIX)/bin/wine test/magapi-gate.sh
 
