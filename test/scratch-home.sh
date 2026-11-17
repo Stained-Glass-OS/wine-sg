@@ -85,3 +85,12 @@ sg_wineserver() {
     _sg_wd=$(dirname "${WINE:-/opt/wine-sg/bin/wine}")
     if [ -x "$_sg_wd/wineserver" ]; then echo "$_sg_wd/wineserver"; else echo "$_sg_wd/server/wineserver"; fi
 }
+# Wine's link to the compositor's control socket (wtsapi32's session state,
+# magnification.dll's Magnifier) goes to SG_LOCK_CONTROL, else the session's
+# own socket under /run/stained-glass-seat -- the person's live compositor: a
+# gate's Magnifier would magnify their screen. A gate reaches only a compositor
+# of its own (it sets SG_LOCK_CONTROL after this, to its socket).
+case "${SG_LOCK_CONTROL:-}" in
+"$SG_GATE_HOME"/*|/var/tmp/*|/tmp/*) ;;
+*) export SG_LOCK_CONTROL="$SG_GATE_HOME/no-compositor-control.sock" ;;
+esac
