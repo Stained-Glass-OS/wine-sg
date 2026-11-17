@@ -70,6 +70,13 @@ if command -v "$MINGW" >/dev/null; then
             pass "pwsh gets the command line as given" ;;
         *) fail "pwsh's command line: $args" ;;
     esac
+    # the 32-bit Windows PowerShell (syswow64) finds the 64-bit PowerShell 7 too: there
+    # %ProgramFiles% is Program Files (x86) and App Paths the 32-bit view. Visual
+    # Studio's installer runs its VC++ redistributable script with it (7842).
+    rm -f "$WINEPREFIX/drive_c/pwsh-args.txt"
+    r=$("$WINE" 'C:\windows\syswow64\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -Command "irm https://example.invalid/x.ps1 | iex" < /dev/null > /dev/null 2>&1; echo $?)
+    [ "$r" = 7 ] && [ -s "$WINEPREFIX/drive_c/pwsh-args.txt" ] && pass "the 32-bit powershell runs the 64-bit pwsh too ($r)" \
+        || fail "32-bit powershell did not run pwsh: exit $r"
     unset SG_PWSH_LOG
 else
     echo "SKIP  PowerShell 7 hand-off (no $MINGW)"
