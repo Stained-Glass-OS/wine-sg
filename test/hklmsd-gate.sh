@@ -15,7 +15,7 @@
 #     System; another user does not see it
 #   a 64-bit program, and a 32-bit one with requestedExecutionLevel: denied; SYSTEM's 32-bit program: no store
 #   WINE=... WINESERVER=... test/hklmsd-gate.sh
-# Mutants: server SG_MUTANT_NO_BUILTIN_USERS_READ, SG_MUTANT_MKEY_NODEFAULT, SG_MUTANT_MKEY_AU_WRITE, SG_MUTANT_C2R_HIVE_READONLY, SG_MUTANT_C2R_SETSD_TOKEN_DACL; kernelbase SG_MUTANT_VIRT_ANY_LEVEL,
+# Mutants: server SG_MUTANT_NO_BUILTIN_USERS_READ, SG_MUTANT_MKEY_NODEFAULT, SG_MUTANT_MKEY_AU_WRITE, SG_MUTANT_C2R_HIVE_READONLY, SG_MUTANT_C2R_SETSD_TOKEN_DACL, SG_MUTANT_C2R_BUILDING_HIVE_READONLY; kernelbase SG_MUTANT_VIRT_ANY_LEVEL,
 # SG_MUTANT_VIRT_64BIT, SG_MUTANT_VIRT_NOT_EXCLUDED, SG_MUTANT_VIRT_NO_STORE_READ.
 # Needs passwordless sudo and the accounts of usersessions-gate.sh; exit 77 otherwise.
 set -u
@@ -110,6 +110,10 @@ out=$(run "$SG_USER1" 'C:\tok.exe' disp)
 # Click-to-Run Office's machine hive: Office's virtual registry opens it with KEY_ALL_ACCESS as the user
 # (Word could not save a new document: 5942); a key SYSTEM makes there after the start too
 as "$SG_SYSTEM" sh -c "umask 002; timeout -s KILL 120 '$WINE' reg add 'HKLM\Software\Microsoft\Office\ClickToRun\REGISTRY\SgMadeLater' /f" >/dev/null 2>&1
+# ...and in the hive Click-to-Run builds beside it, VREGISTRY_<guid>, and renames over it (7841): a
+# key SYSTEM makes there is the users' (the rename keeps it); VREGISTRYX is not the hive
+as "$SG_SYSTEM" sh -c "umask 002; timeout -s KILL 120 '$WINE' reg add 'HKLM\Software\Microsoft\Office\ClickToRun\VREGISTRY_8DF58265-A832-49F0-86B7-899FADCC38E5\MACHINE\SgBuilt' /f" >/dev/null 2>&1
+as "$SG_SYSTEM" sh -c "umask 002; timeout -s KILL 120 '$WINE' reg add 'HKLM\Software\Microsoft\Office\ClickToRun\VREGISTRYX\SgNot' /f" >/dev/null 2>&1
 # ...and SYSTEM (Office's Click-to-Run service) sets an owner on keys of the hive that have no
 # descriptor: they keep the users' access, not the token's default DACL (7822)
 out=$(run "$SG_SYSTEM" 'C:\tok.exe' c2rowner)
@@ -117,13 +121,13 @@ out=$(run "$SG_SYSTEM" 'C:\tok.exe' c2rowner)
 out=$(run "$SG_USER1" 'C:\tok.exe' c2r)
 c2r=Software\\Microsoft\\Office\\ClickToRun
 ok=1
-for k in REGISTRY 'REGISTRY\MACHINE\Software\Classes\Installer\Components\SgC2R' 'REGISTRY\MACHINE\Software\Microsoft\Windows NT\CurrentVersion' 'REGISTRY\SgMadeLater'; do
+for k in REGISTRY 'REGISTRY\MACHINE\Software\Classes\Installer\Components\SgC2R' 'REGISTRY\MACHINE\Software\Microsoft\Windows NT\CurrentVersion' 'REGISTRY\SgMadeLater' 'VREGISTRY_8DF58265-A832-49F0-86B7-899FADCC38E5\MACHINE\SgBuilt'; do
     [ "$(v "$out" "OPENALL $c2r\\$k ->")" = 0 ] || ok=0
 done
 [ "$(v "$out" "SETVALUE hklm $c2r\\REGISTRY\\MACHINE\\SgUserMade ->")" = 0 ] || ok=0
 [ $ok = 1 ] && pass "...opens and writes Click-to-Run Office's machine hive (KEY_ALL_ACCESS)" || fail "C2R hive: $out"
-[ "$(v "$out" "OPENALL $c2r ->")" = 5 ] && [ "$(v "$out" "OPENALL $c2r\\REGISTRYX ->")" = 5 ] && \
-[ "$(v "$out" "OPENALL Software\\Microsoft\\Office\\16.0\\SgC2R ->")" = 5 ] && pass "...but not the keys beside it (ClickToRun, REGISTRYX, Office\\16.0)" || fail "keys beside the C2R hive: $out"
+[ "$(v "$out" "OPENALL $c2r ->")" = 5 ] && [ "$(v "$out" "OPENALL $c2r\\REGISTRYX ->")" = 5 ] && [ "$(v "$out" "OPENALL $c2r\\VREGISTRYX\\SgNot ->")" = 5 ] && \
+[ "$(v "$out" "OPENALL Software\\Microsoft\\Office\\16.0\\SgC2R ->")" = 5 ] && pass "...but not the keys beside it (ClickToRun, REGISTRYX, VREGISTRYX, Office\\16.0)" || fail "keys beside the C2R hive: $out"
 # a pipe between two of a standard user's processes: every byte arrives and the end is a broken pipe
 # (a dropped I/O APC made ReadFile fail with ERROR_ALERTED, 739: 5926)
 out=$(run "$SG_USER1" 'C:\tok.exe' pipe)

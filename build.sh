@@ -231,6 +231,14 @@ if [[ -n "${DO_INSTALL:-}" ]]; then
     log "installing to ${DESTDIR}${PREFIX}"
     make -C "$OBJ_DIR" install ${DESTDIR:+DESTDIR="$DESTDIR"}
 
+    # The server protocol this Wine speaks, and the helper that ends a kept running tree (see
+    # tools/wine-sg-redirect and debian/wine-sg.preinst): an update compares the number with the
+    # running server's tree to know whether new programs can start from the new Wine at once.
+    sed -n 's/^#define SERVER_PROTOCOL_VERSION \([0-9]*\)$/\1/p' "$SRC_DIR/include/wine/server_protocol.h" \
+        > "${DESTDIR}${PREFIX}/share/wine/sg-server-protocol"
+    [[ -s "${DESTDIR}${PREFIX}/share/wine/sg-server-protocol" ]] || { echo "no SERVER_PROTOCOL_VERSION" >&2; exit 1; }
+    install -D -m 755 "$(dirname "$0")/tools/wine-sg-redirect" "${DESTDIR}${PREFIX}/lib/wine-sg/wine-sg-redirect"
+
     # Strip debug info unless asked not to. Wine builds with -g by default and
     # the result is enormous: 1.5G installed, of which about 1.1G is DWARF.
     # Stripped it is 454M -- for *both* architectures, where Debian's Wine

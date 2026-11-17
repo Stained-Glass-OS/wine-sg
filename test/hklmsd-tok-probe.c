@@ -311,8 +311,10 @@ int main(int argc, char **argv)
             L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\MACHINE\\Software\\Classes\\Installer\\Components\\SgC2R",
             L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion",
             L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\SgMadeLater",
+            L"Software\\Microsoft\\Office\\ClickToRun\\VREGISTRY_8DF58265-A832-49F0-86B7-899FADCC38E5\\MACHINE\\SgBuilt",
             L"Software\\Microsoft\\Office\\ClickToRun",
             L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRYX",
+            L"Software\\Microsoft\\Office\\ClickToRun\\VREGISTRYX\\SgNot",
             L"Software\\Microsoft\\Office\\16.0\\SgC2R",
         };
         int i;
