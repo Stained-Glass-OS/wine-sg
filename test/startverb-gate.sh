@@ -9,7 +9,10 @@
 #   - start /wait "" C:\plain.sgverb     : the same
 #   - start "" C:\x.sgopen               (only an Open verb): the probe, given Open and the file
 #   - start "C:\my doc.sgverb"           : a title only (a console), the probe not started
-# Mutant (start.c): SG_MUTANT_START_OPEN_VERB.
+#   - start "" C:\x.sggone               (its ProgID gone: SG Office removed, its .docx left naming
+#     SG Office's): "How do you want to open this file?" (rundll32 shell32.dll,OpenAs_RunDLL), as
+#     on Windows -- start printed "no application associated" (patches/sg/7830)
+# Mutants (start.c): SG_MUTANT_START_OPEN_VERB, SG_MUTANT_START_NO_UI.
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -32,7 +35,7 @@ timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 C="$WINEPREFIX/drive_c"
 cp "$T/probe.exe" "$C/probe.exe"
-echo hi > "$C/my doc.sgverb"; echo hi > "$C/plain.sgverb"; echo hi > "$C/x.sgopen"
+echo hi > "$C/my doc.sgverb"; echo hi > "$C/plain.sgverb"; echo hi > "$C/x.sgopen"; echo hi > "$C/x.sggone"
 cat > "$C/assoc.reg" <<'REG'
 REGEDIT4
 
@@ -50,6 +53,12 @@ REGEDIT4
 
 [HKEY_CLASSES_ROOT\SgOpen.Document\shell\Open\command]
 @="\"C:\\probe.exe\" Open \"%1\""
+
+[HKEY_CLASSES_ROOT\.sggone]
+@="SgGone.Document"
+
+[HKEY_CLASSES_ROOT\.sggone\OpenWithProgids]
+"SgOpen.Document"=""
 REG
 timeout 60 "$WINE" regedit /s 'C:\assoc.reg' >/dev/null 2>&1
 n=0
@@ -72,6 +81,15 @@ case_ 'start "A title" C:\plain.sgverb' '"C:\probe.exe" edit "C:\plain.sgverb"'
 case_ 'start /wait "" C:\plain.sgverb' '"C:\probe.exe" edit "C:\plain.sgverb"'
 case_ 'start "" C:\x.sgopen' '"C:\probe.exe" Open "C:\x.sgopen"'
 case_ 'start "C:\my doc.sgverb"' none
+# its ProgID gone: the picker, in a process of its own
+printf '@echo off\r\nstart "" C:\\x.sggone\r\necho rc=%%errorlevel%%\r\n' > "$C/gone.bat"
+(cd "$C" && timeout -s KILL 60 "$WINE" cmd /c 'C:\gone.bat' >"$T/gone" 2>&1 </dev/null)
+i=0; while ! pgrep -f "[O]penAs_RunDLL.*x.sggone" >/dev/null && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+if pgrep -f "[O]penAs_RunDLL.*x.sggone" >/dev/null; then pass "start \"\" x.sggone (its ProgID gone): \"How do you want to open this file?\" ($(tr -d '\r' < "$T/gone" | tr '\n' ' '))"
+else fail "start \"\" x.sggone (its ProgID gone): no picker; $(tr -d '\r' < "$T/gone" | tr '\n' ' ')"; fi
+for p in $(pgrep -f "[O]penAs_RunDLL.*x.sggone"); do
+    case "$(cat /proc/"$p"/comm 2>/dev/null)" in rundll32*) kill "$p" ;; esac
+done
 "$WINESERVER" -k 2>/dev/null
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
