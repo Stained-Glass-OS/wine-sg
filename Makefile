@@ -2945,6 +2945,11 @@ test-hklmsd:
 test-agentgone:
 	WINE=$(PREFIX)/bin/wine test/agentgone-gate.sh
 
+# CryptProtectData's CRYPTPROTECT_LOCAL_MACHINE: data any user of the machine may unprotect
+# (Visual Studio 2022's license under HKLM), a user's own stays theirs (7844).
+test-dpapimachine:
+	WINE=$(PREFIX)/bin/wine test/dpapimachine-gate.sh
+
 # A standard user's per-user ("just for me") MSI in the shared prefix: its UserData and its
 # Apps & features entry (5944, 5945; Python 3.13 from the SG Store).
 test-msiperuser:
