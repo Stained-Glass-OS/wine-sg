@@ -119,8 +119,15 @@ fi
 # 3: on the first monitor (moved there: the shell puts a program's new
 # frame where its last one was)
 frame 200 'First Screen'
-probe move SgLinuxWindow "$TITLE" 200 150 400 300 >/dev/null; sleep 1
-FR=$(probe rect SgLinuxWindow "$TITLE")
+# (on a loaded host the frame can still be settling: move until it is there)
+k=0
+while [ $k -lt 10 ]; do
+    probe move SgLinuxWindow "$TITLE" 200 150 400 300 >/dev/null; sleep 1
+    FR=$(probe rect SgLinuxWindow "$TITLE")
+    set -- $FR
+    [ $# = 4 ] && [ "$3" -le 1280 ] && break
+    k=$((k + 1))
+done
 set -- $FR
 if [ $# = 4 ] && [ "$3" -le 1280 ]; then
     probe maximize SgLinuxWindow "$TITLE" >/dev/null; waitfor zoomed=1 zoomed; sleep 0.5
