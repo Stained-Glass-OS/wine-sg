@@ -2940,6 +2940,11 @@ test-wicidxpal:
 test-hklmsd:
 	WINE=$(PREFIX)/bin/wine test/hklmsd-gate.sh
 
+# A thread the user's process agent cannot reach fails its suspend at once instead of pending
+# forever: a .NET program's collections go on with the agent killed mid-run (7843; Mono 0016).
+test-agentgone:
+	WINE=$(PREFIX)/bin/wine test/agentgone-gate.sh
+
 # A standard user's per-user ("just for me") MSI in the shared prefix: its UserData and its
 # Apps & features entry (5944, 5945; Python 3.13 from the SG Store).
 test-msiperuser:
