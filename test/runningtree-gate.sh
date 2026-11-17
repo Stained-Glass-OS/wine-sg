@@ -11,6 +11,7 @@
 #     a second start while it is pending keeps it; configure ends it when the protocol is the same
 #     and keeps it when it differs; clear ends it
 #   WINE=.../bin/wine test/runningtree-gate.sh   (needs passwordless sudo for root-owned files)
+#     configure asks for a restart (/run/reboot-required, .pkgs) only when it keeps the running tree
 # Mutant (loader/main.c): SG_MUTANT_NO_LOADER_REDIRECT -> nothing followed.
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -64,7 +65,8 @@ echo 880 > "$TREE/share/wine/sg-server-protocol"
 WINEPREFIX="$T/pfx" "$TREE/bin/wineserver" -f -p >/dev/null 2>&1 &
 SRV=$!
 sleep 2
-h() { WINE_SG_TREE="$TREE" WINE_SG_KEPT="$KEPT" WINE_SG_REDIRECT_FILE="$RF" WINE_SG_MACHINE_PREFIX="$T/none" sh "$HELPER" "$@"; }
+RB="$T/run/reboot-required"
+h() { WINE_SG_TREE="$TREE" WINE_SG_KEPT="$KEPT" WINE_SG_REDIRECT_FILE="$RF" WINE_SG_MACHINE_PREFIX="$T/none" WINE_SG_REBOOT_FILE="$RB" sh "$HELPER" "$@"; }
 h start
 [ -f "$RF" ] && [ "$(cat "$RF")" = "$KEPT" ] && [ "$(stat -c %i "$TREE/bin/wineserver")" = "$(stat -c %i "$KEPT/bin/wineserver")" ] \
     && pass "start keeps the running server's tree (hard links) and names it" || fail "start: $(ls -la "$T" "$T/run" 2>&1 | tr '\n' ' ')"
@@ -73,6 +75,7 @@ cp "$TREE/bin/wineserver" "$TREE/bin/wineserver.new" && mv "$TREE/bin/wineserver
 echo 880 > "$TREE/share/wine/sg-server-protocol.new" && mv "$TREE/share/wine/sg-server-protocol.new" "$TREE/share/wine/sg-server-protocol"
 h configure >/dev/null
 [ ! -e "$RF" ] && [ ! -e "$KEPT" ] && pass "configure: the same protocol, programs start from the new Wine at once" || fail "same protocol kept"
+[ ! -e "$RB" ] && [ ! -e "$RB.pkgs" ] && pass "...and asks for no restart" || fail "same protocol wrote $RB"
 # a later update with a new protocol, the server still the one from before the first update
 # (its file replaced since: "(deleted)")
 h start
@@ -80,9 +83,13 @@ echo 883 > "$TREE/share/wine/sg-server-protocol.new" && mv "$TREE/share/wine/sg-
 out=$(h configure)
 [ -f "$RF" ] && [ "$(cat "$KEPT/share/wine/sg-server-protocol")" = 880 ] \
     && pass "configure: a new protocol keeps the running tree until the server restarts (a server whose file an earlier update replaced)" || fail "new protocol: $out"
+grep -q "System restart required" "$RB" 2>/dev/null && [ "$(grep -cx wine-sg "$RB.pkgs" 2>/dev/null)" = 1 ] \
+    && pass "...and asks for a restart (reboot-required, wine-sg in reboot-required.pkgs)" || fail "no restart asked: $(cat "$RB" "$RB.pkgs" 2>&1)"
 h start
-[ -f "$RF" ] && [ "$(cat "$KEPT/share/wine/sg-server-protocol")" = 880 ] \
-    && pass "a second update while the restart is pending keeps the running server's tree" || fail "second start replaced the kept tree"
+echo 886 > "$TREE/share/wine/sg-server-protocol.new" && mv "$TREE/share/wine/sg-server-protocol.new" "$TREE/share/wine/sg-server-protocol"
+h configure >/dev/null
+[ -f "$RF" ] && [ "$(cat "$KEPT/share/wine/sg-server-protocol")" = 880 ] && [ "$(grep -cx wine-sg "$RB.pkgs")" = 1 ] \
+    && pass "a second bump before the restart keeps the running server's tree, not the one in between" || fail "second start replaced the kept tree"
 h clear
 [ ! -e "$RF" ] && [ ! -e "$KEPT" ] && pass "clear (the server starts) ends it" || fail "clear"
 
