@@ -272,6 +272,34 @@ int main(int argc, char **argv)
         RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\Video\\SgTokProbe");
         RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\GraphicsDrivers\\SgTokProbe");
     }
+    else if (!strcmp(m, "c2rowner"))
+    {
+        /* Office's Click-to-Run service, as SYSTEM, sets an owner on the keys of its hive (the owner
+         * only); the keys must stay writable by users (7822) */
+        static const WCHAR *keys[] =
+        {
+            L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY",
+            L"Software\\Microsoft\\Office\\ClickToRun\\REGISTRY\\MACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion",
+        };
+        SECURITY_DESCRIPTOR sdesc;
+        HANDLE tok;
+        BYTE ob[256];
+        DWORD n;
+        int i;
+
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok);
+        GetTokenInformation(tok, TokenOwner, ob, sizeof(ob), &n);
+        InitializeSecurityDescriptor(&sdesc, SECURITY_DESCRIPTOR_REVISION);
+        SetSecurityDescriptorOwner(&sdesc, ((TOKEN_OWNER *)ob)->Owner, FALSE);
+        for (i = 0; i < ARRAY_SIZE(keys); i++)
+        {
+            HKEY k = NULL;
+            LONG r = RegOpenKeyExW(HKEY_LOCAL_MACHINE, keys[i], 0, WRITE_OWNER, &k);
+            if (!r) r = RegSetKeySecurity(k, OWNER_SECURITY_INFORMATION, &sdesc);
+            printf("SETOWNER %ls -> %ld\n", keys[i], r);
+            if (k) RegCloseKey(k);
+        }
+    }
     else if (!strcmp(m, "c2r"))
     {
         /* Click-to-Run Office's own machine hive: Office's virtual registry opens its keys with

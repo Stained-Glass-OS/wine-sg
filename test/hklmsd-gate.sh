@@ -15,7 +15,7 @@
 #     System; another user does not see it
 #   a 64-bit program, and a 32-bit one with requestedExecutionLevel: denied; SYSTEM's 32-bit program: no store
 #   WINE=... WINESERVER=... test/hklmsd-gate.sh
-# Mutants: server SG_MUTANT_NO_BUILTIN_USERS_READ, SG_MUTANT_MKEY_NODEFAULT, SG_MUTANT_MKEY_AU_WRITE, SG_MUTANT_C2R_HIVE_READONLY; kernelbase SG_MUTANT_VIRT_ANY_LEVEL,
+# Mutants: server SG_MUTANT_NO_BUILTIN_USERS_READ, SG_MUTANT_MKEY_NODEFAULT, SG_MUTANT_MKEY_AU_WRITE, SG_MUTANT_C2R_HIVE_READONLY, SG_MUTANT_C2R_SETSD_TOKEN_DACL; kernelbase SG_MUTANT_VIRT_ANY_LEVEL,
 # SG_MUTANT_VIRT_64BIT, SG_MUTANT_VIRT_NOT_EXCLUDED, SG_MUTANT_VIRT_NO_STORE_READ.
 # Needs passwordless sudo and the accounts of usersessions-gate.sh; exit 77 otherwise.
 set -u
@@ -110,6 +110,10 @@ out=$(run "$SG_USER1" 'C:\tok.exe' disp)
 # Click-to-Run Office's machine hive: Office's virtual registry opens it with KEY_ALL_ACCESS as the user
 # (Word could not save a new document: 5942); a key SYSTEM makes there after the start too
 as "$SG_SYSTEM" sh -c "umask 002; timeout -s KILL 120 '$WINE' reg add 'HKLM\Software\Microsoft\Office\ClickToRun\REGISTRY\SgMadeLater' /f" >/dev/null 2>&1
+# ...and SYSTEM (Office's Click-to-Run service) sets an owner on keys of the hive that have no
+# descriptor: they keep the users' access, not the token's default DACL (7822)
+out=$(run "$SG_SYSTEM" 'C:\tok.exe' c2rowner)
+[ "$(printf '%s\n' "$out" | grep -c ' -> 0$')" = 2 ] && pass "SYSTEM sets an owner on two keys of the C2R hive" || fail "C2R set owner: $out"
 out=$(run "$SG_USER1" 'C:\tok.exe' c2r)
 c2r=Software\\Microsoft\\Office\\ClickToRun
 ok=1
