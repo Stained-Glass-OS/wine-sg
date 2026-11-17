@@ -1,0 +1,683 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] server: account lookups off the main loop
+
+---
+ dlls/advapi32/advapi.c     |  17 +-
+ dlls/ntdll/unix/security.c |  19 ++-
+ dlls/wtsapi32/wtsapi32.c   |  15 +-
+ server/Makefile.in         |   1 +
+ server/nssworker.c         | 333 +++++++++++++++++++++++++++++++++++++
+ server/request.c           |  25 ++-
+ server/security.h          |   6 +
+ server/thread.c            |   3 +
+ server/thread.h            |   3 +
+ server/token.c             |  52 ++++--
+ 10 files changed, 439 insertions(+), 35 deletions(-)
+ create mode 100644 server/nssworker.c
+
+diff --git a/dlls/advapi32/advapi.c b/dlls/advapi32/advapi.c
+index e25bf58..87a48a0 100644
+--- a/dlls/advapi32/advapi.c
++++ b/dlls/advapi32/advapi.c
+@@ -497,13 +497,18 @@ static NTSTATUS logon_ticket_to_token( const char *ticket, DWORD type, HANDLE *t
+ {
+     NTSTATUS status;
+ 
+-    SERVER_START_REQ( logon_ticket_token )
++    /* Stained Glass OS 7824: STATUS_PENDING while the server asks the account databases (off its
++     * main loop) whether the account is an administrator: ask again */
++    do
+     {
+-        req->type = type;
+-        wine_server_add_data( req, ticket, strlen( ticket ) );
+-        if (!(status = wine_server_call( req ))) *token = wine_server_ptr_handle( reply->token );
+-    }
+-    SERVER_END_REQ;
++        SERVER_START_REQ( logon_ticket_token )
++        {
++            req->type = type;
++            wine_server_add_data( req, ticket, strlen( ticket ) );
++            if (!(status = wine_server_call( req ))) *token = wine_server_ptr_handle( reply->token );
++        }
++        SERVER_END_REQ;
++    } while (status == STATUS_PENDING && (Sleep( 20 ), TRUE));
+     return status;
+ }
+ 
+diff --git a/dlls/ntdll/unix/security.c b/dlls/ntdll/unix/security.c
+index 131e1de..cefffb5 100644
+--- a/dlls/ntdll/unix/security.c
++++ b/dlls/ntdll/unix/security.c
+@@ -671,15 +671,22 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
+     }
+ 
+     case TokenLinkedToken:
+-        SERVER_START_REQ( create_linked_token )
++        /* Stained Glass OS 7824: STATUS_PENDING while the server asks the account databases
++         * (off its main loop) whether the person is an administrator: ask again */
++        for (;;)
+         {
+-            TOKEN_LINKED_TOKEN *linked = info;
++            SERVER_START_REQ( create_linked_token )
++            {
++                TOKEN_LINKED_TOKEN *linked = info;
+ 
+-            req->handle = wine_server_obj_handle( token );
+-            status = wine_server_call( req );
+-            if (!status) linked->LinkedToken = wine_server_ptr_handle( reply->linked );
++                req->handle = wine_server_obj_handle( token );
++                status = wine_server_call( req );
++                if (!status) linked->LinkedToken = wine_server_ptr_handle( reply->linked );
++            }
++            SERVER_END_REQ;
++            if (status != STATUS_PENDING) break;
++            usleep( 20000 );
+         }
+-        SERVER_END_REQ;
+         break;
+ 
+     case TokenSecurityAttributes:
+diff --git a/dlls/wtsapi32/wtsapi32.c b/dlls/wtsapi32/wtsapi32.c
+index 04c9ccd..82368b9 100644
+--- a/dlls/wtsapi32/wtsapi32.c
++++ b/dlls/wtsapi32/wtsapi32.c
+@@ -1671,12 +1671,17 @@ BOOL WINAPI WTSQueryUserToken(ULONG session_id, PHANDLE token)
+     /* Stained Glass OS (1708): the session's user's token, for a caller
+      * holding SeTcbPrivilege (LocalSystem services), from the server, which
+      * knows who is logged on to which session (1706) */
+-    SERVER_START_REQ( get_session_user_token )
++    /* Stained Glass OS 7824: STATUS_PENDING while the server asks the account databases (off its
++     * main loop) whether the person is an administrator: ask again */
++    do
+     {
+-        req->session_id = session_id;
+-        if (!(status = wine_server_call( req ))) ret = wine_server_ptr_handle( reply->token );
+-    }
+-    SERVER_END_REQ;
++        SERVER_START_REQ( get_session_user_token )
++        {
++            req->session_id = session_id;
++            if (!(status = wine_server_call( req ))) ret = wine_server_ptr_handle( reply->token );
++        }
++        SERVER_END_REQ;
++    } while (status == STATUS_PENDING && (Sleep( 20 ), TRUE));
+     if (status)
+     {
+         SetLastError( RtlNtStatusToDosError( status ) );
+diff --git a/server/Makefile.in b/server/Makefile.in
+index e91cc6a..02a203c 100644
+--- a/server/Makefile.in
++++ b/server/Makefile.in
+@@ -22,6 +22,7 @@ SOURCES = \
+ 	mapping.c \
+ 	mutex.c \
+ 	named_pipe.c \
++	nssworker.c \
+ 	port.c \
+ 	object.c \
+ 	process.c \
+diff --git a/server/nssworker.c b/server/nssworker.c
+new file mode 100644
+index 0000000..95928dc
+--- /dev/null
++++ b/server/nssworker.c
+@@ -0,0 +1,333 @@
++/*
++ * Account lookups off the server's main loop
++ *
++ * Stained Glass OS (wine-sg 7824). On a shared prefix the server asks the system's account
++ * databases (NSS) whether a connecting account may use it (a member of the prefix's group) and
++ * whether an account is one of the machine's administrators (sg-admins, 7737). Those answers
++ * can come from a network directory: with winbind in nsswitch.conf, getgrouplist() asks winbindd,
++ * which may take minutes to answer while it waits on a domain controller. Asked on the main
++ * loop, that stopped the whole server -- every Windows program of every account waited, and the
++ * server did not even end on SIGTERM.
++ *
++ * Here a thread of its own asks, computing each answer exactly as before and afresh for every
++ * question (nothing is kept between questions), and hands it back through a pipe the main loop
++ * polls. The main loop meanwhile serves everyone else; what waits is only what needs the answer:
++ * the connecting process (admitted, and given its token, when it comes) or the thread whose
++ * request asked (STATUS_PENDING until then; its client asks again).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include <errno.h>
++#include <grp.h>
++#include <pthread.h>
++#include <pwd.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/types.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "winternl.h"
++
++#include "file.h"
++#include "handle.h"
++#include "thread.h"
++#include "process.h"
++#include "request.h"
++#include "security.h"
++
++enum nss_job_kind { NSS_JOB_CONNECT, NSS_JOB_REQUEST };
++
++struct nss_job
++{
++    struct nss_job   *next;
++    enum nss_job_kind kind;
++    uid_t             uid;        /* the account asked about */
++    gid_t             gid;        /* the group to check membership of, or -1 */
++    int               in_group;   /* answer: uid is a member of gid */
++    int               admin;      /* answer: uid is an administrator (sg_uid_is_admin) */
++    int               client;     /* NSS_JOB_CONNECT: the accepted connection */
++    int               admitted;   /* NSS_JOB_CONNECT: already admitted without NSS */
++    thread_id_t       tid;        /* NSS_JOB_REQUEST: the thread that asked */
++};
++
++struct nss_worker
++{
++    struct object  obj;
++    struct fd     *fd;            /* read side of the completion pipe */
++};
++
++static void nss_worker_dump( struct object *obj, int verbose );
++static void nss_worker_destroy( struct object *obj );
++static void nss_worker_poll_event( struct fd *fd, int event );
++
++static const struct object_ops nss_worker_ops =
++{
++    sizeof(struct nss_worker),   /* size */
++    &no_type,                    /* type */
++    nss_worker_dump,             /* dump */
++    no_add_queue,                /* add_queue */
++    NULL,                        /* remove_queue */
++    NULL,                        /* signaled */
++    NULL,                        /* satisfied */
++    no_signal,                   /* signal */
++    no_get_fd,                   /* get_fd */
++    default_map_access,          /* map_access */
++    default_get_sd,              /* get_sd */
++    default_set_sd,              /* set_sd */
++    no_get_full_name,            /* get_full_name */
++    no_lookup_name,              /* lookup_name */
++    no_link_name,                /* link_name */
++    NULL,                        /* unlink_name */
++    no_open_file,                /* open_file */
++    no_kernel_obj_list,          /* get_kernel_obj_list */
++    no_close_handle,             /* close_handle */
++    nss_worker_destroy           /* destroy */
++};
++
++static const struct fd_ops nss_worker_fd_ops =
++{
++    NULL,                        /* get_poll_events */
++    nss_worker_poll_event,       /* poll_event */
++    NULL,                        /* flush */
++    NULL,                        /* get_fd_type */
++    NULL,                        /* ioctl */
++    NULL,                        /* queue_async */
++    NULL                         /* reselect_async */
++};
++
++/* the connecting process's answer while create_process makes its token, else -1 */
++int sg_connect_admin = -1;
++
++static struct nss_worker *worker;
++static int done_pipe[2] = { -1, -1 };
++static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
++static struct nss_job *queue_head, *queue_tail;
++
++static void nss_worker_dump( struct object *obj, int verbose )
++{
++    fprintf( stderr, "NSS lookup worker\n" );
++}
++
++static void nss_worker_destroy( struct object *obj )
++{
++    struct nss_worker *w = (struct nss_worker *)obj;
++
++    if (w->fd) release_object( w->fd );   /* at the server's end: the thread is left as it is */
++}
++
++/* reentrant versions of request.c's uid_in_group and sg_uid_is_admin: the same questions, asked the
++ * same way, safe beside the main thread's own (non-reentrant) getpw* calls */
++static int nss_uid_in_group( uid_t uid, gid_t gid )
++{
++    struct passwd pwbuf, *pw = NULL;
++    gid_t stack[32], *groups = stack;
++    int i, count = ARRAY_SIZE(stack), ret = 0;
++    char buf[4096];
++
++    if (getpwuid_r( uid, &pwbuf, buf, sizeof(buf), &pw ) || !pw) return 0;
++    if (pw->pw_gid == gid) return 1;
++
++    if (getgrouplist( pw->pw_name, pw->pw_gid, groups, &count ) == -1)
++    {
++        if (!(groups = malloc( count * sizeof(*groups) ))) return 0;
++        if (getgrouplist( pw->pw_name, pw->pw_gid, groups, &count ) == -1) count = 0;
++    }
++    for (i = 0; i < count; i++) if (groups[i] == gid) { ret = 1; break; }
++    if (groups != stack) free( groups );
++    return ret;
++}
++
++static int nss_uid_is_admin( uid_t uid )
++{
++    const char *name = getenv( "SG_ADMIN_GROUP" );
++    struct group grbuf, *gr = NULL;
++    char buf[16384];
++
++    if (!uid) return 0;
++    if (getgrnam_r( name && *name ? name : "sg-admins", &grbuf, buf, sizeof(buf), &gr ) || !gr) return 0;
++    return nss_uid_in_group( uid, gr->gr_gid );
++}
++
++static void *nss_worker_thread( void *arg )
++{
++    sigset_t all;
++
++    /* the server's signals (SIGCHLD, SIGALRM's watchdog, SIGTERM...) are the main thread's */
++    sigfillset( &all );
++    pthread_sigmask( SIG_BLOCK, &all, NULL );
++
++    for (;;)
++    {
++        struct nss_job *job;
++
++        pthread_mutex_lock( &queue_mutex );
++        while (!queue_head) pthread_cond_wait( &queue_cond, &queue_mutex );
++        job = queue_head;
++        if (!(queue_head = job->next)) queue_tail = NULL;
++        pthread_mutex_unlock( &queue_mutex );
++
++        job->in_group = job->gid != (gid_t)-1 ? nss_uid_in_group( job->uid, job->gid ) : 0;
++        job->admin = nss_uid_is_admin( job->uid );
++
++        while (write( done_pipe[1], &job, sizeof(job) ) == -1 && errno == EINTR);
++    }
++    return NULL;
++}
++
++static int init_worker(void)
++{
++    pthread_t thread;
++    pthread_attr_t attr;
++
++    if (worker) return 1;
++    if (pipe( done_pipe ) == -1) return 0;
++    if (!(worker = alloc_object( &nss_worker_ops ))) goto failed;
++    if (!(worker->fd = create_anonymous_fd( &nss_worker_fd_ops, done_pipe[0], &worker->obj, 0 )))
++    {
++        release_object( worker );
++        worker = NULL;
++        done_pipe[0] = -1;   /* closed with the fd */
++        goto failed;
++    }
++    make_object_permanent( &worker->obj );
++    set_fd_events( worker->fd, POLLIN );
++
++    pthread_attr_init( &attr );
++    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
++    if (pthread_create( &thread, &attr, nss_worker_thread, NULL ))
++    {
++        pthread_attr_destroy( &attr );
++        fprintf( stderr, "wineserver: cannot start the account lookup thread\n" );
++        return 0;   /* the pipe stays; callers fall back to asking here */
++    }
++    pthread_attr_destroy( &attr );
++    return 1;
++
++failed:
++    if (done_pipe[0] != -1) close( done_pipe[0] );
++    close( done_pipe[1] );
++    done_pipe[0] = done_pipe[1] = -1;
++    return 0;
++}
++
++static int queue_job( struct nss_job *job )
++{
++#ifdef SG_MUTANT_NSS_ON_MAIN_LOOP
++    return 0;
++#endif
++    if (!init_worker()) return 0;
++    job->next = NULL;
++    pthread_mutex_lock( &queue_mutex );
++    if (queue_tail) queue_tail->next = job;
++    else queue_head = job;
++    queue_tail = job;
++    pthread_cond_signal( &queue_cond );
++    pthread_mutex_unlock( &queue_mutex );
++    return 1;
++}
++
++static void finish_connect( struct nss_job *job )
++{
++    struct process *process;
++
++    if (!job->admitted && !job->in_group)
++    {
++        fprintf( stderr, "wineserver: refusing connection from uid %u: not a member of gid %u\n",
++                 (unsigned int)job->uid, (unsigned int)job->gid );
++        close( job->client );
++        return;
++    }
++    sg_connect_admin = job->admin;
++    if ((process = create_process( job->client, NULL, 0, NULL, NULL, NULL, 0, NULL, job->uid )))
++    {
++        create_thread( -1, process, NULL );
++        release_object( process );
++    }
++    sg_connect_admin = -1;
++}
++
++static void finish_request( struct nss_job *job )
++{
++    struct thread *thread = get_thread_from_id( job->tid );
++
++    if (!thread) return;   /* gone meanwhile */
++    if (thread->sg_nss_state == 1 && thread->sg_nss_uid == job->uid)
++    {
++        thread->sg_nss_state = 2;
++        thread->sg_nss_admin = job->admin;
++    }
++    release_object( thread );
++}
++
++static void nss_worker_poll_event( struct fd *fd, int event )
++{
++    struct nss_job *job;
++    ssize_t n;
++
++    /* one answer per event: the pipe stays readable while more are waiting */
++    if ((n = read( done_pipe[0], &job, sizeof(job) )) == sizeof(job))
++    {
++        if (job->kind == NSS_JOB_CONNECT) finish_connect( job );
++        else finish_request( job );
++        free( job );
++    }
++    else if (n == 0 || (n == -1 && errno != EAGAIN && errno != EINTR))
++        fprintf( stderr, "wineserver: account lookup pipe error\n" );
++}
++
++/* The answer for a connecting client: admitted (it may use this server) and, for its token,
++ * administrator or not. Returns 1 when the lookup was handed to the thread (the client is then
++ * admitted or refused later); 0 when it could not be, and the caller asks here as before. */
++int sg_nss_connect_async( int client, uid_t uid, gid_t gid, int admitted )
++{
++    struct nss_job *job = calloc( 1, sizeof(*job) );
++
++    if (!job) return 0;
++    job->kind = NSS_JOB_CONNECT;
++    job->uid = uid;
++    job->gid = admitted ? (gid_t)-1 : gid;
++    job->client = client;
++    job->admitted = admitted;
++    if (queue_job( job )) return 1;
++    free( job );
++    return 0;
++}
++
++/* Is uid an administrator, for a request of the current thread? 1 or 0 when known (answered
++ * for this very request: the answer is used once), -1 when it is being asked (the request
++ * returns STATUS_PENDING and its client asks again). */
++int sg_nss_admin_for_request( uid_t uid )
++{
++    struct nss_job *job;
++
++    if (current->sg_nss_state == 2 && current->sg_nss_uid == uid)
++    {
++        current->sg_nss_state = 0;
++        return current->sg_nss_admin;
++    }
++    if (current->sg_nss_state == 1 && current->sg_nss_uid == uid) return -1;
++
++    if (!(job = calloc( 1, sizeof(*job) ))) return sg_uid_is_admin( uid );
++    job->kind = NSS_JOB_REQUEST;
++    job->uid = uid;
++    job->gid = (gid_t)-1;
++    job->tid = current->id;
++    if (!queue_job( job ))
++    {
++        free( job );
++        return sg_uid_is_admin( uid );   /* no thread: asked here, as before */
++    }
++    current->sg_nss_uid = uid;
++    current->sg_nss_state = 1;
++    return -1;
++}
+diff --git a/server/request.c b/server/request.c
+index 20369a5..9472a37 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -667,12 +667,9 @@ static int check_peer_credentials( int client, uid_t *peer_uid )
+     }
+     *peer_uid = cred.uid;
+     if (cred.uid == 0 || cred.uid == server_dir_uid) return 1;
+-    if (uid_in_group( cred.uid, server_dir_gid )) return 1;
+     if (peer_holds_group( client, server_dir_gid )) return 1;
+-
+-    fprintf( stderr, "wineserver: refusing connection from uid %u: not a member of gid %u\n",
+-             (unsigned int)cred.uid, (unsigned int)server_dir_gid );
+-    return 0;
++    /* 7824: membership by the account databases (NSS) is asked by the caller, off the main loop */
++    return 2;
+ }
+ 
+ static void master_socket_poll_event( struct fd *fd, int event )
+@@ -694,14 +691,28 @@ static void master_socket_poll_event( struct fd *fd, int event )
+         struct sockaddr_un dummy;
+         socklen_t len = sizeof(dummy);
+         uid_t peer_uid;
+-        int client = accept( get_unix_fd( master_socket->fd ), (struct sockaddr *) &dummy, &len );
++        int admitted, client = accept( get_unix_fd( master_socket->fd ), (struct sockaddr *) &dummy, &len );
+         if (client == -1) return;
+-        if (!check_peer_credentials( client, &peer_uid ))
++        if (!(admitted = check_peer_credentials( client, &peer_uid )))
+         {
+             close( client );
+             return;
+         }
+         fcntl( client, F_SETFL, O_NONBLOCK );
++        /* Stained Glass OS 7824: what the account databases say of the peer -- a member of the
++         * prefix's group, an administrator for its token -- is asked off the main loop: through
++         * winbind the answer may take minutes, and the server served nobody meanwhile. The
++         * connection is admitted (or refused) and its process made when the answer comes. */
++        if (system_prefix && peer_uid && peer_uid != sg_system_prefix_uid &&
++            sg_nss_connect_async( client, peer_uid, server_dir_gid, admitted == 1 ))
++            return;
++        if (admitted == 2 && !uid_in_group( peer_uid, server_dir_gid ))
++        {
++            fprintf( stderr, "wineserver: refusing connection from uid %u: not a member of gid %u\n",
++                     (unsigned int)peer_uid, (unsigned int)server_dir_gid );
++            close( client );
++            return;
++        }
+         if ((process = create_process( client, NULL, 0, NULL, NULL, NULL, 0, NULL, peer_uid )))
+         {
+             create_thread( -1, process, NULL );
+diff --git a/server/security.h b/server/security.h
+index 152370c..9698afa 100644
+--- a/server/security.h
++++ b/server/security.h
+@@ -63,6 +63,12 @@ extern struct token *token_create_elevated_for_uid( unsigned int session_id, uid
+ /* Stained Glass OS: may the requesting process mint or assign tokens? */
+ extern int sg_requester_is_admin(void);
+ extern int sg_uid_is_admin( uid_t uid );
++/* Stained Glass OS 7824: account lookups off the main loop (nssworker.c) */
++extern int sg_connect_admin;
++extern int sg_nss_connect_async( int client, uid_t uid, gid_t gid, int admitted );
++extern int sg_nss_admin_for_request( uid_t uid );
++extern struct token *token_create_for_uid_admin( unsigned primary, int impersonation_level, int elevation,
++                                                 unsigned int session_id, uid_t uid, int admin );
+ extern int sg_token_same_user( struct token *a, struct token *b );
+ extern struct security_descriptor *sg_create_owner_sd( const struct sid *user_sid );
+ extern struct security_descriptor *sg_create_session_object_sd( const struct sid *creator, const struct sid *session_user,
+diff --git a/server/thread.c b/server/thread.c
+index c39b72f..72d922e 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -224,6 +224,9 @@ static inline void init_thread_structure( struct thread *thread )
+     thread->unix_pid        = -1;  /* not known yet */
+     thread->unix_tid        = -1;  /* not known yet */
+     thread->sg_ptrace_pending = 0;
++    thread->sg_nss_state = 0;
++    thread->sg_nss_uid = 0;
++    thread->sg_nss_admin = 0;
+     thread->context         = NULL;
+     thread->teb             = 0;
+     thread->entry_point     = 0;
+diff --git a/server/thread.h b/server/thread.h
+index c6f3af9..832ba3f 100644
+--- a/server/thread.h
++++ b/server/thread.h
+@@ -77,6 +77,9 @@ struct thread
+     int                    unix_pid;      /* Unix pid of client */
+     int                    unix_tid;      /* Unix tid of client */
+     int                    sg_ptrace_pending; /* Stained Glass OS 6259: attached, its stop not come yet: detach when it does */
++    int                    sg_nss_state;  /* Stained Glass OS 7824: 0 none, 1 an account lookup asked, 2 answered */
++    uid_t                  sg_nss_uid;    /* ... about this account */
++    int                    sg_nss_admin;  /* ... the answer, used once by the request that asked */
+     struct context        *context;       /* current context */
+     client_ptr_t           suspend_cookie;/* wait cookie of suspending select */
+     client_ptr_t           teb;           /* TEB address (in client address space) */
+diff --git a/server/token.c b/server/token.c
+index 75abdbf..10469e1 100644
+--- a/server/token.c
++++ b/server/token.c
+@@ -1523,12 +1523,21 @@ struct token *token_create_admin( unsigned primary, int impersonation_level, int
+  * them at the admin value leaves a token that is non-admin in name only.
+  */
+ static struct token *token_create_for_uid_ex( unsigned primary, int impersonation_level,
+-                                              int elevation, unsigned int session_id, uid_t uid, int elevated );
++                                              int elevation, unsigned int session_id, uid_t uid, int elevated,
++                                              int admin );
+ 
++/* admin: whether uid is an administrator, asked already (1, 0), or -1: the connecting process's
++ * answer (sg_connect_admin, nssworker.c), else asked here */
+ struct token *token_create_for_uid( unsigned primary, int impersonation_level,
+                                     int elevation, unsigned int session_id, uid_t uid )
+ {
+-    return token_create_for_uid_ex( primary, impersonation_level, elevation, session_id, uid, 0 );
++    return token_create_for_uid_ex( primary, impersonation_level, elevation, session_id, uid, 0, -1 );
++}
++
++struct token *token_create_for_uid_admin( unsigned primary, int impersonation_level, int elevation,
++                                          unsigned int session_id, uid_t uid, int admin )
++{
++    return token_create_for_uid_ex( primary, impersonation_level, elevation, session_id, uid, 0, admin );
+ }
+ 
+ /* Stained Glass OS 7601: a person's elevated token, as Windows' consent gives
+@@ -1536,11 +1545,12 @@ struct token *token_create_for_uid( unsigned primary, int impersonation_level,
+  * administrator's privileges, elevation type Full, high integrity */
+ struct token *token_create_elevated_for_uid( unsigned int session_id, uid_t uid )
+ {
+-    return token_create_for_uid_ex( TRUE, -1, TokenElevationTypeFull, session_id, uid, 1 );
++    return token_create_for_uid_ex( TRUE, -1, TokenElevationTypeFull, session_id, uid, 1, -1 );
+ }
+ 
+ static struct token *token_create_for_uid_ex( unsigned primary, int impersonation_level,
+-                                              int elevation, unsigned int session_id, uid_t uid, int elevated )
++                                              int elevation, unsigned int session_id, uid_t uid, int elevated,
++                                              int admin )
+ {
+     struct token *token = NULL;
+     struct sid alias_admins_sid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS }};
+@@ -1553,7 +1563,8 @@ static struct token *token_create_for_uid_ex( unsigned primary, int impersonatio
+      * token: Administrators only for deny, elevation type Limited, an ordinary user's privileges and
+      * integrity. Its linked token (create_linked_token) is the full one. */
+ #ifndef SG_MUTANT_ADMIN_NOT_SPLIT
+-    int split_admin = !is_admin && elevation == TokenElevationTypeDefault && sg_uid_is_admin( uid );
++    int split_admin = !is_admin && elevation == TokenElevationTypeDefault &&
++                      (admin >= 0 ? admin : sg_connect_admin >= 0 ? sg_connect_admin : sg_uid_is_admin( uid ));
+ #else
+     int split_admin = 0;
+ #endif
+@@ -2811,15 +2822,23 @@ DECL_HANDLER(create_linked_token)
+             token->sg_unix_uid != sg_system_prefix_uid)
+         {
+             uid_t uid = token->sg_unix_uid;
++            int admin = 0;
+ 
+             linked = NULL;
++            /* 7824: whether a full token's person is an administrator is asked off the main loop */
++            if (token->elevation == TokenElevationTypeFull && (admin = sg_nss_admin_for_request( uid )) < 0)
++            {
++                release_object( token );
++                set_error( STATUS_PENDING );   /* its client asks again */
++                return;
++            }
+ #ifndef SG_MUTANT_NO_LINKED_TOKEN
+             if (token->elevation == TokenElevationTypeLimited)
+                 linked = token_create_for_uid_ex( FALSE, SecurityIdentification, TokenElevationTypeFull,
+-                                                  token->session_id, uid, 1 );
+-            else if (token->elevation == TokenElevationTypeFull && sg_uid_is_admin( uid ))
++                                                  token->session_id, uid, 1, -1 );
++            else if (token->elevation == TokenElevationTypeFull && admin)
+                 linked = token_create_for_uid_ex( FALSE, SecurityIdentification, TokenElevationTypeDefault,
+-                                                  token->session_id, uid, 0 );
++                                                  token->session_id, uid, 0, 1 );
+ #endif
+             if (!linked)
+             {
+@@ -3132,6 +3151,7 @@ DECL_HANDLER(get_session_user_token)
+     unsigned int id = req->session_id;
+     struct token *token;
+     uid_t uid;
++    int admin;
+ 
+     reply->token = 0;
+ #ifndef SG_MUTANT_SESSION_TOKEN_FOR_ALL
+@@ -3156,7 +3176,9 @@ DECL_HANDLER(get_session_user_token)
+     }
+     if (id == default_session_id) { set_error( STATUS_NO_TOKEN ); return; }
+     if (!sg_session_user( id, &uid )) { set_error( STATUS_CTX_WINSTATION_NOT_FOUND ); return; }
+-    if ((token = token_create_for_uid( TRUE, -1, TokenElevationTypeDefault, id, uid )))
++    /* 7824: whether the session's person is an administrator, asked off the main loop */
++    if ((admin = sg_nss_admin_for_request( uid )) < 0) { set_error( STATUS_PENDING ); return; }
++    if ((token = token_create_for_uid_admin( TRUE, -1, TokenElevationTypeDefault, id, uid, admin )))
+     {
+         reply->token = alloc_handle( current->process, token, TOKEN_ALL_ACCESS, 0 );
+         release_object( token );
+@@ -3181,7 +3203,7 @@ DECL_HANDLER(logon_ticket_token)
+     struct token *token, *tok2;
+     struct stat st;
+     ssize_t n;
+-    int fd;
++    int fd, admin = 0;
+ 
+     reply->token = 0;
+     if (!sg_system_prefix) { set_error( STATUS_NOT_SUPPORTED ); return; }
+@@ -3216,10 +3238,18 @@ DECL_HANDLER(logon_ticket_token)
+ #ifndef SG_MUTANT_TICKET_ANY_REQUESTER
+     if (for_uid != current->process->peer_uid) return;
+ #endif
++    if (uid != ~0u && uid && uid != sg_system_prefix_uid && expires >= (long long)time( NULL ) &&
++        (admin = sg_nss_admin_for_request( uid )) < 0)
++    {
++        /* 7824: asked off the main loop; the ticket stays until the answer is here */
++        set_error( STATUS_PENDING );
++        return;
++    }
+     unlink( path );
+     if (uid == ~0u || !uid || uid == sg_system_prefix_uid || expires < (long long)time( NULL )) return;
+     clear_error();
+-    if (!(token = token_create_for_uid( TRUE, -1, TokenElevationTypeDefault, current->process->session_id, uid )))
++    if (!(token = token_create_for_uid_admin( TRUE, -1, TokenElevationTypeDefault, current->process->session_id,
++                                              uid, admin )))
+         return;
+     token->sg_logon_for = current->process->peer_uid;  /* may run programs as it (1711) */
+     if (req->type == 3 /* LOGON32_LOGON_NETWORK */)
+-- 
+2.47.3
+
