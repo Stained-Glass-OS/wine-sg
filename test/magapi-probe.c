@@ -2,10 +2,11 @@
  * magapi-gate.sh. Prints one line per call. */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 typedef struct { float transform[5][5]; } MAGCOLOREFFECT;
 
-int main(void)
+int main(int argc, char **argv)
 {
     HMODULE m = LoadLibraryA("magnification.dll");
     BOOL (WINAPI *init)(void), (WINAPI *uninit)(void);
@@ -14,6 +15,7 @@ int main(void)
     MAGCOLOREFFECT inv = {{ { -1, 0, 0, 0, 0 }, { 0, -1, 0, 0, 0 }, { 0, 0, -1, 0, 0 }, { 0, 0, 0, 1, 0 }, { 1, 1, 1, 0, 1 } }};
     float level = 0; int x = -1, y = -1;
 
+    if (argc > 1 && !strcmp(argv[1], "aware")) SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (!m) { printf("no dll\n"); return 1; }
     init = (void *)GetProcAddress(m, "MagInitialize");
     uninit = (void *)GetProcAddress(m, "MagUninitialize");

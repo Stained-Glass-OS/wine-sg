@@ -10,7 +10,10 @@
 #   - what the compositor refuses (ERR) fails, as does a level below 1
 #   - MagUninitialize ends the connection (so magnification ends), 64- and 32-bit callers alike
 #   - with no compositor the calls fail (Magnifier then draws its views itself) and nothing hangs
-#   WINE=/opt/wine-sg/bin/wine test/magapi-gate.sh   (mutant SG_MUTANT_MAG_KEEP_CONNECTION, unixlib.c)
+#   - the compositor is given physical pixels: at 200% (LogPixels 192) a DPI-unaware caller's offsets
+#     are doubled, a per-monitor aware caller's kept; less the virtual screen's top left (7846)
+#   WINE=/opt/wine-sg/bin/wine test/magapi-gate.sh   (mutants SG_MUTANT_MAG_KEEP_CONNECTION, unixlib.c;
+#   SG_MUTANT_MAG_LOGICAL_COORDS, magnification.c)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -92,5 +95,18 @@ took=$(( $(date +%s) - start ))
 printf '%s\n' "$out" | grep -qx "set 0" && printf '%s\n' "$out" | grep -qx "lens 0" && printf '%s\n' "$out" | grep -qx done \
     && pass "with no compositor the calls fail (Magnifier draws its views itself), in ${took} s" \
     || fail "with no compositor: $(printf '%s' "$out" | tr '\n' ' ')"
+# 200%: a DPI-unaware program's screen point is the physical one halved
+"$WINE" reg add 'HKCU\Control Panel\Desktop' /v LogPixels /t REG_DWORD /d 192 /f >/dev/null 2>&1
+"$WINESERVER" -w
+for mode in unaware aware; do
+    : > "$T/comp.log"
+    out=$(SG_LOCK_CONTROL="$T/ctl.sock" timeout -s KILL 60 "$WINE" "$T/probe-$a.exe" $mode 2>/dev/null | tr -d '\r')
+    sleep 0.5
+    want="LINE full 250 100 50"; [ $mode = unaware ] && want="LINE full 250 200 100"
+    got=$(grep '^LINE full' "$T/comp.log")
+    [ "$got" = "$want" ] && printf '%s\n' "$out" | grep -qx "get 250 100 50" \
+        && pass "at 200%, a DPI-$mode caller's offset 100,50 reaches the compositor as ${want#LINE full 250 } (and reads back as given)" \
+        || fail "at 200%, DPI-$mode: the compositor was told '${got#LINE }' (wanted '${want#LINE }'); $(printf '%s' "$out" | grep '^get')"
+done
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
