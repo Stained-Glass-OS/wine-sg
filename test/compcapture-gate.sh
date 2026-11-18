@@ -10,7 +10,8 @@
 # person's) with XWayland, Wine's shell desktop and sg-deskcomp, a window of
 # four colours in one process (test/compcapture-probe.c), and a red Linux
 # window (xterm). Another process reads the screen through
-#   - GDI (GetDC(NULL) + BitBlt), 64- and 32-bit,
+#   - GDI (GetDC(NULL) + BitBlt), 64- and 32-bit; 10000 GetPixel calls under 5
+#     seconds (the picture reused for a frame) and a change seen right after,
 #   - DXGI Desktop Duplication (Wine's dxgi; and DXVK's with SG_DXVK_DIR),
 #   - Windows.Graphics.Capture: a monitor item, a window item, no frame while
 #     nothing changes, the pointer drawn with IsCursorCaptureEnabled, the
@@ -29,6 +30,7 @@
 #   SG_DXVK_DIR=<dir with DXVK's x64 dxgi.dll and d3d11.dll> to test DXVK's too
 # Mutants (wine-sg): SG_MUTANT_CAPTURE_X_ONLY (sg_wlcapture.c, the X server's
 # picture as before), SG_MUTANT_CAPTURE_RB_SWAPPED (sg_wlcapture.c),
+# SG_MUTANT_CAPTURE_CACHE_FOREVER (sg_wlcapture.c, the picture never renewed),
 # SG_MUTANT_WGC_UNSUPPORTED, SG_MUTANT_WGC_ALWAYS_NEW, SG_MUTANT_WGC_NO_CURSOR,
 # SG_MUTANT_WGC_NO_BORDER (graphicscapture); DXVK's (sg-image dxvk/patches/0012,
 # built with the define and given as SG_DXVK_DIR): SG_MUTANT_DXVKDUP_RB_SWAPPED,
@@ -95,6 +97,7 @@ LX=\$((\${X:-0} + \${WIDTH:-0} / 2)); LY=\$((\${Y:-0} + \${HEIGHT:-0} / 2))
 echo "linux \$LX \$LY" > "$T/out.txt"
 run() { timeout -s KILL 90 "$WINE" "\$@" 2>>"$T/probe.err" </dev/null; }
 for api in gdi dxgi wgcmon wgcwin wgcstatic wgccursor; do run probe.exe \$api nowin \$LX \$LY >> "$T/out.txt"; done
+run probe.exe pixloop >> "$T/out.txt"
 for api in gdi dxgi wgcmon; do run probe32.exe \$api nowin \$LX \$LY | sed 's/^/x32 /' >> "$T/out.txt"; done
 if [ -f dxvk/probe-x86_64.exe ]; then
     ( cd dxvk && WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d;dxgi,d3d11=n" timeout -s KILL 90 "$WINE" probe-x86_64.exe dxgi nowin \$LX \$LY 2>/dev/null </dev/null | sed 's/^dxgi/dxvk/' >> "$T/out.txt" )
@@ -142,6 +145,10 @@ case "$(line wgcstatic)" in "wgcstatic new=0"*) pass "WGC: no new frame while no
 case "$(line wgccursor)" in "wgccursor dark=0"*|"") fail "WGC: the pointer is not drawn: $(line wgccursor)";; *) pass "WGC: the pointer is drawn (IsCursorCaptureEnabled)";; esac
 RULES="held=ok dirty=ok timeout=ok formats=ok"
 case "$(line dxgirules)" in *"$RULES"*) pass "DXGI duplication's rules (a held frame, the dirty rectangle, a timeout while nothing changes, the formats list)";; *) fail "DXGI rules: $(line dxgirules)";; esac
+pl=$(line pixloop)
+ms=$(echo "$pl" | sed -n 's/^pixloop ms=\([0-9]*\).*/\1/p')
+[ -n "$ms" ] && [ "$ms" -lt 5000 ] && pass "10000 GetPixel calls on the screen in $ms ms (a capture a frame, not a call)" || fail "GetPixel loop: ${pl:-no answer}"
+case "$pl" in *"before=FF0000 after=00FF00"*) pass "...and a change on the screen is seen on the next read";; *) fail "GetPixel after a change: $pl";; esac
 check "x32 gdi" "GDI, a 32-bit program"
 check "x32 dxgi" "DXGI, a 32-bit program"
 check "x32 wgcmon size=1280x720 wgcmon" "WGC, a 32-bit program"

@@ -11,6 +11,7 @@
  *     wgcstatic  ...and no new frame while nothing changes
  *     wgccursor  ...monitor with IsCursorCaptureEnabled: the pointer drawn
  *     wgchold    ...window, the session held six seconds (its border)
+ *     pixloop    10000 GetPixel calls timed, then a repaint seen at once
  *
  * Prints "<api> [atX,Y=RRGGBB] q0=RRGGBB q1=... q2=... q3=..." (the quadrants'
  * centres: red, green, blue, white expected), "wgcstatic new=N",
@@ -35,7 +36,7 @@
 #define WY 100
 #define WW 400
 #define WH 300
-static const COLORREF quad[4] = { RGB(255, 0, 0), RGB(0, 255, 0), RGB(0, 0, 255), RGB(255, 255, 255) };
+static COLORREF quad[4] = { RGB(255, 0, 0), RGB(0, 255, 0), RGB(0, 0, 255), RGB(255, 255, 255) };
 static const POINT centre[4] = { { WX + WW / 4, WY + WH / 4 }, { WX + 3 * WW / 4, WY + WH / 4 },
                                  { WX + WW / 4, WY + 3 * WH / 4 }, { WX + 3 * WW / 4, WY + 3 * WH / 4 } };
 
@@ -302,6 +303,30 @@ static int do_wgc(BOOL window_item, int mode)
     return 0;
 }
 
+/* a loop of GetPixel calls on the screen DC (AutoHotkey's PixelGetColor, colour
+ * pickers): fast -- the compositor's picture is reused for a frame -- and a
+ * change on the screen seen on the next read after it is shown */
+static int do_pixloop(HWND hwnd)
+{
+    HDC dc = GetDC(NULL);
+    DWORD start = GetTickCount(), ms;
+    COLORREF c = 0, before, after;
+    int i;
+
+    for (i = 0; i < 10000; i++) c = GetPixel(dc, centre[0].x, centre[0].y);
+    ms = GetTickCount() - start;
+    before = c;
+    quad[0] = RGB(0, 255, 0);
+    InvalidateRect(hwnd, NULL, FALSE);
+    UpdateWindow(hwnd);
+    pump(150);
+    after = GetPixel(dc, centre[0].x, centre[0].y);
+    ReleaseDC(NULL, dc);
+    printf("pixloop ms=%lu before=%02X%02X%02X after=%02X%02X%02X\n", ms, GetRValue(before), GetGValue(before),
+           GetBValue(before), GetRValue(after), GetGValue(after), GetBValue(after));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     WNDCLASSA wc = { 0 };
@@ -324,6 +349,7 @@ int main(int argc, char **argv)
     else if (argc > 1 && !strcmp(argv[1], "wgcstatic")) rc = do_wgc(TRUE, 1);
     else if (argc > 1 && !strcmp(argv[1], "wgccursor")) rc = do_wgc(FALSE, 2);
     else if (argc > 1 && !strcmp(argv[1], "wgchold")) rc = do_wgc(TRUE, 3);
+    else if (argc > 1 && !strcmp(argv[1], "pixloop")) rc = do_pixloop(hwnd);
     else printf("usage: capprobe gdi|dxgi\n");
     pump(300);
     if (hwnd) DestroyWindow(hwnd);
