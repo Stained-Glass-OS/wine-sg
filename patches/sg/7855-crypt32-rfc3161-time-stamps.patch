@@ -1,0 +1,784 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] crypt32: CryptRetrieveTimeStamp and CryptVerifyTimeStampSignature (RFC 3161 time stamps).
+
+CryptRetrieveTimeStamp hashes the data (or takes the hash with TIMESTAMP_DONT_HASH_DATA), posts an
+RFC 3161 TimeStampReq (message imprint, optional policy, nonce, certReq, extensions) to the
+time-stamping authority over HTTP(S) (winhttp, delay-loaded), checks the response's status, and
+with TIMESTAMP_VERIFY_CONTEXT_SIGNATURE verifies the token; a nonce asked for must come back.
+CryptVerifyTimeStampSignature checks a token: CMS SignedData whose content is a TSTInfo, signed by
+a certificate from the token or the caller's store, its message imprint the data's hash. Both give
+the token and its TSTInfo as one CRYPT_TIMESTAMP_CONTEXT (CryptMemFree). wincrypt.h gains the
+RFC 3161 types, flags and prototypes. LibreOffice imports both (document signatures with a time
+stamp ended at 'unimplemented function').
+---
+diff --git a/dlls/crypt32/Makefile.in b/dlls/crypt32/Makefile.in
+index 4c92b33..7005696 100644
+--- a/dlls/crypt32/Makefile.in
++++ b/dlls/crypt32/Makefile.in
+@@ -3,7 +3,7 @@ MODULE    = crypt32.dll
+ UNIXLIB   = crypt32.so
+ IMPORTLIB = crypt32
+ IMPORTS   = user32 advapi32 bcrypt
+-DELAYIMPORTS = cryptnet ncrypt
++DELAYIMPORTS = cryptnet ncrypt winhttp
+ UNIX_LIBS    = $(SECURITY_LIBS)
+ UNIX_CFLAGS  = $(GNUTLS_CFLAGS)
+ 
+@@ -35,4 +35,5 @@ SOURCES = \
+ 	sip.c \
+ 	store.c \
+ 	str.c \
++	timestamp.c \
+ 	unixlib.c
+diff --git a/dlls/crypt32/crypt32.spec b/dlls/crypt32/crypt32.spec
+index c8a4b24..79a8570 100644
+--- a/dlls/crypt32/crypt32.spec
++++ b/dlls/crypt32/crypt32.spec
+@@ -169,6 +169,7 @@
+ @ stdcall CryptProtectMemory(ptr long long)
+ @ stdcall CryptQueryObject(long ptr long long long ptr ptr ptr ptr ptr ptr)
+ @ stdcall CryptRegisterDefaultOIDFunction(long str long wstr)
++@ stdcall CryptRetrieveTimeStamp(wstr long long str ptr ptr long ptr ptr ptr)
+ @ stdcall CryptRegisterOIDFunction(long str str wstr str)
+ @ stdcall CryptRegisterOIDInfo(ptr long)
+ @ stdcall CryptSIPAddProvider(ptr)
+@@ -204,6 +205,7 @@
+ @ stdcall CryptVerifyDetachedMessageSignature(ptr long ptr long long ptr ptr ptr)
+ @ stdcall CryptVerifyMessageHash(ptr ptr long ptr ptr ptr ptr)
+ @ stdcall CryptVerifyMessageSignature(ptr long ptr long ptr ptr ptr)
++@ stdcall CryptVerifyTimeStampSignature(ptr long ptr long ptr ptr ptr ptr)
+ @ stdcall CryptVerifyMessageSignatureWithKey(ptr ptr ptr long ptr ptr)
+ @ stdcall CryptVerifySignatureU(long ptr long long wstr long) advapi32.CryptVerifySignatureW
+ @ stdcall I_CertUpdateStore(ptr ptr long long)
+diff --git a/dlls/crypt32/timestamp.c b/dlls/crypt32/timestamp.c
+new file mode 100644
+index 0000000..4dc30b6
+--- /dev/null
++++ b/dlls/crypt32/timestamp.c
+@@ -0,0 +1,639 @@
++/*
++ * RFC 3161 time stamps (wine-sg 7855)
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * CryptRetrieveTimeStamp asks a time-stamping authority for a time stamp of some data (RFC 3161:
++ * a TimeStampReq posted over HTTP as application/timestamp-query), and CryptVerifyTimeStampSignature
++ * checks one: the time-stamp token is CMS SignedData whose content is a TSTInfo; its signature must
++ * verify with the signer's certificate (in the token or the caller's store) and its message imprint
++ * must be the data's hash. Both give the token and its decoded TSTInfo as one
++ * CRYPT_TIMESTAMP_CONTEXT, freed with CryptMemFree. LibreOffice imports both (document signatures
++ * with a time stamp).
++ */
++
++#include <stdarg.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "wincrypt.h"
++#include "winhttp.h"
++#include "bcrypt.h"
++#include "wine/debug.h"
++#include "crypt32_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(crypt);
++
++/* --- DER, the little this needs -------------------------------------------------------------- */
++
++struct der
++{
++    BYTE *data;
++    DWORD len, size;
++    BOOL failed;
++};
++
++static void der_put( struct der *d, const BYTE *p, DWORD n )
++{
++    if (d->failed) return;
++    if (d->len + n > d->size)
++    {
++        DWORD size = max( d->size * 2, d->len + n + 64 );
++        BYTE *data = CryptMemRealloc( d->data, size );
++        if (!data) { d->failed = TRUE; return; }
++        d->data = data;
++        d->size = size;
++    }
++    memcpy( d->data + d->len, p, n );
++    d->len += n;
++}
++
++static void der_tlv( struct der *d, BYTE tag, const BYTE *p, DWORD n )
++{
++    BYTE hdr[6];
++    DWORD hlen = sizeof(hdr) - 1;
++
++    hdr[0] = tag;
++    CRYPT_EncodeLen( n, hdr + 1, &hlen );
++    der_put( d, hdr, 1 + hlen );
++    der_put( d, p, n );
++}
++
++/* an encoding of some structure crypt32 encodes, appended */
++static void der_encoded( struct der *d, LPCSTR type, const void *value )
++{
++    BYTE *enc;
++    DWORD n;
++
++    if (d->failed) return;
++    if (!CryptEncodeObjectEx( X509_ASN_ENCODING, type, value, CRYPT_ENCODE_ALLOC_FLAG, NULL, &enc, &n ))
++    {
++        d->failed = TRUE;
++        return;
++    }
++    der_put( d, enc, n );
++    LocalFree( enc );
++}
++
++/* reads the element at *p (< end): its tag, contents and length; *p moves past it */
++static BOOL der_next( const BYTE **p, const BYTE *end, BYTE *tag, const BYTE **content, DWORD *len,
++                      const BYTE **whole, DWORD *whole_len )
++{
++    const BYTE *start = *p;
++    DWORD n, lenbytes;
++
++    if (end - *p < 2) return FALSE;
++    *tag = (*p)[0];
++    /* DER: definite lengths only */
++    if ((*p)[1] < 0x80)
++    {
++        n = (*p)[1];
++        lenbytes = 1;
++    }
++    else
++    {
++        DWORD i, count = (*p)[1] & 0x7f;
++        if (!count || count > 4 || (DWORD)(end - *p) < 2 + count) return FALSE;
++        for (i = 0, n = 0; i < count; i++) n = n << 8 | (*p)[2 + i];
++        lenbytes = 1 + count;
++    }
++    if ((DWORD)(end - *p) < 1 + lenbytes || n > (DWORD)(end - *p) - 1 - lenbytes) return FALSE;
++    *content = *p + 1 + lenbytes;
++    *len = n;
++    *p = *content + n;
++    if (whole) *whole = start;
++    if (whole_len) *whole_len = *p - start;
++    return TRUE;
++}
++
++/* --- TSTInfo ------------------------------------------------------------------------------- */
++
++struct tst
++{
++    DWORD version;
++    char *policy;
++    char *hash_oid;
++    const BYTE *hash; DWORD hash_len;
++    BYTE *serial; DWORD serial_len;        /* little-endian, as a CRYPT_INTEGER_BLOB */
++    FILETIME time;
++    BOOL has_accuracy;
++    CRYPT_TIMESTAMP_ACCURACY accuracy;
++    BOOL ordering;
++    BYTE *nonce; DWORD nonce_len;
++    const BYTE *tsa; DWORD tsa_len;
++};
++
++static void free_tst( struct tst *t )
++{
++    LocalFree( t->policy );
++    LocalFree( t->hash_oid );
++    LocalFree( t->serial );
++    LocalFree( t->nonce );
++}
++
++static char *decode_oid( const BYTE *p, DWORD n )
++{
++    char **oid;
++    DWORD size;
++    char *ret;
++
++    if (!CryptDecodeObjectEx( X509_ASN_ENCODING, X509_OBJECT_IDENTIFIER, p, n, CRYPT_DECODE_ALLOC_FLAG, NULL,
++                              &oid, &size )) return NULL;
++    ret = LocalAlloc( LMEM_FIXED, strlen( *oid ) + 1 );
++    if (ret) strcpy( ret, *oid );
++    LocalFree( oid );
++    return ret;
++}
++
++static BYTE *decode_integer( const BYTE *p, DWORD n, DWORD *len )
++{
++    CRYPT_INTEGER_BLOB *blob;
++    DWORD size;
++    BYTE *ret;
++
++    if (!CryptDecodeObjectEx( X509_ASN_ENCODING, X509_MULTI_BYTE_INTEGER, p, n, CRYPT_DECODE_ALLOC_FLAG, NULL,
++                              &blob, &size )) return NULL;
++    if ((ret = LocalAlloc( LMEM_FIXED, blob->cbData ? blob->cbData : 1 ))) memcpy( ret, blob->pbData, blob->cbData );
++    *len = blob->cbData;
++    LocalFree( blob );
++    return ret;
++}
++
++static DWORD small_integer( const BYTE *p, DWORD n )
++{
++    DWORD v = 0, i;
++    for (i = 0; i < n && i < 4; i++) v = v << 8 | p[i];
++    return v;
++}
++
++/* TSTInfo ::= SEQUENCE { version, policy, messageImprint, serialNumber, genTime, accuracy OPTIONAL,
++ *     ordering BOOLEAN DEFAULT FALSE, nonce INTEGER OPTIONAL, tsa [0] GeneralName OPTIONAL,
++ *     extensions [1] IMPLICIT Extensions OPTIONAL } */
++static BOOL parse_tst( const BYTE *data, DWORD size, struct tst *t )
++{
++    const BYTE *p = data, *end = data + size, *c, *w, *q, *qend, *x;
++    DWORD n, wn, xn;
++    BYTE tag;
++
++    memset( t, 0, sizeof(*t) );
++    if (!der_next( &p, end, &tag, &c, &n, NULL, NULL ) || tag != 0x30) return FALSE;
++    p = c; end = c + n;
++    /* version */
++    if (!der_next( &p, end, &tag, &c, &n, NULL, NULL ) || tag != 0x02) return FALSE;
++    t->version = small_integer( c, n );
++    /* policy */
++    if (!der_next( &p, end, &tag, &c, &n, &w, &wn ) || tag != 0x06 || !(t->policy = decode_oid( w, wn ))) goto fail;
++    /* messageImprint ::= SEQUENCE { hashAlgorithm AlgorithmIdentifier, hashedMessage OCTET STRING } */
++    if (!der_next( &p, end, &tag, &c, &n, NULL, NULL ) || tag != 0x30) goto fail;
++    q = c; qend = c + n;
++    if (!der_next( &q, qend, &tag, &x, &xn, NULL, NULL ) || tag != 0x30) goto fail;
++    {
++        const BYTE *a = x, *aend = x + xn, *ac;
++        DWORD an, wl;
++        if (!der_next( &a, aend, &tag, &ac, &an, &w, &wl ) || tag != 0x06 || !(t->hash_oid = decode_oid( w, wl ))) goto fail;
++    }
++    if (!der_next( &q, qend, &tag, &t->hash, &t->hash_len, NULL, NULL ) || tag != 0x04) goto fail;
++    /* serialNumber */
++    if (!der_next( &p, end, &tag, &c, &n, &w, &wn ) || tag != 0x02 || !(t->serial = decode_integer( w, wn, &t->serial_len )))
++        goto fail;
++    /* genTime */
++    if (!der_next( &p, end, &tag, &c, &n, &w, &wn ) || tag != 0x18) goto fail;
++    {
++        DWORD fsize = sizeof(t->time);
++        if (!CryptDecodeObjectEx( X509_ASN_ENCODING, X509_CHOICE_OF_TIME, w, wn, 0, NULL, &t->time, &fsize )) goto fail;
++    }
++    /* the optional rest */
++    while (p < end)
++    {
++        if (!der_next( &p, end, &tag, &c, &n, &w, &wn )) goto fail;
++        switch (tag)
++        {
++        case 0x30:   /* accuracy ::= SEQUENCE { seconds INTEGER OPTIONAL, millis [0], micros [1] } */
++            t->has_accuracy = TRUE;
++            q = c; qend = c + n;
++            while (q < qend)
++            {
++                if (!der_next( &q, qend, &tag, &x, &xn, NULL, NULL )) goto fail;
++                if (tag == 0x02) t->accuracy.dwSeconds = small_integer( x, xn );
++                else if (tag == 0x80) t->accuracy.dwMillis = small_integer( x, xn );
++                else if (tag == 0x81) t->accuracy.dwMicros = small_integer( x, xn );
++            }
++            break;
++        case 0x01: t->ordering = n && c[0]; break;
++        case 0x02: if (!(t->nonce = decode_integer( w, wn, &t->nonce_len ))) goto fail; break;
++        case 0xa0: t->tsa = c; t->tsa_len = n; break;
++        default: break;   /* extensions: not given back */
++        }
++    }
++    return TRUE;
++
++fail:
++    free_tst( t );
++    return FALSE;
++}
++
++/* one block: the context, its info, and everything they point to */
++static PCRYPT_TIMESTAMP_CONTEXT make_context( const BYTE *token, DWORD token_len, const struct tst *t )
++{
++    DWORD size = sizeof(CRYPT_TIMESTAMP_CONTEXT) + sizeof(CRYPT_TIMESTAMP_INFO) + sizeof(CRYPT_TIMESTAMP_ACCURACY) +
++                 token_len + strlen( t->policy ) + 1 + strlen( t->hash_oid ) + 1 + t->hash_len + t->serial_len +
++                 t->nonce_len + t->tsa_len + 16;
++    CRYPT_TIMESTAMP_CONTEXT *ctx;
++    CRYPT_TIMESTAMP_INFO *info;
++    BYTE *p;
++
++    if (!(ctx = CryptMemAlloc( size ))) return NULL;
++    memset( ctx, 0, size );
++    info = (CRYPT_TIMESTAMP_INFO *)(ctx + 1);
++    p = (BYTE *)(info + 1);
++    ctx->pTimeStamp = info;
++    if (t->has_accuracy)
++    {
++        info->pvAccuracy = (CRYPT_TIMESTAMP_ACCURACY *)p;
++        *info->pvAccuracy = t->accuracy;
++    }
++    p += sizeof(CRYPT_TIMESTAMP_ACCURACY);
++    ctx->pbEncoded = p; ctx->cbEncoded = token_len; memcpy( p, token, token_len ); p += token_len;
++    info->dwVersion = t->version;
++    info->pszTSAPolicyId = (char *)p; strcpy( (char *)p, t->policy ); p += strlen( t->policy ) + 1;
++    info->HashAlgorithm.pszObjId = (char *)p; strcpy( (char *)p, t->hash_oid ); p += strlen( t->hash_oid ) + 1;
++    info->HashedMessage.pbData = p; info->HashedMessage.cbData = t->hash_len; memcpy( p, t->hash, t->hash_len ); p += t->hash_len;
++    info->SerialNumber.pbData = p; info->SerialNumber.cbData = t->serial_len; memcpy( p, t->serial, t->serial_len ); p += t->serial_len;
++    info->ftTime = t->time;
++    info->fOrdering = t->ordering;
++    if (t->nonce_len)
++    {
++        info->Nonce.pbData = p; info->Nonce.cbData = t->nonce_len; memcpy( p, t->nonce, t->nonce_len ); p += t->nonce_len;
++    }
++    if (t->tsa_len)
++    {
++        info->Tsa.pbData = p; info->Tsa.cbData = t->tsa_len; memcpy( p, t->tsa, t->tsa_len );
++    }
++    return ctx;
++}
++
++/* the data's hash with the algorithm OID names */
++static BOOL hash_data( const char *oid, const BYTE *data, DWORD len, BYTE *hash, DWORD *hash_len )
++{
++    static const struct { const char *oid; const WCHAR *name; } algs[] =
++    {
++        { szOID_OIWSEC_sha1, BCRYPT_SHA1_ALGORITHM },
++        { szOID_NIST_sha256, BCRYPT_SHA256_ALGORITHM },
++        { szOID_NIST_sha384, BCRYPT_SHA384_ALGORITHM },
++        { szOID_NIST_sha512, BCRYPT_SHA512_ALGORITHM },
++        { szOID_RSA_MD5, BCRYPT_MD5_ALGORITHM },
++    };
++    const WCHAR *name = NULL;
++    BCRYPT_ALG_HANDLE alg;
++    DWORD size, got, i;
++    NTSTATUS status;
++
++    for (i = 0; i < ARRAY_SIZE(algs); i++) if (!strcmp( algs[i].oid, oid )) name = algs[i].name;
++    if (!name) return FALSE;
++    if (BCryptOpenAlgorithmProvider( &alg, name, NULL, 0 )) return FALSE;
++    status = BCryptGetProperty( alg, BCRYPT_HASH_LENGTH, (BYTE *)&size, sizeof(size), &got, 0 );
++    if (!status && size <= *hash_len) status = BCryptHash( alg, NULL, 0, (BYTE *)data, len, hash, size );
++    else if (!status) status = 1;   /* the hash would not fit */
++    BCryptCloseAlgorithmProvider( alg, 0 );
++    if (status) return FALSE;
++    *hash_len = size;
++    return TRUE;
++}
++
++/* --- verification ------------------------------------------------------------------------- */
++
++static BOOL verify_token( const BYTE *token, DWORD token_len, const BYTE *hash, DWORD hash_len, const BYTE *data,
++                          DWORD data_len, HCERTSTORE extra, PCRYPT_TIMESTAMP_CONTEXT *ret_ctx, PCCERT_CONTEXT *ret_signer,
++                          HCERTSTORE *ret_store )
++{
++    HCRYPTMSG msg = NULL;
++    HCERTSTORE store = NULL, all = NULL;
++    PCCERT_CONTEXT signer = NULL;
++    CERT_INFO *signer_info = NULL;
++    BYTE *content = NULL, digest[64];
++    char *inner = NULL;
++    DWORD size, digest_len = sizeof(digest);
++    struct tst t;
++    BOOL ok = FALSE, have_tst = FALSE;
++    DWORD err = CRYPT_E_BAD_ENCODE;
++
++    if (!(msg = CryptMsgOpenToDecode( X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, 0, 0, NULL, NULL ))) return FALSE;
++    if (!CryptMsgUpdate( msg, token, token_len, TRUE )) { err = GetLastError(); goto done; }
++
++    /* the content is a TSTInfo */
++    size = 0;
++    if (!CryptMsgGetParam( msg, CMSG_INNER_CONTENT_TYPE_PARAM, 0, NULL, &size ) || !(inner = CryptMemAlloc( size )) ||
++        !CryptMsgGetParam( msg, CMSG_INNER_CONTENT_TYPE_PARAM, 0, inner, &size )) goto done;
++    if (strcmp( inner, szOID_TIMESTAMP_TOKEN ))
++    {
++        WARN( "content is %s, not a TSTInfo\n", debugstr_a(inner) );
++        goto done;
++    }
++    size = 0;
++    if (!CryptMsgGetParam( msg, CMSG_CONTENT_PARAM, 0, NULL, &size ) || !(content = CryptMemAlloc( size )) ||
++        !CryptMsgGetParam( msg, CMSG_CONTENT_PARAM, 0, content, &size )) goto done;
++    if (!(have_tst = parse_tst( content, size, &t ))) goto done;
++
++    /* the message imprint is the data's hash */
++    if (!hash)
++    {
++        if (!hash_data( t.hash_oid, data, data_len, digest, &digest_len ))
++        {
++            err = NTE_BAD_ALGID;
++            goto done;
++        }
++        hash = digest;
++        hash_len = digest_len;
++    }
++#ifndef SG_MUTANT_TS_NO_IMPRINT_CHECK
++    if (hash_len != t.hash_len || memcmp( hash, t.hash, hash_len ))
++    {
++        WARN( "message imprint is not the data's hash\n" );
++        err = NTE_BAD_HASH;
++        goto done;
++    }
++#endif
++
++    /* the signature, with the signer's certificate from the token or the caller's store */
++    if (!(store = CertOpenStore( CERT_STORE_PROV_MSG, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, 0, msg ))) goto done;
++    if (!(all = CertOpenStore( CERT_STORE_PROV_COLLECTION, 0, 0, 0, NULL ))) goto done;
++    CertAddStoreToCollection( all, store, 0, 0 );
++    if (extra) CertAddStoreToCollection( all, extra, 0, 0 );
++    size = 0;
++    if (!CryptMsgGetParam( msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, NULL, &size ) || !(signer_info = CryptMemAlloc( size )) ||
++        !CryptMsgGetParam( msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, signer_info, &size )) goto done;
++    if (!(signer = CertGetSubjectCertificateFromStore( all, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, signer_info )))
++    {
++        err = CRYPT_E_SIGNER_NOT_FOUND;
++        goto done;
++    }
++    if (!CryptMsgControl( msg, 0, CMSG_CTRL_VERIFY_SIGNATURE, signer->pCertInfo ))
++    {
++        err = GetLastError();
++        goto done;
++    }
++
++    if (ret_ctx && !(*ret_ctx = make_context( token, token_len, &t )))
++    {
++        err = ERROR_OUTOFMEMORY;
++        goto done;
++    }
++    if (ret_signer) *ret_signer = CertDuplicateCertificateContext( signer );
++    if (ret_store) *ret_store = CertDuplicateStore( store );
++    ok = TRUE;
++
++done:
++    if (have_tst) free_tst( &t );
++    if (signer) CertFreeCertificateContext( signer );
++    if (all) CertCloseStore( all, 0 );
++    if (store) CertCloseStore( store, 0 );
++    CryptMemFree( signer_info );
++    CryptMemFree( content );
++    CryptMemFree( inner );
++    CryptMsgClose( msg );
++    if (!ok) SetLastError( err );
++    return ok;
++}
++
++/***********************************************************************
++ *      CryptVerifyTimeStampSignature (CRYPT32.@)
++ */
++BOOL WINAPI CryptVerifyTimeStampSignature( const BYTE *token, DWORD token_len, const BYTE *data, DWORD data_len,
++                                           HCERTSTORE extra, PCRYPT_TIMESTAMP_CONTEXT *ctx, PCCERT_CONTEXT *signer,
++                                           HCERTSTORE *store )
++{
++    TRACE( "(%p, %lu, %p, %lu, %p, %p, %p, %p)\n", token, token_len, data, data_len, extra, ctx, signer, store );
++
++    if (ctx) *ctx = NULL;
++    if (signer) *signer = NULL;
++    if (store) *store = NULL;
++    if (!token || !token_len || !ctx)
++    {
++        SetLastError( E_INVALIDARG );
++        return FALSE;
++    }
++    return verify_token( token, token_len, NULL, 0, data, data_len, extra, ctx, signer, store );
++}
++
++/* --- retrieval ----------------------------------------------------------------------------- */
++
++/* TimeStampReq ::= SEQUENCE { version INTEGER (v1), messageImprint, reqPolicy OPTIONAL,
++ *     nonce INTEGER OPTIONAL, certReq BOOLEAN DEFAULT FALSE, extensions [0] OPTIONAL } */
++static BOOL build_request( const char *hash_oid, const BYTE *hash, DWORD hash_len, const CRYPT_TIMESTAMP_PARA *para,
++                           struct der *out )
++{
++    static const BYTE version[] = { 0x02, 0x01, 0x01 }, null[] = { 0x05, 0x00 }, yes[] = { 0x01, 0x01, 0xff };
++    struct der alg = {0}, imprint = {0}, body = {0};
++
++    der_encoded( &alg, X509_OBJECT_IDENTIFIER, &hash_oid );
++    der_put( &alg, null, sizeof(null) );
++    der_tlv( &imprint, 0x30, alg.data, alg.len );
++    der_tlv( &imprint, 0x04, hash, hash_len );
++
++    der_put( &body, version, sizeof(version) );
++    der_tlv( &body, 0x30, imprint.data, imprint.len );
++    if (para && para->pszTSAPolicyId) der_encoded( &body, X509_OBJECT_IDENTIFIER, &para->pszTSAPolicyId );
++    if (para && para->Nonce.cbData) der_encoded( &body, X509_MULTI_BYTE_INTEGER, &para->Nonce );
++    if (para && para->fRequestCerts) der_put( &body, yes, sizeof(yes) );
++    if (para && para->cExtension)
++    {
++        CERT_EXTENSIONS exts = { para->cExtension, para->rgExtension };
++        struct der ext = {0};
++        der_encoded( &ext, X509_EXTENSIONS, &exts );
++        der_tlv( &body, 0xa0, ext.data, ext.len );
++        if (ext.failed) body.failed = TRUE;
++        CryptMemFree( ext.data );
++    }
++    der_tlv( out, 0x30, body.data, body.len );
++    if (alg.failed || imprint.failed || body.failed) out->failed = TRUE;
++    CryptMemFree( alg.data );
++    CryptMemFree( imprint.data );
++    CryptMemFree( body.data );
++    return !out->failed;
++}
++
++static BOOL post_request( const WCHAR *url, DWORD timeout, DWORD flags, const BYTE *req, DWORD req_len, struct der *resp )
++{
++    static const WCHAR type[] = L"Content-Type: application/timestamp-query\r\n";
++    URL_COMPONENTS uc = { sizeof(uc) };
++    WCHAR host[256], path[2048];
++    HINTERNET session = NULL, conn = NULL, request = NULL;
++    DWORD status = 0, size = sizeof(status), got;
++    BYTE buf[4096];
++    BOOL ok = FALSE;
++
++    uc.lpszHostName = host; uc.dwHostNameLength = ARRAY_SIZE(host);
++    uc.lpszUrlPath = path; uc.dwUrlPathLength = ARRAY_SIZE(path);
++    if (!WinHttpCrackUrl( url, 0, 0, &uc ))
++    {
++        SetLastError( CRYPT_E_INVALID_MSG_TYPE );
++        return FALSE;
++    }
++    if (!(session = WinHttpOpen( L"Microsoft-CryptoAPI/10.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, NULL, NULL, 0 )))
++        return FALSE;
++    if (timeout) WinHttpSetTimeouts( session, timeout, timeout, timeout, timeout );
++    if (!(conn = WinHttpConnect( session, host, uc.nPort, 0 ))) goto done;
++    if (!(request = WinHttpOpenRequest( conn, L"POST", path[0] ? path : L"/", NULL, NULL, NULL,
++                                        uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0 ))) goto done;
++    if (flags & TIMESTAMP_NO_AUTH_RETRIEVAL)
++    {
++        DWORD policy = WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH;
++        WinHttpSetOption( request, WINHTTP_OPTION_AUTOLOGON_POLICY, &policy, sizeof(policy) );
++    }
++    if (!WinHttpSendRequest( request, type, -1, (void *)req, req_len, req_len, 0 ) ||
++        !WinHttpReceiveResponse( request, NULL )) goto done;
++    if (!WinHttpQueryHeaders( request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &size,
++                              NULL ) || status != 200)
++    {
++        WARN( "HTTP status %lu\n", status );
++        SetLastError( ERROR_WINHTTP_INVALID_URL );
++        goto done;
++    }
++    while (WinHttpReadData( request, buf, sizeof(buf), &got ) && got) der_put( resp, buf, got );
++    ok = !resp->failed && resp->len;
++    if (!ok) SetLastError( CRYPT_E_BAD_ENCODE );
++
++done:
++    if (request) WinHttpCloseHandle( request );
++    if (conn) WinHttpCloseHandle( conn );
++    WinHttpCloseHandle( session );
++    return ok;
++}
++
++/***********************************************************************
++ *      CryptRetrieveTimeStamp (CRYPT32.@)
++ */
++BOOL WINAPI CryptRetrieveTimeStamp( const WCHAR *url, DWORD flags, DWORD timeout, const char *hash_oid,
++                                    const CRYPT_TIMESTAMP_PARA *para, const BYTE *data, DWORD data_len,
++                                    PCRYPT_TIMESTAMP_CONTEXT *ctx, PCCERT_CONTEXT *signer, HCERTSTORE *store )
++{
++    struct der req = {0}, resp = {0};
++    const BYTE *p, *end, *c, *token = NULL, *w;
++    BYTE tag, digest[64];
++    const BYTE *hash;
++    DWORD n, hash_len, token_len = 0, wn, status;
++    BOOL ok = FALSE;
++
++    TRACE( "(%s, %#lx, %lu, %s, %p, %p, %lu, %p, %p, %p)\n", debugstr_w(url), flags, timeout, debugstr_a(hash_oid),
++           para, data, data_len, ctx, signer, store );
++
++    if (ctx) *ctx = NULL;
++    if (signer) *signer = NULL;
++    if (store) *store = NULL;
++    if (!url || !hash_oid || !data || !data_len || !ctx)
++    {
++        SetLastError( E_INVALIDARG );
++        return FALSE;
++    }
++
++    /* the data's hash, or the hash the caller gives */
++    if (flags & TIMESTAMP_DONT_HASH_DATA)
++    {
++        hash = data;
++        hash_len = data_len;
++    }
++    else
++    {
++        hash_len = sizeof(digest);
++        if (!hash_data( hash_oid, data, data_len, digest, &hash_len ))
++        {
++            SetLastError( NTE_BAD_ALGID );
++            return FALSE;
++        }
++        hash = digest;
++    }
++
++    if (!build_request( hash_oid, hash, hash_len, para, &req ))
++    {
++        SetLastError( ERROR_OUTOFMEMORY );
++        goto done;
++    }
++    if (!post_request( url, timeout, flags, req.data, req.len, &resp )) goto done;
++
++    /* TimeStampResp ::= SEQUENCE { status PKIStatusInfo, timeStampToken ContentInfo OPTIONAL } */
++    p = resp.data; end = resp.data + resp.len;
++    SetLastError( CRYPT_E_BAD_ENCODE );
++    if (!der_next( &p, end, &tag, &c, &n, NULL, NULL ) || tag != 0x30) goto done;
++    p = c; end = c + n;
++    if (!der_next( &p, end, &tag, &c, &n, NULL, NULL ) || tag != 0x30) goto done;
++    {
++        const BYTE *q = c, *qend = c + n, *x;
++        DWORD xn;
++        if (!der_next( &q, qend, &tag, &x, &xn, NULL, NULL ) || tag != 0x02) goto done;
++        status = small_integer( x, xn );
++    }
++    if (status != TIMESTAMP_STATUS_GRANTED && status != TIMESTAMP_STATUS_GRANTED_WITH_MODS)
++    {
++        WARN( "time-stamping authority refused: status %lu\n", status );
++        SetLastError( CRYPT_E_NOT_FOUND );
++        goto done;
++    }
++    if (!der_next( &p, end, &tag, &c, &n, &w, &wn ) || tag != 0x30) goto done;
++    token = w;
++    token_len = wn;
++
++    if (flags & TIMESTAMP_VERIFY_CONTEXT_SIGNATURE)
++        ok = verify_token( token, token_len, hash, hash_len, NULL, 0, NULL, ctx, signer, store );
++    else
++    {
++        /* not verified: the token decoded, its imprint still checked against the hash asked for */
++        HCRYPTMSG msg = CryptMsgOpenToDecode( X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, 0, 0, NULL, NULL );
++        BYTE *content = NULL;
++        struct tst t;
++        DWORD size = 0;
++
++        if (msg && CryptMsgUpdate( msg, token, token_len, TRUE ) &&
++            CryptMsgGetParam( msg, CMSG_CONTENT_PARAM, 0, NULL, &size ) && (content = CryptMemAlloc( size )) &&
++            CryptMsgGetParam( msg, CMSG_CONTENT_PARAM, 0, content, &size ) && parse_tst( content, size, &t ))
++        {
++            if (t.hash_len == hash_len && !memcmp( t.hash, hash, hash_len ))
++            {
++                if ((*ctx = make_context( token, token_len, &t ))) ok = TRUE;
++                if (ok && store) *store = CertOpenStore( CERT_STORE_PROV_MSG, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
++                                                         0, 0, msg );
++            }
++            else SetLastError( NTE_BAD_HASH );
++            free_tst( &t );
++        }
++        CryptMemFree( content );
++        if (msg) CryptMsgClose( msg );
++    }
++
++    /* the nonce asked for comes back */
++    if (ok && para && para->Nonce.cbData)
++    {
++        CRYPT_TIMESTAMP_INFO *info = (*ctx)->pTimeStamp;
++        if (info->Nonce.cbData != para->Nonce.cbData || memcmp( info->Nonce.pbData, para->Nonce.pbData, para->Nonce.cbData ))
++        {
++            WARN( "nonce mismatch\n" );
++            CryptMemFree( *ctx );
++            *ctx = NULL;
++            if (signer && *signer) { CertFreeCertificateContext( *signer ); *signer = NULL; }
++            if (store && *store) { CertCloseStore( *store, 0 ); *store = NULL; }
++            SetLastError( NTE_BAD_DATA );
++            ok = FALSE;
++        }
++    }
++
++done:
++    CryptMemFree( req.data );
++    CryptMemFree( resp.data );
++    return ok;
++}
+diff --git a/include/wincrypt.h b/include/wincrypt.h
+index 89e1e2e..57eb9a1 100644
+--- a/include/wincrypt.h
++++ b/include/wincrypt.h
+@@ -2917,6 +2917,7 @@ typedef struct _CTL_FIND_SUBJECT_PARA
+ #define szOID_RSA_contentType               "1.2.840.113549.1.9.3"
+ #define szOID_RSA_messageDigest             "1.2.840.113549.1.9.4"
+ #define szOID_RSA_signingTime               "1.2.840.113549.1.9.5"
++#define szOID_TIMESTAMP_TOKEN               "1.2.840.113549.1.9.16.1.4"
+ #define szOID_RSA_counterSign               "1.2.840.113549.1.9.6"
+ #define szOID_RSA_challengePwd              "1.2.840.113549.1.9.7"
+ #define szOID_RSA_unstructAddr              "1.2.840.113549.1.9.9"
+@@ -3318,6 +3319,9 @@ typedef struct _CTL_FIND_SUBJECT_PARA
+ #define OCSP_BASIC_RESPONSE                  ((LPCSTR)69)
+ #define CNG_RSA_PUBLIC_KEY_BLOB              ((LPCSTR)72)
+ #define X509_OBJECT_IDENTIFIER               ((LPCSTR)73)
++#define TIMESTAMP_REQUEST                    ((LPCSTR)78)
++#define TIMESTAMP_RESPONSE                   ((LPCSTR)79)
++#define TIMESTAMP_INFO                       ((LPCSTR)80)
+ #define PKCS7_SIGNER_INFO                    ((LPCSTR)500)
+ #define CMS_SIGNER_INFO                      ((LPCSTR)501)
+ 
+@@ -4693,6 +4697,64 @@ WINCRYPT32API BOOL WINAPI CryptHashMessage(PCRYPT_HASH_MESSAGE_PARA pHashPara,
+  BOOL fDetachedHash, DWORD cToBeHashed, const BYTE *rgpbToBeHashed[],
+  DWORD rgcbToBeHashed[], BYTE *pbHashedBlob, DWORD *pcbHashedBlob,
+  BYTE *pbComputedHash, DWORD *pcbComputedHash);
++typedef struct _CRYPT_TIMESTAMP_ACCURACY
++{
++    DWORD dwSeconds;
++    DWORD dwMillis;
++    DWORD dwMicros;
++} CRYPT_TIMESTAMP_ACCURACY, *PCRYPT_TIMESTAMP_ACCURACY;
++
++typedef struct _CRYPT_TIMESTAMP_INFO
++{
++    DWORD dwVersion;
++    LPSTR pszTSAPolicyId;
++    CRYPT_ALGORITHM_IDENTIFIER HashAlgorithm;
++    CRYPT_DER_BLOB HashedMessage;
++    CRYPT_INTEGER_BLOB SerialNumber;
++    FILETIME ftTime;
++    PCRYPT_TIMESTAMP_ACCURACY pvAccuracy;
++    BOOL fOrdering;
++    CRYPT_DER_BLOB Nonce;
++    CRYPT_DER_BLOB Tsa;
++    DWORD cExtension;
++    PCERT_EXTENSION rgExtension;
++} CRYPT_TIMESTAMP_INFO, *PCRYPT_TIMESTAMP_INFO;
++
++typedef struct _CRYPT_TIMESTAMP_CONTEXT
++{
++    DWORD cbEncoded;
++    BYTE *pbEncoded;
++    PCRYPT_TIMESTAMP_INFO pTimeStamp;
++} CRYPT_TIMESTAMP_CONTEXT, *PCRYPT_TIMESTAMP_CONTEXT;
++
++typedef struct _CRYPT_TIMESTAMP_PARA
++{
++    LPCSTR pszTSAPolicyId;
++    BOOL fRequestCerts;
++    CRYPT_INTEGER_BLOB Nonce;
++    DWORD cExtension;
++    PCERT_EXTENSION rgExtension;
++} CRYPT_TIMESTAMP_PARA, *PCRYPT_TIMESTAMP_PARA;
++
++#define TIMESTAMP_VERSION                       1
++#define TIMESTAMP_STATUS_GRANTED                0
++#define TIMESTAMP_STATUS_GRANTED_WITH_MODS      1
++#define TIMESTAMP_STATUS_REJECTED               2
++#define TIMESTAMP_STATUS_WAITING                3
++#define TIMESTAMP_STATUS_REVOCATION_WARNING     4
++#define TIMESTAMP_STATUS_REVOKED                5
++
++#define TIMESTAMP_DONT_HASH_DATA                0x00000001
++#define TIMESTAMP_VERIFY_CONTEXT_SIGNATURE      0x00000020
++#define TIMESTAMP_NO_AUTH_RETRIEVAL             0x00020000
++
++WINCRYPT32API BOOL WINAPI CryptRetrieveTimeStamp(LPCWSTR wszUrl, DWORD dwRetrievalFlags, DWORD dwTimeout,
++    LPCSTR pszHashId, const CRYPT_TIMESTAMP_PARA *pPara, const BYTE *pbData, DWORD cbData,
++    PCRYPT_TIMESTAMP_CONTEXT *ppTsContext, PCCERT_CONTEXT *ppTsSigner, HCERTSTORE *phStore);
++WINCRYPT32API BOOL WINAPI CryptVerifyTimeStampSignature(const BYTE *pbTSContentInfo, DWORD cbTSContentInfo,
++    const BYTE *pbData, DWORD cbData, HCERTSTORE hAdditionalStore, PCRYPT_TIMESTAMP_CONTEXT *ppTsContext,
++    PCCERT_CONTEXT *ppTsSigner, HCERTSTORE *phStore);
++
+ WINCRYPT32API BOOL WINAPI CryptVerifyMessageHash(PCRYPT_HASH_MESSAGE_PARA pHashPara,
+  BYTE *pbHashedBlob, DWORD cbHashedBlob, BYTE *pbToBeHashed,
+  DWORD *pcbToBeHashed, BYTE *pbComputedHash, DWORD *pcbComputedHash);
