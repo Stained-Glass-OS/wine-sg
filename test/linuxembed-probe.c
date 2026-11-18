@@ -108,6 +108,12 @@ int main( int argc, char **argv )
     else if (!strcmp( argv[1], "post" ) && argc == 6)   /* post CLASS TITLE MSG WPARAM (numbers: 0x... or decimal) */
         PostMessageW( hwnd, strtoul( argv[4], NULL, 0 ), strtoul( argv[5], NULL, 0 ), 0 );
     else if (!strcmp( argv[1], "endtask" )) SendMessageW( hwnd, RegisterWindowMessageW( L"SgLinuxWindowEnd" ), 0, 0 );
+    else if (!strcmp( argv[1], "style" ))   /* its style, and whether it has a title bar */
+    {
+        LONG style = GetWindowLongW( hwnd, GWL_STYLE );
+        printf( "style=%#lx caption=%d\n", style, (style & WS_CAPTION) == WS_CAPTION );
+        return 0;
+    }
     else if (!strcmp( argv[1], "rect" ))
     {
         RECT r;
