@@ -1,0 +1,386 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] vccorlib140: Platform::Details::Heap and the weak references' ControlBlock.
+
+C++/CX ref classes are allocated through Platform::Details::Heap; one with weak
+references gets its ControlBlock (the IWeakReference) in front of the object in the
+same block, pointed at from the object's __abi_FTMWeakRefData, with the strong and
+weak counts vccorlib.h's inline code works. Adds Heap::Allocate/AlignedAllocate (with
+and without a control block), AllocateException, Free/AlignedFree, the control block's
+IWeakReference (Resolve takes a strong reference only while the object lives) and
+ReleaseTarget, Platform::Delegate's constructor, GetIidsFn and
+__abi_translateCurrentException, 64- and 32-bit (cdecl/stdcall/thiscall names).
+foobar2000 2.x (PP-UWP-Interop.dll) stopped at start without them.
+---
+diff --git a/dlls/vccorlib140/vccorlib.c b/dlls/vccorlib140/vccorlib.c
+index 71fe033..3454fa2 100644
+--- a/dlls/vccorlib140/vccorlib.c
++++ b/dlls/vccorlib140/vccorlib.c
+@@ -43,6 +43,9 @@
+ #include "winstring.h"
+ #include "roapi.h"
+ #include "inspectable.h"
++#include "objbase.h"
++#include "weakreference.h"
++#include "wine/exception.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(vccorlib);
+@@ -409,6 +412,297 @@ HRESULT __cdecl GetActivationFactoryByPCWSTR(void *name, GUID *iid, void **facto
+     return RoGetActivationFactory(str, iid, factory);
+ }
+ 
++/***********************************************************************
++ * Platform::Details::Heap and ControlBlock (7850)
++ *
++ * The memory of ref classes. A ref class that supports weak references is allocated
++ * with Heap::Allocate(rcOffset, size): one block holds its ControlBlock (the
++ * IWeakReference programs get from it) and then the object, whose
++ * __abi_FTMWeakRefData at rcOffset points at the control block. The control block
++ * counts the strong references (the object's) and the weak ones (its own; the object's
++ * existence is one) and the block is freed with the last weak one; the program's
++ * inline code (vccorlib.h) works these counts and calls ReleaseTarget when the
++ * object goes. Plain Allocate(size) and Free are the heap.
++ */
++
++struct control_block
++{
++    const struct control_block_vtbl *vtbl;
++    LONG weak_ref;
++    LONG strong_ref;
++    IUnknown *target;           /* not referenced: the object owns its control block */
++    BOOLEAN single_allocation;
++    BOOLEAN aligned_allocation;
++    BOOLEAN exception_allocation;
++};
++
++struct control_block_vtbl
++{
++    HRESULT (WINAPI *QueryInterface)(struct control_block *cb, const GUID *iid, void **out);
++    ULONG (WINAPI *AddRef)(struct control_block *cb);
++    ULONG (WINAPI *Release)(struct control_block *cb);
++    HRESULT (WINAPI *Resolve)(struct control_block *cb, const GUID *iid, IInspectable **out);
++};
++
++/* the object follows the control block, as aligned as the heap gives memory */
++#define CONTROL_BLOCK_SPACE ((sizeof(struct control_block) + 2 * sizeof(void *) - 1) & ~(2 * sizeof(void *) - 1))
++
++static HRESULT WINAPI control_block_QueryInterface(struct control_block *cb, const GUID *iid, void **out)
++{
++    TRACE("(%p, %s, %p)\n", cb, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IWeakReference))
++    {
++        InterlockedIncrement(&cb->weak_ref);
++        *out = cb;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI control_block_AddRef(struct control_block *cb)
++{
++    ULONG ref = InterlockedIncrement(&cb->weak_ref);
++    TRACE("(%p) -> %lu\n", cb, ref);
++    return ref;
++}
++
++static ULONG WINAPI control_block_Release(struct control_block *cb)
++{
++    ULONG ref = InterlockedDecrement(&cb->weak_ref);
++
++    TRACE("(%p) -> %lu\n", cb, ref);
++    if (!ref)
++    {
++        if (cb->aligned_allocation) _aligned_free(cb);
++        else free(cb);
++    }
++    return ref;
++}
++
++/* a strong reference to the object, if it still has one: the object is asked for the interface
++ * while a reference taken here keeps it alive */
++static HRESULT WINAPI control_block_Resolve(struct control_block *cb, const GUID *iid, IInspectable **out)
++{
++    IUnknown *target;
++    LONG ref;
++    HRESULT hr;
++
++    TRACE("(%p, %s, %p)\n", cb, debugstr_guid(iid), out);
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++    for (;;)
++    {
++        ref = cb->strong_ref;
++        if (ref <= 0 || !(target = cb->target)) return S_OK;
++        if (InterlockedCompareExchange(&cb->strong_ref, ref + 1, ref) == ref) break;
++    }
++    hr = IUnknown_QueryInterface(target, iid, (void **)out);
++    /* the reference taken above goes the way the object's own do */
++    IUnknown_Release(target);
++    return hr;
++}
++
++static const struct control_block_vtbl control_block_vtbl =
++{
++    control_block_QueryInterface,
++    control_block_AddRef,
++    control_block_Release,
++    control_block_Resolve,
++};
++
++static void init_control_block(struct control_block *cb, void *object, BOOL aligned, BOOL exception)
++{
++    cb->vtbl = &control_block_vtbl;
++    cb->weak_ref = 1;
++    cb->strong_ref = 1;
++    cb->target = object;
++    cb->single_allocation = TRUE;
++    cb->aligned_allocation = aligned;
++    cb->exception_allocation = exception;
++}
++
++static void *allocate_with_control_block(SIZE_T rc_offset, SIZE_T size, SIZE_T alignment, BOOL exception)
++{
++    SIZE_T space = CONTROL_BLOCK_SPACE;
++    struct control_block *cb;
++    char *object;
++
++    if (alignment)
++    {
++        if (alignment & (alignment - 1)) return NULL;
++        if (alignment < sizeof(void *)) alignment = sizeof(void *);
++        space = (sizeof(struct control_block) + alignment - 1) & ~(alignment - 1);
++        cb = _aligned_malloc(space + size, alignment);
++    }
++    else cb = malloc(space + size);
++
++    if (!cb) return NULL;
++    object = (char *)cb + space;
++    init_control_block(cb, object, alignment != 0, exception);
++    /* the object's __abi_FTMWeakRefData::__weakRefSource */
++    if (rc_offset + sizeof(void *) <= size) *(struct control_block **)(object + rc_offset) = cb;
++    TRACE("rc_offset %Iu size %Iu alignment %Iu -> control block %p, object %p\n", rc_offset, size, alignment, cb, object);
++    return object;
++}
++
++/* ?Allocate@Heap@Details@Platform@@SAPEAX_K@Z */
++void * __cdecl Heap_Allocate(SIZE_T size)
++{
++    void *ret = malloc(size ? size : 1);
++    TRACE("(%Iu) -> %p\n", size, ret);
++    if (!ret) __abi_WinRTraiseOutOfMemoryException();
++    return ret;
++}
++
++/* ?Allocate@Heap@Details@Platform@@SAPEAX_K0@Z */
++void * __cdecl Heap_AllocateRc(SIZE_T rc_offset, SIZE_T size)
++{
++    void *ret = allocate_with_control_block(rc_offset, size, 0, FALSE);
++    if (!ret) __abi_WinRTraiseOutOfMemoryException();
++    return ret;
++}
++
++/* ?AlignedAllocate@Heap@Details@Platform@@SAPEAX_K0@Z */
++void * __cdecl Heap_AlignedAllocate(SIZE_T size, SIZE_T alignment)
++{
++    void *ret = _aligned_malloc(size ? size : 1, alignment);
++    TRACE("(%Iu, %Iu) -> %p\n", size, alignment, ret);
++    if (!ret) __abi_WinRTraiseOutOfMemoryException();
++    return ret;
++}
++
++/* ?AlignedAllocate@Heap@Details@Platform@@SAPEAX_K00@Z */
++void * __cdecl Heap_AlignedAllocateRc(SIZE_T rc_offset, SIZE_T size, SIZE_T alignment)
++{
++    void *ret = allocate_with_control_block(rc_offset, size, alignment, FALSE);
++    if (!ret) __abi_WinRTraiseOutOfMemoryException();
++    return ret;
++}
++
++/* ?AllocateException@Heap@Details@Platform@@SAPEAX_K0@Z: an exception object's; failing does not
++ * throw (there would be no exception to throw) */
++void * __cdecl Heap_AllocateException(SIZE_T rc_offset, SIZE_T size)
++{
++    return allocate_with_control_block(rc_offset, size, 0, TRUE);
++}
++
++/* ?AlignedAllocateException@Heap@Details@Platform@@SAPEAX_K00@Z */
++void * __cdecl Heap_AlignedAllocateException(SIZE_T rc_offset, SIZE_T size, SIZE_T alignment)
++{
++    return allocate_with_control_block(rc_offset, size, alignment, TRUE);
++}
++
++/* ?Free@Heap@Details@Platform@@SAXPEAX@Z */
++void __cdecl Heap_Free(void *ptr)
++{
++    TRACE("(%p)\n", ptr);
++    free(ptr);
++}
++
++/* ?AlignedFree@Heap@Details@Platform@@SAXPEAX@Z */
++void __cdecl Heap_AlignedFree(void *ptr)
++{
++    TRACE("(%p)\n", ptr);
++    _aligned_free(ptr);
++}
++
++/* ?ReleaseTarget@ControlBlock@Details@Platform@@AEAAXXZ: the object is going; weak references no
++ * longer reach it */
++void __cdecl ControlBlock_ReleaseTarget(struct control_block *cb)
++{
++    TRACE("(%p)\n", cb);
++#ifndef SG_MUTANT_VCCORLIB_KEEP_TARGET
++    if (cb) InterlockedExchangePointer((void **)&cb->target, NULL);
++#endif
++}
++
++/* ??0Delegate@Platform@@QE$AAA@XZ: the delegates' base; the derived constructor sets everything up */
++void * __cdecl Delegate_ctor(void *this)
++{
++    TRACE("(%p)\n", this);
++    return this;
++}
++
++/* ?GetIidsFn@@YAJHPEAKPEBU__s_GUID@@PEAPEAVGuid@Platform@@@Z: a ref class's
++ * IInspectable::GetIids, its interface ids copied into memory the caller frees with CoTaskMemFree */
++HRESULT __cdecl GetIidsFn(int count, ULONG *out_count, const GUID *iids, GUID **out_iids)
++{
++    TRACE("(%d, %p, %p, %p)\n", count, out_count, iids, out_iids);
++
++    if (!out_count || !out_iids) return E_POINTER;
++    *out_count = 0;
++    *out_iids = NULL;
++    if (count <= 0) return S_OK;
++    if (!(*out_iids = CoTaskMemAlloc(count * sizeof(GUID)))) return E_OUTOFMEMORY;
++    memcpy(*out_iids, iids, count * sizeof(GUID));
++    *out_count = count;
++    return S_OK;
++}
++
++/* ?__abi_translateCurrentException@@YAJ_N@Z: in a catch(...) of a generated ABI wrapper, the
++ * exception being handled as the HRESULT the wrapper returns: a Platform::Exception^'s own,
++ * E_OUTOFMEMORY for std::bad_alloc, E_FAIL otherwise */
++#define CXX_EXCEPTION 0xe06d7363
++
++static const char *catchable_name(const EXCEPTION_RECORD *rec, unsigned int index)
++{
++    ULONG_PTR base = 0;
++    const struct eh_throw_info *info = (const struct eh_throw_info *)rec->ExceptionInformation[2];
++    const struct eh_catchable_table *table;
++    const struct eh_catchable_type *type;
++    const struct eh_type_info *ti;
++
++#ifdef _WIN64
++    base = rec->NumberParameters >= 4 ? rec->ExceptionInformation[3] : 0;
++#endif
++    if (!info || !info->table) return NULL;
++    table = (const struct eh_catchable_table *)(base + (ULONG_PTR)info->table);
++    if (index >= table->count) return NULL;
++    type = (const struct eh_catchable_type *)(base + (ULONG_PTR)table->info[index]);
++    ti = (const struct eh_type_info *)(base + (ULONG_PTR)type->type_info);
++    return ti->mangled;
++}
++
++HRESULT __cdecl __abi_translateCurrentException(BOOLEAN reserved)
++{
++    static void ** (__cdecl *p__current_exception)(void);
++    EXCEPTION_RECORD *rec;
++    const char *name;
++    unsigned int i;
++    HRESULT ret = 0;
++
++    TRACE("(%d)\n", reserved);
++
++    if (!p__current_exception)
++        p__current_exception = (void *)GetProcAddress(LoadLibraryW(L"ucrtbase.dll"), "__current_exception");
++    rec = p__current_exception ? *(EXCEPTION_RECORD **)p__current_exception() : NULL;
++    if (!rec || rec->ExceptionCode != CXX_EXCEPTION || rec->NumberParameters < 3) return E_FAIL;
++
++    __TRY
++    {
++        for (i = 0; !ret && (name = catchable_name(rec, i)); i++)
++        {
++            if (strstr(name, "AAVException@Platform@@"))
++            {
++                ret = Exception_get_HResult(*(IInspectable **)rec->ExceptionInformation[1]);
++                if (SUCCEEDED(ret)) ret = E_FAIL;
++            }
++            else if (!strcmp(name, ".?AVbad_alloc@std@@")) ret = E_OUTOFMEMORY;
++        }
++    }
++    __EXCEPT_PAGE_FAULT
++    {
++        ret = 0;
++    }
++    __ENDTRY
++    if (ret) return ret;
++    WARN("not a Platform::Exception\n");
++    return E_FAIL;
++}
++
+ #ifdef __i386__
+ 
+ /* 32-bit programs: Exception's members are __thiscall; the free functions are exported in
+@@ -444,6 +738,19 @@ void __stdcall __abi_WinRTraiseCOMException_stdcall(HRESULT hr)
+     __abi_WinRTraiseCOMException(hr);
+ }
+ 
++void * __stdcall Heap_Allocate_stdcall(SIZE_T size) { return Heap_Allocate(size); }
++void * __stdcall Heap_AllocateRc_stdcall(SIZE_T rc_offset, SIZE_T size) { return Heap_AllocateRc(rc_offset, size); }
++void * __stdcall Heap_AlignedAllocate_stdcall(SIZE_T size, SIZE_T alignment) { return Heap_AlignedAllocate(size, alignment); }
++void * __stdcall Heap_AlignedAllocateRc_stdcall(SIZE_T rc_offset, SIZE_T size, SIZE_T alignment) { return Heap_AlignedAllocateRc(rc_offset, size, alignment); }
++void * __stdcall Heap_AllocateException_stdcall(SIZE_T rc_offset, SIZE_T size) { return Heap_AllocateException(rc_offset, size); }
++void * __stdcall Heap_AlignedAllocateException_stdcall(SIZE_T rc_offset, SIZE_T size, SIZE_T alignment) { return Heap_AlignedAllocateException(rc_offset, size, alignment); }
++void __stdcall Heap_Free_stdcall(void *ptr) { Heap_Free(ptr); }
++void __stdcall Heap_AlignedFree_stdcall(void *ptr) { Heap_AlignedFree(ptr); }
++void __thiscall ControlBlock_ReleaseTarget_thiscall(struct control_block *cb) { ControlBlock_ReleaseTarget(cb); }
++void * __thiscall Delegate_ctor_thiscall(void *this) { return Delegate_ctor(this); }
++HRESULT __stdcall GetIidsFn_stdcall(int count, ULONG *out_count, const GUID *iids, GUID **out_iids) { return GetIidsFn(count, out_count, iids, out_iids); }
++HRESULT __stdcall __abi_translateCurrentException_stdcall(BOOLEAN reserved) { return __abi_translateCurrentException(reserved); }
++
+ #endif
+ 
+ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+diff --git a/dlls/vccorlib140/vccorlib140.spec b/dlls/vccorlib140/vccorlib140.spec
+index c9e3534..06d6ad0 100644
+--- a/dlls/vccorlib140/vccorlib140.spec
++++ b/dlls/vccorlib140/vccorlib140.spec
+@@ -57,3 +57,36 @@
+ @ cdecl -arch=i386 ?__abi_WinRTraiseOutOfMemoryException@@YGXXZ() __abi_WinRTraiseOutOfMemoryException
+ @ cdecl -arch=i386 ?__abi_WinRTraiseWrongThreadException@@YAXXZ() __abi_WinRTraiseWrongThreadException
+ @ cdecl -arch=i386 ?__abi_WinRTraiseWrongThreadException@@YGXXZ() __abi_WinRTraiseWrongThreadException
++@ cdecl -arch=win64 ?Allocate@Heap@Details@Platform@@SAPEAX_K@Z(long) Heap_Allocate
++@ cdecl -arch=win64 ?Allocate@Heap@Details@Platform@@SAPEAX_K0@Z(long long) Heap_AllocateRc
++@ cdecl -arch=win64 ?AlignedAllocate@Heap@Details@Platform@@SAPEAX_K0@Z(long long) Heap_AlignedAllocate
++@ cdecl -arch=win64 ?AlignedAllocate@Heap@Details@Platform@@SAPEAX_K00@Z(long long long) Heap_AlignedAllocateRc
++@ cdecl -arch=win64 ?AllocateException@Heap@Details@Platform@@SAPEAX_K0@Z(long long) Heap_AllocateException
++@ cdecl -arch=win64 ?AlignedAllocateException@Heap@Details@Platform@@SAPEAX_K00@Z(long long long) Heap_AlignedAllocateException
++@ cdecl -arch=win64 ?Free@Heap@Details@Platform@@SAXPEAX@Z(ptr) Heap_Free
++@ cdecl -arch=win64 ?AlignedFree@Heap@Details@Platform@@SAXPEAX@Z(ptr) Heap_AlignedFree
++@ cdecl -arch=win64 ?ReleaseTarget@ControlBlock@Details@Platform@@AEAAXXZ(ptr) ControlBlock_ReleaseTarget
++@ cdecl -arch=win64 ??0Delegate@Platform@@QE$AAA@XZ(ptr) Delegate_ctor
++@ cdecl -arch=win64 ?GetIidsFn@@YAJHPEAKPEBU__s_GUID@@PEAPEAVGuid@Platform@@@Z(long ptr ptr ptr) GetIidsFn
++@ cdecl -arch=win64 ?__abi_translateCurrentException@@YAJ_N@Z(long) __abi_translateCurrentException
++@ cdecl -arch=i386 ?Allocate@Heap@Details@Platform@@SAPAXI@Z(long) Heap_Allocate
++@ stdcall -arch=i386 ?Allocate@Heap@Details@Platform@@SGPAXI@Z(long) Heap_Allocate_stdcall
++@ cdecl -arch=i386 ?Allocate@Heap@Details@Platform@@SAPAXII@Z(long long) Heap_AllocateRc
++@ stdcall -arch=i386 ?Allocate@Heap@Details@Platform@@SGPAXII@Z(long long) Heap_AllocateRc_stdcall
++@ cdecl -arch=i386 ?AlignedAllocate@Heap@Details@Platform@@SAPAXII@Z(long long) Heap_AlignedAllocate
++@ stdcall -arch=i386 ?AlignedAllocate@Heap@Details@Platform@@SGPAXII@Z(long long) Heap_AlignedAllocate_stdcall
++@ cdecl -arch=i386 ?AlignedAllocate@Heap@Details@Platform@@SAPAXIII@Z(long long long) Heap_AlignedAllocateRc
++@ stdcall -arch=i386 ?AlignedAllocate@Heap@Details@Platform@@SGPAXIII@Z(long long long) Heap_AlignedAllocateRc_stdcall
++@ cdecl -arch=i386 ?AllocateException@Heap@Details@Platform@@SAPAXII@Z(long long) Heap_AllocateException
++@ stdcall -arch=i386 ?AllocateException@Heap@Details@Platform@@SGPAXII@Z(long long) Heap_AllocateException_stdcall
++@ cdecl -arch=i386 ?AlignedAllocateException@Heap@Details@Platform@@SAPAXIII@Z(long long long) Heap_AlignedAllocateException
++@ stdcall -arch=i386 ?AlignedAllocateException@Heap@Details@Platform@@SGPAXIII@Z(long long long) Heap_AlignedAllocateException_stdcall
++@ cdecl -arch=i386 ?Free@Heap@Details@Platform@@SAXPAX@Z(ptr) Heap_Free
++@ stdcall -arch=i386 ?Free@Heap@Details@Platform@@SGXPAX@Z(ptr) Heap_Free_stdcall
++@ cdecl -arch=i386 ?AlignedFree@Heap@Details@Platform@@SAXPAX@Z(ptr) Heap_AlignedFree
++@ stdcall -arch=i386 ?AlignedFree@Heap@Details@Platform@@SGXPAX@Z(ptr) Heap_AlignedFree_stdcall
++@ thiscall -arch=i386 ?ReleaseTarget@ControlBlock@Details@Platform@@AAEXXZ(ptr) ControlBlock_ReleaseTarget_thiscall
++@ thiscall -arch=i386 ??0Delegate@Platform@@Q$AAE@XZ(ptr) Delegate_ctor_thiscall
++@ cdecl -arch=i386 ?GetIidsFn@@YAJHPAKPBU__s_GUID@@PAPAVGuid@Platform@@@Z(long ptr ptr ptr) GetIidsFn
++@ stdcall -arch=i386 ?GetIidsFn@@YGJHPAKPBU__s_GUID@@PAPAVGuid@Platform@@@Z(long ptr ptr ptr) GetIidsFn_stdcall
++@ stdcall -arch=i386 ?__abi_translateCurrentException@@YGJ_N@Z(long) __abi_translateCurrentException_stdcall

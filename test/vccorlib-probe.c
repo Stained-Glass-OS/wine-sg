@@ -5,6 +5,7 @@
  * handler sees each throw and does what the C++ runtime's catch does, then ends the thread.
  * Prints key=value lines. */
 #include <windows.h>
+#include <objbase.h>
 #include <stdio.h>
 #include <string.h>
 #include <winstring.h>
@@ -147,6 +148,104 @@ static void run(const char *key, LPTHREAD_START_ROUTINE fn, void *arg, const cha
     printf("%s_first=%s %s_text=%s\n", key, r.first, key, msg);
 }
 
+/* Platform::Details::Heap and ControlBlock (7850): a ref class with weak references, as the compiler
+ * and vccorlib.h's inline code handle it */
+struct cb
+{
+    const struct cb_vtbl { HRESULT (__stdcall *qi)(struct cb *, const GUID *, void **); ULONG (__stdcall *addref)(struct cb *);
+        ULONG (__stdcall *release)(struct cb *); HRESULT (__stdcall *resolve)(struct cb *, const GUID *, void **); } *vtbl;
+    LONG weak, strong;
+    void *target;
+    BOOLEAN single, aligned, exception;
+};
+
+/* the object: an IUnknown whose strong references are the control block's (as __abi_FTMWeakRefData's) */
+struct obj
+{
+    const struct obj_vtbl { HRESULT (__stdcall *qi)(struct obj *, const GUID *, void **); ULONG (__stdcall *addref)(struct obj *);
+        ULONG (__stdcall *release)(struct obj *); } *vtbl;
+    struct cb *weak_ref_source;   /* the __abi_FTMWeakRefData at rcOffset */
+    void *marshal;
+    int destroyed;
+};
+
+static void (MEMBER *release_target)(struct cb *);
+static int obj_destroyed;
+static HRESULT __stdcall obj_qi(struct obj *o, const GUID *iid, void **out) { o->vtbl->addref(o); *out = o; return S_OK; }
+static ULONG __stdcall obj_addref(struct obj *o) { return InterlockedIncrement(&o->weak_ref_source->strong); }
+static ULONG __stdcall obj_release(struct obj *o)
+{
+    struct cb *cb = o->weak_ref_source;
+    ULONG ref = InterlockedDecrement(&cb->strong);
+    if (!ref)
+    {
+        /* what the compiler's destructor and ReleaseControlBlock do */
+        cb->strong = (LONG)0xc0000000;
+        obj_destroyed++;
+        release_target(cb);
+        cb->vtbl->release(cb);
+    }
+    return ref;
+}
+static const struct obj_vtbl obj_vtbl = { obj_qi, obj_addref, obj_release };
+
+static void heap_tests(HMODULE mod)
+{
+    void * (__cdecl *alloc)(SIZE_T) = (void *)GetProcAddress(mod, NAME("?Allocate@Heap@Details@Platform@@SAPEAX_K@Z", "?Allocate@Heap@Details@Platform@@SAPAXI@Z"));
+    void * (__cdecl *alloc_rc)(SIZE_T, SIZE_T) = (void *)GetProcAddress(mod, NAME("?Allocate@Heap@Details@Platform@@SAPEAX_K0@Z", "?Allocate@Heap@Details@Platform@@SAPAXII@Z"));
+    void * (__cdecl *alloc_al)(SIZE_T, SIZE_T, SIZE_T) = (void *)GetProcAddress(mod, NAME("?AlignedAllocate@Heap@Details@Platform@@SAPEAX_K00@Z", "?AlignedAllocate@Heap@Details@Platform@@SAPAXIII@Z"));
+    void (__cdecl *heap_free)(void *) = (void *)GetProcAddress(mod, NAME("?Free@Heap@Details@Platform@@SAXPEAX@Z", "?Free@Heap@Details@Platform@@SAXPAX@Z"));
+    HRESULT (__cdecl *get_iids)(int, ULONG *, const GUID *, GUID **) = (void *)GetProcAddress(mod, NAME("?GetIidsFn@@YAJHPEAKPEBU__s_GUID@@PEAPEAVGuid@Platform@@@Z", "?GetIidsFn@@YAJHPAKPBU__s_GUID@@PAPAVGuid@Platform@@@Z"));
+    void * (MEMBER *delegate_ctor)(void *) = (void *)GetProcAddress(mod, NAME("??0Delegate@Platform@@QE$AAA@XZ", "??0Delegate@Platform@@Q$AAE@XZ"));
+    static const GUID iids[2] = { {1,2,3,{4}}, {5,6,7,{8}} };
+    struct obj *o;
+    struct cb *cb, *weak;
+    void *p, *res;
+    GUID *got = NULL;
+    ULONG n = 0;
+    SIZE_T rc = FIELD_OFFSET(struct obj, weak_ref_source);
+
+    release_target = (void *)GetProcAddress(mod, NAME("?ReleaseTarget@ControlBlock@Details@Platform@@AEAAXXZ", "?ReleaseTarget@ControlBlock@Details@Platform@@AAEXXZ"));
+    printf("heap_exports=%d\n", alloc && alloc_rc && alloc_al && heap_free && get_iids && delegate_ctor && release_target &&
+           GetProcAddress(mod, NAME("?AlignedFree@Heap@Details@Platform@@SAXPEAX@Z", "?AlignedFree@Heap@Details@Platform@@SAXPAX@Z")) &&
+           GetProcAddress(mod, NAME("?__abi_translateCurrentException@@YAJ_N@Z", "?__abi_translateCurrentException@@YGJ_N@Z")));
+    if (!alloc || !alloc_rc || !heap_free || !release_target || !get_iids || !alloc_al || !delegate_ctor) return;
+
+    p = alloc(100);
+    memset(p, 0x5a, 100);
+    heap_free(p);
+    printf("heap_plain=%d\n", p != NULL);
+
+    /* a ref class with weak references: its control block in front, pointed at from rcOffset */
+    o = alloc_rc(rc, sizeof(*o));
+    cb = o ? o->weak_ref_source : NULL;
+    printf("heap_rc_block=%d\n", cb && (char *)cb < (char *)o && cb->weak == 1 && cb->strong == 1 && cb->target == o && cb->single);
+    if (!cb) return;
+    o->vtbl = &obj_vtbl;
+    o->marshal = (void *)-1;
+    /* a weak reference: QueryInterface on the control block (IWeakReference) */
+    cb->vtbl->qi(cb, &IID_IUnknown, (void **)&weak);
+    printf("heap_weak_qi=%d\n", weak == cb && cb->weak == 2);
+    res = NULL;
+    cb->vtbl->resolve(cb, &IID_IUnknown, &res);
+    printf("heap_resolve_alive=%d\n", res == o && cb->strong == 2);
+    if (res) o->vtbl->release(o);
+    o->vtbl->release(o);          /* the last strong reference: the object goes */
+    res = (void *)1;
+    weak->vtbl->resolve(weak, &IID_IUnknown, &res);
+    printf("heap_resolve_dead=%d heap_destroyed=%d\n", res == NULL && weak->target == NULL, obj_destroyed);
+    printf("heap_weak_last=%lu\n", weak->vtbl->release(weak));   /* frees the block */
+
+    /* aligned, with a control block */
+    o = alloc_al(rc, sizeof(*o), 64);
+    printf("heap_aligned=%d\n", o && !((ULONG_PTR)o & 63) && o->weak_ref_source && o->weak_ref_source->aligned);
+    if (o) o->weak_ref_source->vtbl->release(o->weak_ref_source);
+
+    printf("heap_iids=%d\n", get_iids(2, &n, iids, &got) == S_OK && n == 2 && got && !memcmp(got, iids, sizeof(iids)));
+    if (got) CoTaskMemFree(got);
+    printf("heap_delegate=%d\n", delegate_ctor(&n) == &n);
+}
+
 int main(void)
 {
     static const GUID IID_IActivationFactory = {0x00000035,0,0,{0xc0,0,0,0,0,0,0,0x46}};
@@ -190,6 +289,7 @@ int main(void)
     run("com_mapped", raise_hr_thread, NULL, ".PE$AAVAccessDeniedException@Platform@@", E_ACCESSDENIED);
     raise_hr_value = 0x80041234;
     run("com_other", raise_hr_thread, NULL, ".PE$AAVCOMException@Platform@@", 0x80041234);
+    heap_tests(mod);
     printf("done=1\n");
     return 0;
 }

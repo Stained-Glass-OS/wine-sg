@@ -24,7 +24,7 @@ T=$(mktemp -d /var/tmp/sg-vccorlib.XXXXXX)
 trap 'WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 for b in 64 32; do
     cc=x86_64-w64-mingw32-gcc; [ $b = 32 ] && cc=i686-w64-mingw32-gcc
-    TMPDIR=/var/tmp $cc -O1 -o "$T/probe$b.exe" "$HERE/vccorlib-probe.c" -lruntimeobject \
+    TMPDIR=/var/tmp $cc -O1 -o "$T/probe$b.exe" "$HERE/vccorlib-probe.c" -lruntimeobject -lole32 -luuid \
         || { fail "probe ($b-bit) did not build"; exit 1; }
 done
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINESERVER WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d;winedbg.exe=d"
@@ -56,6 +56,17 @@ for k in oom cast wrongthread com_mapped com_other; do
     check ${k}_message 1 "$k: e->Message has text"
     check ${k}_released 1 "$k: the thrown handle is released after the catch"
 done
+check heap_exports 1 "Platform::Details::Heap, ControlBlock::ReleaseTarget, Delegate, GetIidsFn and __abi_translateCurrentException are exported (7850)"
+check heap_plain 1 "Heap::Allocate(size) and Heap::Free"
+check heap_rc_block 1 "Heap::Allocate(rcOffset, size): a control block in front of the object, pointed at from rcOffset, one strong and one weak reference"
+check heap_weak_qi 1 "the control block answers IWeakReference (a weak reference more)"
+check heap_resolve_alive 1 "Resolve while the object lives: the object, with a strong reference"
+check heap_resolve_dead 1 "after the last strong reference and ReleaseTarget: Resolve gives nothing"
+check heap_destroyed 1 "the object was destroyed once"
+check heap_weak_last 0 "the last weak reference frees the block"
+check heap_aligned 1 "Heap::AlignedAllocate(rcOffset, size, 64): an aligned object with its control block"
+check heap_iids 1 "GetIidsFn copies the interface ids into task memory"
+check heap_delegate 1 "Platform::Delegate's constructor"
 check done 1 "the probe ran to the end"
 done
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
