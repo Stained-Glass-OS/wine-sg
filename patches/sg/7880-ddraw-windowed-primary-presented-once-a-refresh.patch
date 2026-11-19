@@ -1,0 +1,246 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ddraw: A windowed primary surface is presented once a refresh.
+
+7860 shows a windowed (non-exclusive) DirectDraw primary through the swap chain -- the cure for
+the VMR-7's frozen video on NVIDIA/Xwayland -- but presented the whole window after every Blt,
+BltFast, Unlock, ReleaseDC or palette change. A program drawing many small things to the primary
+(a sprite engine, a GDI-on-primary interface) paid one full present per draw: 200 32x32 Blts a
+frame ran at 26 frames a second on an RTX 3090 and at 6 on llvmpipe (967's front buffer path:
+25 and 23).
+
+Windows' compositor shows a window's changes once a refresh, at the vertical blank, whatever was
+drawn since; so does this. An update only marks the primary as waiting; a thread of ours
+presents it at the next blank of the grid WaitForVerticalBlank already keeps (a frame every
+1 / refresh rate), so a change shows within one refresh also when the program draws nothing
+more. WaitForVerticalBlank presents at once (the program's frame is done), and so does the end
+of the surface, of the swap chain or of the DirectDraw object. Reading the primary (Lock,
+GetDC) needs none: it holds everything drawn to it. A present that meets the primary mapped
+(between Lock and Unlock, GetDC and ReleaseDC) fails and the Unlock or ReleaseDC that follows
+marks it again. The waiting objects are listed under the wined3d lock, which the thread takes
+to present.
+
+Same probe after: 527 frames a second (105000 Blts) on the RTX 3090, 431 (86000) on llvmpipe,
+59 presents a second; GetDC + TextOut + ReleaseDC 1344 -> 7748 a second; whole-window Blts
+5357 -> 75397. Gate test-ddperf; mutant SG_MUTANT_DDRAW_PRESENT_EACH_UPDATE.
+---
+--- a/dlls/ddraw/ddraw.c
++++ b/dlls/ddraw/ddraw.c
+@@ -381,6 +381,11 @@
+ 
+     TRACE("Destroying the swapchain.\n");
+ 
++    /* wine-sg 7880: a windowed primary waiting for the next refresh is shown now */
++    wined3d_mutex_lock();
++    ddraw_surface_flush_present(ddraw);
++    wined3d_mutex_unlock();
++
+     wined3d_swapchain_decref(ddraw->wined3d_swapchain);
+ 
+     for (i = 0; i < ddraw->numConvertedDecls; ++i)
+@@ -436,6 +441,8 @@
+ 
+     wined3d_mutex_lock();
+     list_remove(&This->ddraw_list_entry);
++    /* wine-sg 7880: off the presenter's list (surface.c) */
++    ddraw_surface_flush_present(This);
+     wined3d_mutex_unlock();
+ 
+     if (This->wined3d_swapchain)
+@@ -2217,6 +2224,12 @@
+     if (Flags != DDWAITVB_BLOCKBEGIN && Flags != DDWAITVB_BLOCKEND)
+         return DDERR_INVALIDPARAMS;
+ 
++    /* wine-sg 7880: the program's frame is done: a windowed primary waiting for the next
++     * refresh (surface.c) is presented now */
++    wined3d_mutex_lock();
++    ddraw_surface_flush_present(ddraw);
++    wined3d_mutex_unlock();
++
+     /* The blank is modelled on the refresh rate: a frame starts every
+      * 1 / rate seconds, counted from an arbitrary but fixed origin, and the
+      * blank is the first 5% of it. */
+--- a/dlls/ddraw/ddraw_private.h
++++ b/dlls/ddraw/ddraw_private.h
+@@ -111,6 +111,11 @@
+      * the swap chain was destroyed) */
+     HWND sg_present_window;
+     SIZE sg_present_size;
++    /* wine-sg 7880: the primary surface waiting to be presented at the next refresh (none when
++     * nothing waits), when (a performance counter value), and the refresh period in counts */
++    struct ddraw_surface *sg_pending_surface;
++    struct list sg_pending_entry;
++    LONGLONG sg_pending_due, sg_refresh_period;
+ 
+     /* DirectDraw things, which are not handled by WineD3D */
+     DWORD                   cooperative_level;
+@@ -238,6 +243,7 @@
+ HRESULT ddraw_surface_create(struct ddraw *ddraw, const DDSURFACEDESC2 *surface_desc,
+         struct ddraw_surface **surface, IUnknown *outer_unknown, unsigned int version);
+ struct wined3d_rendertarget_view *ddraw_surface_get_rendertarget_view(struct ddraw_surface *surface);
++void ddraw_surface_flush_present(struct ddraw *ddraw);
+ HRESULT ddraw_surface_update_frontbuffer(struct ddraw_surface *surface,
+         const RECT *rect, BOOL read, unsigned int swap_interval);
+ 
+--- a/dlls/ddraw/surface.c
++++ b/dlls/ddraw/surface.c
+@@ -114,6 +114,122 @@
+     return DD_OK;
+ }
+ 
++/* Stained Glass OS (wine-sg 7880): a windowed primary surface is presented once a refresh, as
++ * Windows' compositor shows a window's changes -- at the next vertical blank, whatever was drawn
++ * since. 7860 presented the whole window after every Blt, BltFast, Unlock or ReleaseDC: a
++ * program drawing 200 sprites a frame paid 200 presents a frame (on llvmpipe a third of the
++ * old front buffer path's speed). An update now only marks the primary as waiting; a thread of
++ * ours presents it at the next blank on the grid WaitForVerticalBlank keeps (ddraw.c: a frame
++ * every 1 / refresh rate from a fixed origin), so it shows within one refresh, also when the
++ * program draws nothing more. WaitForVerticalBlank presents at once (the program says its
++ * frame is done), and so does the end of the surface or of the swap chain. Reading the primary
++ * (Lock, GetDC) needs no present: it holds everything drawn to it, the screen only shows it.
++ * The waiting ddraw objects are listed under the wined3d lock, which the thread takes to
++ * present, so an object leaves the list before it is gone. */
++static struct list sg_pending_list = LIST_INIT(sg_pending_list);
++static HANDLE sg_presenter_event;
++
++static HRESULT ddraw_surface_present_window(struct ddraw_surface *surface);
++
++static LONGLONG ddraw_refresh_period(struct ddraw *ddraw)
++{
++    struct wined3d_display_mode mode;
++    LARGE_INTEGER freq;
++
++    QueryPerformanceFrequency(&freq);
++    if (FAILED(wined3d_output_get_display_mode(ddraw->wined3d_output, &mode, NULL)) || mode.refresh_rate < 2)
++        mode.refresh_rate = 60;
++    return max(freq.QuadPart / mode.refresh_rate, 1);
++}
++
++/* the wined3d lock is held */
++void ddraw_surface_flush_present(struct ddraw *ddraw)
++{
++    struct ddraw_surface *surface = ddraw->sg_pending_surface;
++
++    if (!surface)
++        return;
++    ddraw->sg_pending_surface = NULL;
++    list_remove(&ddraw->sg_pending_entry);
++    if (ddraw->wined3d_swapchain && ddraw->swapchain_window && !(ddraw->cooperative_level & DDSCL_EXCLUSIVE))
++        ddraw_surface_present_window(surface);
++}
++
++static DWORD WINAPI ddraw_presenter_thread(void *arg)
++{
++    DWORD timeout = INFINITE;
++    LARGE_INTEGER freq, now;
++
++    SetThreadDescription(GetCurrentThread(), L"wine_ddraw_present");
++    QueryPerformanceFrequency(&freq);
++    for (;;)
++    {
++        struct ddraw *ddraw, *next;
++        LONGLONG soonest = 0;
++
++        WaitForSingleObject(sg_presenter_event, timeout);
++        wined3d_mutex_lock();
++        QueryPerformanceCounter(&now);
++        LIST_FOR_EACH_ENTRY_SAFE(ddraw, next, &sg_pending_list, struct ddraw, sg_pending_entry)
++        {
++            if (ddraw->sg_pending_due <= now.QuadPart)
++            {
++                ddraw_surface_flush_present(ddraw);
++                /* the display mode may have changed since */
++                ddraw->sg_refresh_period = ddraw_refresh_period(ddraw);
++            }
++            else if (!soonest || ddraw->sg_pending_due < soonest)
++                soonest = ddraw->sg_pending_due;
++        }
++        wined3d_mutex_unlock();
++        timeout = soonest ? (DWORD)(((soonest - now.QuadPart) * 1000 + freq.QuadPart - 1) / freq.QuadPart) : INFINITE;
++    }
++    return 0;
++}
++
++/* the wined3d lock is held */
++static HRESULT ddraw_surface_present_later(struct ddraw_surface *surface)
++{
++    struct ddraw *ddraw = surface->ddraw;
++    LARGE_INTEGER now;
++
++    if (!sg_presenter_event)
++    {
++        HMODULE module;
++        HANDLE event, thread;
++
++        /* the thread runs code of ours until the process ends */
++        if (!(event = CreateEventW(NULL, FALSE, FALSE, NULL)))
++            return ddraw_surface_present_window(surface);
++        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++                (const WCHAR *)ddraw_presenter_thread, &module);
++        sg_presenter_event = event;
++        if (!(thread = CreateThread(NULL, 0, ddraw_presenter_thread, NULL, 0, NULL)))
++        {
++            sg_presenter_event = NULL;
++            CloseHandle(event);
++            return ddraw_surface_present_window(surface);
++        }
++        SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
++        CloseHandle(thread);
++    }
++
++    if (ddraw->sg_pending_surface)
++    {
++        ddraw->sg_pending_surface = surface;
++        return DD_OK;
++    }
++    if (!ddraw->sg_refresh_period)
++        ddraw->sg_refresh_period = ddraw_refresh_period(ddraw);
++    QueryPerformanceCounter(&now);
++    ddraw->sg_pending_due = (now.QuadPart / ddraw->sg_refresh_period + 1) * ddraw->sg_refresh_period;
++    ddraw->sg_pending_surface = surface;
++    list_add_tail(&sg_pending_list, &ddraw->sg_pending_entry);
++    TRACE("surface %p presented in %I64d counts.\n", surface, ddraw->sg_pending_due - now.QuadPart);
++    SetEvent(sg_presenter_event);
++    return DD_OK;
++}
++
+ /* This is slow, of course. Also, in case of locks, we can't prevent other
+  * applications from drawing to the screen while we've locked the frontbuffer.
+  * We'd like to do this in wined3d instead, but for that to work wined3d needs
+@@ -192,8 +308,12 @@
+ 
+ #ifndef SG_MUTANT_DDRAW_FRONT_BUFFER_DRAWN
+         if (!swap_interval && !(ddraw->cooperative_level & DDSCL_EXCLUSIVE))
++#ifndef SG_MUTANT_DDRAW_PRESENT_EACH_UPDATE
++            return ddraw_surface_present_later(surface);
++#else
+             return ddraw_surface_present_window(surface);
+ #endif
++#endif
+ 
+         if (swap_interval)
+             dst_texture = wined3d_swapchain_get_back_buffer(ddraw->wined3d_swapchain, 0);
+@@ -633,6 +753,10 @@
+ 
+     TRACE("surface %p.\n", surface);
+ 
++    /* wine-sg 7880: what was drawn to it last is shown, while it still is */
++    if (surface == surface->ddraw->sg_pending_surface)
++        ddraw_surface_flush_present(surface->ddraw);
++
+     /* The refcount test shows that the palette is detached when the surface
+      * is destroyed. */
+     ddraw_surface_set_palette(surface, NULL);
+@@ -6134,6 +6258,13 @@
+     if (surface->clipper && ddraw_clipper_is_valid(surface->clipper))
+         IDirectDrawClipper_Release(&surface->clipper->IDirectDrawClipper_iface);
+ 
++    /* wine-sg 7880: (shown in ddraw_surface_cleanup) never presented once gone */
++    if (surface == surface->ddraw->sg_pending_surface)
++    {
++        surface->ddraw->sg_pending_surface = NULL;
++        list_remove(&surface->ddraw->sg_pending_entry);
++    }
++
+     if (surface == surface->ddraw->primary)
+     {
+         surface->ddraw->primary = NULL;
