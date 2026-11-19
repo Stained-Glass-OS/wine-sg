@@ -1,0 +1,2096 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] wbemprox, wbemdisp, wscript: WMI event queries.
+
+IWbemServices::ExecNotificationQuery failed and ExecNotificationQueryAsync ran the event query
+as an ordinary data query, so no program watching WMI events got one (.NET's
+ManagementEventWatcher, VBScript NextEvent and SWbemSink, C++ services waiting for a process or a
+USB device). Events of classes without an event provider are found as Windows finds them, by
+polling (events.c): __InstanceCreation/Deletion/Modification/OperationEvent WITHIN n WHERE
+TargetInstance ISA 'Class' [AND conditions on TargetInstance's properties] runs the class's data
+query every n seconds (1 without WITHIN) and compares instances by __RELPATH (TargetInstance,
+PreviousInstance, TIME_CREATED); Win32_ProcessStartTrace/StopTrace/ProcessTrace come from
+Win32_Process, Win32_DeviceChangeEvent from Win32_PnPEntity, Win32_VolumeChangeEvent from
+Win32_LogicalDisk (EventType 2/3). Semisynchronous enumerators (WBEM_FLAG_RETURN_IMMEDIATELY |
+WBEM_FLAG_FORWARD_ONLY required, as documented; Next waits up to its timeout, WBEM_S_TIMEDOUT),
+async sinks until CancelAsyncCall (SetStatus WBEM_E_CALL_CANCELLED), any number per services
+object. wbemdisp: SWbemServices.ExecNotificationQueryAsync relays the events to the thread that
+asked and fires the SWbemSink's OnObjectReady there, OnCompleted after Cancel; SWbemSink
+EnumConnectionPoints/EnumConnections. wscript: WScript.Sleep takes the thread's messages, as
+Windows' does, so a script's sink handlers run while it sleeps.
+---
+diff --git a/dlls/wbemdisp/Makefile.in b/dlls/wbemdisp/Makefile.in
+index 3230855..b066053 100644
+--- a/dlls/wbemdisp/Makefile.in
++++ b/dlls/wbemdisp/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = wbemdisp.dll
+-IMPORTS   = oleaut32 ole32 advapi32
++IMPORTS   = oleaut32 ole32 advapi32 user32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+diff --git a/dlls/wbemdisp/locator.c b/dlls/wbemdisp/locator.c
+index f52b1bf..8914b18 100644
+--- a/dlls/wbemdisp/locator.c
++++ b/dlls/wbemdisp/locator.c
+@@ -23,6 +23,7 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "initguid.h"
++#include "winuser.h"
+ #include "objbase.h"
+ #include "olectl.h"
+ #include "wmiutils.h"
+@@ -30,6 +31,7 @@
+ #include "wbemdisp.h"
+ 
+ #include "wine/debug.h"
++#include "wine/list.h"
+ #include "wbemdisp_private.h"
+ #include "wbemdisp_classes.h"
+ 
+@@ -204,6 +206,7 @@ struct sink
+     IDispatch **sinks;                  /* NULL entries are free; a cookie is an index + 1 */
+     DWORD sink_count;
+     LONG busy;
++    struct list relays;                 /* Stained Glass OS: its async event queries (struct event_relay) */
+ };
+ 
+ static inline struct sink *impl_from_ISWbemSink( ISWbemSink *iface )
+@@ -274,12 +277,16 @@ static ULONG WINAPI sink_Release( ISWbemSink *iface )
+ 
+ DISPATCH_IMPL( sink, ISWbemSink, ISWbemSink_tid )
+ 
++static void cancel_relays( struct sink *sink );
++
+ static HRESULT WINAPI sink_Cancel( ISWbemSink *iface )
+ {
+     struct sink *sink = impl_from_ISWbemSink( iface );
+ 
+-    /* what it reports for has ended before the call returned, so nothing is left to cancel */
++    /* other operations have ended before their call returned; an event query
++     * (Stained Glass OS) runs until it is cancelled */
+     TRACE( "%p\n", sink );
++    cancel_relays( sink );
+     return S_OK;
+ }
+ 
+@@ -310,10 +317,153 @@ static ULONG WINAPI sink_cpc_Release( IConnectionPointContainer *iface )
+     return sink_Release( &impl_from_sink_IConnectionPointContainer( iface )->ISWbemSink_iface );
+ }
+ 
++/* Stained Glass OS: an enumerator over a fixed list of interface pointers or connections */
++struct cp_enum
++{
++    union { IEnumConnectionPoints points; IEnumConnections connections; } iface;
++    LONG refs;
++    BOOL connections;               /* the items are CONNECTDATA */
++    CONNECTDATA *items;             /* pUnk only for connection points */
++    ULONG count, pos;
++};
++
++static struct cp_enum *impl_from_cp_enum( void *iface )
++{
++    return CONTAINING_RECORD( iface, struct cp_enum, iface );
++}
++
++static HRESULT cp_enum_create( BOOL connections, CONNECTDATA *items, ULONG count, ULONG pos, void **ret );
++
++static HRESULT WINAPI cp_enum_QueryInterface( IEnumConnections *iface, REFIID riid, void **obj )
++{
++    struct cp_enum *e = impl_from_cp_enum( iface );
++
++    if (IsEqualGUID( riid, &IID_IUnknown ) ||
++        IsEqualGUID( riid, e->connections ? &IID_IEnumConnections : &IID_IEnumConnectionPoints ))
++    {
++        *obj = iface;
++        InterlockedIncrement( &e->refs );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI cp_enum_AddRef( IEnumConnections *iface )
++{
++    return InterlockedIncrement( &impl_from_cp_enum( iface )->refs );
++}
++
++static ULONG WINAPI cp_enum_Release( IEnumConnections *iface )
++{
++    struct cp_enum *e = impl_from_cp_enum( iface );
++    LONG refs = InterlockedDecrement( &e->refs );
++    ULONG i;
++
++    if (!refs)
++    {
++        for (i = 0; i < e->count; i++) IUnknown_Release( e->items[i].pUnk );
++        free( e->items );
++        free( e );
++    }
++    return refs;
++}
++
++static HRESULT WINAPI cp_enum_Next( IEnumConnections *iface, ULONG count, CONNECTDATA *out, ULONG *fetched )
++{
++    struct cp_enum *e = impl_from_cp_enum( iface );
++    ULONG got = 0;
++
++    if (!out || (count > 1 && !fetched)) return E_POINTER;
++    while (got < count && e->pos < e->count)
++    {
++        IUnknown *unk = e->items[e->pos].pUnk;
++        IUnknown_AddRef( unk );
++        if (e->connections) out[got] = e->items[e->pos];
++        else ((IConnectionPoint **)out)[got] = (IConnectionPoint *)unk;
++        got++;
++        e->pos++;
++    }
++    if (fetched) *fetched = got;
++    return got == count ? S_OK : S_FALSE;
++}
++
++static HRESULT WINAPI cp_enum_Skip( IEnumConnections *iface, ULONG count )
++{
++    struct cp_enum *e = impl_from_cp_enum( iface );
++    ULONG left = e->count - e->pos;
++
++    e->pos += min( count, left );
++    return count <= left ? S_OK : S_FALSE;
++}
++
++static HRESULT WINAPI cp_enum_Reset( IEnumConnections *iface )
++{
++    impl_from_cp_enum( iface )->pos = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI cp_enum_Clone( IEnumConnections *iface, IEnumConnections **ret )
++{
++    struct cp_enum *e = impl_from_cp_enum( iface );
++
++    if (!ret) return E_POINTER;
++    return cp_enum_create( e->connections, e->items, e->count, e->pos, (void **)ret );
++}
++
++static const IEnumConnectionsVtbl cp_enum_connections_vtbl =
++{
++    cp_enum_QueryInterface, cp_enum_AddRef, cp_enum_Release, cp_enum_Next, cp_enum_Skip, cp_enum_Reset, cp_enum_Clone
++};
++
++/* IEnumConnectionPoints has the same layout with IConnectionPoint * items */
++static const IEnumConnectionPointsVtbl cp_enum_points_vtbl =
++{
++    (void *)cp_enum_QueryInterface, (void *)cp_enum_AddRef, (void *)cp_enum_Release, (void *)cp_enum_Next,
++    (void *)cp_enum_Skip, (void *)cp_enum_Reset, (void *)cp_enum_Clone
++};
++
++static HRESULT cp_enum_create( BOOL connections, CONNECTDATA *items, ULONG count, ULONG pos, void **ret )
++{
++    struct cp_enum *e;
++    ULONG i;
++
++    *ret = NULL;
++    if (!(e = calloc( 1, sizeof(*e) ))) return E_OUTOFMEMORY;
++    if (count && !(e->items = malloc( count * sizeof(*items) )))
++    {
++        free( e );
++        return E_OUTOFMEMORY;
++    }
++    if (connections) e->iface.connections.lpVtbl = &cp_enum_connections_vtbl;
++    else e->iface.points.lpVtbl = &cp_enum_points_vtbl;
++    e->refs = 1;
++    e->connections = connections;
++    for (i = 0; i < count; i++)
++    {
++        e->items[i] = items[i];
++        IUnknown_AddRef( e->items[i].pUnk );
++    }
++    e->count = count;
++    e->pos = pos;
++    *ret = &e->iface;
++    return S_OK;
++}
++
+ static HRESULT WINAPI sink_cpc_EnumConnectionPoints( IConnectionPointContainer *iface, IEnumConnectionPoints **enum_points )
+ {
+-    FIXME( "%p\n", enum_points );
++    struct sink *sink = impl_from_sink_IConnectionPointContainer( iface );
++    CONNECTDATA point;
++
++    TRACE( "%p, %p\n", sink, enum_points );
++    if (!enum_points) return E_POINTER;
++#ifdef SG_MUTANT_WBEM_NO_CP_ENUM
+     return E_NOTIMPL;
++#endif
++    /* the one connection point, ISWbemSinkEvents */
++    point.pUnk = (IUnknown *)&sink->IConnectionPoint_iface;
++    point.dwCookie = 0;
++    return cp_enum_create( FALSE, &point, 1, 0, (void **)enum_points );
+ }
+ 
+ static HRESULT WINAPI sink_cpc_FindConnectionPoint( IConnectionPointContainer *iface, REFIID riid, IConnectionPoint **point )
+@@ -424,8 +574,25 @@ static HRESULT WINAPI sink_cp_Unadvise( IConnectionPoint *iface, DWORD cookie )
+ 
+ static HRESULT WINAPI sink_cp_EnumConnections( IConnectionPoint *iface, IEnumConnections **enum_connections )
+ {
+-    FIXME( "%p\n", enum_connections );
+-    return E_NOTIMPL;
++    struct sink *sink = impl_from_sink_IConnectionPoint( iface );
++    CONNECTDATA *items;
++    DWORD i, n = 0;
++    HRESULT hr;
++
++    TRACE( "%p, %p\n", sink, enum_connections );
++    if (!enum_connections) return E_POINTER;
++    /* Stained Glass OS: the connections made with Advise, by their cookies */
++    if (!(items = calloc( sink->sink_count + 1, sizeof(*items) ))) return E_OUTOFMEMORY;
++    for (i = 0; i < sink->sink_count; i++)
++    {
++        if (!sink->sinks[i]) continue;
++        items[n].pUnk = (IUnknown *)sink->sinks[i];
++        items[n].dwCookie = i + 1;
++        n++;
++    }
++    hr = cp_enum_create( TRUE, items, n, 0, (void **)enum_connections );
++    free( items );
++    return hr;
+ }
+ 
+ static const IConnectionPointVtbl sink_cp_vtbl =
+@@ -506,6 +673,7 @@ HRESULT SWbemSink_create( void **obj )
+     sink->IConnectionPoint_iface.lpVtbl = &sink_cp_vtbl;
+     sink->IProvideClassInfo2_iface.lpVtbl = &sink_pci_vtbl;
+     sink->refs = 1;
++    list_init( &sink->relays );
+ 
+     *obj = &sink->ISWbemSink_iface;
+     return S_OK;
+@@ -2772,7 +2940,25 @@ static HRESULT WINAPI object_Invoke(
+         flags == DISPATCH_PROPERTYGET)
+     {
+         memset( params, 0, sizeof(*params) );
+-        return IWbemClassObject_Get( object->object, name, 0, result, NULL, NULL );
++        hr = IWbemClassObject_Get( object->object, name, 0, result, NULL, NULL );
++        /* Stained Glass OS: an embedded object (an event's TargetInstance) is an SWbemObject to the script */
++        if (SUCCEEDED(hr) && result && V_VT( result ) == VT_UNKNOWN && V_UNKNOWN( result ))
++        {
++            IWbemClassObject *embedded;
++            ISWbemObject *wrapped;
++
++            if (SUCCEEDED(IUnknown_QueryInterface( V_UNKNOWN( result ), &IID_IWbemClassObject, (void **)&embedded )))
++            {
++                if (SUCCEEDED(SWbemObject_create( object->services, embedded, &wrapped )))
++                {
++                    VariantClear( result );
++                    V_VT( result ) = VT_DISPATCH;
++                    V_DISPATCH( result ) = (IDispatch *)wrapped;
++                }
++                IWbemClassObject_Release( embedded );
++            }
++        }
++        return hr;
+     }
+     else if (flags == DISPATCH_PROPERTYPUT)
+     {
+@@ -4202,6 +4388,132 @@ static HRESULT WINAPI services_ExecNotificationQuery( ISWbemServices *iface, BST
+     return hr;
+ }
+ 
++/*
++ * Stained Glass OS: an async event query. WMI hands the events to this relay on
++ * its own thread; the relay posts them to a window of the thread that made the
++ * query, which fires the sink's OnObjectReady there (a script's handlers run on
++ * the script's thread, while WScript.Sleep pumps messages), and OnCompleted
++ * once the query is cancelled.
++ */
++#define WM_SG_WBEM_EVENT  (WM_USER + 1)
++#define WM_SG_WBEM_STATUS (WM_USER + 2)
++
++struct event_relay
++{
++    IWbemObjectSink IWbemObjectSink_iface;
++    LONG refs;
++    struct sink *sink;
++    struct services *services;
++    IDispatch *context;
++    HWND hwnd;
++    struct list entry;          /* in sink->relays until OnCompleted */
++};
++
++static inline struct event_relay *impl_from_relay( IWbemObjectSink *iface )
++{
++    return CONTAINING_RECORD( iface, struct event_relay, IWbemObjectSink_iface );
++}
++
++static HRESULT WINAPI relay_QueryInterface( IWbemObjectSink *iface, REFIID riid, void **obj )
++{
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IWbemObjectSink ))
++    {
++        *obj = iface;
++        IWbemObjectSink_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI relay_AddRef( IWbemObjectSink *iface )
++{
++    return InterlockedIncrement( &impl_from_relay( iface )->refs );
++}
++
++static ULONG WINAPI relay_Release( IWbemObjectSink *iface )
++{
++    struct event_relay *relay = impl_from_relay( iface );
++    LONG refs = InterlockedDecrement( &relay->refs );
++
++    if (!refs)
++    {
++        if (relay->context) IDispatch_Release( relay->context );
++        ISWbemServices_Release( &relay->services->ISWbemServices_iface );
++        ISWbemSink_Release( &relay->sink->ISWbemSink_iface );
++        free( relay );
++    }
++    return refs;
++}
++
++static HRESULT WINAPI relay_Indicate( IWbemObjectSink *iface, LONG count, IWbemClassObject **objs )
++{
++    struct event_relay *relay = impl_from_relay( iface );
++    LONG i;
++
++    TRACE( "%p, %ld\n", relay, count );
++    for (i = 0; i < count; i++)
++    {
++        IWbemClassObject_AddRef( objs[i] );
++        if (!PostMessageW( relay->hwnd, WM_SG_WBEM_EVENT, 0, (LPARAM)objs[i] )) IWbemClassObject_Release( objs[i] );
++    }
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI relay_SetStatus( IWbemObjectSink *iface, LONG flags, HRESULT hr, BSTR param, IWbemClassObject *obj )
++{
++    struct event_relay *relay = impl_from_relay( iface );
++
++    TRACE( "%p, %#lx, %#lx\n", relay, flags, hr );
++    if (flags == WBEM_STATUS_COMPLETE) PostMessageW( relay->hwnd, WM_SG_WBEM_STATUS, hr, 0 );
++    return WBEM_S_NO_ERROR;
++}
++
++static const IWbemObjectSinkVtbl relay_vtbl =
++{
++    relay_QueryInterface, relay_AddRef, relay_Release, relay_Indicate, relay_SetStatus
++};
++
++static LRESULT CALLBACK relay_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    struct event_relay *relay = (struct event_relay *)GetWindowLongPtrW( hwnd, GWLP_USERDATA );
++
++    if (msg == WM_SG_WBEM_EVENT)
++    {
++        IWbemClassObject *event = (IWbemClassObject *)lparam;
++        ISWbemObject *object;
++
++        if (relay && SUCCEEDED(SWbemObject_create( relay->services, event, &object )))
++        {
++            sink_object_ready( relay->sink, (IDispatch *)object, relay->context );
++            ISWbemObject_Release( object );
++        }
++        IWbemClassObject_Release( event );
++        return 0;
++    }
++    if (msg == WM_SG_WBEM_STATUS)
++    {
++        if (relay)
++        {
++            sink_completed( relay->sink, (HRESULT)wparam, relay->context );
++            list_remove( &relay->entry );
++            SetWindowLongPtrW( hwnd, GWLP_USERDATA, 0 );
++            DestroyWindow( hwnd );
++            IWbemObjectSink_Release( &relay->IWbemObjectSink_iface );
++        }
++        return 0;
++    }
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static void cancel_relays( struct sink *sink )
++{
++    struct event_relay *relay, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( relay, next, &sink->relays, struct event_relay, entry )
++        IWbemServices_CancelAsyncCall( relay->services->services, &relay->IWbemObjectSink_iface );
++}
++
+ static HRESULT WINAPI services_ExecNotificationQueryAsync(
+     ISWbemServices *iface,
+     IDispatch *objWbemSink,
+@@ -4211,8 +4523,57 @@ static HRESULT WINAPI services_ExecNotificationQueryAsync(
+     IDispatch *objWbemNamedValueSet,
+     IDispatch *objWbemAsyncContext )
+ {
+-    FIXME( "\n" );
++    static const WCHAR class_name[] = L"SgWbemEventRelay";
++    struct services *services = impl_from_ISWbemServices( iface );
++    IWbemContext *context = unsafe_get_context_from_namedvalueset( objWbemNamedValueSet );
++    struct event_relay *relay;
++    struct sink *sink;
++    WNDCLASSW wc = { 0 };
++    BSTR lang;
++    HRESULT hr;
++
++    TRACE( "%p, %p, %s, %s, %#lx, %p, %p\n", iface, objWbemSink, debugstr_w(strQuery),
++           debugstr_w(strQueryLanguage), iFlags, objWbemNamedValueSet, objWbemAsyncContext );
++
++#ifdef SG_MUTANT_WBEM_NO_ASYNC_EVENTS
+     return E_NOTIMPL;
++#endif
++    ASYNC_SINK( objWbemSink, sink );
++    if (!strQuery) return E_INVALIDARG;
++
++    wc.lpfnWndProc = relay_wndproc;
++    wc.hInstance = GetModuleHandleW( L"wbemdisp.dll" );
++    wc.lpszClassName = class_name;
++    RegisterClassW( &wc );  /* fails harmlessly once it is registered */
++
++    if (!(relay = calloc( 1, sizeof(*relay) ))) return E_OUTOFMEMORY;
++    relay->IWbemObjectSink_iface.lpVtbl = &relay_vtbl;
++    relay->refs = 1;
++    if (!(relay->hwnd = CreateWindowW( class_name, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL )))
++    {
++        free( relay );
++        return E_OUTOFMEMORY;
++    }
++    ISWbemSink_AddRef( &sink->ISWbemSink_iface );
++    relay->sink = sink;
++    ISWbemServices_AddRef( &services->ISWbemServices_iface );
++    relay->services = services;
++    if ((relay->context = objWbemAsyncContext)) IDispatch_AddRef( relay->context );
++    SetWindowLongPtrW( relay->hwnd, GWLP_USERDATA, (LONG_PTR)relay );
++
++    lang = strQueryLanguage && strQueryLanguage[0] ? strQueryLanguage : SysAllocString( L"WQL" );
++    hr = IWbemServices_ExecNotificationQueryAsync( services->services, lang, strQuery, 0, context,
++                                                   &relay->IWbemObjectSink_iface );
++    if (lang != strQueryLanguage) SysFreeString( lang );
++    if (FAILED(hr))
++    {
++        SetWindowLongPtrW( relay->hwnd, GWLP_USERDATA, 0 );
++        DestroyWindow( relay->hwnd );
++        IWbemObjectSink_Release( &relay->IWbemObjectSink_iface );
++        return hr;
++    }
++    list_add_tail( &sink->relays, &relay->entry );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI services_ExecMethod(
+diff --git a/dlls/wbemprox/Makefile.in b/dlls/wbemprox/Makefile.in
+index b79426b..b71556f 100644
+--- a/dlls/wbemprox/Makefile.in
++++ b/dlls/wbemprox/Makefile.in
+@@ -4,6 +4,7 @@ IMPORTS   = winspool version iphlpapi dxgi oleaut32 ole32 advapi32 user32 gdi32
+ SOURCES = \
+ 	builtin.c \
+ 	class.c \
++	events.c \
+ 	main.c \
+ 	process.c \
+ 	qualifier.c \
+diff --git a/dlls/wbemprox/builtin.c b/dlls/wbemprox/builtin.c
+index a5ede2b..f26b989 100644
+--- a/dlls/wbemprox/builtin.c
++++ b/dlls/wbemprox/builtin.c
+@@ -422,6 +422,46 @@ static const struct column col_pnpentity[] =
+     { L"Manufacturer",         CIM_STRING },
+     { L"Name",                 CIM_STRING },
+ };
++/* Stained Glass OS: the classes of the events event queries deliver (events.c) */
++static const struct column col_instancecreationevent[] =
++{
++    { L"TargetInstance",     CIM_OBJECT },
++    { L"TIME_CREATED",       CIM_UINT64 },
++};
++static const struct column col_instancemodificationevent[] =
++{
++    { L"PreviousInstance",   CIM_OBJECT },
++    { L"TargetInstance",     CIM_OBJECT },
++    { L"TIME_CREATED",       CIM_UINT64 },
++};
++static const struct column col_processstarttrace[] =
++{
++    { L"ParentProcessID",    CIM_UINT32 },
++    { L"ProcessID",          CIM_UINT32 },
++    { L"ProcessName",        CIM_STRING },
++    { L"SessionID",          CIM_UINT32 },
++    { L"TIME_CREATED",       CIM_UINT64 },
++};
++static const struct column col_processstoptrace[] =
++{
++    { L"ExitStatus",         CIM_UINT32 },
++    { L"ParentProcessID",    CIM_UINT32 },
++    { L"ProcessID",          CIM_UINT32 },
++    { L"ProcessName",        CIM_STRING },
++    { L"SessionID",          CIM_UINT32 },
++    { L"TIME_CREATED",       CIM_UINT64 },
++};
++static const struct column col_devicechangeevent[] =
++{
++    { L"EventType",          CIM_UINT16 },
++    { L"TIME_CREATED",       CIM_UINT64 },
++};
++static const struct column col_volumechangeevent[] =
++{
++    { L"DriveName",          CIM_STRING },
++    { L"EventType",          CIM_UINT16 },
++    { L"TIME_CREATED",       CIM_UINT64 },
++};
+ static const struct column col_processstartup[] =
+ {
+     { L"CreateFlags",       CIM_UINT32 },
+@@ -5957,6 +5997,12 @@ static enum fill_status fill_antispywareproduct( struct table *table, const stru
+     return fill_securityproduct( table, cond, L"SG Defender", L"{D2BFC8E3-6D3A-4C59-9A4B-1E7B1F6C5A01}", FALSE );
+ }
+ 
++/* Stained Glass OS: event classes have no instances; event queries make their objects */
++static enum fill_status fill_event_class( struct table *table, const struct expr *cond )
++{
++    return FILL_STATUS_UNFILTERED;
++}
++
+ /* Win32_ProcessStartup has no instances: it is the type of the embedded object passed to Win32_Process.Create */
+ static enum fill_status fill_processstartup( struct table *table, const struct expr *cond )
+ {
+@@ -5975,6 +6021,13 @@ static struct table cimv2_builtin_classes[] =
+     { L"__PARAMETERS", C(col_param), D(data_param) },
+     { L"__QUALIFIERS", C(col_qualifier), D(data_qualifier) },
+     { L"__SystemSecurity", C(col_systemsecurity), D(data_systemsecurity) },
++    { L"__InstanceCreationEvent", C(col_instancecreationevent), 0, 0, NULL, fill_event_class },
++    { L"__InstanceDeletionEvent", C(col_instancecreationevent), 0, 0, NULL, fill_event_class },
++    { L"__InstanceModificationEvent", C(col_instancemodificationevent), 0, 0, NULL, fill_event_class },
++    { L"Win32_DeviceChangeEvent", C(col_devicechangeevent), 0, 0, NULL, fill_event_class },
++    { L"Win32_ProcessStartTrace", C(col_processstarttrace), 0, 0, NULL, fill_event_class },
++    { L"Win32_ProcessStopTrace", C(col_processstoptrace), 0, 0, NULL, fill_event_class },
++    { L"Win32_VolumeChangeEvent", C(col_volumechangeevent), 0, 0, NULL, fill_event_class },
+     { L"CIM_DataFile", C(col_datafile), 0, 0, NULL, fill_datafile },
+     { L"CIM_LogicalDisk", C(col_logicaldisk), 0, 0, NULL, fill_logicaldisk },
+     { L"CIM_Processor", C(col_processor), 0, 0, NULL, fill_processor },
+diff --git a/dlls/wbemprox/events.c b/dlls/wbemprox/events.c
+new file mode 100644
+index 0000000..cdde871
+--- /dev/null
++++ b/dlls/wbemprox/events.c
+@@ -0,0 +1,1322 @@
++/*
++ * WMI event queries (ExecNotificationQuery and ExecNotificationQueryAsync)
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Stained Glass OS: the events Windows' WMI delivers for classes that have no
++ * event provider of their own, found the way Windows finds them -- by polling.
++ *
++ *   SELECT * FROM __InstanceCreationEvent|__InstanceDeletionEvent|
++ *                 __InstanceModificationEvent|__InstanceOperationEvent
++ *       [WITHIN seconds] WHERE TargetInstance ISA 'Class' [AND conditions on TargetInstance.Prop]
++ *
++ * runs "SELECT * FROM Class WHERE conditions" every WITHIN seconds (one second
++ * when there is no WITHIN) and compares the instances by __RELPATH: a new one is
++ * a creation event, a missing one a deletion event, one whose property values
++ * changed a modification event (with PreviousInstance). The extrinsic events
++ * Win32_ProcessStartTrace/Win32_ProcessStopTrace/Win32_ProcessTrace come from
++ * Win32_Process the same way (their ProcessName/ProcessID/ParentProcessID/
++ * SessionID conditions are Win32_Process's Name/ProcessId/ParentProcessId/
++ * SessionId; polled every 200 ms, so a process that lives less than that may
++ * be missed), Win32_DeviceChangeEvent from Win32_PnPEntity and
++ * Win32_VolumeChangeEvent from Win32_LogicalDisk (EventType 2 arrival, 3
++ * removal). The instances there when the query starts make no events.
++ */
++
++#define COBJMACROS
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "objbase.h"
++#include "wbemcli.h"
++
++#include "wine/debug.h"
++#include "wbemprox_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wbemprox);
++
++enum event_kind
++{
++    EVENT_INSTANCE,      /* __Instance*Event */
++    EVENT_PROCESS,       /* Win32_Process*Trace */
++    EVENT_DEVICE,        /* Win32_DeviceChangeEvent */
++    EVENT_VOLUME,        /* Win32_VolumeChangeEvent */
++};
++
++#define WANT_CREATE 1
++#define WANT_DELETE 2
++#define WANT_MODIFY 4
++
++struct snapshot_item
++{
++    BSTR relpath;
++    WCHAR *values;           /* the property values, to see a modification */
++    IWbemClassObject *obj;
++};
++
++struct snapshot
++{
++    struct snapshot_item *items;
++    UINT count;
++};
++
++struct event_sub
++{
++    struct list entry;
++    enum wbm_namespace ns;
++    enum event_kind kind;
++    UINT want;               /* WANT_* */
++    WCHAR *event_class;      /* the class the events are of (__InstanceCreationEvent for an operation event's creation...) */
++    WCHAR *poll;             /* the data query polled */
++    int event_type;          /* EVENT_DEVICE/EVENT_VOLUME: EventType asked for, 0 for both */
++    DWORD interval;          /* milliseconds */
++    IWbemObjectSink *sink;   /* an async query's sink, or NULL */
++    struct event_queue *queue; /* a semisynchronous query's enumerator, or NULL */
++    HANDLE stop, thread;
++    struct snapshot snap;
++};
++
++/* the events a semisynchronous query's enumerator hands out */
++struct event_queue
++{
++    IEnumWbemClassObject IEnumWbemClassObject_iface;
++    LONG refs;
++    CRITICAL_SECTION cs;
++    HANDLE ready;            /* set while there are events */
++    IWbemClassObject **events;
++    UINT count, size;
++    struct event_sub *sub;
++};
++
++static const WCHAR *skip_space( const WCHAR *p )
++{
++    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
++    return p;
++}
++
++/* is the word at p this keyword (not the start of a longer name)? */
++static BOOL is_word( const WCHAR *p, const WCHAR *word )
++{
++    size_t len = wcslen( word );
++    if (wcsnicmp( p, word, len )) return FALSE;
++    return !iswalnum( p[len] ) && p[len] != '_' && p[len] != '.';
++}
++
++static BOOL is_name_char( WCHAR c )
++{
++    return iswalnum( c ) || c == '_';
++}
++
++/* the WHERE text with the keyword-free spans changed: TargetInstance. dropped,
++ * or Win32_Process*Trace's property names made Win32_Process's */
++static WCHAR *rewrite_condition( const WCHAR *cond, enum event_kind kind )
++{
++    static const struct { const WCHAR *from, *to; } process_names[] =
++    {
++        { L"ProcessName", L"Name" }, { L"ProcessID", L"ProcessId" },
++        { L"ParentProcessID", L"ParentProcessId" }, { L"SessionID", L"SessionId" },
++    };
++    WCHAR *ret = malloc( (wcslen( cond ) * 2 + 1) * sizeof(WCHAR) ), *o = ret;
++    const WCHAR *p = cond;
++    unsigned int i;
++
++    if (!ret) return NULL;
++    while (*p)
++    {
++        if (*p == '\'' || *p == '"')
++        {
++            WCHAR q = *p;
++            *o++ = *p++;
++            while (*p && *p != q) *o++ = *p++;
++            if (*p) *o++ = *p++;
++            continue;
++        }
++        if (is_name_char( *p ) && (p == cond || !is_name_char( p[-1] )))
++        {
++            if (kind == EVENT_INSTANCE && !wcsnicmp( p, L"TargetInstance.", 15 ))
++            {
++                p += 15;
++                continue;
++            }
++            if (kind == EVENT_PROCESS)
++            {
++                for (i = 0; i < ARRAY_SIZE(process_names); i++)
++                {
++                    size_t len = wcslen( process_names[i].from );
++                    if (!wcsnicmp( p, process_names[i].from, len ) && !is_name_char( p[len] ))
++                    {
++                        wcscpy( o, process_names[i].to );
++                        o += wcslen( process_names[i].to );
++                        p += len;
++                        break;
++                    }
++                }
++                if (i < ARRAY_SIZE(process_names)) continue;
++            }
++            while (is_name_char( *p ) || *p == '.') *o++ = *p++;
++            continue;
++        }
++        *o++ = *p++;
++    }
++    *o = 0;
++    return ret;
++}
++
++/* "TargetInstance ISA 'Class'" taken out of a condition: the class, and the rest in *rest */
++static HRESULT take_isa( const WCHAR *cond, WCHAR **class, WCHAR **rest )
++{
++    const WCHAR *p = cond, *start = NULL, *end = NULL, *name;
++    WCHAR *r;
++    size_t len;
++
++    *class = *rest = NULL;
++    while (*p)
++    {
++        if (*p == '\'' || *p == '"')
++        {
++            WCHAR q = *p++;
++            while (*p && *p != q) p++;
++            if (*p) p++;
++            continue;
++        }
++        if ((p == cond || !is_name_char( p[-1] )) && is_word( p, L"TargetInstance" ))
++        {
++            const WCHAR *q = skip_space( p + 14 );
++            if (is_word( q, L"ISA" ))
++            {
++                WCHAR quote;
++                q = skip_space( q + 3 );
++                if (*q != '\'' && *q != '"') return WBEM_E_INVALID_QUERY;
++                quote = *q++;
++                name = q;
++                while (*q && *q != quote) q++;
++                if (!*q) return WBEM_E_INVALID_QUERY;
++                if (!(*class = malloc( (q - name + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++                memcpy( *class, name, (q - name) * sizeof(WCHAR) );
++                (*class)[q - name] = 0;
++                start = p;
++                end = q + 1;
++                break;
++            }
++        }
++        p++;
++    }
++    if (!*class) return WBEM_E_NOT_SUPPORTED;  /* events of every class: not polled */
++
++    /* the rest, without the AND that joined the ISA test to it */
++    len = wcslen( cond );
++    if (!(r = malloc( (len + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++    memcpy( r, cond, (start - cond) * sizeof(WCHAR) );
++    r[start - cond] = 0;
++    {
++        WCHAR *tail = r + (start - cond);
++        const WCHAR *after = skip_space( end );
++        size_t n = wcslen( r );
++
++        while (n && (r[n - 1] == ' ' || r[n - 1] == '\t' || r[n - 1] == '(')) n--;
++        if (n >= 3 && !wcsnicmp( r + n - 3, L"AND", 3 ) && (n == 3 || !is_name_char( r[n - 4] )))
++        {
++            r[n - 3] = 0;
++            tail = r + n - 3;
++        }
++        else if (is_word( after, L"AND" )) after = skip_space( after + 3 );
++        wcscpy( tail, after );
++    }
++    /* nothing but spaces and brackets left: no condition */
++    for (p = r; *p; p++) if (*p != ' ' && *p != '\t' && *p != '(' && *p != ')') break;
++    if (!*p) r[0] = 0;
++    *rest = r;
++    return S_OK;
++}
++
++static void free_sub( struct event_sub *sub )
++{
++    UINT i;
++
++    for (i = 0; i < sub->snap.count; i++)
++    {
++        SysFreeString( sub->snap.items[i].relpath );
++        free( sub->snap.items[i].values );
++        IWbemClassObject_Release( sub->snap.items[i].obj );
++    }
++    free( sub->snap.items );
++    if (sub->sink) IWbemObjectSink_Release( sub->sink );
++    if (sub->stop) CloseHandle( sub->stop );
++    if (sub->thread) CloseHandle( sub->thread );
++    free( sub->event_class );
++    free( sub->poll );
++    free( sub );
++}
++
++/* the query understood: what to poll, and what events it asks for */
++static HRESULT parse_event_query( enum wbm_namespace ns, const WCHAR *query, struct event_sub **ret )
++{
++    const WCHAR *p = skip_space( query ), *name;
++    WCHAR *class = NULL, *cond = NULL, *target = NULL, *rest = NULL;
++    struct event_sub *sub;
++    double within = 0;
++    HRESULT hr = WBEM_E_INVALID_QUERY;
++    size_t len;
++
++    if (!is_word( p, L"SELECT" )) return WBEM_E_INVALID_QUERY;
++    while (*p && !is_word( p, L"FROM" )) p++;
++    if (!*p) return WBEM_E_INVALID_QUERY;
++    p = skip_space( p + 4 );
++    name = p;
++    while (is_name_char( *p )) p++;
++    if (p == name) return WBEM_E_INVALID_QUERY;
++    if (!(class = malloc( (p - name + 1) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++    memcpy( class, name, (p - name) * sizeof(WCHAR) );
++    class[p - name] = 0;
++    p = skip_space( p );
++    if (is_word( p, L"WITHIN" ))
++    {
++        WCHAR *e;
++        within = wcstod( skip_space( p + 6 ), &e );
++        if (e == skip_space( p + 6 ) || within <= 0) goto done;
++        p = skip_space( e );
++    }
++    if (is_word( p, L"WHERE" ))
++    {
++        p = skip_space( p + 5 );
++        if (!(cond = wcsdup( p ))) { hr = E_OUTOFMEMORY; goto done; }
++    }
++    else if (*p) goto done;   /* GROUP, HAVING: not supported */
++
++    if (!(sub = calloc( 1, sizeof(*sub) ))) { hr = E_OUTOFMEMORY; goto done; }
++    sub->ns = ns;
++    sub->interval = within ? (DWORD)(within * 1000) : 1000;
++    if (sub->interval < 100) sub->interval = 100;
++
++    if (!wcsicmp( class, L"__InstanceCreationEvent" ) || !wcsicmp( class, L"__InstanceDeletionEvent" ) ||
++        !wcsicmp( class, L"__InstanceModificationEvent" ) || !wcsicmp( class, L"__InstanceOperationEvent" ))
++    {
++        struct table *table;
++
++        sub->kind = EVENT_INSTANCE;
++        if (!wcsicmp( class, L"__InstanceCreationEvent" )) sub->want = WANT_CREATE;
++        else if (!wcsicmp( class, L"__InstanceDeletionEvent" )) sub->want = WANT_DELETE;
++        else if (!wcsicmp( class, L"__InstanceModificationEvent" )) sub->want = WANT_MODIFY;
++        else sub->want = WANT_CREATE | WANT_DELETE | WANT_MODIFY;
++        if (!cond) { hr = WBEM_E_NOT_SUPPORTED; free_sub( sub ); goto done; }
++        if ((hr = take_isa( cond, &target, &rest )) != S_OK) { free_sub( sub ); goto done; }
++        if (wcsstr( rest, L"PreviousInstance" ) || wcsstr( rest, L"previousinstance" ))
++        {
++            FIXME( "conditions on PreviousInstance are not supported: %s\n", debugstr_w(rest) );
++            hr = WBEM_E_NOT_SUPPORTED;
++            free_sub( sub );
++            goto done;
++        }
++        if (!(table = find_table( ns, target )))
++        {
++            hr = WBEM_E_INVALID_CLASS;
++            free_sub( sub );
++            goto done;
++        }
++        release_table( table );
++        free( cond );
++        cond = rest[0] ? rewrite_condition( rest, EVENT_INSTANCE ) : NULL;
++        len = wcslen( target ) + (cond ? wcslen( cond ) : 0) + 32;
++        if ((sub->poll = malloc( len * sizeof(WCHAR) )))
++        {
++            if (cond) swprintf( sub->poll, len, L"SELECT * FROM %s WHERE %s", target, cond );
++            else swprintf( sub->poll, len, L"SELECT * FROM %s", target );
++        }
++    }
++    else if (!wcsicmp( class, L"Win32_ProcessStartTrace" ) || !wcsicmp( class, L"Win32_ProcessStopTrace" ) ||
++             !wcsicmp( class, L"Win32_ProcessTrace" ))
++    {
++        WCHAR *mapped = cond ? rewrite_condition( cond, EVENT_PROCESS ) : NULL;
++
++        sub->kind = EVENT_PROCESS;
++        /* Windows reports these as processes start and stop: a short poll keeps
++         * short-lived processes from slipping between two looks */
++        if (!within) sub->interval = 200;
++        if (!wcsicmp( class, L"Win32_ProcessStartTrace" )) sub->want = WANT_CREATE;
++        else if (!wcsicmp( class, L"Win32_ProcessStopTrace" )) sub->want = WANT_DELETE;
++        else sub->want = WANT_CREATE | WANT_DELETE;
++        len = (mapped ? wcslen( mapped ) : 0) + 48;
++        if ((sub->poll = malloc( len * sizeof(WCHAR) )))
++        {
++            if (mapped) swprintf( sub->poll, len, L"SELECT * FROM Win32_Process WHERE %s", mapped );
++            else wcscpy( sub->poll, L"SELECT * FROM Win32_Process" );
++        }
++        free( mapped );
++    }
++    else if (!wcsicmp( class, L"Win32_DeviceChangeEvent" ) || !wcsicmp( class, L"Win32_VolumeChangeEvent" ))
++    {
++        BOOL volume = !wcsicmp( class, L"Win32_VolumeChangeEvent" );
++
++        sub->kind = volume ? EVENT_VOLUME : EVENT_DEVICE;
++        sub->want = WANT_CREATE | WANT_DELETE;
++        if (cond)
++        {
++            /* EventType = n is the condition these are asked with */
++            const WCHAR *c = skip_space( cond );
++            WCHAR *e;
++
++            if (!is_word( c, L"EventType" )) { hr = WBEM_E_NOT_SUPPORTED; free_sub( sub ); goto done; }
++            c = skip_space( c + 9 );
++            if (*c != '=') { hr = WBEM_E_NOT_SUPPORTED; free_sub( sub ); goto done; }
++            sub->event_type = wcstol( skip_space( c + 1 ), &e, 10 );
++            if (*skip_space( e )) { hr = WBEM_E_NOT_SUPPORTED; free_sub( sub ); goto done; }
++            if (sub->event_type == 2) sub->want = WANT_CREATE;
++            else if (sub->event_type == 3) sub->want = WANT_DELETE;
++            else sub->want = 0;  /* configuration changes and docking: none here */
++        }
++        sub->poll = wcsdup( volume ? L"SELECT * FROM Win32_LogicalDisk" : L"SELECT * FROM Win32_PnPEntity" );
++    }
++    else
++    {
++        FIXME( "events of %s are not supported\n", debugstr_w(class) );
++        hr = WBEM_E_INVALID_CLASS;
++        free_sub( sub );
++        goto done;
++    }
++    if (!sub->poll) { hr = E_OUTOFMEMORY; free_sub( sub ); goto done; }
++    TRACE( "%s: polling %s every %lu ms, want %#x\n", debugstr_w(query), debugstr_w(sub->poll), sub->interval,
++           sub->want );
++    *ret = sub;
++    hr = S_OK;
++
++done:
++    free( class );
++    free( cond );
++    free( target );
++    free( rest );
++    return hr;
++}
++
++/*
++ * A detached object: the property values of an instance or an event, held by
++ * itself. wbemprox's own objects keep their table locked for as long as they
++ * live (grab_table), so objects that outlive a poll, or go to another thread,
++ * must not be those.
++ */
++struct dprop
++{
++    BSTR name;
++    VARIANT value;
++    CIMTYPE type;
++    LONG flavor;
++};
++
++struct dobj
++{
++    IWbemClassObject IWbemClassObject_iface;
++    LONG refs;
++    struct dprop *props;
++    UINT count;
++    UINT pos;              /* of the enumeration */
++    LONG enum_flags;
++};
++
++static const IWbemClassObjectVtbl dobj_vtbl;
++
++static inline struct dobj *impl_from_dobj( IWbemClassObject *iface )
++{
++    return CONTAINING_RECORD( iface, struct dobj, IWbemClassObject_iface );
++}
++
++static struct dobj *dobj_new( void )
++{
++    struct dobj *obj = calloc( 1, sizeof(*obj) );
++    if (!obj) return NULL;
++    obj->IWbemClassObject_iface.lpVtbl = &dobj_vtbl;
++    obj->refs = 1;
++    return obj;
++}
++
++static struct dprop *dobj_find( struct dobj *obj, const WCHAR *name )
++{
++    UINT i;
++    if (!name) return NULL;
++    for (i = 0; i < obj->count; i++) if (!wcsicmp( obj->props[i].name, name )) return &obj->props[i];
++    return NULL;
++}
++
++static HRESULT dobj_set( struct dobj *obj, const WCHAR *name, const VARIANT *value, CIMTYPE type, LONG flavor )
++{
++    struct dprop *prop = dobj_find( obj, name ), *grown;
++
++    if (!prop)
++    {
++        if (!(grown = realloc( obj->props, (obj->count + 1) * sizeof(*grown) ))) return E_OUTOFMEMORY;
++        obj->props = grown;
++        prop = &obj->props[obj->count];
++        if (!(prop->name = SysAllocString( name ))) return E_OUTOFMEMORY;
++        VariantInit( &prop->value );
++        prop->type = type;
++        prop->flavor = flavor;
++        obj->count++;
++    }
++    else if (type) prop->type = type;
++    VariantClear( &prop->value );
++    if (value) return VariantCopy( &prop->value, value );
++    V_VT( &prop->value ) = VT_NULL;
++    return S_OK;
++}
++
++static void dobj_set_str( struct dobj *obj, const WCHAR *name, const WCHAR *str, CIMTYPE type )
++{
++    VARIANT v;
++    if (str)
++    {
++        V_VT( &v ) = VT_BSTR;
++        V_BSTR( &v ) = SysAllocString( str );
++        dobj_set( obj, name, &v, type, WBEM_FLAVOR_ORIGIN_SYSTEM );
++        VariantClear( &v );
++    }
++    else dobj_set( obj, name, NULL, type, WBEM_FLAVOR_ORIGIN_SYSTEM );
++}
++
++static HRESULT WINAPI dobj_QueryInterface( IWbemClassObject *iface, REFIID riid, void **ret )
++{
++    if (IsEqualGUID( riid, &IID_IWbemClassObject ) || IsEqualGUID( riid, &IID_IUnknown ))
++    {
++        *ret = iface;
++        IWbemClassObject_AddRef( iface );
++        return S_OK;
++    }
++    *ret = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI dobj_AddRef( IWbemClassObject *iface )
++{
++    return InterlockedIncrement( &impl_from_dobj( iface )->refs );
++}
++
++static ULONG WINAPI dobj_Release( IWbemClassObject *iface )
++{
++    struct dobj *obj = impl_from_dobj( iface );
++    LONG refs = InterlockedDecrement( &obj->refs );
++    UINT i;
++
++    if (!refs)
++    {
++        for (i = 0; i < obj->count; i++)
++        {
++            SysFreeString( obj->props[i].name );
++            VariantClear( &obj->props[i].value );
++        }
++        free( obj->props );
++        free( obj );
++    }
++    return refs;
++}
++
++static HRESULT WINAPI dobj_GetQualifierSet( IWbemClassObject *iface, IWbemQualifierSet **set )
++{
++    if (set) *set = NULL;
++    return WBEM_E_NOT_SUPPORTED;
++}
++
++static HRESULT WINAPI dobj_Get( IWbemClassObject *iface, LPCWSTR name, LONG flags, VARIANT *value, CIMTYPE *type,
++                                LONG *flavor )
++{
++    struct dprop *prop = dobj_find( impl_from_dobj( iface ), name );
++
++    TRACE( "%p, %s\n", iface, debugstr_w(name) );
++    if (!name) return WBEM_E_INVALID_PARAMETER;
++    if (!prop) return WBEM_E_NOT_FOUND;
++    if (value)
++    {
++        VariantInit( value );
++        VariantCopy( value, &prop->value );
++    }
++    if (type) *type = prop->type;
++    if (flavor) *flavor = prop->flavor;
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI dobj_Put( IWbemClassObject *iface, LPCWSTR name, LONG flags, VARIANT *value, CIMTYPE type )
++{
++    struct dobj *obj = impl_from_dobj( iface );
++
++    if (!name) return WBEM_E_INVALID_PARAMETER;
++    if (name[0] == '_' && name[1] == '_') return WBEM_E_READ_ONLY;
++    return dobj_set( obj, name, value, type, WBEM_FLAVOR_ORIGIN_LOCAL );
++}
++
++static HRESULT WINAPI dobj_Delete( IWbemClassObject *iface, LPCWSTR name )
++{
++    struct dobj *obj = impl_from_dobj( iface );
++    struct dprop *prop = dobj_find( obj, name );
++    UINT i;
++
++    if (!prop) return WBEM_E_NOT_FOUND;
++    i = prop - obj->props;
++    SysFreeString( prop->name );
++    VariantClear( &prop->value );
++    memmove( prop, prop + 1, (obj->count - i - 1) * sizeof(*prop) );
++    obj->count--;
++    return WBEM_S_NO_ERROR;
++}
++
++static BOOL dprop_wanted( const struct dprop *prop, LONG flags )
++{
++    BOOL system = prop->name[0] == '_' && prop->name[1] == '_';
++    if ((flags & WBEM_FLAG_SYSTEM_ONLY) && !system) return FALSE;
++    if ((flags & WBEM_FLAG_NONSYSTEM_ONLY) && system) return FALSE;
++    return TRUE;
++}
++
++static HRESULT WINAPI dobj_GetNames( IWbemClassObject *iface, LPCWSTR qualifier, LONG flags, VARIANT *qualifier_value,
++                                     SAFEARRAY **names )
++{
++    struct dobj *obj = impl_from_dobj( iface );
++    SAFEARRAY *sa;
++    LONG n = 0;
++    UINT i;
++
++    if (!names) return WBEM_E_INVALID_PARAMETER;
++    for (i = 0; i < obj->count; i++) if (dprop_wanted( &obj->props[i], flags )) n++;
++    if (!(sa = SafeArrayCreateVector( VT_BSTR, 0, n ))) return E_OUTOFMEMORY;
++    for (i = 0, n = 0; i < obj->count; i++)
++    {
++        if (!dprop_wanted( &obj->props[i], flags )) continue;
++        SafeArrayPutElement( sa, &n, obj->props[i].name );
++        n++;
++    }
++    *names = sa;
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI dobj_BeginEnumeration( IWbemClassObject *iface, LONG flags )
++{
++    struct dobj *obj = impl_from_dobj( iface );
++    obj->pos = 0;
++    obj->enum_flags = flags;
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI dobj_Next( IWbemClassObject *iface, LONG flags, BSTR *name, VARIANT *value, CIMTYPE *type,
++                                 LONG *flavor )
++{
++    struct dobj *obj = impl_from_dobj( iface );
++
++    while (obj->pos < obj->count && !dprop_wanted( &obj->props[obj->pos], obj->enum_flags )) obj->pos++;
++    if (obj->pos >= obj->count) return WBEM_S_NO_MORE_DATA;
++    if (name) *name = SysAllocString( obj->props[obj->pos].name );
++    if (value)
++    {
++        VariantInit( value );
++        VariantCopy( value, &obj->props[obj->pos].value );
++    }
++    if (type) *type = obj->props[obj->pos].type;
++    if (flavor) *flavor = obj->props[obj->pos].flavor;
++    obj->pos++;
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI dobj_EndEnumeration( IWbemClassObject *iface )
++{
++    impl_from_dobj( iface )->pos = 0;
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI dobj_GetPropertyQualifierSet( IWbemClassObject *iface, LPCWSTR name, IWbemQualifierSet **set )
++{
++    if (set) *set = NULL;
++    return WBEM_E_NOT_SUPPORTED;
++}
++
++static HRESULT WINAPI dobj_Clone( IWbemClassObject *iface, IWbemClassObject **ret )
++{
++    struct dobj *obj = impl_from_dobj( iface ), *copy;
++    UINT i;
++
++    if (!ret) return WBEM_E_INVALID_PARAMETER;
++    if (!(copy = dobj_new())) return E_OUTOFMEMORY;
++    for (i = 0; i < obj->count; i++)
++        dobj_set( copy, obj->props[i].name, &obj->props[i].value, obj->props[i].type, obj->props[i].flavor );
++    *ret = &copy->IWbemClassObject_iface;
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI dobj_GetObjectText( IWbemClassObject *iface, LONG flags, BSTR *text )
++{
++    struct dobj *obj = impl_from_dobj( iface );
++    struct dprop *class = dobj_find( obj, L"__CLASS" );
++    WCHAR *buf, *grown;
++    size_t len;
++    UINT i;
++
++    if (!text) return WBEM_E_INVALID_PARAMETER;
++    len = 64 + (class && V_VT( &class->value ) == VT_BSTR ? wcslen( V_BSTR( &class->value ) ) : 0);
++    if (!(buf = malloc( len * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++    swprintf( buf, len, L"\ninstance of %s\n{\n",
++              class && V_VT( &class->value ) == VT_BSTR ? V_BSTR( &class->value ) : L"" );
++    for (i = 0; i < obj->count; i++)
++    {
++        VARIANT v;
++        size_t n;
++
++        if (obj->props[i].name[0] == '_' || V_VT( &obj->props[i].value ) == VT_NULL) continue;
++        VariantInit( &v );
++        if (V_VT( &obj->props[i].value ) & VT_ARRAY || V_VT( &obj->props[i].value ) == VT_UNKNOWN ||
++            FAILED(VariantChangeType( &v, &obj->props[i].value, 0, VT_BSTR ))) continue;
++        n = wcslen( buf ) + wcslen( obj->props[i].name ) + wcslen( V_BSTR( &v ) ) + 16;
++        if ((grown = realloc( buf, n * sizeof(WCHAR) )))
++        {
++            buf = grown;
++            swprintf( buf + wcslen( buf ), n - wcslen( buf ), L"\t%s = \"%s\";\n", obj->props[i].name, V_BSTR( &v ) );
++        }
++        VariantClear( &v );
++    }
++    len = wcslen( buf ) + 4;
++    if ((grown = realloc( buf, len * sizeof(WCHAR) ))) { buf = grown; wcscat( buf, L"};\n" ); }
++    *text = SysAllocString( buf );
++    free( buf );
++    return *text ? WBEM_S_NO_ERROR : E_OUTOFMEMORY;
++}
++
++static HRESULT WINAPI dobj_SpawnDerivedClass( IWbemClassObject *iface, LONG flags, IWbemClassObject **ret )
++{
++    if (ret) *ret = NULL;
++    return WBEM_E_INVALID_OPERATION;
++}
++
++static HRESULT WINAPI dobj_SpawnInstance( IWbemClassObject *iface, LONG flags, IWbemClassObject **ret )
++{
++    if (ret) *ret = NULL;
++    return WBEM_E_INVALID_OPERATION;
++}
++
++static HRESULT WINAPI dobj_CompareTo( IWbemClassObject *iface, LONG flags, IWbemClassObject *other )
++{
++    return iface == other ? WBEM_S_SAME : WBEM_S_DIFFERENT;
++}
++
++static HRESULT WINAPI dobj_GetPropertyOrigin( IWbemClassObject *iface, LPCWSTR name, BSTR *class )
++{
++    struct dobj *obj = impl_from_dobj( iface );
++    struct dprop *prop = dobj_find( obj, L"__CLASS" );
++
++    if (!dobj_find( obj, name )) return WBEM_E_NOT_FOUND;
++    if (!class) return WBEM_E_INVALID_PARAMETER;
++    *class = prop && V_VT( &prop->value ) == VT_BSTR ? SysAllocString( V_BSTR( &prop->value ) ) : NULL;
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI dobj_InheritsFrom( IWbemClassObject *iface, LPCWSTR ancestor )
++{
++    struct dobj *obj = impl_from_dobj( iface );
++    struct dprop *prop = dobj_find( obj, L"__DERIVATION" );
++    LONG i, lo, hi;
++
++    if (!ancestor) return WBEM_E_INVALID_PARAMETER;
++    if (!prop || V_VT( &prop->value ) != (VT_ARRAY | VT_BSTR)) return WBEM_S_FALSE;
++    SafeArrayGetLBound( V_ARRAY( &prop->value ), 1, &lo );
++    SafeArrayGetUBound( V_ARRAY( &prop->value ), 1, &hi );
++    for (i = lo; i <= hi; i++)
++    {
++        BSTR name;
++        BOOL match;
++        if (FAILED(SafeArrayGetElement( V_ARRAY( &prop->value ), &i, &name ))) continue;
++        match = !wcsicmp( name, ancestor );
++        SysFreeString( name );
++        if (match) return WBEM_S_NO_ERROR;
++    }
++    return WBEM_S_FALSE;
++}
++
++static HRESULT WINAPI dobj_GetMethod( IWbemClassObject *iface, LPCWSTR name, LONG flags, IWbemClassObject **in,
++                                      IWbemClassObject **out )
++{
++    return WBEM_E_NOT_FOUND;
++}
++
++static HRESULT WINAPI dobj_PutMethod( IWbemClassObject *iface, LPCWSTR name, LONG flags, IWbemClassObject *in,
++                                      IWbemClassObject *out )
++{
++    return WBEM_E_INVALID_OPERATION;
++}
++
++static HRESULT WINAPI dobj_DeleteMethod( IWbemClassObject *iface, LPCWSTR name )
++{
++    return WBEM_E_NOT_FOUND;
++}
++
++static HRESULT WINAPI dobj_BeginMethodEnumeration( IWbemClassObject *iface, LONG flags )
++{
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI dobj_NextMethod( IWbemClassObject *iface, LONG flags, BSTR *name, IWbemClassObject **in,
++                                       IWbemClassObject **out )
++{
++    return WBEM_S_NO_MORE_DATA;
++}
++
++static HRESULT WINAPI dobj_EndMethodEnumeration( IWbemClassObject *iface )
++{
++    return WBEM_S_NO_ERROR;
++}
++
++static HRESULT WINAPI dobj_GetMethodQualifierSet( IWbemClassObject *iface, LPCWSTR method, IWbemQualifierSet **set )
++{
++    if (set) *set = NULL;
++    return WBEM_E_NOT_FOUND;
++}
++
++static HRESULT WINAPI dobj_GetMethodOrigin( IWbemClassObject *iface, LPCWSTR method, BSTR *class )
++{
++    return WBEM_E_NOT_FOUND;
++}
++
++static const IWbemClassObjectVtbl dobj_vtbl =
++{
++    dobj_QueryInterface, dobj_AddRef, dobj_Release, dobj_GetQualifierSet, dobj_Get, dobj_Put, dobj_Delete,
++    dobj_GetNames, dobj_BeginEnumeration, dobj_Next, dobj_EndEnumeration, dobj_GetPropertyQualifierSet,
++    dobj_Clone, dobj_GetObjectText, dobj_SpawnDerivedClass, dobj_SpawnInstance, dobj_CompareTo,
++    dobj_GetPropertyOrigin, dobj_InheritsFrom, dobj_GetMethod, dobj_PutMethod, dobj_DeleteMethod,
++    dobj_BeginMethodEnumeration, dobj_NextMethod, dobj_EndMethodEnumeration, dobj_GetMethodQualifierSet,
++    dobj_GetMethodOrigin
++};
++
++/* every property of a wbemprox object, copied */
++static struct dobj *detach( IWbemClassObject *src )
++{
++    struct dobj *obj = dobj_new();
++    CIMTYPE type;
++    LONG flavor;
++    BSTR name;
++    VARIANT v;
++
++    if (!obj) return NULL;
++    if (FAILED(IWbemClassObject_BeginEnumeration( src, 0 ))) return obj;
++    while (IWbemClassObject_Next( src, 0, &name, &v, &type, &flavor ) == S_OK)
++    {
++        dobj_set( obj, name, &v, type, flavor );
++        SysFreeString( name );
++        VariantClear( &v );
++    }
++    IWbemClassObject_EndEnumeration( src );
++    return obj;
++}
++
++/* the values of an instance's own properties, joined, to see whether it changed */
++static WCHAR *instance_values( struct dobj *obj )
++{
++    WCHAR *ret = NULL, *grown;
++    size_t len = 0;
++    UINT i;
++
++    for (i = 0; i < obj->count; i++)
++    {
++        const WCHAR *text = L"?";
++        VARIANT v;
++        size_t n;
++
++        if (obj->props[i].name[0] == '_' && obj->props[i].name[1] == '_') continue;
++        VariantInit( &v );
++        if (V_VT( &obj->props[i].value ) == VT_NULL) text = L"";
++        else if (!(V_VT( &obj->props[i].value ) & VT_ARRAY) && V_VT( &obj->props[i].value ) != VT_UNKNOWN &&
++                 V_VT( &obj->props[i].value ) != VT_DISPATCH &&
++                 SUCCEEDED(VariantChangeType( &v, &obj->props[i].value, 0, VT_BSTR ))) text = V_BSTR( &v );
++        n = wcslen( obj->props[i].name ) + wcslen( text ) + 3;
++        if ((grown = realloc( ret, (len + n + 1) * sizeof(WCHAR) )))
++        {
++            ret = grown;
++            swprintf( ret + len, n + 1, L"%s=%s;", obj->props[i].name, text );
++            len += wcslen( ret + len );
++        }
++        VariantClear( &v );
++    }
++    return ret ? ret : wcsdup( L"" );
++}
++
++/* the instances the poll query gives now, detached; no wbemprox object is left behind */
++static HRESULT take_snapshot( struct event_sub *sub, struct snapshot *snap )
++{
++    IEnumWbemClassObject *iter;
++    IWbemClassObject *obj;
++    ULONG count;
++    HRESULT hr;
++
++    snap->items = NULL;
++    snap->count = 0;
++    if ((hr = exec_query( sub->ns, sub->poll, &iter )) != S_OK) return hr;
++    for (;;)
++    {
++        struct snapshot_item *grown;
++        struct dobj *copy;
++        struct dprop *path;
++
++        IEnumWbemClassObject_Next( iter, WBEM_INFINITE, 1, &obj, &count );
++        if (!count) break;
++        copy = detach( obj );
++        IWbemClassObject_Release( obj );
++        if (!copy) continue;
++        path = dobj_find( copy, L"__RELPATH" );
++        if (!path || V_VT( &path->value ) != VT_BSTR ||
++            !(grown = realloc( snap->items, (snap->count + 1) * sizeof(*grown) )))
++        {
++            IWbemClassObject_Release( &copy->IWbemClassObject_iface );
++            continue;
++        }
++        snap->items = grown;
++        snap->items[snap->count].relpath = SysAllocString( V_BSTR( &path->value ) );
++        snap->items[snap->count].values = sub->want & WANT_MODIFY ? instance_values( copy ) : NULL;
++        snap->items[snap->count].obj = &copy->IWbemClassObject_iface;
++        snap->count++;
++    }
++    IEnumWbemClassObject_Release( iter );
++    return S_OK;
++}
++
++static const struct snapshot_item *find_item( const struct snapshot *snap, BSTR relpath )
++{
++    UINT i;
++    for (i = 0; i < snap->count; i++) if (!wcscmp( snap->items[i].relpath, relpath )) return &snap->items[i];
++    return NULL;
++}
++
++static void put_uint( struct dobj *obj, const WCHAR *name, UINT value, CIMTYPE type )
++{
++    VARIANT v;
++    V_VT( &v ) = VT_I4;
++    V_I4( &v ) = value;
++    dobj_set( obj, name, &v, type, WBEM_FLAVOR_ORIGIN_PROPAGATED );
++}
++
++static void put_object( struct dobj *obj, const WCHAR *name, IWbemClassObject *value )
++{
++    VARIANT v;
++    V_VT( &v ) = VT_UNKNOWN;
++    V_UNKNOWN( &v ) = (IUnknown *)value;
++    dobj_set( obj, name, &v, CIM_OBJECT, WBEM_FLAVOR_ORIGIN_PROPAGATED );
++}
++
++/* uint64 properties travel as decimal strings, as WMI's do */
++static void put_time( struct dobj *obj )
++{
++    FILETIME ft;
++    WCHAR buf[24];
++
++    GetSystemTimeAsFileTime( &ft );
++    swprintf( buf, ARRAY_SIZE(buf), L"%I64u", (ULONGLONG)ft.dwHighDateTime << 32 | ft.dwLowDateTime );
++    dobj_set_str( obj, L"TIME_CREATED", buf, CIM_UINT64 );
++}
++
++static void copy_property( struct dobj *to, const WCHAR *to_name, IWbemClassObject *from, const WCHAR *from_name,
++                           CIMTYPE type )
++{
++    VARIANT v;
++
++    VariantInit( &v );
++    if (SUCCEEDED(IWbemClassObject_Get( from, from_name, 0, &v, NULL, NULL )))
++        dobj_set( to, to_name, &v, type, WBEM_FLAVOR_ORIGIN_PROPAGATED );
++    VariantClear( &v );
++}
++
++/* an event object: its class, superclass chain and system properties */
++static struct dobj *new_event( const WCHAR *class, const WCHAR *super, const WCHAR *root )
++{
++    struct dobj *event = dobj_new();
++    SAFEARRAY *sa;
++    VARIANT v;
++    LONG i = 0;
++
++    if (!event) return NULL;
++    dobj_set_str( event, L"__CLASS", class, CIM_STRING );
++    dobj_set_str( event, L"__SUPERCLASS", super, CIM_STRING );
++    dobj_set_str( event, L"__DYNASTY", L"__SystemClass", CIM_STRING );
++    dobj_set_str( event, L"__RELPATH", NULL, CIM_STRING );
++    dobj_set_str( event, L"__PATH", NULL, CIM_STRING );
++    V_VT( &v ) = VT_I4;
++    V_I4( &v ) = WBEM_GENUS_INSTANCE;
++    dobj_set( event, L"__GENUS", &v, CIM_SINT32, WBEM_FLAVOR_ORIGIN_SYSTEM );
++    if ((sa = SafeArrayCreateVector( VT_BSTR, 0, root ? 4 : 3 )))
++    {
++        const WCHAR *chain[] = { super, root ? root : L"__Event", root ? L"__Event" : L"__IndicationRelated",
++                                 root ? L"__IndicationRelated" : NULL };
++        for (i = 0; i < (root ? 4 : 3); i++)
++        {
++            BSTR name = SysAllocString( chain[i] );
++            SafeArrayPutElement( sa, &i, name );
++            SysFreeString( name );
++        }
++        V_VT( &v ) = VT_ARRAY | VT_BSTR;
++        V_ARRAY( &v ) = sa;
++        dobj_set( event, L"__DERIVATION", &v, CIM_STRING | CIM_FLAG_ARRAY, WBEM_FLAVOR_ORIGIN_SYSTEM );
++        SafeArrayDestroy( sa );
++    }
++    return event;
++}
++
++static void deliver( struct event_sub *sub, IWbemClassObject *event )
++{
++    if (sub->sink) IWbemObjectSink_Indicate( sub->sink, 1, &event );
++    else if (sub->queue)
++    {
++        struct event_queue *q = sub->queue;
++
++        EnterCriticalSection( &q->cs );
++        if (q->count == q->size)
++        {
++            UINT size = q->size ? q->size * 2 : 16;
++            IWbemClassObject **grown = realloc( q->events, size * sizeof(*grown) );
++            if (grown) { q->events = grown; q->size = size; }
++        }
++        if (q->count < q->size)
++        {
++            IWbemClassObject_AddRef( event );
++            q->events[q->count++] = event;
++            SetEvent( q->ready );
++        }
++        LeaveCriticalSection( &q->cs );
++    }
++}
++
++/* the event for an instance that came (create), went (delete) or changed */
++static void instance_event( struct event_sub *sub, UINT what, IWbemClassObject *obj, IWbemClassObject *previous )
++{
++    struct dobj *event = NULL;
++
++    switch (sub->kind)
++    {
++    case EVENT_INSTANCE:
++        event = new_event( what == WANT_CREATE ? L"__InstanceCreationEvent" :
++                           what == WANT_DELETE ? L"__InstanceDeletionEvent" : L"__InstanceModificationEvent",
++                           L"__InstanceOperationEvent", NULL );
++        if (!event) return;
++        put_object( event, L"TargetInstance", obj );
++        if (previous) put_object( event, L"PreviousInstance", previous );
++        break;
++    case EVENT_PROCESS:
++        event = new_event( what == WANT_CREATE ? L"Win32_ProcessStartTrace" : L"Win32_ProcessStopTrace",
++                           L"Win32_ProcessTrace", L"__ExtrinsicEvent" );
++        if (!event) return;
++        copy_property( event, L"ProcessName", obj, L"Name", CIM_STRING );
++        copy_property( event, L"ProcessID", obj, L"ProcessId", CIM_UINT32 );
++        copy_property( event, L"ParentProcessID", obj, L"ParentProcessId", CIM_UINT32 );
++        copy_property( event, L"SessionID", obj, L"SessionId", CIM_UINT32 );
++        if (what == WANT_DELETE) put_uint( event, L"ExitStatus", 0, CIM_UINT32 );
++        break;
++    case EVENT_DEVICE:
++        event = new_event( L"Win32_DeviceChangeEvent", L"Win32_SystemConfigurationChangeEvent", L"__ExtrinsicEvent" );
++        if (!event) return;
++        put_uint( event, L"EventType", what == WANT_CREATE ? 2 : 3, CIM_UINT16 );
++        break;
++    case EVENT_VOLUME:
++        event = new_event( L"Win32_VolumeChangeEvent", L"Win32_DeviceChangeEvent", L"Win32_SystemConfigurationChangeEvent" );
++        if (!event) return;
++        copy_property( event, L"DriveName", obj, L"DeviceID", CIM_STRING );
++        put_uint( event, L"EventType", what == WANT_CREATE ? 2 : 3, CIM_UINT16 );
++        break;
++    }
++    put_time( event );
++    deliver( sub, &event->IWbemClassObject_iface );
++    IWbemClassObject_Release( &event->IWbemClassObject_iface );
++}
++
++static void free_snapshot( struct snapshot *snap )
++{
++    UINT i;
++    for (i = 0; i < snap->count; i++)
++    {
++        SysFreeString( snap->items[i].relpath );
++        free( snap->items[i].values );
++        IWbemClassObject_Release( snap->items[i].obj );
++    }
++    free( snap->items );
++    snap->items = NULL;
++    snap->count = 0;
++}
++
++static void poll_once( struct event_sub *sub )
++{
++    struct snapshot now;
++    UINT i, device_changes = 0;
++
++    if (take_snapshot( sub, &now ) != S_OK) return;
++    for (i = 0; i < now.count; i++)
++    {
++        const struct snapshot_item *old = find_item( &sub->snap, now.items[i].relpath );
++
++        if (!old)
++        {
++            if (sub->kind == EVENT_DEVICE) device_changes |= WANT_CREATE;
++            else if (sub->want & WANT_CREATE) instance_event( sub, WANT_CREATE, now.items[i].obj, NULL );
++        }
++        else if ((sub->want & WANT_MODIFY) && old->values && now.items[i].values &&
++                 wcscmp( old->values, now.items[i].values ))
++            instance_event( sub, WANT_MODIFY, now.items[i].obj, old->obj );
++    }
++    for (i = 0; i < sub->snap.count; i++)
++    {
++        if (find_item( &now, sub->snap.items[i].relpath )) continue;
++        if (sub->kind == EVENT_DEVICE) device_changes |= WANT_DELETE;
++        else if (sub->want & WANT_DELETE) instance_event( sub, WANT_DELETE, sub->snap.items[i].obj, NULL );
++    }
++    /* devices: one event per kind of change in a poll, as Windows sends one per broadcast */
++    if (device_changes & sub->want & WANT_CREATE) instance_event( sub, WANT_CREATE, NULL, NULL );
++    if (device_changes & sub->want & WANT_DELETE) instance_event( sub, WANT_DELETE, NULL, NULL );
++    free_snapshot( &sub->snap );
++    sub->snap = now;
++}
++
++static DWORD CALLBACK poll_thread( void *arg )
++{
++    struct event_sub *sub = arg;
++
++    CoInitializeEx( NULL, COINIT_MULTITHREADED );
++    while (WaitForSingleObject( sub->stop, sub->interval ) == WAIT_TIMEOUT)
++    {
++#ifndef SG_MUTANT_WMI_NO_EVENTS
++        poll_once( sub );
++#endif
++    }
++    CoUninitialize();
++    return 0;
++}
++
++static HRESULT start_sub( struct event_sub *sub )
++{
++    HRESULT hr;
++
++    /* what is there now makes no events */
++    if ((hr = take_snapshot( sub, &sub->snap )) != S_OK) return hr;
++    if (!(sub->stop = CreateEventW( NULL, TRUE, FALSE, NULL ))) return E_OUTOFMEMORY;
++    if (!(sub->thread = CreateThread( NULL, 0, poll_thread, sub, 0, NULL ))) return E_OUTOFMEMORY;
++    return S_OK;
++}
++
++void stop_event_sub( struct event_sub *sub, BOOL cancelled )
++{
++    SetEvent( sub->stop );
++    WaitForSingleObject( sub->thread, INFINITE );
++    if (sub->sink && cancelled)
++        IWbemObjectSink_SetStatus( sub->sink, WBEM_STATUS_COMPLETE, WBEM_E_CALL_CANCELLED, NULL, NULL );
++    free_sub( sub );
++}
++
++/* an async event query: its events go to the sink until it is cancelled */
++HRESULT start_event_query_async( enum wbm_namespace ns, const WCHAR *query, IWbemObjectSink *sink,
++                                 struct event_sub **ret )
++{
++    struct event_sub *sub;
++    HRESULT hr;
++
++    if ((hr = parse_event_query( ns, query, &sub )) != S_OK) return hr;
++    IWbemObjectSink_AddRef( (sub->sink = sink) );
++    if ((hr = start_sub( sub )) != S_OK)
++    {
++        if (sub->stop && sub->thread) stop_event_sub( sub, FALSE );
++        else free_sub( sub );
++        return hr;
++    }
++    *ret = sub;
++    return S_OK;
++}
++
++/* the same object, whichever of its interfaces CancelAsyncCall was given */
++BOOL event_sub_has_sink( const struct event_sub *sub, IWbemObjectSink *sink )
++{
++    IUnknown *a, *b;
++    BOOL ret;
++
++    if (!sub->sink) return FALSE;
++    if (sub->sink == sink) return TRUE;
++    if (FAILED(IWbemObjectSink_QueryInterface( sub->sink, &IID_IUnknown, (void **)&a ))) return FALSE;
++    if (FAILED(IWbemObjectSink_QueryInterface( sink, &IID_IUnknown, (void **)&b )))
++    {
++        IUnknown_Release( a );
++        return FALSE;
++    }
++    ret = a == b;
++    IUnknown_Release( a );
++    IUnknown_Release( b );
++    return ret;
++}
++
++struct list *event_sub_entry( struct event_sub *sub )
++{
++    return &sub->entry;
++}
++
++struct event_sub *event_sub_from_entry( struct list *entry )
++{
++    return LIST_ENTRY( entry, struct event_sub, entry );
++}
++
++/*
++ * The semisynchronous enumerator
++ */
++static inline struct event_queue *impl_from_IEnumWbemClassObject( IEnumWbemClassObject *iface )
++{
++    return CONTAINING_RECORD( iface, struct event_queue, IEnumWbemClassObject_iface );
++}
++
++static ULONG WINAPI event_queue_AddRef( IEnumWbemClassObject *iface )
++{
++    return InterlockedIncrement( &impl_from_IEnumWbemClassObject( iface )->refs );
++}
++
++static ULONG WINAPI event_queue_Release( IEnumWbemClassObject *iface )
++{
++    struct event_queue *q = impl_from_IEnumWbemClassObject( iface );
++    LONG refs = InterlockedDecrement( &q->refs );
++    UINT i;
++
++    if (!refs)
++    {
++        if (q->sub) stop_event_sub( q->sub, FALSE );
++        for (i = 0; i < q->count; i++) IWbemClassObject_Release( q->events[i] );
++        free( q->events );
++        CloseHandle( q->ready );
++        q->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &q->cs );
++        free( q );
++    }
++    return refs;
++}
++
++static HRESULT WINAPI event_queue_QueryInterface( IEnumWbemClassObject *iface, REFIID riid, void **obj )
++{
++    if (IsEqualGUID( riid, &IID_IEnumWbemClassObject ) || IsEqualGUID( riid, &IID_IUnknown ))
++    {
++        *obj = iface;
++        IEnumWbemClassObject_AddRef( iface );
++        return S_OK;
++    }
++    if (IsEqualGUID( riid, &IID_IClientSecurity ))
++    {
++        /* callers set a blanket on it, as on any WMI proxy; nothing to do in the process */
++        *obj = NULL;
++        return E_NOINTERFACE;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static HRESULT WINAPI event_queue_Reset( IEnumWbemClassObject *iface )
++{
++    return WBEM_E_INVALID_OPERATION;
++}
++
++static HRESULT WINAPI event_queue_Next( IEnumWbemClassObject *iface, LONG timeout, ULONG count,
++                                        IWbemClassObject **objs, ULONG *returned )
++{
++    struct event_queue *q = impl_from_IEnumWbemClassObject( iface );
++    ULONGLONG deadline = timeout < 0 ? ~0ull : GetTickCount64() + timeout;
++    ULONG got = 0;
++
++    TRACE( "%p, %ld, %lu, %p, %p\n", iface, timeout, count, objs, returned );
++
++    if (!objs || !returned) return WBEM_E_INVALID_PARAMETER;
++    *returned = 0;
++    if (!count) return WBEM_S_NO_ERROR;
++    for (;;)
++    {
++        ULONGLONG now;
++        DWORD wait;
++
++        EnterCriticalSection( &q->cs );
++        while (got < count && q->count)
++        {
++            objs[got++] = q->events[0];
++            memmove( q->events, q->events + 1, --q->count * sizeof(*q->events) );
++        }
++        if (!q->count) ResetEvent( q->ready );
++        LeaveCriticalSection( &q->cs );
++        if (got == count) break;
++        now = GetTickCount64();
++        if (now >= deadline) break;
++        wait = deadline == ~0ull ? INFINITE : (DWORD)min( deadline - now, 0xfffffffe );
++        if (WaitForSingleObject( q->ready, wait ) == WAIT_TIMEOUT) break;
++    }
++    *returned = got;
++    return got == count ? WBEM_S_NO_ERROR : WBEM_S_TIMEDOUT;
++}
++
++static HRESULT WINAPI event_queue_NextAsync( IEnumWbemClassObject *iface, ULONG count, IWbemObjectSink *sink )
++{
++    FIXME( "%p, %lu, %p\n", iface, count, sink );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI event_queue_Clone( IEnumWbemClassObject *iface, IEnumWbemClassObject **ret )
++{
++    if (ret) *ret = NULL;
++    return WBEM_E_INVALID_OPERATION;
++}
++
++static HRESULT WINAPI event_queue_Skip( IEnumWbemClassObject *iface, LONG timeout, ULONG count )
++{
++    IWbemClassObject *obj;
++    ULONG got, i;
++    HRESULT hr = WBEM_S_NO_ERROR;
++
++    for (i = 0; i < count && hr == WBEM_S_NO_ERROR; i++)
++    {
++        hr = event_queue_Next( iface, timeout, 1, &obj, &got );
++        if (got) IWbemClassObject_Release( obj );
++    }
++    return hr;
++}
++
++static const IEnumWbemClassObjectVtbl event_queue_vtbl =
++{
++    event_queue_QueryInterface,
++    event_queue_AddRef,
++    event_queue_Release,
++    event_queue_Reset,
++    event_queue_Next,
++    event_queue_NextAsync,
++    event_queue_Clone,
++    event_queue_Skip
++};
++
++/* a semisynchronous event query: its events wait in the enumerator for Next */
++HRESULT start_event_query( enum wbm_namespace ns, const WCHAR *query, IEnumWbemClassObject **ret )
++{
++    struct event_queue *q;
++    struct event_sub *sub;
++    HRESULT hr;
++
++    if ((hr = parse_event_query( ns, query, &sub )) != S_OK) return hr;
++    if (!(q = calloc( 1, sizeof(*q) )) || !(q->ready = CreateEventW( NULL, TRUE, FALSE, NULL )))
++    {
++        free( q );
++        free_sub( sub );
++        return E_OUTOFMEMORY;
++    }
++    q->IEnumWbemClassObject_iface.lpVtbl = &event_queue_vtbl;
++    q->refs = 1;
++    InitializeCriticalSectionEx( &q->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    q->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": event_queue.cs");
++    sub->queue = q;
++    if ((hr = start_sub( sub )) != S_OK)
++    {
++        if (sub->stop && sub->thread) stop_event_sub( sub, FALSE );
++        else free_sub( sub );
++        IEnumWbemClassObject_Release( &q->IEnumWbemClassObject_iface );
++        return hr;
++    }
++    q->sub = sub;
++    *ret = &q->IEnumWbemClassObject_iface;
++    return S_OK;
++}
+diff --git a/dlls/wbemprox/services.c b/dlls/wbemprox/services.c
+index 3e9de3d..a038621 100644
+--- a/dlls/wbemprox/services.c
++++ b/dlls/wbemprox/services.c
+@@ -244,6 +244,7 @@ struct wbem_services
+     struct async_header *async;
+     IWbemContext *context;
+     struct client_security client_security;
++    struct list event_subs;  /* Stained Glass OS: async event queries (events.c) */
+ };
+ 
+ static inline struct wbem_services *impl_from_IWbemServices( IWbemServices *iface )
+@@ -275,6 +276,12 @@ static ULONG WINAPI wbem_services_Release(
+             WaitForSingleObject( ws->async->wait, INFINITE );
+             free_async( ws->async );
+         }
++        while (!list_empty( &ws->event_subs ))
++        {
++            struct list *entry = list_head( &ws->event_subs );
++            list_remove( entry );
++            stop_event_sub( event_sub_from_entry( entry ), TRUE );
++        }
+         ws->cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection( &ws->cs );
+         if (ws->context)
+@@ -349,6 +356,21 @@ static HRESULT WINAPI wbem_services_CancelAsyncCall(
+ 
+     EnterCriticalSection( &services->cs );
+ 
++    /* Stained Glass OS: an event query's sink */
++    {
++        struct list *entry;
++
++        LIST_FOR_EACH( entry, &services->event_subs )
++        {
++            struct event_sub *sub = event_sub_from_entry( entry );
++            if (!event_sub_has_sink( sub, pSink )) continue;
++            list_remove( entry );
++            LeaveCriticalSection( &services->cs );
++            stop_event_sub( sub, TRUE );
++            return S_OK;
++        }
++    }
++
+     if (!(async = services->async))
+     {
+         LeaveCriticalSection( &services->cs );
+@@ -1211,8 +1233,18 @@ static HRESULT WINAPI wbem_services_ExecNotificationQuery(
+     IWbemContext *pCtx,
+     IEnumWbemClassObject **ppEnum )
+ {
+-    FIXME("\n");
+-    return WBEM_E_FAILED;
++    struct wbem_services *services = impl_from_IWbemServices( iface );
++
++    TRACE( "%p, %s, %s, %#lx, %p, %p\n", iface, debugstr_w(strQueryLanguage), debugstr_w(strQuery),
++           lFlags, pCtx, ppEnum );
++
++    /* Stained Glass OS: event queries (events.c); semisynchronous only, as the documentation says */
++    if (!ppEnum || !strQueryLanguage || !strQuery || !strQuery[0]) return WBEM_E_INVALID_PARAMETER;
++    *ppEnum = NULL;
++    if ((lFlags & (WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY)) !=
++        (WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY)) return WBEM_E_INVALID_PARAMETER;
++    if (wcsicmp( strQueryLanguage, L"WQL" )) return WBEM_E_INVALID_QUERY_TYPE;
++    return start_event_query( services->ns, strQuery, ppEnum );
+ }
+ 
+ static HRESULT WINAPI wbem_services_ExecNotificationQueryAsync(
+@@ -1224,50 +1256,25 @@ static HRESULT WINAPI wbem_services_ExecNotificationQueryAsync(
+     IWbemObjectSink *pResponseHandler )
+ {
+     struct wbem_services *services = impl_from_IWbemServices( iface );
++    struct event_sub *sub;
+     IWbemObjectSink *sink;
+-    HRESULT hr = E_OUTOFMEMORY;
+-    struct async_header *async;
+-    struct async_query *query;
++    HRESULT hr;
+ 
+     TRACE( "%p, %s, %s, %#lx, %p, %p\n", iface, debugstr_w(strQueryLanguage), debugstr_w(strQuery),
+            lFlags, pCtx, pResponseHandler );
+ 
+-    if (!pResponseHandler) return WBEM_E_INVALID_PARAMETER;
++    if (!pResponseHandler || !strQueryLanguage || !strQuery || !strQuery[0]) return WBEM_E_INVALID_PARAMETER;
++    if (wcsicmp( strQueryLanguage, L"WQL" )) return WBEM_E_INVALID_QUERY_TYPE;
+ 
+     hr = IWbemObjectSink_QueryInterface( pResponseHandler, &IID_IWbemObjectSink, (void **)&sink );
+     if (FAILED(hr)) return hr;
+-
+-    EnterCriticalSection( &services->cs );
+-
+-    if (services->async)
++    /* Stained Glass OS: the events go to the sink until CancelAsyncCall (events.c) */
++    if ((hr = start_event_query_async( services->ns, strQuery, sink, &sub )) == S_OK)
+     {
+-        FIXME("handle more than one pending async\n");
+-        hr = WBEM_E_FAILED;
+-        goto done;
+-    }
+-    if (!(query = calloc( 1, sizeof(*query) ))) goto done;
+-    async = (struct async_header *)query;
+-
+-    if (!(init_async( async, sink, async_exec_query )))
+-    {
+-        free_async( async );
+-        goto done;
+-    }
+-    if (!(query->str = wcsdup( strQuery )))
+-    {
+-        free_async( async );
+-        goto done;
+-    }
+-    hr = queue_async( async );
+-    if (hr == S_OK) services->async = async;
+-    else
+-    {
+-        free( query->str );
+-        free_async( async );
++        EnterCriticalSection( &services->cs );
++        list_add_tail( &services->event_subs, event_sub_entry( sub ) );
++        LeaveCriticalSection( &services->cs );
+     }
+-
+-done:
+-    LeaveCriticalSection( &services->cs );
+     IWbemObjectSink_Release( sink );
+     return hr;
+ }
+@@ -1398,6 +1405,7 @@ HRESULT WbemServices_create( const WCHAR *namespace, IWbemContext *context, LPVO
+     ws->ns        = ns;
+     init_client_security( &ws->client_security, (IUnknown *)&ws->IWbemServices_iface );
+     InitializeCriticalSectionEx( &ws->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    list_init( &ws->event_subs );
+     ws->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": wbemprox_services.cs");
+     if (context)
+         IWbemContext_Clone( context, &ws->context );
+diff --git a/dlls/wbemprox/wbemprox_private.h b/dlls/wbemprox/wbemprox_private.h
+index 9978cef..106d85b 100644
+--- a/dlls/wbemprox/wbemprox_private.h
++++ b/dlls/wbemprox/wbemprox_private.h
+@@ -230,6 +230,14 @@ void free_query( struct query * );
+ struct query *addref_query( struct query * );
+ void release_query( struct query *query );
+ HRESULT exec_query( enum wbm_namespace, const WCHAR *, IEnumWbemClassObject ** );
++/* Stained Glass OS: event queries (events.c) */
++struct event_sub;
++HRESULT start_event_query( enum wbm_namespace, const WCHAR *, IEnumWbemClassObject ** );
++HRESULT start_event_query_async( enum wbm_namespace, const WCHAR *, IWbemObjectSink *, struct event_sub ** );
++void stop_event_sub( struct event_sub *, BOOL );
++BOOL event_sub_has_sink( const struct event_sub *, IWbemObjectSink * );
++struct list *event_sub_entry( struct event_sub * );
++struct event_sub *event_sub_from_entry( struct list * );
+ HRESULT parse_query( enum wbm_namespace, const WCHAR *, struct view **, struct list * );
+ HRESULT create_view( enum view_type, enum wbm_namespace, const WCHAR *, const struct keyword *, const WCHAR *,
+                      const struct property *, const struct expr *, struct view ** );
+diff --git a/programs/wscript/host.c b/programs/wscript/host.c
+index f677915..ca2aa12 100644
+--- a/programs/wscript/host.c
++++ b/programs/wscript/host.c
+@@ -908,8 +908,31 @@ static HRESULT WINAPI Host_Sleep(IHost *iface, LONG Time)
+     TRACE("(%ld)\n", Time);
+     if (Time < 0)
+         return E_INVALIDARG;
++#ifdef SG_MUTANT_WSH_SLEEP_NO_PUMP
+     Sleep(Time);
+     return S_OK;
++#endif
++    /* Stained Glass OS: the script's thread keeps taking its messages while it
++     * sleeps, as on Windows, so events of objects it connected to (an async WMI
++     * query's sink) reach their handlers during WScript.Sleep */
++    {
++        ULONGLONG end = GetTickCount64() + Time;
++        MSG msg;
++
++        for (;;)
++        {
++            ULONGLONG now = GetTickCount64();
++            if (now >= end) break;
++            if (MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)min(end - now, 0xfffffffe), QS_ALLINPUT) == WAIT_TIMEOUT)
++                break;
++            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
++            {
++                TranslateMessage(&msg);
++                DispatchMessageW(&msg);
++            }
++        }
++    }
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI Host_ConnectObject(IHost *iface, IDispatch *Object, BSTR Prefix)
