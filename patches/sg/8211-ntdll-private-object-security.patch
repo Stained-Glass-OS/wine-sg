@@ -1,0 +1,643 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll: RtlNewSecurityObject(Ex/WithMultipleInheritance) build the descriptor from creator, parent and token; RtlConvertToAutoInheritSecurityObject
+
+Owner/group from the creator, the parent (SEF_DEFAULT_*_FROM_PARENT) or the token, with the owner check; DACL/SACL from the creator, the parent's inheritable ACEs (object-type aware, CREATOR OWNER/GROUP and generic rights split into effective + inherit-only ACEs, SEF_*_AUTO_INHERIT) or the token default DACL; a creator SACL needs SeSecurityPrivilege. The conversion marks what the parent passes on as inherited, or protects an ACL that lacks it. Before, every private object got Everyone as owner, group, DACL and SACL, and the conversion was not implemented.
+---
+--- a/dlls/ntdll/sec.c
++++ b/dlls/ntdll/sec.c
+@@ -1138,6 +1138,594 @@
+         SelfRelativeSecurityDescriptor, BufferLength);
+ }
+ 
++#ifndef SG_MUTANT_WORLD_PRIVATE_SD
++/* Stained Glass OS: private object security descriptors built as Windows documents it for
++ * CreatePrivateObjectSecurityEx. Owner: the creator's, else the parent's (SEF_DEFAULT_OWNER_FROM_PARENT),
++ * else the token's default owner; a creator owner the token cannot assign fails STATUS_INVALID_OWNER unless
++ * SEF_AVOID_OWNER_CHECK or SeRestorePrivilege. Group likewise with the token's primary group. DACL: the
++ * creator's when it is there and not defaulted (with SEF_DACL_AUTO_INHERIT and an unprotected creator DACL,
++ * followed by what the parent passes on), else what the parent's inheritable ACEs pass on, else the
++ * creator's defaulted DACL, else the token's default DACL. SACL likewise without a token default; a creator
++ * SACL needs SeSecurityPrivilege unless SEF_AVOID_PRIVILEGE_CHECK. An inherited or explicit ACE that takes
++ * effect on the object gets its generic rights mapped and CREATOR OWNER / CREATOR GROUP replaced by the
++ * owner and group; when it is also passed on, the original stays as a second, inherit-only ACE. Before, every
++ * call gave Everyone as owner and group with an Everyone-full-access DACL and SACL. */
++void WINAPI RtlMapGenericMask( PACCESS_MASK mask, const GENERIC_MAPPING *mapping );
++
++#define SG_SEF_DACL_AUTO_INHERIT             0x01
++#define SG_SEF_SACL_AUTO_INHERIT             0x02
++#define SG_SEF_DEFAULT_DESCRIPTOR_FOR_OBJECT 0x04
++#define SG_SEF_AVOID_PRIVILEGE_CHECK         0x08
++#define SG_SEF_AVOID_OWNER_CHECK             0x10
++#define SG_SEF_DEFAULT_OWNER_FROM_PARENT     0x20
++#define SG_SEF_DEFAULT_GROUP_FROM_PARENT     0x40
++
++static const SID creator_owner_sid = { SID_REVISION, 1, { SECURITY_CREATOR_SID_AUTHORITY }, { SECURITY_CREATOR_OWNER_RID } };
++static const SID creator_group_sid = { SID_REVISION, 1, { SECURITY_CREATOR_SID_AUTHORITY }, { SECURITY_CREATOR_GROUP_RID } };
++
++/* where an ACE keeps its SID: after the mask, or after the object flags and GUIDs; 0 when unknown */
++static DWORD ace_sid_offset( const ACE_HEADER *ace )
++{
++    const DWORD *p = (const DWORD *)(ace + 1);
++    DWORD off;
++
++    switch (ace->AceType)
++    {
++    case ACCESS_ALLOWED_ACE_TYPE: case ACCESS_DENIED_ACE_TYPE: case SYSTEM_AUDIT_ACE_TYPE:
++    case SYSTEM_ALARM_ACE_TYPE: case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: case ACCESS_DENIED_CALLBACK_ACE_TYPE:
++    case SYSTEM_AUDIT_CALLBACK_ACE_TYPE: case SYSTEM_ALARM_CALLBACK_ACE_TYPE: case SYSTEM_MANDATORY_LABEL_ACE_TYPE:
++        off = sizeof(ACE_HEADER) + sizeof(DWORD);
++        break;
++    case ACCESS_ALLOWED_OBJECT_ACE_TYPE: case ACCESS_DENIED_OBJECT_ACE_TYPE: case ACCESS_AUDIT_OBJECT_ACE_TYPE:
++    case ACCESS_ALARM_OBJECT_ACE_TYPE: case ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE:
++    case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE: case SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE:
++    case SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE:
++        if (ace->AceSize < sizeof(ACE_HEADER) + 2 * sizeof(DWORD)) return 0;
++        off = sizeof(ACE_HEADER) + 2 * sizeof(DWORD);
++        if (p[1] & ACE_OBJECT_TYPE_PRESENT) off += sizeof(GUID);
++        if (p[1] & ACE_INHERITED_OBJECT_TYPE_PRESENT) off += sizeof(GUID);
++        break;
++    default:
++        return 0;
++    }
++    if (off + FIELD_OFFSET(SID, SubAuthority[0]) > ace->AceSize) return 0;
++    if (off + RtlLengthSid( (PSID)((const BYTE *)ace + off) ) > ace->AceSize) return 0;
++    return off;
++}
++
++/* the inherited object type of an object ACE, NULL when it has none */
++static const GUID *ace_inherited_type( const ACE_HEADER *ace )
++{
++    const DWORD *p = (const DWORD *)(ace + 1);
++    const BYTE *pos = (const BYTE *)(p + 2);
++
++    if (ace->AceType < ACCESS_MIN_MS_OBJECT_ACE_TYPE || ace->AceType > ACCESS_MAX_MS_V4_ACE_TYPE) return NULL;
++    if (!(p[1] & ACE_INHERITED_OBJECT_TYPE_PRESENT)) return NULL;
++    if (p[1] & ACE_OBJECT_TYPE_PRESENT) pos += sizeof(GUID);
++    return (const GUID *)pos;
++}
++
++/* append a copy of ace with other flags, mask and (when sid is set) SID; the ACL has room */
++static NTSTATUS append_ace( ACL *acl, const ACE_HEADER *ace, BYTE flags, DWORD mask, const SID *sid )
++{
++    DWORD sid_off = ace_sid_offset( ace ), old_len = 0, new_len = 0, tail = 0, size;
++    ACE_HEADER *dst;
++    BYTE *pos;
++
++    if (!RtlFirstFreeAce( acl, &dst ) || !dst) return STATUS_ALLOTTED_SPACE_EXCEEDED;
++    if (sid_off)
++    {
++        old_len = RtlLengthSid( (PSID)((const BYTE *)ace + sid_off) );
++        new_len = sid ? RtlLengthSid( (PSID)sid ) : old_len;
++        tail = ace->AceSize - sid_off - old_len;
++        size = sid_off + new_len + tail;
++    }
++    else size = ace->AceSize;
++    if ((BYTE *)dst + size > (BYTE *)acl + acl->AclSize) return STATUS_ALLOTTED_SPACE_EXCEEDED;
++
++    pos = (BYTE *)dst;
++    if (sid_off)
++    {
++        memcpy( pos, ace, sid_off );
++        memcpy( pos + sid_off, sid ? (const void *)sid : (const BYTE *)ace + sid_off, new_len );
++        memcpy( pos + sid_off + new_len, (const BYTE *)ace + sid_off + old_len, tail );
++        *(DWORD *)(pos + sizeof(ACE_HEADER)) = mask;
++    }
++    else memcpy( pos, ace, size );
++    dst->AceFlags = flags;
++    dst->AceSize = size;
++    if (ace->AceType >= ACCESS_MIN_MS_OBJECT_ACE_TYPE && acl->AclRevision < ACL_REVISION4)
++        acl->AclRevision = ACL_REVISION4;
++    acl->AceCount++;
++    return STATUS_SUCCESS;
++}
++
++/* put one ACE into the new ACL: effective on the object (generic rights mapped, creator SIDs replaced),
++ * passed on (as it is), or both, split in two when the effective form differs */
++static NTSTATUS place_ace( ACL *acl, const ACE_HEADER *ace, BOOL effective, BOOL pass_on, BYTE inherit_flags,
++                           BYTE extra_flags, const SID *owner, const SID *group, const GENERIC_MAPPING *mapping )
++{
++    DWORD sid_off = ace_sid_offset( ace ), mask, mapped;
++    const SID *sid = NULL, *eff_sid = NULL;
++    BYTE audit = ace->AceFlags & (SUCCESSFUL_ACCESS_ACE_FLAG | FAILED_ACCESS_ACE_FLAG);
++    NTSTATUS status;
++
++    if (!sid_off) return append_ace( acl, ace, ace->AceFlags | extra_flags, 0, NULL );
++    mask = mapped = *(const DWORD *)(ace + 1);
++    sid = (const SID *)((const BYTE *)ace + sid_off);
++    if (mapping) RtlMapGenericMask( &mapped, mapping );
++    if (RtlEqualSid( (PSID)sid, (PSID)&creator_owner_sid )) eff_sid = owner;
++    else if (RtlEqualSid( (PSID)sid, (PSID)&creator_group_sid )) eff_sid = group;
++
++    if (effective && pass_on && (mapped != mask || eff_sid))
++    {
++        if ((status = append_ace( acl, ace, audit | extra_flags, mapped, eff_sid ))) return status;
++        return append_ace( acl, ace, audit | extra_flags | inherit_flags | INHERIT_ONLY_ACE, mask, NULL );
++    }
++    if (effective && pass_on) return append_ace( acl, ace, audit | extra_flags | inherit_flags, mask, NULL );
++    if (effective) return append_ace( acl, ace, audit | extra_flags, mapped, eff_sid );
++    return append_ace( acl, ace, audit | extra_flags | inherit_flags | INHERIT_ONLY_ACE, mask, NULL );
++}
++
++static BOOL type_matches( const GUID *inherited, GUID **types, ULONG count )
++{
++    ULONG i;
++
++    if (!inherited) return TRUE;
++    for (i = 0; i < count; i++) if (types[i] && !memcmp( types[i], inherited, sizeof(GUID) )) return TRUE;
++    return FALSE;
++}
++
++/* the ACEs a child inherits from the parent's ACL */
++static NTSTATUS inherit_aces( ACL *acl, const ACL *parent, BOOL container, GUID **types, ULONG type_count,
++                              const SID *owner, const SID *group, const GENERIC_MAPPING *mapping, BYTE extra_flags )
++{
++    const ACE_HEADER *ace;
++    NTSTATUS status;
++    ULONG i;
++
++    if (!parent) return STATUS_SUCCESS;
++    for (i = 0; i < parent->AceCount; i++)
++    {
++        BYTE flags;
++        BOOL match, effective, pass_on;
++
++        if (RtlGetAce( (PACL)parent, i, (void **)&ace )) break;
++        flags = ace->AceFlags;
++        match = type_matches( ace_inherited_type( ace ), types, type_count );
++        if (container)
++        {
++            if (!(flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE))) continue;
++            effective = (flags & CONTAINER_INHERIT_ACE) && match;
++            pass_on = !(flags & NO_PROPAGATE_INHERIT_ACE);
++        }
++        else
++        {
++            if (!(flags & OBJECT_INHERIT_ACE) || !match) continue;
++            effective = TRUE;
++            pass_on = FALSE;
++        }
++        if (!effective && !pass_on) continue;
++        if ((status = place_ace( acl, ace, effective, pass_on, flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE),
++                                 extra_flags, owner, group, mapping )))
++            return status;
++    }
++    return STATUS_SUCCESS;
++}
++
++/* the creator's own ACEs; with auto-inheritance its inherited ones are dropped (the parent's replace them) */
++static NTSTATUS explicit_aces( ACL *acl, const ACL *creator, BOOL container, BOOL auto_inherit,
++                               const SID *owner, const SID *group, const GENERIC_MAPPING *mapping )
++{
++    const ACE_HEADER *ace;
++    NTSTATUS status;
++    ULONG i;
++
++    if (!creator) return STATUS_SUCCESS;
++    for (i = 0; i < creator->AceCount; i++)
++    {
++        BYTE flags, inherit;
++
++        if (RtlGetAce( (PACL)creator, i, (void **)&ace )) break;
++        flags = ace->AceFlags;
++        if (auto_inherit && (flags & INHERITED_ACE)) continue;
++        inherit = flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | NO_PROPAGATE_INHERIT_ACE);
++        if (flags & INHERIT_ONLY_ACE)
++            status = append_ace( acl, ace, flags, *(const DWORD *)(ace + 1), NULL );
++        else
++            status = place_ace( acl, ace, TRUE, container && (inherit & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)),
++                                inherit, flags & INHERITED_ACE, owner, group, mapping );
++        if (status) return status;
++    }
++    return STATUS_SUCCESS;
++}
++
++static ULONG work_acl_size( const ACL *a, const ACL *b )
++{
++    /* every ACE may split in two and take a SID of the largest size */
++    ULONG size = sizeof(ACL);
++    if (a) size += 2 * a->AclSize + 2 * a->AceCount * FIELD_OFFSET(SID, SubAuthority[SID_MAX_SUB_AUTHORITIES]);
++    if (b) size += 2 * b->AclSize + 2 * b->AceCount * FIELD_OFFSET(SID, SubAuthority[SID_MAX_SUB_AUTHORITIES]);
++    return size;
++}
++
++static ACL *new_work_acl( ULONG size )
++{
++    ACL *acl;
++
++    if (size > 0xfffc) size = 0xfffc;
++    if (!(acl = RtlAllocateHeap( GetProcessHeap(), 0, size ))) return NULL;
++    RtlCreateAcl( acl, size, ACL_REVISION );
++    return acl;
++}
++
++static void *query_token( HANDLE token, TOKEN_INFORMATION_CLASS class )
++{
++    ULONG len = 0;
++    void *buf;
++
++    NtQueryInformationToken( token, class, NULL, 0, &len );
++    if (!len || !(buf = RtlAllocateHeap( GetProcessHeap(), 0, len ))) return NULL;
++    if (NtQueryInformationToken( token, class, buf, len, &len ))
++    {
++        RtlFreeHeap( GetProcessHeap(), 0, buf );
++        return NULL;
++    }
++    return buf;
++}
++
++static BOOL token_has_privilege( HANDLE token, ULONG luid )
++{
++    PRIVILEGE_SET set;
++    BOOLEAN held = FALSE;
++
++    set.PrivilegeCount = 1;
++    set.Control = PRIVILEGE_SET_ALL_NECESSARY;
++    set.Privilege[0].Luid.LowPart = luid;
++    set.Privilege[0].Luid.HighPart = 0;
++    set.Privilege[0].Attributes = 0;
++    return !NtPrivilegeCheck( token, &set, &held ) && held;
++}
++
++/* the token may make sid the owner: it is the user, or a group with SE_GROUP_OWNER */
++static BOOL token_can_own( HANDLE token, const SID *sid )
++{
++    TOKEN_USER *user = query_token( token, TokenUser );
++    TOKEN_GROUPS *groups;
++    BOOL ret = FALSE;
++    ULONG i;
++
++    if (user)
++    {
++        ret = RtlEqualSid( user->User.Sid, (PSID)sid );
++        RtlFreeHeap( GetProcessHeap(), 0, user );
++    }
++    if (!ret && (groups = query_token( token, TokenGroups )))
++    {
++        for (i = 0; i < groups->GroupCount && !ret; i++)
++            ret = (groups->Groups[i].Attributes & SE_GROUP_OWNER) && RtlEqualSid( groups->Groups[i].Sid, (PSID)sid );
++        RtlFreeHeap( GetProcessHeap(), 0, groups );
++    }
++    return ret || token_has_privilege( token, SE_RESTORE_PRIVILEGE );
++}
++
++static void get_sd_acl( PSECURITY_DESCRIPTOR sd, BOOL sacl, BOOLEAN *present, ACL **acl, BOOLEAN *defaulted )
++{
++    *present = *defaulted = FALSE;
++    *acl = NULL;
++    if (!sd) return;
++    if (sacl) RtlGetSaclSecurityDescriptor( sd, present, acl, defaulted );
++    else RtlGetDaclSecurityDescriptor( sd, present, acl, defaulted );
++    if (!*present) *acl = NULL;
++}
++
++/* the DACL or SACL of the new object; *result is a work ACL (NULL with *present for a NULL ACL) */
++static NTSTATUS new_object_acl( PSECURITY_DESCRIPTOR parent, PSECURITY_DESCRIPTOR creator, BOOL sacl, BOOL container,
++                                GUID **types, ULONG type_count, ULONG flags, HANDLE token, const SID *owner,
++                                const SID *group, const GENERIC_MAPPING *mapping, ACL **result, BOOLEAN *present,
++                                SECURITY_DESCRIPTOR_CONTROL *control )
++{
++    BOOL auto_inherit = flags & (sacl ? SG_SEF_SACL_AUTO_INHERIT : SG_SEF_DACL_AUTO_INHERIT);
++    SECURITY_DESCRIPTOR_CONTROL creator_control = 0, protect = sacl ? SE_SACL_PROTECTED : SE_DACL_PROTECTED;
++    BOOLEAN p_present, p_def, c_present, c_def;
++    ACL *p_acl, *c_acl, *acl;
++    ULONG rev;
++    BOOL need_priv;
++    NTSTATUS status;
++
++    *result = NULL;
++    *present = FALSE;
++    get_sd_acl( parent, sacl, &p_present, &p_acl, &p_def );
++    get_sd_acl( creator, sacl, &c_present, &c_acl, &c_def );
++    if (creator) RtlGetControlSecurityDescriptor( creator, &creator_control, &rev );
++    if (flags & SG_SEF_DEFAULT_DESCRIPTOR_FOR_OBJECT) c_def = TRUE;
++
++    /* taking a SACL from the creator needs SeSecurityPrivilege */
++    need_priv = sacl && !(flags & SG_SEF_AVOID_PRIVILEGE_CHECK);
++
++    if (!(acl = new_work_acl( work_acl_size( p_acl, c_acl ) ))) return STATUS_NO_MEMORY;
++
++    if (c_present && !c_def)
++    {
++        if (need_priv && !token_has_privilege( token, SE_SECURITY_PRIVILEGE ))
++        {
++            RtlFreeHeap( GetProcessHeap(), 0, acl );
++            return STATUS_PRIVILEGE_NOT_HELD;
++        }
++        *present = TRUE;
++        *control |= creator_control & protect;
++        if (!c_acl)  /* a NULL DACL stays one */
++        {
++            RtlFreeHeap( GetProcessHeap(), 0, acl );
++            if (auto_inherit) *control |= sacl ? SE_SACL_AUTO_INHERITED : SE_DACL_AUTO_INHERITED;
++            return STATUS_SUCCESS;
++        }
++        status = explicit_aces( acl, c_acl, container, auto_inherit, owner, group, mapping );
++        if (!status && auto_inherit && !(creator_control & protect))
++            status = inherit_aces( acl, p_acl, container, types, type_count, owner, group, mapping, INHERITED_ACE );
++    }
++    else
++    {
++        status = inherit_aces( acl, p_acl, container, types, type_count, owner, group, mapping,
++                               auto_inherit ? INHERITED_ACE : 0 );
++        if (!status && acl->AceCount) *present = TRUE;
++        else if (!status && c_present)
++        {
++            if (need_priv && !token_has_privilege( token, SE_SECURITY_PRIVILEGE ))
++            {
++                RtlFreeHeap( GetProcessHeap(), 0, acl );
++                return STATUS_PRIVILEGE_NOT_HELD;
++            }
++            *present = TRUE;
++            *control |= sacl ? SE_SACL_DEFAULTED : SE_DACL_DEFAULTED;
++            if (!c_acl)
++            {
++                RtlFreeHeap( GetProcessHeap(), 0, acl );
++                return STATUS_SUCCESS;
++            }
++            status = explicit_aces( acl, c_acl, container, auto_inherit, owner, group, mapping );
++        }
++        else if (!status && !sacl)
++        {
++            TOKEN_DEFAULT_DACL *def = query_token( token, TokenDefaultDacl );
++            if (def && def->DefaultDacl)
++            {
++                RtlFreeHeap( GetProcessHeap(), 0, acl );
++                if (!(acl = new_work_acl( work_acl_size( def->DefaultDacl, NULL ) )))
++                {
++                    RtlFreeHeap( GetProcessHeap(), 0, def );
++                    return STATUS_NO_MEMORY;
++                }
++                *present = TRUE;
++                *control |= SE_DACL_DEFAULTED;
++                status = explicit_aces( acl, def->DefaultDacl, container, FALSE, owner, group, mapping );
++            }
++            if (def) RtlFreeHeap( GetProcessHeap(), 0, def );
++        }
++    }
++    if (status || !*present)
++    {
++        RtlFreeHeap( GetProcessHeap(), 0, acl );
++        return status;
++    }
++    if (auto_inherit) *control |= sacl ? SE_SACL_AUTO_INHERITED : SE_DACL_AUTO_INHERITED;
++    acl->AclSize = acl_bytesInUse( acl );
++    *result = acl;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS make_relative_sd( const SID *owner, const SID *group, ACL *dacl, BOOLEAN dacl_present, ACL *sacl,
++                                  BOOLEAN sacl_present, SECURITY_DESCRIPTOR_CONTROL control,
++                                  PSECURITY_DESCRIPTOR *descr )
++{
++    ULONG owner_len = owner ? RtlLengthSid( (PSID)owner ) : 0, group_len = group ? RtlLengthSid( (PSID)group ) : 0;
++    ULONG dacl_len = dacl ? dacl->AclSize : 0, sacl_len = sacl ? sacl->AclSize : 0, off;
++    SECURITY_DESCRIPTOR_RELATIVE *rel;
++    BYTE *buffer;
++
++    if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*rel) + owner_len + group_len + dacl_len + sacl_len )))
++        return STATUS_NO_MEMORY;
++    rel = (SECURITY_DESCRIPTOR_RELATIVE *)buffer;
++    RtlCreateSecurityDescriptor( rel, SECURITY_DESCRIPTOR_REVISION );
++    rel->Control = control | SE_SELF_RELATIVE | (dacl_present ? SE_DACL_PRESENT : 0) | (sacl_present ? SE_SACL_PRESENT : 0);
++    off = sizeof(*rel);
++    if (owner_len) { memcpy( buffer + off, owner, owner_len ); rel->Owner = off; off += owner_len; }
++    if (group_len) { memcpy( buffer + off, group, group_len ); rel->Group = off; off += group_len; }
++    if (sacl_len) { memcpy( buffer + off, sacl, sacl_len ); rel->Sacl = off; off += sacl_len; }
++    if (dacl_len) { memcpy( buffer + off, dacl, dacl_len ); rel->Dacl = off; off += dacl_len; }
++    *descr = rel;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS new_security_object( PSECURITY_DESCRIPTOR parent, PSECURITY_DESCRIPTOR creator,
++                                     PSECURITY_DESCRIPTOR *descr, GUID **types, ULONG type_count, BOOLEAN container,
++                                     ULONG flags, HANDLE token, const GENERIC_MAPPING *mapping )
++{
++    PSID owner = NULL, group = NULL, sid;
++    TOKEN_OWNER *tok_owner = NULL;
++    TOKEN_PRIMARY_GROUP *tok_group = NULL;
++    SECURITY_DESCRIPTOR_CONTROL control = 0;
++    ACL *dacl = NULL, *sacl = NULL;
++    BOOLEAN dacl_present, sacl_present, defaulted;
++    HANDLE own_token = 0;
++    NTSTATUS status;
++
++    if (!descr) return STATUS_INVALID_PARAMETER;
++    *descr = NULL;
++    if (parent && !RtlValidSecurityDescriptor( parent )) return STATUS_INVALID_SECURITY_DESCR;
++    if (creator && !RtlValidSecurityDescriptor( creator )) return STATUS_INVALID_SECURITY_DESCR;
++
++    if (!token)
++    {
++        if (NtOpenThreadToken( GetCurrentThread(), TOKEN_QUERY, TRUE, &own_token ) &&
++            NtOpenProcessToken( GetCurrentProcess(), TOKEN_QUERY, &own_token ))
++            return STATUS_NO_TOKEN;
++        token = own_token;
++    }
++
++    if (creator) RtlGetOwnerSecurityDescriptor( creator, &owner, &defaulted );
++    if (owner)
++    {
++        if (!(flags & SG_SEF_AVOID_OWNER_CHECK) && !token_can_own( token, owner ))
++        {
++            status = STATUS_INVALID_OWNER;
++            goto done;
++        }
++    }
++    else
++    {
++        if ((flags & SG_SEF_DEFAULT_OWNER_FROM_PARENT) && parent)
++            RtlGetOwnerSecurityDescriptor( parent, &owner, &defaulted );
++        if (!owner && (tok_owner = query_token( token, TokenOwner )))
++        {
++            owner = tok_owner->Owner;
++            control |= SE_OWNER_DEFAULTED;
++        }
++        if (!owner)
++        {
++            status = STATUS_NO_TOKEN;
++            goto done;
++        }
++    }
++
++    if (creator) RtlGetGroupSecurityDescriptor( creator, &group, &defaulted );
++    if (!group)
++    {
++        if ((flags & SG_SEF_DEFAULT_GROUP_FROM_PARENT) && parent)
++            RtlGetGroupSecurityDescriptor( parent, &group, &defaulted );
++        if (!group && (tok_group = query_token( token, TokenPrimaryGroup )))
++        {
++            group = tok_group->PrimaryGroup;
++            control |= SE_GROUP_DEFAULTED;
++        }
++    }
++
++    sid = owner;
++    if ((status = new_object_acl( parent, creator, FALSE, container, types, type_count, flags, token, sid, group,
++                                  mapping, &dacl, &dacl_present, &control )))
++        goto done;
++    if ((status = new_object_acl( parent, creator, TRUE, container, types, type_count, flags, token, sid, group,
++                                  mapping, &sacl, &sacl_present, &control )))
++        goto done;
++    status = make_relative_sd( owner, group, dacl, dacl_present, sacl, sacl_present, control, descr );
++
++done:
++    if (dacl) RtlFreeHeap( GetProcessHeap(), 0, dacl );
++    if (sacl) RtlFreeHeap( GetProcessHeap(), 0, sacl );
++    if (tok_owner) RtlFreeHeap( GetProcessHeap(), 0, tok_owner );
++    if (tok_group) RtlFreeHeap( GetProcessHeap(), 0, tok_group );
++    if (own_token) NtClose( own_token );
++    return status;
++}
++
++static BOOL same_ace( const ACE_HEADER *a, const ACE_HEADER *b )
++{
++    return a->AceType == b->AceType && a->AceSize == b->AceSize &&
++           (a->AceFlags & ~INHERITED_ACE) == (b->AceFlags & ~INHERITED_ACE) &&
++           !memcmp( a + 1, b + 1, a->AceSize - sizeof(ACE_HEADER) );
++}
++
++/* RtlConvertToAutoInheritSecurityObject for one ACL: the current ACEs that the parent would pass on become
++ * inherited ACEs after the explicit ones; when some of what the parent passes on is missing, the ACL was set on
++ * purpose and stays as it is, protected (GUESS at the exact Windows matching). */
++static NTSTATUS convert_acl( PSECURITY_DESCRIPTOR parent, PSECURITY_DESCRIPTOR current, BOOL sacl, GUID *type,
++                             BOOL dir, const SID *owner, const SID *group, const GENERIC_MAPPING *mapping,
++                             ACL **result, BOOLEAN *present, SECURITY_DESCRIPTOR_CONTROL *control )
++{
++    SECURITY_DESCRIPTOR_CONTROL cur_control = 0, protect = sacl ? SE_SACL_PROTECTED : SE_DACL_PROTECTED;
++    BOOLEAN p_present, p_def, c_present, c_def;
++    ACL *p_acl, *c_acl, *inh = NULL, *out = NULL;
++    const ACE_HEADER *ace, *cur;
++    BOOL *matched = NULL, all = TRUE;
++    ULONG i, j, rev;
++    NTSTATUS status = STATUS_NO_MEMORY;
++
++    *result = NULL;
++    get_sd_acl( parent, sacl, &p_present, &p_acl, &p_def );
++    get_sd_acl( current, sacl, &c_present, &c_acl, &c_def );
++    RtlGetControlSecurityDescriptor( current, &cur_control, &rev );
++    *present = c_present;
++    if (!c_present) return STATUS_SUCCESS;
++    *control |= (cur_control & protect) | (sacl ? SE_SACL_AUTO_INHERITED : SE_DACL_AUTO_INHERITED);
++    if (!c_acl) return STATUS_SUCCESS;
++
++    if (!(out = new_work_acl( work_acl_size( c_acl, p_acl ) ))) goto done;
++    if (!(inh = new_work_acl( work_acl_size( p_acl, NULL ) ))) goto done;
++    if (!(matched = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, (c_acl->AceCount + 1) * sizeof(BOOL) ))) goto done;
++    if (!(cur_control & protect) &&
++        (status = inherit_aces( inh, p_acl, dir, &type, type ? 1 : 0, owner, group, mapping, INHERITED_ACE )))
++        goto done;
++
++    for (i = 0; i < inh->AceCount; i++)
++    {
++        BOOL found = FALSE;
++        if (RtlGetAce( inh, i, (void **)&ace )) break;
++        for (j = 0; j < c_acl->AceCount && !found; j++)
++        {
++            if (matched[j] || RtlGetAce( c_acl, j, (void **)&cur )) continue;
++            if (same_ace( ace, cur )) matched[j] = found = TRUE;
++        }
++        if (!found) all = FALSE;
++    }
++
++    status = STATUS_SUCCESS;
++    for (j = 0; j < c_acl->AceCount && !status; j++)
++    {
++        if (RtlGetAce( c_acl, j, (void **)&cur )) break;
++        if (all && matched[j]) continue;
++        status = append_ace( out, cur, all ? cur->AceFlags & ~INHERITED_ACE : cur->AceFlags,
++                             ace_sid_offset( cur ) ? *(const DWORD *)(cur + 1) : 0, NULL );
++    }
++    for (i = 0; all && i < inh->AceCount && !status; i++)
++    {
++        if (RtlGetAce( inh, i, (void **)&ace )) break;
++        status = append_ace( out, ace, ace->AceFlags, ace_sid_offset( ace ) ? *(const DWORD *)(ace + 1) : 0, NULL );
++    }
++    if (!all) *control |= protect;
++    if (!status)
++    {
++        out->AclRevision = max( out->AclRevision, c_acl->AclRevision );
++        out->AclSize = acl_bytesInUse( out );
++        *result = out;
++        out = NULL;
++    }
++
++done:
++    if (out) RtlFreeHeap( GetProcessHeap(), 0, out );
++    if (inh) RtlFreeHeap( GetProcessHeap(), 0, inh );
++    if (matched) RtlFreeHeap( GetProcessHeap(), 0, matched );
++    return status;
++}
++
++static NTSTATUS convert_to_auto_inherit( PSECURITY_DESCRIPTOR parent, PSECURITY_DESCRIPTOR current,
++                                         PSECURITY_DESCRIPTOR *descr, GUID *type, BOOL dir,
++                                         const GENERIC_MAPPING *mapping )
++{
++    SECURITY_DESCRIPTOR_CONTROL control = 0, cur_control;
++    BOOLEAN dacl_present = FALSE, sacl_present = FALSE, defaulted;
++    PSID owner = NULL, group = NULL;
++    ACL *dacl = NULL, *sacl = NULL;
++    ULONG rev;
++    NTSTATUS status;
++
++    if (!descr || !current) return STATUS_INVALID_PARAMETER;
++    *descr = NULL;
++    if (!RtlValidSecurityDescriptor( current )) return STATUS_INVALID_SECURITY_DESCR;
++    if (parent && !RtlValidSecurityDescriptor( parent )) return STATUS_INVALID_SECURITY_DESCR;
++    RtlGetControlSecurityDescriptor( current, &cur_control, &rev );
++    control = cur_control & (SE_OWNER_DEFAULTED | SE_GROUP_DEFAULTED | SE_DACL_DEFAULTED | SE_SACL_DEFAULTED);
++    RtlGetOwnerSecurityDescriptor( current, &owner, &defaulted );
++    RtlGetGroupSecurityDescriptor( current, &group, &defaulted );
++
++    if (!(status = convert_acl( parent, current, FALSE, type, dir, owner, group, mapping, &dacl, &dacl_present, &control )) &&
++        !(status = convert_acl( parent, current, TRUE, type, dir, owner, group, mapping, &sacl, &sacl_present, &control )))
++        status = make_relative_sd( owner, group, dacl, dacl_present, sacl, sacl_present, control, descr );
++    if (dacl) RtlFreeHeap( GetProcessHeap(), 0, dacl );
++    if (sacl) RtlFreeHeap( GetProcessHeap(), 0, sacl );
++    return status;
++}
++#endif
++
+ /******************************************************************************
+  *  RtlNewSecurityObject		[NTDLL.@]
+  */
+@@ -1158,6 +1746,11 @@
+     NTSTATUS status;
+     BYTE *buffer;
+ 
++#ifndef SG_MUTANT_WORLD_PRIVATE_SD
++    TRACE("%p, %p, %p, %s, %d, %#lx, %p %p\n", parent, creator, descr, debugstr_guid(type), is_container, flags, token, mapping);
++    return new_security_object( parent, creator, descr, type ? &type : NULL, type ? 1 : 0, is_container, flags,
++                                token, mapping );
++#endif
+     FIXME("%p, %p, %p, %p, %d, %#lx, %p %p - semi-stub\n", parent, creator, descr, type, is_container, flags, token, mapping);
+ 
+     needed = sizeof(SECURITY_DESCRIPTOR_RELATIVE);
+@@ -1202,8 +1795,13 @@
+     PSECURITY_DESCRIPTOR *descr, GUID **types, ULONG count, BOOLEAN is_container, ULONG flags,
+     HANDLE token, PGENERIC_MAPPING mapping )
+ {
++#ifndef SG_MUTANT_WORLD_PRIVATE_SD
++    TRACE("%p, %p, %p, %p, %lu, %d, %#lx, %p %p\n", parent, creator, descr, types, count, is_container, flags, token, mapping);
++    return new_security_object( parent, creator, descr, types, count, is_container, flags, token, mapping );
++#else
+     FIXME("semi-stub\n");
+     return RtlNewSecurityObjectEx(parent, creator, descr, NULL, is_container, flags, token, mapping);
++#endif
+ }
+ 
+ /******************************************************************************
+@@ -2068,9 +2666,14 @@
+         BOOL isdir,
+         PGENERIC_MAPPING genmap )
+ {
++#ifndef SG_MUTANT_WORLD_PRIVATE_SD
++    TRACE("%p %p %p %s %d %p\n", pdesc, cdesc, ndesc, debugstr_guid(objtype), isdir, genmap);
++    return convert_to_auto_inherit( pdesc, cdesc, ndesc, objtype, isdir, genmap );
++#else
+     FIXME("%p %p %p %p %d %p - stub\n", pdesc, cdesc, ndesc, objtype, isdir, genmap);
+ 
+     return STATUS_NOT_IMPLEMENTED;
++#endif
+ }
+ 
+ /******************************************************************************
