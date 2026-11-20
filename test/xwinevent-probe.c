@@ -27,11 +27,81 @@ static void pump(DWORD ms)
     }
 }
 
+static LRESULT CALLBACK msg_hook(int code, WPARAM wp, LPARAM lp) { return CallNextHookEx(NULL, code, wp, lp); }
+
+static void CALLBACK any_proc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG obj, LONG child, DWORD tid, DWORD time)
+{
+    if (event == EVENT_OBJECT_LOCATIONCHANGE) events++;
+}
+
+/* (8404) another account's or desktop's program:
+ *   xwinevent-probe.exe xtarget FILE [desktop]   make a window (on a desktop of its own when
+ *                                                asked), write "pid tid" to FILE, announce its child's
+ *                                                EVENT_OBJECT_LOCATIONCHANGE every 100 ms for 20 s
+ *   xwinevent-probe.exe xhook FILE [desktop]     hook the thread FILE names (from that desktop): out of context with no
+ *                                                module, and in context (WH_GETMESSAGE, this module);
+ *                                                count its events for 4 s */
+static int cross(int argc, char **argv)
+{
+    if (!strcmp(argv[1], "xtarget"))
+    {
+        HWND hwnd, child;
+        FILE *f;
+        int i;
+        if (argc > 3)
+        {
+            HDESK desk = CreateDesktopA(argv[3], NULL, NULL, 0, GENERIC_ALL, NULL);
+            if (!desk || !SetThreadDesktop(desk)) { printf("desktop failed %lu\n", GetLastError()); return 1; }
+        }
+        /* a message-only window: another account's programs here have no display to show one on */
+        hwnd = CreateWindowW(L"static", L"sg-xwinevent-x", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
+        child = hwnd;
+        if (!hwnd) { printf("window failed %lu\n", GetLastError()); return 1; }
+        if (!(f = fopen(argv[2], "w"))) return 1;
+        fprintf(f, "%lu %lu\n", GetCurrentProcessId(), GetCurrentThreadId());
+        fclose(f);
+        for (i = 0; i < 200; i++)
+        {
+            /* the event itself, as a program announces one */
+            NotifyWinEvent(EVENT_OBJECT_LOCATIONCHANGE, child, OBJID_WINDOW, CHILDID_SELF);
+            pump(100);
+        }
+        return 0;
+    }
+    else
+    {
+        DWORD pid = 0, tid = 0;
+        HWINEVENTHOOK hook;
+        HHOOK mod;
+        FILE *f = fopen(argv[2], "r");
+        if (!f || fscanf(f, "%lu %lu", &pid, &tid) != 2) { printf("xfile=0\n"); return 1; }
+        fclose(f);
+        if (argc > 3)   /* on the target's desktop */
+        {
+            HDESK desk = OpenDesktopA(argv[3], 0, FALSE, GENERIC_ALL);
+            if (!desk || !SetThreadDesktop(desk)) { printf("xdesktop=0 %lu\n", GetLastError()); return 1; }
+        }
+        hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, NULL, any_proc, pid, tid,
+                               WINEVENT_OUTOFCONTEXT);
+        printf("xhook=%d\n", hook != NULL);
+        pump(3000);
+        printf("xevents=%d\n", events > 0);
+        mod = SetWindowsHookExA(WH_GETMESSAGE, msg_hook, GetModuleHandleA(NULL), tid);
+        printf("xmodhook=%d\n", mod != NULL);
+        if (hook) UnhookWinEvent(hook);
+        if (mod) UnhookWindowsHookEx(mod);
+        return 0;
+    }
+}
+
 int main(int argc, char **argv)
 {
-    HANDLE ready = CreateEventW(NULL, FALSE, FALSE, L"Local\\sg-xwinevent-ready");
-    HANDLE go = CreateEventW(NULL, FALSE, FALSE, L"Local\\sg-xwinevent-go");
-    HANDLE done = CreateEventW(NULL, FALSE, FALSE, L"Local\\sg-xwinevent-done");
+    HANDLE ready, go, done;
+
+    if (argc > 2 && (!strcmp(argv[1], "xtarget") || !strcmp(argv[1], "xhook"))) return cross(argc, argv);
+    ready = CreateEventW(NULL, FALSE, FALSE, L"Local\\sg-xwinevent-ready");
+    go = CreateEventW(NULL, FALSE, FALSE, L"Local\\sg-xwinevent-go");
+    done = CreateEventW(NULL, FALSE, FALSE, L"Local\\sg-xwinevent-done");
 
     if (argc > 1 && !strcmp(argv[1], "target"))
     {
