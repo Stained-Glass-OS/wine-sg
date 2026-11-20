@@ -838,7 +838,7 @@ test-d2dseg:
 test-keyidprop:
 	WINE=$(PREFIX)/bin/wine test/keyidprop-gate.sh
 
-# Windows.UI.Composition DropShadow, nine-grid and backdrop brushes (8215).
+# Windows.UI.Composition DropShadow, nine-grid and backdrop brushes (8215), animation groups (8216).
 test-compgrid:
 	WINE=$(PREFIX)/bin/wine test/compgrid-gate.sh
 

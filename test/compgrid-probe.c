@@ -1,6 +1,7 @@
 /* compgrid-probe (wine-sg 8215): ICompositor2's DropShadow (with ISpriteVisual2.Shadow), CompositionNineGridBrush
  * (drawn: corners and edges of its source, a hollow centre left out) and CompositionBackdropBrush (what is
- * behind shows). They were E_NOTIMPL. Built from test/compmask-probe.c; interface identity per windows-rs 0.30
+ * behind shows), and (8216) CompositionAnimationGroup with StartAnimationGroup and groups as implicit
+ * animations. They were E_NOTIMPL. Built from test/compmask-probe.c; interface identity per windows-rs 0.30
  * (MIT OR Apache-2.0). Prints name=value lines.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #define COBJMACROS
@@ -37,13 +38,21 @@ DEFINE_GUID(probe_IID_ICompositionNineGridBrush, 0xf25154e4, 0xbc8c, 0x4be7, 0xb
 DEFINE_GUID(probe_IID_ICompositionBackdropBrush, 0xc5acae58, 0x3898, 0x499e, 0x8d, 0x7f, 0x22, 0x4e, 0x91, 0x28, 0x6a, 0x5d);
 DEFINE_GUID(probe_IID_ISpriteVisual2, 0x588c9664, 0x997a, 0x4850, 0x91, 0xfe, 0x53, 0xcb, 0x58, 0xf8, 0x1c, 0xe9);
 DEFINE_GUID(probe_IID_ISpriteVisual, 0x08e05581, 0x1ad1, 0x4f97, 0x97, 0x57, 0x40, 0x2d, 0x76, 0xe4, 0x23, 0x3b);
+DEFINE_GUID(probe_IID_ICompositionAnimationGroup, 0x5e7cc90c, 0xcd14, 0x4e07, 0x8a, 0x55, 0xc7, 0x25, 0x27, 0xaa, 0xbd, 0xac);
+DEFINE_GUID(probe_IID_ICompositionAnimation2, 0x369b603e, 0xa80f, 0x4948, 0x93, 0xe3, 0xed, 0x23, 0xfb, 0x38, 0xc6, 0xcb);
+DEFINE_GUID(probe_IID_ICompositionObject2, 0xef874ea1, 0x5cff, 0x4b68, 0x9e, 0x30, 0xa1, 0x51, 0x9d, 0x08, 0xba, 0x03);
+DEFINE_GUID(probe_IID_IKeyFrameAnimation, 0x126e7f22, 0x3ae9, 0x4540, 0x9a, 0x8a, 0xde, 0xae, 0x8a, 0x4a, 0x4a, 0x84);
+DEFINE_GUID(probe_IID_IIterable_CompositionAnimation, 0x0cb59942, 0xc6f3, 0x585f, 0x9a, 0x92, 0xb4, 0x7e, 0x8d, 0xd3, 0x8e, 0xbf);
+DEFINE_GUID(probe_IID_IMap_HSTRING_ICompositionAnimationBase, 0x4ba9aa1d, 0x57ac, 0x54de, 0xa8, 0x07, 0xb5, 0x2e, 0x68, 0x9b, 0xfc, 0x04);
 DEFINE_GUID(probe_IID_ICompositionCapabilitiesStatics, 0xf7b7a86e, 0x6416, 0x49e5, 0x8d, 0xdf, 0xaf, 0xe9, 0x49, 0xe2, 0x05, 0x62);
 
 #define COMPOSITOR_CREATE_COLOR_BRUSH_WITH_COLOR 8
 #define COMPOSITOR_CREATE_CONTAINER_VISUAL       9
 #define COMPOSITOR_CREATE_SPRITE_VISUAL          22
 #define COMPOSITOR_CREATE_SURFACE_BRUSH_WITH_SURFACE 24
+#define COMPOSITOR2_CREATE_ANIMATION_GROUP       7
 #define COMPOSITOR2_CREATE_BACKDROP_BRUSH        8
+#define COMPOSITOR_CREATE_SCALAR_KEYFRAME        20
 #define COMPOSITOR2_CREATE_DROP_SHADOW           10
 #define COMPOSITOR2_CREATE_NINE_GRID_BRUSH       14
 #define MASK_GET_MASK 6
@@ -129,6 +138,101 @@ static int is_class( void *obj, const WCHAR *want )
     return ret;
 }
 
+struct timespan { INT64 duration; };
+
+/* a scalar key frame animation to `to` over ms, on target (NULL: none) */
+static void *scalar_animation( void *compositor, float to, double ms, const WCHAR *target )
+{
+    void *anim = NULL, *kf, *anim2;
+    struct timespan t = { (INT64)(ms * 10000) };
+    HSTRING hs = NULL;
+
+    SLOT( compositor, COMPOSITOR_CREATE_SCALAR_KEYFRAME, get_fn )( compositor, &anim );
+    if (!anim) return NULL;
+    SLOT( anim, 6, HRESULT (WINAPI *)( void *, float, float ) )( anim, 1.0f, to );
+    kf = qi( anim, &probe_IID_IKeyFrameAnimation );
+    SLOT( kf, 9, HRESULT (WINAPI *)( void *, struct timespan ) )( kf, t );
+    if (target)
+    {
+        anim2 = qi( anim, &probe_IID_ICompositionAnimation2 );
+        WindowsCreateString( target, (UINT32)wcslen( target ), &hs );
+        SLOT( anim2, 8, HRESULT (WINAPI *)( void *, HSTRING ) )( anim2, hs );
+        WindowsDeleteString( hs );
+    }
+    return anim;
+}
+
+static void animation_group( void *compositor, void *compositor2 )
+{
+    void *group = NULL, *g, *a1, *a2, *iterable, *iter = NULL, *visual, *object2, *base, *item = NULL;
+    INT32 count = -1, count2 = -1;
+    boolean has = 0;
+    int seen = 0;
+    float opacity = -1;
+    HRESULT hr;
+
+    hr = SLOT( compositor2, COMPOSITOR2_CREATE_ANIMATION_GROUP, get_fn )( compositor2, &group );
+    g = qi( group, &probe_IID_ICompositionAnimationGroup );
+    printf( "group=%d (%#lx)\n", SUCCEEDED(hr) && g, hr );
+    printf( "group_class=%d\n", is_class( g, L"Windows.UI.Composition.CompositionAnimationGroup" ) );
+    if (!g) return;
+    a1 = scalar_animation( compositor, 0.25f, 100, L"Opacity" );
+    a2 = scalar_animation( compositor, 0.5f, 100, NULL );
+    SLOT( g, 7, put_fn )( g, a1 );
+    SLOT( g, 7, put_fn )( g, a2 );
+    SLOT( g, 6, HRESULT (WINAPI *)( void *, INT32 * ) )( g, &count );
+    iterable = qi( g, &probe_IID_IIterable_CompositionAnimation );
+    if (iterable && SUCCEEDED( SLOT( iterable, 6, get_fn )( iterable, &iter ) ) && iter)
+    {
+        SLOT( iter, 7, HRESULT (WINAPI *)( void *, boolean * ) )( iter, &has );
+        while (has && seen < 10)
+        {
+            item = NULL;
+            SLOT( iter, 6, get_fn )( iter, &item );
+            if (item) seen++;
+            SLOT( iter, 8, HRESULT (WINAPI *)( void *, boolean * ) )( iter, &has );
+        }
+    }
+    SLOT( g, 8, put_fn )( g, a2 );
+    SLOT( g, 6, HRESULT (WINAPI *)( void *, INT32 * ) )( g, &count2 );
+    printf( "group_items=%d (%d %d %d)\n", count == 2 && seen == 2 && count2 == 1, count, seen, count2 );
+
+    visual = make_sprite( compositor, NULL, 0, 0, 10, 10 );
+    object2 = qi( visual, &probe_IID_ICompositionObject2 );
+    base = qi( g, &probe_IID_ICompositionAnimationGroup );
+    hr = SLOT( object2, 10, put_fn )( object2, base );
+    pump( 500 );
+    SLOT( visual, 22, HRESULT (WINAPI *)( void *, float * ) )( visual, &opacity );
+    printf( "group_started=%d (%#lx %.2f)\n", SUCCEEDED(hr) && opacity > 0.2f && opacity < 0.3f, hr, opacity );
+    SLOT( g, 7, put_fn )( g, a2 );
+    hr = SLOT( object2, 10, put_fn )( object2, base );
+    printf( "group_needs_targets=%d (%#lx)\n", hr == E_INVALIDARG, hr );
+
+    /* a group as an implicit animation: changing Opacity runs the group's Opacity animation */
+    {
+        void *group2 = NULL, *g2, *collection = NULL, *visual2, *object2b, *map;
+        HSTRING key;
+        boolean replaced = 0;
+
+        SLOT( compositor2, COMPOSITOR2_CREATE_ANIMATION_GROUP, get_fn )( compositor2, &group2 );
+        g2 = qi( group2, &probe_IID_ICompositionAnimationGroup );
+        SLOT( g2, 7, put_fn )( g2, scalar_animation( compositor, 0.75f, 100, L"Opacity" ) );
+        SLOT( compositor2, 11, get_fn )( compositor2, &collection );
+        WindowsCreateString( L"Opacity", 7, &key );
+        map = qi( collection, &probe_IID_IMap_HSTRING_ICompositionAnimationBase );
+        hr = map ? SLOT( map, 10, HRESULT (WINAPI *)( void *, HSTRING, void *, boolean * ) )( map, key, g2, &replaced ) : E_NOINTERFACE;
+        WindowsDeleteString( key );
+        visual2 = make_sprite( compositor, NULL, 0, 0, 10, 10 );
+        object2b = qi( visual2, &probe_IID_ICompositionObject2 );
+        SLOT( object2b, 9, put_fn )( object2b, collection );
+        SLOT( visual2, 23, HRESULT (WINAPI *)( void *, float ) )( visual2, 0.1f );
+        pump( 500 );
+        opacity = -1;
+        SLOT( visual2, 22, HRESULT (WINAPI *)( void *, float * ) )( visual2, &opacity );
+        printf( "group_implicit=%d (%#lx %.2f)\n", SUCCEEDED(hr) && opacity > 0.7f && opacity < 0.8f, hr, opacity );
+    }
+}
+
 int main( void )
 {
     static const WCHAR name[] = L"Windows.UI.Composition.Compositor";
@@ -207,6 +311,8 @@ int main( void )
     bd = qi( backdrop, &probe_IID_ICompositionBackdropBrush );
     printf( "backdrop_brush=%d (%#lx)\n", SUCCEEDED(hr) && bd, hr );
     printf( "backdrop_class=%d\n", is_class( bd, L"Windows.UI.Composition.CompositionBackdropBrush" ) );
+
+    animation_group( compositor, compositor2 );
 
     if (FAILED( hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                         levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d, NULL, NULL ) ))

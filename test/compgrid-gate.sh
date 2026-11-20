@@ -1,11 +1,13 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
 # ICompositor2::CreateDropShadow (and ISpriteVisual2.Shadow), CreateNineGridBrush
-# (drawn) and CreateBackdropBrush (patches/sg/8215): test/compgrid-probe.c under
+# (drawn), CreateBackdropBrush (patches/sg/8215) and CreateAnimationGroup with
+# StartAnimationGroup and implicit groups (8216): test/compgrid-probe.c under
 # Xvfb. They were E_NOTIMPL.
 #
 #   WINE=/opt/wine-sg/bin/wine test/compgrid-gate.sh
-# Mutant: SG_MUTANT_NO_COMPOSITOR2_OBJECTS (dcomp/composition.c).
+# Mutants: SG_MUTANT_NO_COMPOSITOR2_OBJECTS (dcomp/composition.c),
+# SG_MUTANT_NO_ANIMATION_GROUP (dcomp/composition.c and animation.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -58,6 +60,12 @@ check 'nine_grid_class=1'      "its runtime class is Windows.UI.Composition.Comp
 check 'nine_grid_props=1'      "its insets, hollow centre and source are kept"
 check 'backdrop_brush=1'       "ICompositor2::CreateBackdropBrush makes a CompositionBackdropBrush"
 check 'backdrop_class=1'       "its runtime class is Windows.UI.Composition.CompositionBackdropBrush"
+check 'group=1'                "ICompositor2::CreateAnimationGroup makes a CompositionAnimationGroup"
+check 'group_class=1'          "its runtime class is Windows.UI.Composition.CompositionAnimationGroup"
+check 'group_items=1'          "Add, Remove, Count and iteration"
+check 'group_started=1'        "StartAnimationGroup runs each animation on its Target"
+check 'group_needs_targets=1'  "an animation without a Target makes StartAnimationGroup fail"
+check 'group_implicit=1'       "a group as an implicit animation runs its animations on their Targets"
 if printf '%s\n' "$out" | grep -q '^no_d3d11='; then
     echo "SKIP: no Direct3D 11 device here for the drawing part"
 else
