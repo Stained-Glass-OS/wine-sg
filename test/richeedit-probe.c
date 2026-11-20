@@ -1,5 +1,5 @@
 /* riched20 ITextRange batch (patches/sg/2029), run by test/richeedit-gate.sh.
- * Families: Delete (range text, counted characters, ranges kept in step),
+ * Families: Delete (range text, counted characters, ranges kept in step; any unit, 8205),
  * CanEdit and the read-only error, SetChar, ChangeCase (five kinds, formatting
  * kept), InStory, on a range and on the selection.
  *
@@ -92,13 +92,26 @@ static void test_delete(void)
     check(hr == S_OK && delta == 16 && text_is(L""), "delete forward stops before the last paragraph mark");
     ITextRange_Release(r); ITextRange_Release(other); ITextRange_Release(later);
 
+    /* wine-sg 8205: a longer range counts as one unit, then more units go; any unit */
     settext(L"abcdef");
     r = rng(1, 3);
     hr = ITextRange_Delete(r, tomCharacter, 2, &delta);
-    check(hr == E_NOTIMPL && text_is(L"abcdef"), "counted delete of a longer range is not done");
-    ITextRange_SetEnd(r, 1);
+    check(hr == S_OK && delta == 2 && text_is(L"aef") && at(r, 1, 1), "counted delete of a longer range: it, then one more character");
+    ITextRange_Release(r);
+    settext(L"one two three four");
+    r = rng(4, 4);
     hr = ITextRange_Delete(r, tomWord, 1, &delta);
-    check(hr == E_NOTIMPL && text_is(L"abcdef"), "counted delete of words is not done");
+    check(hr == S_OK && delta == 1 && text_is(L"one three four") && at(r, 4, 4), "delete a word after a point (Ctrl+Delete)");
+    hr = ITextRange_Delete(r, tomWord, -1, &delta);
+    check(hr == S_OK && delta == -1 && text_is(L"three four") && at(r, 0, 0), "delete a word before a point (Ctrl+Backspace)");
+    ITextRange_SetRange(r, 6, 6);
+    hr = ITextRange_Delete(r, tomWord, 2, &delta);
+    check(hr == S_OK && text_is(L"three ") && at(r, 6, 6), "delete the words to the end");
+    ITextRange_Release(r);
+    settext(L"first.\rsecond.\rthird.");
+    r = rng(7, 7);
+    hr = ITextRange_Delete(r, tomParagraph, 1, &delta);
+    check(hr == S_OK && delta == 1 && text_is(L"first.\rthird."), "delete a paragraph after a point");
     ITextRange_Release(r);
 
     settext(L"abcdef");
@@ -112,6 +125,16 @@ static void test_delete(void)
             CHARRANGE cr;
             SendMessageW(edit, EM_EXGETSEL, 0, (LPARAM)&cr);
             check(cr.cpMin == 2 && cr.cpMax == 2, "selection delete leaves a point");
+        }
+        {
+            LONG d = 99;
+            /* wine-sg 8205: MoveLeft/MoveRight take tomCharacter or tomWord only (documented E_INVALIDARG) */
+            hr = ITextSelection_MoveLeft(sel, tomLine, 1, tomMove, &d);
+            check(hr == E_INVALIDARG && d == 0, "MoveLeft by lines is not valid");
+            hr = ITextSelection_MoveRight(sel, tomParagraph, 1, tomMove, &d);
+            check(hr == E_INVALIDARG && d == 0, "MoveRight by paragraphs is not valid");
+            hr = ITextSelection_Delete(sel, tomWord, -1, &d);
+            check(hr == S_OK && d == -1 && text_is(L"f"), "selection delete of a word before it");
         }
         ITextSelection_Release(sel);
     }

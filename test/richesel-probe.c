@@ -146,7 +146,8 @@ static void test_moves(void)
         check(hr == S_OK && d == 1 && s < 16, "MoveUp one line goes back");
     }
     hr = ITextSelection_MoveRight(sel, tomSentence, 1, tomMove, &d);
-    check(hr == E_NOTIMPL && d == 0, "sentences are not a unit it moves by");
+    /* documented: tomCharacter or tomWord only, anything else E_INVALIDARG (8205; was E_NOTIMPL) */
+    check(hr == E_INVALIDARG && d == 0, "sentences are not a unit it moves by");
 
     /* Home and End */
     ITextSelection_SetRange(sel, 5, 5);
