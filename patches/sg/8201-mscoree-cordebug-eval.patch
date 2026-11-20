@@ -1,0 +1,624 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] mscoree: ICorDebugEval over Wine Mono's agent (call, new object, new string).
+
+ICorDebugThread::CreateEval was E_NOTIMPL, so a debugger could not evaluate an expression that calls code
+(property getters, ToString, watch expressions). As in the .NET Framework, an evaluation is set up while
+stopped and runs at the next Continue: CallFunction and NewObject are VM INVOKE_METHOD on the eval's thread
+(stopped in managed code; breakpoints do not stop it), NewString is APPDOMAIN CREATE_STRING,
+NewObjectNoConstructor TYPE CREATE_INSTANCE; it ends with EvalComplete, or EvalException with the
+exception object as the result, delivered on the event thread with the process stopped again. GetResult,
+IsActive, GetThread; CreateValue makes primitives and null references the debugger sets and passes.
+Not done: NewArray (the agent makes only byte arrays), Abort.
+---
+--- a/dlls/mscoree/cordebug.c
++++ b/dlls/mscoree/cordebug.c
+@@ -69,12 +69,15 @@
+     struct list breakpoints, steppers;   /* active ones */
+     ICorDebugAppDomain *appdomain;
+     struct list modules, assemblies;   /* the agent's, as handed out (wine-sg 8200) */
++    struct list evals;                 /* evaluations to run at the next Continue (wine-sg 8201) */
++    HANDLE eval_thread;
+ 
+     LONG ref;
+ } DebugProcess;
+ 
+ static void process_start_events(DebugProcess *This);
+ static void process_stop_events(DebugProcess *This);
++static BOOL process_start_evals(DebugProcess *This);
+ 
+ static inline CorDebug *impl_from_ICorDebug( ICorDebug *iface )
+ {
+@@ -251,6 +254,8 @@
+             if ((This->abort = CreateEventW(NULL, TRUE, FALSE, NULL)))
+                 This->connector = CreateThread(NULL, 0, connect_thread, This, 0, NULL);
+         }
++        else if (This->sdb && process_start_evals(This))
++            TRACE("evaluations run\n");
+         else if (This->sdb)
+             sdb_request(This->sdb, SDB_SET_VM, SDB_VM_RESUME, NULL, 0, NULL, NULL);
+         else if (This->thread && !This->connector)
+@@ -1307,6 +1312,7 @@
+     ULONG32 rank, count, *dims, *lows;   /* an array's */
+     CorElementType element;
+     struct value_home home;
++    BOOL temp;            /* the debugger's own (ICorDebugEval::CreateValue): set here only */
+ } DebugValue;
+ 
+ static const ICorDebugGenericValueVtbl genericvalue_vtbl;
+@@ -1579,6 +1585,7 @@
+     UINT32 n = 0;
+     BYTE set, cmd;
+ 
++    if (This->temp) return S_OK;
+     switch (This->home.kind)
+     {
+     case HOME_FRAME:
+@@ -3774,10 +3781,12 @@
+     return E_NOTIMPL;
+ }
+ 
++static HRESULT eval_create(DebugThread *thread, ICorDebugEval **ret);
++
+ static HRESULT WINAPI cordebugthread_CreateEval(ICorDebugThread *iface, ICorDebugEval **ppEval)
+ {
+-    FIXME("%p: evaluation not yet\n", iface);
+-    return E_NOTIMPL;
++    if (!ppEval) return E_INVALIDARG;
++    return eval_create(impl_from_ICorDebugThread(iface), ppEval);
+ }
+ 
+ static HRESULT WINAPI cordebugthread_GetObject(ICorDebugThread *iface, ICorDebugValue **ppObject)
+@@ -4581,18 +4590,514 @@
+     return S_OK;
+ }
+ 
++/***************************************************************************
++ * Stained Glass OS: evaluation (wine-sg 8201)
++ *
++ * ICorDebugEval over the agent: CallFunction and NewObject are VM INVOKE_METHOD on the eval's thread (which
++ * must be stopped in managed code, as at a breakpoint or a step), NewString is APPDOMAIN CREATE_STRING,
++ * NewObjectNoConstructor TYPE CREATE_INSTANCE. As in the .NET Framework, an evaluation is set up stopped and
++ * runs when the debugger continues; it ends with the EvalComplete (or EvalException) callback, the process
++ * stopped again. The agent runs the program's threads during the call and suspends them after it. Breakpoints
++ * do not stop an evaluation. CreateValue makes values to pass as arguments.
++ */
++#define SDB_VM_INVOKE_METHOD          7
++#define SDB_APPDOMAIN_CREATE_STRING   5
++#define SDB_TYPE_CREATE_INSTANCE      19
++#define SDB_INVOKE_DISABLE_BREAKPOINTS 1
++
++enum eval_state { EVAL_IDLE, EVAL_PENDING, EVAL_RUNNING, EVAL_DONE };
++enum eval_kind { EVAL_CALL, EVAL_STRING, EVAL_INSTANCE };
++
++typedef struct DebugEval
++{
++    ICorDebugEval ICorDebugEval_iface;
++    LONG ref;
++    DebugThread *thread;
++    struct list entry;          /* in the process's pending evaluations */
++    enum eval_state state;
++    enum eval_kind kind;
++    UINT32 method, type;
++    BYTE *args;                 /* "this", the count, the arguments: the agent's encoding */
++    UINT32 args_len;
++    char *string;
++    ICorDebugValue *result;
++    BOOL exception;
++} DebugEval;
++
++static inline DebugEval *impl_from_ICorDebugEval(ICorDebugEval *iface)
++{
++    return CONTAINING_RECORD(iface, DebugEval, ICorDebugEval_iface);
++}
++
++/* values in the agent's encoding, for arguments */
++struct encoding
++{
++    BYTE *data;
++    UINT32 len, cap;
++};
++
++static BOOL enc_put(struct encoding *e, const void *p, UINT32 n)
++{
++    BYTE *data;
++
++    if (e->len + n > e->cap)
++    {
++        UINT32 cap = max(e->cap * 2, e->len + n + 64);
++        if (!(data = realloc(e->data, cap))) return FALSE;
++        e->data = data;
++        e->cap = cap;
++    }
++    memcpy(e->data + e->len, p, n);
++    e->len += n;
++    return TRUE;
++}
++
++static BOOL enc_byte(struct encoding *e, BYTE b) { return enc_put(e, &b, 1); }
++static BOOL enc_be32(struct encoding *e, UINT32 v) { BYTE b[4]; put_be32(b, v); return enc_put(e, b, 4); }
++
++static HRESULT enc_value(struct encoding *e, ICorDebugValue *iface)
++{
++    DebugValue *v = value_impl(iface);
++    INT32 v32;
++    UINT64 v64;
++    UINT32 i;
++    HRESULT hr;
++
++    if (!v) return E_INVALIDARG;
++    switch (v->kind)
++    {
++    case VALUE_PRIMITIVE:
++        switch (v->type)
++        {
++        case ELEMENT_TYPE_BOOLEAN: case ELEMENT_TYPE_U1: v32 = v->raw[0]; break;
++        case ELEMENT_TYPE_I1: v32 = (signed char)v->raw[0]; break;
++        case ELEMENT_TYPE_CHAR: case ELEMENT_TYPE_U2: v32 = *(WORD *)v->raw; break;
++        case ELEMENT_TYPE_I2: v32 = *(SHORT *)v->raw; break;
++        case ELEMENT_TYPE_I4: case ELEMENT_TYPE_U4: case ELEMENT_TYPE_R4: memcpy(&v32, v->raw, 4); break;
++        case ELEMENT_TYPE_I8: case ELEMENT_TYPE_U8: case ELEMENT_TYPE_R8:
++            memcpy(&v64, v->raw, 8);
++            return enc_byte(e, v->type) && enc_be32(e, v64 >> 32) && enc_be32(e, (UINT32)v64) ? S_OK : E_OUTOFMEMORY;
++        default:
++            FIXME("an argument of type %#x not yet\n", v->type);
++            return E_NOTIMPL;
++        }
++        return enc_byte(e, v->type) && enc_be32(e, v32) ? S_OK : E_OUTOFMEMORY;
++    case VALUE_REFERENCE:
++        if (!v->objid) return enc_byte(e, SDB_VALUE_NULL) ? S_OK : E_OUTOFMEMORY;
++        return enc_byte(e, v->type) && enc_be32(e, v->objid) ? S_OK : E_OUTOFMEMORY;
++    case VALUE_STRING:
++    case VALUE_OBJECT:
++    case VALUE_ARRAY:
++        return enc_byte(e, v->kind == VALUE_OBJECT ? ELEMENT_TYPE_CLASS : v->type) && enc_be32(e, v->objid)
++               ? S_OK : E_OUTOFMEMORY;
++    case VALUE_STRUCT:
++        if (!enc_byte(e, ELEMENT_TYPE_VALUETYPE) || !enc_byte(e, v->is_enum) || !enc_be32(e, v->class_type) ||
++            !enc_be32(e, v->field_count))
++            return E_OUTOFMEMORY;
++        for (i = 0; i < v->field_count; i++)
++        {
++            if (!v->fields[i]) return E_NOTIMPL;
++            if (FAILED(hr = enc_value(e, v->fields[i]))) return hr;
++        }
++        return S_OK;
++    }
++    return E_INVALIDARG;
++}
++
++static HRESULT WINAPI eval_QueryInterface(ICorDebugEval *iface, REFIID riid, void **ppv)
++{
++    if (IsEqualGUID(riid, &IID_ICorDebugEval) || IsEqualGUID(riid, &IID_IUnknown))
++    {
++        *ppv = iface;
++        ICorDebugEval_AddRef(iface);
++        return S_OK;
++    }
++    *ppv = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI eval_AddRef(ICorDebugEval *iface)
++{
++    return InterlockedIncrement(&impl_from_ICorDebugEval(iface)->ref);
++}
++
++static ULONG WINAPI eval_Release(ICorDebugEval *iface)
++{
++    DebugEval *This = impl_from_ICorDebugEval(iface);
++    ULONG ref = InterlockedDecrement(&This->ref);
++
++    if (!ref)
++    {
++        if (This->result) ICorDebugValue_Release(This->result);
++        ICorDebugThread_Release(&This->thread->ICorDebugThread_iface);
++        free(This->args);
++        free(This->string);
++        free(This);
++    }
++    return ref;
++}
++
++/* set up: it runs at the next Continue (the process's list holds a reference until then) */
++static HRESULT eval_queue(DebugEval *This)
++{
++    DebugProcess *process = This->thread->process;
++
++    if (This->result)
++    {
++        ICorDebugValue_Release(This->result);
++        This->result = NULL;
++    }
++    This->exception = FALSE;
++    This->state = EVAL_PENDING;
++    ICorDebugEval_AddRef(&This->ICorDebugEval_iface);
++    EnterCriticalSection(&process->cs);
++    list_add_tail(&process->evals, &This->entry);
++    LeaveCriticalSection(&process->cs);
++    return S_OK;
++}
++
++static HRESULT eval_setup_call(DebugEval *This, ICorDebugFunction *function, ULONG32 count, ICorDebugValue **args,
++                               BOOL construct)
++{
++    DebugFunction *fn;
++    struct encoding e = { 0 };
++    UINT32 flags, first = 0, i;
++    HRESULT hr;
++
++    if (!function || (count && !args)) return E_INVALIDARG;
++    if (function->lpVtbl != &function_vtbl) return E_INVALIDARG;
++    if (This->state == EVAL_PENDING || This->state == EVAL_RUNNING) return CORDBG_E_FUNC_EVAL_NOT_COMPLETE;
++    fn = impl_from_ICorDebugFunction(function);
++    if (FAILED(hr = method_info(This->thread->process, fn->method, &flags, NULL))) return hr;
++    /* "this" is the first argument of an instance method; a constructor makes its object */
++    if (construct || (flags & 0x10 /* mdStatic */)) hr = enc_byte(&e, SDB_VALUE_NULL) ? S_OK : E_OUTOFMEMORY;
++    else if (!count) hr = E_INVALIDARG;
++    else
++    {
++        hr = enc_value(&e, args[0]);
++        first = 1;
++    }
++    if (SUCCEEDED(hr)) hr = enc_be32(&e, count - first) ? S_OK : E_OUTOFMEMORY;
++    for (i = first; SUCCEEDED(hr) && i < count; i++) hr = enc_value(&e, args[i]);
++    if (FAILED(hr))
++    {
++        free(e.data);
++        return hr;
++    }
++    free(This->args);
++    This->args = e.data;
++    This->args_len = e.len;
++    This->kind = EVAL_CALL;
++    This->method = fn->method;
++    return eval_queue(This);
++}
++
++static HRESULT WINAPI eval_CallFunction(ICorDebugEval *iface, ICorDebugFunction *pFunction, ULONG32 nArgs,
++                                        ICorDebugValue *ppArgs[])
++{
++    return eval_setup_call(impl_from_ICorDebugEval(iface), pFunction, nArgs, ppArgs, FALSE);
++}
++
++static HRESULT WINAPI eval_NewObject(ICorDebugEval *iface, ICorDebugFunction *pConstructor, ULONG32 nArgs,
++                                     ICorDebugValue *ppArgs[])
++{
++    return eval_setup_call(impl_from_ICorDebugEval(iface), pConstructor, nArgs, ppArgs, TRUE);
++}
++
++static HRESULT WINAPI eval_NewObjectNoConstructor(ICorDebugEval *iface, ICorDebugClass *pClass)
++{
++    DebugEval *This = impl_from_ICorDebugEval(iface);
++    DebugClass *cls = class_impl(pClass);
++
++    if (!cls) return E_INVALIDARG;
++    if (This->state == EVAL_PENDING || This->state == EVAL_RUNNING) return CORDBG_E_FUNC_EVAL_NOT_COMPLETE;
++    This->kind = EVAL_INSTANCE;
++    This->type = cls->type;
++    return eval_queue(This);
++}
++
++static HRESULT WINAPI eval_NewString(ICorDebugEval *iface, LPCWSTR string)
++{
++    DebugEval *This = impl_from_ICorDebugEval(iface);
++    char *utf8;
++    int n;
++
++    if (!string) return E_INVALIDARG;
++    if (This->state == EVAL_PENDING || This->state == EVAL_RUNNING) return CORDBG_E_FUNC_EVAL_NOT_COMPLETE;
++    n = WideCharToMultiByte(CP_UTF8, 0, string, -1, NULL, 0, NULL, NULL);
++    if (!(utf8 = malloc(n))) return E_OUTOFMEMORY;
++    WideCharToMultiByte(CP_UTF8, 0, string, -1, utf8, n, NULL, NULL);
++    free(This->string);
++    This->string = utf8;
++    This->kind = EVAL_STRING;
++    return eval_queue(This);
++}
++
++static HRESULT WINAPI eval_NewArray(ICorDebugEval *iface, CorElementType elementType, ICorDebugClass *pElementClass,
++                                    ULONG32 rank, ULONG32 dims[], ULONG32 lowBounds[])
++{
++    FIXME("%p: arrays not yet (the agent makes byte arrays only)\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI eval_IsActive(ICorDebugEval *iface, BOOL *pbActive)
++{
++    DebugEval *This = impl_from_ICorDebugEval(iface);
++
++    if (!pbActive) return E_INVALIDARG;
++    *pbActive = This->state == EVAL_PENDING || This->state == EVAL_RUNNING;
++    return S_OK;
++}
++
++static HRESULT WINAPI eval_Abort(ICorDebugEval *iface)
++{
++    FIXME("%p: aborting an evaluation not yet\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI eval_GetResult(ICorDebugEval *iface, ICorDebugValue **ppResult)
++{
++    DebugEval *This = impl_from_ICorDebugEval(iface);
++
++    if (!ppResult) return E_INVALIDARG;
++    *ppResult = NULL;
++    if (This->state != EVAL_DONE) return CORDBG_E_FUNC_EVAL_NOT_COMPLETE;
++    if (!This->result) return CORDBG_S_FUNC_EVAL_HAS_NO_RESULT;
++    *ppResult = This->result;
++    ICorDebugValue_AddRef(*ppResult);
++    return S_OK;
++}
++
++static HRESULT WINAPI eval_GetThread(ICorDebugEval *iface, ICorDebugThread **ppThread)
++{
++    DebugEval *This = impl_from_ICorDebugEval(iface);
++
++    if (!ppThread) return E_INVALIDARG;
++    *ppThread = &This->thread->ICorDebugThread_iface;
++    ICorDebugThread_AddRef(*ppThread);
++    return S_OK;
++}
++
++/* a value of the debugger's to pass as an argument: zero (null), set with SetValue */
++static HRESULT WINAPI eval_CreateValue(ICorDebugEval *iface, CorElementType elementType, ICorDebugClass *pElementClass,
++                                       ICorDebugValue **ppValue)
++{
++    DebugEval *This = impl_from_ICorDebugEval(iface);
++    DebugValue *value;
++    ULONG32 size;
++
++    if (!ppValue) return E_INVALIDARG;
++    *ppValue = NULL;
++    switch (elementType)
++    {
++    case ELEMENT_TYPE_BOOLEAN: case ELEMENT_TYPE_I1: case ELEMENT_TYPE_U1: size = 1; break;
++    case ELEMENT_TYPE_CHAR: case ELEMENT_TYPE_I2: case ELEMENT_TYPE_U2: size = 2; break;
++    case ELEMENT_TYPE_I4: case ELEMENT_TYPE_U4: case ELEMENT_TYPE_R4: size = 4; break;
++    case ELEMENT_TYPE_I8: case ELEMENT_TYPE_U8: case ELEMENT_TYPE_R8: size = 8; break;
++    case ELEMENT_TYPE_CLASS: case ELEMENT_TYPE_OBJECT: case ELEMENT_TYPE_STRING:
++        if (!(value = value_alloc(This->thread->process, VALUE_REFERENCE, elementType, NULL, sizeof(void *), 0)))
++            return E_OUTOFMEMORY;
++        value->temp = TRUE;
++        *ppValue = value_iface(value);
++        return S_OK;
++    default:
++        FIXME("%p: values of type %#x not yet\n", iface, elementType);
++        return E_NOTIMPL;
++    }
++    if (!(value = value_alloc(This->thread->process, VALUE_PRIMITIVE, elementType, NULL, size, 0)))
++        return E_OUTOFMEMORY;
++    value->temp = TRUE;
++    *ppValue = value_iface(value);
++    return S_OK;
++}
++
++static const ICorDebugEvalVtbl eval_vtbl =
++{
++    eval_QueryInterface, eval_AddRef, eval_Release,
++    eval_CallFunction, eval_NewObject, eval_NewObjectNoConstructor, eval_NewString, eval_NewArray,
++    eval_IsActive, eval_Abort, eval_GetResult, eval_GetThread, eval_CreateValue,
++};
++
++static HRESULT eval_create(DebugThread *thread, ICorDebugEval **ret)
++{
++    DebugEval *This = calloc(1, sizeof(*This));
++
++    if (!This) return E_OUTOFMEMORY;
++    This->ICorDebugEval_iface.lpVtbl = &eval_vtbl;
++    This->ref = 1;
++    This->thread = thread;
++    ICorDebugThread_AddRef(&thread->ICorDebugThread_iface);
++    *ret = &This->ICorDebugEval_iface;
++    return S_OK;
++}
++
++/* runs one evaluation (the program continued): the result, or the exception it threw */
++static void eval_run(DebugEval *This)
++{
++    DebugProcess *process = This->thread->process;
++    BYTE *payload, *reply = NULL, id[4];
++    const BYTE *p;
++    UINT32 len, domain;
++    HRESULT hr = E_FAIL;
++
++    switch (This->kind)
++    {
++    case EVAL_CALL:
++        if (!(payload = malloc(12 + This->args_len))) break;
++        put_be32(payload, This->thread->objid);
++        put_be32(payload + 4, SDB_INVOKE_DISABLE_BREAKPOINTS);
++        put_be32(payload + 8, This->method);
++        memcpy(payload + 12, This->args, This->args_len);
++        hr = agent_request(process, SDB_SET_VM, SDB_VM_INVOKE_METHOD, payload, 12 + This->args_len, &reply, &len);
++        free(payload);
++        if (SUCCEEDED(hr) && len >= 1)
++        {
++            /* 0: it threw (the exception follows), else the result (void: none) */
++            This->exception = !(reply[0] & 1);
++            p = reply + 1;
++#ifndef SG_MUTANT_CDB_EVAL_NO_RESULT
++            parse_value(process, &p, reply + len, &This->result, FALSE);
++#endif
++        }
++        else
++        {
++            WARN("invoke failed (%#lx): the thread is not stopped in managed code?\n", hr);
++            This->exception = TRUE;
++        }
++        break;
++    case EVAL_STRING:
++        if (FAILED(hr = agent_request(process, SDB_SET_APPDOMAIN, SDB_APPDOMAIN_GET_ROOT, NULL, 0, &reply, &len)))
++            break;
++        domain = len >= 4 ? sdb_get32(reply) : 0;
++        free(reply);
++        reply = NULL;
++        len = strlen(This->string);
++        if (!(payload = malloc(8 + len))) break;
++        put_be32(payload, domain);
++        put_be32(payload + 4, len);
++        memcpy(payload + 8, This->string, len);
++        hr = agent_request(process, SDB_SET_APPDOMAIN, SDB_APPDOMAIN_CREATE_STRING, payload, 8 + len, &reply, &len);
++        free(payload);
++        if (SUCCEEDED(hr) && len >= 4)
++            value_create(process, VALUE_REFERENCE, ELEMENT_TYPE_STRING, NULL, sizeof(void *), sdb_get32(reply),
++                         &This->result);
++        else This->exception = TRUE;
++        break;
++    case EVAL_INSTANCE:
++        put_be32(id, This->type);
++        hr = agent_request(process, SDB_SET_TYPE, SDB_TYPE_CREATE_INSTANCE, id, 4, &reply, &len);
++        if (SUCCEEDED(hr) && len >= 4)
++            value_create(process, VALUE_REFERENCE, ELEMENT_TYPE_CLASS, NULL, sizeof(void *), sdb_get32(reply),
++                         &This->result);
++        else This->exception = TRUE;
++        break;
++    }
++    free(reply);
++    This->state = EVAL_DONE;
++}
++
++static void queue_eval_done(DebugProcess *This, DebugEval *eval);
++
++/* the evaluations set up before the debugger continued, one after the other */
++static DWORD WINAPI eval_thread(void *arg)
++{
++    DebugProcess *This = arg;
++    DebugEval *eval;
++
++    for (;;)
++    {
++        EnterCriticalSection(&This->cs);
++        eval = list_empty(&This->evals) ? NULL : LIST_ENTRY(list_head(&This->evals), DebugEval, entry);
++        if (eval)
++        {
++            list_remove(&eval->entry);
++            eval->state = EVAL_RUNNING;
++        }
++        LeaveCriticalSection(&This->cs);
++        if (!eval) return 0;
++        eval_run(eval);
++        /* done: stopped again until continued, and told (on the event thread) */
++        EnterCriticalSection(&This->cs);
++        This->stop_count++;
++        LeaveCriticalSection(&This->cs);
++        queue_eval_done(This, eval);   /* (takes the list's reference) */
++    }
++}
++
++/* Continue with evaluations set up: they run (instead of the program resuming); FALSE: none */
++static BOOL process_start_evals(DebugProcess *This)
++{
++    if (list_empty(&This->evals)) return FALSE;
++    if (This->eval_thread && WaitForSingleObject(This->eval_thread, 0) == WAIT_TIMEOUT) return TRUE;   /* on it */
++    if (This->eval_thread) CloseHandle(This->eval_thread);
++    This->eval_thread = CreateThread(NULL, 0, eval_thread, This, 0, NULL);
++    return TRUE;
++}
++
++static void process_stop_evals(DebugProcess *This)
++{
++    DebugEval *eval, *next;
++
++    if (This->eval_thread)
++    {
++        if (GetCurrentThreadId() != GetThreadId(This->eval_thread)) WaitForSingleObject(This->eval_thread, 35000);
++        CloseHandle(This->eval_thread);
++        This->eval_thread = NULL;
++    }
++    EnterCriticalSection(&This->cs);
++    LIST_FOR_EACH_ENTRY_SAFE(eval, next, &This->evals, DebugEval, entry)
++    {
++        list_remove(&eval->entry);
++        eval->state = EVAL_IDLE;
++        ICorDebugEval_Release(&eval->ICorDebugEval_iface);
++    }
++    LeaveCriticalSection(&This->cs);
++}
++
+ /* the agent's events, from the reader thread: queued for the process's event thread */
+ struct queued_event
+ {
+     struct list entry;
+     BYTE *data;
+     UINT32 len;
++    DebugEval *eval;   /* (or an evaluation done, wine-sg 8201) */
+ };
+ 
++static void queue_eval_done(DebugProcess *This, DebugEval *eval)
++{
++    struct queued_event *ev = calloc(1, sizeof(*ev));
++
++    if (!ev)
++    {
++        ICorDebugEval_Release(&eval->ICorDebugEval_iface);
++        return;
++    }
++    ev->eval = eval;
++    EnterCriticalSection(&This->cs);
++    list_add_tail(&This->events, &ev->entry);
++    LeaveCriticalSection(&This->cs);
++    SetEvent(This->event_ready);
++}
++
++static void deliver_eval(DebugProcess *This, DebugEval *eval)
++{
++    ICorDebugManagedCallback *callback = This->cordebug ? This->cordebug->pCallback : NULL;
++    ICorDebugAppDomain *domain = process_appdomain(This);
++
++    TRACE("evaluation %p done%s\n", eval, eval->exception ? ", it threw" : "");
++    if (callback && eval->exception)
++        ICorDebugManagedCallback_EvalException(callback, domain, &eval->thread->ICorDebugThread_iface,
++                                               &eval->ICorDebugEval_iface);
++    else if (callback)
++        ICorDebugManagedCallback_EvalComplete(callback, domain, &eval->thread->ICorDebugThread_iface,
++                                              &eval->ICorDebugEval_iface);
++    if (domain) ICorDebugAppDomain_Release(domain);
++}
++
+ static void process_event_func(void *ctx, BYTE *data, UINT32 len)
+ {
+     DebugProcess *This = ctx;
+-    struct queued_event *ev = malloc(sizeof(*ev));
++    struct queued_event *ev = calloc(1, sizeof(*ev));
+ 
+     if (!ev) { free(data); return; }
+     ev->data = data;
+@@ -4707,7 +5212,12 @@
+             if (ev) list_remove(&ev->entry);
+             LeaveCriticalSection(&This->cs);
+             if (!ev) break;
+-            deliver_event(This, ev->data, ev->len);
++            if (ev->eval)
++            {
++                deliver_eval(This, ev->eval);
++                ICorDebugEval_Release(&ev->eval->ICorDebugEval_iface);
++            }
++            else deliver_event(This, ev->data, ev->len);
+             free(ev->data);
+             free(ev);
+         }
+@@ -4729,6 +5239,7 @@
+     DebugBreakpoint *bp, *bp2;
+     DebugStepper *st, *st2;
+ 
++    process_stop_evals(This);
+     if (This->sdb) sdb_set_event_handler(This->sdb, NULL, NULL);
+     if (This->event_thread)
+     {
+@@ -4745,6 +5256,7 @@
+     LIST_FOR_EACH_ENTRY_SAFE(ev, next, &This->events, struct queued_event, entry)
+     {
+         list_remove(&ev->entry);
++        if (ev->eval) ICorDebugEval_Release(&ev->eval->ICorDebugEval_iface);
+         free(ev->data);
+         free(ev);
+     }
+@@ -4851,6 +5363,7 @@
+     list_init(&This->steppers);
+     list_init(&This->modules);
+     list_init(&This->assemblies);
++    list_init(&This->evals);
+     This->ref = 1;
+     This->stop_count = 1;   /* created suspended: the first Continue starts it */
+     This->cordebug = cordebug;
