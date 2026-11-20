@@ -2,13 +2,14 @@
 . "$(dirname "$0")/scratch-home.sh"
 # ICompositor2::CreateDropShadow (and ISpriteVisual2.Shadow), CreateNineGridBrush
 # (drawn), CreateBackdropBrush (patches/sg/8215) and CreateAnimationGroup with
-# StartAnimationGroup and implicit groups (8216), CreateLayerVisual (8218):
-# test/compgrid-probe.c under Xvfb. They were E_NOTIMPL.
+# StartAnimationGroup and implicit groups (8216), CreateLayerVisual (8218) and
+# the four lights (8219): test/compgrid-probe.c under Xvfb. They were E_NOTIMPL.
 #
 #   WINE=/opt/wine-sg/bin/wine test/compgrid-gate.sh
 # Mutants: SG_MUTANT_NO_COMPOSITOR2_OBJECTS (dcomp/composition.c),
 # SG_MUTANT_NO_ANIMATION_GROUP (dcomp/composition.c and animation.c),
-# SG_MUTANT_NO_LAYER_VISUAL (dcomp/composition.c).
+# SG_MUTANT_NO_LAYER_VISUAL (dcomp/composition.c),
+# SG_MUTANT_NO_LIGHTS (dcomp/composition.c and lights.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -66,6 +67,10 @@ check 'layer_class=1'          "its runtime class is Windows.UI.Composition.Laye
 check 'layer_container=1'      "it is a container visual"
 check 'layer_effect=1'         "its Effect is kept"
 check 'layer_shadow=1'         "its Shadow is kept (ILayerVisual2)"
+check 'lights_made=1'          "ICompositor2 makes ambient, distant, point and spot lights (8219)"
+check 'lights_class=1'         "with their runtime classes"
+check 'lights_props=1'         "white, constant attenuation 1, cone angle in degrees and radians, enabled"
+check 'light_targets=1'        "a light's Targets keep a visual once and iterate"
 check 'group=1'                "ICompositor2::CreateAnimationGroup makes a CompositionAnimationGroup"
 check 'group_class=1'          "its runtime class is Windows.UI.Composition.CompositionAnimationGroup"
 check 'group_items=1'          "Add, Remove, Count and iteration"

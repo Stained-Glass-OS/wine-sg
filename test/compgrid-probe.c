@@ -1,7 +1,8 @@
 /* compgrid-probe (wine-sg 8215): ICompositor2's DropShadow (with ISpriteVisual2.Shadow), CompositionNineGridBrush
  * (drawn: corners and edges of its source, a hollow centre left out) and CompositionBackdropBrush (what is
  * behind shows), and (8216) CompositionAnimationGroup with StartAnimationGroup and groups as implicit
- * animations, and (8218) LayerVisual (Effect and Shadow kept, children drawn). They were E_NOTIMPL. Built from test/compmask-probe.c; interface identity per windows-rs 0.30
+ * animations, (8218) LayerVisual (Effect and Shadow kept, children drawn) and (8219) the four lights with
+ * their targets. They were E_NOTIMPL. Built from test/compmask-probe.c; interface identity per windows-rs 0.30
  * (MIT OR Apache-2.0). Prints name=value lines.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #define COBJMACROS
@@ -46,6 +47,13 @@ DEFINE_GUID(probe_IID_IIterable_CompositionAnimation, 0x0cb59942, 0xc6f3, 0x585f
 DEFINE_GUID(probe_IID_IMap_HSTRING_ICompositionAnimationBase, 0x4ba9aa1d, 0x57ac, 0x54de, 0xa8, 0x07, 0xb5, 0x2e, 0x68, 0x9b, 0xfc, 0x04);
 DEFINE_GUID(probe_IID_ILayerVisual, 0xaf843985, 0x0444, 0x4887, 0x8e, 0x83, 0xb4, 0x0b, 0x25, 0x3f, 0x82, 0x2c);
 DEFINE_GUID(probe_IID_ILayerVisual2, 0x98f9aeeb, 0x6f23, 0x49f1, 0x90, 0xb1, 0x1f, 0x59, 0xa1, 0x4f, 0xbc, 0xe3);
+DEFINE_GUID(probe_IID_ICompositionLight, 0x41a6d7c2, 0x2e5d, 0x4bc1, 0xb0, 0x9e, 0x8f, 0x0a, 0x03, 0xe3, 0xd8, 0xd3);
+DEFINE_GUID(probe_IID_ICompositionLight3, 0x4b0b00e4, 0xdf07, 0x4959, 0xb7, 0xa4, 0x4f, 0x7e, 0x42, 0x33, 0xf8, 0x38);
+DEFINE_GUID(probe_IID_IAmbientLight, 0xa48130a1, 0xb7c4, 0x46f7, 0xb9, 0xbf, 0xda, 0xf4, 0x3a, 0x44, 0xe6, 0xee);
+DEFINE_GUID(probe_IID_IPointLight, 0xb18545b3, 0x0c5a, 0x4ab0, 0xbe, 0xdc, 0x4f, 0x35, 0x46, 0x94, 0x82, 0x72);
+DEFINE_GUID(probe_IID_ISpotLight, 0x5a9fe273, 0x44a1, 0x4f95, 0xa4, 0x22, 0x8f, 0xa5, 0x11, 0x6b, 0xdb, 0x44);
+DEFINE_GUID(probe_IID_IDistantLight, 0x318cfafc, 0x5ce3, 0x4b55, 0xab, 0x5d, 0x07, 0xa0, 0x03, 0x53, 0xac, 0x99);
+DEFINE_GUID(probe_IID_IIterable_Visual, 0x4eed7dce, 0xe4ac, 0x5891, 0x9b, 0x52, 0x79, 0x9d, 0x70, 0xdf, 0x47, 0xfe);
 DEFINE_GUID(probe_IID_ICompositionCapabilitiesStatics, 0xf7b7a86e, 0x6416, 0x49e5, 0x8d, 0xdf, 0xaf, 0xe9, 0x49, 0xe2, 0x05, 0x62);
 
 #define COMPOSITOR_CREATE_COLOR_BRUSH_WITH_COLOR 8
@@ -236,6 +244,64 @@ static void animation_group( void *compositor, void *compositor2 )
     }
 }
 
+/* the lights (8219): made, their classes, defaults, a target kept and iterated */
+static void lights( void *compositor, void *compositor2 )
+{
+    static const struct { int slot; const GUID *iid; const WCHAR *cls; const char *name; } kinds[] =
+    {
+        { 6, &probe_IID_IAmbientLight, L"Windows.UI.Composition.AmbientLight", "ambient" },
+        { 9, &probe_IID_IDistantLight, L"Windows.UI.Composition.DistantLight", "distant" },
+        { 15, &probe_IID_IPointLight, L"Windows.UI.Composition.PointLight", "point" },
+        { 16, &probe_IID_ISpotLight, L"Windows.UI.Composition.SpotLight", "spot" },
+    };
+    void *made[4] = { 0 }, *typed[4] = { 0 };
+    int i, ok_made = 1, ok_class = 1;
+    HRESULT hr;
+
+    for (i = 0; i < 4; i++)
+    {
+        hr = SLOT( compositor2, kinds[i].slot, get_fn )( compositor2, &made[i] );
+        typed[i] = qi( made[i], kinds[i].iid );
+        if (FAILED(hr) || !typed[i]) { ok_made = 0; printf( "light_%s=%#lx\n", kinds[i].name, hr ); }
+        if (!is_class( typed[i], kinds[i].cls )) ok_class = 0;
+    }
+    printf( "lights_made=%d\n", ok_made );
+    printf( "lights_class=%d\n", ok_class );
+    if (!ok_made) return;
+    {
+        struct ui_color color = { 0 };
+        float constant = 0, angle = 0;
+        boolean enabled = 0;
+        void *light, *light3, *targets = NULL, *iterable, *iter = NULL, *visual;
+        INT32 count = -1;
+        boolean has = 0;
+
+        SLOT( typed[0], 6, HRESULT (WINAPI *)( void *, struct ui_color * ) )( typed[0], &color );
+        SLOT( typed[2], 8, HRESULT (WINAPI *)( void *, float * ) )( typed[2], &constant );
+        SLOT( typed[3], 15, HRESULT (WINAPI *)( void *, float ) )( typed[3], 30.0f );
+        SLOT( typed[3], 12, HRESULT (WINAPI *)( void *, float * ) )( typed[3], &angle );
+        light3 = qi( typed[0], &probe_IID_ICompositionLight3 );
+        if (light3) SLOT( light3, 6, HRESULT (WINAPI *)( void *, boolean * ) )( light3, &enabled );
+        printf( "lights_props=%d (%02x%02x%02x%02x %.2f %.4f %d)\n", color.a == 255 && color.r == 255 && color.g == 255 &&
+                color.b == 255 && constant == 1.0f && angle > 0.5235f && angle < 0.5237f && enabled,
+                color.a, color.r, color.g, color.b, constant, angle, enabled );
+
+        light = qi( typed[2], &probe_IID_ICompositionLight );
+        SLOT( light, 6, get_fn )( light, &targets );
+        visual = make_sprite( compositor, NULL, 0, 0, 10, 10 );
+        if (targets)
+        {
+            SLOT( targets, 7, put_fn )( targets, visual );
+            SLOT( targets, 7, put_fn )( targets, visual );   /* a set: once */
+            SLOT( targets, 6, HRESULT (WINAPI *)( void *, INT32 * ) )( targets, &count );
+            iterable = qi( targets, &probe_IID_IIterable_Visual );
+            if (iterable) SLOT( iterable, 6, get_fn )( iterable, &iter );
+            if (iter) SLOT( iter, 7, HRESULT (WINAPI *)( void *, boolean * ) )( iter, &has );
+        }
+        printf( "light_targets=%d (%d %d)\n", count == 1 && has, count, has );
+    }
+}
+
 int main( void )
 {
     static const WCHAR name[] = L"Windows.UI.Composition.Compositor";
@@ -337,6 +403,7 @@ int main( void )
     }
 
     animation_group( compositor, compositor2 );
+    lights( compositor, compositor2 );
 
     if (FAILED( hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                         levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d, NULL, NULL ) ))
