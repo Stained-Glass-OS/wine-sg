@@ -1,0 +1,201 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] win32u, winex11: a dead key composes with the next character in layouts not the X server's.
+
+6000 builds the tables of a keyboard layout that is not the X server's (a French layout activated on a US
+X map) and makes its dead keys return -1 from ToUnicodeEx, but the next key then typed its own character:
+French ^ then e gave "e". The layout's dead-key table (KBDTABLES pDeadKey) is now built from the X compose
+rules (xkbcommon-compose, en_US.UTF-8), each dead key with every character the layout types and with space;
+ToUnicodeEx keeps a dead key waiting (per thread, unless flag 0x4 asks it not to change the state) and the
+next character composes with it, or both are given, as Windows does. TranslateMessage so posts WM_DEADCHAR
+then WM_CHAR with the composed character.
+---
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -1337,6 +1337,35 @@
+     if (str[0] != WCH_NONE) len = is_dead ? -1 : 1;
+     else str[0] = len = 0;
+ 
++    /* Stained Glass OS (wine-sg 8204): a dead key waits for the next character; the two compose as the
++     * layout's dead-key table says, or both are given. Flag 0x4: the keyboard state is not changed. */
++    if (len)
++    {
++        struct user_thread_info *thread_info = get_user_thread_info();
++        WCHAR pending = thread_info->sg_dead_char, composed = 0;
++        const DEADKEY *dk;
++
++        if (pending)
++        {
++            for (dk = kbd_tables->pDeadKey; dk && dk->dwBoth; dk++)
++                if (dk->dwBoth == MAKELONG( str[0], pending )) { composed = dk->wchComposed; break; }
++            if (composed)
++            {
++                str[0] = composed;
++                len = 1;
++            }
++            else if (size > 1)
++            {
++                str[1] = str[0];
++                str[0] = pending;
++                if (size > 2) str[2] = 0;
++                len = 2;
++            }
++            if (!(flags & 0x4)) thread_info->sg_dead_char = 0;
++        }
++        else if (len == -1 && !(flags & 0x4)) thread_info->sg_dead_char = str[0];
++    }
++
+     if (kbd_tables != &kbdus_tables) user_driver->pReleaseKbdTables( kbd_tables );
+ 
+     TRACE_(keyboard)( "ret %d, str %s.\n", len, debugstr_wn(str, len) );
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -133,6 +133,7 @@
+     struct session_thread_data   *session_data;           /* shared session thread data */
+     struct sg_pointer_data        sg_pointer;             /* Stained Glass OS: the pen message last retrieved */
+     struct sg_touch_state        *sg_touch;               /* Stained Glass OS: the touches (wine-sg 1150) */
++    WCHAR                         sg_dead_char;           /* Stained Glass OS: a dead key typed, waiting (wine-sg 8204) */
+ };
+ 
+ C_ASSERT( sizeof(struct user_thread_info) <= sizeof(((TEB *)0)->Win32ClientInfo) );
+--- a/dlls/winex11.drv/xkbtables.c
++++ b/dlls/winex11.drv/xkbtables.c
+@@ -50,6 +50,7 @@
+ 
+ #ifdef HAVE_XKBCOMMON_XKBCOMMON_H
+ #include <xkbcommon/xkbcommon.h>
++#include <xkbcommon/xkbcommon-compose.h>
+ #endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(keyboard);
+@@ -184,6 +185,7 @@
+     VK_TO_WCHAR_TABLE vk_to_wchar_table[2];
+     SG_VK_TO_WCHARS6 vk_to_wchars[0x100 * 3 + 1]; /* SGCAPS and dead-key entries take two */
+     VK_TO_BIT vk2bit[4];
++    DEADKEY *deadkeys;     /* (wine-sg 8204) what a dead key and the next character compose */
+     union
+     {
+         MODIFIERS modifiers;
+@@ -310,6 +312,90 @@
+     if (has_dead) *(*out)++ = dead;
+ }
+ 
++/* Stained Glass OS (wine-sg 8204): the layout's dead-key table, from the X compose rules (the en_US.UTF-8
++ * Compose file, as an X client composes): each dead key with each character the layout types, and with
++ * space (the accent itself, as Windows' layouts give it) */
++/* the one BMP character of a UTF-8 string, or 0 */
++static WCHAR utf8_char( const unsigned char *s, int len )
++{
++    if (len == 1 && s[0] < 0x80) return s[0];
++    if (len == 2 && (s[0] & 0xe0) == 0xc0 && (s[1] & 0xc0) == 0x80) return ((s[0] & 0x1f) << 6) | (s[1] & 0x3f);
++    if (len == 3 && (s[0] & 0xf0) == 0xe0 && (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80)
++        return ((s[0] & 0x0f) << 12) | ((s[1] & 0x3f) << 6) | (s[2] & 0x3f);
++    return 0;
++}
++
++static void build_dead_keys( struct foreign_layout *layout, const xkb_keysym_t *dead_syms, unsigned int dead_count )
++{
++    struct xkb_compose_table *table;
++    struct xkb_compose_state *compose;
++    const SG_VK_TO_WCHARS6 *entry;
++    WCHAR bases[512];
++    unsigned int nbases = 0, d, b, count = 0, mod;
++    DEADKEY *keys;
++
++    if (!dead_count) return;
++    if (!(table = xkb_compose_table_new_from_locale( xkb_context, "en_US.UTF-8", XKB_COMPOSE_COMPILE_NO_FLAGS )))
++    {
++        WARN( "no compose rules: dead keys do not compose\n" );
++        return;
++    }
++    if (!(compose = xkb_compose_state_new( table, XKB_COMPOSE_STATE_NO_FLAGS )))
++    {
++        xkb_compose_table_unref( table );
++        return;
++    }
++    bases[nbases++] = ' ';
++    for (entry = layout->vk_to_wchars; entry->VirtualKey; entry++)
++    {
++        if (entry->VirtualKey == 0xff) continue;   /* a dead key's own characters */
++        for (mod = 0; mod < NB_MODS; mod++)
++        {
++            WCHAR ch = entry->wch[mod];
++            unsigned int i;
++            if (ch == WCH_NONE || ch == WCH_DEAD || ch < 0x20) continue;
++            for (i = 0; i < nbases; i++) if (bases[i] == ch) break;
++            if (i == nbases && nbases < ARRAY_SIZE(bases)) bases[nbases++] = ch;
++        }
++    }
++    if (!(keys = calloc( dead_count * nbases + 1, sizeof(*keys) )))
++    {
++        xkb_compose_state_unref( compose );
++        xkb_compose_table_unref( table );
++        return;
++    }
++    for (d = 0; d < dead_count; d++)
++    {
++        WCHAR dead = dead_char( dead_syms[d] );
++        for (b = 0; b < nbases; b++)
++        {
++            char utf8[16];
++            WCHAR composed;
++            int len;
++
++            xkb_compose_state_reset( compose );
++            xkb_compose_state_feed( compose, dead_syms[d] );
++            xkb_compose_state_feed( compose, xkb_utf32_to_keysym( bases[b] ) );
++            if (xkb_compose_state_get_status( compose ) != XKB_COMPOSE_COMPOSED) continue;
++            len = xkb_compose_state_get_utf8( compose, utf8, sizeof(utf8) );
++            if (!(composed = utf8_char( (const unsigned char *)utf8, len ))) continue;
++            keys[count].dwBoth = MAKELONG( bases[b], dead );
++            keys[count].wchComposed = composed;
++            keys[count].uFlags = 0;
++            count++;
++        }
++    }
++    xkb_compose_state_unref( compose );
++    xkb_compose_table_unref( table );
++#ifdef SG_MUTANT_KBD_NO_COMPOSE
++    count = 0;
++#endif
++    keys[count].dwBoth = 0;
++    layout->deadkeys = keys;
++    layout->tables.pDeadKey = keys;
++    TRACE( "%u dead-key compositions\n", count );
++}
++
+ static void build_layout( struct foreign_layout *layout, int name )
+ {
+     struct xkb_rule_names names = {.rules = "evdev", .model = "pc105"};
+@@ -361,6 +447,32 @@
+     add_chars( layout, keymap, state, 98 /* KEY_KPSLASH */ + 8, VK_DIVIDE, &out, FALSE );
+     out->VirtualKey = 0;
+ 
++    /* the dead keys the layout has, for their compositions */
++    {
++        xkb_keysym_t dead_syms[32];
++        unsigned int dead_count = 0, k;
++        const xkb_keysym_t *syms;
++        xkb_layout_index_t lay = 0;
++        xkb_level_index_t level, levels;
++        int n, j;
++
++        for (scan = 1; scan < 0x59; scan++)
++        {
++            levels = xkb_keymap_num_levels_for_key( keymap, scan + 8, lay );
++            for (level = 0; level < levels; level++)
++            {
++                n = xkb_keymap_key_get_syms_by_level( keymap, scan + 8, lay, level, &syms );
++                for (j = 0; j < n; j++)
++                {
++                    if (!dead_char( syms[j] )) continue;
++                    for (k = 0; k < dead_count; k++) if (dead_syms[k] == syms[j]) break;
++                    if (k == dead_count && dead_count < ARRAY_SIZE(dead_syms)) dead_syms[dead_count++] = syms[j];
++                }
++            }
++        }
++        build_dead_keys( layout, dead_syms, dead_count );
++    }
++
+     xkb_state_unref( state );
+     xkb_keymap_unref( keymap );
+ 

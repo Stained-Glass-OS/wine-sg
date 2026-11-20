@@ -156,6 +156,8 @@ int main( int argc, char **argv )
     check( r == '$', "fr: MapVirtualKeyEx(VK_OEM_1, VK_TO_CHAR)", r, '$' );
     unicode( fr, "fr", 'A', 0x10, state, 1, 'a' );
     unicode( fr, "fr", VK_OEM_6, 0x1a, state, -1, '^' );
+    /* the dead key waits for the next character (8204): space gives the accent itself and clears it */
+    unicode( fr, "fr", VK_SPACE, 0x39, state, 1, '^' );
     unicode( fr, "fr", '2', 0x03, state, 1, 0xe9 );
     state[VK_SHIFT] = 0x80;
     unicode( fr, "fr", '2', 0x03, state, 1, '2' );
