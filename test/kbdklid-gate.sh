@@ -2,7 +2,8 @@
 . "$(dirname "$0")/scratch-home.sh"
 # Layout-id keyboard layouts (KLID 00010409 US-Dvorak, 00020409 US-International...)
 # load as their 0xfXXX HKLs and the key functions follow their XKB variant
-# (patches/sg/8212): test/kbdklid-probe.c. Mutant: SG_MUTANT_KBD_NO_KLID
+# (patches/sg/8212; Windows' own Layout Ids and the Canadian French KLIDs:
+# 8217): test/kbdklid-probe.c. Mutant: SG_MUTANT_KBD_NO_KLID
 # (winex11.drv/xkbtables.c, win32u/input.c).
 #   WINE=/opt/wine-sg/bin/wine test/kbdklid-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
@@ -53,5 +54,13 @@ tr -d '\r' <"$T/out.raw" >"$T/out"
 cat "$T/out"
 grep -qx 'RESULT: PASS' "$T/out" && ! grep -q '^FAIL' "$T/out" || rc=1
 
-[ $rc = 0 ] || { grep -q '^RESULT:' "$T/out" || echo "RESULT: FAIL (the probe gave no result)"; }
+# (8217) a prefix updated from 8212 loses the wrong 00010c0c key (wine.inf DelReg)
+KEY='HKLM\System\CurrentControlSet\Control\Keyboard Layouts\00010c0c'
+"$WINE" reg add "$KEY" /v "Layout Id" /d 0e03 /f >/dev/null 2>&1
+timeout -s KILL 300 "$WINE" wineboot -u >/dev/null 2>&1
+"$WINESERVER" -w
+if "$WINE" reg query "$KEY" >/dev/null 2>&1; then echo "FAIL  the update leaves the wrong 00010c0c key"; rc=1
+else echo "ok    the update removes the wrong 00010c0c key"; fi
+
+[ $rc = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $rc
