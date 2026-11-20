@@ -16,13 +16,15 @@
 #   structs   a struct argument's fields, a struct's static, an enum's value (ICorDebugGenericValue)
 #   eval      (8201) at the breakpoint: App.Twice(21) called (an argument made with CreateValue): 42, the
 #             process stopped again; NewString; NewObject with a constructor; a call that throws (EvalException)
+#   loads     (8209) CreateAppDomain, LoadAssembly/LoadModule for each assembly (those loaded before the
+#             agent was reached, and one loaded while the program runs); the probe continues after each
 #   setting   a field, an array element and an argument set (ICorDebugGenericValue::SetValue): continued, the
 #             program writes what it then has: "500 111 1234"
 #
 # Needs Wine Mono with the dt_unix transport (SG_MONO_RUNTIME=DIR names one) and mingw. SKIP without.
 #   WINE=/opt/wine-sg/bin/wine test/cordbgobj-gate.sh
 #   mutants: SG_MUTANT_CDB_DEREF_STRINGS_ONLY, SG_MUTANT_CDB_STRUCT_NONE, SG_MUTANT_CDB_FIELD_INDEX,
-#            SG_MUTANT_CDB_SET_NOOP, SG_MUTANT_CDB_NO_ASSEMBLIES, SG_MUTANT_CDB_EVAL_NO_RESULT (mscoree cordebug.c)
+#            SG_MUTANT_CDB_SET_NOOP, SG_MUTANT_CDB_NO_ASSEMBLIES, SG_MUTANT_CDB_EVAL_NO_RESULT, SG_MUTANT_CDB_NO_LOADS (mscoree cordebug.c)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -58,7 +60,7 @@ timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 C="$WINEPREFIX/drive_c"
 cp "$HERE/cordbgobj-app.cs" "$T/app.cs"
-(cd "$T" && timeout -s KILL 300 "$WINE" "$MCS" -debug -out:App.exe app.cs >/dev/null 2>&1 </dev/null)
+(cd "$T" && timeout -s KILL 300 "$WINE" "$MCS" -debug -r:System.Xml.dll -out:App.exe app.cs >/dev/null 2>&1 </dev/null)
 [ -f "$T/App.exe" ] || { fail "mcs did not build the program"; exit 1; }
 cp "$T/App.exe" "$T/probe.exe" "$C/"
 out=$(cd "$C" && timeout -s KILL 300 "$WINE" probe.exe 'C:\App.exe' 2>/dev/null </dev/null | tr -d '\r')
@@ -115,6 +117,7 @@ expect Eval.String "0 1 sg-eval" "NewString: a string sg-eval"
 expect Eval.NewObject "0 1 0x12 0.25" "NewObject with Node's constructor: an object, its constructor ran (Weight 0.25)"
 expect Eval.Throws "0 1 0x12" "App.Fail(): EvalException, the exception object as the result"
 expect Seen "500 111 1234" "continued, the program has the values set"
+expect Loads "1 1 1 1" "load callbacks (8209): one CreateAppDomain, LoadAssembly and LoadModule for the assemblies there at the start, and for System.Xml loaded later"
 expect done 1 "the probe ran to the end"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"

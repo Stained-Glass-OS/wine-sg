@@ -1,0 +1,256 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] mscoree: ICorDebug CreateAppDomain, LoadAssembly and LoadModule callbacks.
+
+A .NET debugger learns of a program's code from these callbacks -- it binds its breakpoints when a module
+loads -- and none came. Now, once the agent is reached (a program the debugger launched, held at its
+start; or one it attached to), CreateAppDomain and then LoadAssembly + LoadModule for each assembly already
+loaded are given, as the .NET Framework does at attach; assemblies loaded later come from the agent's
+ASSEMBLY_LOAD events, the program held until the debugger continues. Each callback stops the process (the
+debugger continues it); the start's hold counts as one stop while they are announced, so no Continue of
+theirs releases it early. The connector thread no longer waits for itself on its own agent requests. An
+application domain no longer releases the process it never referenced (that dropped the process's last
+reference at Detach).
+---
+--- a/dlls/mscoree/cordebug.c
++++ b/dlls/mscoree/cordebug.c
+@@ -70,6 +70,7 @@
+     ICorDebugAppDomain *appdomain;
+     struct list modules, assemblies;   /* the agent's, as handed out (wine-sg 8200) */
+     struct list evals;                 /* evaluations to run at the next Continue (wine-sg 8201) */
++    BOOL domain_reported;              /* CreateAppDomain given (wine-sg 8209) */
+     HANDLE eval_thread;
+ 
+     LONG ref;
+@@ -78,6 +79,7 @@
+ static void process_start_events(DebugProcess *This);
+ static void process_stop_events(DebugProcess *This);
+ static BOOL process_start_evals(DebugProcess *This);
++static void process_announce_loads(DebugProcess *This);
+ 
+ static inline CorDebug *impl_from_ICorDebug( ICorDebug *iface )
+ {
+@@ -180,7 +182,8 @@
+     EnterCriticalSection(&This->cs);
+     connector = This->connector;
+     LeaveCriticalSection(&This->cs);
+-    if (connector) WaitForSingleObject(connector, 30000);
++    /* (the connector itself asks the agent too, announcing the program's assemblies: wine-sg 8209) */
++    if (connector && GetThreadId(connector) != GetCurrentThreadId()) WaitForSingleObject(connector, 30000);
+     return sdb_alive(This->sdb) ? This->sdb : NULL;
+ }
+ 
+@@ -223,11 +226,17 @@
+     EnterCriticalSection(&This->cs);
+     This->sdb = sdb;
+     process_start_events(This);
+-    /* the agent holds the program until told to go (suspend=y): it goes unless the debugger stopped it meanwhile */
+-    if (sdb && !This->stop_count)
++    /* the agent holds the program until told to go (suspend=y): that hold counts as a stop while the
++     * program's assemblies and modules are announced (wine-sg 8209), so no Continue of theirs ends it */
++    if (sdb) This->stop_count++;
++    LeaveCriticalSection(&This->cs);
++    if (sdb) process_announce_loads(This);
++    EnterCriticalSection(&This->cs);
++    /* it goes unless the debugger stopped it meanwhile (or the announcements wait for their Continue) */
++    if (sdb && !--This->stop_count)
+         sdb_request(sdb, SDB_SET_VM, SDB_VM_RESUME, NULL, 0, NULL, NULL);
+     else if (sdb)
+-        TRACE("stopped before the agent came: it stays suspended\n");
++        TRACE("stopped meanwhile: it stays suspended\n");
+     LeaveCriticalSection(&This->cs);
+     if (!sdb) WARN("no debugger agent in process %lu\n", This->dwProcessID);
+     return 0;
+@@ -1093,6 +1102,7 @@
+     struct list entry;
+     UINT32 id;
+     WCHAR *location;
++    BOOL reported;        /* its LoadAssembly/LoadModule callbacks were given (wine-sg 8209) */
+ } DebugAssembly;
+ 
+ typedef struct DebugModule
+@@ -4065,11 +4075,9 @@
+ {
+     DebugAppDomain *This = impl_from_ICorDebugAppDomain(iface);
+     ULONG ref = InterlockedDecrement(&This->ref);
+-    if (!ref)
+-    {
+-        ICorDebugProcess_Release(&This->process->ICorDebugProcess_iface);
+-        free(This);
+-    }
++    /* (it holds no reference to the process: the process holds it -- process_appdomain; releasing one
++     * here dropped the process's last reference at Detach, wine-sg 8209) */
++    if (!ref) free(This);
+     return ref;
+ }
+ #define PROC(This) (&impl_from_ICorDebugAppDomain(This)->process->ICorDebugProcess_iface)
+@@ -4601,6 +4609,7 @@
+  * do not stop an evaluation. CreateValue makes values to pass as arguments.
+  */
+ #define SDB_VM_INVOKE_METHOD          7
++#define SDB_EVENT_KIND_ASSEMBLY_LOAD  8
+ #define SDB_APPDOMAIN_CREATE_STRING   5
+ #define SDB_TYPE_CREATE_INSTANCE      19
+ #define SDB_INVOKE_DISABLE_BREAKPOINTS 1
+@@ -5061,8 +5070,103 @@
+     BYTE *data;
+     UINT32 len;
+     DebugEval *eval;   /* (or an evaluation done, wine-sg 8201) */
++    BOOL load;         /* (or an announcement, wine-sg 8209: the domain if no assembly) */
++    UINT32 assembly;
+ };
+ 
++/* Stained Glass OS (wine-sg 8209): CreateAppDomain, and LoadAssembly + LoadModule for each assembly, as the
++ * .NET Framework gives them: each callback stops the process until the debugger continues (the count is
++ * taken when it is queued). The assemblies already loaded are announced when the agent is reached (at the
++ * start of a program the debugger launched, or at attach); later ones come from the agent's ASSEMBLY_LOAD
++ * events, the program held for each. */
++static BOOL queue_load(DebugProcess *This, UINT32 assembly)
++{
++    struct queued_event *ev;
++    DebugAssembly *as = NULL;
++
++    if (assembly)
++    {
++        if (!(as = process_assembly(This, assembly))) return FALSE;
++        EnterCriticalSection(&This->cs);
++        if (as->reported) as = (ICorDebugAssembly_Release(&as->ICorDebugAssembly_iface), NULL);
++        else as->reported = TRUE;
++        LeaveCriticalSection(&This->cs);
++        if (!as) return FALSE;
++        ICorDebugAssembly_Release(&as->ICorDebugAssembly_iface);
++    }
++    if (!(ev = calloc(1, sizeof(*ev)))) return FALSE;
++    ev->load = TRUE;
++    ev->assembly = assembly;
++    EnterCriticalSection(&This->cs);
++    This->stop_count += assembly ? 2 : 1;
++    list_add_tail(&This->events, &ev->entry);
++    LeaveCriticalSection(&This->cs);
++    SetEvent(This->event_ready);
++    return TRUE;
++}
++
++static void deliver_load(DebugProcess *This, UINT32 assembly)
++{
++    ICorDebugManagedCallback *callback = This->cordebug ? This->cordebug->pCallback : NULL;
++    ICorDebugAppDomain *domain = process_appdomain(This);
++    ICorDebugModuleEnum *modules;
++    ICorDebugModule *module = NULL;
++    DebugAssembly *as;
++    ULONG fetched;
++
++    if (!assembly)
++    {
++        TRACE("CreateAppDomain\n");
++        if (callback) ICorDebugManagedCallback_CreateAppDomain(callback, &This->ICorDebugProcess_iface, domain);
++    }
++    else if ((as = process_assembly(This, assembly)))
++    {
++        TRACE("LoadAssembly %s\n", debugstr_w(as->location));
++        if (callback) ICorDebugManagedCallback_LoadAssembly(callback, domain, &as->ICorDebugAssembly_iface);
++        if (SUCCEEDED(ICorDebugAssembly_EnumerateModules(&as->ICorDebugAssembly_iface, &modules)))
++        {
++            ICorDebugModuleEnum_Next(modules, 1, &module, &fetched);
++            ICorDebugModuleEnum_Release(modules);
++        }
++        if (callback && module) ICorDebugManagedCallback_LoadModule(callback, domain, module);
++        else if (!module) ICorDebugProcess_Continue(&This->ICorDebugProcess_iface, FALSE);   /* (its count) */
++        if (module) ICorDebugModule_Release(module);
++        ICorDebugAssembly_Release(&as->ICorDebugAssembly_iface);
++    }
++    if (domain) ICorDebugAppDomain_Release(domain);
++}
++
++static void process_announce_loads(DebugProcess *This)
++{
++    DebugAssembly **assemblies;
++    UINT32 count, i;
++    BYTE payload[3];
++
++#ifdef SG_MUTANT_CDB_NO_LOADS
++    return;
++#endif
++    EnterCriticalSection(&This->cs);
++    if (This->domain_reported) { LeaveCriticalSection(&This->cs); return; }
++    This->domain_reported = TRUE;
++    LeaveCriticalSection(&This->cs);
++    /* the domain first, then what is loaded already (the program held), then the agent's events for what
++     * comes later -- the agent replays the loaded ones then, already announced */
++    queue_load(This, 0);
++    if (SUCCEEDED(process_assemblies(This, &assemblies, &count)))
++    {
++        for (i = 0; i < count; i++)
++        {
++            queue_load(This, assemblies[i]->id);
++            ICorDebugAssembly_Release(&assemblies[i]->ICorDebugAssembly_iface);
++        }
++        free(assemblies);
++    }
++    payload[0] = SDB_EVENT_KIND_ASSEMBLY_LOAD;
++    payload[1] = SDB_SUSPEND_POLICY_ALL;
++    payload[2] = 0;
++    if (!event_request(This, payload, sizeof(payload))) WARN("no assembly load events from the agent\n");
++}
++
+ static void queue_eval_done(DebugProcess *This, DebugEval *eval)
+ {
+     struct queued_event *ev = calloc(1, sizeof(*ev));
+@@ -5188,6 +5292,42 @@
+             if (found_bp) ICorDebugFunctionBreakpoint_Release(&found_bp->ICorDebugFunctionBreakpoint_iface);
+             if (found_st) ICorDebugStepper_Release(&found_st->ICorDebugStepper_iface);
+         }
++        else if (kind == SDB_EVENT_KIND_ASSEMBLY_LOAD)
++        {
++            UINT32 assembly;
++            DebugAssembly *as;
++            BOOL fresh = FALSE;
++
++            if (end - p < 4) break;
++            assembly = sdb_get32(p);
++            p += 4;
++            if ((as = process_assembly(This, assembly)))
++            {
++                EnterCriticalSection(&This->cs);
++                if (!as->reported)
++                {
++                    as->reported = fresh = TRUE;
++                    if (policy == SDB_SUSPEND_POLICY_ALL) This->stop_count += 2;
++                }
++                LeaveCriticalSection(&This->cs);
++                ICorDebugAssembly_Release(&as->ICorDebugAssembly_iface);
++            }
++            if (!fresh)
++            {
++                /* announced already (or replayed by the agent): the program goes on */
++                if (policy == SDB_SUSPEND_POLICY_ALL && sdb) sdb_request(sdb, SDB_SET_VM, SDB_VM_RESUME, NULL, 0, NULL, NULL);
++            }
++            else if (policy == SDB_SUSPEND_POLICY_ALL) deliver_load(This, assembly);
++            else
++            {
++                /* (not held: the callbacks are given, and their Continues have nothing to resume) */
++                EnterCriticalSection(&This->cs);
++                This->stop_count += 2;
++                LeaveCriticalSection(&This->cs);
++                deliver_load(This, assembly);
++            }
++            policy = 0;
++        }
+         else break;   /* (no other kinds are asked for) */
+     }
+ }
+@@ -5217,6 +5357,7 @@
+                 deliver_eval(This, ev->eval);
+                 ICorDebugEval_Release(&ev->eval->ICorDebugEval_iface);
+             }
++            else if (ev->load) deliver_load(This, ev->assembly);
+             else deliver_event(This, ev->data, ev->len);
+             free(ev->data);
+             free(ev);
+@@ -5833,6 +5974,7 @@
+     *ppProcess = process;
+     if (This->pCallback)
+         ICorDebugManagedCallback_CreateProcess(This->pCallback, process);
++    process_announce_loads(impl);   /* (after CreateProcess, as the .NET Framework's attach events) */
+     return S_OK;
+ }
+ 

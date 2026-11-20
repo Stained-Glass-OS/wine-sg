@@ -46,6 +46,32 @@ static HRESULT __stdcall cb_breakpoint(Obj *o, Obj *domain, Obj *thread, Obj *bp
 }
 
 static HANDLE debuggee;
+/* the load callbacks (wine-sg 8209): each stops the process; a debugger continues it */
+static LONG domains_created, assemblies_loaded, modules_loaded, xml_loaded;
+static HRESULT __stdcall cb_createappdomain(Obj *o, Obj *proc, Obj *domain)
+{
+    InterlockedIncrement(&domains_created);
+    CALL(proc, 4, HRESULT, BOOL)(proc, FALSE);
+    return S_OK;
+}
+static HRESULT __stdcall cb_loadassembly(Obj *o, Obj *domain, Obj *assembly)
+{
+    InterlockedIncrement(&assemblies_loaded);
+    CALL(domain, 4, HRESULT, BOOL)(domain, FALSE);
+    return S_OK;
+}
+static HRESULT __stdcall cb_loadmodule(Obj *o, Obj *domain, Obj *module)
+{
+    WCHAR name[MAX_PATH];
+    ULONG32 len = 0;
+    InterlockedIncrement(&modules_loaded);
+    if (CALL(module, 6, HRESULT, ULONG32, ULONG32 *, WCHAR *)(module, MAX_PATH, &len, name) == S_OK && len > 14 &&
+        !_wcsicmp(name + wcslen(name) - 14, L"System.Xml.dll"))
+        InterlockedIncrement(&xml_loaded);
+    CALL(domain, 4, HRESULT, BOOL)(domain, FALSE);
+    return S_OK;
+}
+
 static int bail(void)
 {
     if (debuggee) TerminateProcess(debuggee, 1);   /* (it holds the gate's output pipe while it lives) */
@@ -211,6 +237,7 @@ int main(int argc, char **argv)
     for (i = 0; i < 32; i++) cb_vtbl[i] = cb_any;
     cb_vtbl[0] = cb_qi; cb_vtbl[1] = cb_ref; cb_vtbl[2] = cb_ref; cb_vtbl[3] = cb_breakpoint;
     cb_vtbl[7] = cb_evalcomplete; cb_vtbl[8] = cb_evalexception;
+    cb_vtbl[13] = cb_loadmodule; cb_vtbl[20] = cb_createappdomain; cb_vtbl[22] = cb_loadassembly;
 
     CoInitialize(NULL);
     {
@@ -457,6 +484,7 @@ int main(int argc, char **argv)
         if ((f = fopen(seenpath, "r"))) { fgets(seen, sizeof(seen), f); fclose(f); if (seen[0]) break; }
     }
     printf("Seen=%s\n", seen[0] ? seen : "nothing");
+    printf("Loads=%ld %d %d %ld\n", domains_created, assemblies_loaded >= 2, modules_loaded >= 2, xml_loaded);
     CALL(proc, 3, HRESULT, DWORD)(proc, 0);
     for (i = 0; i < 7; i++) REL(a[i]);
     REL(d); REL(il); REL(fr); REL(bp); REL(fn); REL(cNode); REL(cDerived); REL(cPoint);

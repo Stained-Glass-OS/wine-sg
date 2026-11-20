@@ -57,10 +57,14 @@ class App
     // the debugger stops here (a breakpoint at its start) and changes d.Id, nums[0] and round
     static void Hold(Derived d, int[] nums, string[] words, int[,] grid, Point pt, Color c, int round)
     {
+        if (round == 30)
+            LoadXml();   // an assembly loaded while the program runs: its LoadModule callback (8209)
         if (round == 1234)
             File.WriteAllText(seen, d.Id + " " + nums[0] + " " + round);
         Thread.Sleep(50);
     }
+
+    static void LoadXml() { GC.KeepAlive(new System.Xml.XmlDocument()); }
 
     // called by the debugger (ICorDebugEval)
     static int Twice(int x) { return x * 2; }

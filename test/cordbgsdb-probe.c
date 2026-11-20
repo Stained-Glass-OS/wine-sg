@@ -39,6 +39,31 @@ static HRESULT __stdcall cb_stepcomplete(Obj *o, Obj *domain, Obj *thread, Obj *
     InterlockedIncrement(&steps_done);
     return S_OK;
 }
+/* the load callbacks (wine-sg 8209): each stops the process; a debugger continues it */
+static LONG domains_created, assemblies_loaded, modules_loaded, xml_loaded;
+static HRESULT __stdcall cb_createappdomain(Obj *o, Obj *proc, Obj *domain)
+{
+    InterlockedIncrement(&domains_created);
+    CALL(proc, 4, HRESULT, BOOL)(proc, FALSE);
+    return S_OK;
+}
+static HRESULT __stdcall cb_loadassembly(Obj *o, Obj *domain, Obj *assembly)
+{
+    InterlockedIncrement(&assemblies_loaded);
+    CALL(domain, 4, HRESULT, BOOL)(domain, FALSE);
+    return S_OK;
+}
+static HRESULT __stdcall cb_loadmodule(Obj *o, Obj *domain, Obj *module)
+{
+    WCHAR name[MAX_PATH];
+    ULONG32 len = 0;
+    InterlockedIncrement(&modules_loaded);
+    if (CALL(module, 6, HRESULT, ULONG32, ULONG32 *, WCHAR *)(module, MAX_PATH, &len, name) == S_OK && len > 14 &&
+        !_wcsicmp(name + wcslen(name) - 14, L"System.Xml.dll"))
+        InterlockedIncrement(&xml_loaded);
+    CALL(domain, 4, HRESULT, BOOL)(domain, FALSE);
+    return S_OK;
+}
 static Obj *g_il, *g_thread, *g_callee;   /* App.Inspect's frame, thread, and the frame it called (App.Tick) */
 static unsigned int g_ip;
 
@@ -316,6 +341,7 @@ int main(int argc, char **argv)
     for (i = 0; i < 32; i++) cb_vtbl[i] = cb_any;
     cb_vtbl[0] = cb_qi; cb_vtbl[1] = cb_ref; cb_vtbl[2] = cb_ref; cb_vtbl[9] = cb_createprocess;
     cb_vtbl[3] = cb_breakpoint; cb_vtbl[4] = cb_stepcomplete;
+    cb_vtbl[13] = cb_loadmodule; cb_vtbl[20] = cb_createappdomain; cb_vtbl[22] = cb_loadassembly;
 
     CoInitialize(NULL);
     create = (PFN_CDI)GetProcAddress(LoadLibraryW(L"mscoree.dll"), "CreateDebuggingInterfaceFromVersion");
