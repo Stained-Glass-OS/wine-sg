@@ -71,7 +71,8 @@ typedef unsigned long long SQLULEN;
 static const WCHAR *const col_names[NCOLS] = { L"Id", L"Name", L"Age" };
 
 struct value { int is_null, is_num; int num; WCHAR str[64]; };
-struct row { struct value v[NCOLS]; };
+#define NVALS 12   /* a catalog row's distinct values (wine-sg 8224) */
+struct row { struct value v[NVALS]; };
 
 struct param { SQLSMALLINT io, ctype; void *ptr; SQLLEN buflen; SQLLEN *ind; };
 
@@ -84,7 +85,7 @@ struct stmt
     struct row rows[MAX_ROWS];
     int nrows, row, ncols;
     unsigned int got;           /* the columns of the current row SQLGetData has given, as bits */
-    struct result_col cols[NCOLS + 3];
+    struct result_col cols[24];
     int catalog;                /* a catalog function's result: every column a string */
     SQLLEN affected;
     WCHAR *prepared;
@@ -779,6 +780,96 @@ __declspec(dllexport) SQLRETURN WINAPI SQLPrimaryKeysW( SQLHANDLE h, SQLWCHAR *c
     lstrcpyW( st->rows[0].v[1].str, L"People" );
     lstrcpyW( st->rows[0].v[2].str, L"Id" );
     st->nrows = 1;
+    return SQL_SUCCESS;
+}
+
+/* (wine-sg 8224) a catalog row from (column -> value index) and the values: "" null, "#n" a number */
+static void catalog_result( struct stmt *st, const WCHAR *const *names, int ncols, const int *src )
+{
+    int c;
+    st->nrows = st->row = 0;
+    st->ncols = ncols;
+    st->catalog = 1;
+    for (c = 0; c < ncols; c++) { st->cols[c].name = names[c]; st->cols[c].src = src[c]; }
+}
+
+static void catalog_row( struct stmt *st, const WCHAR *const *values, int nvalues )
+{
+    struct row *row = &st->rows[st->nrows++];
+    int i;
+    memset( row, 0, sizeof(*row) );
+    for (i = 0; i < nvalues && i < NVALS; i++)
+    {
+        if (!values[i][0]) row->v[i].is_null = 1;
+        else if (values[i][0] == '#') { row->v[i].is_num = 1; row->v[i].num = _wtoi( values[i] + 1 ); }
+        else lstrcpyW( row->v[i].str, values[i] );
+    }
+}
+
+/* People.Id is referenced by Pets.OwnerId (FK_Pets_People): ODBC's SQLForeignKeys result */
+__declspec(dllexport) SQLRETURN WINAPI SQLForeignKeysW( SQLHANDLE h, SQLWCHAR *pc, SQLSMALLINT pcl, SQLWCHAR *ps,
+        SQLSMALLINT psl, SQLWCHAR *pt, SQLSMALLINT ptl, SQLWCHAR *fc, SQLSMALLINT fcl, SQLWCHAR *fs, SQLSMALLINT fsl,
+        SQLWCHAR *ft, SQLSMALLINT ftl )
+{
+    static const WCHAR *const names[] = { L"PKTABLE_CAT", L"PKTABLE_SCHEM", L"PKTABLE_NAME", L"PKCOLUMN_NAME",
+        L"FKTABLE_CAT", L"FKTABLE_SCHEM", L"FKTABLE_NAME", L"FKCOLUMN_NAME", L"KEY_SEQ", L"UPDATE_RULE",
+        L"DELETE_RULE", L"FK_NAME", L"PK_NAME", L"DEFERRABILITY" };
+    static const int src[] = { 0, 0, 1, 2, 0, 0, 3, 4, 5, 6, 7, 8, 9, 10 };
+    static const WCHAR *const values[] = { L"", L"People", L"Id", L"Pets", L"OwnerId", L"#1", L"#0", L"#3",
+        L"FK_Pets_People", L"PK_People", L"#7" };
+    struct stmt *st = h;
+
+    if (!connected) { set_diag( L"08003" ); return SQL_ERROR; }
+    log_line( L"FOREIGNKEYS" );
+    catalog_result( st, names, 14, src );
+    if (pt && wcsnicmp( pt, L"People", 6 )) return SQL_SUCCESS;
+    if (ft && wcsnicmp( ft, L"Pets", 4 )) return SQL_SUCCESS;
+    catalog_row( st, values, ARRAYSIZE(values) );
+    return SQL_SUCCESS;
+}
+
+/* People's statistics row and its primary-key index on Id: ODBC's SQLStatistics result */
+__declspec(dllexport) SQLRETURN WINAPI SQLStatisticsW( SQLHANDLE h, SQLWCHAR *cat, SQLSMALLINT cl, SQLWCHAR *sch,
+        SQLSMALLINT sl, SQLWCHAR *tab, SQLSMALLINT tl, SQLUSMALLINT unique, SQLUSMALLINT reserved )
+{
+    static const WCHAR *const names[] = { L"TABLE_CAT", L"TABLE_SCHEM", L"TABLE_NAME", L"NON_UNIQUE",
+        L"INDEX_QUALIFIER", L"INDEX_NAME", L"TYPE", L"ORDINAL_POSITION", L"COLUMN_NAME", L"ASC_OR_DESC",
+        L"CARDINALITY", L"PAGES", L"FILTER_CONDITION" };
+    static const int src[] = { 0, 0, 1, 2, 0, 3, 4, 5, 6, 7, 8, 0, 0 };
+    static const WCHAR *const stat[] = { L"", L"People", L"", L"", L"#0", L"", L"", L"", L"#2" };
+    static const WCHAR *const index[] = { L"", L"People", L"#0", L"PK_People", L"#3", L"#1", L"Id", L"A", L"#2" };
+    struct stmt *st = h;
+
+    if (!connected) { set_diag( L"08003" ); return SQL_ERROR; }
+    log_line( L"STATISTICS" );
+    catalog_result( st, names, 13, src );
+    if (!tab || wcsnicmp( tab, L"People", 6 )) return SQL_SUCCESS;
+    catalog_row( st, stat, ARRAYSIZE(stat) );
+    catalog_row( st, index, ARRAYSIZE(index) );
+    return SQL_SUCCESS;
+}
+
+/* two types, INTEGER and NVARCHAR: ODBC's SQLGetTypeInfo result */
+__declspec(dllexport) SQLRETURN WINAPI SQLGetTypeInfoW( SQLHANDLE h, SQLSMALLINT type )
+{
+    static const WCHAR *const names[] = { L"TYPE_NAME", L"DATA_TYPE", L"COLUMN_SIZE", L"LITERAL_PREFIX",
+        L"LITERAL_SUFFIX", L"CREATE_PARAMS", L"NULLABLE", L"CASE_SENSITIVE", L"SEARCHABLE", L"UNSIGNED_ATTRIBUTE",
+        L"FIXED_PREC_SCALE", L"AUTO_UNIQUE_VALUE", L"LOCAL_TYPE_NAME", L"MINIMUM_SCALE", L"MAXIMUM_SCALE",
+        L"SQL_DATA_TYPE", L"SQL_DATETIME_SUB", L"NUM_PREC_RADIX", L"INTERVAL_PRECISION" };
+    /* values: 0 null, 1 name, 2 type, 3 size, 4 prefix, 5 suffix, 6 nullable, 7 case, 8 searchable,
+     * 9 unsigned, 10 fixed, 11 radix */
+    static const int src[] = { 1, 2, 3, 4, 5, 0, 6, 7, 8, 9, 10, 0, 1, 0, 0, 2, 0, 11, 0 };
+    static const WCHAR *const integer[] = { L"", L"INTEGER", L"#4", L"#10", L"", L"", L"#1", L"#0", L"#2",
+        L"#0", L"#1", L"#10" };
+    static const WCHAR *const nvarchar[] = { L"", L"NVARCHAR", L"#-9", L"#4000", L"N'", L"'", L"#1", L"#1",
+        L"#3", L"", L"#0", L"" };
+    struct stmt *st = h;
+
+    if (!connected) { set_diag( L"08003" ); return SQL_ERROR; }
+    log_line( L"TYPEINFO" );
+    catalog_result( st, names, 19, src );
+    if (type == 0 || type == 4) catalog_row( st, integer, ARRAYSIZE(integer) );
+    if (type == 0 || type == -9) catalog_row( st, nvarchar, ARRAYSIZE(nvarchar) );
     return SQL_SUCCESS;
 }
 
