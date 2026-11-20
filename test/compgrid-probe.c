@@ -1,7 +1,7 @@
 /* compgrid-probe (wine-sg 8215): ICompositor2's DropShadow (with ISpriteVisual2.Shadow), CompositionNineGridBrush
  * (drawn: corners and edges of its source, a hollow centre left out) and CompositionBackdropBrush (what is
  * behind shows), and (8216) CompositionAnimationGroup with StartAnimationGroup and groups as implicit
- * animations. They were E_NOTIMPL. Built from test/compmask-probe.c; interface identity per windows-rs 0.30
+ * animations, and (8218) LayerVisual (Effect and Shadow kept, children drawn). They were E_NOTIMPL. Built from test/compmask-probe.c; interface identity per windows-rs 0.30
  * (MIT OR Apache-2.0). Prints name=value lines.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #define COBJMACROS
@@ -44,6 +44,8 @@ DEFINE_GUID(probe_IID_ICompositionObject2, 0xef874ea1, 0x5cff, 0x4b68, 0x9e, 0x3
 DEFINE_GUID(probe_IID_IKeyFrameAnimation, 0x126e7f22, 0x3ae9, 0x4540, 0x9a, 0x8a, 0xde, 0xae, 0x8a, 0x4a, 0x4a, 0x84);
 DEFINE_GUID(probe_IID_IIterable_CompositionAnimation, 0x0cb59942, 0xc6f3, 0x585f, 0x9a, 0x92, 0xb4, 0x7e, 0x8d, 0xd3, 0x8e, 0xbf);
 DEFINE_GUID(probe_IID_IMap_HSTRING_ICompositionAnimationBase, 0x4ba9aa1d, 0x57ac, 0x54de, 0xa8, 0x07, 0xb5, 0x2e, 0x68, 0x9b, 0xfc, 0x04);
+DEFINE_GUID(probe_IID_ILayerVisual, 0xaf843985, 0x0444, 0x4887, 0x8e, 0x83, 0xb4, 0x0b, 0x25, 0x3f, 0x82, 0x2c);
+DEFINE_GUID(probe_IID_ILayerVisual2, 0x98f9aeeb, 0x6f23, 0x49f1, 0x90, 0xb1, 0x1f, 0x59, 0xa1, 0x4f, 0xbc, 0xe3);
 DEFINE_GUID(probe_IID_ICompositionCapabilitiesStatics, 0xf7b7a86e, 0x6416, 0x49e5, 0x8d, 0xdf, 0xaf, 0xe9, 0x49, 0xe2, 0x05, 0x62);
 
 #define COMPOSITOR_CREATE_COLOR_BRUSH_WITH_COLOR 8
@@ -55,6 +57,7 @@ DEFINE_GUID(probe_IID_ICompositionCapabilitiesStatics, 0xf7b7a86e, 0x6416, 0x49e
 #define COMPOSITOR_CREATE_SCALAR_KEYFRAME        20
 #define COMPOSITOR2_CREATE_DROP_SHADOW           10
 #define COMPOSITOR2_CREATE_NINE_GRID_BRUSH       14
+#define COMPOSITOR2_CREATE_LAYER_VISUAL          12
 #define MASK_GET_MASK 6
 #define MASK_PUT_MASK 7
 #define MASK_GET_SOURCE 8
@@ -240,6 +243,7 @@ int main( void )
     WNDCLASSW wc = { 0, wndproc, 0, 0, NULL, NULL, NULL, NULL, NULL, L"compgrid" };
     struct ui_color red = { 255, 255, 0, 0 }, white = { 255, 255, 255, 255 }, blue = { 255, 0, 0, 255 }, got_color = { 0 };
     void *compositor, *compositor2, *desktop, *target = NULL, *ctarget, *root = NULL, *container, *children = NULL;
+    void *layer = NULL, *lv = NULL, *layer_children = NULL;
     void *shadow = NULL, *ds, *grid = NULL, *ng, *backdrop = NULL, *bd, *sprite = NULL, *sprite2, *got = NULL, *gshadow;
     IInspectable *inspectable = NULL;
     ID3D11Device *d3d;
@@ -249,7 +253,7 @@ int main( void )
     HWND hwnd;
     HDC dc;
     HRESULT hr;
-    COLORREF a, b, c, d;
+    COLORREF a, b, c, d, e;
 
     RoInitialize( RO_INIT_SINGLETHREADED );
     WindowsCreateString( name, (UINT32)wcslen( name ), &hs );
@@ -312,6 +316,26 @@ int main( void )
     printf( "backdrop_brush=%d (%#lx)\n", SUCCEEDED(hr) && bd, hr );
     printf( "backdrop_class=%d\n", is_class( bd, L"Windows.UI.Composition.CompositionBackdropBrush" ) );
 
+    /* LayerVisual (8218) */
+    hr = SLOT( compositor2, COMPOSITOR2_CREATE_LAYER_VISUAL, get_fn )( compositor2, &layer );
+    lv = qi( layer, &probe_IID_ILayerVisual );
+    printf( "layer=%d (%#lx)\n", SUCCEEDED(hr) && lv, hr );
+    printf( "layer_class=%d\n", is_class( lv, L"Windows.UI.Composition.LayerVisual" ) );
+    printf( "layer_container=%d\n", qi( lv, &probe_IID_IContainerVisual ) != NULL );
+    if (lv)
+    {
+        void *lv2 = qi( lv, &probe_IID_ILayerVisual2 ), *effect = color_brush( compositor, red );
+        got = NULL;
+        SLOT( lv, 7, put_fn )( lv, effect );
+        SLOT( lv, 6, get_fn )( lv, &got );
+        printf( "layer_effect=%d\n", got != NULL );
+        got = NULL;
+        if (lv2 && ds) SLOT( lv2, 7, put_fn )( lv2, qi( ds, &probe_IID_ICompositionShadow ) );
+        if (lv2) SLOT( lv2, 6, get_fn )( lv2, &got );
+        printf( "layer_shadow=%d\n", got != NULL );
+        SLOT( lv, 7, put_fn )( lv, NULL );
+    }
+
     animation_group( compositor, compositor2 );
 
     if (FAILED( hr = D3D11CreateDevice( NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -326,7 +350,7 @@ int main( void )
     /* white everywhere; the nine-grid over the left square, the backdrop brush over a blue right square */
     wc.hInstance = GetModuleHandleW( NULL );
     RegisterClassW( &wc );
-    hwnd = CreateWindowExW( 0, L"compgrid", L"compgrid", WS_POPUP | WS_VISIBLE, 50, 50, 200, 100, NULL, NULL, NULL, NULL );
+    hwnd = CreateWindowExW( 0, L"compgrid", L"compgrid", WS_POPUP | WS_VISIBLE, 50, 50, 200, 150, NULL, NULL, NULL, NULL );
     pump( 300 );
     SLOT( desktop, DESKTOP_INTEROP_CREATE_TARGET, HRESULT (WINAPI *)( void *, HWND, BOOL, void ** ) )( desktop, hwnd, FALSE, &target );
     ctarget = qi( target, &probe_IID_ICompositionTarget );
@@ -337,6 +361,15 @@ int main( void )
     SLOT( children, COLLECTION_INSERT_AT_TOP, put_fn )( children, make_sprite( compositor, color_brush( compositor, blue ), 100, 0, 100, 100 ) );
     SLOT( children, COLLECTION_INSERT_AT_TOP, put_fn )( children, make_sprite( compositor, qi( ng, &probe_IID_ICompositionBrush ), 0, 0, 100, 100 ) );
     SLOT( children, COLLECTION_INSERT_AT_TOP, put_fn )( children, make_sprite( compositor, qi( bd, &probe_IID_ICompositionBrush ), 100, 0, 100, 100 ) );
+    if (lv)
+    {
+        void *lc = qi( lv, &probe_IID_IContainerVisual ), *lvis = qi( lv, &probe_IID_IVisual );
+        SLOT( lvis, VISUAL_PUT_OFFSET, HRESULT (WINAPI *)( void *, struct vector3 ) )( lvis, (struct vector3){ 0, 100, 0 } );
+        SLOT( lvis, VISUAL_PUT_SIZE, HRESULT (WINAPI *)( void *, struct vector2 ) )( lvis, (struct vector2){ 200, 50 } );
+        SLOT( lc, CONTAINER_GET_CHILDREN, get_fn )( lc, &layer_children );
+        SLOT( layer_children, COLLECTION_INSERT_AT_TOP, put_fn )( layer_children, make_sprite( compositor, color_brush( compositor, red ), 0, 0, 200, 50 ) );
+        SLOT( children, COLLECTION_INSERT_AT_TOP, put_fn )( children, lvis );
+    }
     SLOT( ctarget, TARGET_PUT_ROOT, put_fn )( ctarget, qi( root, &probe_IID_IVisual ) );
     pump( 1500 );
     dc = GetDC( hwnd );
@@ -344,10 +377,12 @@ int main( void )
     b = GetPixel( dc, 50, 4 );
     c = GetPixel( dc, 50, 50 );
     d = GetPixel( dc, 150, 50 );
+    e = GetPixel( dc, 100, 125 );
     ReleaseDC( hwnd, dc );
     printf( "nine_grid_edge=%d (%06lx %06lx)\n", close_to( a, 255, 0, 0 ) && close_to( b, 255, 0, 0 ), a, b );
     printf( "nine_grid_hollow=%d (%06lx)\n", close_to( c, 255, 255, 255 ), c );
     printf( "backdrop_shows_behind=%d (%06lx)\n", close_to( d, 0, 0, 255 ), d );
+    printf( "layer_children_drawn=%d (%06lx)\n", close_to( e, 255, 0, 0 ), e );
     DestroyWindow( hwnd );
     printf( "done=1\n" );
     return 0;

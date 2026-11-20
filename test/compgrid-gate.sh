@@ -2,12 +2,13 @@
 . "$(dirname "$0")/scratch-home.sh"
 # ICompositor2::CreateDropShadow (and ISpriteVisual2.Shadow), CreateNineGridBrush
 # (drawn), CreateBackdropBrush (patches/sg/8215) and CreateAnimationGroup with
-# StartAnimationGroup and implicit groups (8216): test/compgrid-probe.c under
-# Xvfb. They were E_NOTIMPL.
+# StartAnimationGroup and implicit groups (8216), CreateLayerVisual (8218):
+# test/compgrid-probe.c under Xvfb. They were E_NOTIMPL.
 #
 #   WINE=/opt/wine-sg/bin/wine test/compgrid-gate.sh
 # Mutants: SG_MUTANT_NO_COMPOSITOR2_OBJECTS (dcomp/composition.c),
-# SG_MUTANT_NO_ANIMATION_GROUP (dcomp/composition.c and animation.c).
+# SG_MUTANT_NO_ANIMATION_GROUP (dcomp/composition.c and animation.c),
+# SG_MUTANT_NO_LAYER_VISUAL (dcomp/composition.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -60,6 +61,11 @@ check 'nine_grid_class=1'      "its runtime class is Windows.UI.Composition.Comp
 check 'nine_grid_props=1'      "its insets, hollow centre and source are kept"
 check 'backdrop_brush=1'       "ICompositor2::CreateBackdropBrush makes a CompositionBackdropBrush"
 check 'backdrop_class=1'       "its runtime class is Windows.UI.Composition.CompositionBackdropBrush"
+check 'layer=1'                "ICompositor2::CreateLayerVisual makes a LayerVisual (8218)"
+check 'layer_class=1'          "its runtime class is Windows.UI.Composition.LayerVisual"
+check 'layer_container=1'      "it is a container visual"
+check 'layer_effect=1'         "its Effect is kept"
+check 'layer_shadow=1'         "its Shadow is kept (ILayerVisual2)"
 check 'group=1'                "ICompositor2::CreateAnimationGroup makes a CompositionAnimationGroup"
 check 'group_class=1'          "its runtime class is Windows.UI.Composition.CompositionAnimationGroup"
 check 'group_items=1'          "Add, Remove, Count and iteration"
@@ -72,6 +78,7 @@ else
     check 'nine_grid_edge=1'       "a nine-grid brush draws its source's edges"
     check 'nine_grid_hollow=1'     "and leaves a hollow centre out"
     check 'backdrop_shows_behind=1' "a backdrop brush shows what is behind it"
+    check 'layer_children_drawn=1' "a layer visual's children are drawn"
 fi
 check 'done=1'                 "the probe ran to the end"
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
