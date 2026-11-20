@@ -849,6 +849,57 @@ __declspec(dllexport) SQLRETURN WINAPI SQLStatisticsW( SQLHANDLE h, SQLWCHAR *ca
     return SQL_SUCCESS;
 }
 
+/* (wine-sg 8230) the table People and the view PeopleView: ODBC's SQLTables result, by table type */
+__declspec(dllexport) SQLRETURN WINAPI SQLTablesW( SQLHANDLE h, SQLWCHAR *cat, SQLSMALLINT cl, SQLWCHAR *sch,
+        SQLSMALLINT sl, SQLWCHAR *tab, SQLSMALLINT tl, SQLWCHAR *type, SQLSMALLINT tyl )
+{
+    static const WCHAR *const names[] = { L"TABLE_CAT", L"TABLE_SCHEM", L"TABLE_NAME", L"TABLE_TYPE", L"REMARKS" };
+    static const int src[] = { 0, 0, 1, 2, 3 };
+    static const WCHAR *const table[] = { L"", L"People", L"TABLE", L"" };
+    static const WCHAR *const view[] = { L"", L"PeopleView", L"VIEW", L"adults only" };
+    struct stmt *st = h;
+
+    if (!connected) { set_diag( L"08003" ); return SQL_ERROR; }
+    log_line( L"TABLES" );
+    catalog_result( st, names, 5, src );
+    if ((!type || wcsstr( type, L"TABLE" )) && (!tab || !wcsicmp( tab, L"People" ))) catalog_row( st, table, ARRAYSIZE(table) );
+    if ((!type || wcsstr( type, L"VIEW" )) && (!tab || !wcsicmp( tab, L"PeopleView" ))) catalog_row( st, view, ARRAYSIZE(view) );
+    return SQL_SUCCESS;
+}
+
+/* (wine-sg 8230) GetPets' return value, @OwnerId (input), @Name (input/output, with a default) and a
+ * result-set column: ODBC's SQLProcedureColumns result */
+__declspec(dllexport) SQLRETURN WINAPI SQLProcedureColumnsW( SQLHANDLE h, SQLWCHAR *cat, SQLSMALLINT cl,
+        SQLWCHAR *sch, SQLSMALLINT sl, SQLWCHAR *proc, SQLSMALLINT pl, SQLWCHAR *col, SQLSMALLINT col_len )
+{
+    static const WCHAR *const names[] = { L"PROCEDURE_CAT", L"PROCEDURE_SCHEM", L"PROCEDURE_NAME", L"COLUMN_NAME",
+        L"COLUMN_TYPE", L"DATA_TYPE", L"TYPE_NAME", L"COLUMN_SIZE", L"BUFFER_LENGTH", L"DECIMAL_DIGITS",
+        L"NUM_PREC_RADIX", L"NULLABLE", L"REMARKS", L"COLUMN_DEF", L"SQL_DATA_TYPE", L"SQL_DATETIME_SUB",
+        L"CHAR_OCTET_LENGTH", L"ORDINAL_POSITION", L"IS_NULLABLE" };
+    /* values: 0 null, 1 procedure, 2 name, 3 column type, 4 data type, 5 type name, 6 size, 7 digits,
+     * 8 nullable, 9 default, 10 octets, 11 ordinal */
+    static const int src[] = { 0, 0, 1, 2, 3, 4, 5, 6, 0, 7, 0, 8, 0, 9, 0, 0, 10, 11, 0 };
+    static const WCHAR *const ret[] = { L"", L"GetPets", L"@RETURN_VALUE", L"#5", L"#4", L"INTEGER", L"#10", L"#0",
+        L"#0", L"", L"", L"#0" };
+    static const WCHAR *const owner[] = { L"", L"GetPets", L"@OwnerId", L"#1", L"#4", L"INTEGER", L"#10", L"#0",
+        L"#0", L"", L"", L"#1" };
+    static const WCHAR *const name[] = { L"", L"GetPets", L"@Name", L"#2", L"#-9", L"NVARCHAR", L"#50", L"",
+        L"#1", L"N'x'", L"#100", L"#2" };
+    static const WCHAR *const result[] = { L"", L"GetPets", L"PetName", L"#3", L"#-9", L"NVARCHAR", L"#50", L"",
+        L"#1", L"", L"#100", L"#1" };
+    struct stmt *st = h;
+
+    if (!connected) { set_diag( L"08003" ); return SQL_ERROR; }
+    log_line( L"PROCEDURECOLUMNS" );
+    catalog_result( st, names, 19, src );
+    if (proc && wcsicmp( proc, L"GetPets" )) return SQL_SUCCESS;
+    if (!col || !wcsicmp( col, ret[2] )) catalog_row( st, ret, ARRAYSIZE(ret) );
+    if (!col || !wcsicmp( col, owner[2] )) catalog_row( st, owner, ARRAYSIZE(owner) );
+    if (!col || !wcsicmp( col, name[2] )) catalog_row( st, name, ARRAYSIZE(name) );
+    if (!col || !wcsicmp( col, result[2] )) catalog_row( st, result, ARRAYSIZE(result) );
+    return SQL_SUCCESS;
+}
+
 /* two types, INTEGER and NVARCHAR: ODBC's SQLGetTypeInfo result */
 __declspec(dllexport) SQLRETURN WINAPI SQLGetTypeInfoW( SQLHANDLE h, SQLSMALLINT type )
 {

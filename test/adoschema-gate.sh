@@ -4,9 +4,11 @@
 # rows left out) and DBSCHEMA_PROVIDER_TYPES through ODBC's SQLForeignKeys,
 # SQLStatistics and SQLGetTypeInfo (patches/sg/8224), 64-bit, over
 # test/adomock-driver.c: test/adoschema-probe.c. They were E_INVALIDARG.
+# (8230) DBSCHEMA_VIEWS and DBSCHEMA_PROCEDURE_PARAMETERS through SQLTables
+# (table type VIEW) and SQLProcedureColumns (result-set columns left out).
 #
 #   WINE=/opt/wine-sg/bin/wine test/adoschema-gate.sh
-# Mutant: SG_MUTANT_NO_MORE_SCHEMAS (msdasql/session.c).
+# Mutants: SG_MUTANT_NO_MORE_SCHEMAS, SG_MUTANT_NO_VIEW_PARAM_SCHEMAS (msdasql/session.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -51,6 +53,15 @@ for b in p64; do
               index_name_restriction=80040e53 provider_types=00000000 pt_rows=2 pt0.TYPE_NAME=INTEGER pt0.DATA_TYPE=3 \
               pt0.SEARCHABLE=3 pt0.IS_NULLABLE=-1 pt0.IS_LONG=0 pt1.TYPE_NAME=NVARCHAR pt1.DATA_TYPE=130 \
               pt1.LITERAL_PREFIX=N\' pt1.CASE_SENSITIVE=-1 pt1.SEARCHABLE=4; do
+        printf '%s\n' "$out" | grep -qxF "$kv" && pass "$b: $kv" || fail "$b: $kv (got: $(printf '%s\n' "$out" | grep "^${kv%%=*}=" || echo none))"
+    done
+    for kv in schemas_listed2=11 views=00000000 vw_rows=1 vw0.TABLE_NAME=PeopleView "vw0.DESCRIPTION=adults only" \
+              vw0.VIEW_DEFINITION=NULL procedure_parameters=00000000 pp_rows=3 pp0.PROCEDURE_NAME=GetPets \
+              pp0.PARAMETER_NAME=@RETURN_VALUE pp0.ORDINAL_POSITION=0 pp0.PARAMETER_TYPE=4 \
+              pp1.PARAMETER_NAME=@OwnerId pp1.ORDINAL_POSITION=1 pp1.PARAMETER_TYPE=1 pp1.PARAMETER_HASDEFAULT=0 \
+              pp1.IS_NULLABLE=0 pp1.DATA_TYPE=3 pp1.NUMERIC_PRECISION=10 pp1.CHARACTER_MAXIMUM_LENGTH=NULL \
+              pp2.PARAMETER_NAME=@Name pp2.PARAMETER_TYPE=2 pp2.PARAMETER_HASDEFAULT=-1 "pp2.PARAMETER_DEFAULT=N'x'" \
+              pp2.IS_NULLABLE=-1 pp2.DATA_TYPE=130 pp2.CHARACTER_MAXIMUM_LENGTH=50 pp2.TYPE_NAME=NVARCHAR; do
         printf '%s\n' "$out" | grep -qxF "$kv" && pass "$b: $kv" || fail "$b: $kv (got: $(printf '%s\n' "$out" | grep "^${kv%%=*}=" || echo none))"
     done
 done
