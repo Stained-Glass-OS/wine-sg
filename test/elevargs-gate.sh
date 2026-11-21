@@ -13,7 +13,7 @@
 # the elevated side records the arguments part of its own command line. test/elevargs-probe.c.
 #   WINE=/opt/wine-sg/bin/wine test/elevargs-gate.sh
 # Mutants: SG_MUTANT_RUNAS_REQUOTES (dlls/shell32/shlexec.c), SG_MUTANT_NO_RAW_ARGS
-# (dlls/ntdll/unix/env.c, programs/start/start.c).
+# (dlls/ntdll/unix/env.c, programs/start/start.c), SG_MUTANT_RAW_ARGS_LITERAL_AFTER_PROGRAM (programs/start/start.c).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 WINE=${WINE:-/opt/wine-sg/bin/wine}
@@ -52,6 +52,18 @@ printf '%s\n' "\$*" >> "$W/out/argv.log"
 "$WINE" "\$@" >/dev/null 2>&1
 EOS
 chmod 755 "$W/elevate"
+# ...and as it runs a console program: start /exec wineconsole PROGRAM ARGS (wineconsole needs a display:
+# a private Xvfb for that case)
+cat > "$W/elevate-con" <<EOS
+#!/bin/sh
+ready=""
+while :; do case "\$1" in --ready) ready=\$2; shift 2 ;; --code) shift 2 ;; *) break ;; esac; done
+[ "\$1" = --wine ] && shift
+printf '%s\n' "\$*" >> "$W/out/argv.log"
+[ -n "\$ready" ] && printf 0 > "\$ready"
+"$WINE" start.exe /exec wineconsole "\$@" >/dev/null 2>&1
+EOS
+chmod 755 "$W/elevate-con"
 mkdir -m 777 "$W/out"
 printf 'ready\n' > "$W/features"
 
@@ -71,7 +83,7 @@ chmod 644 "$W/relay.cmd"
 runas() {   # FILE CASE: prints the elevated side's record of its arguments
     sudo -n rm -f "$REC"
     sudo -n -u "$SG_OTHER" env WINEPREFIX="$PFX" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" \
-        HOME=/var/tmp SG_ELEVATE="$W/elevate" SG_ELEVATE_FEATURES="$W/features" \
+        HOME=/var/tmp SG_ELEVATE="${ELEV:-$W/elevate}" SG_ELEVATE_FEATURES="$W/features" ${DISPLAY:+DISPLAY="$DISPLAY"} \
         timeout -s KILL 180 "$WINE" "$(zp "$W/probe.exe")" runas "$1" "$2" >/dev/null 2>&1
     sudo -n cat "$REC" 2>/dev/null | tr -d '\r'
 }
@@ -95,5 +107,13 @@ grep -q 'sg-raw-args:show advpack' "$W/out/argv.log" && ! grep -q 'sg-raw-args:s
     && pass "the raw form only where writing the arguments again would change them" \
     || fail "raw form use: $(cat "$W/out/argv.log")"
 check "$(zp "$W/relay.cmd")" 0 "a .cmd (the loader starts it through start.exe /exec): its %* as written"
+if command -v Xvfb >/dev/null; then
+    Xvfb -displayfd 3 -ac -screen 0 800x600x24 -nolisten tcp 3>"$W/display" >/dev/null 2>&1 & XP=$!
+    i=0; while [ ! -s "$W/display" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    DISPLAY=":$(cat "$W/display")" ELEV=$W/elevate-con check "$P" 0 "a console program (start /exec wineconsole PROGRAM, Bitvise's uninstaller): its arguments as written"
+    kill "$XP" 2>/dev/null
+else
+    echo "SKIP the console program case: no Xvfb"
+fi
 [ "$fails" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$fails"
