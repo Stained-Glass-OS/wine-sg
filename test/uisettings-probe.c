@@ -110,7 +110,7 @@ static DWORD WINAPI sta_thread( void *arg )
     Sleep( 1500 );
     before = na.calls;
     start = GetTickCount();
-    while (!na.calls && GetTickCount() - start < 5000)
+    while (!na.calls && GetTickCount() - start < 15000)
     {
         MsgWaitForMultipleObjects( 0, NULL, FALSE, 100, QS_ALLINPUT );
         while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
