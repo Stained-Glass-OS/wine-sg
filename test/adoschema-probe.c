@@ -1,7 +1,9 @@
 /* adoschema-probe: MSDASQL's IDBSchemaRowset gives the foreign keys, indexes and provider types of an ODBC
  * data source (wine-sg 8224; test/adoschema-gate.sh) through SQLForeignKeys, SQLStatistics and SQLGetTypeInfo
  * of the gate's mock driver, and (8230) its views and procedure parameters through SQLTables and
- * SQLProcedureColumns. They were E_INVALIDARG (unknown schema). Prints the rows as name=value lines.
+ * SQLProcedureColumns, and (8232) statistics and table and column privileges through SQLStatistics,
+ * SQLTablePrivileges and SQLColumnPrivileges. They were E_INVALIDARG (unknown schema). Prints the rows as
+ * name=value lines.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #define COBJMACROS
 #define DBINITCONSTANTS
@@ -12,6 +14,9 @@
 #include <stddef.h>
 
 static const GUID DBSCHEMA_PROCEDURE_PARAMETERS_ = {0xc8b522b8,0x5cf3,0x11ce,{0xad,0xe5,0x00,0xaa,0x00,0x44,0x77,0x3d}};
+static const GUID DBSCHEMA_STATISTICS_ = {0xc8b52227,0x5cf3,0x11ce,{0xad,0xe5,0x00,0xaa,0x00,0x44,0x77,0x3d}};
+static const GUID DBSCHEMA_TABLE_PRIVILEGES_ = {0xc8b52222,0x5cf3,0x11ce,{0xad,0xe5,0x00,0xaa,0x00,0x44,0x77,0x3d}};
+static const GUID DBSCHEMA_COLUMN_PRIVILEGES_ = {0xc8b52221,0x5cf3,0x11ce,{0xad,0xe5,0x00,0xaa,0x00,0x44,0x77,0x3d}};
 static const CLSID CLSID_MSDASQL_ = {0xc8b522cb,0x5cf3,0x11ce,{0xad,0xe5,0x00,0xaa,0x00,0x44,0x77,0x3d}};
 
 struct cellbuf { DBSTATUS status; DBLENGTH len; union { WCHAR text[128]; LONG num; } u; };
@@ -94,7 +99,11 @@ int main( void )
     static const WCHAR *const param_cols[] = { L"PROCEDURE_NAME", L"PARAMETER_NAME", L"ORDINAL_POSITION",
         L"PARAMETER_TYPE", L"PARAMETER_HASDEFAULT", L"PARAMETER_DEFAULT", L"IS_NULLABLE", L"DATA_TYPE",
         L"CHARACTER_MAXIMUM_LENGTH", L"NUMERIC_PRECISION", L"TYPE_NAME" };
-    int fk = 0, idx = 0, types = 0, views = 0, params = 0;
+    static const WCHAR *const stat_cols[] = { L"TABLE_NAME", L"CARDINALITY" };
+    static const WCHAR *const tpriv_cols[] = { L"GRANTOR", L"GRANTEE", L"TABLE_NAME", L"PRIVILEGE_TYPE", L"IS_GRANTABLE" };
+    static const WCHAR *const cpriv_cols[] = { L"GRANTOR", L"GRANTEE", L"TABLE_NAME", L"COLUMN_NAME", L"PRIVILEGE_TYPE",
+        L"IS_GRANTABLE" };
+    int fk = 0, idx = 0, types = 0, views = 0, params = 0, stats = 0, privs = 0;
     HRESULT hr;
 
     CoInitialize( NULL );
@@ -125,9 +134,13 @@ int main( void )
         if (IsEqualGUID( &guids[i], &DBSCHEMA_PROVIDER_TYPES )) types = 1;
         if (IsEqualGUID( &guids[i], &DBSCHEMA_VIEWS )) views = 1;
         if (IsEqualGUID( &guids[i], &DBSCHEMA_PROCEDURE_PARAMETERS_ )) params = 1;
+        if (IsEqualGUID( &guids[i], &DBSCHEMA_STATISTICS_ )) stats = 1;
+        if (IsEqualGUID( &guids[i], &DBSCHEMA_TABLE_PRIVILEGES_ )) privs++;
+        if (IsEqualGUID( &guids[i], &DBSCHEMA_COLUMN_PRIVILEGES_ )) privs++;
     }
     printf( "schemas_listed=%d%d%d\n", fk, idx, types );
     printf( "schemas_listed2=%d%d\n", views, params );
+    printf( "schemas_listed3=%d%d\n", stats, privs );
 
     for (i = 0; i < 5; i++) VariantInit( &restr[i] );
     V_VT(&restr[2]) = VT_BSTR; V_BSTR(&restr[2]) = SysAllocString( L"People" );   /* PK_TABLE_NAME */
@@ -165,6 +178,26 @@ int main( void )
     hr = IDBSchemaRowset_GetRowset( schema, NULL, &DBSCHEMA_PROCEDURE_PARAMETERS_, 3, restr, &IID_IRowset, 0, NULL, (IUnknown **)&rowset );
     printf( "procedure_parameters=%08lx\n", hr );
     if (rowset) dump( rowset, "pp", param_cols, ARRAYSIZE(param_cols) );
+
+    for (i = 0; i < 5; i++) VariantClear( &restr[i] );
+    V_VT(&restr[2]) = VT_BSTR; V_BSTR(&restr[2]) = SysAllocString( L"People" );   /* TABLE_NAME */
+    rowset = NULL;
+    hr = IDBSchemaRowset_GetRowset( schema, NULL, &DBSCHEMA_STATISTICS_, 3, restr, &IID_IRowset, 0, NULL, (IUnknown **)&rowset );
+    printf( "statistics=%08lx\n", hr );
+    if (rowset) dump( rowset, "st", stat_cols, ARRAYSIZE(stat_cols) );
+    rowset = NULL;
+    hr = IDBSchemaRowset_GetRowset( schema, NULL, &DBSCHEMA_TABLE_PRIVILEGES_, 3, restr, &IID_IRowset, 0, NULL, (IUnknown **)&rowset );
+    printf( "table_privileges=%08lx\n", hr );
+    if (rowset) dump( rowset, "tp", tpriv_cols, ARRAYSIZE(tpriv_cols) );
+    rowset = NULL;
+    hr = IDBSchemaRowset_GetRowset( schema, NULL, &DBSCHEMA_COLUMN_PRIVILEGES_, 3, restr, &IID_IRowset, 0, NULL, (IUnknown **)&rowset );
+    printf( "column_privileges=%08lx\n", hr );
+    if (rowset) dump( rowset, "cp", cpriv_cols, ARRAYSIZE(cpriv_cols) );
+    /* a grantor restriction is not supported (ODBC has none) */
+    V_VT(&restr[3]) = VT_BSTR; V_BSTR(&restr[3]) = SysAllocString( L"dbo" );
+    rowset = NULL;
+    hr = IDBSchemaRowset_GetRowset( schema, NULL, &DBSCHEMA_TABLE_PRIVILEGES_, 4, restr, &IID_IRowset, 0, NULL, (IUnknown **)&rowset );
+    printf( "grantor_restriction=%08lx\n", hr );
     printf( "DONE\n" );
     return 0;
 }

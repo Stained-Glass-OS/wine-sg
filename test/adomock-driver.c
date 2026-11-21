@@ -900,6 +900,44 @@ __declspec(dllexport) SQLRETURN WINAPI SQLProcedureColumnsW( SQLHANDLE h, SQLWCH
     return SQL_SUCCESS;
 }
 
+/* (wine-sg 8232) dbo's SELECT (grantable) and UPDATE on People: ODBC's SQLTablePrivileges result */
+__declspec(dllexport) SQLRETURN WINAPI SQLTablePrivilegesW( SQLHANDLE h, SQLWCHAR *cat, SQLSMALLINT cl, SQLWCHAR *sch,
+        SQLSMALLINT sl, SQLWCHAR *tab, SQLSMALLINT tl )
+{
+    static const WCHAR *const names[] = { L"TABLE_CAT", L"TABLE_SCHEM", L"TABLE_NAME", L"GRANTOR", L"GRANTEE",
+        L"PRIVILEGE", L"IS_GRANTABLE" };
+    static const int src[] = { 0, 0, 1, 2, 3, 4, 5 };
+    static const WCHAR *const sel[] = { L"", L"People", L"dbo", L"ann", L"SELECT", L"YES" };
+    static const WCHAR *const upd[] = { L"", L"People", L"dbo", L"bob", L"UPDATE", L"NO" };
+    struct stmt *st = h;
+
+    if (!connected) { set_diag( L"08003" ); return SQL_ERROR; }
+    log_line( L"TABLEPRIVILEGES" );
+    catalog_result( st, names, 7, src );
+    if (tab && wcsicmp( tab, L"People" )) return SQL_SUCCESS;
+    catalog_row( st, sel, ARRAYSIZE(sel) );
+    catalog_row( st, upd, ARRAYSIZE(upd) );
+    return SQL_SUCCESS;
+}
+
+/* (wine-sg 8232) bob's UPDATE of People.Name, grantability unknown: ODBC's SQLColumnPrivileges result */
+__declspec(dllexport) SQLRETURN WINAPI SQLColumnPrivilegesW( SQLHANDLE h, SQLWCHAR *cat, SQLSMALLINT cl,
+        SQLWCHAR *sch, SQLSMALLINT sl, SQLWCHAR *tab, SQLSMALLINT tl, SQLWCHAR *col, SQLSMALLINT col_len )
+{
+    static const WCHAR *const names[] = { L"TABLE_CAT", L"TABLE_SCHEM", L"TABLE_NAME", L"COLUMN_NAME", L"GRANTOR",
+        L"GRANTEE", L"PRIVILEGE", L"IS_GRANTABLE" };
+    static const int src[] = { 0, 0, 1, 2, 3, 4, 5, 6 };
+    static const WCHAR *const name[] = { L"", L"People", L"Name", L"dbo", L"bob", L"UPDATE", L"" };
+    struct stmt *st = h;
+
+    if (!connected) { set_diag( L"08003" ); return SQL_ERROR; }
+    log_line( L"COLUMNPRIVILEGES" );
+    catalog_result( st, names, 8, src );
+    if (!tab || wcsicmp( tab, L"People" )) return SQL_SUCCESS;
+    if (!col || !wcsicmp( col, L"Name" )) catalog_row( st, name, ARRAYSIZE(name) );
+    return SQL_SUCCESS;
+}
+
 /* two types, INTEGER and NVARCHAR: ODBC's SQLGetTypeInfo result */
 __declspec(dllexport) SQLRETURN WINAPI SQLGetTypeInfoW( SQLHANDLE h, SQLSMALLINT type )
 {

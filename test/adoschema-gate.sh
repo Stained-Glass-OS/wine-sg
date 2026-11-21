@@ -6,9 +6,12 @@
 # test/adomock-driver.c: test/adoschema-probe.c. They were E_INVALIDARG.
 # (8230) DBSCHEMA_VIEWS and DBSCHEMA_PROCEDURE_PARAMETERS through SQLTables
 # (table type VIEW) and SQLProcedureColumns (result-set columns left out).
+# (8232) DBSCHEMA_STATISTICS, DBSCHEMA_TABLE_PRIVILEGES and DBSCHEMA_COLUMN_PRIVILEGES through
+# SQLStatistics (its table statistics row), SQLTablePrivileges and SQLColumnPrivileges.
 #
 #   WINE=/opt/wine-sg/bin/wine test/adoschema-gate.sh
-# Mutants: SG_MUTANT_NO_MORE_SCHEMAS, SG_MUTANT_NO_VIEW_PARAM_SCHEMAS (msdasql/session.c).
+# Mutants: SG_MUTANT_NO_MORE_SCHEMAS, SG_MUTANT_NO_VIEW_PARAM_SCHEMAS, SG_MUTANT_NO_STAT_PRIV_SCHEMAS
+# (msdasql/session.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -61,7 +64,12 @@ for b in p64; do
               pp1.PARAMETER_NAME=@OwnerId pp1.ORDINAL_POSITION=1 pp1.PARAMETER_TYPE=1 pp1.PARAMETER_HASDEFAULT=0 \
               pp1.IS_NULLABLE=0 pp1.DATA_TYPE=3 pp1.NUMERIC_PRECISION=10 pp1.CHARACTER_MAXIMUM_LENGTH=NULL \
               pp2.PARAMETER_NAME=@Name pp2.PARAMETER_TYPE=2 pp2.PARAMETER_HASDEFAULT=-1 "pp2.PARAMETER_DEFAULT=N'x'" \
-              pp2.IS_NULLABLE=-1 pp2.DATA_TYPE=130 pp2.CHARACTER_MAXIMUM_LENGTH=50 pp2.TYPE_NAME=NVARCHAR; do
+              pp2.IS_NULLABLE=-1 pp2.DATA_TYPE=130 pp2.CHARACTER_MAXIMUM_LENGTH=50 pp2.TYPE_NAME=NVARCHAR \
+              schemas_listed3=12 statistics=00000000 st_rows=1 st0.TABLE_NAME=People st0.CARDINALITY=2 \
+              table_privileges=00000000 tp_rows=2 tp0.GRANTOR=dbo tp0.GRANTEE=ann tp0.PRIVILEGE_TYPE=SELECT \
+              tp0.IS_GRANTABLE=-1 tp1.GRANTEE=bob tp1.PRIVILEGE_TYPE=UPDATE tp1.IS_GRANTABLE=0 \
+              column_privileges=00000000 cp_rows=1 cp0.COLUMN_NAME=Name cp0.GRANTEE=bob cp0.PRIVILEGE_TYPE=UPDATE \
+              cp0.IS_GRANTABLE=NULL grantor_restriction=80040e53; do
         printf '%s\n' "$out" | grep -qxF "$kv" && pass "$b: $kv" || fail "$b: $kv (got: $(printf '%s\n' "$out" | grep "^${kv%%=*}=" || echo none))"
     done
 done
