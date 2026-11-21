@@ -8,7 +8,10 @@
 # and ended on "class not available". The probe checks the IUISettings values
 # against the Win32 settings they mirror, TextScaleFactor, AdvancedEffects-
 # Enabled and AutoHideScrollBars, and that each Changed event is raised when
-# its setting changes (and not once its handler is removed).
+# its setting changes (and not once its handler is removed).  8290: a handler that
+# is not agile, registered in a single-threaded apartment, is called on that thread
+# (Firefox asserted its main thread and crashed; mutant SG_MUTANT_UISETTINGS_ANY_THREAD,
+# dlls/windows.ui/uisettings.c).
 #
 #   WINE=/opt/wine-sg/bin/wine test/uisettings-gate.sh
 set -u
@@ -48,6 +51,7 @@ chk effectsevent "1 0" "AdvancedEffectsEnabledChanged raised when transparency i
 chk autohide "00000000 1" "AutoHideScrollBars on by default"
 chk autohideevent "1 1 0" "AutoHideScrollBarsChanged raised with its event args"
 chk settings6 "00000000 00000000" "IUISettings6 events register and unregister"
+chk colorsta "0 1 1" "8290: in a single-threaded apartment a handler that is not agile runs on its own thread, when it pumps"
 chk corewindow "00000000 00000000 1" "CoreWindow.GetForCurrentThread(): the statics exist, null for a desktop thread"
 
 echo

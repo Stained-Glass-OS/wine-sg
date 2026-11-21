@@ -54,6 +54,23 @@ static HRESULT WINAPI h_invoke( struct handler *h, void *sender, void *args )
 }
 static void *h_vtbl[] = { h_qi, h_addref, h_release, h_invoke };
 
+/* 8290: a handler that is not agile (no IAgileObject, like a WRL callback) and the thread it ran on */
+static const GUID IID_IAgileObject_ = { 0x94ea2b94, 0xe9cc, 0x49e0, { 0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90 } };
+static DWORD invoked_on;
+static HRESULT WINAPI na_qi( struct handler *h, REFIID iid, void **out )
+{
+    if (!memcmp( iid, &IID_IAgileObject_, sizeof(GUID) )) { *out = NULL; return E_NOINTERFACE; }
+    *out = h; InterlockedIncrement( &h->ref ); return S_OK;
+}
+static HRESULT WINAPI na_invoke( struct handler *h, void *sender, void *args )
+{
+    invoked_on = GetCurrentThreadId();
+    InterlockedIncrement( &h->calls );
+    SetEvent( h->event );
+    return S_OK;
+}
+static void *na_vtbl[] = { na_qi, h_addref, h_release, na_invoke };
+
 static void handler_init( struct handler *h )
 {
     memset( h, 0, sizeof(*h) );
@@ -70,6 +87,38 @@ static void set_dword( const WCHAR *key, const WCHAR *name, DWORD value )
 static const WCHAR *accessibility = L"Software\\Microsoft\\Accessibility";
 static const WCHAR *personalize = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 static const WCHAR *cpl_access = L"Control Panel\\Accessibility";
+
+static DWORD WINAPI sta_thread( void *arg )
+{
+    void *factory = NULL, *obj = NULL, *s3 = NULL, *hstr;
+    struct handler na;
+    INT64 token;
+    DWORD start, before;
+    MSG msg;
+
+    pRoInitialize( 0 );   /* RO_INIT_SINGLETHREADED */
+    pWindowsCreateString( L"Windows.UI.ViewManagement.UISettings", 36, &hstr );
+    pRoGetActivationFactory( hstr, &IID_IActivationFactory_, &factory );
+    CALL( factory, 6, &obj );
+    CALL( obj, 0, &IID_IUISettings_[2], &s3 );
+    handler_init( &na );
+    na.vtbl = na_vtbl;
+    invoked_on = 0;
+    CALL( s3, 7, &na, &token );
+    set_dword( personalize, L"AppsUseLightTheme", 0 );
+    /* not pumping: the call waits for this thread */
+    Sleep( 1500 );
+    before = na.calls;
+    start = GetTickCount();
+    while (!na.calls && GetTickCount() - start < 5000)
+    {
+        MsgWaitForMultipleObjects( 0, NULL, FALSE, 100, QS_ALLINPUT );
+        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
+    }
+    printf( "colorsta=%ld %ld %d\n", before, na.calls, invoked_on == GetCurrentThreadId() );
+    CALL( s3, 8, token );
+    return 0;
+}
 
 int main(void)
 {
@@ -190,5 +239,11 @@ int main(void)
     set_dword( personalize, L"AppsUseLightTheme", 1 );
     set_dword( personalize, L"EnableTransparency", 1 );
     set_dword( cpl_access, L"DynamicScrollbars", 1 );
+    /* 8290: a handler that is not agile runs on the single-threaded apartment that registered it */
+    {
+        HANDLE thread = CreateThread( NULL, 0, sta_thread, NULL, 0, NULL );
+        WaitForSingleObject( thread, 20000 );
+        CloseHandle( thread );
+    }
     return 0;
 }
