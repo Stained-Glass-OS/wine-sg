@@ -427,6 +427,20 @@ static void test_binding(void)
     CHECK(bsc.stopped && bsc.stop_hr == S_OK, "pull stopped=%d hr=%08lx", bsc.stopped, bsc.stop_hr);
     CHECK(bsc.got_stream && bsc.data_len == 10 && !memcmp(bsc.data, "0123456789", 10),
           "pull data len %lu", bsc.data_len);
+
+    /* the ANSI form (wine-sg 8280; mutant SG_MUTANT_NO_PULL_STREAM_A, dlls/urlmon/umstream.c) */
+    {
+        char urlA[INTERNET_MAX_URL_LENGTH];
+        WideCharToMultiByte(CP_ACP, 0, url, -1, urlA, sizeof(urlA), NULL, NULL);
+        init_bsc(&bsc, 0);
+        bsc.bindf = BINDF_ASYNCHRONOUS | BINDF_PULLDATA;
+        hr = URLOpenPullStreamA(NULL, urlA, 0, &bsc.iface);
+        CHECK(SUCCEEDED(hr), "URLOpenPullStreamA %08lx", hr);
+        for (i = 0; i < 100 && !bsc.stopped; i++) pump(100);
+        CHECK(bsc.got_stream && bsc.data_len == 10 && !memcmp(bsc.data, "0123456789", 10),
+              "pull (A) data len %lu", bsc.data_len);
+        CHECK(URLOpenPullStreamA(NULL, NULL, 0, &bsc.iface) == E_INVALIDARG, "URLOpenPullStreamA(NULL url)");
+    }
 }
 
 /* ---------------------------------------------------------------- protocol seek / abort */

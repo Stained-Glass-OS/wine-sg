@@ -2,6 +2,7 @@
 . "$(dirname "$0")/scratch-home.sh"
 # urlmon batch 2: seek, storage binding, status forwarding, URL moniker, features, zones.
 #
+# 8280: also URLOpenPullStreamA (mutant SG_MUTANT_NO_PULL_STREAM_A, dlls/urlmon/umstream.c).
 #   WINE=/opt/wine-sg/bin/wine test/fasturlmon-b2-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
 set -u
