@@ -62,6 +62,31 @@ int main( void )
     pp = desc.CollectionDesc[0].PreparsedData;
     printf( "      input report %u bytes\n", desc.CollectionDesc[0].InputLength );
 
+    {
+        /* the fields of a variable item with two usages take them in the order they were listed (X the first
+         * byte: "the parser assigns usages in the order in which they are specified", Value Capability Arrays,
+         * Microsoft Learn); the value caps -- and their data indices -- come last usage first (Y 8, X 9), as
+         * Windows gives them (Wine's dinput/tests/hid.c expect_value_caps, run on Windows: Y index 0, X 1) */
+        NTSTATUS (WINAPI *pGetValue)(HIDP_REPORT_TYPE, USAGE, USHORT, USAGE, ULONG *, PHIDP_PREPARSED_DATA, char *, ULONG) =
+            (void *)GetProcAddress( hid, "HidP_GetUsageValue" );
+        NTSTATUS (WINAPI *pGetSpecificValueCaps)(HIDP_REPORT_TYPE, USAGE, USHORT, USAGE, HIDP_VALUE_CAPS *, USHORT *, PHIDP_PREPARSED_DATA) =
+            (void *)GetProcAddress( hid, "HidP_GetSpecificValueCaps" );
+        HIDP_VALUE_CAPS caps;
+        USHORT n = 1;
+        ULONG vx = 0, vy = 0;
+        int ix = -1, iy = -1;
+
+        memset( report, 0, sizeof(report) );
+        report[2] = 0x11; report[3] = 0x22;
+        pGetValue( HidP_Input, 1, 0, 0x30, &vx, pp, report, desc.CollectionDesc[0].InputLength );
+        pGetValue( HidP_Input, 1, 0, 0x31, &vy, pp, report, desc.CollectionDesc[0].InputLength );
+        n = 1; if (pGetSpecificValueCaps( HidP_Input, 1, 0, 0x30, &caps, &n, pp ) == HIDP_STATUS_SUCCESS) ix = caps.NotRange.DataIndex;
+        n = 1; if (pGetSpecificValueCaps( HidP_Input, 1, 0, 0x31, &caps, &n, pp ) == HIDP_STATUS_SUCCESS) iy = caps.NotRange.DataIndex;
+        printf( "      X %#lx (index %d), Y %#lx (index %d)\n", vx, ix, vy, iy );
+        check( vx == 0x11 && vy == 0x22, "X is the item's first field, Y the second", vx );
+        check( iy == 8 && ix == 9, "data indices as Windows gives them: Y 8, X 9", ix );
+    }
+
     /* data indices: buttons 0-7, X 8, Y 9 (the order of the main items) */
     memset( report, 0, sizeof(report) );
     data[0].DataIndex = 2; data[0].On = TRUE;          /* button 3 */
