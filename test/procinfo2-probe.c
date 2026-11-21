@@ -68,6 +68,28 @@ int main(int argc, char **argv)
     CHECK(st == LENGTH_MISMATCH, "io priority short st %#lx", st);
     st = pQuery(GetCurrentProcess(), ProcessIoPriority, &prio, 8, &len);
     CHECK(st == LENGTH_MISMATCH, "io priority long st %#lx", st);
+    /* 8288: NtSetInformationProcess ProcessIoPriority keeps very low/low/normal and reads them back */
+    {
+        LONG (WINAPI *pSet)(HANDLE, ULONG, void *, ULONG) = (void *)GetProcAddress(ntdll, "NtSetInformationProcess");
+        ULONG v = 0;
+
+        st = pSet(GetCurrentProcess(), ProcessIoPriority, &v, sizeof(v));
+        prio = 0xdead;
+        pQuery(GetCurrentProcess(), ProcessIoPriority, &prio, sizeof(prio), &len);
+        CHECK(!st && prio == 0, "set io priority very low: st %#lx, reads back %lu", st, prio);
+        v = 3;
+        st = pSet(GetCurrentProcess(), ProcessIoPriority, &v, sizeof(v));
+        CHECK(st == (LONG)0xC0000061, "set io priority high without the privilege: st %#lx", st);
+        v = 7;
+        st = pSet(GetCurrentProcess(), ProcessIoPriority, &v, sizeof(v));
+        CHECK(st == (LONG)0xC000000D, "set io priority 7: st %#lx", st);
+        st = pSet(GetCurrentProcess(), ProcessIoPriority, &v, 2);
+        CHECK(st == LENGTH_MISMATCH, "set io priority short: st %#lx", st);
+        v = 2;
+        st = pSet(GetCurrentProcess(), ProcessIoPriority, &v, sizeof(v));
+        pQuery(GetCurrentProcess(), ProcessIoPriority, &prio, sizeof(prio), &len);
+        CHECK(!st && prio == 2, "set io priority normal: st %#lx, reads back %lu", st, prio);
+    }
     prot = 0x55;
     st = pQuery(GetCurrentProcess(), ProcessProtectionInformation, &prot, 1, &len);
     CHECK(!st && prot == 0 && len == 1, "protection st %#lx prot %u len %lu", st, prot, len);

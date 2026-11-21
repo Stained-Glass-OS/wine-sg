@@ -7,7 +7,8 @@
 #
 #   WINE=/opt/wine-sg/bin/wine test/procinfo2-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
-# Mutants: SG_MUTANT_IOPRIO, SG_MUTANT_CMDLINE_OWN (ntdll/unix/process.c).
+# 8288: NtSetInformationProcess ProcessIoPriority keeps 0-2 and reads them back.
+# Mutants: SG_MUTANT_IOPRIO, SG_MUTANT_CMDLINE_OWN, SG_MUTANT_NO_SET_IOPRIO (ntdll/unix/process.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
