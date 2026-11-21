@@ -10,7 +10,8 @@
 # 6253: IsMemberOf gets the file's FILE_ATTRIBUTE_* flags (as documented), not SFGAO flags
 # (mutant SG_MUTANT_OVERLAY_SFGAO, shfldr_fs.c). 6254: the overlay is drawn, in details and large icons.
 # 6255: at the icon's size and over its bottom-left (test/overlayid-mkico.py: a red quarter in every frame).
-# test/overlayid-dll.c (the handlers), test/overlayid-probe.c.
+# 8286: SHGetFileInfoW SHGFI_OVERLAYINDEX gives the overlay index in iIcon's top byte (mutant
+# SG_MUTANT_NO_OVERLAY_INDEX, shell32_main.c).  test/overlayid-dll.c (the handlers), test/overlayid-probe.c.
 # Mutants (dlls/shell32): SG_MUTANT_NO_OVERLAY_HANDLERS, SG_MUTANT_FAILED_SLOT (iconcache.c),
 # SG_MUTANT_OVERLAY_ON_CALLER (iconcache.c), SG_MUTANT_NO_FOLDER_OVERLAY (shfldr_fs.c),
 # SG_MUTANT_VIEW_NO_OVERLAYS, SG_MUTANT_VIEW_OVERLAY_SYNC (shlview.c);

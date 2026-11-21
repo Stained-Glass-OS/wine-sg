@@ -7,6 +7,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <stdio.h>
 
 static const GUID IID_Overlay = { 0x7d688a70, 0xc613, 0x11d0, { 0x99, 0x9b, 0x00, 0xc0, 0x4f, 0xd6, 0x55, 0xe1 } };
@@ -222,6 +223,20 @@ int main(void)
     icon = -7;
     hr = ((ov_fn)SLOT(ov, 4))(ov, a, &icon);
     CHECK(hr == S_OK && icon == image, "GetOverlayIconIndex: %#lx %d (%d)", hr, icon, image);
+
+    /* 8286: SHGetFileInfoW SHGFI_OVERLAYINDEX puts the item's overlay index in iIcon's top eight bits */
+    {
+        SHFILEINFOW with, without, none;
+
+        SHGetFileInfoW(L"C:\\ovtest\\x.ova", 0, &with, sizeof(with), SHGFI_ICON | SHGFI_OVERLAYINDEX);
+        SHGetFileInfoW(L"C:\\ovtest\\x.ova", 0, &without, sizeof(without), SHGFI_ICON);
+        CHECK((with.iIcon >> 24) == 1, "SHGFI_OVERLAYINDEX: the overlay index in the top byte: %#x", with.iIcon);
+        CHECK((with.iIcon & 0xffffff) == without.iIcon, "  and the icon index below it: %#x %#x", with.iIcon, without.iIcon);
+        CHECK(!(without.iIcon >> 24), "  not without the flag: %#x", without.iIcon);
+        SHGetFileInfoW(L"C:\\ovtest\\z.txt", 0, &none, sizeof(none), SHGFI_ICON | SHGFI_OVERLAYINDEX);
+        CHECK(!(none.iIcon >> 24), "  an item with no overlay: %#x", none.iIcon);
+        DestroyIcon(with.hIcon); DestroyIcon(without.hIcon); DestroyIcon(none.hIcon);
+    }
 
     /* the file view */
     {
