@@ -77,7 +77,13 @@ int main(void)
     CHECK(r == PDH_MORE_DATA && size > 2, "expand size r=%lx", r);
     size = sizeof(buf);
     r = PdhExpandWildCardPathA(NULL, "\\Processor(*)\\*", buf, &size, 0);
-    CHECK(r == 0 && !strcmp(buf, "\\Processor(_Total)\\% Processor Time") && buf[strlen(buf) + 1] == 0, "expand r=%lx %s", r, buf);
+    /* (8236) the processors' instances and counters too, _Total first */
+    CHECK(r == 0 && !strcmp(buf, "\\Processor(_Total)\\% Processor Time"), "expand r=%lx %s", r, buf);
+    {
+        const char *p; int found = 0;
+        for (p = buf; *p; p += strlen(p) + 1) if (!strcmp(p, "\\Processor(0)\\% Processor Time")) found = 1;
+        CHECK(found, "expand: processor 0");
+    }
     size = sizeof(buf);
     CHECK(PdhExpandWildCardPathA(NULL, "\\NoSuchObject(*)\\*", buf, &size, 0) == PDH_CSTATUS_NO_OBJECT, "no object");
     size = sizeof(buf);
