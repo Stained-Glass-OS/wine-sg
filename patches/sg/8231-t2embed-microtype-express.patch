@@ -1,0 +1,1108 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] t2embed: MicroType Express compressed EOT fonts
+
+TTLoadEmbeddedFont of an EOT whose font data is MicroType Express compressed (TTEMBED_TTCOMPRESSED, most IE-era web fonts) was E_ERRORDECOMPRESSINGFONTDATA. New mtx.c, written from the W3C Member Submission MicroType Express (MTX) Font Format: the three LZCOMP blocks (adaptive Huffman symbols, copy items over a preloaded history, optional run-length layer) and the Compact Table Format back to TrueType: glyf (triplet-coded points, computed bounding boxes, composite glyphs) with the glyph programs rebuilt from the push data and instruction blocks, loca rebuilt, cvt, hdmx and VDMX from their predictions and magnitude-coded surprises, table checksums and the head checksum adjustment. XOR encryption is undone first. Every read is bounds-checked; corrupt data gives E_ERRORDECOMPRESSINGFONTDATA.
+---
+--- a/dlls/t2embed/Makefile.in
++++ b/dlls/t2embed/Makefile.in
+@@ -5,4 +5,5 @@
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
+-	main.c
++	main.c \
++	mtx.c
+--- a/dlls/t2embed/main.c
++++ b/dlls/t2embed/main.c
+@@ -28,6 +28,8 @@
+ #include "t2embapi.h"
+ #include "wine/debug.h"
+ 
++#include "t2embed_private.h"
++
+ WINE_DEFAULT_DEBUG_CHANNEL(t2embed);
+ 
+ /* Stained Glass OS: fonts embedded in documents, in the Embedded OpenType
+@@ -358,14 +360,41 @@
+     }
+     eot->fstype = *(USHORT *)(eot->header + 32);
+     eot->font = eot->header + eot->size - eot->font_size;
++    if (eot->flags & TTEMBED_XORENCRYPTDATA)
++        for (i = 0; i < eot->font_size; i++) eot->font[i] ^= 0x50;
+     if (eot->flags & TTEMBED_TTCOMPRESSED)
+     {
++#ifndef SG_MUTANT_NO_MTX
++        /* (wine-sg 8231) MicroType Express: the font data (decrypted first: XOR applies to the compressed
++         * data) decompressed into a TrueType font, which then replaces it after the header */
++        ULONG prefix = eot->size - eot->font_size, ttf_size;
++        BYTE *ttf, *header;
++
++        if (!mtx_decompress( eot->font, eot->font_size, &ttf, &ttf_size ))
++        {
++            free( eot->header );
++            return E_ERRORDECOMPRESSINGFONTDATA;
++        }
++        if (!(header = malloc( prefix + ttf_size )))
++        {
++            free( ttf );
++            free( eot->header );
++            return E_NOFREEMEMORY;
++        }
++        memcpy( header, eot->header, prefix );
++        memcpy( header + prefix, ttf, ttf_size );
++        free( ttf );
++        free( eot->header );
++        eot->header = header;
++        eot->size = prefix + ttf_size;
++        eot->font = header + prefix;
++        eot->font_size = ttf_size;
++#else
+         FIXME( "MicroType Express compressed font data\n" );
+         free( eot->header );
+         return E_ERRORDECOMPRESSINGFONTDATA;
++#endif
+     }
+-    if (eot->flags & TTEMBED_XORENCRYPTDATA)
+-        for (i = 0; i < eot->font_size; i++) eot->font[i] ^= 0x50;
+     return E_NONE;
+ }
+ 
+--- /dev/null
++++ b/dlls/t2embed/mtx.c
+@@ -0,0 +1,969 @@
++/*
++ * MicroType Express (MTX) decompression for Embedded OpenType fonts
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Written from the W3C Member Submission "MicroType Express (MTX) Font Format" (2008): the three
++ * LZCOMP-compressed blocks of an MTX font, their adaptive Huffman coding, and the Compact Table
++ * Format (CTF) of the glyf, loca, cvt, hdmx and VDMX tables are turned back into a TrueType font.
++ * The input is untrusted (web fonts): every read is bounds-checked. */
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "wine/debug.h"
++
++#include "t2embed_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(t2embed);
++
++/* ---------------------------------------------------------------------------------------------- */
++/* bit input: most significant bit first (LZCOMP) */
++
++struct bits
++{
++    const BYTE *data;
++    size_t size, pos;
++    unsigned int bit;   /* 8: next byte */
++    BOOL eof;
++};
++
++static int read_bit( struct bits *b )
++{
++    int ret;
++    if (b->bit == 8)
++    {
++        if (b->pos >= b->size) { b->eof = TRUE; return 0; }
++        b->pos++;
++        b->bit = 0;
++    }
++    ret = (b->data[b->pos - 1] >> (7 - b->bit)) & 1;
++    b->bit++;
++    return ret;
++}
++
++static unsigned int read_bits( struct bits *b, int count )
++{
++    unsigned int v = 0;
++    while (count--) v = (v << 1) | read_bit( b );
++    return v;
++}
++
++/* ---------------------------------------------------------------------------------------------- */
++/* adaptive Huffman coding of symbols 0 .. range-1 (the spec's AHUFF): nodes 1 (the root) .. 2*range-1,
++ * kept in decreasing weight order; the leaves start as the range .. 2*range-1 nodes of a balanced tree */
++
++struct ahuff_node
++{
++    int up, left, right;
++    int code;   /* the symbol, -1 for an inner node */
++    unsigned int weight;
++};
++
++struct ahuff
++{
++    struct ahuff_node *node;
++    int *leaf;      /* the node of each symbol */
++    int range;
++};
++
++static void ahuff_swap( struct ahuff *h, int a, int b )
++{
++    struct ahuff_node t = h->node[a];
++    int up_a = h->node[a].up, up_b = h->node[b].up;
++
++    h->node[a] = h->node[b];
++    h->node[b] = t;
++    h->node[a].up = up_a;
++    h->node[b].up = up_b;
++    if (h->node[a].code < 0) h->node[h->node[a].left].up = h->node[h->node[a].right].up = a;
++    else h->leaf[h->node[a].code] = a;
++    if (h->node[b].code < 0) h->node[h->node[b].left].up = h->node[h->node[b].right].up = b;
++    else h->leaf[h->node[b].code] = b;
++}
++
++/* a symbol was seen: its weight and its ancestors' go up by one, a node first moving to the front of the
++ * nodes with its weight so that the order stays decreasing */
++static void ahuff_update( struct ahuff *h, int a )
++{
++    while (a != 1)
++    {
++        unsigned int w = h->node[a].weight;
++        int b = a - 1;
++
++        if (h->node[b].weight == w)
++        {
++            while (h->node[b - 1].weight == w && b - 1 >= 1) b--;
++            if (b > 1)
++            {
++                ahuff_swap( h, a, b );
++                a = b;
++            }
++        }
++        h->node[a].weight = w + 1;
++        a = h->node[a].up;
++    }
++    h->node[1].weight++;
++}
++
++static unsigned int ahuff_sum( struct ahuff *h, int a )
++{
++    if (h->node[a].code < 0)
++        h->node[a].weight = ahuff_sum( h, h->node[a].left ) + ahuff_sum( h, h->node[a].right );
++    return h->node[a].weight;
++}
++
++static BOOL ahuff_init( struct ahuff *h, int range )
++{
++    int i, j;
++
++    h->range = range;
++    if (!(h->node = calloc( 2 * range, sizeof(*h->node) ))) return FALSE;
++    if (!(h->leaf = calloc( range, sizeof(*h->leaf) ))) return FALSE;
++    for (i = 2; i < 2 * range; i++)
++    {
++        h->node[i].up = i / 2;
++        h->node[i].weight = 1;
++    }
++    for (i = 1; i < range; i++)
++    {
++        h->node[i].left = 2 * i;
++        h->node[i].right = 2 * i + 1;
++    }
++    for (i = 0; i < range; i++)
++    {
++        h->node[i].code = -1;
++        h->node[range + i].code = i;
++        h->node[range + i].left = h->node[range + i].right = -1;
++        h->leaf[i] = range + i;
++    }
++    /* node 0 is no node: a weight no node has, so that the search in ahuff_update stops at the root */
++    h->node[0].weight = ~0u;
++    ahuff_sum( h, 1 );
++    if (range > 256 && range < 512)
++    {
++        /* the symbol coder of a copy stream: the first copy codes, DUP2 and DUP4 start more likely */
++        ahuff_update( h, h->leaf[256] );
++        ahuff_update( h, h->leaf[257] );
++        for (i = 0; i < 12; i++) ahuff_update( h, h->leaf[range - 3] );
++        for (i = 0; i < 6; i++) ahuff_update( h, h->leaf[range - 2] );
++    }
++    else
++    {
++        for (j = 0; j < 2; j++)
++            for (i = 0; i < range; i++) ahuff_update( h, h->leaf[i] );
++    }
++    return TRUE;
++}
++
++static void ahuff_free( struct ahuff *h )
++{
++    free( h->node );
++    free( h->leaf );
++}
++
++static int ahuff_read( struct ahuff *h, struct bits *b )
++{
++    int a = 1, code;
++    while (h->node[a].code < 0)
++    {
++        a = read_bit( b ) ? h->node[a].right : h->node[a].left;
++        if (b->eof) return -1;
++    }
++    code = h->node[a].code;     /* before the update moves the node */
++    ahuff_update( h, a );
++    return code;
++}
++
++/* ---------------------------------------------------------------------------------------------- */
++/* LZCOMP: literals, one-byte copies 2, 4 and 6 back, and copy items over the whole history, which
++ * starts with a fixed preload; optionally run-length coded on top */
++
++#define LZ_PRELOAD (2 * 32 * 96 + 4 * 256)
++
++struct growbuf
++{
++    BYTE *data;
++    size_t size, alloc;
++};
++
++static BOOL grow( struct growbuf *g, size_t more )
++{
++    BYTE *p;
++    size_t n;
++    if (g->size + more <= g->alloc) return TRUE;
++    if (more > (64u << 20) || g->size > (256u << 20)) return FALSE;   /* no font is that big */
++    n = max( g->alloc * 2, g->size + more + 4096 );
++    if (!(p = realloc( g->data, n ))) return FALSE;
++    g->data = p;
++    g->alloc = n;
++    return TRUE;
++}
++
++static BOOL put_byte( struct growbuf *g, BYTE v )
++{
++    if (!grow( g, 1 )) return FALSE;
++    g->data[g->size++] = v;
++    return TRUE;
++}
++
++struct runlength
++{
++    int state;  /* 0 normal, 1 after the escape, 2 a count read, 3 before the escape byte */
++    BYTE escape, count;
++};
++
++static BOOL rl_put( struct runlength *rl, struct growbuf *out, BYTE v )
++{
++    switch (rl->state)
++    {
++    case 3: rl->escape = v; rl->state = 0; return TRUE;
++    case 0:
++        if (v == rl->escape) { rl->state = 1; return TRUE; }
++        return put_byte( out, v );
++    case 1:
++        if (!(rl->count = v)) { rl->state = 0; return put_byte( out, rl->escape ); }
++        rl->state = 2;
++        return TRUE;
++    default:
++        rl->state = 0;
++        if (!grow( out, rl->count )) return FALSE;
++        memset( out->data + out->size, v, rl->count );
++        out->size += rl->count;
++        return TRUE;
++    }
++}
++
++static BOOL lzcomp_unpack( const BYTE *data, size_t size, struct growbuf *out )
++{
++    struct ahuff dist = {0}, len = {0}, sym = {0};
++    struct bits b = { data, size, 0, 8, FALSE };
++    struct runlength rl = { 3 };
++    BYTE *hist = NULL;
++    unsigned int out_len, ranges, dist_max, dup2, pos, i;
++    BOOL run_length, ok = FALSE;
++
++    run_length = read_bit( &b );
++    if (!ahuff_init( &dist, 8 ) || !ahuff_init( &len, 8 )) goto done;
++    out_len = read_bits( &b, 24 );
++    if (b.eof) goto done;
++    for (ranges = 1, dist_max = 8; dist_max < out_len; ranges++) dist_max *= 8;
++    dup2 = 256 + 8 * ranges;
++    if (!ahuff_init( &sym, dup2 + 3 )) goto done;
++    if (!(hist = malloc( LZ_PRELOAD + (size_t)out_len ))) goto done;
++
++    for (i = 0, pos = 0; i < 32 * 96; i++)
++    {
++        hist[pos++] = i / 96;
++        hist[pos++] = i % 96;
++    }
++    for (i = 0; pos < LZ_PRELOAD; i++, pos += 4) memset( hist + pos, i, 4 );
++
++    for (pos = LZ_PRELOAD; pos < LZ_PRELOAD + out_len;)
++    {
++        int s = ahuff_read( &sym, &b );
++        unsigned int length, distance, n, j;
++        int bits;
++
++        if (s < 0) goto done;
++        if (s < 256 || s >= dup2)
++        {
++            BYTE v = s < 256 ? s : hist[pos - 2 * (s - dup2 + 1)];
++            hist[pos++] = v;
++            if (!(run_length ? rl_put( &rl, out, v ) : put_byte( out, v ))) goto done;
++            continue;
++        }
++        /* a copy item: the number of 3-bit distance symbols and the first two length bits; the length goes
++         * on in 2-bit groups as long as a group's third bit is set */
++        n = (s - 256) / 8 + 1;
++        bits = (s - 256) % 8;
++        length = 0;
++        for (j = 0;; j++)
++        {
++            length = (length << 2) | (bits & 3);
++            if (!(bits & 4)) break;
++            if (j > 14 || (bits = ahuff_read( &len, &b )) < 0) goto done;
++        }
++        length += 2;
++        for (distance = 0, j = 0; j < n; j++)
++        {
++            if ((bits = ahuff_read( &dist, &b )) < 0) goto done;
++            distance = (distance << 3) | bits;
++        }
++        distance += 1;
++        if (distance >= 512) length++;
++        if (distance + length - 1 > pos || length > LZ_PRELOAD + out_len - pos) goto done;
++        for (j = 0; j < length; j++, pos++)
++        {
++            hist[pos] = hist[pos - distance - length + 1];
++            if (!(run_length ? rl_put( &rl, out, hist[pos] ) : put_byte( out, hist[pos] ))) goto done;
++        }
++    }
++    ok = TRUE;
++done:
++    if (!ok) WARN( "corrupt LZCOMP data\n" );
++    free( hist );
++    ahuff_free( &dist );
++    ahuff_free( &len );
++    ahuff_free( &sym );
++    return ok;
++}
++
++/* ---------------------------------------------------------------------------------------------- */
++/* byte readers over a block */
++
++struct rd
++{
++    const BYTE *p;
++    size_t size, pos;
++    BOOL bad;
++};
++
++static BYTE rd8( struct rd *r )
++{
++    if (r->pos >= r->size) { r->bad = TRUE; return 0; }
++    return r->p[r->pos++];
++}
++
++static USHORT rd16( struct rd *r )
++{
++    USHORT v = rd8( r ) << 8;
++    return v | rd8( r );
++}
++
++static ULONG rd32( struct rd *r )
++{
++    ULONG v = (ULONG)rd16( r ) << 16;
++    return v | rd16( r );
++}
++
++static USHORT rd255ushort( struct rd *r )
++{
++    BYTE code = rd8( r );
++    if (code == 253) return rd16( r );
++    if (code == 255) return 253 + rd8( r );
++    if (code == 254) return 506 + rd8( r );
++    return code;
++}
++
++static SHORT rd255short( struct rd *r )
++{
++    BYTE code = rd8( r );
++    int sign = 1;
++    if (code == 253) return (SHORT)rd16( r );
++    if (code == 250) { sign = -1; code = rd8( r ); }
++    if (code == 255) return sign * (250 + rd8( r ));
++    if (code == 254) return sign * (500 + rd8( r ));
++    return sign * code;
++}
++
++static void put16( BYTE *p, USHORT v ) { p[0] = v >> 8; p[1] = v; }
++static void put32( BYTE *p, ULONG v ) { put16( p, v >> 16 ); put16( p + 2, v ); }
++
++static BOOL out16( struct growbuf *g, USHORT v )
++{
++    if (!grow( g, 2 )) return FALSE;
++    put16( g->data + g->size, v );
++    g->size += 2;
++    return TRUE;
++}
++
++static BOOL out_bytes( struct growbuf *g, const void *p, size_t n )
++{
++    if (!grow( g, n )) return FALSE;
++    memcpy( g->data + g->size, p, n );
++    g->size += n;
++    return TRUE;
++}
++
++static BOOL pad4( struct growbuf *g )
++{
++    while (g->size & 3) if (!put_byte( g, 0 )) return FALSE;
++    return TRUE;
++}
++
++/* ---------------------------------------------------------------------------------------------- */
++/* glyf: the glyphs one after another; push data (block 2) and instructions (block 3) taken glyph by glyph */
++
++static const struct
++{
++    BYTE bytes, xbits, ybits;
++    USHORT dx, dy;
++    signed char xsign, ysign;
++}
++triplets[128] =
++{
++#include "mtx_triplets.h"
++};
++
++/* pushCount values from the push block: 251 and 252 repeat the value two back (A, X, A, X, A...) */
++static BOOL read_push_data( struct rd *push, SHORT *values, unsigned int count )
++{
++    unsigned int i = 0;
++    while (i < count)
++    {
++        BYTE code = push->pos < push->size ? push->p[push->pos] : 0;
++        if ((code == 251 || code == 252) && i >= 2)
++        {
++            SHORT a = values[i - 2];
++            unsigned int need = code == 251 ? 3 : 5;
++            push->pos++;
++            if (i + need > count) return FALSE;
++            values[i++] = a;
++            values[i++] = rd255short( push );
++            values[i++] = a;
++            if (code == 252)
++            {
++                values[i++] = rd255short( push );
++                values[i++] = a;
++            }
++        }
++        else values[i++] = rd255short( push );
++    }
++    return !push->bad;
++}
++
++/* the TrueType instructions of a glyph: its push values as PUSHB/PUSHW (NPUSHB/NPUSHW for more than 8),
++ * then its code */
++static BOOL write_instructions( struct growbuf *g, struct rd *push, struct rd *code, unsigned int push_count,
++                                unsigned int code_size )
++{
++    SHORT *values = NULL;
++    size_t len_pos = g->size;
++    unsigned int i = 0, n, j;
++    BOOL ok = FALSE;
++
++    if (!out16( g, 0 )) return FALSE;
++    if (push_count && (!(values = malloc( push_count * sizeof(*values) )) ||
++                       !read_push_data( push, values, push_count )))
++        goto done;
++    while (i < push_count)
++    {
++        BOOL words = values[i] < 0 || values[i] > 255;
++        /* a run of byte values or of word values, at most 255 */
++        for (n = 1; i + n < push_count && n < 255; n++)
++        {
++            BOOL w = values[i + n] < 0 || values[i + n] > 255;
++            if (w != words) break;
++        }
++        if (n <= 8) { if (!put_byte( g, (words ? 0xb8 : 0xb0) + n - 1 )) goto done; }
++        else if (!put_byte( g, words ? 0x41 : 0x40 ) || !put_byte( g, n )) goto done;
++        for (j = 0; j < n; j++, i++)
++            if (!(words ? out16( g, values[i] ) : put_byte( g, values[i] ))) goto done;
++    }
++    if (code->pos + code_size > code->size || !out_bytes( g, code->p + code->pos, code_size )) goto done;
++    code->pos += code_size;
++    if (g->size - len_pos - 2 > 0xffff) goto done;
++    put16( g->data + len_pos, g->size - len_pos - 2 );
++    ok = TRUE;
++done:
++    free( values );
++    return ok;
++}
++
++static BOOL decode_simple( struct rd *r, struct rd *push, struct rd *code, int contours, BOOL have_bbox,
++                           struct growbuf *g )
++{
++    SHORT bbox[4] = {0};
++    USHORT *ends = NULL;
++    BYTE *on = NULL;
++    int *x = NULL, *y = NULL, cx = 0, cy = 0;
++    unsigned int points = 0, i, push_count, code_size;
++    size_t start = g->size;
++    BOOL ok = FALSE;
++
++    if (have_bbox) for (i = 0; i < 4; i++) bbox[i] = rd16( r );
++    if (!(ends = malloc( contours * sizeof(*ends) ))) goto done;
++    for (i = 0; i < (unsigned int)contours; i++)
++    {
++        points += rd255ushort( r ) + (i ? 0 : 1);
++        if (points > 0xffff) goto done;
++        ends[i] = points - 1;
++    }
++    if (r->bad || points > r->size - r->pos) goto done;
++    if (!(on = malloc( points )) || !(x = malloc( points * sizeof(int) )) || !(y = malloc( points * sizeof(int) )))
++        goto done;
++    for (i = 0; i < points; i++) on[i] = rd8( r );
++    for (i = 0; i < points; i++)
++    {
++        BYTE f = on[i] & 0x7f;
++        unsigned int v = 0, k, n = triplets[f].bytes - 1;
++        int dx, dy;
++
++        for (k = 0; k < n; k++) v = (v << 8) | rd8( r );
++        dx = triplets[f].xbits ? (int)((v >> (8 * n - triplets[f].xbits)) & ((1u << triplets[f].xbits) - 1)) : 0;
++        dy = triplets[f].ybits ? (int)((v >> (8 * n - triplets[f].xbits - triplets[f].ybits)) &
++                                       ((1u << triplets[f].ybits) - 1)) : 0;
++        dx = (dx + triplets[f].dx) * triplets[f].xsign;
++        dy = (dy + triplets[f].dy) * triplets[f].ysign;
++        x[i] = cx += dx;
++        y[i] = cy += dy;
++        on[i] = !(on[i] & 0x80);
++    }
++    push_count = rd255ushort( r );
++    code_size = rd255ushort( r );
++    if (r->bad) goto done;
++    if (!have_bbox && points)
++    {
++        int xmin = x[0], xmax = x[0], ymin = y[0], ymax = y[0];
++        for (i = 1; i < points; i++)
++        {
++            xmin = min( xmin, x[i] ); xmax = max( xmax, x[i] );
++            ymin = min( ymin, y[i] ); ymax = max( ymax, y[i] );
++        }
++        bbox[0] = xmin; bbox[1] = ymin; bbox[2] = xmax; bbox[3] = ymax;
++    }
++
++    if (!out16( g, contours )) goto done;
++    for (i = 0; i < 4; i++) if (!out16( g, bbox[i] )) goto done;
++    for (i = 0; i < (unsigned int)contours; i++) if (!out16( g, ends[i] )) goto done;
++    if (!write_instructions( g, push, code, push_count, code_size )) goto done;
++    /* flags: on-curve, then short or long x and y (no repeats) */
++    for (i = 0, cx = cy = 0; i < points; i++)
++    {
++        int dx = x[i] - cx, dy = y[i] - cy;
++        BYTE f = on[i] ? 1 : 0;
++        if (!dx) f |= 0x10;
++        else if (abs( dx ) < 256) f |= 0x02 | (dx > 0 ? 0x10 : 0);
++        if (!dy) f |= 0x20;
++        else if (abs( dy ) < 256) f |= 0x04 | (dy > 0 ? 0x20 : 0);
++        if (!put_byte( g, f )) goto done;
++        cx = x[i]; cy = y[i];
++    }
++    for (i = 0, cx = 0; i < points; i++)
++    {
++        int d = x[i] - cx;
++        if (d && !(abs( d ) < 256 ? put_byte( g, abs( d ) ) : out16( g, d ))) goto done;
++        cx = x[i];
++    }
++    for (i = 0, cy = 0; i < points; i++)
++    {
++        int d = y[i] - cy;
++        if (d && !(abs( d ) < 256 ? put_byte( g, abs( d ) ) : out16( g, d ))) goto done;
++        cy = y[i];
++    }
++    ok = TRUE;
++done:
++    if (!ok) g->size = start;
++    free( ends );
++    free( on );
++    free( x );
++    free( y );
++    return ok;
++}
++
++static BOOL decode_composite( struct rd *r, struct rd *push, struct rd *code, struct growbuf *g )
++{
++    USHORT flags;
++    unsigned int i;
++
++    if (!out16( g, 0xffff )) return FALSE;
++    for (i = 0; i < 4; i++) if (!out16( g, rd16( r ) )) return FALSE;
++    do
++    {
++        unsigned int n;
++        flags = rd16( r );
++        n = 2 + ((flags & 0x0001) ? 4 : 2);                 /* glyph index, ARG_1_AND_2_ARE_WORDS */
++        if (flags & 0x0008) n += 2;                         /* WE_HAVE_A_SCALE */
++        else if (flags & 0x0040) n += 4;                    /* WE_HAVE_AN_X_AND_Y_SCALE */
++        else if (flags & 0x0080) n += 8;                    /* WE_HAVE_A_TWO_BY_TWO */
++        if (r->bad || r->pos + n > r->size || !out16( g, flags ) || !out_bytes( g, r->p + r->pos, n ))
++            return FALSE;
++        r->pos += n;
++    } while (flags & 0x0020);                               /* MORE_COMPONENTS */
++    if (flags & 0x0100)                                     /* WE_HAVE_INSTRUCTIONS */
++    {
++        unsigned int push_count = rd255ushort( r ), code_size = rd255ushort( r );
++        if (r->bad || !write_instructions( g, push, code, push_count, code_size )) return FALSE;
++    }
++    return !r->bad;
++}
++
++static BOOL decode_glyf( struct rd *r, struct rd *push, struct rd *code, unsigned int num_glyphs,
++                         struct growbuf *glyf, struct growbuf *loca )
++{
++    unsigned int i;
++
++    for (i = 0; i < num_glyphs; i++)
++    {
++        SHORT contours;
++        BOOL ok;
++
++        if (!out16( loca, 0 ) || !out16( loca, 0 )) return FALSE;
++        put32( loca->data + loca->size - 4, glyf->size );
++        contours = rd16( r );
++        if (r->bad) return FALSE;
++        if (contours == 0) continue;                        /* an empty glyph */
++        if (contours == -1) ok = decode_composite( r, push, code, glyf );
++        else if (contours == 0x7fff)
++        {
++            contours = rd16( r );
++            ok = contours > 0 && decode_simple( r, push, code, contours, TRUE, glyf );
++        }
++        else ok = contours > 0 && decode_simple( r, push, code, contours, FALSE, glyf );
++        if (!ok || !pad4( glyf )) { WARN( "bad glyph %u\n", i ); return FALSE; }
++    }
++    if (!out16( loca, 0 ) || !out16( loca, 0 )) return FALSE;
++    put32( loca->data + loca->size - 4, glyf->size );
++    return TRUE;
++}
++
++/* ---------------------------------------------------------------------------------------------- */
++/* cvt, hdmx, VDMX */
++
++static BOOL decode_cvt( struct rd *r, struct growbuf *g )
++{
++    unsigned int n = rd16( r ), i;
++    USHORT value = 0;
++
++    for (i = 0; i < n && !r->bad; i++)
++    {
++        BYTE c = rd8( r );
++        int v;
++        if (c < 238) v = c;
++        else if (c == 238) v = (SHORT)rd16( r );
++        else if (c <= 247) v = -(238 * (c - 239) + rd8( r ));
++        else v = 238 * (c - 247) + rd8( r );
++        value += v;
++        if (!out16( g, value )) return FALSE;
++    }
++    return !r->bad;
++}
++
++/* magnitude dependent values: n ones, a zero, a sign bit (0 +) unless n is 0; least significant bit first */
++struct mbits
++{
++    const BYTE *p;
++    size_t size, pos;
++    unsigned int bit;
++    BOOL bad;
++};
++
++static int mbit( struct mbits *m )
++{
++    int v;
++    if (m->pos >= m->size) { m->bad = TRUE; return 0; }
++    v = (m->p[m->pos] >> m->bit) & 1;
++    if (++m->bit == 8) { m->bit = 0; m->pos++; }
++    return v;
++}
++
++static int mvalue( struct mbits *m )
++{
++    int n = 0;
++    while (mbit( m ) && !m->bad) if (++n > 0xffff) { m->bad = TRUE; return 0; }
++    if (n && mbit( m )) n = -n;
++    return n;
++}
++
++static BOOL decode_hdmx( const BYTE *t, size_t size, const USHORT *aw, unsigned int num_glyphs,
++                         unsigned int upem, struct growbuf *g )
++{
++    struct rd r = { t, size };
++    struct mbits m;
++    USHORT version = rd16( &r ), records = rd16( &r );
++    ULONG record_size = rd32( &r ), i, j;
++    const BYTE *pairs = t + 8;
++
++    if (version >= 0x8000)  /* stored as it is, the version 0xffff - version */
++    {
++        if (size < 2 || !out_bytes( g, t, size )) return FALSE;
++        put16( g->data + g->size - size, 0xffff - version );
++        return TRUE;
++    }
++    if (r.bad || 8 + 2 * (size_t)records > size || record_size < 2 + num_glyphs || record_size > 0x10000 || !upem)
++        return FALSE;
++    m.p = t + 8 + 2 * records; m.size = size - 8 - 2 * records; m.pos = m.bit = 0; m.bad = FALSE;
++    if (!out16( g, version ) || !out16( g, records ) || !out16( g, record_size >> 16 ) || !out16( g, record_size ))
++        return FALSE;
++    for (i = 0; i < records; i++)
++    {
++        BYTE ppem = pairs[2 * i];
++        size_t rec = g->size;
++        if (!grow( g, record_size )) return FALSE;
++        memset( g->data + rec, 0, record_size );
++        g->data[rec] = ppem;
++        g->data[rec + 1] = pairs[2 * i + 1];
++        for (j = 0; j < num_glyphs; j++)
++        {
++            int w = (int)((((64 * ppem * aw[j]) + upem / 2) / upem + 32) / 64) + mvalue( &m );
++            g->data[rec + 2 + j] = w;
++        }
++        g->size += record_size;
++        if (m.bad) return FALSE;
++    }
++    return TRUE;
++}
++
++static BOOL decode_vdmx( const BYTE *t, size_t size, struct growbuf *g )
++{
++    struct rd r = { t, size };
++    USHORT version = rd16( &r ), groups = rd16( &r ), ratios = rd16( &r );
++    size_t base = g->size, group_pos, *ctf_off = NULL, *ttf_off = NULL;
++    unsigned int i, j;
++    BOOL ok = FALSE;
++
++    if (version >= 0x8000)
++    {
++        if (size < 2 || !out_bytes( g, t, size )) return FALSE;
++        put16( g->data + g->size - size, 0xffff - version );
++        return TRUE;
++    }
++    if (r.bad || 6 + 6 * (size_t)ratios > size || !ratios || !groups) return FALSE;
++    /* the header and ratios as they are, the offsets filled in below */
++    if (!out_bytes( g, t, 6 + 6 * (size_t)ratios )) return FALSE;
++    if (!(ctf_off = calloc( groups, sizeof(*ctf_off) )) || !(ttf_off = calloc( groups, sizeof(*ttf_off) ))) goto done;
++    r.pos = 6 + 4 * ratios;
++    group_pos = rd16( &r );
++    for (i = 0; i < groups; i++)
++    {
++        struct rd gr = { t, size, group_pos };
++        USHORT recs = rd16( &gr );
++        SHORT ymax_mult = rd16( &gr ), ymin_mult = rd16( &gr );
++        struct mbits m = { t + gr.pos, gr.pos <= size ? size - gr.pos : 0, 0, 0, FALSE };
++        int predicted = 8;
++        size_t start;
++
++        if (gr.bad) goto done;
++        ctf_off[i] = group_pos;
++        ttf_off[i] = g->size - base;
++        start = g->size;
++        if (!grow( g, 4 + 6 * (size_t)recs )) goto done;
++        g->size += 4 + 6 * (size_t)recs;
++        put16( g->data + start, recs );
++        for (j = 0; j < recs; j++)
++        {
++            int ppem = predicted + mvalue( &m );
++            int ymax = (ppem * ymax_mult + 1024) / 2048 + mvalue( &m );
++            int ymin = -((ppem * ymin_mult + 1024) / 2048) + mvalue( &m );
++            BYTE *e = g->data + start + 4 + 6 * j;
++            if (m.bad) goto done;
++            put16( e, ppem );
++            put16( e + 2, ymax );
++            put16( e + 4, ymin );
++            if (!j) g->data[start + 2] = ppem;
++            g->data[start + 3] = ppem;
++            predicted = ppem + 1;
++        }
++        group_pos = gr.pos + m.pos + (m.bit ? 1 : 0);
++    }
++    /* each ratio's offset: the group at that CTF offset */
++    for (i = 0; i < ratios; i++)
++    {
++        size_t off = (t[6 + 4 * ratios + 2 * i] << 8) | t[6 + 4 * ratios + 2 * i + 1];
++        for (j = 0; j < groups && ctf_off[j] != off; j++) ;
++        if (j == groups || ttf_off[j] > 0xffff) goto done;
++        put16( g->data + base + 6 + 4 * ratios + 2 * i, ttf_off[j] );
++    }
++    ok = TRUE;
++done:
++    free( ctf_off );
++    free( ttf_off );
++    return ok;
++}
++
++/* ---------------------------------------------------------------------------------------------- */
++/* the CTF font of block 1 back to TrueType */
++
++struct table
++{
++    ULONG tag;
++    const BYTE *data;
++    ULONG size;
++    struct growbuf made;
++    BOOL rebuilt;
++};
++
++#define TAG(a,b,c,d) (((ULONG)(a) << 24) | ((ULONG)(b) << 16) | ((ULONG)(c) << 8) | (ULONG)(d))
++
++static struct table *find_table( struct table *t, unsigned int n, ULONG tag )
++{
++    unsigned int i;
++    for (i = 0; i < n; i++) if (t[i].tag == tag) return &t[i];
++    return NULL;
++}
++
++static ULONG checksum( const BYTE *p, size_t size )
++{
++    ULONG sum = 0;
++    size_t i;
++    for (i = 0; i + 4 <= size; i += 4) sum += ((ULONG)p[i] << 24) | (p[i + 1] << 16) | (p[i + 2] << 8) | p[i + 3];
++    if (i < size)
++    {
++        BYTE last[4] = {0};
++        memcpy( last, p + i, size - i );
++        sum += ((ULONG)last[0] << 24) | (last[1] << 16) | (last[2] << 8) | last[3];
++    }
++    return sum;
++}
++
++static int __cdecl cmp_tag( const void *a, const void *b )
++{
++    ULONG x = ((const struct table *)a)->tag, y = ((const struct table *)b)->tag;
++    return x < y ? -1 : x > y;
++}
++
++static BOOL ctf_to_ttf( const BYTE *ctf, size_t ctf_size, const BYTE *push_data, size_t push_size,
++                        const BYTE *code_data, size_t code_size, struct growbuf *out )
++{
++    struct rd r = { ctf, ctf_size };
++    struct rd push = { push_data, push_size }, code = { code_data, code_size };
++    struct table *tables = NULL, *t;
++    unsigned int num, i, num_glyphs = 0, upem = 0, hmetrics = 0, sel;
++    USHORT *aw = NULL;
++    ULONG version, total, head_off = 0;
++    BOOL ok = FALSE;
++
++    version = rd32( &r );
++    num = rd16( &r );
++    if (r.bad || !num || num > 512 || 12 + 16 * (size_t)num > ctf_size) return FALSE;
++    if (!(tables = calloc( num, sizeof(*tables) ))) return FALSE;
++    for (i = 0; i < num; i++)
++    {
++        ULONG off, len;
++        r.pos = 12 + 16 * i;
++        tables[i].tag = rd32( &r );
++        rd32( &r );
++        off = rd32( &r );
++        len = rd32( &r );
++        if (off > ctf_size || len > ctf_size - off) goto done;
++        tables[i].data = ctf + off;
++        tables[i].size = len;
++    }
++
++    if ((t = find_table( tables, num, TAG('m','a','x','p') )) && t->size >= 6)
++        num_glyphs = (t->data[4] << 8) | t->data[5];
++    if ((t = find_table( tables, num, TAG('h','e','a','d') )) && t->size >= 54)
++        upem = (t->data[18] << 8) | t->data[19];
++    if ((t = find_table( tables, num, TAG('h','h','e','a') )) && t->size >= 36)
++        hmetrics = (t->data[34] << 8) | t->data[35];
++    if (!num_glyphs || !upem) goto done;
++
++    if ((t = find_table( tables, num, TAG('g','l','y','f') )))
++    {
++        struct table *loca = find_table( tables, num, TAG('l','o','c','a') );
++        struct rd g = { t->data, t->size };
++        if (!loca) goto done;
++        if (!decode_glyf( &g, &push, &code, num_glyphs, &t->made, &loca->made )) goto done;
++        t->rebuilt = loca->rebuilt = TRUE;
++    }
++    if ((t = find_table( tables, num, TAG('c','v','t',' ') )))
++    {
++        struct rd c = { t->data, t->size };
++        if (!decode_cvt( &c, &t->made )) goto done;
++        t->rebuilt = TRUE;
++    }
++    if ((t = find_table( tables, num, TAG('h','d','m','x') )))
++    {
++        struct table *hmtx = find_table( tables, num, TAG('h','m','t','x') );
++        if (!hmtx || !hmetrics || hmtx->size < 4 * (size_t)hmetrics) goto done;
++        if (!(aw = malloc( num_glyphs * sizeof(*aw) ))) goto done;
++        for (i = 0; i < num_glyphs; i++)
++        {
++            unsigned int k = min( i, hmetrics - 1 );
++            aw[i] = (hmtx->data[4 * k] << 8) | hmtx->data[4 * k + 1];
++        }
++        if (!decode_hdmx( t->data, t->size, aw, num_glyphs, upem, &t->made )) goto done;
++        t->rebuilt = TRUE;
++    }
++    if ((t = find_table( tables, num, TAG('V','D','M','X') )))
++    {
++        if (!decode_vdmx( t->data, t->size, &t->made )) goto done;
++        t->rebuilt = TRUE;
++    }
++    if ((t = find_table( tables, num, TAG('h','e','a','d') )))
++    {
++        /* long loca offsets; the checksum adjustment set below */
++        if (!out_bytes( &t->made, t->data, t->size )) goto done;
++        put16( t->made.data + 50, 1 );
++        put32( t->made.data + 8, 0 );
++        t->rebuilt = TRUE;
++    }
++
++    /* the TrueType font: the directory, then the tables in tag order, each 4-byte aligned */
++    qsort( tables, num, sizeof(*tables), cmp_tag );
++    for (sel = 0; (2u << sel) <= num; sel++) ;
++    total = 12 + 16 * num;
++    if (!grow( out, total )) goto done;
++    memset( out->data, 0, total );
++    out->size = total;
++    put32( out->data, version );
++    put16( out->data + 4, num );
++    put16( out->data + 6, 16 << sel );
++    put16( out->data + 8, sel );
++    put16( out->data + 10, num * 16 - (16 << sel) );
++    for (i = 0; i < num; i++)
++    {
++        const BYTE *p = tables[i].rebuilt ? tables[i].made.data : tables[i].data;
++        ULONG len = tables[i].rebuilt ? tables[i].made.size : tables[i].size;
++        BYTE *e = out->data + 12 + 16 * i;
++        ULONG off = out->size;
++
++        if (len && !out_bytes( out, p, len )) goto done;
++        if (!pad4( out )) goto done;
++        e = out->data + 12 + 16 * i;
++        put32( e, tables[i].tag );
++        put32( e + 4, checksum( out->data + off, len ) );
++        put32( e + 8, off );
++        put32( e + 12, len );
++        if (tables[i].tag == TAG('h','e','a','d')) head_off = off;
++    }
++    if (head_off) put32( out->data + head_off + 8, 0xb1b0afba - checksum( out->data, out->size ) );
++    ok = TRUE;
++done:
++    if (tables) for (i = 0; i < num; i++) free( tables[i].made.data );
++    free( tables );
++    free( aw );
++    return ok;
++}
++
++/* ---------------------------------------------------------------------------------------------- */
++
++BOOL mtx_decompress( const BYTE *data, ULONG size, BYTE **ret, ULONG *ret_size )
++{
++    struct growbuf block[3] = {{0}}, out = {0};
++    ULONG off[4];
++    unsigned int i;
++    BOOL ok = FALSE;
++
++    *ret = NULL;
++    *ret_size = 0;
++    if (size < 10 || data[0] != 3) return FALSE;
++    off[0] = 10;
++    off[1] = (data[4] << 16) | (data[5] << 8) | data[6];
++    off[2] = (data[7] << 16) | (data[8] << 8) | data[9];
++    off[3] = size;
++    if (off[1] < off[0] || off[2] < off[1] || off[2] > size) return FALSE;
++    for (i = 0; i < 3; i++)
++        if (!lzcomp_unpack( data + off[i], off[i + 1] - off[i], &block[i] )) goto done;
++    TRACE( "blocks of %Iu, %Iu, %Iu bytes\n", block[0].size, block[1].size, block[2].size );
++    if (!ctf_to_ttf( block[0].data, block[0].size, block[1].data, block[1].size, block[2].data, block[2].size,
++                     &out ))
++        goto done;
++    *ret = out.data;
++    *ret_size = out.size;
++    out.data = NULL;
++    ok = TRUE;
++done:
++    for (i = 0; i < 3; i++) free( block[i].data );
++    free( out.data );
++    return ok;
++}
+--- /dev/null
++++ b/dlls/t2embed/mtx_triplets.h
+@@ -0,0 +1,34 @@
++/* MTX triplet encoding of glyph points (W3C MTX submission, 5.11): byte count, x bits, y bits, delta x,
++ * delta y, x sign, y sign */
++    {2,0,8,0,0,0,-1}, {2,0,8,0,0,0,1}, {2,0,8,0,256,0,-1}, {2,0,8,0,256,0,1},
++    {2,0,8,0,512,0,-1}, {2,0,8,0,512,0,1}, {2,0,8,0,768,0,-1}, {2,0,8,0,768,0,1},
++    {2,0,8,0,1024,0,-1}, {2,0,8,0,1024,0,1}, {2,8,0,0,0,-1,0}, {2,8,0,0,0,1,0},
++    {2,8,0,256,0,-1,0}, {2,8,0,256,0,1,0}, {2,8,0,512,0,-1,0}, {2,8,0,512,0,1,0},
++    {2,8,0,768,0,-1,0}, {2,8,0,768,0,1,0}, {2,8,0,1024,0,-1,0}, {2,8,0,1024,0,1,0},
++    {2,4,4,1,1,-1,-1}, {2,4,4,1,1,1,-1}, {2,4,4,1,1,-1,1}, {2,4,4,1,1,1,1},
++    {2,4,4,1,17,-1,-1}, {2,4,4,1,17,1,-1}, {2,4,4,1,17,-1,1}, {2,4,4,1,17,1,1},
++    {2,4,4,1,33,-1,-1}, {2,4,4,1,33,1,-1}, {2,4,4,1,33,-1,1}, {2,4,4,1,33,1,1},
++    {2,4,4,1,49,-1,-1}, {2,4,4,1,49,1,-1}, {2,4,4,1,49,-1,1}, {2,4,4,1,49,1,1},
++    {2,4,4,17,1,-1,-1}, {2,4,4,17,1,1,-1}, {2,4,4,17,1,-1,1}, {2,4,4,17,1,1,1},
++    {2,4,4,17,17,-1,-1}, {2,4,4,17,17,1,-1}, {2,4,4,17,17,-1,1}, {2,4,4,17,17,1,1},
++    {2,4,4,17,33,-1,-1}, {2,4,4,17,33,1,-1}, {2,4,4,17,33,-1,1}, {2,4,4,17,33,1,1},
++    {2,4,4,17,49,-1,-1}, {2,4,4,17,49,1,-1}, {2,4,4,17,49,-1,1}, {2,4,4,17,49,1,1},
++    {2,4,4,33,1,-1,-1}, {2,4,4,33,1,1,-1}, {2,4,4,33,1,-1,1}, {2,4,4,33,1,1,1},
++    {2,4,4,33,17,-1,-1}, {2,4,4,33,17,1,-1}, {2,4,4,33,17,-1,1}, {2,4,4,33,17,1,1},
++    {2,4,4,33,33,-1,-1}, {2,4,4,33,33,1,-1}, {2,4,4,33,33,-1,1}, {2,4,4,33,33,1,1},
++    {2,4,4,33,49,-1,-1}, {2,4,4,33,49,1,-1}, {2,4,4,33,49,-1,1}, {2,4,4,33,49,1,1},
++    {2,4,4,49,1,-1,-1}, {2,4,4,49,1,1,-1}, {2,4,4,49,1,-1,1}, {2,4,4,49,1,1,1},
++    {2,4,4,49,17,-1,-1}, {2,4,4,49,17,1,-1}, {2,4,4,49,17,-1,1}, {2,4,4,49,17,1,1},
++    {2,4,4,49,33,-1,-1}, {2,4,4,49,33,1,-1}, {2,4,4,49,33,-1,1}, {2,4,4,49,33,1,1},
++    {2,4,4,49,49,-1,-1}, {2,4,4,49,49,1,-1}, {2,4,4,49,49,-1,1}, {2,4,4,49,49,1,1},
++    {3,8,8,1,1,-1,-1}, {3,8,8,1,1,1,-1}, {3,8,8,1,1,-1,1}, {3,8,8,1,1,1,1},
++    {3,8,8,1,257,-1,-1}, {3,8,8,1,257,1,-1}, {3,8,8,1,257,-1,1}, {3,8,8,1,257,1,1},
++    {3,8,8,1,513,-1,-1}, {3,8,8,1,513,1,-1}, {3,8,8,1,513,-1,1}, {3,8,8,1,513,1,1},
++    {3,8,8,257,1,-1,-1}, {3,8,8,257,1,1,-1}, {3,8,8,257,1,-1,1}, {3,8,8,257,1,1,1},
++    {3,8,8,257,257,-1,-1}, {3,8,8,257,257,1,-1}, {3,8,8,257,257,-1,1}, {3,8,8,257,257,1,1},
++    {3,8,8,257,513,-1,-1}, {3,8,8,257,513,1,-1}, {3,8,8,257,513,-1,1}, {3,8,8,257,513,1,1},
++    {3,8,8,513,1,-1,-1}, {3,8,8,513,1,1,-1}, {3,8,8,513,1,-1,1}, {3,8,8,513,1,1,1},
++    {3,8,8,513,257,-1,-1}, {3,8,8,513,257,1,-1}, {3,8,8,513,257,-1,1}, {3,8,8,513,257,1,1},
++    {3,8,8,513,513,-1,-1}, {3,8,8,513,513,1,-1}, {3,8,8,513,513,-1,1}, {3,8,8,513,513,1,1},
++    {4,12,12,0,0,-1,-1}, {4,12,12,0,0,1,-1}, {4,12,12,0,0,-1,1}, {4,12,12,0,0,1,1},
++    {5,16,16,0,0,-1,-1}, {5,16,16,0,0,1,-1}, {5,16,16,0,0,-1,1}, {5,16,16,0,0,1,1},
+--- /dev/null
++++ b/dlls/t2embed/t2embed_private.h
+@@ -0,0 +1,27 @@
++/*
++ * t2embed private definitions
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_T2EMBED_PRIVATE_H
++#define __WINE_T2EMBED_PRIVATE_H
++
++/* MicroType Express font data to a TrueType font (mtx.c); the result is malloc'ed */
++BOOL mtx_decompress( const BYTE *data, ULONG size, BYTE **ret, ULONG *ret_size );
++
++#endif
