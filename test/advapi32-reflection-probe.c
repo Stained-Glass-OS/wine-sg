@@ -36,6 +36,9 @@ int main(void)
     check(!ret, "disable on an open key: %ld", ret);
     ret = RegEnableReflectionKey(closed);
     check(ret == ERROR_INVALID_HANDLE, "enable on a closed key: %ld", ret);
+    /* wine-sg 8284: disabling checks the key too (mutant SG_MUTANT_DISABLE_REFLECTION_NO_CHECK) */
+    ret = RegDisableReflectionKey(closed);
+    check(ret == ERROR_INVALID_HANDLE, "disable on a closed key: %ld", ret);
     off = 0x55;
     ret = RegQueryReflectionKey(key, &off);
     check(!ret && off == TRUE, "still reported disabled: %ld %d", ret, off);

@@ -5,7 +5,7 @@
 #
 #   WINE=/opt/wine-sg/bin/wine test/advapi32-reflection-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
-# Mutant: SG_MUTANT_REFLECTION_NO_CHECK (advapi32/registry.c).
+# Mutants: SG_MUTANT_REFLECTION_NO_CHECK, SG_MUTANT_DISABLE_REFLECTION_NO_CHECK (8284) (advapi32/registry.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
