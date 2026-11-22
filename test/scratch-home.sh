@@ -31,6 +31,10 @@ if [ -z "${SG_GATE_HOME:-}" ]; then
     mkdir -p "$HOME/Desktop" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
     export WINEDLLOVERRIDES="winemenubuilder.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 fi
+# A Windows program that listens tells the firewall (wine-sg 1500), and the firewall asks the
+# person on their desktop. A gate's probes must never do that (David 2026-11-21: prompts popped
+# up from an agent's gate sweep). Gates that test the notice set their own SG_FIREWALL_NOTIFY.
+export SG_FIREWALL_NOTIFY="$SG_GATE_HOME/no-firewall-notify"
 # Nothing a gate runs may reach the person's own session: Wine's Wayland
 # driver connects to $XDG_RUNTIME_DIR/wayland-0 even with WAYLAND_DISPLAY
 # unset (2026-10-06: a printing run reached the host's desktop; 2026-11-16:
