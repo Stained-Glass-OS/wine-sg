@@ -13,6 +13,11 @@ WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 [ -x "$WINESERVER" ] || WINESERVER="$(dirname "$WINE")/server/wineserver"
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 DPY="${KBCHAR_DPY:-179}"
+# a display no one else holds: a stale lock of another account's (sgsystem's on :175) made Xvfb
+# fail to start, and the gate then talked to whatever server answered there -- or failed
+if [ -z "${KBCHAR_DPY:-}" ]; then
+    while [ -e "/tmp/.X$DPY-lock" ] || [ -e "/tmp/.X11-unix/X$DPY" ]; do DPY=$((DPY + 1)); done
+fi
 RC=0; XP=""
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
@@ -25,11 +30,12 @@ T=$(mktemp -d /var/tmp/sg-kbchar.XXXXXX)
 cleanup() {
     WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null
     [ -n "$XP" ] && kill "$XP" 2>/dev/null
-    rm -f "/tmp/.X${DPY}-lock"; rm -rf "$T"
+    [ -n "$XP" ] && rm -f "/tmp/.X${DPY}-lock"; rm -rf "$T"
 }
 trap cleanup EXIT INT TERM
 
 Xvfb ":$DPY" -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 & XP=$!
+sleep 0.5; kill -0 "$XP" 2>/dev/null || { XP=""; echo "FAIL  Xvfb did not start on :$DPY"; exit 1; }
 mkdir -p "$T/home" "$T/prefix"
 export DISPLAY=":$DPY" HOME="$T/home" WINEPREFIX="$T/prefix" WINEDEBUG=${KBCHAR_DEBUG:--all} WINEDLLOVERRIDES="mscoree=;winemenubuilder.exe=d" WINESERVER
 i=0; while ! xdpyinfo >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
@@ -57,7 +63,10 @@ sleep 1
 timeout -s KILL 120 "$WINE" iexplore "http://127.0.0.1:$PORT/kbchar.html" >"$T/ie.log" 2>&1 &
 i=0; while ! grep -qx loaded "$T/log.txt" 2>/dev/null && [ $i -lt 120 ]; do sleep 0.5; i=$((i + 1)); done
 grep -qx loaded "$T/log.txt" 2>/dev/null || { fail "the page did not load"; grep -v '^$' "$T/ie.log" | tail -15; exit 1; }
-w=$(xdotool search --name "Internet Explorer" 2>/dev/null | head -1)
+# its window says "Web Browser" since 5967 (no "Internet Explorer" title any more): found by
+# name, the click that puts the focus in the page found nothing, and no key reached it
+w=$(xdotool search --name "Web Browser|Internet Explorer" 2>/dev/null | head -1)
+[ -n "$w" ] || fail "no browser window to click into"
 if [ -n "$w" ]; then
     eval "$(xdotool getwindowgeometry --shell "$w")"
     xdotool mousemove $((X + WIDTH / 2)) $((Y + HEIGHT * 3 / 4)) click 1

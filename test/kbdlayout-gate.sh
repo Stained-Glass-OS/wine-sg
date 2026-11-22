@@ -22,6 +22,11 @@ WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
 MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 DPY="${KBDLAYOUT_DPY:-175}"
+# a display no one else holds: a stale lock of another account's (sgsystem's on :175) made Xvfb
+# fail to start, and the gate then talked to whatever server answered there -- or failed
+if [ -z "${KBDLAYOUT_DPY:-}" ]; then
+    while [ -e "/tmp/.X$DPY-lock" ] || [ -e "/tmp/.X11-unix/X$DPY" ]; do DPY=$((DPY + 1)); done
+fi
 RC=0; XP=""
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
@@ -33,11 +38,12 @@ T=$(mktemp -d /var/tmp/sg-kbdlayout.XXXXXX)
 cleanup() {
     WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null
     [ -n "$XP" ] && kill "$XP" 2>/dev/null
-    rm -f "/tmp/.X${DPY}-lock"; rm -rf "$T"
+    [ -n "$XP" ] && rm -f "/tmp/.X${DPY}-lock"; rm -rf "$T"
 }
 trap cleanup EXIT INT TERM
 
 Xvfb ":$DPY" -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 & XP=$!
+sleep 0.5; kill -0 "$XP" 2>/dev/null || { XP=""; echo "FAIL  Xvfb did not start on :$DPY"; exit 1; }
 mkdir -p "$T/home" "$T/prefix"
 export DISPLAY=":$DPY" HOME="$T/home" WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" WINESERVER LANG=C.UTF-8
 i=0; while ! xdpyinfo >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done

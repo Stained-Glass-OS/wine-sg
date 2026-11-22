@@ -94,6 +94,23 @@ static int name_is(IShellFolder2 *sf, LPCITEMIDLIST pidl, const WCHAR *want)
     return !wcscmp(buf, want);
 }
 
+/* how many of the folder's items are the probe's two printers */
+static int sg_items(IShellFolder2 *sf)
+{
+    IEnumIDList *en = NULL;
+    LPITEMIDLIST pidl;
+    ULONG got;
+    int n = 0;
+    if (FAILED(IShellFolder2_EnumObjects(sf, NULL, SHCONTF_NONFOLDERS, &en)) || !en) return -1;
+    while (IEnumIDList_Next(en, 1, &pidl, &got) == S_OK && got == 1)
+    {
+        if (name_is(sf, pidl, L"SG Alpha Printer") || name_is(sf, pidl, L"SG Beta Printer")) n++;
+        CoTaskMemFree(pidl);
+    }
+    IEnumIDList_Release(en);
+    return n;
+}
+
 static int detail_is(IShellFolder2 *sf, LPCITEMIDLIST pidl, UINT col, const WCHAR *want)
 {
     SHELLDETAILS d;
@@ -124,8 +141,11 @@ int main(void)
     checkhr(hr, S_OK, "create the Printers folder");
     if (!sf) { printf("RESULT: FAIL\n"); return 1; }
 
+    /* the prefix has printers of its own besides the two -- the host's CUPS queues (a PDF
+     * printer on a desktop) come in at wineboot -- so it is the two that are counted */
     n = count_items(sf, SHCONTF_NONFOLDERS, &p1, &p2);
-    check(n == 2, "two printers enumerated");
+    printf("INFO  %d printers enumerated, %d of them the probe's\n", n, sg_items(sf));
+    check(n >= 2 && sg_items(sf) == 2, "both printers enumerated");
     check(count_items(sf, SHCONTF_FOLDERS, NULL, NULL) == 0, "the printers are not folders");
     CoTaskMemFree(p1); CoTaskMemFree(p2);
 
