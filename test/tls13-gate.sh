@@ -5,9 +5,12 @@
 # TLS 1.2 only. wininet and winhttp reach both (a server taking one version only is the proof of
 # the version; where wininet reports it, it must be SP_PROT_TLS1_3_CLIENT / _TLS1_2_CLIENT); Protocols\TLS 1.3\Client DisabledByDefault=1, then Enabled=0, turn TLS 1.3
 # off again (the 1.3-only server refused, the 1.2 one still reached). claws-mail.org is TLS 1.3
-# only: SG Store's download failed with 12157.
+# only: SG Store's download failed with 12157. Then a TLS 1.3 server that sends its reply with
+# its Finished (test/tls13-earlyserver.c, GnuTLS early start; what GitHub's server does with its
+# session tickets): wininet and winhttp must keep those bytes (patches/sg/8416).
 #   WINE=/opt/wine-sg/bin/wine test/tls13-gate.sh
-# Mutant: SG_MUTANT_NO_TLS13_CLIENT (dlls/secur32/schannel.c).
+# Mutants: SG_MUTANT_NO_TLS13_CLIENT (dlls/secur32/schannel.c), SG_MUTANT_TLS13_DROP_FINISHED and
+# SG_MUTANT_TLS_DROP_EXTRA (dlls/wininet/netconnection.c, dlls/winhttp/net.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -17,9 +20,9 @@ pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; RC=1; }
 for t in x86_64-w64-mingw32-gcc openssl python3; do command -v $t >/dev/null || { echo "SKIP: $t missing"; exit 77; }; done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
-T=$(mktemp -d /var/tmp/sg-tls13.XXXXXX); S13=; S12=
+T=$(mktemp -d /var/tmp/sg-tls13.XXXXXX); S13=; S12=; SE=
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
-cleanup() { "$WINESERVER" -k 2>/dev/null; [ -n "$S13" ] && kill $S13 2>/dev/null; [ -n "$S12" ] && kill $S12 2>/dev/null; rm -rf "$T"; }
+cleanup() { "$WINESERVER" -k 2>/dev/null; [ -n "$S13" ] && kill $S13 2>/dev/null; [ -n "$S12" ] && kill $S12 2>/dev/null; [ -n "$SE" ] && kill $SE 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 TMPDIR=/var/tmp x86_64-w64-mingw32-gcc -O1 -o "$T/probe.exe" "$HERE/tls13-probe.c" "$HERE/tls13-http.c" -lwininet -lwinhttp ||
     { echo "FAIL  probe did not build"; exit 1; }
@@ -49,5 +52,14 @@ o=$(run inet $P12); case "$o" in "ok proto=0x800"|"ok proto=?") pass "DisabledBy
 o=$(run inet $P13); case "$o" in fail*) pass "Enabled=0: the TLS 1.3-only server is refused";; *) fail "Enabled=0 ignored: $o";; esac
 "$WINE" reg add "$K" /v Enabled /t REG_DWORD /d 1 /f >/dev/null 2>&1; "$WINESERVER" -w
 o=$(run inet $P13); case "$o" in "ok proto=0x2000"|"ok proto=?") pass "Enabled=1: TLS 1.3 again";; *) fail "Enabled=1: $o";; esac
+"$WINE" reg delete "$K" /f >/dev/null 2>&1; "$WINESERVER" -w
+if command -v gcc >/dev/null && pkg-config --exists gnutls 2>/dev/null &&
+   gcc -O1 -o "$T/earlysrv" "$HERE/tls13-earlyserver.c" $(pkg-config --cflags --libs gnutls) 2>/dev/null; then
+    PE=$(port); "$T/earlysrv" $PE "$T/cert.pem" "$T/key.pem" >/dev/null 2>&1 & SE=$!; sleep 1
+    o=$(run inet $PE); case "$o" in ok*) pass "wininet keeps what came with the server's Finished";; *) fail "wininet, reply sent with the Finished: $o";; esac
+    o=$(run http $PE); case "$o" in ok*) pass "winhttp keeps what came with the server's Finished";; *) fail "winhttp, reply sent with the Finished: $o";; esac
+else
+    echo "SKIP  the early-sending server (gcc and GnuTLS's headers needed)"
+fi
 [ "$RC" = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit "$RC"
