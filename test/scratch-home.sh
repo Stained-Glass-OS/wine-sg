@@ -35,6 +35,11 @@ fi
 # person on their desktop. A gate's probes must never do that (David 2026-11-21: prompts popped
 # up from an agent's gate sweep). Gates that test the notice set their own SG_FIREWALL_NOTIFY.
 export SG_FIREWALL_NOTIFY="$SG_GATE_HOME/no-firewall-notify"
+# Shut down / Restart from a Windows program (ExitWindowsEx, InitiateSystemShutdown, shutdown.exe) runs
+# SG_POWERCTL, else sg-session's /usr/bin/sg-settingsctl, which asks logind -- as the person running the
+# gate, that powers off the real PC (David's desktop went down twice, 2026-11-21/22, from shutdown-gate
+# in an agent's sweep). A path that does not exist: nothing is run. Gates that test it set their own.
+export SG_POWERCTL="$SG_GATE_HOME/no-power-helper"
 # Nothing a gate runs may reach the person's own session: Wine's Wayland
 # driver connects to $XDG_RUNTIME_DIR/wayland-0 even with WAYLAND_DISPLAY
 # unset (2026-10-06: a printing run reached the host's desktop; 2026-11-16:

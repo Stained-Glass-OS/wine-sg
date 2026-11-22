@@ -61,11 +61,17 @@ out=$(run logoff)
 grep -q '^EXIT logoff 1' <<<"$out" && [ ! -s "$W/calls" ] && pass "Sign out ends the session only: the PC is not asked anything" \
     || fail "Sign out: $out $(tr '\n' '|' < "$W/calls")"
 # A relative or empty SG_POWERCTL is not a Unix path: the default helper is
-# used (absent here, so nothing is run and ExitWindowsEx still succeeds).
-: > "$W/calls"
-out=$(SG_POWERCTL=powerctl "$WINE" "$W/probe.exe" shutdown 2>&1 | tr -d '\r'); sleep 4
-grep -q '^EXIT shutdown 1' <<<"$out" && [ ! -s "$W/calls" ] && pass "only an absolute Unix path names a stand-in" \
-    || fail "relative SG_POWERCTL: $out $(tr '\n' '|' < "$W/calls")"
+# used. Only where that helper is absent: where sg-session is installed it is
+# the real one, and this check powered the PC off (David's desktop,
+# 2026-11-21/22, from an agent's gate sweep).
+if [ -e /usr/bin/sg-settingsctl ]; then
+    echo "SKIP  relative SG_POWERCTL: /usr/bin/sg-settingsctl is installed here, and running it would power this machine off"
+else
+    : > "$W/calls"
+    out=$(SG_POWERCTL=powerctl "$WINE" "$W/probe.exe" shutdown 2>&1 | tr -d '\r'); sleep 4
+    grep -q '^EXIT shutdown 1' <<<"$out" && [ ! -s "$W/calls" ] && pass "only an absolute Unix path names a stand-in" \
+        || fail "relative SG_POWERCTL: $out $(tr '\n' '|' < "$W/calls")"
+fi
 
 echo "shutdown-gate: $fails failure(s)"
 exit $((fails > 0))
