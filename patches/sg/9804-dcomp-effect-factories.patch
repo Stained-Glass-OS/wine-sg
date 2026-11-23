@@ -1,0 +1,1226 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dcomp: CompositionEffectFactory and CompositionEffectBrush
+
+ICompositor::CreateEffectFactory and CreateEffectFactoryWithProperties read an IGraphicsEffect description once through IGraphicsEffectD2D1Interop (IID and method order per windows-rs 0.58, generated from Microsoft's open win32metadata): the Direct2D effects, their properties and sources -- other effects, or CompositionEffectSourceParameters an effect brush binds by name. Animatable properties (Effect.Property) follow the brush's StartAnimation or its Properties. A brush draws as its Direct2D effect graph over its source brushes, each drawn into a bitmap by a device context of its own.
+---
+--- /dev/null
++++ b/dlls/dcomp/effects.c
+@@ -0,0 +1,831 @@
++/*
++ * Windows.UI.Composition effects: CompositionEffectFactory and the effect graphs of effect brushes
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Stained Glass OS (wine-sg 9804). ICompositor::CreateEffectFactory takes a description of an effect graph:
++ * Windows.Graphics.Effects.IGraphicsEffect objects (Win2D's effects, or a program's own) whose
++ * IGraphicsEffectD2D1Interop names the Direct2D effect (its CLSID), gives its properties in Direct2D's
++ * order and its sources -- other effects, or CompositionEffectSourceParameters a brush binds by name.
++ * The factory reads the description once, as Windows does (later changes to the description objects do not
++ * reach brushes made from it); CreateEffectFactoryWithProperties names the properties ("Effect.Property")
++ * a brush may change or animate afterwards, through its StartAnimation or its Properties. A brush draws
++ * as its graph of Direct2D effects over what its source brushes draw.
++ *
++ * IGraphicsEffectD2D1Interop's IID and method order, and GRAPHICS_EFFECT_PROPERTY_MAPPING, are the Windows
++ * metadata's (windows.graphics.effects.interop.h), as windows-rs 0.58 (MIT/Apache-2.0, generated from
++ * Microsoft's open win32metadata) publishes them. */
++
++#include <math.h>
++#include "composition_private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(composition);
++
++static const GUID IID_IGraphicsEffectD2D1Interop_x = { 0x2fc57384, 0xa068, 0x44d7, { 0xa3, 0x31, 0x30, 0x98, 0x2f, 0xcf, 0x71, 0x77 } };
++static const GUID IID_ICompositionEffectSourceParameter_e = { 0x858ab13a, 0x3292, 0x4e4e, { 0xb3, 0xbb, 0x2b, 0x6c, 0x65, 0x44, 0xa6, 0xee } };
++static const WCHAR class_effect_factory[] = L"Windows.UI.Composition.CompositionEffectFactory";
++
++typedef enum
++{
++    MAPPING_UNKNOWN = 0,
++    MAPPING_DIRECT = 1,
++    MAPPING_VECTORX = 2,
++    MAPPING_VECTORY = 3,
++    MAPPING_VECTORZ = 4,
++    MAPPING_VECTORW = 5,
++    MAPPING_RECT_TO_VECTOR4 = 6,
++    MAPPING_RADIANS_TO_DEGREES = 7,
++    MAPPING_COLORMATRIX_ALPHA_MODE = 8,
++    MAPPING_COLOR_TO_VECTOR3 = 9,
++    MAPPING_COLOR_TO_VECTOR4 = 10,
++} GRAPHICS_EFFECT_PROPERTY_MAPPING;
++
++typedef struct graphics_effect_interop graphics_effect_interop;
++struct graphics_effect_interop_vtbl
++{
++    HRESULT (WINAPI *QueryInterface)( graphics_effect_interop *, REFIID, void ** );
++    ULONG (WINAPI *AddRef)( graphics_effect_interop * );
++    ULONG (WINAPI *Release)( graphics_effect_interop * );
++    HRESULT (WINAPI *GetEffectId)( graphics_effect_interop *, GUID * );
++    HRESULT (WINAPI *GetNamedPropertyMapping)( graphics_effect_interop *, const WCHAR *, UINT *,
++                                              GRAPHICS_EFFECT_PROPERTY_MAPPING * );
++    HRESULT (WINAPI *GetPropertyCount)( graphics_effect_interop *, UINT * );
++    HRESULT (WINAPI *GetProperty)( graphics_effect_interop *, UINT, IPropertyValue ** );
++    HRESULT (WINAPI *GetSource)( graphics_effect_interop *, UINT, IGraphicsEffectSource ** );
++    HRESULT (WINAPI *GetSourceCount)( graphics_effect_interop *, UINT * );
++};
++struct graphics_effect_interop { const struct graphics_effect_interop_vtbl *lpVtbl; };
++
++#define MAX_EFFECT_NODES   64
++#define MAX_EFFECT_SOURCES 16
++#define MAX_EFFECT_PROPS   64
++#define MAX_PROP_SIZE      (16 * sizeof(float))
++
++struct effect_prop
++{
++    UINT size;                 /* 0: not given, the effect's default stays */
++    BYTE data[MAX_PROP_SIZE];
++};
++
++struct effect_node
++{
++    GUID clsid;
++    WCHAR *name;
++    UINT prop_count;
++    struct effect_prop *props;
++    UINT source_count;
++    int sources[MAX_EFFECT_SOURCES];   /* >= 0: a node; < 0: -1 - the index of a source parameter */
++};
++
++/* a property a brush may change: "Effect.Property", where it goes in Direct2D's terms */
++struct effect_anim
++{
++    WCHAR *name;
++    UINT node, index;
++    GRAPHICS_EFFECT_PROPERTY_MAPPING mapping;
++    enum anim_kind kind;
++    BYTE initial[MAX_PROP_SIZE];      /* in the animated value's terms */
++};
++
++struct effect_graph
++{
++    LONG ref;
++    UINT node_count, root;
++    struct effect_node nodes[MAX_EFFECT_NODES];
++    UINT param_count;
++    WCHAR *params[MAX_EFFECT_SOURCES];
++    UINT anim_count;
++    struct effect_anim *anims;
++    IGraphicsEffect *objects[MAX_EFFECT_NODES];   /* the description's, while it is read */
++};
++
++static WCHAR *hstring_copy( HSTRING str )
++{
++    UINT32 len;
++    const WCHAR *buf = WindowsGetStringRawBuffer( str, &len );
++    WCHAR *ret = malloc( (len + 1) * sizeof(WCHAR) );
++    if (!ret) return NULL;
++    memcpy( ret, buf, len * sizeof(WCHAR) );
++    ret[len] = 0;
++    return ret;
++}
++
++void effect_graph_release( struct effect_graph *graph )
++{
++    UINT i;
++
++    if (!graph || InterlockedDecrement( &graph->ref )) return;
++    for (i = 0; i < graph->node_count; i++)
++    {
++        free( graph->nodes[i].name );
++        free( graph->nodes[i].props );
++    }
++    for (i = 0; i < graph->param_count; i++) free( graph->params[i] );
++    for (i = 0; i < graph->anim_count; i++) free( graph->anims[i].name );
++    free( graph->anims );
++    free( graph );
++}
++
++struct effect_graph *effect_graph_addref( struct effect_graph *graph )
++{
++    InterlockedIncrement( &graph->ref );
++    return graph;
++}
++
++/* a property's value as Direct2D takes it (FLOAT, UINT32/enum, BOOL, vectors and matrices as floats) */
++static HRESULT read_property( IPropertyValue *value, struct effect_prop *prop )
++{
++    PropertyType type;
++    HRESULT hr;
++
++    prop->size = 0;
++    if (!value) return S_OK;
++    if (FAILED(hr = IPropertyValue_get_Type( value, &type ))) return hr;
++    switch (type)
++    {
++    case PropertyType_Single:
++        prop->size = sizeof(FLOAT);
++        return IPropertyValue_GetSingle( value, (FLOAT *)prop->data );
++    case PropertyType_Double:
++    {
++        DOUBLE d;
++        if (FAILED(hr = IPropertyValue_GetDouble( value, &d ))) return hr;
++        *(FLOAT *)prop->data = d;
++        prop->size = sizeof(FLOAT);
++        return S_OK;
++    }
++    case PropertyType_UInt32:
++        prop->size = sizeof(UINT32);
++        return IPropertyValue_GetUInt32( value, (UINT32 *)prop->data );
++    case PropertyType_Int32:
++        prop->size = sizeof(INT32);
++        return IPropertyValue_GetInt32( value, (INT32 *)prop->data );
++    case PropertyType_Boolean:
++    {
++        boolean b;
++        if (FAILED(hr = IPropertyValue_GetBoolean( value, &b ))) return hr;
++        *(BOOL *)prop->data = !!b;
++        prop->size = sizeof(BOOL);
++        return S_OK;
++    }
++    case PropertyType_SingleArray:
++    {
++        UINT32 count;
++        FLOAT *array;
++        if (FAILED(hr = IPropertyValue_GetSingleArray( value, &count, &array ))) return hr;
++        if (count * sizeof(FLOAT) <= MAX_PROP_SIZE)
++        {
++            memcpy( prop->data, array, count * sizeof(FLOAT) );
++            prop->size = count * sizeof(FLOAT);
++        }
++        else FIXME( "an array of %u floats is not kept\n", count );
++        CoTaskMemFree( array );
++        return S_OK;
++    }
++    default:
++        FIXME( "property type %u is not supported\n", type );
++        return S_OK;
++    }
++}
++
++/* the name of a CompositionEffectSourceParameter (ours or a program's), or NULL */
++static WCHAR *source_parameter_name( IGraphicsEffectSource *source )
++{
++    IInspectable *param;
++    HSTRING name = NULL;
++    WCHAR *ret = NULL;
++
++    if (FAILED(IGraphicsEffectSource_QueryInterface( source, &IID_ICompositionEffectSourceParameter_e, (void **)&param )))
++        return NULL;
++    /* ICompositionEffectSourceParameter::get_Name, its first method */
++    if (SUCCEEDED(((HRESULT (WINAPI *)( IInspectable *, HSTRING * ))(*(void ***)param)[6])( param, &name )))
++    {
++        ret = hstring_copy( name );
++        WindowsDeleteString( name );
++    }
++    IInspectable_Release( param );
++    return ret;
++}
++
++static HRESULT read_effect( struct effect_graph *graph, IGraphicsEffect *effect, UINT depth, UINT *index );
++
++static HRESULT read_source( struct effect_graph *graph, IGraphicsEffectSource *source, UINT depth, int *out )
++{
++    IGraphicsEffect *effect;
++    WCHAR *name;
++    UINT i, node;
++    HRESULT hr;
++
++    if (!source) return E_INVALIDARG;
++    if ((name = source_parameter_name( source )))
++    {
++        for (i = 0; i < graph->param_count; i++)
++            if (!wcscmp( graph->params[i], name )) break;
++        if (i == graph->param_count)
++        {
++            if (graph->param_count == MAX_EFFECT_SOURCES)
++            {
++                free( name );
++                return E_INVALIDARG;
++            }
++            graph->params[graph->param_count++] = name;
++        }
++        else free( name );
++        *out = -1 - (int)i;
++        return S_OK;
++    }
++    if (SUCCEEDED(IGraphicsEffectSource_QueryInterface( source, &IID_IGraphicsEffect, (void **)&effect )))
++    {
++        hr = read_effect( graph, effect, depth + 1, &node );
++        IGraphicsEffect_Release( effect );
++        if (SUCCEEDED(hr)) *out = node;
++        return hr;
++    }
++    /* a source that is neither (a Win2D bitmap, say): Windows' compositor takes none */
++    WARN( "source %p is neither an effect nor a source parameter\n", source );
++    return E_INVALIDARG;
++}
++
++static HRESULT read_effect( struct effect_graph *graph, IGraphicsEffect *effect, UINT depth, UINT *index )
++{
++    graphics_effect_interop *interop;
++    struct effect_node *node;
++    IGraphicsEffectSource *source;
++    IPropertyValue *value;
++    HSTRING name = NULL;
++    UINT i, count;
++    HRESULT hr;
++
++    if (depth > 16 || graph->node_count == MAX_EFFECT_NODES) return E_INVALIDARG;
++    if (FAILED(hr = IGraphicsEffect_QueryInterface( effect, &IID_IGraphicsEffectD2D1Interop_x, (void **)&interop )))
++    {
++        WARN( "effect %p has no IGraphicsEffectD2D1Interop\n", effect );
++        return E_INVALIDARG;
++    }
++    node = &graph->nodes[*index = graph->node_count++];
++    graph->objects[*index] = effect;
++    IGraphicsEffect_AddRef( effect );
++    if (SUCCEEDED(IGraphicsEffect_get_Name( effect, &name )))
++    {
++        node->name = hstring_copy( name );
++        WindowsDeleteString( name );
++    }
++    if (FAILED(hr = interop->lpVtbl->GetEffectId( interop, &node->clsid ))) goto done;
++    TRACE( "effect %u %s: %s\n", *index, debugstr_w( node->name ), debugstr_guid( &node->clsid ) );
++
++    count = 0;
++    if (FAILED(hr = interop->lpVtbl->GetPropertyCount( interop, &count ))) goto done;
++    if (count > MAX_EFFECT_PROPS) { hr = E_INVALIDARG; goto done; }
++    if (count && !(node->props = calloc( count, sizeof(*node->props) ))) { hr = E_OUTOFMEMORY; goto done; }
++    node->prop_count = count;
++    for (i = 0; i < count; i++)
++    {
++        value = NULL;
++        if (FAILED(hr = interop->lpVtbl->GetProperty( interop, i, &value ))) goto done;
++        hr = read_property( value, &node->props[i] );
++        if (value) IPropertyValue_Release( value );
++        if (FAILED(hr)) goto done;
++    }
++
++    count = 0;
++    if (FAILED(hr = interop->lpVtbl->GetSourceCount( interop, &count ))) goto done;
++    if (count > MAX_EFFECT_SOURCES) { hr = E_INVALIDARG; goto done; }
++    for (i = 0; i < count; i++)
++    {
++        int src;
++        source = NULL;
++        if (FAILED(hr = interop->lpVtbl->GetSource( interop, i, &source ))) goto done;
++        node = &graph->nodes[*index];
++        hr = read_source( graph, source, depth, &src );
++        if (source) IGraphicsEffectSource_Release( source );
++        if (FAILED(hr)) goto done;
++        node = &graph->nodes[*index];
++        node->sources[node->source_count++] = src;
++    }
++done:
++    interop->lpVtbl->Release( interop );
++    return hr;
++}
++
++static UINT kind_bytes( enum anim_kind kind )
++{
++    switch (kind)
++    {
++    case ANIM_SCALAR: return 4;
++    case ANIM_VECTOR2: return 8;
++    case ANIM_VECTOR3: return 12;
++    case ANIM_VECTOR4: return 16;
++    case ANIM_MATRIX3X2: return 24;
++    case ANIM_MATRIX4X4: return 64;
++    default: return 0;
++    }
++}
++
++static enum anim_kind mapping_kind( GRAPHICS_EFFECT_PROPERTY_MAPPING mapping, UINT size )
++{
++    switch (mapping)
++    {
++    case MAPPING_DIRECT:
++        switch (size)
++        {
++        case 4: return ANIM_SCALAR;
++        case 8: return ANIM_VECTOR2;
++        case 12: return ANIM_VECTOR3;
++        case 16: return ANIM_VECTOR4;
++        case 24: return ANIM_MATRIX3X2;
++        case 64: return ANIM_MATRIX4X4;
++        default: return ANIM_NONE;
++        }
++    case MAPPING_VECTORX: case MAPPING_VECTORY: case MAPPING_VECTORZ: case MAPPING_VECTORW:
++    case MAPPING_RADIANS_TO_DEGREES:
++        return ANIM_SCALAR;
++    case MAPPING_RECT_TO_VECTOR4:
++        return ANIM_VECTOR4;
++    case MAPPING_COLOR_TO_VECTOR3: case MAPPING_COLOR_TO_VECTOR4:
++        return ANIM_COLOR;
++    default:
++        return ANIM_NONE;
++    }
++}
++
++static BYTE color_byte( float f )
++{
++    return (BYTE)floorf( max( 0.0f, min( 1.0f, f ) ) * 255.0f + 0.5f );
++}
++
++/* a Direct2D value in the animated value's terms */
++static void d2d_to_anim( const struct effect_anim *anim, const struct effect_prop *prop, BYTE *out )
++{
++    const float *f = (const float *)prop->data;
++    float *o = (float *)out;
++
++    memset( out, 0, MAX_PROP_SIZE );
++    switch (anim->mapping)
++    {
++    case MAPPING_VECTORX: case MAPPING_VECTORY: case MAPPING_VECTORZ: case MAPPING_VECTORW:
++    {
++        UINT c = anim->mapping - MAPPING_VECTORX;
++        if (prop->size > c * sizeof(float)) o[0] = f[c];
++        break;
++    }
++    case MAPPING_RADIANS_TO_DEGREES:
++        if (prop->size >= sizeof(float)) o[0] = f[0] * (float)M_PI / 180.0f;
++        break;
++    case MAPPING_RECT_TO_VECTOR4:
++        if (prop->size >= 4 * sizeof(float))
++        {
++            o[0] = f[0]; o[1] = f[1]; o[2] = f[2] - f[0]; o[3] = f[3] - f[1];
++        }
++        break;
++    case MAPPING_COLOR_TO_VECTOR3: case MAPPING_COLOR_TO_VECTOR4:
++    {
++        Color *color = (Color *)out;
++        color->A = prop->size >= 4 * sizeof(float) ? color_byte( f[3] ) : 255;
++        if (prop->size >= 3 * sizeof(float))
++        {
++            color->R = color_byte( f[0] ); color->G = color_byte( f[1] ); color->B = color_byte( f[2] );
++        }
++        break;
++    }
++    default:
++        memcpy( out, prop->data, min( prop->size, MAX_PROP_SIZE ) );
++        break;
++    }
++}
++
++/* the animated value back in Direct2D's terms, over the property's own value */
++static UINT anim_to_d2d( const struct effect_anim *anim, const struct effect_prop *base, const BYTE *value, BYTE *out )
++{
++    const float *v = (const float *)value;
++    float *o = (float *)out;
++    UINT size = base->size;
++
++    memcpy( out, base->data, MAX_PROP_SIZE );
++    switch (anim->mapping)
++    {
++    case MAPPING_VECTORX: case MAPPING_VECTORY: case MAPPING_VECTORZ: case MAPPING_VECTORW:
++    {
++        UINT c = anim->mapping - MAPPING_VECTORX;
++        o[c] = v[0];
++        size = max( size, (c + 1) * sizeof(float) );
++        break;
++    }
++    case MAPPING_RADIANS_TO_DEGREES:
++        o[0] = v[0] * 180.0f / (float)M_PI;
++        size = sizeof(float);
++        break;
++    case MAPPING_RECT_TO_VECTOR4:
++        o[0] = v[0]; o[1] = v[1]; o[2] = v[0] + v[2]; o[3] = v[1] + v[3];
++        size = 4 * sizeof(float);
++        break;
++    case MAPPING_COLOR_TO_VECTOR3: case MAPPING_COLOR_TO_VECTOR4:
++    {
++        const Color *color = (const Color *)value;
++        o[0] = color->R / 255.0f; o[1] = color->G / 255.0f; o[2] = color->B / 255.0f;
++        o[3] = color->A / 255.0f;
++        size = (anim->mapping == MAPPING_COLOR_TO_VECTOR3 ? 3 : 4) * sizeof(float);
++        break;
++    }
++    default:
++        size = max( size, kind_bytes( anim->kind ) );
++        memcpy( out, value, size );
++        break;
++    }
++    return size;
++}
++
++/* an animatable property's name, "Effect.Property": the node named Effect, and Property through its interop */
++static HRESULT add_animatable( struct effect_graph *graph, HSTRING hname )
++{
++    const WCHAR *full = WindowsGetStringRawBuffer( hname, NULL ), *dot = wcschr( full, '.' );
++    GRAPHICS_EFFECT_PROPERTY_MAPPING mapping = MAPPING_UNKNOWN;
++    graphics_effect_interop *interop = NULL;
++    struct effect_anim *anim, *anims;
++    UINT i, node, index = 0;
++    HRESULT hr;
++
++    if (!dot || dot == full) return E_INVALIDARG;
++    for (node = 0; node < graph->node_count; node++)
++        if (graph->nodes[node].name && wcslen( graph->nodes[node].name ) == dot - full &&
++            !wcsncmp( graph->nodes[node].name, full, dot - full ))
++            break;
++    if (node == graph->node_count)
++    {
++        WARN( "no effect named %s\n", debugstr_wn( full, dot - full ) );
++        return E_INVALIDARG;
++    }
++    /* that effect's description, for the property's mapping */
++    if (FAILED(IGraphicsEffect_QueryInterface( graph->objects[node], &IID_IGraphicsEffectD2D1Interop_x,
++                                               (void **)&interop )))
++        return E_INVALIDARG;
++    hr = interop->lpVtbl->GetNamedPropertyMapping( interop, dot + 1, &index, &mapping );
++    interop->lpVtbl->Release( interop );
++    if (FAILED(hr) || index >= graph->nodes[node].prop_count ||
++        mapping_kind( mapping, graph->nodes[node].props[index].size ) == ANIM_NONE)
++    {
++        WARN( "%s is not an animatable property (%#lx, index %u, mapping %u)\n", debugstr_w( full ), hr, index, mapping );
++        return E_INVALIDARG;
++    }
++    for (i = 0; i < graph->anim_count; i++) if (!wcscmp( graph->anims[i].name, full )) return S_OK;
++    if (!(anims = realloc( graph->anims, (graph->anim_count + 1) * sizeof(*anims) ))) return E_OUTOFMEMORY;
++    graph->anims = anims;
++    anim = &anims[graph->anim_count];
++    memset( anim, 0, sizeof(*anim) );
++    if (!(anim->name = hstring_copy( hname ))) return E_OUTOFMEMORY;
++    anim->node = node;
++    anim->index = index;
++    anim->mapping = mapping;
++    anim->kind = mapping_kind( mapping, graph->nodes[node].props[index].size );
++    d2d_to_anim( anim, &graph->nodes[node].props[index], anim->initial );
++    graph->anim_count++;
++    TRACE( "animatable %s: effect %u property %u, mapping %u\n", debugstr_w( full ), node, index, mapping );
++    return S_OK;
++}
++
++/* the graph keeps no reference to the description: later changes to it reach no brush, as on Windows */
++static void release_objects( struct effect_graph *graph )
++{
++    UINT i;
++    for (i = 0; i < MAX_EFFECT_NODES; i++)
++    {
++        if (graph->objects[i]) IGraphicsEffect_Release( graph->objects[i] );
++        graph->objects[i] = NULL;
++    }
++}
++
++HRESULT effect_graph_create( IGraphicsEffect *effect, IIterable_HSTRING *animatable, struct effect_graph **out )
++{
++    struct effect_graph *graph;
++    IIterator_HSTRING *iter;
++    boolean more = FALSE;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!effect) return E_INVALIDARG;
++    if (!(graph = calloc( 1, sizeof(*graph) ))) return E_OUTOFMEMORY;
++    graph->ref = 1;
++    if (FAILED(hr = read_effect( graph, effect, 0, &graph->root ))) goto fail;
++    if (animatable)
++    {
++        if (FAILED(hr = IIterable_HSTRING_First( animatable, &iter ))) goto fail;
++        hr = IIterator_HSTRING_get_HasCurrent( iter, &more );
++        while (SUCCEEDED(hr) && more)
++        {
++            HSTRING name = NULL;
++            if (FAILED(hr = IIterator_HSTRING_get_Current( iter, &name ))) break;
++            hr = add_animatable( graph, name );
++            WindowsDeleteString( name );
++            if (FAILED(hr)) break;
++            hr = IIterator_HSTRING_MoveNext( iter, &more );
++        }
++        IIterator_HSTRING_Release( iter );
++        if (FAILED(hr)) goto fail;
++    }
++    release_objects( graph );
++    *out = graph;
++    return S_OK;
++fail:
++    release_objects( graph );
++    effect_graph_release( graph );
++    return hr;
++}
++
++UINT effect_graph_param_count( const struct effect_graph *graph )
++{
++    return graph->param_count;
++}
++
++/* the index of a source parameter, or -1 */
++int effect_graph_param_index( const struct effect_graph *graph, const WCHAR *name )
++{
++    UINT i;
++    for (i = 0; i < graph->param_count; i++) if (!wcscmp( graph->params[i], name )) return i;
++    return -1;
++}
++
++/* a brush's own values of the animatable properties, at their described values */
++BYTE *effect_values_create( const struct effect_graph *graph )
++{
++    BYTE *values = calloc( max( graph->anim_count, 1 ), MAX_PROP_SIZE );
++    UINT i;
++
++    if (!values) return NULL;
++    for (i = 0; i < graph->anim_count; i++) memcpy( values + i * MAX_PROP_SIZE, graph->anims[i].initial, MAX_PROP_SIZE );
++    return values;
++}
++
++/* where an animatable property's value is: the brush's Properties when they have it, else the brush's own */
++static void *anim_storage( const struct effect_graph *graph, UINT i, BYTE *values, ICompositionPropertySet *properties )
++{
++    enum anim_kind kind;
++    void *data;
++
++    if (properties && (data = property_set_value( properties, graph->anims[i].name, &kind )) &&
++        kind == graph->anims[i].kind)
++        return data;
++    return values + i * MAX_PROP_SIZE;
++}
++
++/* StartAnimation of an effect brush: "Effect.Property", maybe with components ("Effect.Offset.X") */
++BOOL effect_values_resolve( const struct effect_graph *graph, BYTE *values, ICompositionPropertySet *properties,
++                            const WCHAR *name, struct anim_property *prop )
++{
++    UINT i;
++
++#ifdef SG_MUTANT_EFFECT_NOT_ANIMATABLE
++    return FALSE;
++#endif
++    for (i = 0; i < graph->anim_count; i++)
++    {
++        size_t len = wcslen( graph->anims[i].name );
++        if (wcsnicmp( graph->anims[i].name, name, len ) || (name[len] && name[len] != '.')) continue;
++        prop->base_kind = graph->anims[i].kind;
++        prop->data = anim_storage( graph, i, values, properties );
++        prop->factor = 0;
++        return anim_resolve_components( name[len] ? name + len : NULL, prop );
++    }
++    return FALSE;
++}
++
++/* a stamp of the animatable values a brush draws with: it changes when one does */
++UINT64 effect_values_stamp( const struct effect_graph *graph, BYTE *values, ICompositionPropertySet *properties,
++                            UINT64 h )
++{
++    UINT i, j;
++
++    for (i = 0; i < graph->anim_count; i++)
++    {
++        const BYTE *p = anim_storage( graph, i, values, properties );
++        for (j = 0; j < MAX_PROP_SIZE; j++) h = (h ^ p[j]) * 0x100000001b3ull;
++    }
++    return h;
++}
++
++/* the graph's output for these source images (NULL for a parameter no brush is bound to); the caller holds
++ * the compositor's lock and releases the image */
++ID2D1Image *effect_graph_render( const struct effect_graph *graph, BYTE *values, ICompositionPropertySet *properties,
++                                 ID2D1DeviceContext *ctx, ID2D1Image **param_images )
++{
++    ID2D1Effect *effects[MAX_EFFECT_NODES] = { 0 };
++    ID2D1Image *output = NULL;
++    BYTE data[MAX_PROP_SIZE];
++    UINT i, j, size;
++    HRESULT hr;
++
++    for (i = 0; i < graph->node_count; i++)
++    {
++        const struct effect_node *node = &graph->nodes[i];
++
++        if (FAILED(hr = ID2D1DeviceContext_CreateEffect( ctx, &node->clsid, &effects[i] )))
++        {
++            FIXME( "effect %s %s is not drawn: %#lx\n", debugstr_w( node->name ), debugstr_guid( &node->clsid ), hr );
++            goto done;
++        }
++        for (j = 0; j < node->prop_count; j++)
++        {
++            if (!node->props[j].size) continue;
++            if (FAILED(hr = ID2D1Effect_SetValue( effects[i], j, D2D1_PROPERTY_TYPE_UNKNOWN, node->props[j].data,
++                                                  node->props[j].size )))
++                WARN( "effect %s property %u (%u bytes): %#lx\n", debugstr_w( node->name ), j, node->props[j].size, hr );
++        }
++    }
++    for (i = 0; i < graph->anim_count; i++)
++    {
++        const struct effect_anim *anim = &graph->anims[i];
++        const struct effect_prop *base = &graph->nodes[anim->node].props[anim->index];
++        size = anim_to_d2d( anim, base, anim_storage( graph, i, values, properties ), data );
++        ID2D1Effect_SetValue( effects[anim->node], anim->index, D2D1_PROPERTY_TYPE_UNKNOWN, data, size );
++    }
++    for (i = 0; i < graph->node_count; i++)
++    {
++        const struct effect_node *node = &graph->nodes[i];
++
++        if (ID2D1Effect_GetInputCount( effects[i] ) < node->source_count)
++            ID2D1Effect_SetInputCount( effects[i], node->source_count );
++        for (j = 0; j < node->source_count; j++)
++        {
++            ID2D1Image *input = NULL;
++
++            if (node->sources[j] >= 0) ID2D1Effect_GetOutput( effects[node->sources[j]], &input );
++            else if ((input = param_images[-1 - node->sources[j]])) ID2D1Image_AddRef( input );
++            ID2D1Effect_SetInput( effects[i], j, input, FALSE );
++            if (input) ID2D1Image_Release( input );
++        }
++    }
++    ID2D1Effect_GetOutput( effects[graph->root], &output );
++done:
++    for (i = 0; i < graph->node_count; i++) if (effects[i]) ID2D1Effect_Release( effects[i] );
++    return output;
++}
++
++/***********************************************************************
++ *          CompositionEffectFactory
++ */
++
++struct effect_factory
++{
++    ICompositionEffectFactory ICompositionEffectFactory_iface;
++    ICompositionObject ICompositionObject_iface;
++    IClosable IClosable_iface;
++    IInspectable ICompositionObject4_iface;
++    LONG ref;
++    struct compositor *compositor;
++    ICompositionPropertySet *properties;
++    struct effect_graph *graph;
++};
++
++static inline struct effect_factory *impl_from_ICompositionEffectFactory( ICompositionEffectFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct effect_factory, ICompositionEffectFactory_iface );
++}
++
++static HRESULT WINAPI factory_QueryInterface( ICompositionEffectFactory *iface, REFIID iid, void **out )
++{
++    struct effect_factory *impl = impl_from_ICompositionEffectFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionEffectFactory ))
++        *out = &impl->ICompositionEffectFactory_iface;
++    else if (IsEqualGUID( iid, &IID_ICompositionObject ))
++        *out = &impl->ICompositionObject_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &impl->IClosable_iface;
++    else if (IsEqualGUID( iid, &IID_ICompositionObject4_x ))
++        *out = &impl->ICompositionObject4_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI factory_AddRef( ICompositionEffectFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_ICompositionEffectFactory( iface )->ref );
++}
++
++static ULONG WINAPI factory_Release( ICompositionEffectFactory *iface )
++{
++    struct effect_factory *impl = impl_from_ICompositionEffectFactory( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    if (!ref)
++    {
++        effect_graph_release( impl->graph );
++        object_release_properties( impl->properties );
++        ICompositor_Release( (ICompositor *)impl->compositor );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI factory_GetIids( ICompositionEffectFactory *iface, ULONG *count, IID **iids )
++{
++    if (!(*iids = CoTaskMemAlloc( 3 * sizeof(IID) ))) return E_OUTOFMEMORY;
++    (*iids)[0] = IID_ICompositionEffectFactory;
++    (*iids)[1] = IID_ICompositionObject;
++    (*iids)[2] = IID_IClosable;
++    *count = 3;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_GetRuntimeClassName( ICompositionEffectFactory *iface, HSTRING *name )
++{
++    return WindowsCreateString( class_effect_factory, wcslen( class_effect_factory ), name );
++}
++
++static HRESULT WINAPI factory_GetTrustLevel( ICompositionEffectFactory *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_CreateBrush( ICompositionEffectFactory *iface, ICompositionEffectBrush **result )
++{
++    struct effect_factory *impl = impl_from_ICompositionEffectFactory( iface );
++
++    TRACE( "iface %p, result %p.\n", iface, result );
++    if (!result) return E_POINTER;
++    return effect_brush_create( impl->compositor, impl->graph, result );
++}
++
++static HRESULT WINAPI factory_get_ExtendedError( ICompositionEffectFactory *iface, HRESULT *value )
++{
++    if (!value) return E_POINTER;
++    *value = S_OK;
++    return S_OK;
++}
++
++static HRESULT WINAPI factory_get_LoadStatus( ICompositionEffectFactory *iface, CompositionEffectFactoryLoadStatus *value )
++{
++    if (!value) return E_POINTER;
++    *value = CompositionEffectFactoryLoadStatus_Success;
++    return S_OK;
++}
++
++static const struct ICompositionEffectFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_GetIids,
++    factory_GetRuntimeClassName,
++    factory_GetTrustLevel,
++    factory_CreateBrush,
++    factory_get_ExtendedError,
++    factory_get_LoadStatus,
++};
++
++DEFINE_COMPOSITION_OBJECT( factory, struct effect_factory, ICompositionEffectFactory_iface )
++DEFINE_COMPOSITION_OBJECT4( factory, struct effect_factory, ICompositionEffectFactory_iface )
++
++HRESULT effect_factory_create( struct compositor *compositor, IGraphicsEffect *effect, IIterable_HSTRING *animatable,
++                               ICompositionEffectFactory **out )
++{
++    struct effect_factory *impl;
++    struct effect_graph *graph;
++    HRESULT hr;
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++#ifdef SG_MUTANT_NO_EFFECT_FACTORY
++    return E_NOTIMPL;
++#endif
++    if (FAILED(hr = effect_graph_create( effect, animatable, &graph ))) return hr;
++    if (!(impl = calloc( 1, sizeof(*impl) )))
++    {
++        effect_graph_release( graph );
++        return E_OUTOFMEMORY;
++    }
++    impl->ICompositionEffectFactory_iface.lpVtbl = &factory_vtbl;
++    impl->ICompositionObject_iface.lpVtbl = &factory_object_vtbl;
++    impl->IClosable_iface.lpVtbl = &factory_closable_vtbl;
++    impl->ICompositionObject4_iface.lpVtbl = (const IInspectableVtbl *)factory_object4_vtbl;
++    impl->ref = 1;
++    impl->compositor = compositor;
++    ICompositor_AddRef( (ICompositor *)compositor );
++    impl->graph = graph;
++    *out = &impl->ICompositionEffectFactory_iface;
++    return S_OK;
++}
+--- a/dlls/dcomp/Makefile.in
++++ b/dlls/dcomp/Makefile.in
+@@ -10,6 +10,7 @@
+ 	composition.c \
+ 	objects.c \
+ 	device.c \
++	effects.c \
+ 	expression.c \
+ 	implicit.c \
+ 	lights.c \
+--- a/dlls/dcomp/animation.c
++++ b/dlls/dcomp/animation.c
+@@ -134,6 +134,12 @@
+     return TRUE;
+ }
+ 
++/* (wine-sg 9804) for effects.c: the components after a property's name */
++BOOL anim_resolve_components( const WCHAR *dot, struct anim_property *prop )
++{
++    return resolve_components( dot, prop );
++}
++
+ BOOL anim_resolve( void *impl, const struct anim_member *table, UINT count, const WCHAR *name,
+                    struct anim_property *prop )
+ {
+@@ -777,6 +783,18 @@
+ DEFINE_COMPOSITION_OBJECT_( property_set, struct property_set, ICompositionPropertySet_iface, property_set_animatable )
+ DEFINE_COMPOSITION_OBJECT4( property_set, struct property_set, ICompositionPropertySet_iface )
+ 
++/* (wine-sg 9804) an entry of one of our property sets by its whole name ("Blur.BlurAmount" too): where its
++ * value is and its kind, NULL when there is none; the caller holds the compositor's lock */
++void *property_set_value( ICompositionPropertySet *iface, const WCHAR *name, enum anim_kind *kind )
++{
++    struct property *property;
++
++    if (!iface || iface->lpVtbl != &property_set_vtbl) return NULL;
++    if (!(property = find_property( impl_from_ICompositionPropertySet( iface ), name, wcslen( name ) ))) return NULL;
++    *kind = property->kind;
++    return &property->value;
++}
++
+ HRESULT property_set_create( struct compositor *compositor, ICompositionPropertySet **out )
+ {
+     struct property_set *impl;
+--- a/dlls/dcomp/composition_private.h
++++ b/dlls/dcomp/composition_private.h
+@@ -200,6 +200,8 @@
+ 
+ /* animation.c: the compositor's animations, batches, easing functions and property sets */
+ HRESULT property_set_create( struct compositor *compositor, ICompositionPropertySet **out );
++void *property_set_value( ICompositionPropertySet *iface, const WCHAR *name, enum anim_kind *kind );
++BOOL anim_resolve_components( const WCHAR *dot, struct anim_property *prop );
+ HRESULT keyframe_animation_create( struct compositor *compositor, enum anim_kind kind, void **out );
+ HRESULT expression_animation_create( struct compositor *compositor, HSTRING expression, IExpressionAnimation **out );
+ HRESULT linear_easing_create( struct compositor *compositor, ILinearEasingFunction **out );
+@@ -332,6 +334,24 @@
+         pfx##_object4_TryGetAnimationController,                                                   \
+     };
+ 
++/* effects.c (wine-sg 9804): effect factories and the effect graphs of effect brushes */
++struct effect_graph;
++HRESULT effect_factory_create( struct compositor *compositor, IGraphicsEffect *effect, IIterable_HSTRING *animatable,
++                               ICompositionEffectFactory **out );
++struct effect_graph *effect_graph_addref( struct effect_graph *graph );
++void effect_graph_release( struct effect_graph *graph );
++UINT effect_graph_param_count( const struct effect_graph *graph );
++int effect_graph_param_index( const struct effect_graph *graph, const WCHAR *name );
++BYTE *effect_values_create( const struct effect_graph *graph );
++BOOL effect_values_resolve( const struct effect_graph *graph, BYTE *values, ICompositionPropertySet *properties,
++                            const WCHAR *name, struct anim_property *prop );
++UINT64 effect_values_stamp( const struct effect_graph *graph, BYTE *values, ICompositionPropertySet *properties,
++                            UINT64 h );
++ID2D1Image *effect_graph_render( const struct effect_graph *graph, BYTE *values, ICompositionPropertySet *properties,
++                                 ID2D1DeviceContext *ctx, ID2D1Image **param_images );
++/* composition.c */
++HRESULT effect_brush_create( struct compositor *compositor, struct effect_graph *graph, ICompositionEffectBrush **out );
++
+ #define DEFINE_COMPOSITION_OBJECT( pfx, impl_type, base_iface ) \
+     DEFINE_COMPOSITION_OBJECT_( pfx, impl_type, base_iface, anim_none )
+ 
+--- a/dlls/dcomp/composition.c
++++ b/dlls/dcomp/composition.c
+@@ -126,6 +126,7 @@
+ static const WCHAR class_drop_shadow[] = L"Windows.UI.Composition.DropShadow";
+ static const WCHAR class_nine_grid_brush[] = L"Windows.UI.Composition.CompositionNineGridBrush";
+ static const WCHAR class_backdrop_brush[] = L"Windows.UI.Composition.CompositionBackdropBrush";
++static const WCHAR class_effect_brush[] = L"Windows.UI.Composition.CompositionEffectBrush";
+ 
+ /***********************************************************************
+  *          Visuals
+@@ -1071,6 +1072,13 @@
+     CompositionStretch stretch;
+     FLOAT horizontal_ratio, vertical_ratio;
+     ICompositionPropertySet *properties;
++    /* (wine-sg 9804) an effect brush: its factory's graph, the brushes bound to its source parameters, its
++     * values of the animatable properties */
++    BOOL effect;
++    struct { const void * const *vtbl; } ICompositionEffectBrush_iface;
++    struct effect_graph *graph;
++    ICompositionBrush *effect_sources[16];
++    BYTE *effect_values;
+ };
+ 
+ static const struct ICompositionBrushVtbl brush_vtbl;
+@@ -1091,7 +1099,7 @@
+ {
+     struct brush *brush = unsafe_brush( iface );
+ 
+-    if (!brush || brush->surface_brush || brush->mask_brush || brush->nine_grid || brush->backdrop) return FALSE;
++    if (!brush || brush->surface_brush || brush->mask_brush || brush->nine_grid || brush->backdrop || brush->effect) return FALSE;
+     color->r = brush->color.R / 255.0f;
+     color->g = brush->color.G / 255.0f;
+     color->b = brush->color.B / 255.0f;
+@@ -1108,13 +1116,15 @@
+     if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable )
+             || IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_ICompositionBrush ))
+         *out = &impl->ICompositionBrush_iface;
+-    else if (!impl->surface_brush && !impl->mask_brush && !impl->nine_grid && !impl->backdrop
++    else if (!impl->surface_brush && !impl->mask_brush && !impl->nine_grid && !impl->backdrop && !impl->effect
+             && IsEqualGUID( iid, &IID_ICompositionColorBrush ))
+         *out = &impl->ICompositionColorBrush_iface;
+     else if (impl->nine_grid && IsEqualGUID( iid, &IID_ICompositionNineGridBrush_x ))
+         *out = &impl->ICompositionNineGridBrush_iface;
+     else if (impl->backdrop && IsEqualGUID( iid, &IID_ICompositionBackdropBrush_x ))
+         *out = &impl->ICompositionBackdropBrush_iface;
++    else if (impl->effect && IsEqualGUID( iid, &IID_ICompositionEffectBrush ))
++        *out = &impl->ICompositionEffectBrush_iface;
+     else if (impl->surface_brush && IsEqualGUID( iid, &IID_ICompositionSurfaceBrush ))
+         *out = &impl->ICompositionSurfaceBrush_iface;
+     else if (impl->mask_brush && IsEqualGUID( iid, &IID_ICompositionMaskBrush_x ))
+@@ -1144,11 +1154,16 @@
+ {
+     struct brush *impl = impl_from_ICompositionBrush( iface );
+     ULONG ref = InterlockedDecrement( &impl->ref );
++    UINT i;
+     if (!ref)
+     {
+         if (impl->surface) ICompositionSurface_Release( impl->surface );
+         if (impl->mask) ICompositionBrush_Release( impl->mask );
+         if (impl->source) ICompositionBrush_Release( impl->source );
++        for (i = 0; i < ARRAY_SIZE(impl->effect_sources); i++)
++            if (impl->effect_sources[i]) ICompositionBrush_Release( impl->effect_sources[i] );
++        if (impl->graph) effect_graph_release( impl->graph );
++        free( impl->effect_values );
+         ICompositor_Release( (ICompositor *)impl->compositor );
+         object_release_properties( impl->properties );
+         free( impl );
+@@ -1164,10 +1179,12 @@
+     static const IID *const mask[] = { &IID_ICompositionBrush, &IID_ICompositionMaskBrush_x, &IID_ICompositionObject, &IID_IClosable };
+     static const IID *const nine_grid[] = { &IID_ICompositionBrush, &IID_ICompositionNineGridBrush_x, &IID_ICompositionObject, &IID_IClosable };
+     static const IID *const backdrop[] = { &IID_ICompositionBrush, &IID_ICompositionBackdropBrush_x, &IID_ICompositionObject, &IID_IClosable };
++    static const IID *const effect[] = { &IID_ICompositionBrush, &IID_ICompositionEffectBrush, &IID_ICompositionObject, &IID_IClosable };
+     if (impl->surface_brush) return get_iids( iid_count, iids, surface, ARRAY_SIZE(surface) );
+     if (impl->mask_brush) return get_iids( iid_count, iids, mask, ARRAY_SIZE(mask) );
+     if (impl->nine_grid) return get_iids( iid_count, iids, nine_grid, ARRAY_SIZE(nine_grid) );
+     if (impl->backdrop) return get_iids( iid_count, iids, backdrop, ARRAY_SIZE(backdrop) );
++    if (impl->effect) return get_iids( iid_count, iids, effect, ARRAY_SIZE(effect) );
+     return get_iids( iid_count, iids, color, ARRAY_SIZE(color) );
+ }
+ 
+@@ -1176,7 +1193,7 @@
+     struct brush *impl = impl_from_ICompositionBrush( iface );
+     return runtime_class_name( impl->surface_brush ? class_surface_brush : impl->mask_brush ? class_mask_brush
+                                : impl->nine_grid ? class_nine_grid_brush : impl->backdrop ? class_backdrop_brush
+-                               : class_color_brush, class_name );
++                               : impl->effect ? class_effect_brush : class_color_brush, class_name );
+ }
+ 
+ static HRESULT WINAPI brush_GetTrustLevel( ICompositionBrush *iface, TrustLevel *trust_level )
+@@ -1485,6 +1502,73 @@
+     backdrop_brush_GetRuntimeClassName, backdrop_brush_GetTrustLevel,
+ };
+ 
++/* CompositionEffectBrush (wine-sg 9804): a factory's effect graph, drawn over the brushes bound to its source
++ * parameters by name (a parameter the graph does not have is an error, E_INVALIDARG) */
++SG_VOID_IINSPECTABLE( effect_brush, struct brush, ICompositionEffectBrush_iface, ICompositionBrush, ICompositionBrush_iface )
++
++static HRESULT WINAPI effect_brush_GetSourceParameter( void *iface, HSTRING name, ICompositionBrush **result )
++{
++    struct brush *impl = effect_brush_impl( iface );
++    int index;
++
++    TRACE( "iface %p, name %s, result %p.\n", iface, debugstr_hstring( name ), result );
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if ((index = effect_graph_param_index( impl->graph, WindowsGetStringRawBuffer( name, NULL ) )) < 0)
++        return E_INVALIDARG;
++    compositor_lock( impl->compositor );
++    if ((*result = impl->effect_sources[index])) ICompositionBrush_AddRef( *result );
++    compositor_unlock( impl->compositor );
++    return S_OK;
++}
++
++static HRESULT WINAPI effect_brush_SetSourceParameter( void *iface, HSTRING name, ICompositionBrush *source )
++{
++    struct brush *impl = effect_brush_impl( iface );
++    ICompositionBrush *old;
++    int index;
++
++    TRACE( "iface %p, name %s, source %p.\n", iface, debugstr_hstring( name ), source );
++    if ((index = effect_graph_param_index( impl->graph, WindowsGetStringRawBuffer( name, NULL ) )) < 0)
++        return E_INVALIDARG;
++    if (source) ICompositionBrush_AddRef( source );
++    compositor_lock( impl->compositor );
++    old = impl->effect_sources[index];
++    impl->effect_sources[index] = source;
++    compositor_unlock( impl->compositor );
++    if (old) ICompositionBrush_Release( old );
++    compositor_changed( impl->compositor );
++    return S_OK;
++}
++
++static const void * const effect_brush_vtbl[] =
++{
++    effect_brush_QueryInterface, effect_brush_AddRef, effect_brush_Release, effect_brush_GetIids,
++    effect_brush_GetRuntimeClassName, effect_brush_GetTrustLevel,
++    effect_brush_GetSourceParameter, effect_brush_SetSourceParameter,
++};
++
++static HRESULT brush_create( struct compositor *compositor, BOOL surface_brush, struct brush **out );
++
++HRESULT effect_brush_create( struct compositor *compositor, struct effect_graph *graph, ICompositionEffectBrush **out )
++{
++    struct brush *brush;
++    HRESULT hr;
++
++    *out = NULL;
++    if (FAILED(hr = brush_create( compositor, FALSE, &brush ))) return hr;
++    if (!(brush->effect_values = effect_values_create( graph )))
++    {
++        ICompositionBrush_Release( &brush->ICompositionBrush_iface );
++        return E_OUTOFMEMORY;
++    }
++    brush->effect = TRUE;
++    brush->graph = effect_graph_addref( graph );
++    brush->ICompositionEffectBrush_iface.vtbl = effect_brush_vtbl;
++    *out = (ICompositionEffectBrush *)&brush->ICompositionEffectBrush_iface;
++    return S_OK;
++}
++
+ static BOOL brush_animatable( void *impl, const WCHAR *name, struct anim_property *prop )
+ {
+     static const struct anim_member members[] =
+@@ -1505,6 +1589,7 @@
+         { L"TopInsetScale", ANIM_SCALAR, offsetof(struct brush, ng_top_scale) },
+     };
+     struct brush *brush = impl;
++    if (brush->effect) return effect_values_resolve( brush->graph, brush->effect_values, brush->properties, name, prop );
+     if (brush->nine_grid) return anim_resolve( impl, nine_grid_members, ARRAY_SIZE(nine_grid_members), name, prop );
+     if (brush->mask_brush || brush->backdrop) return FALSE;
+     /* a color brush's colour, a surface brush's alignment */
+@@ -1606,6 +1691,8 @@
+     ULONG ref = InterlockedDecrement( &impl->ref );
+     if (!ref)
+     {
++        if (impl->geometry) IInspectable_Release( impl->geometry );
++        if (impl->view_box) IInspectable_Release( impl->view_box );
+         ICompositor_Release( (ICompositor *)impl->compositor );
+         object_release_properties( impl->properties );
+         free( impl );
+@@ -3025,12 +3112,84 @@
+     v->render_offset.Y += v->relative_offset.Y * parent.Y;
+ }
+ 
++/* (wine-sg 9804) an effect brush: each bound source brush drawn into a bitmap of the visual's size (by a device
++ * context of its own: the one drawing the tree has its clips and layers pushed), the graph of Direct2D effects
++ * over them, its output drawn over the visual's area */
++static void draw_effect_brush( ID2D1DeviceContext *ctx, Vector2 size, struct brush *brush, float opacity,
++        unsigned int depth )
++{
++    static const D2D1_MATRIX_3X2_F identity = { ._11 = 1.0f, ._22 = 1.0f };
++    D2D1_BITMAP_PROPERTIES1 props = { { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, 96.0f, 96.0f,
++                                      D2D1_BITMAP_OPTIONS_TARGET };
++    ID2D1Image *images[ARRAY_SIZE(brush->effect_sources)] = { 0 }, *output;
++    UINT i, count = effect_graph_param_count( brush->graph ), w, h, none = 0;
++    ID2D1DeviceContext *offscreen = NULL;
++    ID2D1Device *device = NULL;
++    D2D1_RECT_F area = { 0, 0, size.X, size.Y };
++
++    if (depth > 8 || size.X <= 0.0f || size.Y <= 0.0f) return;
++    if (draw_render_target_only)
++    {
++        FIXME( "an effect brush is not drawn into a render target\n" );
++        return;
++    }
++    ID2D1DeviceContext_GetDpi( ctx, &props.dpiX, &props.dpiY );
++    w = (UINT)ceilf( size.X * props.dpiX / 96.0f );
++    h = (UINT)ceilf( size.Y * props.dpiY / 96.0f );
++    for (i = 0; i < count && i < ARRAY_SIZE(images); i++)
++    {
++        struct brush *source = unsafe_brush( brush->effect_sources[i] );
++        ID2D1Bitmap1 *bitmap;
++
++        if (!source) continue;
++        if (!offscreen)
++        {
++            ID2D1DeviceContext_GetDevice( ctx, &device );
++            if (!device || FAILED(ID2D1Device_CreateDeviceContext( device, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &offscreen )))
++                break;
++            ID2D1DeviceContext_SetDpi( offscreen, props.dpiX, props.dpiY );
++        }
++        if (FAILED(ID2D1DeviceContext_CreateBitmap( offscreen, (D2D1_SIZE_U){ w, h }, NULL, 0, &props, &bitmap ))) continue;
++        ID2D1DeviceContext_SetTarget( offscreen, (ID2D1Image *)bitmap );
++        ID2D1DeviceContext_BeginDraw( offscreen );
++        ID2D1DeviceContext_SetTransform( offscreen, &identity );
++        ID2D1DeviceContext_Clear( offscreen, NULL );
++        draw_brush( offscreen, size, source, 1.0f, &identity, NULL, 0, &none, depth + 1 );
++        ID2D1DeviceContext_EndDraw( offscreen, NULL, NULL );
++        ID2D1DeviceContext_SetTarget( offscreen, NULL );
++        images[i] = (ID2D1Image *)bitmap;
++    }
++    if (offscreen) ID2D1DeviceContext_Release( offscreen );
++    if (device) ID2D1Device_Release( device );
++
++    if ((output = effect_graph_render( brush->graph, brush->effect_values, brush->properties, ctx, images )))
++    {
++        D2D1_LAYER_PARAMETERS1 layer;
++
++        memset( &layer, 0, sizeof(layer) );
++        layer.contentBounds = area;
++        layer.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
++        layer.maskTransform._11 = layer.maskTransform._22 = 1.0f;
++        layer.opacity = opacity;
++        ID2D1DeviceContext_PushAxisAlignedClip( ctx, &area, D2D1_ANTIALIAS_MODE_ALIASED );
++        if (opacity < 1.0f) ID2D1DeviceContext_PushLayer( ctx, &layer, NULL );
++        ID2D1DeviceContext_DrawImage( ctx, output, NULL, NULL, D2D1_INTERPOLATION_MODE_LINEAR,
++                                      D2D1_COMPOSITE_MODE_SOURCE_OVER );
++        if (opacity < 1.0f) ID2D1DeviceContext_PopLayer( ctx );
++        ID2D1DeviceContext_PopAxisAlignedClip( ctx );
++        ID2D1Image_Release( output );
++    }
++    for (i = 0; i < ARRAY_SIZE(images); i++) if (images[i]) ID2D1Image_Release( images[i] );
++}
++
+ /* what a sprite visual's brush paints over its area */
+ static void draw_brush( ID2D1DeviceContext *ctx, Vector2 size, struct brush *brush, float opacity,
+         const D2D1_MATRIX_3X2_F *world, struct swapchain_place *places, unsigned int max_places, unsigned int *count,
+         unsigned int depth )
+ {
+-    if (brush->mask_brush)
++    if (brush->effect)
++        draw_effect_brush( ctx, size, brush, opacity, depth );
++    else if (brush->mask_brush)
+         draw_mask_brush( ctx, size, brush, opacity, world, places, max_places, count, depth );
+     else if (brush->nine_grid)
+         draw_nine_grid_brush( ctx, size, brush, opacity, world, places, max_places, count, depth );
+@@ -3327,6 +3486,15 @@
+                ^ (UINT64)*(UINT32 *)&brush->ng_bottom << 24 ^ (UINT64)*(UINT32 *)&brush->ng_left_scale << 32
+                ^ (UINT64)*(UINT32 *)&brush->ng_top_scale << 36 ^ (UINT64)*(UINT32 *)&brush->ng_right_scale << 40
+                ^ (UINT64)*(UINT32 *)&brush->ng_bottom_scale << 44 ^ brush->ng_hollow) * 0x100000001b3ull;
++    if (brush->effect && depth <= 8)
++    {
++        /* (9804) its animatable values and what its sources draw */
++        UINT i;
++        h = effect_values_stamp( brush->graph, brush->effect_values, brush->properties, h );
++        for (i = 0; i < ARRAY_SIZE(brush->effect_sources); i++)
++            if ((part = unsafe_brush( brush->effect_sources[i] ))) h = brush_stamp( part, h ^ (3 + i), depth + 1 );
++        return h;
++    }
+     if ((!brush->mask_brush && !brush->nine_grid) || depth > 8) return h;
+     if ((part = unsafe_brush( brush->mask ))) h = brush_stamp( part, h ^ 1, depth + 1 );
+     if ((part = unsafe_brush( brush->source ))) h = brush_stamp( part, h ^ 2, depth + 1 );
+@@ -3749,9 +3917,21 @@
+         return E_NOTIMPL;                                                                          \
+     }
+ 
+-COMPOSITOR_NOT_YET( CreateEffectFactory, IGraphicsEffect *effect, ICompositionEffectFactory **result )
+-COMPOSITOR_NOT_YET( CreateEffectFactoryWithProperties, IGraphicsEffect *effect, IIterable_HSTRING *animatable,
+-                    ICompositionEffectFactory **result )
++/* (wine-sg 9804) effects.c */
++static HRESULT WINAPI compositor_CreateEffectFactory( ICompositor *iface, IGraphicsEffect *effect,
++                                                      ICompositionEffectFactory **result )
++{
++    TRACE( "iface %p, effect %p, result %p.\n", iface, effect, result );
++    return effect_factory_create( impl_from_ICompositor( iface ), effect, NULL, result );
++}
++
++static HRESULT WINAPI compositor_CreateEffectFactoryWithProperties( ICompositor *iface, IGraphicsEffect *effect,
++                                                                    IIterable_HSTRING *animatable,
++                                                                    ICompositionEffectFactory **result )
++{
++    TRACE( "iface %p, effect %p, animatable %p, result %p.\n", iface, effect, animatable, result );
++    return effect_factory_create( impl_from_ICompositor( iface ), effect, animatable, result );
++}
+ COMPOSITOR_NOT_YET( CreateTargetForCurrentView, ICompositionTarget **result )
+ 
+ #define COMPOSITOR_KEYFRAME_ANIMATION( name, iface_type, kind )                                     \
