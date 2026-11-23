@@ -15,7 +15,7 @@ WINE="${WINE:-/opt/wine-sg/bin/wine}"
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 command -v python3 >/dev/null || { echo "SKIP: python3 missing"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-srvdeath.XXXXXX)
-trap 'rm -rf "$T"' EXIT INT TERM
+trap 'rm -rf "$T" "${SG_GATE_HOME:-$T}"' EXIT INT TERM
 # no server is ever started: the stand-in is the only one, and the prefix is never touched
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all
 mkdir -p "$WINEPREFIX"
