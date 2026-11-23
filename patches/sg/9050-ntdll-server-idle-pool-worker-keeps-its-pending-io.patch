@@ -1,0 +1,163 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll, server: an idle thread-pool worker with I/O in flight is not retired (9050)
+
+digiKam froze for good when a photo was opened (qa4, alice and bob). Its main
+thread waited for exiftool's answer; exiftool had answered. digiKam reads the
+child's stdout and stderr through Qt 6's QProcess, whose pipe reader issues
+each overlapped ReadFile from inside its thread-pool wait callback -- on
+whatever worker runs it. When that worker then sat idle for 5 s, Wine's pool
+retired it, the server cancelled the read with the thread
+(cancel_terminating_thread_asyncs, as Windows does for a thread that exits),
+Qt took stderr for a broken pipe and the "{ready}" line exiftool wrote there
+was never read. Intermittent: it depends on which worker issued the read.
+
+Windows' thread pool does not retire a worker while I/O it started is in
+flight (ThreadIsIoPending). Now the same:
+- server: GET_THREAD_INFO_FLAG_IO_PENDING in get_thread_info's flags, set
+  while the thread has an async its exit would cancel (the same rule
+  cancel_terminating_thread_asyncs uses). A new flag bit only: an older
+  server simply never sets it.
+- ntdll: ThreadIsIoPending answers from it (it was always FALSE, 8298).
+- ntdll threadpool: an idle worker past its timeout stays while
+  ThreadIsIoPending is TRUE for it.
+A plain thread that exits still cancels its pending I/O, as on Windows.
+Mutant SG_MUTANT_TP_RETIRE_WITH_IO (dlls/ntdll/threadpool.c); gate
+test-tpiopending.
+---
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1295,6 +1295,7 @@
+ @END
+ #define GET_THREAD_INFO_FLAG_DBG_HIDDEN 0x01
+ #define GET_THREAD_INFO_FLAG_TERMINATED 0x02
++#define GET_THREAD_INFO_FLAG_IO_PENDING 0x04 /* I/O the thread's exit would cancel is in flight (9050) */
+ 
+ 
+ /* Retrieve information about thread times */
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1389,6 +1389,7 @@
+ };
+ #define GET_THREAD_INFO_FLAG_DBG_HIDDEN 0x01
+ #define GET_THREAD_INFO_FLAG_TERMINATED 0x02
++#define GET_THREAD_INFO_FLAG_IO_PENDING 0x04 /* I/O the thread's exit would cancel is in flight (9050) */
+ 
+ 
+ 
+--- a/server/file.h
++++ b/server/file.h
+@@ -288,6 +288,7 @@
+ extern struct async *find_pending_async( struct async_queue *queue );
+ extern void cancel_process_asyncs( struct process *process );
+ extern void cancel_terminating_thread_asyncs( struct thread *thread );
++extern int thread_has_pending_io( struct thread *thread );
+ extern int async_close_obj_handle( struct object *obj, struct process *process, obj_handle_t handle );
+ 
+ static inline void init_async_queue( struct async_queue *queue )
+--- a/server/async.c
++++ b/server/async.c
+@@ -674,6 +674,23 @@
+     }
+ }
+ 
++/* (wine-sg 9050) does the thread have I/O in flight that its exit would cancel --
++ * the asyncs cancel_terminating_thread_asyncs() picks. ThreadIsIoPending answers
++ * from this, and the thread pool keeps such a worker instead of retiring it. */
++int thread_has_pending_io( struct thread *thread )
++{
++    struct async *async;
++
++    LIST_FOR_EACH_ENTRY( async, &thread->process->asyncs, struct async, process_entry )
++    {
++        if (async->thread != thread || async->terminated || async->canceled) continue;
++        if (async->completion && async->data.apc_context && !async->event) continue;
++        if (async->is_system) continue;
++        return 1;
++    }
++    return 0;
++}
++
+ /* wake up async operations on the queue */
+ void async_wake_up( struct async_queue *queue, unsigned int status )
+ {
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -1554,6 +1554,8 @@
+             reply->flags |= GET_THREAD_INFO_FLAG_DBG_HIDDEN;
+         if (thread->state == TERMINATED)
+             reply->flags |= GET_THREAD_INFO_FLAG_TERMINATED;
++        else if (thread_has_pending_io( thread ))
++            reply->flags |= GET_THREAD_INFO_FLAG_IO_PENDING;
+ 
+         if (thread->desc && get_reply_max_size())
+         {
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -2323,7 +2323,11 @@
+     }
+ 
+     case ThreadIsIoPending:
+-        /* (wine-sg 8298) answered (no I/O is tracked as pending on a thread): not a FIXME */
++    {
++        /* (wine-sg 8298, 9050) TRUE while I/O the thread started is in flight and
++         * its exit would cancel it (the server's GET_THREAD_INFO_FLAG_IO_PENDING) */
++        unsigned int flags = 0;
++
+         TRACE( "ThreadIsIoPending\n" );
+         if (length != sizeof(BOOL)) return STATUS_INFO_LENGTH_MISMATCH;
+         if (!data) return STATUS_ACCESS_DENIED;
+@@ -2334,13 +2338,15 @@
+             req->handle = wine_server_obj_handle( handle );
+             req->access = THREAD_QUERY_INFORMATION;
+             status = wine_server_call( req );
++            flags = reply->flags;
+         }
+         SERVER_END_REQ;
+         if (status) return status;
+ #endif
+-        *(BOOL*)data = FALSE;
++        *(BOOL*)data = !!(flags & GET_THREAD_INFO_FLAG_IO_PENDING);
+         if (ret_len) *ret_len = sizeof(BOOL);
+         return STATUS_SUCCESS;
++    }
+ 
+     case ThreadIsTerminated:
+     {
+--- a/dlls/ntdll/threadpool.c
++++ b/dlls/ntdll/threadpool.c
+@@ -2352,6 +2352,26 @@
+ /***********************************************************************
+  *           threadpool_worker_proc    (internal)
+  */
++/* (wine-sg 9050) An idle worker that still has I/O in flight is not retired: a
++ * thread's exit cancels the I/O it started, and callbacks re-issue reads from
++ * the worker they run on (Qt 6's QProcess pipe reader does, for every chunk of
++ * a child's output). Windows' pool keeps such a worker (ThreadIsIoPending);
++ * Wine's retired it after 5 s, the read was cancelled and the program took the
++ * pipe for broken -- digiKam then waited for ever for exiftool's answer. */
++static BOOL tp_worker_io_pending(void)
++{
++    BOOL pending = FALSE;
++
++#ifdef SG_MUTANT_TP_RETIRE_WITH_IO
++    return FALSE;
++#endif
++    if (NtQueryInformationThread( GetCurrentThread(), ThreadIsIoPending, &pending, sizeof(pending), NULL ))
++        return FALSE;
++    if (pending) TRACE( "worker %04lx keeps running: I/O it started is in flight\n",
++                        HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
++    return pending;
++}
++
+ static void CALLBACK threadpool_worker_proc( void *param )
+ {
+     struct threadpool *pool = param;
+@@ -2395,7 +2415,7 @@
+         timeout.QuadPart = (ULONGLONG)THREADPOOL_WORKER_TIMEOUT * -10000;
+         if (RtlSleepConditionVariableCS( &pool->update_event, &pool->cs, &timeout ) == STATUS_TIMEOUT &&
+             !threadpool_get_next_item( pool ) && (pool->num_workers > max( pool->min_workers, 1 ) ||
+-            (!pool->min_workers && !pool->objcount)))
++            (!pool->min_workers && !pool->objcount)) && !tp_worker_io_pending())
+         {
+             break;
+         }
