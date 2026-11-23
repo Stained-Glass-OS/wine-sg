@@ -69,7 +69,7 @@ int main(void)
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_FULL);
     GetTempPathW(MAX_PATH, dir);
-    swprintf(a, MAX_PATH, L"%saggsrc-a.wav", dir); swprintf(b, MAX_PATH, L"%saggsrc-b.wav", dir);
+    swprintf(a, MAX_PATH, L"%lsaggsrc-a.wav", dir); swprintf(b, MAX_PATH, L"%lsaggsrc-b.wav", dir);
     write_wav(a, 8000, 1, 500); write_wav(b, 16000, 2, 500);
     s1 = open_source(a); s2 = open_source(b);
     if (!s1 || !s2) { printf("SKIP no WAV media source\n"); return 77; }
