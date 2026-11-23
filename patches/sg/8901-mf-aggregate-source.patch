@@ -1,0 +1,1088 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] mf: MFCreateAggregateSource joins several media sources into one
+
+Qt Multimedia joins a camera and a microphone source with MFCreateAggregateSource for capture sessions with audio (imported by Anki, Kdenlive, MKVToolNix, MusicBrainz Picard, Wireshark, calibre); Wine had a stub. The aggregate lists every stream of every source; each stream gets a descriptor that forwards to the real one (attributes and media type handler) and keeps its identifier unless two sources share it, then streams are numbered in order. Start/Pause/Stop go to the sources with selected streams and their answers become one event; MEEndOfPresentation once all started sources ended.
+---
+--- a/include/mfidl.idl
++++ b/include/mfidl.idl
+@@ -710,6 +710,7 @@
+ cpp_quote("HRESULT WINAPI MFCreateMPEG4MediaSink(IMFByteStream *stream, IMFMediaType *video_type,")
+ cpp_quote("    IMFMediaType *audio_type, IMFMediaSink **sink);")
+ cpp_quote("HRESULT WINAPI MFCreatePresentationClock(IMFPresentationClock **clock);")
++cpp_quote("HRESULT WINAPI MFCreateAggregateSource(IMFCollection *collection, IMFMediaSource **source);")
+ cpp_quote("HRESULT WINAPI MFCreatePresentationDescriptor(DWORD count, IMFStreamDescriptor **descriptors,")
+ cpp_quote("     IMFPresentationDescriptor **presentation_desc);")
+ cpp_quote("HRESULT WINAPI MFCreateSimpleTypeHandler(IMFMediaTypeHandler **handler);")
+--- a/dlls/mf/Makefile.in
++++ b/dlls/mf/Makefile.in
+@@ -6,6 +6,7 @@
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
++	aggregate.c \
+ 	clock.c \
+ 	copier.c \
+ 	evr.c \
+--- a/dlls/mf/mf.spec
++++ b/dlls/mf/mf.spec
+@@ -23,7 +23,7 @@
+ @ stub MFCreateASFStreamSelector
+ @ stub MFCreateASFStreamingMediaSink
+ @ stub MFCreateASFStreamingMediaSinkActivate
+-@ stub MFCreateAggregateSource
++@ stdcall MFCreateAggregateSource(ptr ptr)
+ @ stub MFCreateAppSourceProxy
+ @ stdcall MFCreateAudioRenderer(ptr ptr)
+ @ stdcall MFCreateAudioRendererActivate(ptr)
+--- /dev/null
++++ b/dlls/mf/aggregate.c
+@@ -0,0 +1,1049 @@
++/*
++ * Media Foundation aggregated media source (MFCreateAggregateSource)
++ *
++ * Copyright 2026 Stained Glass OS
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * One media source made of several (a camera and a microphone, for Qt Multimedia's capture sessions).
++ * Its presentation descriptor lists every stream of every source. Two sources commonly both call their
++ * stream 0, so each stream gets a descriptor of its own: it keeps the stream's identifier when no other
++ * source uses it, else streams are numbered in order across the sources. The descriptor shares the
++ * stream's media type handler and attributes, so what a caller selects (a source reader setting the
++ * current type) reaches the real stream. Start/Pause/Stop go to every source that has a selected
++ * stream; their MESourceStarted/Paused/Stopped become one event when all have answered, and
++ * MEEndOfPresentation comes once every started source has ended.
++ */
++
++#define COBJMACROS
++
++#include "mfapi.h"
++#include "mferror.h"
++#include "mfidl.h"
++#include "mf_private.h"
++
++#include "wine/debug.h"
++#include "wine/list.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++
++struct agg_source;
++
++/* a stream's descriptor as the aggregate presents it */
++struct agg_descriptor
++{
++    IMFStreamDescriptor IMFStreamDescriptor_iface;
++    LONG refcount;
++    IMFStreamDescriptor *inner;
++    DWORD id;
++};
++
++struct agg_stream
++{
++    IMFMediaStream IMFMediaStream_iface;
++    IMFAsyncCallback events_callback;
++    LONG refcount;
++    struct agg_source *source;
++    IMFMediaStream *inner;
++    IMFMediaEventQueue *queue;
++};
++
++struct agg_input
++{
++    IMFAsyncCallback events_callback;
++    struct agg_source *source;
++    IMFMediaSource *media_source;
++    DWORD stream_count;
++    DWORD first;            /* index of its first stream in the aggregate's stream list */
++    BOOL started;           /* has selected streams in the current presentation */
++    BOOL ended;
++};
++
++struct agg_entry
++{
++    struct agg_input *input;
++    DWORD inner_id;
++    struct agg_descriptor *descriptor;
++    struct agg_stream *stream;
++};
++
++enum agg_pending { PENDING_NONE, PENDING_START, PENDING_PAUSE, PENDING_STOP };
++
++struct agg_source
++{
++    IMFMediaSource IMFMediaSource_iface;
++    LONG refcount;
++    IMFMediaEventQueue *queue;
++    CRITICAL_SECTION cs;
++    struct agg_input *inputs;
++    DWORD input_count;
++    struct agg_entry *entries;
++    DWORD entry_count;
++    enum agg_pending pending;
++    DWORD pending_count;
++    HRESULT pending_hr;
++    MediaEventType pending_event;
++    PROPVARIANT pending_value;
++    BOOL shutdown;
++};
++
++static inline struct agg_descriptor *impl_from_IMFStreamDescriptor(IMFStreamDescriptor *iface)
++{
++    return CONTAINING_RECORD(iface, struct agg_descriptor, IMFStreamDescriptor_iface);
++}
++
++static inline struct agg_stream *impl_from_IMFMediaStream(IMFMediaStream *iface)
++{
++    return CONTAINING_RECORD(iface, struct agg_stream, IMFMediaStream_iface);
++}
++
++static inline struct agg_stream *impl_stream_from_events_callback(IMFAsyncCallback *iface)
++{
++    return CONTAINING_RECORD(iface, struct agg_stream, events_callback);
++}
++
++static inline struct agg_input *impl_input_from_events_callback(IMFAsyncCallback *iface)
++{
++    return CONTAINING_RECORD(iface, struct agg_input, events_callback);
++}
++
++static inline struct agg_source *impl_from_IMFMediaSource(IMFMediaSource *iface)
++{
++    return CONTAINING_RECORD(iface, struct agg_source, IMFMediaSource_iface);
++}
++
++/* descriptor: IMFAttributes are the real descriptor's */
++
++static HRESULT WINAPI agg_sd_QueryInterface(IMFStreamDescriptor *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IMFStreamDescriptor) || IsEqualIID(riid, &IID_IMFAttributes) ||
++            IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IMFStreamDescriptor_AddRef(iface);
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI agg_sd_AddRef(IMFStreamDescriptor *iface)
++{
++    return InterlockedIncrement(&impl_from_IMFStreamDescriptor(iface)->refcount);
++}
++
++static ULONG WINAPI agg_sd_Release(IMFStreamDescriptor *iface)
++{
++    struct agg_descriptor *sd = impl_from_IMFStreamDescriptor(iface);
++    ULONG refcount = InterlockedDecrement(&sd->refcount);
++
++    if (!refcount)
++    {
++        IMFStreamDescriptor_Release(sd->inner);
++        free(sd);
++    }
++    return refcount;
++}
++
++#define SD_FWD(name, args, call) \
++static HRESULT WINAPI agg_sd_##name args \
++{ \
++    return IMFStreamDescriptor_##name call; \
++}
++#define INNER impl_from_IMFStreamDescriptor(iface)->inner
++
++SD_FWD(GetItem, (IMFStreamDescriptor *iface, REFGUID key, PROPVARIANT *value), (INNER, key, value))
++SD_FWD(GetItemType, (IMFStreamDescriptor *iface, REFGUID key, MF_ATTRIBUTE_TYPE *type), (INNER, key, type))
++SD_FWD(CompareItem, (IMFStreamDescriptor *iface, REFGUID key, REFPROPVARIANT value, BOOL *result), (INNER, key, value, result))
++SD_FWD(Compare, (IMFStreamDescriptor *iface, IMFAttributes *theirs, MF_ATTRIBUTES_MATCH_TYPE type, BOOL *result), (INNER, theirs, type, result))
++SD_FWD(GetUINT32, (IMFStreamDescriptor *iface, REFGUID key, UINT32 *value), (INNER, key, value))
++SD_FWD(GetUINT64, (IMFStreamDescriptor *iface, REFGUID key, UINT64 *value), (INNER, key, value))
++SD_FWD(GetDouble, (IMFStreamDescriptor *iface, REFGUID key, double *value), (INNER, key, value))
++SD_FWD(GetGUID, (IMFStreamDescriptor *iface, REFGUID key, GUID *value), (INNER, key, value))
++SD_FWD(GetStringLength, (IMFStreamDescriptor *iface, REFGUID key, UINT32 *length), (INNER, key, length))
++SD_FWD(GetString, (IMFStreamDescriptor *iface, REFGUID key, WCHAR *value, UINT32 size, UINT32 *length), (INNER, key, value, size, length))
++SD_FWD(GetAllocatedString, (IMFStreamDescriptor *iface, REFGUID key, WCHAR **value, UINT32 *length), (INNER, key, value, length))
++SD_FWD(GetBlobSize, (IMFStreamDescriptor *iface, REFGUID key, UINT32 *size), (INNER, key, size))
++SD_FWD(GetBlob, (IMFStreamDescriptor *iface, REFGUID key, UINT8 *buf, UINT32 bufsize, UINT32 *blobsize), (INNER, key, buf, bufsize, blobsize))
++SD_FWD(GetAllocatedBlob, (IMFStreamDescriptor *iface, REFGUID key, UINT8 **buf, UINT32 *size), (INNER, key, buf, size))
++SD_FWD(GetUnknown, (IMFStreamDescriptor *iface, REFGUID key, REFIID riid, void **out), (INNER, key, riid, out))
++SD_FWD(SetItem, (IMFStreamDescriptor *iface, REFGUID key, REFPROPVARIANT value), (INNER, key, value))
++SD_FWD(DeleteItem, (IMFStreamDescriptor *iface, REFGUID key), (INNER, key))
++SD_FWD(DeleteAllItems, (IMFStreamDescriptor *iface), (INNER))
++SD_FWD(SetUINT32, (IMFStreamDescriptor *iface, REFGUID key, UINT32 value), (INNER, key, value))
++SD_FWD(SetUINT64, (IMFStreamDescriptor *iface, REFGUID key, UINT64 value), (INNER, key, value))
++SD_FWD(SetDouble, (IMFStreamDescriptor *iface, REFGUID key, double value), (INNER, key, value))
++SD_FWD(SetGUID, (IMFStreamDescriptor *iface, REFGUID key, REFGUID value), (INNER, key, value))
++SD_FWD(SetString, (IMFStreamDescriptor *iface, REFGUID key, const WCHAR *value), (INNER, key, value))
++SD_FWD(SetBlob, (IMFStreamDescriptor *iface, REFGUID key, const UINT8 *buf, UINT32 size), (INNER, key, buf, size))
++SD_FWD(SetUnknown, (IMFStreamDescriptor *iface, REFGUID key, IUnknown *unknown), (INNER, key, unknown))
++SD_FWD(LockStore, (IMFStreamDescriptor *iface), (INNER))
++SD_FWD(UnlockStore, (IMFStreamDescriptor *iface), (INNER))
++SD_FWD(GetCount, (IMFStreamDescriptor *iface, UINT32 *count), (INNER, count))
++SD_FWD(GetItemByIndex, (IMFStreamDescriptor *iface, UINT32 index, GUID *key, PROPVARIANT *value), (INNER, index, key, value))
++SD_FWD(CopyAllItems, (IMFStreamDescriptor *iface, IMFAttributes *dest), (INNER, dest))
++SD_FWD(GetMediaTypeHandler, (IMFStreamDescriptor *iface, IMFMediaTypeHandler **handler), (INNER, handler))
++
++#undef SD_FWD
++#undef INNER
++
++static HRESULT WINAPI agg_sd_GetStreamIdentifier(IMFStreamDescriptor *iface, DWORD *identifier)
++{
++    struct agg_descriptor *sd = impl_from_IMFStreamDescriptor(iface);
++
++    if (!identifier) return E_POINTER;
++    *identifier = sd->id;
++    return S_OK;
++}
++
++static const IMFStreamDescriptorVtbl agg_sd_vtbl =
++{
++    agg_sd_QueryInterface,
++    agg_sd_AddRef,
++    agg_sd_Release,
++    agg_sd_GetItem,
++    agg_sd_GetItemType,
++    agg_sd_CompareItem,
++    agg_sd_Compare,
++    agg_sd_GetUINT32,
++    agg_sd_GetUINT64,
++    agg_sd_GetDouble,
++    agg_sd_GetGUID,
++    agg_sd_GetStringLength,
++    agg_sd_GetString,
++    agg_sd_GetAllocatedString,
++    agg_sd_GetBlobSize,
++    agg_sd_GetBlob,
++    agg_sd_GetAllocatedBlob,
++    agg_sd_GetUnknown,
++    agg_sd_SetItem,
++    agg_sd_DeleteItem,
++    agg_sd_DeleteAllItems,
++    agg_sd_SetUINT32,
++    agg_sd_SetUINT64,
++    agg_sd_SetDouble,
++    agg_sd_SetGUID,
++    agg_sd_SetString,
++    agg_sd_SetBlob,
++    agg_sd_SetUnknown,
++    agg_sd_LockStore,
++    agg_sd_UnlockStore,
++    agg_sd_GetCount,
++    agg_sd_GetItemByIndex,
++    agg_sd_CopyAllItems,
++    agg_sd_GetStreamIdentifier,
++    agg_sd_GetMediaTypeHandler,
++};
++
++/* stream */
++
++static HRESULT WINAPI agg_stream_QueryInterface(IMFMediaStream *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IMFMediaStream) || IsEqualIID(riid, &IID_IMFMediaEventGenerator) ||
++            IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IMFMediaStream_AddRef(iface);
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI agg_stream_AddRef(IMFMediaStream *iface)
++{
++    return InterlockedIncrement(&impl_from_IMFMediaStream(iface)->refcount);
++}
++
++static ULONG WINAPI agg_stream_Release(IMFMediaStream *iface)
++{
++    struct agg_stream *stream = impl_from_IMFMediaStream(iface);
++    ULONG refcount = InterlockedDecrement(&stream->refcount);
++
++    if (!refcount)
++    {
++        if (stream->inner) IMFMediaStream_Release(stream->inner);
++        if (stream->queue) IMFMediaEventQueue_Release(stream->queue);
++        free(stream);
++    }
++    return refcount;
++}
++
++static HRESULT WINAPI agg_stream_GetEvent(IMFMediaStream *iface, DWORD flags, IMFMediaEvent **event)
++{
++    return IMFMediaEventQueue_GetEvent(impl_from_IMFMediaStream(iface)->queue, flags, event);
++}
++
++static HRESULT WINAPI agg_stream_BeginGetEvent(IMFMediaStream *iface, IMFAsyncCallback *callback, IUnknown *state)
++{
++    return IMFMediaEventQueue_BeginGetEvent(impl_from_IMFMediaStream(iface)->queue, callback, state);
++}
++
++static HRESULT WINAPI agg_stream_EndGetEvent(IMFMediaStream *iface, IMFAsyncResult *result, IMFMediaEvent **event)
++{
++    return IMFMediaEventQueue_EndGetEvent(impl_from_IMFMediaStream(iface)->queue, result, event);
++}
++
++static HRESULT WINAPI agg_stream_QueueEvent(IMFMediaStream *iface, MediaEventType type, REFGUID ext_type,
++        HRESULT hr, const PROPVARIANT *value)
++{
++    return IMFMediaEventQueue_QueueEventParamVar(impl_from_IMFMediaStream(iface)->queue, type, ext_type, hr, value);
++}
++
++static HRESULT WINAPI agg_stream_GetMediaSource(IMFMediaStream *iface, IMFMediaSource **source)
++{
++    struct agg_stream *stream = impl_from_IMFMediaStream(iface);
++    HRESULT hr = S_OK;
++
++    if (!source) return E_POINTER;
++    EnterCriticalSection(&stream->source->cs);
++    if (stream->source->shutdown) hr = MF_E_SHUTDOWN;
++    else
++    {
++        *source = &stream->source->IMFMediaSource_iface;
++        IMFMediaSource_AddRef(*source);
++    }
++    LeaveCriticalSection(&stream->source->cs);
++    return hr;
++}
++
++static HRESULT WINAPI agg_stream_GetStreamDescriptor(IMFMediaStream *iface, IMFStreamDescriptor **descriptor)
++{
++    struct agg_stream *stream = impl_from_IMFMediaStream(iface);
++    struct agg_source *source = stream->source;
++    HRESULT hr = MF_E_INVALIDSTREAMNUMBER;
++    DWORD i;
++
++    if (!descriptor) return E_POINTER;
++    EnterCriticalSection(&source->cs);
++    if (source->shutdown) hr = MF_E_SHUTDOWN;
++    else for (i = 0; i < source->entry_count; i++)
++    {
++        if (source->entries[i].stream != stream) continue;
++        *descriptor = &source->entries[i].descriptor->IMFStreamDescriptor_iface;
++        IMFStreamDescriptor_AddRef(*descriptor);
++        hr = S_OK;
++        break;
++    }
++    LeaveCriticalSection(&source->cs);
++    return hr;
++}
++
++static HRESULT WINAPI agg_stream_RequestSample(IMFMediaStream *iface, IUnknown *token)
++{
++    struct agg_stream *stream = impl_from_IMFMediaStream(iface);
++
++    if (stream->source->shutdown) return MF_E_SHUTDOWN;
++    return IMFMediaStream_RequestSample(stream->inner, token);
++}
++
++static const IMFMediaStreamVtbl agg_stream_vtbl =
++{
++    agg_stream_QueryInterface,
++    agg_stream_AddRef,
++    agg_stream_Release,
++    agg_stream_GetEvent,
++    agg_stream_BeginGetEvent,
++    agg_stream_EndGetEvent,
++    agg_stream_QueueEvent,
++    agg_stream_GetMediaSource,
++    agg_stream_GetStreamDescriptor,
++    agg_stream_RequestSample,
++};
++
++static HRESULT WINAPI agg_callback_QueryInterface(IMFAsyncCallback *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IMFAsyncCallback) || IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IMFAsyncCallback_AddRef(iface);
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static HRESULT WINAPI agg_callback_GetParameters(IMFAsyncCallback *iface, DWORD *flags, DWORD *queue)
++{
++    return E_NOTIMPL;
++}
++
++static ULONG WINAPI agg_stream_events_AddRef(IMFAsyncCallback *iface)
++{
++    return IMFMediaStream_AddRef(&impl_stream_from_events_callback(iface)->IMFMediaStream_iface);
++}
++
++static ULONG WINAPI agg_stream_events_Release(IMFAsyncCallback *iface)
++{
++    return IMFMediaStream_Release(&impl_stream_from_events_callback(iface)->IMFMediaStream_iface);
++}
++
++/* the real stream's events are the aggregate stream's */
++static HRESULT WINAPI agg_stream_events_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++{
++    struct agg_stream *stream = impl_stream_from_events_callback(iface);
++    IMFMediaEvent *event;
++
++    if (FAILED(IMFMediaStream_EndGetEvent(stream->inner, result, &event)))
++        return S_OK;
++    if (!stream->source->shutdown)
++    {
++        IMFMediaEventQueue_QueueEvent(stream->queue, event);
++        IMFMediaStream_BeginGetEvent(stream->inner, &stream->events_callback, NULL);
++    }
++    IMFMediaEvent_Release(event);
++    return S_OK;
++}
++
++static const IMFAsyncCallbackVtbl agg_stream_events_vtbl =
++{
++    agg_callback_QueryInterface,
++    agg_stream_events_AddRef,
++    agg_stream_events_Release,
++    agg_callback_GetParameters,
++    agg_stream_events_Invoke,
++};
++
++/* source */
++
++static struct agg_entry *find_entry(struct agg_source *source, struct agg_input *input, DWORD inner_id)
++{
++    DWORD i;
++
++    for (i = input->first; i < input->first + input->stream_count; i++)
++        if (source->entries[i].inner_id == inner_id) return &source->entries[i];
++    return NULL;
++}
++
++static HRESULT stream_from_event(struct agg_source *source, struct agg_input *input, IMFMediaEvent *event,
++        struct agg_stream **ret, BOOL *created)
++{
++    IMFStreamDescriptor *sd;
++    struct agg_entry *entry;
++    struct agg_stream *stream;
++    IMFMediaStream *inner;
++    PROPVARIANT value;
++    DWORD id;
++    HRESULT hr;
++
++    PropVariantInit(&value);
++    if (FAILED(hr = IMFMediaEvent_GetValue(event, &value))) return hr;
++    if (value.vt != VT_UNKNOWN || !value.punkVal ||
++            FAILED(hr = IUnknown_QueryInterface(value.punkVal, &IID_IMFMediaStream, (void **)&inner)))
++    {
++        PropVariantClear(&value);
++        return E_UNEXPECTED;
++    }
++    PropVariantClear(&value);
++
++    hr = IMFMediaStream_GetStreamDescriptor(inner, &sd);
++    if (SUCCEEDED(hr))
++    {
++        hr = IMFStreamDescriptor_GetStreamIdentifier(sd, &id);
++        IMFStreamDescriptor_Release(sd);
++    }
++    if (FAILED(hr) || !(entry = find_entry(source, input, id)))
++    {
++        IMFMediaStream_Release(inner);
++        return FAILED(hr) ? hr : MF_E_INVALIDSTREAMNUMBER;
++    }
++
++    *created = FALSE;
++    if (!(stream = entry->stream))
++    {
++        if (!(stream = calloc(1, sizeof(*stream))))
++        {
++            IMFMediaStream_Release(inner);
++            return E_OUTOFMEMORY;
++        }
++        stream->IMFMediaStream_iface.lpVtbl = &agg_stream_vtbl;
++        stream->events_callback.lpVtbl = &agg_stream_events_vtbl;
++        stream->refcount = 1;
++        stream->source = source;
++        if (FAILED(hr = MFCreateEventQueue(&stream->queue)))
++        {
++            free(stream);
++            IMFMediaStream_Release(inner);
++            return hr;
++        }
++        entry->stream = stream;
++        *created = TRUE;
++    }
++    if (stream->inner != inner)
++    {
++        if (stream->inner) IMFMediaStream_Release(stream->inner);
++        stream->inner = inner;
++        IMFMediaStream_BeginGetEvent(inner, &stream->events_callback, NULL);
++    }
++    else IMFMediaStream_Release(inner);
++    *ret = stream;
++    return S_OK;
++}
++
++/* called with the lock held: one of the sources answered the pending Start/Pause/Stop */
++static void source_answered(struct agg_source *source, MediaEventType type, HRESULT status, IMFMediaEvent *event)
++{
++    if (FAILED(status) && SUCCEEDED(source->pending_hr)) source->pending_hr = status;
++    if (type == MESourceStarted || type == MESourceSeeked)
++    {
++        if (source->pending_value.vt == VT_EMPTY) IMFMediaEvent_GetValue(event, &source->pending_value);
++        source->pending_event = type;
++    }
++    if (!source->pending_count || --source->pending_count) return;
++    IMFMediaEventQueue_QueueEventParamVar(source->queue, source->pending_event, &GUID_NULL, source->pending_hr,
++            &source->pending_value);
++    PropVariantClear(&source->pending_value);
++    source->pending = PENDING_NONE;
++}
++
++static HRESULT WINAPI agg_input_events_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++{
++    struct agg_input *input = impl_input_from_events_callback(iface);
++    struct agg_source *source = input->source;
++    struct agg_stream *stream;
++    MediaEventType type;
++    IMFMediaEvent *event;
++    HRESULT status;
++    BOOL created, ended;
++    PROPVARIANT value;
++    DWORD i;
++
++    if (FAILED(IMFMediaSource_EndGetEvent(input->media_source, result, &event)))
++        return S_OK;
++    IMFMediaEvent_GetType(event, &type);
++    IMFMediaEvent_GetStatus(event, &status);
++
++    EnterCriticalSection(&source->cs);
++    if (source->shutdown)
++    {
++        LeaveCriticalSection(&source->cs);
++        IMFMediaEvent_Release(event);
++        return S_OK;
++    }
++
++    switch (type)
++    {
++    case MENewStream:
++    case MEUpdatedStream:
++        if (SUCCEEDED(stream_from_event(source, input, event, &stream, &created)))
++        {
++            value.vt = VT_UNKNOWN;
++            value.punkVal = (IUnknown *)&stream->IMFMediaStream_iface;
++            IMFMediaEventQueue_QueueEventParamVar(source->queue, created ? MENewStream : MEUpdatedStream,
++                    &GUID_NULL, status, &value);
++        }
++        break;
++
++    case MESourceStarted:
++    case MESourceSeeked:
++        if (source->pending == PENDING_START) source_answered(source, type, status, event);
++        else IMFMediaEventQueue_QueueEvent(source->queue, event);
++        break;
++
++    case MESourcePaused:
++        if (source->pending == PENDING_PAUSE) source_answered(source, type, status, event);
++        else IMFMediaEventQueue_QueueEvent(source->queue, event);
++        break;
++
++    case MESourceStopped:
++        if (source->pending == PENDING_STOP) source_answered(source, type, status, event);
++        else IMFMediaEventQueue_QueueEvent(source->queue, event);
++        break;
++
++    case MEEndOfPresentation:
++        input->ended = TRUE;
++        ended = TRUE;
++        for (i = 0; i < source->input_count; i++)
++            if (source->inputs[i].started && !source->inputs[i].ended) ended = FALSE;
++        if (ended) IMFMediaEventQueue_QueueEventParamVar(source->queue, MEEndOfPresentation, &GUID_NULL, S_OK, NULL);
++        break;
++
++    default:
++        IMFMediaEventQueue_QueueEvent(source->queue, event);
++        break;
++    }
++
++    IMFMediaSource_BeginGetEvent(input->media_source, &input->events_callback, NULL);
++    LeaveCriticalSection(&source->cs);
++    IMFMediaEvent_Release(event);
++    return S_OK;
++}
++
++static ULONG WINAPI agg_input_events_AddRef(IMFAsyncCallback *iface)
++{
++    return IMFMediaSource_AddRef(&impl_input_from_events_callback(iface)->source->IMFMediaSource_iface);
++}
++
++static ULONG WINAPI agg_input_events_Release(IMFAsyncCallback *iface)
++{
++    return IMFMediaSource_Release(&impl_input_from_events_callback(iface)->source->IMFMediaSource_iface);
++}
++
++static const IMFAsyncCallbackVtbl agg_input_events_vtbl =
++{
++    agg_callback_QueryInterface,
++    agg_input_events_AddRef,
++    agg_input_events_Release,
++    agg_callback_GetParameters,
++    agg_input_events_Invoke,
++};
++
++static HRESULT WINAPI agg_source_QueryInterface(IMFMediaSource *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IMFMediaSource) || IsEqualIID(riid, &IID_IMFMediaEventGenerator) ||
++            IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IMFMediaSource_AddRef(iface);
++        return S_OK;
++    }
++    WARN("Unsupported %s.\n", debugstr_guid(riid));
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI agg_source_AddRef(IMFMediaSource *iface)
++{
++    return InterlockedIncrement(&impl_from_IMFMediaSource(iface)->refcount);
++}
++
++static void release_entries(struct agg_source *source)
++{
++    DWORD i;
++
++    for (i = 0; i < source->entry_count; i++)
++    {
++        if (source->entries[i].descriptor)
++            IMFStreamDescriptor_Release(&source->entries[i].descriptor->IMFStreamDescriptor_iface);
++        if (source->entries[i].stream)
++            IMFMediaStream_Release(&source->entries[i].stream->IMFMediaStream_iface);
++    }
++    free(source->entries);
++    source->entries = NULL;
++    source->entry_count = 0;
++}
++
++static ULONG WINAPI agg_source_Release(IMFMediaSource *iface)
++{
++    struct agg_source *source = impl_from_IMFMediaSource(iface);
++    ULONG refcount = InterlockedDecrement(&source->refcount);
++    DWORD i;
++
++    if (!refcount)
++    {
++        release_entries(source);
++        for (i = 0; i < source->input_count; i++)
++            if (source->inputs[i].media_source) IMFMediaSource_Release(source->inputs[i].media_source);
++        free(source->inputs);
++        if (source->queue) IMFMediaEventQueue_Release(source->queue);
++        PropVariantClear(&source->pending_value);
++        DeleteCriticalSection(&source->cs);
++        free(source);
++    }
++    return refcount;
++}
++
++static HRESULT WINAPI agg_source_GetEvent(IMFMediaSource *iface, DWORD flags, IMFMediaEvent **event)
++{
++    return IMFMediaEventQueue_GetEvent(impl_from_IMFMediaSource(iface)->queue, flags, event);
++}
++
++static HRESULT WINAPI agg_source_BeginGetEvent(IMFMediaSource *iface, IMFAsyncCallback *callback, IUnknown *state)
++{
++    return IMFMediaEventQueue_BeginGetEvent(impl_from_IMFMediaSource(iface)->queue, callback, state);
++}
++
++static HRESULT WINAPI agg_source_EndGetEvent(IMFMediaSource *iface, IMFAsyncResult *result, IMFMediaEvent **event)
++{
++    return IMFMediaEventQueue_EndGetEvent(impl_from_IMFMediaSource(iface)->queue, result, event);
++}
++
++static HRESULT WINAPI agg_source_QueueEvent(IMFMediaSource *iface, MediaEventType type, REFGUID ext_type,
++        HRESULT hr, const PROPVARIANT *value)
++{
++    return IMFMediaEventQueue_QueueEventParamVar(impl_from_IMFMediaSource(iface)->queue, type, ext_type, hr, value);
++}
++
++/* live if any source is; seeks, pauses only if every source can */
++static HRESULT WINAPI agg_source_GetCharacteristics(IMFMediaSource *iface, DWORD *characteristics)
++{
++    static const DWORD all_must = MFMEDIASOURCE_CAN_SEEK | MFMEDIASOURCE_CAN_PAUSE | MFMEDIASOURCE_CAN_SKIPFORWARD |
++            MFMEDIASOURCE_CAN_SKIPBACKWARD | MFMEDIASOURCE_HAS_SLOW_SEEK;
++    struct agg_source *source = impl_from_IMFMediaSource(iface);
++    DWORD i, flags, any = 0, all = all_must;
++    HRESULT hr = S_OK;
++
++    if (!characteristics) return E_POINTER;
++    if (source->shutdown) return MF_E_SHUTDOWN;
++    for (i = 0; i < source->input_count; i++)
++    {
++        if (FAILED(hr = IMFMediaSource_GetCharacteristics(source->inputs[i].media_source, &flags))) break;
++        any |= flags;
++        all &= flags;
++    }
++    /* slow seeking if any source seeks slowly */
++    if (SUCCEEDED(hr)) *characteristics = (any & ~all_must) | (all & ~MFMEDIASOURCE_HAS_SLOW_SEEK) |
++            (any & MFMEDIASOURCE_HAS_SLOW_SEEK);
++    return hr;
++}
++
++static HRESULT WINAPI agg_source_CreatePresentationDescriptor(IMFMediaSource *iface, IMFPresentationDescriptor **pd)
++{
++    struct agg_source *source = impl_from_IMFMediaSource(iface);
++    IMFStreamDescriptor **sds;
++    IMFPresentationDescriptor *inner_pd;
++    UINT64 duration, max_duration = 0;
++    BOOL selected, have_duration = FALSE;
++    IMFStreamDescriptor *sd;
++    HRESULT hr = S_OK;
++    DWORD i, j;
++
++    TRACE("%p, %p.\n", iface, pd);
++
++    if (!pd) return E_POINTER;
++    EnterCriticalSection(&source->cs);
++    if (source->shutdown)
++    {
++        LeaveCriticalSection(&source->cs);
++        return MF_E_SHUTDOWN;
++    }
++    if (!(sds = calloc(source->entry_count, sizeof(*sds))))
++    {
++        LeaveCriticalSection(&source->cs);
++        return E_OUTOFMEMORY;
++    }
++    for (i = 0; i < source->entry_count; i++)
++        sds[i] = &source->entries[i].descriptor->IMFStreamDescriptor_iface;
++    hr = MFCreatePresentationDescriptor(source->entry_count, sds, pd);
++    free(sds);
++
++    /* each source's own default selection, and the longest duration */
++    for (i = 0; SUCCEEDED(hr) && i < source->input_count; i++)
++    {
++        struct agg_input *input = &source->inputs[i];
++
++        if (FAILED(IMFMediaSource_CreatePresentationDescriptor(input->media_source, &inner_pd))) continue;
++        if (SUCCEEDED(IMFPresentationDescriptor_GetUINT64(inner_pd, &MF_PD_DURATION, &duration)))
++        {
++            have_duration = TRUE;
++            if (duration > max_duration) max_duration = duration;
++        }
++        for (j = 0; j < input->stream_count; j++)
++        {
++            if (FAILED(IMFPresentationDescriptor_GetStreamDescriptorByIndex(inner_pd, j, &selected, &sd))) continue;
++            if (selected) IMFPresentationDescriptor_SelectStream(*pd, input->first + j);
++            else IMFPresentationDescriptor_DeselectStream(*pd, input->first + j);
++            IMFStreamDescriptor_Release(sd);
++        }
++        IMFPresentationDescriptor_Release(inner_pd);
++    }
++    if (SUCCEEDED(hr) && have_duration) IMFPresentationDescriptor_SetUINT64(*pd, &MF_PD_DURATION, max_duration);
++    LeaveCriticalSection(&source->cs);
++    return hr;
++}
++
++/* whether @pd (the aggregate's presentation descriptor) selects the stream of @entry */
++static BOOL is_selected(IMFPresentationDescriptor *pd, struct agg_entry *entry)
++{
++    IMFStreamDescriptor *sd;
++    DWORD i, count, id;
++    BOOL selected;
++
++    if (FAILED(IMFPresentationDescriptor_GetStreamDescriptorCount(pd, &count))) return FALSE;
++    for (i = 0; i < count; i++)
++    {
++        if (FAILED(IMFPresentationDescriptor_GetStreamDescriptorByIndex(pd, i, &selected, &sd))) continue;
++        IMFStreamDescriptor_GetStreamIdentifier(sd, &id);
++        IMFStreamDescriptor_Release(sd);
++        if (id == entry->descriptor->id) return selected;
++    }
++    return FALSE;
++}
++
++static HRESULT WINAPI agg_source_Start(IMFMediaSource *iface, IMFPresentationDescriptor *pd, const GUID *time_format,
++        const PROPVARIANT *start_position)
++{
++    struct agg_source *source = impl_from_IMFMediaSource(iface);
++    IMFPresentationDescriptor *inner_pd;
++    IMFStreamDescriptor *sd;
++    BOOL selected, any;
++    HRESULT hr = S_OK;
++    DWORD i, j, count;
++
++    TRACE("%p, %p, %s, %p.\n", iface, pd, debugstr_guid(time_format), start_position);
++
++    if (!pd) return E_INVALIDARG;
++    EnterCriticalSection(&source->cs);
++    if (source->shutdown)
++    {
++        LeaveCriticalSection(&source->cs);
++        return MF_E_SHUTDOWN;
++    }
++    source->pending = PENDING_START;
++    source->pending_count = 0;
++    source->pending_hr = S_OK;
++    source->pending_event = MESourceStarted;
++    PropVariantClear(&source->pending_value);
++
++    for (i = 0; i < source->input_count; i++)
++    {
++        struct agg_input *input = &source->inputs[i];
++
++        input->started = FALSE;
++        input->ended = FALSE;
++        if (FAILED(hr = IMFMediaSource_CreatePresentationDescriptor(input->media_source, &inner_pd))) break;
++        any = FALSE;
++        if (SUCCEEDED(IMFPresentationDescriptor_GetStreamDescriptorCount(inner_pd, &count)))
++        {
++            for (j = 0; j < count; j++)
++            {
++                struct agg_entry *entry;
++                DWORD id;
++
++                if (FAILED(IMFPresentationDescriptor_GetStreamDescriptorByIndex(inner_pd, j, &selected, &sd))) continue;
++                IMFStreamDescriptor_GetStreamIdentifier(sd, &id);
++                IMFStreamDescriptor_Release(sd);
++                if ((entry = find_entry(source, input, id)) && is_selected(pd, entry))
++                {
++                    IMFPresentationDescriptor_SelectStream(inner_pd, j);
++                    any = TRUE;
++                }
++                else IMFPresentationDescriptor_DeselectStream(inner_pd, j);
++            }
++        }
++        if (any)
++        {
++            input->started = TRUE;
++            source->pending_count++;
++            if (FAILED(hr = IMFMediaSource_Start(input->media_source, inner_pd, time_format, start_position)))
++            {
++                source->pending_count--;
++                input->started = FALSE;
++            }
++        }
++        IMFPresentationDescriptor_Release(inner_pd);
++        if (FAILED(hr)) break;
++    }
++    if (SUCCEEDED(hr) && !source->pending_count)
++    {
++        /* nothing selected: started, with no streams */
++        source->pending = PENDING_NONE;
++        hr = IMFMediaEventQueue_QueueEventParamVar(source->queue, MESourceStarted, &GUID_NULL, S_OK, start_position);
++    }
++    LeaveCriticalSection(&source->cs);
++    return hr;
++}
++
++static HRESULT forward_state(struct agg_source *source, enum agg_pending pending, MediaEventType event)
++{
++    HRESULT hr = S_OK;
++    DWORD i;
++
++    EnterCriticalSection(&source->cs);
++    if (source->shutdown)
++    {
++        LeaveCriticalSection(&source->cs);
++        return MF_E_SHUTDOWN;
++    }
++    source->pending = pending;
++    source->pending_count = 0;
++    source->pending_hr = S_OK;
++    source->pending_event = event;
++    PropVariantClear(&source->pending_value);
++    for (i = 0; i < source->input_count; i++)
++    {
++        struct agg_input *input = &source->inputs[i];
++
++        if (!input->started) continue;
++        source->pending_count++;
++        if (pending == PENDING_PAUSE) hr = IMFMediaSource_Pause(input->media_source);
++        else hr = IMFMediaSource_Stop(input->media_source);
++        if (FAILED(hr))
++        {
++            source->pending_count--;
++            break;
++        }
++    }
++    if (SUCCEEDED(hr) && !source->pending_count)
++    {
++        source->pending = PENDING_NONE;
++        hr = IMFMediaEventQueue_QueueEventParamVar(source->queue, event, &GUID_NULL, S_OK, NULL);
++    }
++    LeaveCriticalSection(&source->cs);
++    return hr;
++}
++
++static HRESULT WINAPI agg_source_Stop(IMFMediaSource *iface)
++{
++    TRACE("%p.\n", iface);
++    return forward_state(impl_from_IMFMediaSource(iface), PENDING_STOP, MESourceStopped);
++}
++
++static HRESULT WINAPI agg_source_Pause(IMFMediaSource *iface)
++{
++    struct agg_source *source = impl_from_IMFMediaSource(iface);
++    DWORD characteristics;
++    HRESULT hr;
++
++    TRACE("%p.\n", iface);
++    if (FAILED(hr = agg_source_GetCharacteristics(iface, &characteristics))) return hr;
++    if (!(characteristics & MFMEDIASOURCE_CAN_PAUSE)) return MF_E_INVALID_STATE_TRANSITION;
++    return forward_state(source, PENDING_PAUSE, MESourcePaused);
++}
++
++static HRESULT WINAPI agg_source_Shutdown(IMFMediaSource *iface)
++{
++    struct agg_source *source = impl_from_IMFMediaSource(iface);
++    DWORD i;
++
++    TRACE("%p.\n", iface);
++
++    EnterCriticalSection(&source->cs);
++    if (source->shutdown)
++    {
++        LeaveCriticalSection(&source->cs);
++        return MF_E_SHUTDOWN;
++    }
++    source->shutdown = TRUE;
++    for (i = 0; i < source->input_count; i++)
++        IMFMediaSource_Shutdown(source->inputs[i].media_source);
++    for (i = 0; i < source->entry_count; i++)
++        if (source->entries[i].stream) IMFMediaEventQueue_Shutdown(source->entries[i].stream->queue);
++    IMFMediaEventQueue_Shutdown(source->queue);
++    LeaveCriticalSection(&source->cs);
++    return S_OK;
++}
++
++static const IMFMediaSourceVtbl agg_source_vtbl =
++{
++    agg_source_QueryInterface,
++    agg_source_AddRef,
++    agg_source_Release,
++    agg_source_GetEvent,
++    agg_source_BeginGetEvent,
++    agg_source_EndGetEvent,
++    agg_source_QueueEvent,
++    agg_source_GetCharacteristics,
++    agg_source_CreatePresentationDescriptor,
++    agg_source_Start,
++    agg_source_Stop,
++    agg_source_Pause,
++    agg_source_Shutdown,
++};
++
++/***********************************************************************
++ *      MFCreateAggregateSource (mf.@)
++ */
++HRESULT WINAPI MFCreateAggregateSource(IMFCollection *collection, IMFMediaSource **out)
++{
++    IMFPresentationDescriptor *inner_pd;
++    struct agg_source *source;
++    IMFStreamDescriptor *sd;
++    BOOL selected, unique = TRUE;
++    DWORD i, j, k, count, id;
++    IUnknown *unk;
++    HRESULT hr;
++
++    TRACE("%p, %p.\n", collection, out);
++
++    if (!collection || !out) return E_POINTER;
++    *out = NULL;
++    if (FAILED(hr = IMFCollection_GetElementCount(collection, &count))) return hr;
++    if (!count) return E_INVALIDARG;
++
++    if (!(source = calloc(1, sizeof(*source)))) return E_OUTOFMEMORY;
++    source->IMFMediaSource_iface.lpVtbl = &agg_source_vtbl;
++    source->refcount = 1;
++    InitializeCriticalSection(&source->cs);
++    if (!(source->inputs = calloc(count, sizeof(*source->inputs))))
++    {
++        IMFMediaSource_Release(&source->IMFMediaSource_iface);
++        return E_OUTOFMEMORY;
++    }
++    if (FAILED(hr = MFCreateEventQueue(&source->queue))) goto failed;
++
++    for (i = 0; i < count; i++)
++    {
++        struct agg_input *input = &source->inputs[i];
++
++        if (FAILED(hr = IMFCollection_GetElement(collection, i, &unk))) goto failed;
++        hr = unk ? IUnknown_QueryInterface(unk, &IID_IMFMediaSource, (void **)&input->media_source) : E_INVALIDARG;
++        if (unk) IUnknown_Release(unk);
++        if (FAILED(hr)) goto failed;
++        input->events_callback.lpVtbl = &agg_input_events_vtbl;
++        input->source = source;
++        source->input_count++;
++
++        if (FAILED(hr = IMFMediaSource_CreatePresentationDescriptor(input->media_source, &inner_pd))) goto failed;
++        if (SUCCEEDED(hr = IMFPresentationDescriptor_GetStreamDescriptorCount(inner_pd, &input->stream_count)))
++        {
++            struct agg_entry *entries = realloc(source->entries,
++                    (source->entry_count + input->stream_count) * sizeof(*entries));
++            if (!entries) hr = E_OUTOFMEMORY;
++            else
++            {
++                source->entries = entries;
++                input->first = source->entry_count;
++                for (j = 0; SUCCEEDED(hr) && j < input->stream_count; j++)
++                {
++                    struct agg_entry *entry = &source->entries[source->entry_count];
++
++                    memset(entry, 0, sizeof(*entry));
++                    if (FAILED(hr = IMFPresentationDescriptor_GetStreamDescriptorByIndex(inner_pd, j, &selected, &sd)))
++                        break;
++                    IMFStreamDescriptor_GetStreamIdentifier(sd, &entry->inner_id);
++                    if (!(entry->descriptor = calloc(1, sizeof(*entry->descriptor))))
++                    {
++                        IMFStreamDescriptor_Release(sd);
++                        hr = E_OUTOFMEMORY;
++                        break;
++                    }
++                    entry->descriptor->IMFStreamDescriptor_iface.lpVtbl = &agg_sd_vtbl;
++                    entry->descriptor->refcount = 1;
++                    entry->descriptor->inner = sd;
++                    entry->input = input;
++                    source->entry_count++;
++                }
++            }
++        }
++        IMFPresentationDescriptor_Release(inner_pd);
++        if (FAILED(hr)) goto failed;
++    }
++
++    /* identifiers stay the streams' own unless two sources use the same one */
++    for (i = 0; i < source->entry_count && unique; i++)
++        for (k = i + 1; k < source->entry_count; k++)
++            if (source->entries[i].inner_id == source->entries[k].inner_id) unique = FALSE;
++    for (i = 0; i < source->entry_count; i++)
++    {
++        id = unique ? source->entries[i].inner_id : i;
++#ifdef SG_MUTANT_AGG_SAME_IDS
++        id = source->entries[i].inner_id;
++#endif
++        source->entries[i].descriptor->id = id;
++    }
++
++    for (i = 0; i < source->input_count; i++)
++        IMFMediaSource_BeginGetEvent(source->inputs[i].media_source, &source->inputs[i].events_callback, NULL);
++
++    *out = &source->IMFMediaSource_iface;
++    return S_OK;
++
++failed:
++    IMFMediaSource_Release(&source->IMFMediaSource_iface);
++    return hr;
++}
