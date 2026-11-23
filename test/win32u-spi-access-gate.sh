@@ -3,8 +3,8 @@
 # CORE: accessibility SPI_GET/SET pairs persist (5216)
 #
 #   WINE=/opt/wine-sg/bin/wine test/win32u-spi-access-gate.sh
-#   WINESERVER=... when it is not beside $WINE (a build tree); on a build tree the gate
-#   needs a display (DISPLAY, e.g. Xvfb) because the probe creates windows or screen DCs.
+#   WINESERVER=... when it is not beside $WINE (a build tree). The probe makes windows or
+#   screen DCs: SG_GATE_DISPLAY=:N uses that display, else the gate starts an Xvfb (sg_gate_display).
 # Mutants: SPI_ACCESS_NOSET
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -17,7 +17,7 @@ done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-win32u-spi-access.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
-[ -n "${SG_GATE_DISPLAY:-}" ] && export DISPLAY="$SG_GATE_DISPLAY"
+sg_gate_display || exit $?
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T" "${SG_GATE_HOME:-$T}"' EXIT INT TERM
 TMPDIR=/var/tmp x86_64-w64-mingw32-gcc -O1 -o "$T/p64.exe" "$HERE/win32u-spi-access-probe.c" -luser32 -ladvapi32 &&
     TMPDIR=/var/tmp i686-w64-mingw32-gcc -O1 -o "$T/p32.exe" "$HERE/win32u-spi-access-probe.c" -luser32 -ladvapi32 ||

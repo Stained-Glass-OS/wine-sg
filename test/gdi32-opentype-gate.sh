@@ -3,8 +3,8 @@
 # CORE: OpenType chain/context substitution and positioning, alternate glyphs (5224)
 #
 #   WINE=/opt/wine-sg/bin/wine test/gdi32-opentype-gate.sh
-#   WINESERVER=... when it is not beside $WINE (a build tree); on a build tree the gate
-#   needs a display (DISPLAY, e.g. Xvfb) because the probe creates windows or screen DCs.
+#   WINESERVER=... when it is not beside $WINE (a build tree). The probe makes windows or
+#   screen DCs: SG_GATE_DISPLAY=:N uses that display, else the gate starts an Xvfb (sg_gate_display).
 # Mutants: OT_CHAIN1 OT_CTXPOS1 OT_CHAINPOS1
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -17,7 +17,7 @@ done
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-gdi32-opentype.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
-[ -n "${SG_GATE_DISPLAY:-}" ] && export DISPLAY="$SG_GATE_DISPLAY"
+sg_gate_display || exit $?
 trap '"$WINESERVER" -k 2>/dev/null; rm -rf "$T" "${SG_GATE_HOME:-$T}"' EXIT INT TERM
 TMPDIR=/var/tmp x86_64-w64-mingw32-gcc -O1 -o "$T/p64.exe" "$HERE/gdi32-opentype-probe.c" -lgdi32 -lusp10 -luser32 &&
     TMPDIR=/var/tmp i686-w64-mingw32-gcc -O1 -o "$T/p32.exe" "$HERE/gdi32-opentype-probe.c" -lgdi32 -lusp10 -luser32 ||

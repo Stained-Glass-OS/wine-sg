@@ -103,3 +103,35 @@ case "${SG_LOCK_CONTROL:-}" in
 "$SG_GATE_HOME"/*|/var/tmp/*|/tmp/*) ;;
 *) export SG_LOCK_CONTROL="$SG_GATE_HOME/no-compositor-control.sock" ;;
 esac
+# sg_gate_display: the display a gate's windows go to. SG_GATE_DISPLAY when the
+# caller gives one; otherwise an Xvfb of the gate's own, on the first free
+# display from SG_GATE_XVFB_FIRST (default 720) on, gone when the gate's shell
+# is. 27 gates said "needs a display (SG_GATE_DISPLAY)" and used whatever
+# DISPLAY the caller had; since the line above unsets it (10.0-920) they ran
+# with none, created no window and failed (win32u-menu-autodismiss on every
+# release, 2026-11-22). Sets and exports DISPLAY; returns 77 (skip) without Xvfb.
+sg_gate_display() {
+    if [ -n "${SG_GATE_DISPLAY:-}" ]; then export DISPLAY="$SG_GATE_DISPLAY"; return 0; fi
+    command -v Xvfb >/dev/null || { echo "SKIP: no display (SG_GATE_DISPLAY) and no Xvfb"; return 77; }
+    _sg_n=${SG_GATE_XVFB_FIRST:-720}
+    while [ "$_sg_n" -lt $(( ${SG_GATE_XVFB_FIRST:-720} + 30 )) ]; do
+        if [ ! -e "/tmp/.X$_sg_n-lock" ] && [ ! -e "/tmp/.X11-unix/X$_sg_n" ]; then
+            Xvfb ":$_sg_n" -screen 0 1280x1024x24 -nolisten tcp >/dev/null 2>&1 &
+            _sg_x=$!
+            _sg_i=0
+            while [ "$_sg_i" -lt 50 ] && kill -0 "$_sg_x" 2>/dev/null && [ ! -e "/tmp/.X11-unix/X$_sg_n" ]; do
+                sleep 0.1; _sg_i=$((_sg_i + 1))
+            done
+            if kill -0 "$_sg_x" 2>/dev/null && [ -e "/tmp/.X11-unix/X$_sg_n" ]; then
+                # the Xvfb goes with the gate, whatever trap the gate sets
+                ( _sg_p=$$; while kill -0 "$_sg_p" 2>/dev/null; do sleep 1; done; kill "$_sg_x" 2>/dev/null ) \
+                    >/dev/null 2>&1 </dev/null &
+                export DISPLAY=":$_sg_n"
+                return 0
+            fi
+            kill "$_sg_x" 2>/dev/null   # another gate took it first
+        fi
+        _sg_n=$((_sg_n + 1))
+    done
+    echo "SKIP: no free display for an Xvfb"; return 77
+}
