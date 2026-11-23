@@ -1,14 +1,20 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# An elevated program's Start menu and desktop are the ones all users share
-# (patches/sg/0617). The elevation broker runs a program as the SYSTEM
-# account, not as the user who asked; an installer's own-user shortcuts went
-# to SYSTEM's Start menu, which nobody sees (Blender, Temurin, Audacity,
-# Winamp: not in Start). In a program the broker started (SG_IN_BROKER) the
-# Programs, Startup and desktop folders -- by CSIDL and by known folder -- are
-# the all-users ones; its application data stays its own. Elsewhere, nothing
-# changes. And a user's own programs folder, FOLDERID_UserProgramFiles,
-# exists (0618).
+# Where an elevated program's Start menu and desktop are (patches/sg/0617, 9004).
+# The elevation broker runs a program on disk as the SYSTEM account. Before
+# wine-sg 7601 it had SYSTEM's token too, and an installer's own-user shortcuts
+# went to SYSTEM's Start menu, which nobody sees (Blender, Temurin, Audacity,
+# Winamp): 0617 gave such a program the all-users Programs, Startup and desktop.
+# Since 7601 an elevated program is the person who asked (their SID, HKCU and
+# profile), and on Windows an elevated per-user install keeps that person's
+# Start menu and desktop -- Mixxx's per-user MSI put its shortcuts in all
+# users' Start menu. So (9004):
+#   - a program the broker started (SG_IN_BROKER) that is the person keeps the
+#     person's Programs, Startup and desktop (CSIDL and known folder);
+#   - one that really is the SYSTEM account (the owner of a shared prefix,
+#     SG_GROUP) gets the all-users ones, as before; its application data stays
+#     its own. Mutant SG_MUTANT_ELEVATED_ALWAYS_COMMON (dlls/shell32).
+# And a user's own programs folder, FOLDERID_UserProgramFiles, exists (0618).
 #
 #   WINE=/opt/wine-sg/bin/wine test/elevfolders-gate.sh
 set -u
@@ -36,18 +42,37 @@ P() { "$WINE" 'C:\elevfolders-probe.exe' 2>/dev/null | tr -d '\r'; }
 v() { echo "$1" | sed -n "s/^$2=//p"; }
 plain=$(P)
 elev=$(SG_IN_BROKER=1 P)
-common=$(v "$plain" common-programs)
 echo "      plain: $(v "$plain" programs)"
-echo "      elevated: $(v "$elev" programs)"
+echo "      elevated, the person: $(v "$elev" programs)"
 case "$(v "$plain" programs)" in *ProgramData*) fail "a plain program's Programs folder is all users': $(v "$plain" programs)" ;;
     *) pass "a plain program keeps its own Start menu" ;; esac
-[ -n "$common" ] && [ "$(v "$elev" programs)" = "$common" ] && [ "$(v "$elev" known-programs)" = "$common" ] &&
-    pass "elevated: Programs is all users' (CSIDL and known folder)" ||
-    fail "elevated Programs: $(v "$elev" programs) / $(v "$elev" known-programs), all users': $common"
-case "$(v "$elev" startup)" in *ProgramData*) pass "elevated: Startup is all users'" ;; *) fail "elevated Startup: $(v "$elev" startup)" ;; esac
-[ "$(v "$elev" desktop)" != "$(v "$plain" desktop)" ] && case "$(v "$elev" desktop)" in *Public*|*ProgramData*) true ;; *) false ;; esac &&
-    pass "elevated: the desktop is the shared one ($(v "$elev" desktop))" || fail "elevated desktop: $(v "$elev" desktop)"
-[ "$(v "$elev" appdata)" = "$(v "$plain" appdata)" ] && pass "its application data stays its own" || fail "appdata moved: $(v "$elev" appdata)"
+[ "$(v "$elev" programs)" = "$(v "$plain" programs)" ] && [ "$(v "$elev" known-programs)" = "$(v "$plain" programs)" ] &&
+    [ "$(v "$elev" startup)" = "$(v "$plain" startup)" ] && [ "$(v "$elev" desktop)" = "$(v "$plain" desktop)" ] &&
+    pass "elevated, the person: their own Programs, Startup and desktop (CSIDL and known folder)" ||
+    fail "elevated person: programs $(v "$elev" programs) startup $(v "$elev" startup) desktop $(v "$elev" desktop)"
+# the SYSTEM account: the owner of a shared prefix
+SG_GROUP=${SG_GROUP:-sgconfgrp}
+if getent group "$SG_GROUP" | grep -qw "$(id -un)"; then
+    SP="$T/shared"
+    mkdir "$SP"; chgrp "$SG_GROUP" "$SP"; chmod 2770 "$SP"; touch "$SP/.sg-system-prefix"
+    S() { sg "$SG_GROUP" -c "umask 002; WINEPREFIX='$SP' $1 timeout -s KILL 60 '$WINE' 'C:\\elevfolders-probe.exe'" 2>/dev/null | tr -d '\r'; }
+    sg "$SG_GROUP" -c "umask 002; WINEPREFIX='$SP' '$WINESERVER' -p; WINEPREFIX='$SP' timeout -s KILL 300 '$WINE' wineboot -i" >/dev/null 2>&1
+    cp "$T/elevfolders-probe.exe" "$SP/drive_c/"
+    splain=$(S "")
+    sys=$(S "SG_IN_BROKER=1")
+    common=$(v "$splain" common-programs)
+    echo "      elevated, SYSTEM: $(v "$sys" programs)"
+    [ -n "$common" ] && [ "$(v "$sys" programs)" = "$common" ] && [ "$(v "$sys" known-programs)" = "$common" ] &&
+        pass "elevated, the SYSTEM account: Programs is all users' (CSIDL and known folder)" ||
+        fail "SYSTEM Programs: $(v "$sys" programs) / $(v "$sys" known-programs), all users': $common"
+    case "$(v "$sys" startup)" in *ProgramData*) pass "...Startup is all users'" ;; *) fail "SYSTEM Startup: $(v "$sys" startup)" ;; esac
+    case "$(v "$sys" desktop)" in *Public*|*ProgramData*) pass "...the desktop is the shared one ($(v "$sys" desktop))" ;;
+        *) fail "SYSTEM desktop: $(v "$sys" desktop)" ;; esac
+    [ "$(v "$sys" appdata)" = "$(v "$splain" appdata)" ] && pass "...its application data stays its own" || fail "appdata moved: $(v "$sys" appdata)"
+    WINEPREFIX="$SP" "$WINESERVER" -k 2>/dev/null
+else
+    echo "SKIP  the SYSTEM account's part: $(id -un) is not in $SG_GROUP"
+fi
 # a user's own programs folder (0618): %LOCALAPPDATA%\Programs -- it was
 # "disallowed" and Opera's installer stopped with code 103
 lad=$(v "$plain" localappdata)

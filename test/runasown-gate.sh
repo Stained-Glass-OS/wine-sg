@@ -51,7 +51,7 @@ q=$(timeout -s KILL 60 "$WINE" reg query 'HKLM\Software\SGTEST\TransformTest' /r
 "$WINE" reg delete 'HKLM\Software\SGTEST' /f >/dev/null 2>&1
 timeout -s KILL 300 "$WINE" msiexec /x 'C:\t\base.msi' /qn >/dev/null 2>&1
 timeout -s KILL 300 "$WINE" msiexec /i 'C:\t\base.msi' /qn >/dev/null 2>&1; rc=$?
-[ "$rc" = 0 ] && pass "an all-users msiexec install by the prefix owner elevates and finishes (rc 0)" \
+[ "$rc" = 0 ] && pass "an all-users msiexec install by the prefix owner finishes (rc 0)" \
     || fail "the all-users install (rc $rc)"
 # the relaunch marker is msiexec's own: what it starts (a custom action, a nested msiexec for a
 # second all-users package, which then elevates for itself) does not inherit it

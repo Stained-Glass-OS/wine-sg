@@ -1,0 +1,198 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] msi: a program's own MsiInstallProduct reaches the consent prompt, as Windows Installer's service does
+
+A setup program that installs an MSI in its own process (MsiInstallProduct, MsiConfigureProductEx to
+remove one: Advanced IP Scanner's Inno wrapper, many setup.exe bootstrappers) never got the consent
+prompt: there is no Windows Installer service here, msi ran the install in the caller's process as
+the person, and an all-users package failed with 1603. On Windows the call goes to the Installer
+service, which asks for consent when the package needs elevation (for all users, or per user without
+"elevated privileges are not required") and the UI may ask (not in silent mode), then installs.
+
+msi now hands such an install to msiexec run with "runas" -- the same broker, prompt, timeout and
+input as a double-clicked package (0590, 9001) -- at the caller's UI level (/qb, /qr with their
+-, !, + modifiers, or full), waits for it and returns its result (1602 when consent is not given).
+Not in msiexec itself, which decides for itself; not with privileges already (9002's
+msi_sg_privileged); not for a URL. Differences from Windows, kept small: the program's external UI
+handler gets no messages from the elevated install (msiexec shows its own UI), and the install's UI
+sequence runs elevated too.
+
+David 2026-11-23. Gate test-msipriv (cases 4, 5); mutant SG_MUTANT_MSI_INPROC_NOELEVATE.
+---
+--- a/dlls/msi/msi.c
++++ b/dlls/msi/msi.c
+@@ -26,6 +26,7 @@
+ #include "winreg.h"
+ #include "winnls.h"
+ #include "shlwapi.h"
++#include "shellapi.h"
+ #include "msi.h"
+ #include "msidefs.h"
+ #include "msiquery.h"
+@@ -345,6 +346,148 @@
+     return r;
+ }
+ 
++/* Stained Glass OS 9003: an install a program makes in its own process (MsiInstallProduct: a setup.exe
++ * that carries an MSI, Advanced IP Scanner's Inno wrapper) reaches the consent prompt the way msiexec's
++ * does. On Windows such a call hands the install to the Windows Installer service, which asks for
++ * consent when the package needs elevation (for all users, or per user without "elevated privileges
++ * are not required") and the UI may ask (not in silent mode). There is no such service here: the
++ * install is handed to msiexec, run with "runas" -- the same broker, prompt, timeout and input as a
++ * double-clicked package -- at the caller's UI level, and the caller gets its result. The program's
++ * external UI handler gets no messages from it (msiexec shows its own), and its UI sequence runs
++ * elevated too. Not in msiexec itself (0590/9001 decide there), nor with privileges already. */
++static BOOL sg_package_needs_elevation( const WCHAR *path, const WCHAR *cmdline )
++{
++    WCHAR allusers[16] = L"", peruser[16] = L"", name[64], value[16];
++    MSIHANDLE db, view, rec, suminfo;
++    const WCHAR *opt;
++    DWORD nlen, vlen;
++    UINT len;
++    INT words = 0;
++
++    if (MsiOpenDatabaseW( path, MSIDBOPEN_READONLY, &db ) != ERROR_SUCCESS) return FALSE;
++    if (MsiGetSummaryInformationW( db, NULL, 0, &suminfo ) == ERROR_SUCCESS)
++    {
++        MsiSummaryInfoGetPropertyW( suminfo, PID_WORDCOUNT, NULL, &words, NULL, NULL, NULL );
++        MsiCloseHandle( suminfo );
++    }
++    if (MsiDatabaseOpenViewW( db, L"SELECT `Property`, `Value` FROM `Property`", &view ) == ERROR_SUCCESS)
++    {
++        MsiViewExecute( view, 0 );
++        while (MsiViewFetch( view, &rec ) == ERROR_SUCCESS)
++        {
++            nlen = ARRAY_SIZE(name); vlen = ARRAY_SIZE(value);
++            if (MsiRecordGetStringW( rec, 1, name, &nlen ) == ERROR_SUCCESS &&
++                MsiRecordGetStringW( rec, 2, value, &vlen ) == ERROR_SUCCESS)
++            {
++                if (!wcscmp( name, L"ALLUSERS" )) lstrcpynW( allusers, value, ARRAY_SIZE(allusers) );
++                else if (!wcscmp( name, L"MSIINSTALLPERUSER" )) lstrcpynW( peruser, value, ARRAY_SIZE(peruser) );
++            }
++            MsiCloseHandle( rec );
++        }
++        MsiCloseHandle( view );
++    }
++    MsiCloseHandle( db );
++    if ((opt = msi_get_command_line_option( cmdline, L"ALLUSERS", &len )))
++        lstrcpynW( allusers, opt, min( len + 1, ARRAY_SIZE(allusers) ) );
++    if ((opt = msi_get_command_line_option( cmdline, L"MSIINSTALLPERUSER", &len )))
++        lstrcpynW( peruser, opt, min( len + 1, ARRAY_SIZE(peruser) ) );
++    TRACE( "ALLUSERS %s MSIINSTALLPERUSER %s word count %#x\n", debugstr_w(allusers), debugstr_w(peruser), words );
++    /* for all users, or per user, it needs elevation unless it says it does not (bit 3) */
++    return !(words & 8);
++}
++
++static BOOL sg_in_msiexec(void)
++{
++    WCHAR self[MAX_PATH], *base;
++
++    if (!GetModuleFileNameW( NULL, self, ARRAY_SIZE(self) )) return TRUE;
++    base = wcsrchr( self, '\\' );
++    return !wcsicmp( base ? base + 1 : self, L"msiexec.exe" );
++}
++
++/* msiexec's switch for the caller's UI level; FALSE: silent, nothing may ask */
++static BOOL sg_ui_switch( WCHAR *out, DWORD size )
++{
++    DWORD level = gUILevel & INSTALLUILEVEL_MASK;
++
++    out[0] = 0;
++    if (level == INSTALLUILEVEL_NONE) return FALSE;
++    if (level == INSTALLUILEVEL_FULL) return TRUE;
++    lstrcpynW( out, level == INSTALLUILEVEL_REDUCED ? L"/qr" : L"/qb", size );
++    if (gUILevel & INSTALLUILEVEL_PROGRESSONLY) lstrcatW( out, L"-" );
++    if (gUILevel & INSTALLUILEVEL_HIDECANCEL) lstrcatW( out, L"!" );
++    if (gUILevel & INSTALLUILEVEL_ENDDIALOG) lstrcatW( out, L"+" );
++    return TRUE;
++}
++
++/* runs msiexec OP TARGET UI CMDLINE through the consent prompt; FALSE when it is not for this call */
++static BOOL sg_msiexec_elevated( const WCHAR *op, const WCHAR *target, const WCHAR *cmdline, UINT *ret )
++{
++    SHELLEXECUTEINFOW sei = { sizeof(sei) };
++    WCHAR ui[8], exe[MAX_PATH], *args;
++    DWORD code = ERROR_INSTALL_FAILURE;
++    size_t len;
++
++    if (!sg_ui_switch( ui, ARRAY_SIZE(ui) )) return FALSE;
++    GetSystemDirectoryW( exe, MAX_PATH - 14 );
++    lstrcatW( exe, L"\\msiexec.exe" );
++    len = wcslen( op ) + wcslen( target ) + wcslen( ui ) + (cmdline ? wcslen( cmdline ) : 0) + 8;
++    if (!(args = malloc( len * sizeof(WCHAR) ))) return FALSE;
++    swprintf( args, len, L"%s \"%s\"%s%s%s%s", op, target, ui[0] ? L" " : L"", ui,
++              cmdline && cmdline[0] ? L" " : L"", cmdline ? cmdline : L"" );
++    TRACE( "elevated: msiexec %s\n", debugstr_w(args) );
++    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
++    sei.lpVerb = L"runas";
++    sei.lpFile = exe;
++    sei.lpParameters = args;
++    sei.nShow = SW_SHOWNORMAL;
++    SetEnvironmentVariableW( L"SG_MSIEXEC_RUNAS", L"1" );   /* msiexec 7745: it installs as it is */
++    if (!ShellExecuteExW( &sei ) || !sei.hProcess)
++    {
++        *ret = GetLastError() == ERROR_CANCELLED ? ERROR_INSTALL_USEREXIT : ERROR_INSTALL_FAILURE;
++        SetEnvironmentVariableW( L"SG_MSIEXEC_RUNAS", NULL );
++        free( args );
++        return TRUE;
++    }
++    SetEnvironmentVariableW( L"SG_MSIEXEC_RUNAS", NULL );
++    free( args );
++    WaitForSingleObject( sei.hProcess, INFINITE );
++    GetExitCodeProcess( sei.hProcess, &code );
++    CloseHandle( sei.hProcess );
++    *ret = code;
++    return TRUE;
++}
++
++static BOOL sg_install_elevated( const WCHAR *path, const WCHAR *cmdline, UINT *ret )
++{
++    WCHAR full[MAX_PATH];
++
++#ifdef SG_MUTANT_MSI_INPROC_NOELEVATE
++    return FALSE;
++#endif
++    if (sg_in_msiexec() || msi_sg_privileged() || UrlIsW( path, URLIS_URL )) return FALSE;
++    if (!GetFullPathNameW( path, ARRAY_SIZE(full), full, NULL )) return FALSE;
++    if (!sg_package_needs_elevation( full, cmdline )) return FALSE;
++    return sg_msiexec_elevated( L"/i", full, cmdline, ret );
++}
++
++/* the removal of an installed product: one for all users, or the person's own whose cached package
++ * does not say it needs no elevation */
++static BOOL sg_remove_elevated( const WCHAR *product, MSIINSTALLCONTEXT context, const WCHAR *cmdline, UINT *ret )
++{
++    WCHAR local[MAX_PATH];
++    DWORD len = ARRAY_SIZE(local);
++
++#ifdef SG_MUTANT_MSI_INPROC_NOELEVATE
++    return FALSE;
++#endif
++    if (sg_in_msiexec() || msi_sg_privileged()) return FALSE;
++    if (context != MSIINSTALLCONTEXT_MACHINE &&
++        (MsiGetProductInfoExW( product, NULL, context, INSTALLPROPERTY_LOCALPACKAGEW, local, &len ) ||
++         !sg_package_needs_elevation( local, NULL ))) return FALSE;
++    return sg_msiexec_elevated( L"/x", product, cmdline, ret );
++}
++
+ UINT WINAPI MsiInstallProductW(LPCWSTR szPackagePath, LPCWSTR szCommandLine)
+ {
+     MSIPACKAGE *package = NULL;
+@@ -360,6 +503,8 @@
+     if (!*szPackagePath)
+         return ERROR_PATH_NOT_FOUND;
+ 
++    if (sg_install_elevated( szPackagePath, szCommandLine, &r )) return r;
++
+     reinstallmode = msi_get_command_line_option(szCommandLine, L"REINSTALLMODE", &len);
+     if (reinstallmode)
+     {
+@@ -1032,6 +1177,9 @@
+     if (r != ERROR_SUCCESS)
+         return r;
+ 
++    if (eInstallState == INSTALLSTATE_ABSENT && sg_remove_elevated( szProduct, context, szCommandLine, &r ))
++        return r;
++
+     r = open_package(szProduct, NULL, context, &package);
+     if (r != ERROR_SUCCESS)
+         return r;

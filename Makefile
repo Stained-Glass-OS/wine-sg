@@ -1431,6 +1431,12 @@ test-instdetect:
 test-msineedadmin:
 	WINE=$(PREFIX)/bin/wine test/msineedadmin-gate.sh
 
+# Windows Installer's privileges (Privileged only when elevated, 1925 for an unprivileged all-users
+# install, ALLUSERS=2/MSIINSTALLPERUSER, no consent in silent mode: 9002) and a program's own
+# MsiInstallProduct reaching the consent prompt (9003).
+test-msipriv:
+	WINE=$(PREFIX)/bin/wine test/msipriv-gate.sh
+
 # The SCM checks who asks (0141); a second Unix user as for test-pipeimp.
 test-scm-access:
 	WINE=$(PREFIX)/bin/wine test/scm-access-gate.sh

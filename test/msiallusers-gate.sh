@@ -7,7 +7,7 @@
 # (David: PuTTY added no icons). Now msiexec asks for an administrator (runs
 # itself again with "runas") and the shortcuts go to the All Users Start
 # menu. A perMachine test package (test/msiallusers.wxs, built with wixl) is
-# installed without UI.
+# installed with basic UI (/qb): in silent mode msiexec never asks (9002).
 #
 #   WINE=/opt/wine-sg/bin/wine test/msiallusers-gate.sh
 set -u
@@ -25,7 +25,7 @@ cd "$T" && echo hello > hello.txt && wixl -o allusers.msi "$HERE/msiallusers.wxs
     || { echo "FAIL  the test package did not build"; exit 1; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
 cp allusers.msi "$WINEPREFIX/drive_c/"
-WINEDEBUG=trace+msiexec timeout 120 "$WINE" msiexec /i 'C:\allusers.msi' /qn > "$T/msiexec.log" 2>&1
+WINEDEBUG=trace+msiexec timeout 120 "$WINE" msiexec /i 'C:\allusers.msi' /qb > "$T/msiexec.log" 2>&1
 "$WINESERVER" -w
 C="$WINEPREFIX/drive_c"
 rc=0
