@@ -1,0 +1,479 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] ntdll: RtlQueryProcessDebugInformation fills in modules, heaps and locks
+
+CodeLite and WinMerge import RtlCreateQueryDebugBuffer/RtlQueryProcessDebugInformation; Wine gave
+zeroed placeholders of a layout Windows never had. Now PDI_MODULES is an RTL_PROCESS_MODULES list,
+PDI_HEAPS an RTL_PROCESS_HEAPS list with allocated/committed bytes and entry counts (PDI_HEAP_BLOCKS:
+the blocks too), PDI_LOCKS an RTL_PROCESS_LOCKS list (empty: Wine keeps no list of critical sections).
+Another process: its modules from its loader list; its heaps and locks need a thread inside it, as on
+Windows -- STATUS_NOT_IMPLEMENTED. Gate: test/dbgbuf-gate.sh. Mutant: SG_MUTANT_DBGBUF_STUB.
+---
+--- a/dlls/ntdll/debugbuffer.c
++++ b/dlls/ntdll/debugbuffer.c
+@@ -32,121 +32,359 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(debug_buffer);
+ 
+-static void dump_DEBUG_MODULE_INFORMATION(const DEBUG_MODULE_INFORMATION *iBuf)
++/* Stained Glass OS (wine-sg 9704): RtlQueryProcessDebugInformation fills the debug buffer the way Windows
++ * does (undocumented; the layouts are the ones the Windows SDK-era headers and every native-API header set
++ * agree on): PDI_MODULES an RTL_PROCESS_MODULES list (the one NtQuerySystemInformation and
++ * LdrQueryProcessModuleInformation use), PDI_HEAPS an RTL_PROCESS_HEAPS list of the process's heaps with
++ * their allocated and committed bytes and entry counts, PDI_HEAP_BLOCKS each heap's blocks and regions too,
++ * PDI_LOCKS an RTL_PROCESS_LOCKS list. Wine's stub gave zeroed placeholder structures of the wrong layout.
++ * The information lives in memory of the buffer's own, freed by RtlDestroyQueryDebugBuffer (Windows puts it
++ * in the buffer's section). Another process: its modules are read from its loader list; its heaps and locks
++ * would need a thread run inside it (as Windows does), not done -- STATUS_NOT_IMPLEMENTED. Critical
++ * sections are not listed anywhere in Wine, so the lock list is empty. */
++
++typedef struct
++{
++    SIZE_T Size;
++    USHORT Flags;
++    USHORT AllocatorBackTraceIndex;
++    union
++    {
++        struct { SIZE_T Settable; ULONG Tag; } s1;
++        struct { SIZE_T CommittedSize; PVOID FirstBlock; } s2;
++    } u;
++} SG_RTL_HEAP_ENTRY;
++
++#define SG_RTL_HEAP_BUSY               0x0001
++#define SG_RTL_HEAP_SEGMENT            0x0002
++#define SG_RTL_HEAP_UNCOMMITTED_RANGE  0x0100
++
++typedef struct
++{
++    PVOID BaseAddress;
++    ULONG Flags;
++    USHORT EntryOverhead;
++    USHORT CreatorBackTraceIndex;
++    SIZE_T BytesAllocated;
++    SIZE_T BytesCommitted;
++    ULONG NumberOfTags;
++    ULONG NumberOfEntries;
++    ULONG NumberOfPseudoTags;
++    ULONG PseudoTagGranularity;
++    ULONG Reserved[5];
++    PVOID Tags;
++    SG_RTL_HEAP_ENTRY *Entries;
++} SG_RTL_HEAP_INFORMATION;
++
++typedef struct
++{
++    ULONG NumberOfHeaps;
++    SG_RTL_HEAP_INFORMATION Heaps[1];
++} SG_RTL_PROCESS_HEAPS;
++
++typedef struct
++{
++    PVOID Address;
++    USHORT Type;
++    USHORT CreatorBackTraceIndex;
++    HANDLE OwningThread;
++    LONG LockCount;
++    ULONG ContentionCount;
++    ULONG EntryCount;
++    LONG RecursionCount;
++    ULONG NumberOfWaitingShared;
++    ULONG NumberOfWaitingExclusive;
++} SG_RTL_PROCESS_LOCK_INFORMATION;
++
++typedef struct
++{
++    ULONG NumberOfLocks;
++    SG_RTL_PROCESS_LOCK_INFORMATION Locks[1];
++} SG_RTL_PROCESS_LOCKS;
++
++/* the RtlWalkHeap entry (heap.c) */
++struct walk_entry
++{
++    void *data;
++    SIZE_T size;
++    BYTE overhead;
++    BYTE region_index;
++    WORD flags;
++    union
++    {
++        struct { HANDLE mem; DWORD reserved[3]; } block;
++        struct { DWORD committed; DWORD uncommitted; void *first; void *last; } region;
++    };
++};
++#define WALK_BUSY    0x0001
++#define WALK_REGION  0x0002
++#define WALK_UNCOMMITTED 0x1000
++
++static void *dbg_alloc( SIZE_T size )
++{
++    void *ptr = NULL;
++    if (NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE ))
++        return NULL;
++    return ptr;
++}
++
++static void dbg_free( void *ptr )
++{
++    SIZE_T size = 0;
++    if (ptr) NtFreeVirtualMemory( NtCurrentProcess(), &ptr, &size, MEM_RELEASE );
++}
++
++/***********************************************************************
++ *           RtlCreateQueryDebugBuffer   (NTDLL.@)
++ */
++PDEBUG_BUFFER WINAPI RtlCreateQueryDebugBuffer( ULONG size, BOOLEAN event_pair )
++{
++    DEBUG_BUFFER *buf;
++    SIZE_T alloc = max( size, sizeof(DEBUG_BUFFER) );
++
++    TRACE( "(%lu, %d)\n", size, event_pair );
++    if (!(buf = dbg_alloc( alloc ))) return NULL;
++    buf->SectionSize = alloc;
++    buf->AllocatedSize = alloc;
++    return buf;
++}
++
++/***********************************************************************
++ *           RtlDestroyQueryDebugBuffer   (NTDLL.@)
++ */
++NTSTATUS WINAPI RtlDestroyQueryDebugBuffer( PDEBUG_BUFFER buf )
++{
++    TRACE( "(%p)\n", buf );
++    if (!buf) return STATUS_SUCCESS;
++    dbg_free( buf->ModuleInformation );
++    dbg_free( buf->HeapInformation );
++    dbg_free( buf->LockInformation );
++    dbg_free( buf );
++    return STATUS_SUCCESS;
++}
++
++/* another process's modules, from its loader list */
++static NTSTATUS query_remote_modules( HANDLE process, RTL_PROCESS_MODULES **ret )
++{
++    PROCESS_BASIC_INFORMATION pbi;
++    PEB peb;
++    PEB_LDR_DATA ldr;
++    LDR_DATA_TABLE_ENTRY mod;
++    LIST_ENTRY *head, *entry;
++    RTL_PROCESS_MODULES *list;
++    ULONG count = 0, max = 0, i;
++    NTSTATUS status;
++
++    if ((status = NtQueryInformationProcess( process, ProcessBasicInformation, &pbi, sizeof(pbi), NULL ))) return status;
++    if ((status = NtReadVirtualMemory( process, pbi.PebBaseAddress, &peb, sizeof(peb), NULL ))) return status;
++    if ((status = NtReadVirtualMemory( process, peb.LdrData, &ldr, sizeof(ldr), NULL ))) return status;
++    head = &((PEB_LDR_DATA *)peb.LdrData)->InLoadOrderModuleList;
++    /* count first (bounded: a list that changes under us cannot loop forever) */
++    for (entry = ldr.InLoadOrderModuleList.Flink; entry != head && max < 4096; max++)
++    {
++        if (NtReadVirtualMemory( process, CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks ),
++                                 &mod, sizeof(mod), NULL )) break;
++        entry = mod.InLoadOrderLinks.Flink;
++    }
++    if (!(list = dbg_alloc( offsetof( RTL_PROCESS_MODULES, Modules[max ? max : 1] ) ))) return STATUS_NO_MEMORY;
++    for (entry = ldr.InLoadOrderModuleList.Flink; entry != head && count < max; )
++    {
++        RTL_PROCESS_MODULE_INFORMATION *sm = &list->Modules[count];
++        WCHAR name[MAX_PATH];
++        UNICODE_STRING nameW;
++        ANSI_STRING str;
++        char *p;
++
++        if (NtReadVirtualMemory( process, CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks ),
++                                 &mod, sizeof(mod), NULL )) break;
++        sm->MappedBaseAddress = sm->ImageBaseAddress = mod.DllBase;
++        sm->ImageSize = mod.SizeOfImage;
++        sm->Flags = mod.Flags;
++        sm->LoadOrderIndex = count;
++        sm->LoadCount = mod.LoadCount;
++        nameW.Length = min( mod.FullDllName.Length, sizeof(name) - sizeof(WCHAR) );
++        nameW.MaximumLength = sizeof(name);
++        nameW.Buffer = name;
++        if (NtReadVirtualMemory( process, mod.FullDllName.Buffer, name, nameW.Length, NULL )) nameW.Length = 0;
++        str.Length = 0;
++        str.MaximumLength = MAXIMUM_FILENAME_LENGTH;
++        str.Buffer = (char *)sm->Name;
++        RtlUnicodeStringToAnsiString( &str, &nameW, FALSE );
++        sm->Name[min( str.Length, MAXIMUM_FILENAME_LENGTH - 1 )] = 0;
++        p = strrchr( (char *)sm->Name, '\\' );
++        sm->NameOffset = p ? p - (char *)sm->Name + 1 : 0;
++        count++;
++        entry = mod.InLoadOrderLinks.Flink;
++    }
++    for (i = count; i < max; i++) memset( &list->Modules[i], 0, sizeof(list->Modules[i]) );
++    list->ModulesCount = count;
++    *ret = list;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS query_modules( RTL_PROCESS_MODULES **ret )
++{
++    RTL_PROCESS_MODULES *list;
++    ULONG size = 4096, needed;
++    NTSTATUS status;
++
++    for (;;)
++    {
++        if (!(list = dbg_alloc( size ))) return STATUS_NO_MEMORY;
++        status = LdrQueryProcessModuleInformation( list, size, &needed );
++        if (status != STATUS_INFO_LENGTH_MISMATCH) break;
++        dbg_free( list );
++        size = needed + 16 * sizeof(RTL_PROCESS_MODULE_INFORMATION);
++    }
++    if (status) { dbg_free( list ); return status; }
++    *ret = list;
++    return STATUS_SUCCESS;
++}
++
++static void walk_one_heap( HANDLE heap, SG_RTL_HEAP_INFORMATION *info, SG_RTL_HEAP_ENTRY *entries, ULONG max )
+ {
+-  TRACE( "MODULE_INFORMATION:%p\n", iBuf );
+-  if (NULL == iBuf) return ;
+-  TRACE( "Base:%lx\n", iBuf->Base );
+-  TRACE( "Size:%lx\n", iBuf->Size );
+-  TRACE( "Flags:%lx\n", iBuf->Flags );
+-}
+-
+-static void dump_DEBUG_HEAP_INFORMATION(const DEBUG_HEAP_INFORMATION *iBuf)
+-{
+-  TRACE( "HEAP_INFORMATION:%p\n", iBuf );
+-  if (NULL == iBuf) return ;
+-  TRACE( "Base:%lx\n", iBuf->Base );
+-  TRACE( "Flags:%lx\n", iBuf->Flags );
+-}
+-
+-static void dump_DEBUG_LOCK_INFORMATION(const DEBUG_LOCK_INFORMATION *iBuf)
+-{
+-  TRACE( "LOCK_INFORMATION:%p\n", iBuf );
+-
+-  if (NULL == iBuf) return ;
+-
+-  TRACE( "Address:%p\n", iBuf->Address );
+-  TRACE( "Type:%d\n", iBuf->Type );
+-  TRACE( "CreatorBackTraceIndex:%d\n", iBuf->CreatorBackTraceIndex );
+-  TRACE( "OwnerThreadId:%lx\n", iBuf->OwnerThreadId );
+-  TRACE( "ActiveCount:%ld\n", iBuf->ActiveCount );
+-  TRACE( "ContentionCount:%ld\n", iBuf->ContentionCount );
+-  TRACE( "EntryCount:%ld\n", iBuf->EntryCount );
+-  TRACE( "RecursionCount:%ld\n", iBuf->RecursionCount );
+-  TRACE( "NumberOfSharedWaiters:%ld\n", iBuf->NumberOfSharedWaiters );
+-  TRACE( "NumberOfExclusiveWaiters:%ld\n", iBuf->NumberOfExclusiveWaiters );
+-}
+-
+-static void dump_DEBUG_BUFFER(const DEBUG_BUFFER *iBuf)
+-{
+-  if (NULL == iBuf) return ;
+-  TRACE( "SectionHandle:%p\n", iBuf->SectionHandle);
+-  TRACE( "SectionBase:%p\n", iBuf->SectionBase);
+-  TRACE( "RemoteSectionBase:%p\n", iBuf->RemoteSectionBase);
+-  TRACE( "SectionBaseDelta:%lx\n", iBuf->SectionBaseDelta);
+-  TRACE( "EventPairHandle:%p\n", iBuf->EventPairHandle);
+-  TRACE( "RemoteThreadHandle:%p\n", iBuf->RemoteThreadHandle);
+-  TRACE( "InfoClassMask:%lx\n", iBuf->InfoClassMask);
+-  TRACE( "SizeOfInfo:%Iu\n", iBuf->SizeOfInfo);
+-  TRACE( "AllocatedSize:%Iu\n", iBuf->AllocatedSize);
+-  TRACE( "SectionSize:%ld\n", iBuf->SectionSize);
+-  TRACE( "BackTraceInfo:%p\n", iBuf->BackTraceInformation);
+-  dump_DEBUG_MODULE_INFORMATION(iBuf->ModuleInformation);
+-  dump_DEBUG_HEAP_INFORMATION(iBuf->HeapInformation);
+-  dump_DEBUG_LOCK_INFORMATION(iBuf->LockInformation);
+-}
+-
+-PDEBUG_BUFFER WINAPI RtlCreateQueryDebugBuffer(IN ULONG iSize, IN BOOLEAN iEventPair) 
+-{
+-   PDEBUG_BUFFER oBuf;
+-   FIXME("(%ld, %d): stub\n", iSize, iEventPair);
+-   if (iSize < sizeof(DEBUG_BUFFER)) {
+-     iSize = sizeof(DEBUG_BUFFER);
+-   }
+-   oBuf = RtlAllocateHeap(GetProcessHeap(), 0, iSize);
+-   memset(oBuf, 0, iSize);
+-   FIXME("(%ld, %d): returning %p\n", iSize, iEventPair, oBuf);
+-   return oBuf;
+-}
+-
+-NTSTATUS WINAPI RtlDestroyQueryDebugBuffer(IN PDEBUG_BUFFER iBuf) 
+-{
+-   NTSTATUS nts = STATUS_SUCCESS;
+-   FIXME("(%p): stub\n", iBuf);
+-   if (NULL != iBuf) {
+-     RtlFreeHeap(GetProcessHeap(), 0, iBuf->ModuleInformation);
+-     RtlFreeHeap(GetProcessHeap(), 0, iBuf->HeapInformation);
+-     RtlFreeHeap(GetProcessHeap(), 0, iBuf->LockInformation);
+-     RtlFreeHeap(GetProcessHeap(), 0, iBuf);
+-   }
+-   return nts;
++    struct walk_entry e;
++
++    memset( &e, 0, sizeof(e) );
++    while (!RtlWalkHeap( heap, &e ))
++    {
++        if (e.flags & WALK_REGION)
++        {
++            info->BytesCommitted += e.region.committed;
++            if (entries && info->NumberOfEntries < max)
++            {
++                SG_RTL_HEAP_ENTRY *out = &entries[info->NumberOfEntries];
++                out->Size = e.size;
++                out->Flags = SG_RTL_HEAP_SEGMENT;
++                out->AllocatorBackTraceIndex = 0;
++                out->u.s2.CommittedSize = e.region.committed;
++                out->u.s2.FirstBlock = e.region.first;
++            }
++        }
++        else if (e.flags & WALK_UNCOMMITTED)
++        {
++            if (entries && info->NumberOfEntries < max)
++            {
++                SG_RTL_HEAP_ENTRY *out = &entries[info->NumberOfEntries];
++                memset( out, 0, sizeof(*out) );
++                out->Size = e.size;
++                out->Flags = SG_RTL_HEAP_UNCOMMITTED_RANGE;
++            }
++        }
++        else
++        {
++            if (e.flags & WALK_BUSY) info->BytesAllocated += e.size;
++            if (entries && info->NumberOfEntries < max)
++            {
++                SG_RTL_HEAP_ENTRY *out = &entries[info->NumberOfEntries];
++                memset( out, 0, sizeof(*out) );
++                out->Size = e.size;
++                out->Flags = (e.flags & WALK_BUSY) ? SG_RTL_HEAP_BUSY : 0;
++            }
++        }
++        info->NumberOfEntries++;
++    }
+ }
+ 
+-NTSTATUS WINAPI RtlQueryProcessDebugInformation(IN ULONG iProcessId, IN ULONG iDebugInfoMask, IN OUT PDEBUG_BUFFER iBuf) 
++static NTSTATUS query_heaps( ULONG mask, SG_RTL_PROCESS_HEAPS **ret )
++{
++    SG_RTL_PROCESS_HEAPS *list;
++    HANDLE *heaps = NULL;
++    ULONG count, alloc = 0, i;
++
++    for (;;)
++    {
++        count = RtlGetProcessHeaps( alloc, heaps );
++        if (count <= alloc) break;
++        dbg_free( heaps );
++        alloc = count + 8;
++        if (!(heaps = dbg_alloc( alloc * sizeof(HANDLE) ))) return STATUS_NO_MEMORY;
++    }
++    if (!(list = dbg_alloc( offsetof( SG_RTL_PROCESS_HEAPS, Heaps[count ? count : 1] ) )))
++    {
++        dbg_free( heaps );
++        return STATUS_NO_MEMORY;
++    }
++    list->NumberOfHeaps = count;
++    for (i = 0; i < count; i++)
++    {
++        SG_RTL_HEAP_INFORMATION *info = &list->Heaps[i];
++
++        info->BaseAddress = heaps[i];
++        info->EntryOverhead = 2 * sizeof(void *);
++        if (!RtlLockHeap( heaps[i] )) continue;
++        walk_one_heap( heaps[i], info, NULL, 0 );
++        if (mask & PDI_HEAP_BLOCKS)
++        {
++            ULONG max = info->NumberOfEntries;
++            if ((info->Entries = dbg_alloc( max * sizeof(SG_RTL_HEAP_ENTRY) + 1 )))
++            {
++                info->BytesAllocated = info->BytesCommitted = 0;
++                info->NumberOfEntries = 0;
++                walk_one_heap( heaps[i], info, info->Entries, max );
++                if (info->NumberOfEntries > max) info->NumberOfEntries = max;
++            }
++        }
++        RtlUnlockHeap( heaps[i] );
++    }
++    dbg_free( heaps );
++    *ret = list;
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
++ *           RtlQueryProcessDebugInformation   (NTDLL.@)
++ */
++NTSTATUS WINAPI RtlQueryProcessDebugInformation( ULONG pid, ULONG mask, PDEBUG_BUFFER buf )
+ {
+     CLIENT_ID cid;
+     NTSTATUS status;
+     HANDLE process;
++    BOOL self = pid == HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
+ 
+-    cid.UniqueProcess = ULongToHandle( iProcessId );
+-    cid.UniqueThread = 0;
++    TRACE( "(%lu, %#lx, %p)\n", pid, mask, buf );
+ 
+-    if ((status = NtOpenProcess( &process, PROCESS_QUERY_LIMITED_INFORMATION, NULL, &cid ))) return status;
++    if (!buf) return STATUS_INVALID_PARAMETER;
++    cid.UniqueProcess = ULongToHandle( pid );
++    cid.UniqueThread = 0;
++    if ((status = NtOpenProcess( &process, self ? PROCESS_QUERY_LIMITED_INFORMATION : PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
++                                 NULL, &cid )))
++        return status;
++    if (!self && (mask & (PDI_HEAPS | PDI_HEAP_TAGS | PDI_HEAP_BLOCKS | PDI_LOCKS | PDI_BACKTRACE)))
++    {
++        FIXME( "heaps, locks and back traces of another process (%lu): needs a thread in it\n", pid );
++        NtClose( process );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++
++    /* a buffer queried again gives up what the last query gave it */
++    dbg_free( buf->ModuleInformation ); buf->ModuleInformation = NULL;
++    dbg_free( buf->HeapInformation ); buf->HeapInformation = NULL;
++    dbg_free( buf->LockInformation ); buf->LockInformation = NULL;
++    buf->BackTraceInformation = NULL;
++    buf->InfoClassMask = mask;
++
++#ifndef SG_MUTANT_DBGBUF_STUB
++    if (mask & PDI_MODULES)
++    {
++        RTL_PROCESS_MODULES *mods = NULL;
++        status = self ? query_modules( &mods ) : query_remote_modules( process, &mods );
++        buf->ModuleInformation = mods;
++    }
++    if (!status && (mask & (PDI_HEAPS | PDI_HEAP_BLOCKS)))
++    {
++        SG_RTL_PROCESS_HEAPS *heaps = NULL;
++        status = query_heaps( mask, &heaps );
++        buf->HeapInformation = heaps;
++    }
++    if (!status && (mask & PDI_LOCKS))
++    {
++        SG_RTL_PROCESS_LOCKS *locks = dbg_alloc( sizeof(*locks) );
++        if (locks) locks->NumberOfLocks = 0;
++        else status = STATUS_NO_MEMORY;
++        buf->LockInformation = locks;
++    }
++#endif
+     NtClose( process );
+-
+-   FIXME("(%ld, %lx, %p): stub\n", iProcessId, iDebugInfoMask, iBuf);
+-   iBuf->InfoClassMask = iDebugInfoMask;
+-
+-   if (iDebugInfoMask & PDI_MODULES) {
+-     PDEBUG_MODULE_INFORMATION info = RtlAllocateHeap(GetProcessHeap(), 0, sizeof(DEBUG_MODULE_INFORMATION));
+-     memset(info, 0, sizeof(DEBUG_MODULE_INFORMATION));
+-     iBuf->ModuleInformation = info;
+-   }
+-   if (iDebugInfoMask & PDI_HEAPS) {
+-     PDEBUG_HEAP_INFORMATION info = RtlAllocateHeap(GetProcessHeap(), 0, sizeof(DEBUG_HEAP_INFORMATION));
+-     memset(info, 0, sizeof(DEBUG_HEAP_INFORMATION));
+-     if (iDebugInfoMask & PDI_HEAP_TAGS) {
+-     }
+-     if (iDebugInfoMask & PDI_HEAP_BLOCKS) {
+-     }
+-     iBuf->HeapInformation = info;
+-   }
+-   if (iDebugInfoMask & PDI_LOCKS) {
+-     PDEBUG_LOCK_INFORMATION info = RtlAllocateHeap(GetProcessHeap(), 0, sizeof(DEBUG_LOCK_INFORMATION));
+-     memset(info, 0, sizeof(DEBUG_LOCK_INFORMATION));
+-     iBuf->LockInformation = info;
+-   }
+-   TRACE("returns:%p\n", iBuf);
+-   dump_DEBUG_BUFFER(iBuf);
+-   return status;
++    return status;
+ }
