@@ -1,6 +1,8 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# UI ribbon framework object model and image factory (patch 3579)
+# UI ribbon framework object model and image factory (patch 3579); the markup
+# is a resource of type UIFILE, as the Ribbon compiler names it (patch 9303;
+# mutant SG_MUTANT_RIBBON_WRONG_TYPE, uiribbon/uiribbon.c)
 #
 #   WINE=/opt/wine-sg/bin/wine test/fastb-ribbon-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
@@ -23,7 +25,7 @@ BUILD=$(dirname "$WINE")
 [ -f "$BUILD/include/uiribbon.h" ] || { echo "SKIP: needs $BUILD/include/uiribbon.h"; exit 77; }
 cp "$BUILD/include/uiribbon.h" "$T/inc/"
 printf 'ribbon markup stand-in' > "$T/dummy.bin"
-echo 'APPLICATION_RIBBON UIRIBBON "dummy.bin"' > "$T/res.rc"
+echo 'APPLICATION_RIBBON UIFILE "dummy.bin"' > "$T/res.rc"
 (cd "$T" && x86_64-w64-mingw32-windres res.rc res.o) || { echo "FAIL  windres"; exit 1; }
 TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/fastb-ribbon-probe.c" -I"$T/inc" "$T/res.o" -lole32 -loleaut32 -luuid -luser32 -lgdi32 \
     || { echo "FAIL  probe did not build"; exit 1; }
