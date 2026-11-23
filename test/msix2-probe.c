@@ -1,6 +1,7 @@
 /* msix2-probe: staging, registering by name, users, state, status, integrity, cleanup, provisioning,
  * App Installer files, cancellation and the display information of an application, for
- * test/msix2-gate.sh.  (The helpers are those of msix-probe.c.)
+ * test/msix2-gate.sh (removekeep: RemovePackageWithOptionsAsync keeping the user's data, for
+ * test/appdata-gate.sh).  (The helpers are those of msix-probe.c.)
  *
  * Interfaces are declared here from their published IIDs.
  *
@@ -251,7 +252,7 @@ typedef struct { InspVtbl i; void *AddPackageAsync, *UpdatePackageAsync, *Remove
                  HRESULT (WINAPI *CleanupPackageForUserAsync)(void *, HSTRING, HSTRING, void **);
                  void *FindPackagesByPackageFamilyName, *FindPackagesByUserSecurityIdPackageFamilyName,
                       *FindPackageByUserSecurityIdPackageFullName; } ManagerAllVtbl;
-typedef struct { InspVtbl i; void *RemovePackageWithOptionsAsync;
+typedef struct { InspVtbl i; HRESULT (WINAPI *RemovePackageWithOptionsAsync)(void *, HSTRING, UINT32, void **);
                  HRESULT (WINAPI *StagePackageWithOptionsAsync)(void *, void *, void *, UINT32, void **);
                  HRESULT (WINAPI *RegisterPackageByFullNameAsync)(void *, HSTRING, void *, UINT32, void **);
                  void *FindPackagesWithPackageTypes, *f1, *f2, *f3, *f4, *f5;
@@ -383,6 +384,13 @@ int main( int argc, char **argv )
     {
         hr = VT(manager, ManagerVtbl)->RemovePackageAsync( manager, H( argv[2] ), &op );
         printf( "RemovePackageAsync=0x%08lx\n", (unsigned long)hr );
+        return SUCCEEDED(hr) ? wait_op( "Remove", op ) : 1;
+    }
+    if (argc == 3 && !strcmp( argv[1], "removekeep" ))
+    {
+        /* RemovalOptions_PreserveApplicationData */
+        hr = VT(m2, Manager2AllVtbl)->RemovePackageWithOptionsAsync( m2, H( argv[2] ), 0x1000, &op );
+        printf( "RemovePackageWithOptionsAsync=0x%08lx\n", (unsigned long)hr );
         return SUCCEEDED(hr) ? wait_op( "Remove", op ) : 1;
     }
     if (argc == 3 && !strcmp( argv[1], "add" ))
