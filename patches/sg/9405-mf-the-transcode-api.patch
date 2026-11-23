@@ -1,0 +1,896 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] mf: The transcode API (9405)
+
+MFCreateTranscodeTopology was E_NOTIMPL (Zoom's media adapter imports it; 7853) and
+MFCreateTranscodeSinkActivate a stub. As documented: a partial topology of, per selected stream the
+profile has attributes for, a source node, an encoder node (an encoder MFT for the profile's subtype,
+its types set, video attributes the profile leaves out taken from the source) and an output node on the
+transcode sink activation object; streams the profile has nothing for are deselected;
+MF_E_TRANSCODE_NO_CONTAINERTYPE, MF_E_TRANSCODE_PROFILE_NO_MATCHING_STREAMS,
+MF_E_TRANSCODE_NO_MATCHING_ENCODER, MF_E_MEDIA_SOURCE_NO_STREAMS_SELECTED. The sink activation object
+(IMFTranscodeSinkInfoProvider -- added to mfidl.idl, layout as in Windows' metadata) makes the
+MF_TRANSCODE_CONTAINERTYPE sink (MPEG-4, 3GP, fragmented MPEG-4, MP3, ADTS, AC-3, WAVE, ASF) on the
+output file when the session activates it; its stream types are the encoders' actual output types.
+---
+--- a/include/mfidl.idl
++++ b/include/mfidl.idl
+@@ -1716,6 +1716,27 @@
+     HRESULT GetContainerAttributes([out] IMFAttributes **attrs);
+ }
+ 
++typedef struct _MF_TRANSCODE_SINK_INFO
++{
++    DWORD dwVideoStreamID;
++    IMFMediaType *pVideoMediaType;
++    DWORD dwAudioStreamID;
++    IMFMediaType *pAudioMediaType;
++} MF_TRANSCODE_SINK_INFO;
++
++[
++    object,
++    uuid(8cffcd2e-5a03-4a3a-aff7-edcd107c620e),
++    local
++]
++interface IMFTranscodeSinkInfoProvider : IUnknown
++{
++    HRESULT SetOutputFile([in] LPCWSTR filename);
++    HRESULT SetOutputByteStream([in] IMFActivate *bytestream_activate);
++    HRESULT SetProfile([in] IMFTranscodeProfile *profile);
++    HRESULT GetSinkInfo([out] MF_TRANSCODE_SINK_INFO *info);
++}
++
+ [
+     object,
+     uuid(994e23af-1cc2-493c-b9fa-46f1cb040fa4)
+@@ -1728,6 +1749,8 @@
+ }
+ 
+ cpp_quote("HRESULT WINAPI MFCreateTranscodeProfile(IMFTranscodeProfile **profile);")
++cpp_quote("HRESULT WINAPI MFCreateTranscodeSinkActivate(IMFActivate **activate);")
++cpp_quote("HRESULT WINAPI MFCreateTranscodeTopology(IMFMediaSource *source, LPCWSTR url, IMFTranscodeProfile *profile, IMFTopology **topology);")
+ cpp_quote("HRESULT WINAPI MFCreatePMPServer(DWORD flags, IMFPMPServer **server);")
+ cpp_quote("HRESULT WINAPI MFCreatePMPMediaSession(DWORD flags, IMFAttributes *config, IMFMediaSession **session, IMFActivate **enabler_activate);")
+ cpp_quote("HRESULT WINAPI MFCreateDeviceSource(IMFAttributes *attributes, IMFMediaSource **source);")
+--- a/dlls/mf/sg_transcode.c
++++ b/dlls/mf/sg_transcode.c
+@@ -1,5 +1,5 @@
+ /*
+- * MFCreateTranscodeTopology (7853)
++ * The transcode API: MFCreateTranscodeTopology, MFCreateTranscodeSinkActivate
+  *
+  * Copyright 2026 Stained Glass OS
+  *
+@@ -18,23 +18,816 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++/*
++ * Stained Glass OS (wine-sg 7853 made MFCreateTranscodeTopology a clean E_NOTIMPL for Zoom's media
++ * adapter; wine-sg 9405 builds it): as Microsoft documents it, MFCreateTranscodeTopology makes a partial
++ * topology -- per selected stream of the source that the profile has attributes for, a source node, an
++ * encoder node (an encoder MFT for the profile's subtype, its types set from the profile) and an output
++ * node on the transcode sink activation object; streams the profile has nothing for are deselected. The
++ * Media Session's topology loader adds the decoders and converters in front of the encoders. The sink
++ * activation object (MFCreateTranscodeSinkActivate, IMFTranscodeSinkInfoProvider) creates the container
++ * sink of MF_TRANSCODE_CONTAINERTYPE (MPEG-4, 3GP, MP3, ADTS, AC-3, fragmented MPEG-4, WAVE or ASF) on
++ * the output file when the session activates it.
++ */
++
+ #define COBJMACROS
+ #include <stdarg.h>
+ #include "windef.h"
+ #include "winbase.h"
++#include "mfapi.h"
++#include "mferror.h"
+ #include "mfidl.h"
++#include "wmcontainer.h"
++#include "wine/mfinternal.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ 
+-/* a topology that encodes a source into a file: the transcode API is not built here; the caller
+- * (Zoom's media adapter) is told so instead of the program ending at a stub */
++#define TRANSCODE_VIDEO_ID 1
++
++static DWORD audio_stream_id(const GUID *container)
++{
++    /* the WAVE sink's only stream is 1; the other sinks put audio beside video as 2 */
++    return IsEqualGUID(container, &MFTranscodeContainerType_WAVE) ? 1 : 2;
++}
++
++static HRESULT media_type_from_attributes(IMFAttributes *attributes, const GUID *major, IMFMediaType **out)
++{
++    IMFMediaType *type;
++    HRESULT hr;
++
++    if (FAILED(hr = MFCreateMediaType(&type)))
++        return hr;
++    if (SUCCEEDED(hr = IMFAttributes_CopyAllItems(attributes, (IMFAttributes *)type)))
++        hr = IMFMediaType_SetGUID(type, &MF_MT_MAJOR_TYPE, major);
++    if (FAILED(hr))
++    {
++        IMFMediaType_Release(type);
++        return hr;
++    }
++    *out = type;
++    return S_OK;
++}
++
++/* transcode sink activation object */
++
++struct transcode_sink
++{
++    IMFActivate IMFActivate_iface;
++    IMFTranscodeSinkInfoProvider IMFTranscodeSinkInfoProvider_iface;
++    LONG refcount;
++    CRITICAL_SECTION cs;
++    IMFAttributes *attributes;
++    WCHAR *url;
++    IMFActivate *bytestream_activate;
++    GUID container;
++    IMFMediaType *audio_type, *video_type;
++    IMFMediaSink *sink;
++};
++
++static struct transcode_sink *impl_from_IMFActivate(IMFActivate *iface)
++{
++    return CONTAINING_RECORD(iface, struct transcode_sink, IMFActivate_iface);
++}
++
++static struct transcode_sink *impl_from_IMFTranscodeSinkInfoProvider(IMFTranscodeSinkInfoProvider *iface)
++{
++    return CONTAINING_RECORD(iface, struct transcode_sink, IMFTranscodeSinkInfoProvider_iface);
++}
++
++static HRESULT WINAPI transcode_sink_QueryInterface(IMFActivate *iface, REFIID riid, void **out)
++{
++    struct transcode_sink *sink = impl_from_IMFActivate(iface);
++
++    TRACE("%p, %s, %p.\n", iface, debugstr_guid(riid), out);
++
++    if (IsEqualIID(riid, &IID_IMFActivate) || IsEqualIID(riid, &IID_IMFAttributes) || IsEqualIID(riid, &IID_IUnknown))
++        *out = &sink->IMFActivate_iface;
++    else if (IsEqualIID(riid, &IID_IMFTranscodeSinkInfoProvider))
++        *out = &sink->IMFTranscodeSinkInfoProvider_iface;
++    else
++    {
++        WARN("Unsupported interface %s.\n", debugstr_guid(riid));
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IUnknown_AddRef((IUnknown *)*out);
++    return S_OK;
++}
++
++static ULONG WINAPI transcode_sink_AddRef(IMFActivate *iface)
++{
++    return InterlockedIncrement(&impl_from_IMFActivate(iface)->refcount);
++}
++
++static ULONG WINAPI transcode_sink_Release(IMFActivate *iface)
++{
++    struct transcode_sink *sink = impl_from_IMFActivate(iface);
++    ULONG refcount = InterlockedDecrement(&sink->refcount);
++
++    if (!refcount)
++    {
++        if (sink->sink)
++            IMFMediaSink_Release(sink->sink);
++        if (sink->bytestream_activate)
++            IMFActivate_Release(sink->bytestream_activate);
++        if (sink->audio_type)
++            IMFMediaType_Release(sink->audio_type);
++        if (sink->video_type)
++            IMFMediaType_Release(sink->video_type);
++        IMFAttributes_Release(sink->attributes);
++        free(sink->url);
++        sink->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection(&sink->cs);
++        free(sink);
++    }
++    return refcount;
++}
++
++#define SINK_FORWARD(name, args, call) \
++static HRESULT WINAPI transcode_sink_##name args \
++{ return IMFAttributes_##name call; }
++
++SINK_FORWARD(GetItem, (IMFActivate *iface, REFGUID key, PROPVARIANT *value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(GetItemType, (IMFActivate *iface, REFGUID key, MF_ATTRIBUTE_TYPE *type), (impl_from_IMFActivate(iface)->attributes, key, type))
++SINK_FORWARD(CompareItem, (IMFActivate *iface, REFGUID key, REFPROPVARIANT value, BOOL *result), (impl_from_IMFActivate(iface)->attributes, key, value, result))
++SINK_FORWARD(Compare, (IMFActivate *iface, IMFAttributes *theirs, MF_ATTRIBUTES_MATCH_TYPE type, BOOL *result), (impl_from_IMFActivate(iface)->attributes, theirs, type, result))
++SINK_FORWARD(GetUINT32, (IMFActivate *iface, REFGUID key, UINT32 *value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(GetUINT64, (IMFActivate *iface, REFGUID key, UINT64 *value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(GetDouble, (IMFActivate *iface, REFGUID key, double *value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(GetGUID, (IMFActivate *iface, REFGUID key, GUID *value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(GetStringLength, (IMFActivate *iface, REFGUID key, UINT32 *length), (impl_from_IMFActivate(iface)->attributes, key, length))
++SINK_FORWARD(GetString, (IMFActivate *iface, REFGUID key, WCHAR *value, UINT32 size, UINT32 *length), (impl_from_IMFActivate(iface)->attributes, key, value, size, length))
++SINK_FORWARD(GetAllocatedString, (IMFActivate *iface, REFGUID key, WCHAR **value, UINT32 *length), (impl_from_IMFActivate(iface)->attributes, key, value, length))
++SINK_FORWARD(GetBlobSize, (IMFActivate *iface, REFGUID key, UINT32 *size), (impl_from_IMFActivate(iface)->attributes, key, size))
++SINK_FORWARD(GetBlob, (IMFActivate *iface, REFGUID key, UINT8 *buf, UINT32 bufsize, UINT32 *blobsize), (impl_from_IMFActivate(iface)->attributes, key, buf, bufsize, blobsize))
++SINK_FORWARD(GetAllocatedBlob, (IMFActivate *iface, REFGUID key, UINT8 **buf, UINT32 *size), (impl_from_IMFActivate(iface)->attributes, key, buf, size))
++SINK_FORWARD(GetUnknown, (IMFActivate *iface, REFGUID key, REFIID riid, void **out), (impl_from_IMFActivate(iface)->attributes, key, riid, out))
++SINK_FORWARD(SetItem, (IMFActivate *iface, REFGUID key, REFPROPVARIANT value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(DeleteItem, (IMFActivate *iface, REFGUID key), (impl_from_IMFActivate(iface)->attributes, key))
++SINK_FORWARD(DeleteAllItems, (IMFActivate *iface), (impl_from_IMFActivate(iface)->attributes))
++SINK_FORWARD(SetUINT32, (IMFActivate *iface, REFGUID key, UINT32 value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(SetUINT64, (IMFActivate *iface, REFGUID key, UINT64 value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(SetDouble, (IMFActivate *iface, REFGUID key, double value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(SetGUID, (IMFActivate *iface, REFGUID key, REFGUID value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(SetString, (IMFActivate *iface, REFGUID key, const WCHAR *value), (impl_from_IMFActivate(iface)->attributes, key, value))
++SINK_FORWARD(SetBlob, (IMFActivate *iface, REFGUID key, const UINT8 *buf, UINT32 size), (impl_from_IMFActivate(iface)->attributes, key, buf, size))
++SINK_FORWARD(SetUnknown, (IMFActivate *iface, REFGUID key, IUnknown *unknown), (impl_from_IMFActivate(iface)->attributes, key, unknown))
++SINK_FORWARD(LockStore, (IMFActivate *iface), (impl_from_IMFActivate(iface)->attributes))
++SINK_FORWARD(UnlockStore, (IMFActivate *iface), (impl_from_IMFActivate(iface)->attributes))
++SINK_FORWARD(GetCount, (IMFActivate *iface, UINT32 *count), (impl_from_IMFActivate(iface)->attributes, count))
++SINK_FORWARD(GetItemByIndex, (IMFActivate *iface, UINT32 index, GUID *key, PROPVARIANT *value), (impl_from_IMFActivate(iface)->attributes, index, key, value))
++SINK_FORWARD(CopyAllItems, (IMFActivate *iface, IMFAttributes *dest), (impl_from_IMFActivate(iface)->attributes, dest))
++
++static HRESULT create_container_sink(const GUID *container, IMFByteStream *stream, IMFMediaType *video,
++        IMFMediaType *audio, IMFMediaSink **sink)
++{
++    if (IsEqualGUID(container, &MFTranscodeContainerType_MPEG4))
++        return MFCreateMPEG4MediaSink(stream, video, audio, sink);
++    if (IsEqualGUID(container, &MFTranscodeContainerType_3GP))
++        return MFCreate3GPMediaSink(stream, video, audio, sink);
++    if (IsEqualGUID(container, &MFTranscodeContainerType_FMPEG4))
++        return MFCreateFMPEG4MediaSink(stream, video, audio, sink);
++    if (video)
++        return MF_E_INVALIDMEDIATYPE;   /* the audio containers */
++    if (IsEqualGUID(container, &MFTranscodeContainerType_MP3))
++        return MFCreateMP3MediaSink(stream, sink);
++    if (IsEqualGUID(container, &MFTranscodeContainerType_ADTS))
++        return MFCreateADTSMediaSink(stream, audio, sink);
++    if (IsEqualGUID(container, &MFTranscodeContainerType_AC3))
++        return MFCreateAC3MediaSink(stream, audio, sink);
++    if (IsEqualGUID(container, &MFTranscodeContainerType_WAVE))
++    {
++        IMFSinkClassFactory *factory;
++        HRESULT hr;
++
++        /* mfsrcsnk's, through its class factory */
++        if (!audio)
++            return MF_E_INVALIDMEDIATYPE;
++        if (FAILED(hr = CoCreateInstance(&CLSID_MFWAVESinkClassFactory, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IMFSinkClassFactory, (void **)&factory)))
++            return hr;
++        hr = IMFSinkClassFactory_CreateMediaSink(factory, stream, NULL, audio, sink);
++        IMFSinkClassFactory_Release(factory);
++        return hr;
++    }
++    FIXME("Unsupported container %s.\n", debugstr_guid(container));
++    return MF_E_INVALIDMEDIATYPE;
++}
++
++/* the sink, with a stream sink of the sink info's identifier per stream */
++static HRESULT transcode_sink_create(struct transcode_sink *sink, IMFMediaSink **out)
++{
++    IMFByteStream *stream;
++    IMFStreamSink *stream_sink;
++    IMFMediaSink *media_sink;
++    HRESULT hr;
++
++    if (sink->url)
++        hr = MFCreateFile(MF_ACCESSMODE_READWRITE, MF_OPENMODE_DELETE_IF_EXIST, MF_FILEFLAGS_NONE, sink->url, &stream);
++    else if (sink->bytestream_activate)
++        hr = IMFActivate_ActivateObject(sink->bytestream_activate, &IID_IMFByteStream, (void **)&stream);
++    else
++        hr = MF_E_NOT_INITIALIZED;
++    if (FAILED(hr))
++        return hr;
++
++    if (IsEqualGUID(&sink->container, &MFTranscodeContainerType_ASF))
++        hr = MFCreateASFMediaSink(stream, &media_sink);
++    else
++        hr = create_container_sink(&sink->container, stream, sink->video_type, sink->audio_type, &media_sink);
++    IMFByteStream_Release(stream);
++    if (FAILED(hr))
++        return hr;
++
++    /* sinks made without their streams (ASF, MP3) get them here */
++    if (SUCCEEDED(hr) && sink->video_type
++            && FAILED(IMFMediaSink_GetStreamSinkById(media_sink, TRANSCODE_VIDEO_ID, &stream_sink)))
++        hr = IMFMediaSink_AddStreamSink(media_sink, TRANSCODE_VIDEO_ID, sink->video_type, &stream_sink);
++    if (SUCCEEDED(hr) && sink->video_type)
++        IMFStreamSink_Release(stream_sink);
++    if (SUCCEEDED(hr) && sink->audio_type
++            && FAILED(IMFMediaSink_GetStreamSinkById(media_sink, audio_stream_id(&sink->container), &stream_sink)))
++        hr = IMFMediaSink_AddStreamSink(media_sink, audio_stream_id(&sink->container), sink->audio_type, &stream_sink);
++    if (SUCCEEDED(hr) && sink->audio_type)
++        IMFStreamSink_Release(stream_sink);
++    if (FAILED(hr))
++    {
++        IMFMediaSink_Shutdown(media_sink);
++        IMFMediaSink_Release(media_sink);
++        return hr;
++    }
++    *out = media_sink;
++    return S_OK;
++}
++
++static HRESULT WINAPI transcode_sink_ActivateObject(IMFActivate *iface, REFIID riid, void **out)
++{
++    struct transcode_sink *sink = impl_from_IMFActivate(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %s, %p.\n", iface, debugstr_guid(riid), out);
++
++    EnterCriticalSection(&sink->cs);
++    if (!sink->sink)
++        hr = transcode_sink_create(sink, &sink->sink);
++    if (SUCCEEDED(hr))
++        hr = IMFMediaSink_QueryInterface(sink->sink, riid, out);
++    LeaveCriticalSection(&sink->cs);
++    return hr;
++}
++
++static HRESULT WINAPI transcode_sink_ShutdownObject(IMFActivate *iface)
++{
++    struct transcode_sink *sink = impl_from_IMFActivate(iface);
++
++    TRACE("%p.\n", iface);
++
++    EnterCriticalSection(&sink->cs);
++    if (sink->sink)
++    {
++        IMFMediaSink_Shutdown(sink->sink);
++        IMFMediaSink_Release(sink->sink);
++        sink->sink = NULL;
++    }
++    LeaveCriticalSection(&sink->cs);
++    return S_OK;
++}
++
++static HRESULT WINAPI transcode_sink_DetachObject(IMFActivate *iface)
++{
++    struct transcode_sink *sink = impl_from_IMFActivate(iface);
++
++    TRACE("%p.\n", iface);
++
++    EnterCriticalSection(&sink->cs);
++    if (sink->sink)
++        IMFMediaSink_Release(sink->sink);
++    sink->sink = NULL;
++    LeaveCriticalSection(&sink->cs);
++    return S_OK;
++}
++
++static const IMFActivateVtbl transcode_sink_vtbl =
++{
++    transcode_sink_QueryInterface,
++    transcode_sink_AddRef,
++    transcode_sink_Release,
++    transcode_sink_GetItem,
++    transcode_sink_GetItemType,
++    transcode_sink_CompareItem,
++    transcode_sink_Compare,
++    transcode_sink_GetUINT32,
++    transcode_sink_GetUINT64,
++    transcode_sink_GetDouble,
++    transcode_sink_GetGUID,
++    transcode_sink_GetStringLength,
++    transcode_sink_GetString,
++    transcode_sink_GetAllocatedString,
++    transcode_sink_GetBlobSize,
++    transcode_sink_GetBlob,
++    transcode_sink_GetAllocatedBlob,
++    transcode_sink_GetUnknown,
++    transcode_sink_SetItem,
++    transcode_sink_DeleteItem,
++    transcode_sink_DeleteAllItems,
++    transcode_sink_SetUINT32,
++    transcode_sink_SetUINT64,
++    transcode_sink_SetDouble,
++    transcode_sink_SetGUID,
++    transcode_sink_SetString,
++    transcode_sink_SetBlob,
++    transcode_sink_SetUnknown,
++    transcode_sink_LockStore,
++    transcode_sink_UnlockStore,
++    transcode_sink_GetCount,
++    transcode_sink_GetItemByIndex,
++    transcode_sink_CopyAllItems,
++    transcode_sink_ActivateObject,
++    transcode_sink_ShutdownObject,
++    transcode_sink_DetachObject,
++};
++
++static HRESULT WINAPI sink_info_QueryInterface(IMFTranscodeSinkInfoProvider *iface, REFIID riid, void **out)
++{
++    struct transcode_sink *sink = impl_from_IMFTranscodeSinkInfoProvider(iface);
++    return IMFActivate_QueryInterface(&sink->IMFActivate_iface, riid, out);
++}
++
++static ULONG WINAPI sink_info_AddRef(IMFTranscodeSinkInfoProvider *iface)
++{
++    struct transcode_sink *sink = impl_from_IMFTranscodeSinkInfoProvider(iface);
++    return IMFActivate_AddRef(&sink->IMFActivate_iface);
++}
++
++static ULONG WINAPI sink_info_Release(IMFTranscodeSinkInfoProvider *iface)
++{
++    struct transcode_sink *sink = impl_from_IMFTranscodeSinkInfoProvider(iface);
++    return IMFActivate_Release(&sink->IMFActivate_iface);
++}
++
++static HRESULT WINAPI sink_info_SetOutputFile(IMFTranscodeSinkInfoProvider *iface, const WCHAR *url)
++{
++    struct transcode_sink *sink = impl_from_IMFTranscodeSinkInfoProvider(iface);
++    HRESULT hr = S_OK;
++    WCHAR *copy;
++
++    TRACE("%p, %s.\n", iface, debugstr_w(url));
++
++    if (!url)
++        return E_INVALIDARG;
++    if (!(copy = wcsdup(url)))
++        return E_OUTOFMEMORY;
++    EnterCriticalSection(&sink->cs);
++    /* documented: the output file and the output byte stream exclude each other */
++    if (sink->bytestream_activate)
++    {
++        free(copy);
++        hr = MF_E_INVALIDREQUEST;
++    }
++    else
++    {
++        free(sink->url);
++        sink->url = copy;
++    }
++    LeaveCriticalSection(&sink->cs);
++    return hr;
++}
++
++static HRESULT WINAPI sink_info_SetOutputByteStream(IMFTranscodeSinkInfoProvider *iface, IMFActivate *activate)
++{
++    struct transcode_sink *sink = impl_from_IMFTranscodeSinkInfoProvider(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %p.\n", iface, activate);
++
++    if (!activate)
++        return E_INVALIDARG;
++    EnterCriticalSection(&sink->cs);
++    if (sink->url)
++        hr = MF_E_INVALIDREQUEST;
++    else
++    {
++        if (sink->bytestream_activate)
++            IMFActivate_Release(sink->bytestream_activate);
++        IMFActivate_AddRef((sink->bytestream_activate = activate));
++    }
++    LeaveCriticalSection(&sink->cs);
++    return hr;
++}
++
++static HRESULT WINAPI sink_info_SetProfile(IMFTranscodeSinkInfoProvider *iface, IMFTranscodeProfile *profile)
++{
++    struct transcode_sink *sink = impl_from_IMFTranscodeSinkInfoProvider(iface);
++    IMFMediaType *audio = NULL, *video = NULL;
++    IMFAttributes *attributes;
++    GUID container;
++    HRESULT hr;
++
++    TRACE("%p, %p.\n", iface, profile);
++
++    if (!profile)
++        return E_INVALIDARG;
++    if (FAILED(hr = IMFTranscodeProfile_GetContainerAttributes(profile, &attributes)) || !attributes)
++        return MF_E_TRANSCODE_NO_CONTAINERTYPE;
++    hr = IMFAttributes_GetGUID(attributes, &MF_TRANSCODE_CONTAINERTYPE, &container);
++    IMFAttributes_Release(attributes);
++    if (FAILED(hr))
++        return MF_E_TRANSCODE_NO_CONTAINERTYPE;
++
++    if (SUCCEEDED(IMFTranscodeProfile_GetAudioAttributes(profile, &attributes)) && attributes)
++    {
++        hr = media_type_from_attributes(attributes, &MFMediaType_Audio, &audio);
++        IMFAttributes_Release(attributes);
++    }
++    if (SUCCEEDED(hr) && SUCCEEDED(IMFTranscodeProfile_GetVideoAttributes(profile, &attributes)) && attributes)
++    {
++        hr = media_type_from_attributes(attributes, &MFMediaType_Video, &video);
++        IMFAttributes_Release(attributes);
++    }
++    if (FAILED(hr))
++    {
++        if (audio) IMFMediaType_Release(audio);
++        if (video) IMFMediaType_Release(video);
++        return hr;
++    }
++
++    EnterCriticalSection(&sink->cs);
++    sink->container = container;
++    if (sink->audio_type)
++        IMFMediaType_Release(sink->audio_type);
++    if (sink->video_type)
++        IMFMediaType_Release(sink->video_type);
++    sink->audio_type = audio;
++    sink->video_type = video;
++    LeaveCriticalSection(&sink->cs);
++    return S_OK;
++}
++
++static HRESULT WINAPI sink_info_GetSinkInfo(IMFTranscodeSinkInfoProvider *iface, MF_TRANSCODE_SINK_INFO *info)
++{
++    struct transcode_sink *sink = impl_from_IMFTranscodeSinkInfoProvider(iface);
++
++    TRACE("%p, %p.\n", iface, info);
++
++    if (!info)
++        return E_INVALIDARG;
++    EnterCriticalSection(&sink->cs);
++    memset(info, 0, sizeof(*info));
++    if ((info->pVideoMediaType = sink->video_type))
++    {
++        IMFMediaType_AddRef(info->pVideoMediaType);
++        info->dwVideoStreamID = TRANSCODE_VIDEO_ID;
++    }
++    if ((info->pAudioMediaType = sink->audio_type))
++    {
++        IMFMediaType_AddRef(info->pAudioMediaType);
++        info->dwAudioStreamID = audio_stream_id(&sink->container);
++    }
++    LeaveCriticalSection(&sink->cs);
++    return S_OK;
++}
++
++static const IMFTranscodeSinkInfoProviderVtbl sink_info_vtbl =
++{
++    sink_info_QueryInterface,
++    sink_info_AddRef,
++    sink_info_Release,
++    sink_info_SetOutputFile,
++    sink_info_SetOutputByteStream,
++    sink_info_SetProfile,
++    sink_info_GetSinkInfo,
++};
++
++/***********************************************************************
++ *      MFCreateTranscodeSinkActivate (mf.@)
++ */
++HRESULT WINAPI MFCreateTranscodeSinkActivate(IMFActivate **activate)
++{
++    struct transcode_sink *sink;
++    HRESULT hr;
++
++    TRACE("%p.\n", activate);
++
++    if (!activate)
++        return E_POINTER;
++    if (!(sink = calloc(1, sizeof(*sink))))
++        return E_OUTOFMEMORY;
++    sink->IMFActivate_iface.lpVtbl = &transcode_sink_vtbl;
++    sink->IMFTranscodeSinkInfoProvider_iface.lpVtbl = &sink_info_vtbl;
++    sink->refcount = 1;
++    if (FAILED(hr = MFCreateAttributes(&sink->attributes, 0)))
++    {
++        free(sink);
++        return hr;
++    }
++    InitializeCriticalSectionEx(&sink->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    sink->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": transcode_sink.cs");
++    *activate = &sink->IMFActivate_iface;
++    return S_OK;
++}
++
++/* the sink's stream types become the encoders' actual output types (with their codec data) */
++static void transcode_sink_set_type(IMFActivate *activate, const GUID *major, IMFMediaType *type)
++{
++    struct transcode_sink *sink = impl_from_IMFActivate(activate);
++    IMFMediaType **slot = IsEqualGUID(major, &MFMediaType_Audio) ? &sink->audio_type : &sink->video_type;
++
++    EnterCriticalSection(&sink->cs);
++    if (*slot)
++        IMFMediaType_Release(*slot);
++    IMFMediaType_AddRef((*slot = type));
++    LeaveCriticalSection(&sink->cs);
++}
++
++/* topology */
++
++/* the source's stream type the encoder's missing video attributes come from */
++static void complete_video_type(IMFMediaType *type, IMFMediaType *source_type)
++{
++    static const GUID *const keys[] =
++    {
++        &MF_MT_FRAME_SIZE, &MF_MT_FRAME_RATE, &MF_MT_PIXEL_ASPECT_RATIO, &MF_MT_INTERLACE_MODE,
++    };
++    PROPVARIANT value;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(keys); i++)
++    {
++        if (SUCCEEDED(IMFMediaType_GetItem(type, keys[i], NULL)))
++            continue;
++        PropVariantInit(&value);
++        if (SUCCEEDED(IMFMediaType_GetItem(source_type, keys[i], &value)))
++            IMFMediaType_SetItem(type, keys[i], &value);
++        PropVariantClear(&value);
++    }
++    if (FAILED(IMFMediaType_GetItem(type, &MF_MT_INTERLACE_MODE, NULL)))
++        IMFMediaType_SetUINT32(type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
++}
++
++/* the uncompressed input an audio encoder is given for its output type */
++static HRESULT audio_encoder_input(IMFTransform *encoder, IMFMediaType *output)
++{
++    UINT32 rate = 0, channels = 0;
++    IMFMediaType *input;
++    HRESULT hr;
++    DWORD i;
++
++    IMFMediaType_GetUINT32(output, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
++    IMFMediaType_GetUINT32(output, &MF_MT_AUDIO_NUM_CHANNELS, &channels);
++    /* the encoder's own input type for the rate and channels, 16-bit PCM first */
++    for (i = 0; SUCCEEDED(hr = IMFTransform_GetInputAvailableType(encoder, 0, i, &input)); i++)
++    {
++        UINT32 r = 0, c = 0, bits = 0;
++
++        IMFMediaType_GetUINT32(input, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &r);
++        IMFMediaType_GetUINT32(input, &MF_MT_AUDIO_NUM_CHANNELS, &c);
++        IMFMediaType_GetUINT32(input, &MF_MT_AUDIO_BITS_PER_SAMPLE, &bits);
++        if ((!rate || r == rate) && (!channels || c == channels) && bits == 16
++                && SUCCEEDED(IMFTransform_SetInputType(encoder, 0, input, 0)))
++        {
++            IMFMediaType_Release(input);
++            return S_OK;
++        }
++        IMFMediaType_Release(input);
++    }
++    if (hr != MF_E_NO_MORE_TYPES && hr != MF_E_TRANSFORM_TYPE_NOT_SET)
++        return hr;
++
++    /* else a PCM type of its own */
++    if (FAILED(hr = MFCreateMediaType(&input)))
++        return hr;
++    IMFMediaType_SetGUID(input, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
++    IMFMediaType_SetGUID(input, &MF_MT_SUBTYPE, &MFAudioFormat_PCM);
++    IMFMediaType_SetUINT32(input, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
++    IMFMediaType_SetUINT32(input, &MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
++    IMFMediaType_SetUINT32(input, &MF_MT_AUDIO_NUM_CHANNELS, channels);
++    IMFMediaType_SetUINT32(input, &MF_MT_AUDIO_BLOCK_ALIGNMENT, channels * 2);
++    IMFMediaType_SetUINT32(input, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * channels * 2);
++    IMFMediaType_SetUINT32(input, &MF_MT_ALL_SAMPLES_INDEPENDENT, 1);
++    hr = IMFTransform_SetInputType(encoder, 0, input, 0);
++    IMFMediaType_Release(input);
++    return hr;
++}
++
++/* an encoder for the profile's type of a stream, its types set */
++static HRESULT create_encoder(const GUID *major, IMFMediaType *output, IMFMediaType *source_type,
++        IMFTransform **out, IMFMediaType **actual)
++{
++    BOOL audio = IsEqualGUID(major, &MFMediaType_Audio);
++    MFT_REGISTER_TYPE_INFO info = {*major};
++    IMFActivate **activates = NULL;
++    IMFTransform *encoder;
++    UINT32 count = 0, i;
++    HRESULT hr;
++
++    *out = NULL;
++#ifdef SG_MUTANT_TRANSCODE_NO_ENCODER
++    return MF_E_TRANSCODE_NO_MATCHING_ENCODER;
++#endif
++    if (FAILED(IMFMediaType_GetGUID(output, &MF_MT_SUBTYPE, &info.guidSubtype)))
++        return MF_E_TRANSCODE_INVALID_PROFILE;
++    if (!audio)
++        complete_video_type(output, source_type);
++    if (FAILED(hr = MFTEnumEx(audio ? MFT_CATEGORY_AUDIO_ENCODER : MFT_CATEGORY_VIDEO_ENCODER,
++            MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER, NULL, &info,
++            &activates, &count)))
++        return hr;
++
++    for (i = 0, hr = MF_E_TRANSCODE_NO_MATCHING_ENCODER; i < count && !*out; i++)
++    {
++        if (FAILED(IMFActivate_ActivateObject(activates[i], &IID_IMFTransform, (void **)&encoder)))
++            continue;
++        /* encoders take their output type first; those that need their input first (WMA) say so */
++        if (SUCCEEDED(IMFTransform_SetOutputType(encoder, 0, output, 0)))
++        {
++            if (!audio || SUCCEEDED(audio_encoder_input(encoder, output)))
++                *out = encoder;
++        }
++        else if (audio && SUCCEEDED(audio_encoder_input(encoder, output))
++                && SUCCEEDED(IMFTransform_SetOutputType(encoder, 0, output, 0)))
++            *out = encoder;
++        if (!*out)
++            IMFTransform_Release(encoder);
++    }
++    for (i = 0; i < count; i++)
++        IMFActivate_Release(activates[i]);
++    CoTaskMemFree(activates);
++    if (!*out)
++        return MF_E_TRANSCODE_NO_MATCHING_ENCODER;
++    if (FAILED(hr = IMFTransform_GetOutputCurrentType(*out, 0, actual)))
++    {
++        IMFTransform_Release(*out);
++        *out = NULL;
++    }
++    return hr;
++}
++
++static HRESULT add_branch(IMFTopology *topology, IMFMediaSource *source, IMFPresentationDescriptor *pd,
++        IMFStreamDescriptor *sd, IMFTransform *encoder, IMFActivate *sink, DWORD stream_id)
++{
++    IMFTopologyNode *source_node = NULL, *encoder_node = NULL, *output_node = NULL;
++    HRESULT hr;
++
++    if (SUCCEEDED(hr = MFCreateTopologyNode(MF_TOPOLOGY_SOURCESTREAM_NODE, &source_node)))
++    {
++        IMFTopologyNode_SetUnknown(source_node, &MF_TOPONODE_SOURCE, (IUnknown *)source);
++        IMFTopologyNode_SetUnknown(source_node, &MF_TOPONODE_PRESENTATION_DESCRIPTOR, (IUnknown *)pd);
++        hr = IMFTopologyNode_SetUnknown(source_node, &MF_TOPONODE_STREAM_DESCRIPTOR, (IUnknown *)sd);
++    }
++    if (SUCCEEDED(hr) && SUCCEEDED(hr = MFCreateTopologyNode(MF_TOPOLOGY_TRANSFORM_NODE, &encoder_node)))
++        hr = IMFTopologyNode_SetObject(encoder_node, (IUnknown *)encoder);
++    if (SUCCEEDED(hr) && SUCCEEDED(hr = MFCreateTopologyNode(MF_TOPOLOGY_OUTPUT_NODE, &output_node)))
++    {
++        IMFTopologyNode_SetObject(output_node, (IUnknown *)sink);
++        IMFTopologyNode_SetUINT32(output_node, &MF_TOPONODE_STREAMID, stream_id);
++        hr = IMFTopologyNode_SetUINT32(output_node, &MF_TOPONODE_NOSHUTDOWN_ON_REMOVE, FALSE);
++    }
++    if (SUCCEEDED(hr))
++        hr = IMFTopology_AddNode(topology, source_node);
++    if (SUCCEEDED(hr))
++        hr = IMFTopology_AddNode(topology, encoder_node);
++    if (SUCCEEDED(hr))
++        hr = IMFTopology_AddNode(topology, output_node);
++    if (SUCCEEDED(hr))
++        hr = IMFTopologyNode_ConnectOutput(source_node, 0, encoder_node, 0);
++    if (SUCCEEDED(hr))
++        hr = IMFTopologyNode_ConnectOutput(encoder_node, 0, output_node, 0);
++    if (source_node) IMFTopologyNode_Release(source_node);
++    if (encoder_node) IMFTopologyNode_Release(encoder_node);
++    if (output_node) IMFTopologyNode_Release(output_node);
++    return hr;
++}
++
++static HRESULT stream_current_type(IMFStreamDescriptor *sd, IMFMediaType **type, GUID *major)
++{
++    IMFMediaTypeHandler *handler;
++    HRESULT hr;
++
++    if (FAILED(hr = IMFStreamDescriptor_GetMediaTypeHandler(sd, &handler)))
++        return hr;
++    if (FAILED(hr = IMFMediaTypeHandler_GetCurrentMediaType(handler, type)))
++        hr = IMFMediaTypeHandler_GetMediaTypeByIndex(handler, 0, type);
++    if (SUCCEEDED(hr))
++        hr = IMFMediaTypeHandler_GetMajorType(handler, major);
++    IMFMediaTypeHandler_Release(handler);
++    return hr;
++}
++
++/***********************************************************************
++ *      MFCreateTranscodeTopology (mf.@)
++ */
+ HRESULT WINAPI MFCreateTranscodeTopology(IMFMediaSource *source, const WCHAR *url, IMFTranscodeProfile *profile,
+                                          IMFTopology **topology)
+ {
+-    FIXME("(%p, %s, %p, %p): not implemented\n", source, debugstr_w(url), profile, topology);
+-    if (!topology) return E_POINTER;
++    IMFAttributes *audio_attrs = NULL, *video_attrs = NULL, *container_attrs = NULL;
++    IMFTranscodeSinkInfoProvider *info;
++    IMFPresentationDescriptor *pd = NULL;
++    DWORD count, i, selected = 0, matched = 0;
++    IMFActivate *sink = NULL;
++    IMFTopology *topo = NULL;
++    GUID container;
++    HRESULT hr;
++
++    TRACE("%p, %s, %p, %p.\n", source, debugstr_w(url), profile, topology);
++
++    if (!topology)
++        return E_POINTER;
+     *topology = NULL;
+-    if (!source || !url || !profile) return E_INVALIDARG;
+-    return E_NOTIMPL;
++    if (!source || !url || !profile)
++        return E_INVALIDARG;
++
++    if (FAILED(IMFTranscodeProfile_GetContainerAttributes(profile, &container_attrs)) || !container_attrs
++            || FAILED(IMFAttributes_GetGUID(container_attrs, &MF_TRANSCODE_CONTAINERTYPE, &container)))
++    {
++        if (container_attrs)
++            IMFAttributes_Release(container_attrs);
++        return MF_E_TRANSCODE_NO_CONTAINERTYPE;
++    }
++    IMFAttributes_Release(container_attrs);
++    IMFTranscodeProfile_GetAudioAttributes(profile, &audio_attrs);
++    IMFTranscodeProfile_GetVideoAttributes(profile, &video_attrs);
++
++    if (FAILED(hr = IMFMediaSource_CreatePresentationDescriptor(source, &pd)))
++        goto done;
++    if (FAILED(hr = MFCreateTranscodeSinkActivate(&sink)))
++        goto done;
++    IMFActivate_QueryInterface(sink, &IID_IMFTranscodeSinkInfoProvider, (void **)&info);
++    if (SUCCEEDED(hr = IMFTranscodeSinkInfoProvider_SetOutputFile(info, url)))
++        hr = IMFTranscodeSinkInfoProvider_SetProfile(info, profile);
++    IMFTranscodeSinkInfoProvider_Release(info);
++    if (FAILED(hr))
++        goto done;
++    if (FAILED(hr = MFCreateTopology(&topo)))
++        goto done;
++
++    IMFPresentationDescriptor_GetStreamDescriptorCount(pd, &count);
++    for (i = 0; SUCCEEDED(hr) && i < count; i++)
++    {
++        IMFMediaType *source_type = NULL, *profile_type = NULL, *actual = NULL;
++        IMFStreamDescriptor *sd;
++        IMFTransform *encoder;
++        IMFAttributes *attrs;
++        BOOL is_selected;
++        GUID major;
++
++        if (FAILED(hr = IMFPresentationDescriptor_GetStreamDescriptorByIndex(pd, i, &is_selected, &sd)))
++            break;
++        if (is_selected)
++            selected++;
++        attrs = NULL;
++        if (is_selected && SUCCEEDED(stream_current_type(sd, &source_type, &major)))
++        {
++            if (IsEqualGUID(&major, &MFMediaType_Audio))
++                attrs = audio_attrs;
++            else if (IsEqualGUID(&major, &MFMediaType_Video))
++                attrs = video_attrs;
++        }
++        /* the streams the profile has nothing for are not transcoded */
++        if (!attrs)
++        {
++            if (is_selected)
++                IMFPresentationDescriptor_DeselectStream(pd, i);
++        }
++        else if (SUCCEEDED(hr = media_type_from_attributes(attrs, &major, &profile_type))
++                && SUCCEEDED(hr = create_encoder(&major, profile_type, source_type, &encoder, &actual)))
++        {
++            transcode_sink_set_type(sink, &major, actual);
++            hr = add_branch(topo, source, pd, sd, encoder, sink, IsEqualGUID(&major, &MFMediaType_Audio)
++                    ? audio_stream_id(&container) : TRANSCODE_VIDEO_ID);
++            IMFTransform_Release(encoder);
++            IMFMediaType_Release(actual);
++            matched++;
++            /* one stream of each kind */
++            if (IsEqualGUID(&major, &MFMediaType_Audio))
++                audio_attrs = NULL;
++            else
++                video_attrs = NULL;
++            IMFAttributes_Release(attrs);
++        }
++        if (profile_type)
++            IMFMediaType_Release(profile_type);
++        if (source_type)
++            IMFMediaType_Release(source_type);
++        IMFStreamDescriptor_Release(sd);
++    }
++    if (SUCCEEDED(hr) && !selected)
++        hr = MF_E_MEDIA_SOURCE_NO_STREAMS_SELECTED;
++    else if (SUCCEEDED(hr) && !matched)
++        hr = MF_E_TRANSCODE_PROFILE_NO_MATCHING_STREAMS;
++
++done:
++    if (audio_attrs)
++        IMFAttributes_Release(audio_attrs);
++    if (video_attrs)
++        IMFAttributes_Release(video_attrs);
++    if (sink)
++        IMFActivate_Release(sink);
++    if (pd)
++        IMFPresentationDescriptor_Release(pd);
++    if (SUCCEEDED(hr))
++        *topology = topo;
++    else if (topo)
++        IMFTopology_Release(topo);
++    return hr;
+ }
+--- a/dlls/mf/mf.spec
++++ b/dlls/mf/mf.spec
+@@ -66,7 +66,7 @@
+ @ stdcall MFCreateTopology(ptr)
+ @ stdcall MFCreateTopologyNode(long ptr)
+ @ stdcall MFCreateTranscodeProfile(ptr)
+-@ stub MFCreateTranscodeSinkActivate
++@ stdcall MFCreateTranscodeSinkActivate(ptr)
+ @ stdcall MFCreateTranscodeTopology(ptr wstr ptr ptr)
+ @ stub MFCreateUrlmonSchemePlugin
+ @ stdcall MFCreateVideoRenderer(ptr ptr)

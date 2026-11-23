@@ -7,7 +7,8 @@
 # sample), and writes and reads back a .wma through a sink writer and mf.dll's ASF sink; the audio must
 # still be the 1 kHz tone it started as.
 #   WINE=/opt/wine-sg/bin/wine test/wmaenc-gate.sh
-# Mutants: SG_MUTANT_WMAENC_CODEC_DATA, SG_MUTANT_WMAENC_TIME (dlls/winegstreamer/wma_encoder.c).
+# Mutants: SG_MUTANT_WMAENC_CODEC_DATA, SG_MUTANT_WMAENC_TIME, SG_MUTANT_WMAENC_ZERO_CODEC_DATA (9407)
+# (dlls/winegstreamer/wma_encoder.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"

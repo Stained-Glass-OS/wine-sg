@@ -26,7 +26,9 @@ DEFINE_GUID(CLSID_WMADec_, 0x2eeb4adf, 0x4578, 0x4d10, 0xbc, 0xa7, 0xbb, 0x95, 0
 static int failures;
 #define CHECK(c, ...) do { if (c) printf("ok    " __VA_ARGS__); else { failures++; printf("FAIL  " __VA_ARGS__); } } while (0)
 
+#ifndef RATE
 #define RATE 22050
+#endif
 #define SECONDS 3
 #define TONE 1000.0
 
@@ -225,6 +227,13 @@ static void test_wma(void)
         IMFMediaType_GetUINT32(cur, &MF_MT_AUDIO_BLOCK_ALIGNMENT, &cb);
         IMFMediaType_GetUINT32(cur, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &bytes);
         CHECK(cb == block, "the current type keeps the block size %u (%u)\n", block, cb);
+        {
+            BYTE ud[16] = {0};
+            UINT32 len = 0, k, nonzero = 0;
+            IMFMediaType_GetBlob(cur, &MF_MT_USER_DATA, ud, sizeof(ud), &len);
+            for (k = 0; k < len; k++) nonzero |= ud[k];
+            CHECK(len == 10 && nonzero, "and codec data a decoder can use (%u bytes, encode options %02x)\n", len, ud[4]);
+        }
     }
     memset(&oinfo, 0, sizeof(oinfo));
     IMFTransform_GetOutputStreamInfo(t, 0, &oinfo);
@@ -315,10 +324,18 @@ static void test_sink_writer(void)
     if (SUCCEEDED(hr)) hr = IMFSinkWriter_BeginWriting(writer);
     CHECK(hr == S_OK, "BeginWriting %#lx\n", hr);
     pcm = make_tone(2, &bytes);
+#ifndef CHUNK
     for (i = 0; SUCCEEDED(hr) && i < SECONDS * 10; i++)
     {
         DWORD piece = bytes / (SECONDS * 10);
         IMFSample *s = make_sample((BYTE *)pcm + i * piece, piece, i * 1000000LL, 1000000, TRUE, TRUE);
+#else
+    for (i = 0; SUCCEEDED(hr) && i * CHUNK < bytes; i++)
+    {
+        DWORD piece = min(CHUNK, bytes - i * CHUNK);
+        IMFSample *s = make_sample((BYTE *)pcm + i * CHUNK, piece, (LONGLONG)i * CHUNK / 4 * 10000000 / RATE,
+                (LONGLONG)piece / 4 * 10000000 / RATE, TRUE, TRUE);
+#endif
         hr = IMFSinkWriter_WriteSample(writer, stream, s);
         IMFSample_Release(s);
     }
