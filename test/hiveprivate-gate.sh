@@ -11,12 +11,14 @@
 #      SG_OTHER cannot read the file -- yet reads its value through the server
 #   2. a hive left 0644 by an older server is closed when the server loads it,
 #      with nothing written to it, and its values are all there
-#   3. the server owner's own hive is closed too; system.reg and userdef.reg
-#      keep their modes (not people's hives)
+#   3. the server owner's own hive is closed too, and so is the machine's
+#      system.reg (9101: Windows' SOFTWARE and SYSTEM hive files are not the
+#      users'), left 0644 or written anew -- yet the person reads HKLM through
+#      the server; userdef.reg (the Default User template) keeps its mode
 #   4. a hive that is a symlink to a file of the server's is not chmod'ed
 #      through the link
 #   WINE=... WINESERVER=... test/hiveprivate-gate.sh
-# Mutant: SG_MUTANT_HIVE_SHARED (server/registry.c). Needs passwordless
+# Mutants: SG_MUTANT_HIVE_SHARED, SG_MUTANT_SYSTEM_HIVE_SHARED (server/registry.c). Needs passwordless
 # sudo -u $SG_OTHER; exit 77 otherwise.
 set -u
 WINE=${WINE:-/opt/wine-sg/bin/wine}
@@ -74,7 +76,8 @@ else pass "no other account can read the hive file"; fi
 # 2. a hive an older server left 0644
 chmod 644 "$HIVE"
 [ -f "$MINE" ] && chmod 644 "$MINE"
-sysmode=$(mode "$PFX/system.reg"); defmode=$(mode "$PFX/userdef.reg")
+chmod 644 "$PFX/system.reg"
+defmode=$(mode "$PFX/userdef.reg")
 before=$(md5sum < "$HIVE")
 start_server
 out=$(other reg query 'HKCU\Software\SgPrivate' /v Mine)
@@ -83,6 +86,15 @@ printf '%s' "$out" | grep -q 'Mine.*yes' && pass "the person reads their HKCU th
 [ "$(mode "$HIVE")" = 600 ] && pass "a 0644 hive is closed to others when it is loaded" \
     || fail "after load: $(mode "$HIVE")"
 [ "$(md5sum < "$HIVE")" = "$before" ] && pass "without being rewritten" || fail "the hive was rewritten on load"
+[ "$(mode "$PFX/system.reg")" = 600 ] && pass "a 0644 system.reg is closed to others when it is loaded" \
+    || fail "system.reg after load: $(mode "$PFX/system.reg")"
+if other_reads "$PFX/system.reg"; then fail "another account can read system.reg"
+else pass "no other account can read the machine's hive file"; fi
+out=$(other reg query 'HKLM\Software\Microsoft\Windows NT\CurrentVersion' /v CurrentBuild)
+printf '%s' "$out" | grep -q 'CurrentBuild' && pass "the person reads HKLM through the server" \
+    || fail "HKLM read: '$out'"
+other reg add 'HKCU\Software\SgPrivate' /v Again /d yes /f >/dev/null
+"$WINE" reg add 'HKLM\Software\SgPrivate' /v Machine /d yes /f >/dev/null 2>&1
 
 # 3. the owner's own hive; the machine's files keep their modes
 "$WINE" reg query 'HKCU\Software' >/dev/null 2>&1
@@ -90,9 +102,12 @@ stop_server
 if [ -f "$MINE" ]; then
     [ "$(mode "$MINE")" = 600 ] && pass "the server owner's own hive is closed too" || fail "own hive: $(mode "$MINE")"
 fi
-[ "$(mode "$PFX/system.reg")" = "$sysmode" ] && [ "$(mode "$PFX/userdef.reg")" = "$defmode" ] \
-    && pass "system.reg and userdef.reg keep their modes ($sysmode, $defmode)" \
-    || fail "system.reg $(mode "$PFX/system.reg") (was $sysmode), userdef.reg $(mode "$PFX/userdef.reg") (was $defmode)"
+grep -q SgPrivate "$PFX/system.reg" && [ "$(mode "$PFX/system.reg")" = 600 ] \
+    && pass "system.reg written anew is 0600" || fail "system.reg after a save: $(mode "$PFX/system.reg")"
+[ "$(mode "$HIVE")" = 600 ] && grep -q Again "$HIVE" && pass "a person's hive written anew is 0600" \
+    || fail "hive after a save: $(mode "$HIVE")"
+[ "$(mode "$PFX/userdef.reg")" = "$defmode" ] && pass "userdef.reg keeps its mode ($defmode)" \
+    || fail "userdef.reg $(mode "$PFX/userdef.reg") (was $defmode)"
 
 # 4. a hive that is a symlink (to a file of the server's): not chmod'ed through it
 echo keep > "$W/elsewhere"; chmod 644 "$W/elsewhere"
