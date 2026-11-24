@@ -61,6 +61,16 @@ case "${XDG_RUNTIME_DIR:-}" in
     unset DISPLAY ;;
 esac
 export WAYLAND_DISPLAY=sg-gate-no-wayland
+# The person's session bus (systemd's unix:path=/run/user/UID/bus) came along in
+# DBUS_SESSION_BUS_ADDRESS, and Wine's Unix side uses it: Credential Manager's
+# keyring (advapi32, Secret Service), the media controls (MPRIS), the screen saver
+# inhibitor. A census run of PrusaSlicer read credentials from the person's keyring
+# (2026-11-24). A gate's Windows programs reach no bus but one the gate starts itself
+# (dbus-run-session, its own dbus-daemon: those addresses stay).
+case "${DBUS_SESSION_BUS_ADDRESS:-}" in
+*/run/user/*|*"${SG_REAL_XDG_RUNTIME_DIR:-/nonexistent}"/*)
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$SG_GATE_HOME/no-session-bus" ;;
+esac
 # Vulkan on a gate's own display (Xvfb) is lavapipe's: the host's GPU driver
 # may have no instance there -- NVIDIA's needs its own X server -- and the
 # loader took it first: every Vulkan gate skipped on a host with NVIDIA's
