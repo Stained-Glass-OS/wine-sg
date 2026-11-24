@@ -2,7 +2,7 @@
 . "$(dirname "$0")/scratch-home.sh"
 # Windows.UI and Windows.UI.Composition for WinUI 2 controls (patches/sg/6182): the thread's CoreWindow
 # gives weak references (MUX's AnimatedVisualPlayer makes one); the compositor is an ICompositor5: Comment
-# and GlobalPlaybackRate kept, RequestCommitAsync done, shape visuals made (6265; they were E_NOTIMPL, and
+# and GlobalPlaybackRate kept, RequestCommitAsync gives an action (Started until the next frame, 9012), shape visuals made (6265; they were E_NOTIMPL, and
 # Lottie animations fell back). test/compweak-probe.c (the XAML switch on, for the thread's CoreWindow).
 #   WINE=/opt/wine-sg/bin/wine test/compweak-gate.sh
 # Mutants: SG_MUTANT_COREWINDOW_NO_WEAK (dlls/windows.ui/thread_corewindow.c), SG_MUTANT_NO_COMPOSITOR5
@@ -42,7 +42,7 @@ chk() { if printf '%s\n' "$out" | grep -qx "$1"; then printf 'PASS  %s\n' "$2"; 
 chk 'weak=1,1,1' "the thread's CoreWindow: a weak reference that resolves to it"
 chk 'compositor5=00000000,1' "the compositor is an ICompositor5"
 chk 'kept=sg note,1.0,2.5' "its Comment and GlobalPlaybackRate kept"
-chk 'commit=00000000,1' "RequestCommitAsync: an action already completed"
+chk 'commit=00000000,0' "RequestCommitAsync: an action, Started until the next frame (9012; test/compcommitasync)"
 chk 'shapes=00000000,0' "shape visuals made (6265)"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
