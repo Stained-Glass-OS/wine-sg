@@ -1,0 +1,689 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] mp3dmod, mfplat: The MP3 decoder is an MFT too; MFTEnumEx gives a transform's name
+
+Windows' CLSID_CMP3DecMediaObject is one object with IMediaObject and IMFTransform, registered as "MP3 Decoder MFT" in MFT_CATEGORY_AUDIO_DECODER (MP3 -> PCM); Wine's was a DMO only, so MFTEnumEx found no MP3 decoder and the source reader and topology loader could not decode an MP3 stream handed out as MP3. The MFT side decodes with the same mpg123 handle, as dlls/mf/tests/transform.c test_mp3_decoder records Windows': one input type (MP3), float / PCM 16 / PCM 8 output types at the input's rate in its channel count and then mono, 1152-frame output blocks, an input sample taken only once its output is read (MF_E_NOTACCEPTING before), MFT_OUTPUT_DATA_BUFFER_INCOMPLETE while more output follows.
+mfplat: MFTEnumEx's activation objects of registered transforms carry MFT_FRIENDLY_NAME_Attribute, the default value of the transform's key, as Windows' do (only local registrations had it).
+---
+--- a/dlls/mp3dmod/Makefile.in
++++ b/dlls/mp3dmod/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = mp3dmod.dll
+-IMPORTS   = $(MPG123_PE_LIBS) dmoguids msdmo ole32 uuid wmcodecdspuuid kernelbase
++IMPORTS   = $(MPG123_PE_LIBS) dmoguids msdmo mfplat mfuuid ole32 uuid wmcodecdspuuid kernelbase
+ EXTRAINCL = $(MPG123_PE_CFLAGS)
+ EXTRADEFS = -DMPG123_NO_LARGENAME
+ 
+--- a/dlls/mp3dmod/mp3dmod.c
++++ b/dlls/mp3dmod/mp3dmod.c
+@@ -30,6 +30,9 @@
+ #include "dmo.h"
+ #include "rpcproxy.h"
+ #include "wmcodecdsp.h"
++#include "mfapi.h"
++#include "mferror.h"
++#include "mftransform.h"
+ #include "wine/debug.h"
+ 
+ #include "initguid.h"
+@@ -44,6 +47,7 @@
+ {
+     IUnknown IUnknown_inner;
+     IMediaObject IMediaObject_iface;
++    IMFTransform IMFTransform_iface;
+     IUnknown *outer;
+     LONG ref;
+     mpg123_handle *mh;
+@@ -55,6 +59,13 @@
+     REFERENCE_TIME timestamp;
+ 
+     CRITICAL_SECTION cs;  /* IMediaObject::Lock, taken by the stream methods */
++
++    /* the IMFTransform side (wine-sg 8903) */
++    IMFMediaType *mf_in, *mf_out;
++    BYTE *mf_buf;              /* decoded, not handed out yet */
++    DWORD mf_buf_size, mf_pending;
++    BOOL mf_have_input, mf_draining, mf_time_set;
++    LONGLONG mf_time, mf_frames;
+ };
+ 
+ static inline struct mp3_decoder *impl_from_IUnknown(IUnknown *iface)
+@@ -72,6 +83,10 @@
+         *obj = &This->IUnknown_inner;
+     else if (IsEqualGUID(iid, &IID_IMediaObject))
+         *obj = &This->IMediaObject_iface;
++#ifndef SG_MUTANT_MP3MFT_NONE
++    else if (IsEqualGUID(iid, &IID_IMFTransform))
++        *obj = &This->IMFTransform_iface;
++#endif
+     else
+     {
+         FIXME("no interface for %s\n", debugstr_guid(iid));
+@@ -107,6 +122,9 @@
+         if (This->intype_set)
+             MoFreeMediaType(&This->intype);
+         MoFreeMediaType(&This->outtype);
++        if (This->mf_in) IMFMediaType_Release(This->mf_in);
++        if (This->mf_out) IMFMediaType_Release(This->mf_out);
++        free(This->mf_buf);
+         mpg123_delete(This->mh);
+         This->cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&This->cs);
+@@ -679,6 +697,555 @@
+     MediaObject_Lock,
+ };
+ 
++/* Stained Glass OS (wine-sg 8903): the MP3 decoder is also an MFT, as Windows'
++ * CLSID_CMP3DecMediaObject is ("MP3 Decoder MFT", MFT_CATEGORY_AUDIO_DECODER):
++ * one object with IMediaObject and IMFTransform. Programs and the source
++ * reader / topology loader find it through MFTEnumEx for MP3 -> PCM. It
++ * decodes with the same mpg123 handle as the DMO side; an object is used
++ * through one interface or the other. Behaviour as dlls/mf/tests/transform.c
++ * test_mp3_decoder records Windows': one input type (MP3), float/PCM16/PCM8
++ * output types at the input's rate in its channel count and mono, output
++ * blocks of 1152 frames, one input sample taken until its output is read. */
++
++static inline struct mp3_decoder *impl_from_IMFTransform(IMFTransform *iface)
++{
++    return CONTAINING_RECORD(iface, struct mp3_decoder, IMFTransform_iface);
++}
++
++static HRESULT WINAPI mft_QueryInterface(IMFTransform *iface, REFIID iid, void **out)
++{
++    return IUnknown_QueryInterface(impl_from_IMFTransform(iface)->outer, iid, out);
++}
++
++static ULONG WINAPI mft_AddRef(IMFTransform *iface)
++{
++    return IUnknown_AddRef(impl_from_IMFTransform(iface)->outer);
++}
++
++static ULONG WINAPI mft_Release(IMFTransform *iface)
++{
++    return IUnknown_Release(impl_from_IMFTransform(iface)->outer);
++}
++
++static HRESULT WINAPI mft_GetStreamLimits(IMFTransform *iface, DWORD *input_minimum,
++        DWORD *input_maximum, DWORD *output_minimum, DWORD *output_maximum)
++{
++    TRACE("iface %p.\n", iface);
++    *input_minimum = *input_maximum = *output_minimum = *output_maximum = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI mft_GetStreamCount(IMFTransform *iface, DWORD *inputs, DWORD *outputs)
++{
++    TRACE("iface %p.\n", iface);
++    *inputs = *outputs = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI mft_GetStreamIDs(IMFTransform *iface, DWORD input_size, DWORD *inputs,
++        DWORD output_size, DWORD *outputs)
++{
++    return E_NOTIMPL;
++}
++
++static UINT32 mft_block_align(struct mp3_decoder *dec)
++{
++    UINT32 align = 0;
++    if (dec->mf_out) IMFMediaType_GetUINT32(dec->mf_out, &MF_MT_AUDIO_BLOCK_ALIGNMENT, &align);
++    return align;
++}
++
++static HRESULT WINAPI mft_GetInputStreamInfo(IMFTransform *iface, DWORD id, MFT_INPUT_STREAM_INFO *info)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++
++    TRACE("iface %p, id %#lx, info %p.\n", iface, id, info);
++
++    if (!dec->mf_in || !dec->mf_out)
++    {
++        memset(info, 0, sizeof(*info));
++        return MF_E_TRANSFORM_TYPE_NOT_SET;
++    }
++    memset(info, 0, sizeof(*info));
++    info->cbAlignment = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI mft_GetOutputStreamInfo(IMFTransform *iface, DWORD id, MFT_OUTPUT_STREAM_INFO *info)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++
++    TRACE("iface %p, id %#lx, info %p.\n", iface, id, info);
++
++    if (!dec->mf_in || !dec->mf_out)
++    {
++        memset(info, 0, sizeof(*info));
++        return MF_E_TRANSFORM_TYPE_NOT_SET;
++    }
++    memset(info, 0, sizeof(*info));
++    info->cbSize = 1152 * mft_block_align(dec);
++    info->cbAlignment = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI mft_GetAttributes(IMFTransform *iface, IMFAttributes **attributes)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI mft_GetInputStreamAttributes(IMFTransform *iface, DWORD id, IMFAttributes **attributes)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI mft_GetOutputStreamAttributes(IMFTransform *iface, DWORD id, IMFAttributes **attributes)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI mft_DeleteInputStream(IMFTransform *iface, DWORD id)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI mft_AddInputStreams(IMFTransform *iface, DWORD streams, DWORD *ids)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI mft_GetInputAvailableType(IMFTransform *iface, DWORD id, DWORD index, IMFMediaType **type)
++{
++    IMFMediaType *media_type;
++    HRESULT hr;
++
++    TRACE("iface %p, id %#lx, index %#lx, type %p.\n", iface, id, index, type);
++
++    *type = NULL;
++    if (id) return MF_E_INVALIDSTREAMNUMBER;
++    if (index) return MF_E_NO_MORE_TYPES;
++    if (FAILED(hr = MFCreateMediaType(&media_type))) return hr;
++    IMFMediaType_SetGUID(media_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
++    IMFMediaType_SetGUID(media_type, &MF_MT_SUBTYPE, &MFAudioFormat_MP3);
++    IMFMediaType_SetUINT32(media_type, &MF_MT_ALL_SAMPLES_INDEPENDENT, 1);
++    *type = media_type;
++    return S_OK;
++}
++
++/* float 32, PCM 16 and PCM 8, in the input's channel count and then mono */
++static HRESULT WINAPI mft_GetOutputAvailableType(IMFTransform *iface, DWORD id, DWORD index, IMFMediaType **type)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++    static const struct { const GUID *subtype; UINT32 bits; } formats[] =
++    {
++        {&MFAudioFormat_Float, 32}, {&MFAudioFormat_PCM, 16}, {&MFAudioFormat_PCM, 8},
++    };
++    UINT32 channels = 0, rate = 0, align;
++    IMFMediaType *media_type;
++    HRESULT hr;
++
++    TRACE("iface %p, id %#lx, index %#lx, type %p.\n", iface, id, index, type);
++
++    *type = NULL;
++    if (id) return MF_E_INVALIDSTREAMNUMBER;
++    if (!dec->mf_in) return MF_E_TRANSFORM_TYPE_NOT_SET;
++    IMFMediaType_GetUINT32(dec->mf_in, &MF_MT_AUDIO_NUM_CHANNELS, &channels);
++    IMFMediaType_GetUINT32(dec->mf_in, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
++    if (index >= (channels > 1 ? 2 : 1) * ARRAY_SIZE(formats)) return MF_E_NO_MORE_TYPES;
++    if (index >= ARRAY_SIZE(formats)) channels = 1;
++    align = channels * formats[index % ARRAY_SIZE(formats)].bits / 8;
++
++    if (FAILED(hr = MFCreateMediaType(&media_type))) return hr;
++    IMFMediaType_SetGUID(media_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
++    IMFMediaType_SetGUID(media_type, &MF_MT_SUBTYPE, formats[index % ARRAY_SIZE(formats)].subtype);
++    IMFMediaType_SetUINT32(media_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, formats[index % ARRAY_SIZE(formats)].bits);
++    IMFMediaType_SetUINT32(media_type, &MF_MT_AUDIO_NUM_CHANNELS, channels);
++    IMFMediaType_SetUINT32(media_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
++    IMFMediaType_SetUINT32(media_type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * align);
++    IMFMediaType_SetUINT32(media_type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, align);
++    IMFMediaType_SetUINT32(media_type, &MF_MT_ALL_SAMPLES_INDEPENDENT, 1);
++    *type = media_type;
++    return S_OK;
++}
++
++static void mft_reset_stream(struct mp3_decoder *dec)
++{
++    dec->mf_pending = 0;
++    dec->mf_have_input = FALSE;
++    dec->mf_draining = FALSE;
++    dec->mf_frames = 0;
++    dec->mf_time_set = FALSE;
++    dec->mf_time = 0;
++    mpg123_close(dec->mh);
++    mpg123_open_feed(dec->mh);
++}
++
++static HRESULT WINAPI mft_SetInputType(IMFTransform *iface, DWORD id, IMFMediaType *type, DWORD flags)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++    GUID major, subtype;
++    UINT32 channels;
++    HRESULT hr;
++
++    TRACE("iface %p, id %#lx, type %p, flags %#lx.\n", iface, id, type, flags);
++
++    if (id) return MF_E_INVALIDSTREAMNUMBER;
++    if (!type)
++    {
++        EnterCriticalSection(&dec->cs);
++        if (dec->mf_in) IMFMediaType_Release(dec->mf_in);
++        if (dec->mf_out) IMFMediaType_Release(dec->mf_out);
++        dec->mf_in = dec->mf_out = NULL;
++        LeaveCriticalSection(&dec->cs);
++        return S_OK;
++    }
++    if (FAILED(IMFMediaType_GetGUID(type, &MF_MT_MAJOR_TYPE, &major))
++            || FAILED(IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &subtype)))
++        return MF_E_ATTRIBUTENOTFOUND;
++    if (!IsEqualGUID(&major, &MFMediaType_Audio) || !IsEqualGUID(&subtype, &MFAudioFormat_MP3))
++        return MF_E_INVALIDMEDIATYPE;
++    if (FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_NUM_CHANNELS, &channels)))
++        return MF_E_ATTRIBUTENOTFOUND;
++    if (!channels || channels > 2)
++        return MF_E_INVALIDMEDIATYPE;
++    if (flags & MFT_SET_TYPE_TEST_ONLY) return S_OK;
++
++    EnterCriticalSection(&dec->cs);
++    if (dec->mf_in) IMFMediaType_Release(dec->mf_in);
++    if (dec->mf_out) IMFMediaType_Release(dec->mf_out);
++    dec->mf_out = NULL;
++    if (SUCCEEDED(hr = MFCreateMediaType(&dec->mf_in)))
++    {
++        /* Windows keeps it as a WAVEFORMATEX: the type reads back with
++         * MF_MT_AUDIO_PREFER_WAVEFORMATEX */
++        IMFMediaType_CopyAllItems(type, (IMFAttributes *)dec->mf_in);
++        IMFMediaType_SetUINT32(dec->mf_in, &MF_MT_AUDIO_PREFER_WAVEFORMATEX, 1);
++    }
++    else dec->mf_in = NULL;
++    mft_reset_stream(dec);
++    LeaveCriticalSection(&dec->cs);
++    return hr;
++}
++
++static HRESULT WINAPI mft_SetOutputType(IMFTransform *iface, DWORD id, IMFMediaType *type, DWORD flags)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++    UINT32 channels, rate, bits, align, avg, in_rate = 0;
++    GUID major, subtype;
++    long enc;
++    HRESULT hr;
++
++    TRACE("iface %p, id %#lx, type %p, flags %#lx.\n", iface, id, type, flags);
++
++    if (id) return MF_E_INVALIDSTREAMNUMBER;
++    if (!type)
++    {
++        EnterCriticalSection(&dec->cs);
++        if (dec->mf_out) IMFMediaType_Release(dec->mf_out);
++        dec->mf_out = NULL;
++        LeaveCriticalSection(&dec->cs);
++        return S_OK;
++    }
++    if (!dec->mf_in) return MF_E_TRANSFORM_TYPE_NOT_SET;
++    if (FAILED(IMFMediaType_GetGUID(type, &MF_MT_MAJOR_TYPE, &major))
++            || FAILED(IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &subtype))
++            || FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_NUM_CHANNELS, &channels))
++            || FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_BITS_PER_SAMPLE, &bits))
++            || FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate))
++            || FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, &align))
++            || FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &avg)))
++        return MF_E_ATTRIBUTENOTFOUND;
++    if (!IsEqualGUID(&major, &MFMediaType_Audio)) return MF_E_INVALIDMEDIATYPE;
++    if (IsEqualGUID(&subtype, &MFAudioFormat_Float) && bits == 32) enc = MPG123_ENC_FLOAT_32;
++    else if (IsEqualGUID(&subtype, &MFAudioFormat_PCM) && bits == 16) enc = MPG123_ENC_SIGNED_16;
++    else if (IsEqualGUID(&subtype, &MFAudioFormat_PCM) && bits == 8) enc = MPG123_ENC_UNSIGNED_8;
++    else return MF_E_INVALIDMEDIATYPE;
++    IMFMediaType_GetUINT32(dec->mf_in, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &in_rate);
++    if (!channels || channels > 2 || (in_rate && rate != in_rate)
++            || align != channels * bits / 8 || avg != rate * align)
++        return MF_E_INVALIDMEDIATYPE;
++    if (flags & MFT_SET_TYPE_TEST_ONLY) return S_OK;
++
++    EnterCriticalSection(&dec->cs);
++    mpg123_format_none(dec->mh);
++    if (mpg123_format(dec->mh, rate, channels, enc) != MPG123_OK)
++    {
++        LeaveCriticalSection(&dec->cs);
++        return MF_E_INVALIDMEDIATYPE;
++    }
++    if (dec->mf_out) IMFMediaType_Release(dec->mf_out);
++    if (SUCCEEDED(hr = MFCreateMediaType(&dec->mf_out)))
++    {
++        IMFMediaType_CopyAllItems(type, (IMFAttributes *)dec->mf_out);
++        IMFMediaType_SetUINT32(dec->mf_out, &MF_MT_ALL_SAMPLES_INDEPENDENT, 1);
++        IMFMediaType_SetUINT32(dec->mf_out, &MF_MT_AUDIO_PREFER_WAVEFORMATEX, 1);
++        free(dec->mf_buf);
++        dec->mf_buf_size = 2 * 1152 * align;
++        if (!(dec->mf_buf = malloc(dec->mf_buf_size))) hr = E_OUTOFMEMORY;
++    }
++    if (FAILED(hr) && dec->mf_out) { IMFMediaType_Release(dec->mf_out); dec->mf_out = NULL; }
++    mft_reset_stream(dec);
++    LeaveCriticalSection(&dec->cs);
++    return hr;
++}
++
++static HRESULT mft_current_type(struct mp3_decoder *dec, IMFMediaType *current, IMFMediaType **type)
++{
++    HRESULT hr;
++
++    if (!current) return MF_E_TRANSFORM_TYPE_NOT_SET;
++    if (FAILED(hr = MFCreateMediaType(type))) return hr;
++    return IMFMediaType_CopyAllItems(current, (IMFAttributes *)*type);
++}
++
++static HRESULT WINAPI mft_GetInputCurrentType(IMFTransform *iface, DWORD id, IMFMediaType **type)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, id %#lx, type %p.\n", iface, id, type);
++    if (id) return MF_E_INVALIDSTREAMNUMBER;
++    EnterCriticalSection(&dec->cs);
++    hr = mft_current_type(dec, dec->mf_in, type);
++    LeaveCriticalSection(&dec->cs);
++    return hr;
++}
++
++static HRESULT WINAPI mft_GetOutputCurrentType(IMFTransform *iface, DWORD id, IMFMediaType **type)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++    HRESULT hr;
++
++    TRACE("iface %p, id %#lx, type %p.\n", iface, id, type);
++    if (id) return MF_E_INVALIDSTREAMNUMBER;
++    EnterCriticalSection(&dec->cs);
++    hr = mft_current_type(dec, dec->mf_out, type);
++    LeaveCriticalSection(&dec->cs);
++    return hr;
++}
++
++static HRESULT WINAPI mft_GetInputStatus(IMFTransform *iface, DWORD id, DWORD *flags)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++
++    TRACE("iface %p, id %#lx, flags %p.\n", iface, id, flags);
++    if (id) return MF_E_INVALIDSTREAMNUMBER;
++    if (!dec->mf_in || !dec->mf_out) return MF_E_TRANSFORM_TYPE_NOT_SET;
++    *flags = dec->mf_have_input ? 0 : MFT_INPUT_STATUS_ACCEPT_DATA;
++    return S_OK;
++}
++
++static HRESULT WINAPI mft_GetOutputStatus(IMFTransform *iface, DWORD *flags)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++
++    TRACE("iface %p, flags %p.\n", iface, flags);
++    if (!dec->mf_in || !dec->mf_out) return MF_E_TRANSFORM_TYPE_NOT_SET;
++    *flags = dec->mf_have_input || dec->mf_pending ? MFT_OUTPUT_STATUS_SAMPLE_READY : 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI mft_SetOutputBounds(IMFTransform *iface, LONGLONG lower, LONGLONG upper)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI mft_ProcessEvent(IMFTransform *iface, DWORD id, IMFMediaEvent *event)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI mft_ProcessMessage(IMFTransform *iface, MFT_MESSAGE_TYPE message, ULONG_PTR param)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++
++    TRACE("iface %p, message %#x, param %#Ix.\n", iface, message, param);
++
++    EnterCriticalSection(&dec->cs);
++    switch (message)
++    {
++    case MFT_MESSAGE_COMMAND_FLUSH:
++        mft_reset_stream(dec);
++        break;
++    case MFT_MESSAGE_COMMAND_DRAIN:
++        dec->mf_draining = TRUE;
++        break;
++    default:
++        break;
++    }
++    LeaveCriticalSection(&dec->cs);
++    return S_OK;
++}
++
++static HRESULT WINAPI mft_ProcessInput(IMFTransform *iface, DWORD id, IMFSample *sample, DWORD flags)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++    IMFMediaBuffer *buffer;
++    LONGLONG time;
++    DWORD len;
++    HRESULT hr;
++    BYTE *data;
++
++    TRACE("iface %p, id %#lx, sample %p, flags %#lx.\n", iface, id, sample, flags);
++
++    if (id) return MF_E_INVALIDSTREAMNUMBER;
++    if (!sample) return E_POINTER;
++    EnterCriticalSection(&dec->cs);
++    if (!dec->mf_in || !dec->mf_out) hr = MF_E_TRANSFORM_TYPE_NOT_SET;
++#ifndef SG_MUTANT_MP3MFT_TAKES_ALL
++    else if (dec->mf_have_input) hr = MF_E_NOTACCEPTING;
++#endif
++    else if (SUCCEEDED(hr = IMFSample_ConvertToContiguousBuffer(sample, &buffer)))
++    {
++        if (SUCCEEDED(hr = IMFMediaBuffer_Lock(buffer, &data, NULL, &len)))
++        {
++            if (mpg123_feed(dec->mh, data, len) != MPG123_OK)
++            {
++                ERR("mpg123_feed() failed: %s\n", mpg123_strerror(dec->mh));
++                hr = E_FAIL;
++            }
++            IMFMediaBuffer_Unlock(buffer);
++        }
++        IMFMediaBuffer_Release(buffer);
++        if (SUCCEEDED(hr))
++        {
++            dec->mf_have_input = TRUE;
++            dec->mf_draining = FALSE;
++            /* the output's times run on from the first input sample's */
++            if (!dec->mf_time_set && SUCCEEDED(IMFSample_GetSampleTime(sample, &time)))
++            {
++                dec->mf_time = time;
++                dec->mf_frames = 0;
++            }
++            dec->mf_time_set = TRUE;
++        }
++    }
++    LeaveCriticalSection(&dec->cs);
++    return hr;
++}
++
++/* decodes into the pending buffer up to "want" bytes; FALSE once mpg123 needs more input */
++static BOOL mft_fill(struct mp3_decoder *dec, DWORD want)
++{
++    while (dec->mf_pending < want)
++    {
++        size_t written = 0;
++        int err;
++
++        while ((err = mpg123_read(dec->mh, dec->mf_buf + dec->mf_pending, want - dec->mf_pending, &written))
++                == MPG123_NEW_FORMAT) ;
++        dec->mf_pending += written;
++        if (err == MPG123_NEED_MORE || err == MPG123_DONE) return FALSE;
++        if (err != MPG123_OK)
++        {
++            ERR("mpg123_read() failed: %s\n", mpg123_strerror(dec->mh));
++            return FALSE;
++        }
++        if (!written) return FALSE;
++    }
++    return TRUE;
++}
++
++static HRESULT WINAPI mft_ProcessOutput(IMFTransform *iface, DWORD flags, DWORD count,
++        MFT_OUTPUT_DATA_BUFFER *samples, DWORD *status)
++{
++    struct mp3_decoder *dec = impl_from_IMFTransform(iface);
++    DWORD block, align, copy, max_len, len;
++    UINT32 rate = 0;
++    IMFMediaBuffer *buffer;
++    BOOL more;
++    HRESULT hr;
++    BYTE *data;
++
++    TRACE("iface %p, flags %#lx, count %lu, samples %p, status %p.\n", iface, flags, count, samples, status);
++
++    if (count != 1) return E_INVALIDARG;
++    *status = samples->dwStatus = 0;
++    EnterCriticalSection(&dec->cs);
++    if (!dec->mf_in || !dec->mf_out) { LeaveCriticalSection(&dec->cs); return MF_E_TRANSFORM_TYPE_NOT_SET; }
++    if (!samples->pSample)
++    {
++        samples->dwStatus = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
++        LeaveCriticalSection(&dec->cs);
++        return E_INVALIDARG;
++    }
++    align = mft_block_align(dec);
++    block = 1152 * align;
++    IMFMediaType_GetUINT32(dec->mf_out, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
++    if (!rate) rate = 44100;
++
++    /* one more byte than a block: whether more output follows this one */
++    more = mft_fill(dec, block + 1);
++    if (!more) dec->mf_have_input = FALSE;
++    if (!dec->mf_pending)
++    {
++        LeaveCriticalSection(&dec->cs);
++        return MF_E_TRANSFORM_NEED_MORE_INPUT;
++    }
++
++    if (FAILED(hr = IMFSample_ConvertToContiguousBuffer(samples->pSample, &buffer)))
++    {
++        LeaveCriticalSection(&dec->cs);
++        return hr;
++    }
++    if (SUCCEEDED(hr = IMFMediaBuffer_Lock(buffer, &data, &max_len, &len)))
++    {
++        copy = min(min(block, dec->mf_pending), max_len);
++        copy -= copy % align;
++        if (!copy) hr = MF_E_BUFFERTOOSMALL;
++        else
++        {
++            memcpy(data, dec->mf_buf, copy);
++            memmove(dec->mf_buf, dec->mf_buf + copy, dec->mf_pending - copy);
++            dec->mf_pending -= copy;
++        }
++        IMFMediaBuffer_Unlock(buffer);
++        if (SUCCEEDED(hr))
++        {
++            LONGLONG frames = copy / align;
++            LONGLONG start = dec->mf_frames * 10000000 / rate, end = (dec->mf_frames + frames) * 10000000 / rate;
++            IMFMediaBuffer_SetCurrentLength(buffer, copy);
++            IMFSample_SetSampleTime(samples->pSample, dec->mf_time + start);
++            IMFSample_SetSampleDuration(samples->pSample, end - start);
++            IMFSample_SetUINT32(samples->pSample, &MFSampleExtension_CleanPoint, 1);
++            dec->mf_frames += frames;
++            if (dec->mf_pending || dec->mf_have_input) samples->dwStatus |= MFT_OUTPUT_DATA_BUFFER_INCOMPLETE;
++        }
++    }
++    IMFMediaBuffer_Release(buffer);
++    LeaveCriticalSection(&dec->cs);
++    return hr;
++}
++
++static const IMFTransformVtbl mft_vtbl =
++{
++    mft_QueryInterface,
++    mft_AddRef,
++    mft_Release,
++    mft_GetStreamLimits,
++    mft_GetStreamCount,
++    mft_GetStreamIDs,
++    mft_GetInputStreamInfo,
++    mft_GetOutputStreamInfo,
++    mft_GetAttributes,
++    mft_GetInputStreamAttributes,
++    mft_GetOutputStreamAttributes,
++    mft_DeleteInputStream,
++    mft_AddInputStreams,
++    mft_GetInputAvailableType,
++    mft_GetOutputAvailableType,
++    mft_SetInputType,
++    mft_SetOutputType,
++    mft_GetInputCurrentType,
++    mft_GetOutputCurrentType,
++    mft_GetInputStatus,
++    mft_GetOutputStatus,
++    mft_SetOutputBounds,
++    mft_ProcessEvent,
++    mft_ProcessMessage,
++    mft_ProcessInput,
++    mft_ProcessOutput,
++};
++
+ static HRESULT create_mp3_decoder(IUnknown *outer, REFIID iid, void **obj)
+ {
+     struct mp3_decoder *This;
+@@ -690,6 +1257,7 @@
+ 
+     This->IUnknown_inner.lpVtbl = &Unknown_vtbl;
+     This->IMediaObject_iface.lpVtbl = &MediaObject_vtbl;
++    This->IMFTransform_iface.lpVtbl = &mft_vtbl;
+     This->ref = 1;
+     This->outer = outer ? outer : &This->IUnknown_inner;
+     InitializeCriticalSectionEx(&This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+@@ -790,6 +1358,16 @@
+     hr = DMORegister(L"MP3 Decoder DMO", &CLSID_CMP3DecMediaObject, &DMOCATEGORY_AUDIO_DECODER,
+         0, 1, &in, 1, &out);
+     if (FAILED(hr)) return hr;
++#ifndef SG_MUTANT_MP3MFT_NONE
++    {
++        MFT_REGISTER_TYPE_INFO mft_in = {MFMediaType_Audio, MFAudioFormat_MP3};
++        MFT_REGISTER_TYPE_INFO mft_out = {MFMediaType_Audio, MFAudioFormat_PCM};
++
++        if (FAILED(hr = MFTRegister(CLSID_CMP3DecMediaObject, MFT_CATEGORY_AUDIO_DECODER, (WCHAR *)L"MP3 Decoder MFT",
++                0, 1, &mft_in, 1, &mft_out, NULL)))
++            return hr;
++    }
++#endif
+ 
+     return __wine_register_resources();
+ }
+@@ -803,6 +1381,7 @@
+ 
+     hr = DMOUnregister(&CLSID_CMP3DecMediaObject, &DMOCATEGORY_AUDIO_DECODER);
+     if (FAILED(hr)) return hr;
++    MFTUnregister(CLSID_CMP3DecMediaObject);
+ 
+     return __wine_unregister_resources();
+ }
+--- a/dlls/mfplat/main.c
++++ b/dlls/mfplat/main.c
+@@ -1145,6 +1145,27 @@
+             goto next;
+         }
+ 
++        /* Stained Glass OS (wine-sg 8903): the transform's name, the default value of its key, which
++         * Windows hands out as MFT_FRIENDLY_NAME_Attribute ("MP3 Decoder MFT") */
++#ifndef SG_MUTANT_MFT_NO_NAME
++        {
++            HKEY htransform, hmft;
++            DWORD name_size;
++
++            if (!RegOpenKeyW(HKEY_CLASSES_ROOT, transform_keyW, &htransform))
++            {
++                if (!RegOpenKeyW(htransform, clsidW, &hmft))
++                {
++                    if (!RegQueryValueExW(hmft, NULL, NULL, NULL, NULL, &name_size) && name_size > sizeof(WCHAR)
++                            && (mft.name = calloc(1, name_size + sizeof(WCHAR))))
++                        RegQueryValueExW(hmft, NULL, NULL, NULL, (BYTE *)mft.name, &name_size);
++                    RegCloseKey(hmft);
++                }
++                RegCloseKey(htransform);
++            }
++        }
++#endif
++
+         cur = malloc(sizeof(*cur));
+         /* Reuse allocated type arrays. */
+         *cur = mft;

@@ -42,7 +42,9 @@ cd "$WINEPREFIX/drive_c"
 timeout -s KILL 180 "$WINE" wmspeech-probe.exe 2>/dev/null </dev/null | tr -d '\r' > "$T/probe.out"
 EOS
 chmod +x "$T/run.sh"
-timeout -s KILL 300 xvfb-run -a -s '-screen 0 1024x768x24' "$T/run.sh"
+if [ -n "${XVFB_NUM:-}" ]; then XV="-n $XVFB_NUM"; else XV="-a"; fi   # XVFB_NUM: the display to use
+# shellcheck disable=SC2086
+timeout -s KILL 300 xvfb-run $XV -s '-screen 0 1024x768x24' "$T/run.sh"
 cat "$T/probe.out"
 grep -qx 'RESULT: PASS' "$T/probe.out" && exit 0
 exit 1

@@ -41,7 +41,9 @@ Xvfb ":$DPY" -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 & XP=$!
 mkdir -p "$T/prefix"
 export DISPLAY=":$DPY" WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 i=0; while ! xdpyinfo >/dev/null 2>&1 && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
-DISPLAY= timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
+# with the display: a prefix booted without one has no GPU in it, D3D11CreateDevice then fails
+# (DXGI_ERROR_UNSUPPORTED) and the drawing half below never ran
+timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 
 out=$(timeout -s KILL 120 "$WINE" "$T/compgrid-probe.exe" 2>/dev/null | tr -d '\r')
@@ -78,7 +80,10 @@ check 'group_started=1'        "StartAnimationGroup runs each animation on its T
 check 'group_needs_targets=1'  "an animation without a Target makes StartAnimationGroup fail"
 check 'group_implicit=1'       "a group as an implicit animation runs its animations on their Targets"
 if printf '%s\n' "$out" | grep -q '^no_d3d11='; then
-    echo "SKIP: no Direct3D 11 device here for the drawing part"
+    # a real failure where Xvfb has GLX (llvmpipe): the drawing half must run; COMPGRID_ALLOW_NO_D3D=1
+    # for a machine without any OpenGL
+    if [ -n "${COMPGRID_ALLOW_NO_D3D:-}" ]; then echo "SKIP: no Direct3D 11 device here for the drawing part"
+    else fail "a Direct3D 11 device for the drawing part ($(printf '%s\n' "$out" | grep '^no_d3d11='))"; fi
 else
     check 'nine_grid_edge=1'       "a nine-grid brush draws its source's edges"
     check 'nine_grid_hollow=1'     "and leaves a hollow centre out"
