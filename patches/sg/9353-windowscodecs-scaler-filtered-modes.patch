@@ -1,0 +1,293 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] windowscodecs: the bitmap scaler's linear, cubic, Fant and high quality cubic modes resample
+
+IWICBitmapScaler drew every interpolation mode as nearest neighbour ('unsupported mode 3', PDFgear at start; Fant is what WPF's DecodePixelWidth and many viewers ask for). For formats of 8-bit channels (24/32 bpp BGR/RGB, premultiplied or straight BGRA/RGBA, 8 bpp grey and alpha) the scaled image is now resampled, separably: linear (two taps), cubic (cubic convolution, a = -0.5), Fant (the covered source area, each pixel weighted by its coverage; linear when enlarging), high quality cubic (the cubic kernel stretched over the source area when reducing). Straight alpha weighs the colour. Other formats and nearest neighbour stay as they were.
+---
+--- a/dlls/windowscodecs/scaler.c
++++ b/dlls/windowscodecs/scaler.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <stdarg.h>
++#include <math.h>
+ 
+ #define COBJMACROS
+ 
+@@ -42,6 +43,9 @@
+     UINT bpp;
+     void (*fn_get_required_source_rect)(struct BitmapScaler*,UINT,UINT,WICRect*);
+     void (*fn_copy_scanline)(struct BitmapScaler*,UINT,UINT,UINT,BYTE**,UINT,UINT,BYTE*);
++    BOOL filtered;      /* wine-sg 9353: linear, cubic, Fant or high quality cubic resampling */
++    int alpha;          /* the channel of straight alpha, or -1 */
++    BYTE *scaled;       /* the whole scaled image, made at the first CopyPixels */
+     CRITICAL_SECTION lock; /* must be held when initialized */
+ } BitmapScaler;
+ 
+@@ -106,6 +110,7 @@
+         This->lock.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&This->lock);
+         if (This->source) IWICBitmapSource_Release(This->source);
++        free(This->scaled);
+         free(This);
+     }
+ 
+@@ -203,6 +208,189 @@
+     }
+ }
+ 
++/* wine-sg 9353: the interpolation modes other than nearest neighbour, for formats of 8-bit channels.
++ * Separable: for each destination column (row) the source columns (rows) it takes and their weights.
++ * Linear: two taps around the destination pixel's centre mapped into the source. Cubic: four taps of the
++ * cubic convolution kernel (a = -0.5). Fant: the source area the destination pixel covers, each source pixel
++ * weighted by how much of it is covered (linear when enlarging). High quality cubic: the cubic kernel
++ * stretched over the source area when reducing, so every source pixel counts. */
++/* not in our wincodec.idl yet */
++#define WIC_INTERPOLATION_HIGH_QUALITY_CUBIC ((WICBitmapInterpolationMode)4)
++
++struct scale_taps
++{
++    int first;          /* the first source index */
++    int count;
++    float *weights;
++};
++
++static float cubic_weight(float x)
++{
++    const float a = -0.5f;
++    x = fabsf(x);
++    if (x < 1.0f) return ((a + 2.0f) * x - (a + 3.0f)) * x * x + 1.0f;
++    if (x < 2.0f) return ((a * x - 5.0f * a) * x + 8.0f * a) * x - 4.0f * a;
++    return 0.0f;
++}
++
++static struct scale_taps *make_taps(UINT src, UINT dst, WICBitmapInterpolationMode mode)
++{
++    double scale = (double)src / dst, support;
++    struct scale_taps *taps;
++    float *w;
++    int max_taps, i, j;
++
++    if (mode == WICBitmapInterpolationModeFant && scale <= 1.0) mode = WICBitmapInterpolationModeLinear;
++    if (mode == WIC_INTERPOLATION_HIGH_QUALITY_CUBIC && scale <= 1.0) mode = WICBitmapInterpolationModeCubic;
++
++    switch (mode)
++    {
++    case WICBitmapInterpolationModeLinear: support = 1.0; break;
++    case WICBitmapInterpolationModeCubic: support = 2.0; break;
++    case WICBitmapInterpolationModeFant: support = scale / 2.0 + 1.0; break;
++    default: support = 2.0 * scale; break;
++    }
++    max_taps = (int)ceil(2.0 * support) + 2;
++    if (!(taps = calloc(dst, sizeof(*taps)))) return NULL;
++    if (!(w = calloc((size_t)dst * max_taps, sizeof(*w))))
++    {
++        free(taps);
++        return NULL;
++    }
++    for (i = 0; i < (int)dst; ++i)
++    {
++        double center = (i + 0.5) * scale, sum = 0.0;
++        int lo, hi;
++
++        taps[i].weights = w + (size_t)i * max_taps;
++        if (mode == WICBitmapInterpolationModeFant)
++        {
++            double a = i * scale, b = (i + 1) * scale;
++            lo = (int)floor(a);
++            hi = (int)ceil(b) - 1;
++        }
++        else
++        {
++            lo = (int)floor(center - 0.5 - support) + 1;
++            hi = (int)floor(center - 0.5 + support);
++        }
++        if (hi - lo + 1 > max_taps) hi = lo + max_taps - 1;
++        taps[i].first = lo;
++        taps[i].count = hi - lo + 1;
++        for (j = lo; j <= hi; ++j)
++        {
++            double d = j + 0.5 - center, v;
++
++            switch (mode)
++            {
++            case WICBitmapInterpolationModeLinear: v = max(0.0, 1.0 - fabs(d)); break;
++            case WICBitmapInterpolationModeCubic: v = cubic_weight(d); break;
++            case WICBitmapInterpolationModeFant:
++                v = min((double)j + 1, (i + 1) * scale) - max((double)j, i * scale);
++                if (v < 0.0) v = 0.0;
++                break;
++            default: v = cubic_weight(d / scale); break;
++            }
++            taps[i].weights[j - lo] = v;
++            sum += v;
++        }
++        if (sum != 0.0)
++            for (j = 0; j < taps[i].count; ++j) taps[i].weights[j] /= sum;
++    }
++    return taps;
++}
++
++static void free_taps(struct scale_taps *taps)
++{
++    if (!taps) return;
++    free(taps[0].weights);
++    free(taps);
++}
++
++static HRESULT scale_filtered(BitmapScaler *This)
++{
++    UINT n = This->bpp / 8, sw = This->src_width, sh = This->src_height, dw = This->width, dh = This->height;
++    UINT src_stride = sw * n, x, y, c;
++    struct scale_taps *tx = NULL, *ty = NULL;
++    float *rows = NULL, *acc = NULL;
++    BYTE *src = NULL, *out = NULL;
++    WICRect rc = { 0, 0, sw, sh };
++    HRESULT hr;
++    int k;
++
++    if (!(src = malloc((size_t)src_stride * sh)) || !(out = malloc((size_t)dw * dh * n))
++            || !(rows = malloc((size_t)dw * sh * n * sizeof(float))) || !(acc = malloc((size_t)n * sizeof(float)))
++            || !(tx = make_taps(sw, dw, This->mode)) || !(ty = make_taps(sh, dh, This->mode)))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    if (FAILED(hr = IWICBitmapSource_CopyPixels(This->source, &rc, src_stride, src_stride * sh, src)))
++        goto done;
++
++    /* across: every source row to the destination width (straight alpha weighs the colour) */
++    for (y = 0; y < sh; ++y)
++    {
++        const BYTE *line = src + (size_t)y * src_stride;
++
++        for (x = 0; x < dw; ++x)
++        {
++            float *o = rows + ((size_t)y * dw + x) * n;
++
++            for (c = 0; c < n; ++c) o[c] = 0.0f;
++            for (k = 0; k < tx[x].count; ++k)
++            {
++                int sx = min(max(tx[x].first + k, 0), (int)sw - 1);
++                const BYTE *p = line + (size_t)sx * n;
++                float wgt = tx[x].weights[k], a = This->alpha >= 0 ? p[This->alpha] / 255.0f : 1.0f;
++
++                for (c = 0; c < n; ++c)
++                    o[c] += wgt * ((int)c == This->alpha ? p[c] : p[c] * a);
++            }
++        }
++    }
++    /* down: the columns to the destination height */
++    for (y = 0; y < dh; ++y)
++    {
++        for (x = 0; x < dw; ++x)
++        {
++            BYTE *d = out + ((size_t)y * dw + x) * n;
++
++            for (c = 0; c < n; ++c) acc[c] = 0.0f;
++            for (k = 0; k < ty[y].count; ++k)
++            {
++                int sy = min(max(ty[y].first + k, 0), (int)sh - 1);
++                const float *p = rows + ((size_t)sy * dw + x) * n;
++
++                for (c = 0; c < n; ++c) acc[c] += ty[y].weights[k] * p[c];
++            }
++            for (c = 0; c < n; ++c)
++            {
++                float v = acc[c];
++
++                if (This->alpha >= 0 && (int)c != This->alpha)
++                {
++                    float a = acc[This->alpha] / 255.0f;
++                    v = a > 0.0f ? v / a : 0.0f;
++                }
++                d[c] = (BYTE)min(max(v + 0.5f, 0.0f), 255.0f);
++            }
++        }
++    }
++    This->scaled = out;
++    out = NULL;
++    hr = S_OK;
++
++done:
++    free(src);
++    free(out);
++    free(rows);
++    free(acc);
++    free_taps(tx);
++    free_taps(ty);
++    return hr;
++}
++
+ static HRESULT WINAPI BitmapScaler_CopyPixels(IWICBitmapScaler *iface,
+     const WICRect *prc, UINT cbStride, UINT cbBufferSize, BYTE *pbBuffer)
+ {
+@@ -257,6 +445,18 @@
+         goto end;
+     }
+ 
++    if (This->filtered)
++    {
++        UINT n = This->bpp / 8;
++
++        if (!This->scaled && FAILED(hr = scale_filtered(This))) goto end;
++        for (y = 0; y < dest_rect.Height; ++y)
++            memcpy(pbBuffer + (size_t)cbStride * y,
++                   This->scaled + ((size_t)(dest_rect.Y + y) * This->width + dest_rect.X) * n, bytesperrow);
++        hr = S_OK;
++        goto end;
++    }
++
+     /* MSDN recommends calling CopyPixels once for each scanline from top to
+      * bottom, and claims codecs optimize for this. Ideally, when called in this
+      * way, we should avoid requesting a scanline from the source more than
+@@ -349,10 +549,39 @@
+ 
+     if (SUCCEEDED(hr))
+     {
++        /* wine-sg 9353: the filtered modes for formats of 8-bit channels */
++        static const struct { const GUID *format; int alpha; } filterable[] = {
++            { &GUID_WICPixelFormat24bppBGR, -1 }, { &GUID_WICPixelFormat24bppRGB, -1 },
++            { &GUID_WICPixelFormat32bppBGR, -1 }, { &GUID_WICPixelFormat32bppRGB, -1 },
++            { &GUID_WICPixelFormat32bppPBGRA, -1 }, { &GUID_WICPixelFormat32bppPRGBA, -1 },
++            { &GUID_WICPixelFormat32bppBGRA, 3 }, { &GUID_WICPixelFormat32bppRGBA, 3 },
++            { &GUID_WICPixelFormat8bppGray, -1 }, { &GUID_WICPixelFormat8bppAlpha, -1 },
++        };
++        unsigned int i;
++
++        This->filtered = FALSE;
++#ifndef SG_MUTANT_WIC_SCALER_NEAREST_ONLY
++        if (mode == WICBitmapInterpolationModeLinear || mode == WICBitmapInterpolationModeCubic
++                || mode == WICBitmapInterpolationModeFant || mode == WIC_INTERPOLATION_HIGH_QUALITY_CUBIC)
++        {
++            for (i = 0; i < ARRAY_SIZE(filterable); ++i)
++            {
++                if (!IsEqualGUID(&src_pixelformat, filterable[i].format)) continue;
++                IWICBitmapSource_AddRef(pISource);
++                This->source = pISource;
++                This->alpha = filterable[i].alpha;
++                This->filtered = TRUE;
++                This->fn_get_required_source_rect = NearestNeighbor_GetRequiredSourceRect;
++                This->fn_copy_scanline = NearestNeighbor_CopyScanline;
++                break;
++            }
++        }
++#endif
++        if (!This->filtered)
+         switch (mode)
+         {
+         default:
+-            FIXME("unsupported mode %i\n", mode);
++            FIXME("mode %i on %s drawn as nearest neighbour\n", mode, debugstr_guid(&src_pixelformat));
+             /* fall-through */
+         case WICBitmapInterpolationModeNearestNeighbor:
+             if ((This->bpp % 8) == 0)
+@@ -527,6 +756,9 @@
+     This->src_height = 0;
+     This->mode = 0;
+     This->bpp = 0;
++    This->filtered = FALSE;
++    This->alpha = -1;
++    This->scaled = NULL;
+     InitializeCriticalSectionEx(&This->lock, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     This->lock.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": BitmapScaler.lock");
+ 

@@ -1,0 +1,860 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] windowscodecs: PNG bKGD, sRGB, iCCP and iTXt chunks have metadata readers and writers
+
+Windows has metadata readers and writers for the PNG bKGD, sRGB, iCCP and iTXt chunks (Native Image Format Metadata Queries: /bKGD/BackgroundColor as VT_UI1, VT_UI2 or a vector of three VT_UI2; /sRGB/RenderingIntent; /iCCP/ProfileName and the inflated ProfileData; /iTXt/Keyword, CompressionFlag, LanguageTag, TranslatedKeyword and TextEntry, compressed text inflated). Wine read them with the Unknown reader and had no writers, so a program that writes each block back through its format's writer found no header for it in the PNG container: Paint.NET 5.2 could not open any PNG with an sRGB or bKGD chunk (ImagingComponentNotFoundException from WICMetadataWriterInfo.GetHeader). The four readers and writers are registered (the writers' headers follow from their patterns, 9501), each writer writes its chunk back, and the PNG encoder writes bKGD (in the form the colour type has), sRGB and iTXt blocks it is given.
+---
+--- a/dlls/windowscodecs/pngformat.c
++++ b/dlls/windowscodecs/pngformat.c
+@@ -29,6 +29,8 @@
+ 
+ #include "wincodecs_private.h"
+ 
++#include "zlib.h"
++
+ #include "wine/debug.h"
+ 
+ static inline USHORT read_ushort_be(BYTE* data)
+@@ -617,6 +619,468 @@
+     return MetadataReader_Create(&TimeWriter_Vtbl, iid, ppv);
+ }
+ 
++/* wine-sg 9350: the bKGD, sRGB, iCCP and iTXt chunks have readers and writers of their own, as on Windows
++ * (Native Image Format Metadata Queries: /bKGD/BackgroundColor -- VT_UI1 palette index, VT_UI2 grey or a vector
++ * of three VT_UI2 -- /sRGB/RenderingIntent, /iCCP/ProfileName and ProfileData, /iTXt/Keyword, CompressionFlag,
++ * LanguageTag, TranslatedKeyword and TextEntry). The Unknown reader had them, and a program that writes each
++ * block back through its format's writer found no writer for the container: Paint.NET could not open any PNG
++ * with an sRGB or bKGD chunk ("There was an error while opening the file"). */
++
++static void *png_zalloc(void *opaque, unsigned int items, unsigned int size)
++{
++    return malloc((size_t)items * size);
++}
++
++static void png_zfree(void *opaque, void *ptr)
++{
++    free(ptr);
++}
++
++/* zlib data (iCCP profiles, compressed iTXt text), inflated */
++HRESULT png_inflate(const BYTE *src, ULONG len, BYTE **out, ULONG *out_len)
++{
++    ULONG size = max(len * 4, 256);
++    z_stream z;
++    BYTE *buf, *grown;
++    int ret;
++
++    memset(&z, 0, sizeof(z));
++    z.zalloc = png_zalloc;
++    z.zfree = png_zfree;
++    if (inflateInit(&z) != Z_OK) return E_FAIL;
++    if (!(buf = malloc(size)))
++    {
++        inflateEnd(&z);
++        return E_OUTOFMEMORY;
++    }
++    z.next_in = (Bytef *)src;
++    z.avail_in = len;
++    for (;;)
++    {
++        z.next_out = buf + z.total_out;
++        z.avail_out = size - z.total_out;
++        ret = inflate(&z, Z_NO_FLUSH);
++        if (ret == Z_STREAM_END) break;
++        if ((ret != Z_OK && ret != Z_BUF_ERROR) || (z.avail_out && !z.avail_in) || size >= 0x10000000)
++        {
++            free(buf);
++            inflateEnd(&z);
++            return WINCODEC_ERR_BADMETADATAHEADER;
++        }
++        if (!z.avail_out)
++        {
++            if (!(grown = realloc(buf, size * 2)))
++            {
++                free(buf);
++                inflateEnd(&z);
++                return E_OUTOFMEMORY;
++            }
++            buf = grown;
++            size *= 2;
++        }
++    }
++    *out = buf;
++    *out_len = z.total_out;
++    inflateEnd(&z);
++    return S_OK;
++}
++
++static HRESULT png_deflate(const BYTE *src, ULONG len, struct md_buf *buf)
++{
++    BYTE out[4096];
++    HRESULT hr = S_OK;
++    z_stream z;
++    int ret;
++
++    memset(&z, 0, sizeof(z));
++    z.zalloc = png_zalloc;
++    z.zfree = png_zfree;
++    if (deflateInit(&z, Z_DEFAULT_COMPRESSION) != Z_OK) return E_FAIL;
++    z.next_in = (Bytef *)src;
++    z.avail_in = len;
++    do
++    {
++        z.next_out = out;
++        z.avail_out = sizeof(out);
++        if ((ret = deflate(&z, Z_FINISH)) == Z_STREAM_ERROR)
++        {
++            hr = E_FAIL;
++            break;
++        }
++        hr = md_buf_put(buf, out, sizeof(out) - z.avail_out);
++    } while (SUCCEEDED(hr) && ret != Z_STREAM_END);
++    deflateEnd(&z);
++    return hr;
++}
++
++static HRESULT png_items_alloc(MetadataItem **items, const WCHAR **names, DWORD count)
++{
++    HRESULT hr = S_OK;
++    DWORD i;
++
++    if (!(*items = calloc(count, sizeof(**items)))) return E_OUTOFMEMORY;
++    for (i = 0; i < count; ++i)
++    {
++        PropVariantInit(&(*items)[i].schema);
++        PropVariantInit(&(*items)[i].id);
++        PropVariantInit(&(*items)[i].value);
++        (*items)[i].id.vt = VT_LPWSTR;
++        if (FAILED(hr = SHStrDupW(names[i], &(*items)[i].id.pwszVal))) (*items)[i].id.vt = VT_EMPTY;
++    }
++    return hr;
++}
++
++static void png_items_free(MetadataItem *items, DWORD count)
++{
++    DWORD i;
++
++    if (!items) return;
++    for (i = 0; i < count; ++i)
++    {
++        PropVariantClear(&items[i].id);
++        PropVariantClear(&items[i].value);
++    }
++    free(items);
++}
++
++static HRESULT png_lpstr(PROPVARIANT *v, const BYTE *text, ULONG len)
++{
++    if (!(v->pszVal = CoTaskMemAlloc(len + 1))) return E_OUTOFMEMORY;
++    memcpy(v->pszVal, text, len);
++    v->pszVal[len] = 0;
++    v->vt = VT_LPSTR;
++    return S_OK;
++}
++
++static HRESULT png_lpwstr_utf8(PROPVARIANT *v, const BYTE *text, ULONG len)
++{
++    int n = len ? MultiByteToWideChar(CP_UTF8, 0, (const char *)text, len, NULL, 0) : 0;
++
++    if (!(v->pwszVal = CoTaskMemAlloc((n + 1) * sizeof(WCHAR)))) return E_OUTOFMEMORY;
++    if (n) MultiByteToWideChar(CP_UTF8, 0, (const char *)text, len, v->pwszVal, n);
++    v->pwszVal[n] = 0;
++    v->vt = VT_LPWSTR;
++    return S_OK;
++}
++
++/* UTF-8 of an LPWSTR item, the bytes of an LPSTR one */
++static HRESULT png_item_utf8(const PROPVARIANT *v, char **text, ULONG *len)
++{
++    if (v->vt == VT_LPWSTR && v->pwszVal)
++    {
++        int n = WideCharToMultiByte(CP_UTF8, 0, v->pwszVal, -1, NULL, 0, NULL, NULL);
++
++        if (!(*text = malloc(n))) return E_OUTOFMEMORY;
++        WideCharToMultiByte(CP_UTF8, 0, v->pwszVal, -1, *text, n, NULL, NULL);
++        *len = n - 1;
++        return S_OK;
++    }
++    return png_item_text(v, text, len);
++}
++
++static HRESULT LoadBkgdMetadata(IStream *stream, const GUID *preferred_vendor,
++    DWORD persist_options, MetadataItem **items, DWORD *item_count)
++{
++    static const WCHAR *names[] = { L"BackgroundColor" };
++    MetadataItem *result;
++    ULONG data_size, i;
++    BYTE type[4], *data;
++    HRESULT hr;
++
++    if (FAILED(hr = read_png_chunk(stream, type, &data, &data_size))) return hr;
++    if (data_size != 1 && data_size != 2 && data_size != 6)
++    {
++        free(data);
++        return E_FAIL;
++    }
++    if (FAILED(hr = png_items_alloc(&result, names, 1))) goto done;
++    if (data_size == 1)
++    {
++        result[0].value.vt = VT_UI1;
++        result[0].value.bVal = data[0];
++    }
++    else if (data_size == 2)
++    {
++        result[0].value.vt = VT_UI2;
++        result[0].value.uiVal = read_ushort_be(data);
++    }
++    else if (!(result[0].value.caui.pElems = CoTaskMemAlloc(3 * sizeof(USHORT))))
++        hr = E_OUTOFMEMORY;
++    else
++    {
++        result[0].value.vt = VT_UI2 | VT_VECTOR;
++        result[0].value.caui.cElems = 3;
++        for (i = 0; i < 3; ++i) result[0].value.caui.pElems[i] = read_ushort_be(data + 2 * i);
++    }
++done:
++    free(data);
++    if (FAILED(hr))
++    {
++        png_items_free(result, 1);
++        return hr;
++    }
++    *items = result;
++    *item_count = 1;
++    return S_OK;
++}
++
++static HRESULT bkgd_serialize(const MetadataItem *items, DWORD count, DWORD options, struct md_buf *buf)
++{
++    const MetadataItem *item = md_find_item(items, count, L"BackgroundColor");
++    struct md_buf data = {0};
++    HRESULT hr = S_OK;
++    ULONG i;
++
++    if (!item || item->value.vt == VT_UI1)
++        hr = md_buf_put_u8(&data, item ? item->value.bVal : 0);
++    else if (item->value.vt == VT_UI2)
++        hr = md_buf_put_u16(&data, item->value.uiVal, TRUE);
++    else if (item->value.vt == (VT_UI2 | VT_VECTOR) && item->value.caui.cElems == 3)
++        for (i = 0; i < 3 && SUCCEEDED(hr); ++i) hr = md_buf_put_u16(&data, item->value.caui.pElems[i], TRUE);
++    else
++        hr = WINCODEC_ERR_UNEXPECTEDMETADATATYPE;
++    if (SUCCEEDED(hr)) hr = png_chunk_put(buf, "bKGD", data.data, data.len);
++    md_buf_free(&data);
++    return hr;
++}
++
++MD_SERIALIZER(bkgd)
++
++static HRESULT LoadSrgbMetadata(IStream *stream, const GUID *preferred_vendor,
++    DWORD persist_options, MetadataItem **items, DWORD *item_count)
++{
++    static const WCHAR *names[] = { L"RenderingIntent" };
++    MetadataItem *result;
++    BYTE type[4], *data;
++    ULONG data_size;
++    HRESULT hr;
++
++    if (FAILED(hr = read_png_chunk(stream, type, &data, &data_size))) return hr;
++    if (data_size < 1)
++    {
++        free(data);
++        return E_FAIL;
++    }
++    if (FAILED(hr = png_items_alloc(&result, names, 1)))
++    {
++        free(data);
++        png_items_free(result, 1);
++        return hr;
++    }
++    result[0].value.vt = VT_UI1;
++    result[0].value.bVal = data[0];
++    free(data);
++    *items = result;
++    *item_count = 1;
++    return S_OK;
++}
++
++static HRESULT srgb_serialize(const MetadataItem *items, DWORD count, DWORD options, struct md_buf *buf)
++{
++    const MetadataItem *item = md_find_item(items, count, L"RenderingIntent");
++    struct md_buf data = {0};
++    ULONGLONG intent = 0;
++    HRESULT hr;
++
++    if (item && !md_item_uint(item, &intent)) return WINCODEC_ERR_UNEXPECTEDMETADATATYPE;
++    if (SUCCEEDED(hr = md_buf_put_u8(&data, intent)))
++        hr = png_chunk_put(buf, "sRGB", data.data, data.len);
++    md_buf_free(&data);
++    return hr;
++}
++
++MD_SERIALIZER(srgb)
++
++static HRESULT LoadIccpMetadata(IStream *stream, const GUID *preferred_vendor,
++    DWORD persist_options, MetadataItem **items, DWORD *item_count)
++{
++    static const WCHAR *names[] = { L"ProfileName", L"ProfileData" };
++    MetadataItem *result = NULL;
++    BYTE type[4], *data, *nul, *profile = NULL;
++    ULONG data_size, name_len, profile_len;
++    HRESULT hr;
++
++    if (FAILED(hr = read_png_chunk(stream, type, &data, &data_size))) return hr;
++    /* name (1 to 79 characters), NUL, compression method 0, the zlib stream of the profile */
++    if (!(nul = memchr(data, 0, data_size)) || (name_len = nul - data) > 79 || data_size < name_len + 2)
++    {
++        free(data);
++        return E_FAIL;
++    }
++    if (FAILED(hr = png_inflate(nul + 2, data_size - name_len - 2, &profile, &profile_len))) goto done;
++    if (FAILED(hr = png_items_alloc(&result, names, 2))) goto done;
++    if (FAILED(hr = png_lpstr(&result[0].value, data, name_len))) goto done;
++    if (!(result[1].value.caub.pElems = CoTaskMemAlloc(max(profile_len, 1))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    memcpy(result[1].value.caub.pElems, profile, profile_len);
++    result[1].value.caub.cElems = profile_len;
++    result[1].value.vt = VT_UI1 | VT_VECTOR;
++done:
++    free(data);
++    free(profile);
++    if (FAILED(hr))
++    {
++        png_items_free(result, 2);
++        return hr;
++    }
++    *items = result;
++    *item_count = 2;
++    return S_OK;
++}
++
++static HRESULT iccp_serialize(const MetadataItem *items, DWORD count, DWORD options, struct md_buf *buf)
++{
++    const MetadataItem *name_item = md_find_item(items, count, L"ProfileName");
++    const MetadataItem *data_item = md_find_item(items, count, L"ProfileData");
++    struct md_buf data = {0};
++    char *name = NULL;
++    ULONG name_len = 0;
++    HRESULT hr = S_OK;
++
++    if (name_item && FAILED(hr = png_item_text(&name_item->value, &name, &name_len))) return hr;
++    if (data_item && data_item->value.vt != (VT_UI1 | VT_VECTOR) && data_item->value.vt != VT_BLOB)
++        hr = WINCODEC_ERR_UNEXPECTEDMETADATATYPE;
++    else if (name_len > 79)
++        hr = E_INVALIDARG;
++    if (SUCCEEDED(hr)) hr = md_buf_put(&data, name ? name : "", name_len + 1);
++    if (SUCCEEDED(hr)) hr = md_buf_put_u8(&data, 0);
++    if (SUCCEEDED(hr))
++    {
++        if (!data_item) hr = png_deflate(NULL, 0, &data);
++        else if (data_item->value.vt == VT_BLOB)
++            hr = png_deflate(data_item->value.blob.pBlobData, data_item->value.blob.cbSize, &data);
++        else
++            hr = png_deflate(data_item->value.caub.pElems, data_item->value.caub.cElems, &data);
++    }
++    if (SUCCEEDED(hr)) hr = png_chunk_put(buf, "iCCP", data.data, data.len);
++    md_buf_free(&data);
++    free(name);
++    return hr;
++}
++
++MD_SERIALIZER(iccp)
++
++static HRESULT LoadItxtMetadata(IStream *stream, const GUID *preferred_vendor,
++    DWORD persist_options, MetadataItem **items, DWORD *item_count)
++{
++    static const WCHAR *names[] = { L"Keyword", L"CompressionFlag", L"LanguageTag", L"TranslatedKeyword",
++            L"TextEntry" };
++    BYTE type[4], *data, *p, *end, *lang, *lang_end, *trans, *trans_end, *text = NULL, *nul;
++    MetadataItem *result = NULL;
++    ULONG data_size, text_len;
++    HRESULT hr;
++    BYTE flag;
++
++    if (FAILED(hr = read_png_chunk(stream, type, &data, &data_size))) return hr;
++    /* keyword NUL, compression flag, compression method, language tag NUL, translated keyword NUL, text */
++    end = data + data_size;
++    if (!(nul = memchr(data, 0, data_size)) || nul - data > 79 || end - nul < 3) goto bad;
++    flag = nul[1];
++    lang = nul + 3;
++    if (!(lang_end = memchr(lang, 0, end - lang))) goto bad;
++    trans = lang_end + 1;
++    if (!(trans_end = memchr(trans, 0, end - trans))) goto bad;
++    p = trans_end + 1;
++
++    if (flag)
++    {
++        if (FAILED(hr = png_inflate(p, end - p, &text, &text_len))) goto done;
++    }
++    else
++    {
++        text_len = end - p;
++        if (!(text = malloc(max(text_len, 1)))) { hr = E_OUTOFMEMORY; goto done; }
++        memcpy(text, p, text_len);
++    }
++
++    if (FAILED(hr = png_items_alloc(&result, names, 5))) goto done;
++    if (FAILED(hr = png_lpstr(&result[0].value, data, nul - data))) goto done;
++    result[1].value.vt = VT_UI1;
++    result[1].value.bVal = flag;
++    if (FAILED(hr = png_lpstr(&result[2].value, lang, lang_end - lang))) goto done;
++    if (FAILED(hr = png_lpwstr_utf8(&result[3].value, trans, trans_end - trans))) goto done;
++    hr = png_lpwstr_utf8(&result[4].value, text, text_len);
++    goto done;
++
++bad:
++    hr = E_FAIL;
++done:
++    free(data);
++    free(text);
++    if (FAILED(hr))
++    {
++        png_items_free(result, 5);
++        return hr;
++    }
++    *items = result;
++    *item_count = 5;
++    return S_OK;
++}
++
++static HRESULT itxt_serialize(const MetadataItem *items, DWORD count, DWORD options, struct md_buf *buf)
++{
++    const MetadataItem *keyword = md_find_item(items, count, L"Keyword");
++    const MetadataItem *flag_item = md_find_item(items, count, L"CompressionFlag");
++    const MetadataItem *lang_item = md_find_item(items, count, L"LanguageTag");
++    const MetadataItem *trans_item = md_find_item(items, count, L"TranslatedKeyword");
++    const MetadataItem *text_item = md_find_item(items, count, L"TextEntry");
++    char *name = NULL, *lang = NULL, *trans = NULL, *text = NULL;
++    ULONG name_len = 0, lang_len = 0, trans_len = 0, text_len = 0;
++    struct md_buf data = {0};
++    ULONGLONG flag = 0;
++    HRESULT hr = S_OK;
++
++    if (!keyword) return WINCODEC_ERR_PROPERTYNOTFOUND;
++    if (FAILED(hr = png_item_text(&keyword->value, &name, &name_len))) return hr;
++    if (!name_len || name_len > 79) hr = E_INVALIDARG;
++    if (SUCCEEDED(hr) && flag_item && !md_item_uint(flag_item, &flag)) hr = WINCODEC_ERR_UNEXPECTEDMETADATATYPE;
++    if (SUCCEEDED(hr) && lang_item) hr = png_item_text(&lang_item->value, &lang, &lang_len);
++    if (SUCCEEDED(hr) && trans_item) hr = png_item_utf8(&trans_item->value, &trans, &trans_len);
++    if (SUCCEEDED(hr) && text_item) hr = png_item_utf8(&text_item->value, &text, &text_len);
++
++    if (SUCCEEDED(hr)) hr = md_buf_put(&data, name, name_len + 1);
++    if (SUCCEEDED(hr)) hr = md_buf_put_u8(&data, flag ? 1 : 0);
++    if (SUCCEEDED(hr)) hr = md_buf_put_u8(&data, 0);
++    if (SUCCEEDED(hr)) hr = md_buf_put(&data, lang ? lang : "", lang_len + 1);
++    if (SUCCEEDED(hr)) hr = md_buf_put(&data, trans ? trans : "", trans_len + 1);
++    if (SUCCEEDED(hr))
++    {
++        if (flag) hr = png_deflate((const BYTE *)(text ? text : ""), text_len, &data);
++        else hr = md_buf_put(&data, text ? text : "", text_len);
++    }
++    if (SUCCEEDED(hr)) hr = png_chunk_put(buf, "iTXt", data.data, data.len);
++    md_buf_free(&data);
++    free(name);
++    free(lang);
++    free(trans);
++    free(text);
++    return hr;
++}
++
++MD_SERIALIZER(itxt)
++
++#define PNG_CHUNK_HANDLERS(Name, name) \
++    static const MetadataHandlerVtbl Name##Reader_Vtbl = { 0, &CLSID_WICPng##Name##MetadataReader, \
++            Load##Name##Metadata }; \
++    HRESULT Png##Name##Reader_CreateInstance(REFIID iid, void **ppv) \
++    { \
++        return MetadataReader_Create(&Name##Reader_Vtbl, iid, ppv); \
++    } \
++    static const MetadataHandlerVtbl Name##Writer_Vtbl = { 1, &CLSID_WICPng##Name##MetadataWriter, \
++            Load##Name##Metadata, name##_save, name##_size }; \
++    HRESULT Png##Name##Writer_CreateInstance(REFIID iid, void **ppv) \
++    { \
++        return MetadataReader_Create(&Name##Writer_Vtbl, iid, ppv); \
++    }
++
++PNG_CHUNK_HANDLERS(Bkgd, bkgd)
++PNG_CHUNK_HANDLERS(Srgb, srgb)
++PNG_CHUNK_HANDLERS(Iccp, iccp)
++PNG_CHUNK_HANDLERS(Itxt, itxt)
++
+ HRESULT PngDecoder_CreateInstance(REFIID iid, void** ppv)
+ {
+     HRESULT hr;
+--- a/dlls/windowscodecs/regsvr.c
++++ b/dlls/windowscodecs/regsvr.c
+@@ -1762,6 +1762,67 @@
+     { NULL } /* list terminator */
+ };
+ 
++/* wine-sg 9350: the bKGD, iCCP, iTXt and sRGB chunks */
++static const BYTE bKGD[] = "bKGD";
++
++static const struct metadata_pattern pngbkgd_metadata_pattern[] = {
++    { 4, 4, bKGD, mask_all, 4 },
++    { 0 }
++};
++
++static const struct reader_containers pngbkgd_containers[] = {
++    {
++        &GUID_ContainerFormatPng,
++        pngbkgd_metadata_pattern
++    },
++    { NULL } /* list terminator */
++};
++
++static const BYTE iCCP[] = "iCCP";
++
++static const struct metadata_pattern pngiccp_metadata_pattern[] = {
++    { 4, 4, iCCP, mask_all, 4 },
++    { 0 }
++};
++
++static const struct reader_containers pngiccp_containers[] = {
++    {
++        &GUID_ContainerFormatPng,
++        pngiccp_metadata_pattern
++    },
++    { NULL } /* list terminator */
++};
++
++static const BYTE iTXt[] = "iTXt";
++
++static const struct metadata_pattern pngitxt_metadata_pattern[] = {
++    { 4, 4, iTXt, mask_all, 4 },
++    { 0 }
++};
++
++static const struct reader_containers pngitxt_containers[] = {
++    {
++        &GUID_ContainerFormatPng,
++        pngitxt_metadata_pattern
++    },
++    { NULL } /* list terminator */
++};
++
++static const BYTE sRGB[] = "sRGB";
++
++static const struct metadata_pattern pngsrgb_metadata_pattern[] = {
++    { 4, 4, sRGB, mask_all, 4 },
++    { 0 }
++};
++
++static const struct reader_containers pngsrgb_containers[] = {
++    {
++        &GUID_ContainerFormatPng,
++        pngsrgb_metadata_pattern
++    },
++    { NULL } /* list terminator */
++};
++
+ static const struct metadata_pattern lsd_metadata_patterns[] = {
+     { 0, 6, gif87a_magic, mask_all, 0 },
+     { 0, 6, gif89a_magic, mask_all, 0 },
+@@ -1917,6 +1978,48 @@
+         0, 0, 0,
+         pngtime_containers
+     },
++#ifndef SG_MUTANT_WIC_NO_NEW_CHUNKS
++    {   &CLSID_WICPngBkgdMetadataReader,
++        "The Wine Project",
++        "Chunk bKGD Reader",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatChunkbKGD,
++        0, 0, 0,
++        pngbkgd_containers
++    },
++    {   &CLSID_WICPngIccpMetadataReader,
++        "The Wine Project",
++        "Chunk iCCP Reader",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatChunkiCCP,
++        0, 0, 0,
++        pngiccp_containers
++    },
++    {   &CLSID_WICPngItxtMetadataReader,
++        "The Wine Project",
++        "Chunk iTXt Reader",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatChunkiTXt,
++        0, 0, 0,
++        pngitxt_containers
++    },
++    {   &CLSID_WICPngSrgbMetadataReader,
++        "The Wine Project",
++        "Chunk sRGB Reader",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatChunksRGB,
++        0, 0, 0,
++        pngsrgb_containers
++    },
++#endif
+     {   &CLSID_WICLSDMetadataReader,
+         "The Wine Project",
+         "Logical Screen Descriptor Reader",
+@@ -2071,6 +2174,48 @@
+         0, 0, 0,
+         pngtime_containers
+     },
++#ifndef SG_MUTANT_WIC_NO_NEW_CHUNKS
++    {   &CLSID_WICPngBkgdMetadataWriter,
++        "The Wine Project",
++        "Chunk bKGD Writer",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatChunkbKGD,
++        0, 0, 0,
++        pngbkgd_containers
++    },
++    {   &CLSID_WICPngIccpMetadataWriter,
++        "The Wine Project",
++        "Chunk iCCP Writer",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatChunkiCCP,
++        0, 0, 0,
++        pngiccp_containers
++    },
++    {   &CLSID_WICPngItxtMetadataWriter,
++        "The Wine Project",
++        "Chunk iTXt Writer",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatChunkiTXt,
++        0, 0, 0,
++        pngitxt_containers
++    },
++    {   &CLSID_WICPngSrgbMetadataWriter,
++        "The Wine Project",
++        "Chunk sRGB Writer",
++        "1.0.0.0",
++        "1.0.0.0",
++        &GUID_VendorMicrosoft,
++        &GUID_MetadataFormatChunksRGB,
++        0, 0, 0,
++        pngsrgb_containers
++    },
++#endif
+     {   &CLSID_WICLSDMetadataWriter,
+         "The Wine Project",
+         "Logical Screen Descriptor Writer",
+--- a/dlls/windowscodecs/clsfactory.c
++++ b/dlls/windowscodecs/clsfactory.c
+@@ -87,6 +87,14 @@
+     {&CLSID_WICPngHistMetadataWriter, PngHistWriter_CreateInstance},
+     {&CLSID_WICPngTextMetadataWriter, PngTextWriter_CreateInstance},
+     {&CLSID_WICPngTimeMetadataWriter, PngTimeWriter_CreateInstance},
++    {&CLSID_WICPngBkgdMetadataReader, PngBkgdReader_CreateInstance},
++    {&CLSID_WICPngBkgdMetadataWriter, PngBkgdWriter_CreateInstance},
++    {&CLSID_WICPngIccpMetadataReader, PngIccpReader_CreateInstance},
++    {&CLSID_WICPngIccpMetadataWriter, PngIccpWriter_CreateInstance},
++    {&CLSID_WICPngItxtMetadataReader, PngItxtReader_CreateInstance},
++    {&CLSID_WICPngItxtMetadataWriter, PngItxtWriter_CreateInstance},
++    {&CLSID_WICPngSrgbMetadataReader, PngSrgbReader_CreateInstance},
++    {&CLSID_WICPngSrgbMetadataWriter, PngSrgbWriter_CreateInstance},
+     {&CLSID_WICLSDMetadataWriter, LSDWriter_CreateInstance},
+     {&CLSID_WICIMDMetadataWriter, IMDWriter_CreateInstance},
+     {&CLSID_WICGCEMetadataWriter, GCEWriter_CreateInstance},
+--- a/dlls/windowscodecs/wincodecs_private.h
++++ b/dlls/windowscodecs/wincodecs_private.h
+@@ -298,6 +298,14 @@
+ extern HRESULT PngHistWriter_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT PngTextWriter_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT PngTimeWriter_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT PngBkgdReader_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT PngBkgdWriter_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT PngIccpReader_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT PngIccpWriter_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT PngItxtReader_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT PngItxtWriter_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT PngSrgbReader_CreateInstance(REFIID iid, void **ppv);
++extern HRESULT PngSrgbWriter_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT LSDWriter_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT IMDWriter_CreateInstance(REFIID iid, void **ppv);
+ extern HRESULT GCEWriter_CreateInstance(REFIID iid, void **ppv);
+@@ -318,6 +326,7 @@
+ extern HMODULE windowscodecs_module;
+ 
+ HRESULT read_png_chunk(IStream *stream, BYTE *type, BYTE **data, ULONG *data_size);
++HRESULT png_inflate(const BYTE *src, ULONG len, BYTE **out, ULONG *out_len);
+ 
+ struct decoder_funcs;
+ 
+--- a/dlls/windowscodecs/windowscodecs_wincodec.idl
++++ b/dlls/windowscodecs/windowscodecs_wincodec.idl
+@@ -323,6 +323,62 @@
+ coclass WICPngTimeMetadataWriter { interface IWICMetadataWriter; }
+ 
+ [
++    helpstring("WIC Png bKGD Metadata Reader"),
++    threading(both),
++    uuid(0ce7a4a6-03e8-4a60-9d15-282ef32ee7da)
++]
++coclass WICPngBkgdMetadataReader { interface IWICMetadataReader; }
++
++[
++    helpstring("WIC Png bKGD Metadata Writer"),
++    threading(both),
++    uuid(68e3f2fd-31ae-4441-bb6a-fd7047525f90)
++]
++coclass WICPngBkgdMetadataWriter { interface IWICMetadataWriter; }
++
++[
++    helpstring("WIC Png iCCP Metadata Reader"),
++    threading(both),
++    uuid(f5d3e63b-cb0f-4628-a478-6d8244be36b1)
++]
++coclass WICPngIccpMetadataReader { interface IWICMetadataReader; }
++
++[
++    helpstring("WIC Png iCCP Metadata Writer"),
++    threading(both),
++    uuid(16671e5f-0ce6-4cc4-9768-e89fe5018ade)
++]
++coclass WICPngIccpMetadataWriter { interface IWICMetadataWriter; }
++
++[
++    helpstring("WIC Png iTXt Metadata Reader"),
++    threading(both),
++    uuid(aabfb2fa-3e1e-4a8f-8977-5556fb94ea23)
++]
++coclass WICPngItxtMetadataReader { interface IWICMetadataReader; }
++
++[
++    helpstring("WIC Png iTXt Metadata Writer"),
++    threading(both),
++    uuid(31879719-e751-4df8-981d-68dff67704ed)
++]
++coclass WICPngItxtMetadataWriter { interface IWICMetadataWriter; }
++
++[
++    helpstring("WIC Png sRGB Metadata Reader"),
++    threading(both),
++    uuid(fb40360c-547e-4956-a3b9-d4418859ba66)
++]
++coclass WICPngSrgbMetadataReader { interface IWICMetadataReader; }
++
++[
++    helpstring("WIC Png sRGB Metadata Writer"),
++    threading(both),
++    uuid(a6ee35c6-87ec-47df-9f22-1d5aad840c82)
++]
++coclass WICPngSrgbMetadataWriter { interface IWICMetadataWriter; }
++
++[
+     helpstring("WIC LSD Metadata Writer"),
+     threading(both),
+     uuid(73c037e7-e5d9-4954-876a-6da81d6e5768)
+--- a/dlls/windowscodecs/encoder.c
++++ b/dlls/windowscodecs/encoder.c
+@@ -434,14 +434,17 @@
+     return hr;
+ }
+ 
+-/* The writers the file type has a place for: the PNG chunks of the text, gamma, chromaticities, histogram
+- * and time writers, the JPEG Exif APP1 segments. */
++/* The writers the file type has a place for: the PNG chunks of the text, gamma, chromaticities, histogram,
++ * time, background, sRGB and international text writers, the JPEG Exif APP1 segments. */
+ static BOOL frame_writer_wanted(const GUID *container, const GUID *format)
+ {
+     if (IsEqualGUID(container, &GUID_ContainerFormatPng))
+         return IsEqualGUID(format, &GUID_MetadataFormatChunktEXt) || IsEqualGUID(format, &GUID_MetadataFormatChunkgAMA)
+                 || IsEqualGUID(format, &GUID_MetadataFormatChunkcHRM) || IsEqualGUID(format, &GUID_MetadataFormatChunkhIST)
+-                || IsEqualGUID(format, &GUID_MetadataFormatChunktIME);
++                || IsEqualGUID(format, &GUID_MetadataFormatChunktIME)
++                /* wine-sg 9350 */
++                || IsEqualGUID(format, &GUID_MetadataFormatChunkbKGD) || IsEqualGUID(format, &GUID_MetadataFormatChunksRGB)
++                || IsEqualGUID(format, &GUID_MetadataFormatChunkiTXt);
+     if (IsEqualGUID(container, &GUID_ContainerFormatJpeg))
+         return IsEqualGUID(format, &GUID_MetadataFormatApp1);
+     /* wine-sg 9506: a TIFF frame's own IFD */
+--- a/dlls/windowscodecs/libpng.c
++++ b/dlls/windowscodecs/libpng.c
+@@ -676,6 +676,61 @@
+             time.second = data[6];
+             png_set_tIME(This->png_ptr, This->info_ptr, &time);
+         }
++        /* wine-sg 9350: background colour (in the form the image's colour type has), sRGB and iTXt */
++        else if (!memcmp(chunk + 4, "bKGD", 4))
++        {
++            int ct = This->format->color_type;
++            png_color_16 bg;
++
++            memset(&bg, 0, sizeof(bg));
++            if (size == 1 && ct == PNG_COLOR_TYPE_PALETTE) bg.index = data[0];
++            else if (size == 2 && !(ct & PNG_COLOR_MASK_COLOR)) bg.gray = (data[0] << 8) | data[1];
++            else if (size == 6 && (ct & PNG_COLOR_MASK_COLOR) && ct != PNG_COLOR_TYPE_PALETTE)
++            {
++                bg.red = (data[0] << 8) | data[1];
++                bg.green = (data[2] << 8) | data[3];
++                bg.blue = (data[4] << 8) | data[5];
++            }
++            else continue;
++            png_set_bKGD(This->png_ptr, This->info_ptr, &bg);
++        }
++        else if (!memcmp(chunk + 4, "sRGB", 4) && size == 1)
++        {
++            png_set_sRGB(This->png_ptr, This->info_ptr, data[0]);
++        }
++        else if (!memcmp(chunk + 4, "iTXt", 4))
++        {
++            /* keyword, flag, method, language, translated keyword, text: libpng compresses the text itself */
++            const BYTE *end = data + size, *nul, *lang_end, *trans_end;
++            BYTE *copy, *plain = NULL;
++            ULONG plain_len = 0;
++            png_text text;
++
++            if (!(nul = memchr(data, 0, size)) || end - nul < 3) continue;
++            if (!(lang_end = memchr(nul + 3, 0, end - nul - 3))) continue;
++            if (!(trans_end = memchr(lang_end + 1, 0, end - lang_end - 1))) continue;
++            /* compressed text is handed to libpng as it reads, and libpng compresses it again */
++            if (nul[1] && FAILED(png_inflate(trans_end + 1, end - trans_end - 1, &plain, &plain_len))) continue;
++            if (!(copy = malloc(size + plain_len + 1)))
++            {
++                free(plain);
++                continue;
++            }
++            memcpy(copy, data, trans_end + 1 - data);
++            if (plain) memcpy(copy + (trans_end + 1 - data), plain, plain_len);
++            else memcpy(copy + (trans_end + 1 - data), trans_end + 1, end - trans_end - 1);
++            memset(&text, 0, sizeof(text));
++            text.compression = nul[1] ? PNG_ITXT_COMPRESSION_zTXt : PNG_ITXT_COMPRESSION_NONE;
++            text.key = (char *)copy;
++            text.lang = (char *)copy + (nul + 3 - data);
++            text.lang_key = (char *)copy + (lang_end + 1 - data);
++            text.text = (char *)copy + (trans_end + 1 - data);
++            text.itxt_length = plain ? plain_len : (size_t)(end - trans_end - 1);
++            text.text[text.itxt_length] = 0;
++            png_set_text(This->png_ptr, This->info_ptr, &text, 1);
++            free(plain);
++            free(copy);
++        }
+         else if (!memcmp(chunk + 4, "hIST", 4) && This->format->color_type == PNG_COLOR_TYPE_PALETTE
+                 && size == 2 * min(num_colors, 1u << This->format->bit_depth))
+         {
+--- a/dlls/windowscodecs/Makefile.in
++++ b/dlls/windowscodecs/Makefile.in
+@@ -1,8 +1,8 @@
+ MODULE    = windowscodecs.dll
+ UNIXLIB   = windowscodecs.so
+ IMPORTLIB = windowscodecs
+-IMPORTS   = $(TIFF_PE_LIBS) $(JPEG_PE_LIBS) $(PNG_PE_LIBS) windowscodecs uuid ole32 oleaut32 propsys rpcrt4 shlwapi user32 gdi32 advapi32
+-EXTRAINCL = $(TIFF_PE_CFLAGS) $(JPEG_PE_CFLAGS) $(PNG_PE_CFLAGS)
++IMPORTS   = $(TIFF_PE_LIBS) $(JPEG_PE_LIBS) $(PNG_PE_LIBS) $(ZLIB_PE_LIBS) windowscodecs uuid ole32 oleaut32 propsys rpcrt4 shlwapi user32 gdi32 advapi32
++EXTRAINCL = $(TIFF_PE_CFLAGS) $(JPEG_PE_CFLAGS) $(PNG_PE_CFLAGS) $(ZLIB_PE_CFLAGS)
+ 
+ SOURCES = \
+ 	bitmap.c \
