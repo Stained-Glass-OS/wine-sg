@@ -2,17 +2,21 @@
 . "$(dirname "$0")/scratch-home.sh"
 # The session's X11 hints for Linux programs (sg-common.sh SG_LINUX_APP_ENV: GDK_BACKEND=x11,
 # SDL_VIDEODRIVER=x11, QT_QPA_PLATFORM=xcb) are Unix-side only (patches/sg/5946), and Java's options
-# (JAVA_TOOL_OPTIONS: no assistive technology for Linux Java, 5951). A Windows build of
+# (JAVA_TOOL_OPTIONS: no assistive technology for Linux Java, 5951), and the search paths
+# for Linux programs' data and settings (XDG_DATA_DIRS, XDG_CONFIG_DIRS, 9650: a Windows GTK took SG's
+# /etc/xdg/gtk-3.0/settings.ini and /usr/share/icons/StainedGlass and Xournal++ crashed at start). A Windows build of
 # GTK or SDL read them and found no X11: Geany said "cannot open display" and ended when started from
 # Start or the desktop. With them set:
 #   a Windows program does not see GDK_, GTK_, GSK_, SDL_, JAVA_TOOL_OPTIONS (a Windows Java keeps its
-#   Access Bridge; nor QT_, upstream); MOZ_ENABLE_WAYLAND,
+#   Access Bridge; nor QT_, upstream), nor XDG_DATA_DIRS / XDG_CONFIG_DIRS; MOZ_ENABLE_WAYLAND and
+#   XDG_DATA_HOME (Wine's shell32 reads it),
 #   not a toolkit's, stays
 #   a Unix program a Windows child process starts (as Start's gio launch) still gets them, and one a
 #   Windows program starts with CreateProcess
 #   a value the Windows side sets itself reaches its Windows children
 #   WINE=/opt/wine-sg/bin/wine test/toolkitenv-gate.sh
-# Mutants: ntdll SG_MUTANT_TOOLKIT_ENV_VISIBLE, SG_MUTANT_UNIX_ENV_DROPPED, SG_MUTANT_JAVA_ENV_VISIBLE.
+# Mutants: ntdll SG_MUTANT_TOOLKIT_ENV_VISIBLE, SG_MUTANT_UNIX_ENV_DROPPED, SG_MUTANT_JAVA_ENV_VISIBLE,
+# SG_MUTANT_XDG_DIRS_VISIBLE.
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -30,6 +34,7 @@ fail() { echo "FAIL  $*"; rc=1; }
 v() { printf '%s\n' "$1" | tr -d '\r' | awk -v k="$2" '$1 == "WINENV" && $2 == k { print $3; exit }'; }
 export GDK_BACKEND=x11 SDL_VIDEODRIVER=x11 GTK_THEME=Adwaita:dark GSK_RENDERER=gl QT_QPA_PLATFORM=xcb MOZ_ENABLE_WAYLAND=0
 export JAVA_TOOL_OPTIONS=-Djavax.accessibility.assistive_technologies=
+export XDG_DATA_DIRS=/usr/local/share:/usr/share XDG_CONFIG_DIRS=/etc/xdg XDG_DATA_HOME="$HOME/.local/share"
 J=-Djavax.accessibility.assistive_technologies=
 out=$(timeout 120 "$WINE" "$T/probe.exe" check 2>/dev/null)
 { [ "$(v "$out" GDK_BACKEND)" = - ] && [ "$(v "$out" SDL_VIDEODRIVER)" = - ] && [ "$(v "$out" GTK_THEME)" = - ] \
@@ -39,7 +44,15 @@ out=$(timeout 120 "$WINE" "$T/probe.exe" check 2>/dev/null)
 [ "$(v "$out" JAVA_TOOL_OPTIONS)" = - ] && pass "...nor JAVA_TOOL_OPTIONS (a Windows Java keeps its Access Bridge)" \
     || fail "JAVA_TOOL_OPTIONS seen by a Windows program: $(v "$out" JAVA_TOOL_OPTIONS)"
 [ "$(v "$out" MOZ_ENABLE_WAYLAND)" = 0 ] && pass "...MOZ_ENABLE_WAYLAND, not a toolkit's, it does" || fail "MOZ_ENABLE_WAYLAND: $(v "$out" MOZ_ENABLE_WAYLAND)"
+{ [ "$(v "$out" XDG_DATA_DIRS)" = - ] && [ "$(v "$out" XDG_CONFIG_DIRS)" = - ]; } \
+    && pass "...nor XDG_DATA_DIRS, XDG_CONFIG_DIRS (a Windows GLib took them as its own search paths)" \
+    || fail "seen by a Windows program: XDG_DATA_DIRS=$(v "$out" XDG_DATA_DIRS) XDG_CONFIG_DIRS=$(v "$out" XDG_CONFIG_DIRS)"
+[ "$(v "$out" XDG_DATA_HOME)" = "$HOME/.local/share" ] && pass "...XDG_DATA_HOME, which Wine's shell32 reads, it does" \
+    || fail "XDG_DATA_HOME: $(v "$out" XDG_DATA_HOME)"
 timeout 120 "$WINE" "$T/probe.exe" child "$T/unix.txt" >/dev/null 2>&1
+[ "$(cat "$T/unix.txt.xdg" 2>/dev/null)" = "/usr/local/share:/usr/share /etc/xdg" ] \
+    && pass "a Unix program a Windows child starts gets XDG_DATA_DIRS and XDG_CONFIG_DIRS" \
+    || fail "the Unix grandchild got XDG dirs '$(cat "$T/unix.txt.xdg" 2>/dev/null)'"
 [ "$(cat "$T/unix.txt" 2>/dev/null)" = "x11 x11 xcb $J" ] && pass "a Unix program a Windows child starts gets them (x11 x11 xcb, Java's)" \
     || fail "the Unix grandchild got '$(cat "$T/unix.txt" 2>/dev/null)' (want 'x11 x11 xcb $J')"
 timeout 120 "$WINE" "$T/probe.exe" env 'C:\env.txt' >/dev/null 2>&1

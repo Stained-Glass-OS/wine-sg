@@ -1,8 +1,9 @@
-/* toolkitenv-probe (patches/sg/5946, 5951, test/toolkitenv-gate.sh)
+/* toolkitenv-probe (patches/sg/5946, 5951, 9650, test/toolkitenv-gate.sh)
  *   check          prints WINENV NAME VALUE (or -) for the toolkit variables
  *   child FILE     starts itself again ("unix FILE") as a Windows child process and waits
  *   unix FILE      runs /bin/sh, a Unix program, which writes "$GDK_BACKEND $SDL_VIDEODRIVER
- *                  $QT_QPA_PLATFORM $JAVA_TOOL_OPTIONS" to FILE (a Unix path)
+ *                  $QT_QPA_PLATFORM $JAVA_TOOL_OPTIONS" to FILE (a Unix path), and
+ *                  "$XDG_DATA_DIRS $XDG_CONFIG_DIRS" to FILE.xdg
  *   env FILE       starts the Unix program /usr/bin/env with CreateProcess, its output to FILE (a
  *                  Windows path) */
 #include <windows.h>
@@ -11,7 +12,8 @@
 
 int main(int argc, char **argv)
 {
-    static const char *names[] = { "GDK_BACKEND", "SDL_VIDEODRIVER", "GTK_THEME", "GSK_RENDERER", "QT_QPA_PLATFORM", "MOZ_ENABLE_WAYLAND", "JAVA_TOOL_OPTIONS" };
+    static const char *names[] = { "GDK_BACKEND", "SDL_VIDEODRIVER", "GTK_THEME", "GSK_RENDERER", "QT_QPA_PLATFORM", "MOZ_ENABLE_WAYLAND", "JAVA_TOOL_OPTIONS",
+                                   "XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "XDG_DATA_HOME" };
     const char *m = argc > 1 ? argv[1] : "check";
     char buf[512];
     unsigned int i;
@@ -36,7 +38,8 @@ int main(int argc, char **argv)
             (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "__wine_unix_spawnvp");
         char sh[] = "/bin/sh", c[] = "-c", script[700];
         char *args[] = { sh, c, script, NULL };
-        snprintf(script, sizeof(script), "echo \"$GDK_BACKEND $SDL_VIDEODRIVER $QT_QPA_PLATFORM $JAVA_TOOL_OPTIONS\" > '%s'", argv[2]);
+        snprintf(script, sizeof(script), "echo \"$GDK_BACKEND $SDL_VIDEODRIVER $QT_QPA_PLATFORM $JAVA_TOOL_OPTIONS\" > '%s'; "
+                 "echo \"$XDG_DATA_DIRS $XDG_CONFIG_DIRS\" > '%s.xdg'", argv[2], argv[2]);
         if (!spawnvp) return 2;
         return spawnvp(args, TRUE);
     }

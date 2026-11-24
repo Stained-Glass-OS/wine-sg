@@ -8,6 +8,11 @@
 # The probe makes a package with TortoiseGit's AppSearch rows and runs the
 # action: both properties must be found, and the files must say 10.0.19041
 # and 14.42.
+# 9651/9652: TortoiseSVN's MSI looks for user32.dll >= 6.3.14392.0 (Wine's said XP's
+# 5.1.2600); Transmission's and Drawpile's for the Visual C++ runtime's registration
+# (VisualStudio\14.0\VC\Runtimes\x64 Installed/Minor/Version), Git Extensions' for Windows
+# PowerShell's (PowerShell\1\ShellIds\Microsoft.PowerShell Path); all four ended with 1603.
+# Mutant (user32/user32.rc): SG_MUTANT_USER32_XP_VERSION.
 #
 #   WINE=/opt/wine-sg/bin/wine test/sysversions-gate.sh
 set -u
@@ -42,4 +47,14 @@ case "$(v shell32)" in 10.0.19041.*) pass "shell32.dll says 10.0.19041" ;; *) fa
 [ "$(v vcruntime140)" = 14.42.34433.0 ] && [ "$(v vcruntime140_1)" = 14.42.34433.0 ] &&
     pass "vcruntime140 and vcruntime140_1 say 14.42.34433.0, as msvcp140" ||
     fail "vcruntime140 $(v vcruntime140), vcruntime140_1 $(v vcruntime140_1)"
+case "$(v user32win10)" in *[Ss]ys[Ww][Oo][Ww]64*) pass "an MSI finds \"Windows 10 1607 or later\" by user32.dll too (TortoiseSVN)" ;;
+    *) fail "USER32WIN10: '$(v user32win10)' (user32 $(v user32))" ;; esac
+case "$(v user32)" in 10.0.19041.*) pass "user32.dll says 10.0.19041" ;; *) fail "user32 $(v user32)" ;; esac
+[ "$(v vcinstalled)" = "#1" ] && [ "$(v vcminor)" = "#42" ] && [ "$(v vcversion)" = v14.42.34433.00 ] &&
+    pass "the Visual C++ runtime is registered (Runtimes\\x64 Installed #1, Minor #42, v14.42.34433.00)" ||
+    fail "Runtimes\\x64: Installed '$(v vcinstalled)' Minor '$(v vcminor)' Version '$(v vcversion)'"
+[ "$(v vcinstalled32)" = "#1" ] && pass "...in the 32-bit view too" || fail "Runtimes\\x64 in the 32-bit view: '$(v vcinstalled32)'"
+case "$(v powershell)" in *WindowsPowerShell*v1.0*powershell.exe) pass "Windows PowerShell is registered (ShellIds Path)" ;;
+    *) fail "PowerShell ShellIds Path: '$(v powershell)'" ;; esac
+[ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
