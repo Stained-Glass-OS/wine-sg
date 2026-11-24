@@ -1,0 +1,352 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dbghelp: a minidump holds the memory its type asks for (9552)
+
+The dump type's memory flags were ignored: a minidump held thread
+stacks, instruction windows and (1625) data segments whatever the
+caller asked for. As on Windows:
+
+- MiniDumpWithProcessThreadData: the PEB, the process parameters with
+  their strings (image path, command line, current directory, DLL path,
+  window title, desktop) and environment block, and each written
+  thread's TEB;
+- MiniDumpWithPrivateReadWriteMemory: every committed private read-write
+  region (what .NET's heap dumps are made of);
+- MiniDumpWithPrivateWriteCopyMemory: committed copy-on-write image and
+  mapped regions;
+- MiniDumpWithIndirectlyReferencedMemory: a pointer-sized value in a
+  thread's stack that is an address in readable memory outside the
+  modules brings in the memory around it (256 bytes before, 768 after,
+  within its region; at most 4096 of them);
+- MiniDumpWithCodeSegs (ModuleWriteCodeSegs): the modules' code
+  sections;
+- MiniDumpWithModuleHeaders: the PE headers, the debug directory and its
+  records, and on x86-64 the exception directory (unwind data);
+- MiniDumpWithFullMemory leaves out no-access and guard pages, which
+  cannot be read (they were listed and written as zeros).
+
+The memory list never holds overlapping ranges -- each new range is cut
+to what is not there yet (WinDbg and Breakpad's processor reject or drop
+overlapping ones); MemoryCallback's ranges too.
+
+Gate: test/dumpmem-gate.sh (64- and 32-bit). Mutants
+SG_MUTANT_NO_PROCESS_THREAD_DATA, SG_MUTANT_NO_CODE_SEGS,
+SG_MUTANT_NO_INDIRECT_MEMORY, SG_MUTANT_NO_PRIVATE_RW,
+SG_MUTANT_FULL_MEMORY_NOACCESS, SG_MUTANT_MEMORY_OVERLAP
+(dbghelp/minidump.c).
+---
+diff --git a/dlls/dbghelp/dbghelp_private.h b/dlls/dbghelp/dbghelp_private.h
+--- a/dlls/dbghelp/dbghelp_private.h
++++ b/dlls/dbghelp/dbghelp_private.h
+@@ -601,6 +601,7 @@ struct dump_module
+     DWORD                               checksum;
+     WCHAR                               name[MAX_PATH];
+     ULONG                               include_flags; /* ModuleWriteFlags IncludeModuleCallback left */
++    ULONG                               write_flags;   /* what dump_modules wrote for it, 0 when left out */
+ };
+ 
+ struct dump_thread
+diff --git a/dlls/dbghelp/minidump.c b/dlls/dbghelp/minidump.c
+--- a/dlls/dbghelp/minidump.c
++++ b/dlls/dbghelp/minidump.c
+@@ -272,7 +272,11 @@ static void fetch_memory64_info(struct dump_context* dc)
+     while (VirtualQueryEx(dc->process->handle, (LPCVOID)addr, &mbi, sizeof(mbi)) != 0)
+     {
+         /* Memory regions with state MEM_COMMIT will be added to the dump */
+-        if (mbi.State == MEM_COMMIT)
++        if (mbi.State == MEM_COMMIT
++#ifndef SG_MUTANT_FULL_MEMORY_NOACCESS
++            && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
++#endif
++            )
+         {
+             minidump_add_memory64_block(dc, (ULONG_PTR)mbi.BaseAddress, mbi.RegionSize);
+         }
+@@ -708,6 +712,7 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
+             continue;
+ 
+         flags_out = dc->modules[i].include_flags;
++        dc->modules[i].write_flags = 0;
+         if (dump_cancelled(dc)) break;
+         if ((dc->type & MiniDumpScanMemory) && !dc->modules[i].is_elf &&
+             module_referenced_by_stacks(dc, dc->modules[i].base, dc->modules[i].size))
+@@ -742,6 +747,7 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
+                 continue;
+             flags_out &= cbout.ModuleWriteFlags;
+         }
++        dc->modules[i].write_flags = (flags_out & ModuleWriteModule) ? flags_out : 0;
+         if (flags_out & ModuleWriteModule)
+         {
+             /* fetch CPU dependent module info (like UNWIND_INFO) */
+@@ -1236,6 +1242,255 @@ static unsigned dump_handle_data(struct dump_context* dc)
+ }
+ 
+ 
++/* Stained Glass OS: add [base, base+size) to the memory list, less what
++ * the list already holds: memory list ranges must not overlap (readers --
++ * WinDbg, Breakpad's processor -- reject or drop overlapping ones) */
++static void add_memory_block_new(struct dump_context* dc, ULONG64 base, ULONG64 size)
++{
++    ULONG64 end = base + size, b, e;
++    unsigned i;
++
++    if (!size || end < base) return;
++#ifndef SG_MUTANT_MEMORY_OVERLAP
++    for (i = 0; i < dc->num_mem; i++)
++    {
++        b = dc->mem[i].base;
++        e = b + dc->mem[i].size;
++        if (e <= base || b >= end) continue;
++        if (b <= base && e >= end) return;
++        if (b > base && e < end)
++        {
++            /* the part above the block, then the part below it */
++            add_memory_block_new(dc, e, end - e);
++            end = b;
++        }
++        else if (b <= base) base = e;
++        else end = b;
++        if (base >= end) return;
++    }
++#endif
++    while (end - base > 0x40000000)
++    {
++        minidump_add_memory_block(dc, base, 0x40000000, 0);
++        base += 0x40000000;
++    }
++    minidump_add_memory_block(dc, base, end - base, 0);
++}
++
++/* the process's committed regions with one of the given protections */
++static void add_private_regions(struct dump_context* dc, DWORD type_mask, const DWORD* protects, unsigned count)
++{
++    MEMORY_BASIC_INFORMATION mbi;
++    ULONG_PTR addr = 0;
++    unsigned i;
++
++    while (VirtualQueryEx(dc->process->handle, (LPCVOID)addr, &mbi, sizeof(mbi)))
++    {
++        if (mbi.State == MEM_COMMIT && (mbi.Type & type_mask) && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
++            for (i = 0; i < count; i++)
++                if ((mbi.Protect & 0xff) == protects[i])
++                {
++                    add_memory_block_new(dc, (ULONG_PTR)mbi.BaseAddress, mbi.RegionSize);
++                    break;
++                }
++        if ((ULONG_PTR)mbi.BaseAddress + mbi.RegionSize <= addr) break;
++        addr = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
++        if (!addr) break;
++    }
++}
++
++/* whether the address is in committed memory that can be read; the region */
++static BOOL readable_region(struct dump_context* dc, ULONG64 addr, ULONG64* base, ULONG64* end)
++{
++    MEMORY_BASIC_INFORMATION mbi;
++
++    if (!VirtualQueryEx(dc->process->handle, (LPCVOID)(ULONG_PTR)addr, &mbi, sizeof(mbi))) return FALSE;
++    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return FALSE;
++    *base = (ULONG_PTR)mbi.BaseAddress;
++    *end = *base + mbi.RegionSize;
++    return TRUE;
++}
++
++/* MiniDumpWithIndirectlyReferencedMemory: what the threads' stacks point
++ * to -- a pointer-sized value in a stack that is an address in readable
++ * memory outside the stacks and modules brings in the memory around it */
++static void add_referenced_memory(struct dump_context* dc)
++{
++    unsigned i, j, k, n = 0, nstacks = dc->num_mem, word = dbghelp_current_cpu->word_size;
++    ULONG64 value, rb = 0, re = 0, start, end;
++    char buf[4096];
++    ULONG pos, len;
++    BOOL in_image;
++
++    for (i = 0; i < nstacks && n < 4096; i++)
++    {
++        if (!dc->mem[i].rva) continue;  /* the stacks the thread list points to */
++        for (pos = 0; pos < dc->mem[i].size && n < 4096; pos += len)
++        {
++            len = min(dc->mem[i].size - pos, sizeof(buf));
++            if (!read_process_memory(dc->process, dc->mem[i].base + pos, buf, len)) break;
++            for (j = 0; j + word <= len && n < 4096; j += word)
++            {
++                value = 0;
++                memcpy(&value, buf + j, word);
++                if (value < 0x10000) continue;
++                if (!(value >= rb && value < re) && !readable_region(dc, value, &rb, &re)) { rb = re = 0; continue; }
++                in_image = FALSE;
++                for (k = 0; k < dc->num_modules && !in_image; k++)
++                    in_image = value >= dc->modules[k].base && value < dc->modules[k].base + dc->modules[k].size;
++                if (in_image) continue;
++                start = max(rb, value - 0x100);
++                end = min(re, value + 0x300);
++                add_memory_block_new(dc, start, end - start);
++                n++;
++            }
++        }
++    }
++}
++
++/* a module's sections with any of the characteristics, and with
++ * headers set its PE headers, debug and (x86-64) exception directories */
++static void add_module_sections(struct dump_context* dc, ULONG64 base, DWORD characteristics, BOOL headers)
++{
++    IMAGE_DOS_HEADER        dos;
++    IMAGE_FILE_HEADER       fh;
++    IMAGE_SECTION_HEADER    sec;
++    IMAGE_DATA_DIRECTORY    dirs[16];
++    ULONG64                 nt, opt;
++    WORD                    magic;
++    DWORD                   size_headers = 0, num_dirs = 0;
++    unsigned                i;
++
++    if (!read_process_memory(dc->process, base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) return;
++    nt = base + dos.e_lfanew;
++    opt = nt + sizeof(DWORD) + sizeof(fh);
++    if (!read_process_memory(dc->process, nt + sizeof(DWORD), &fh, sizeof(fh)) ||
++        !read_process_memory(dc->process, opt, &magic, sizeof(magic)))
++        return;
++    memset(dirs, 0, sizeof(dirs));
++    if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
++    {
++        read_process_memory(dc->process, opt + FIELD_OFFSET(IMAGE_OPTIONAL_HEADER64, SizeOfHeaders), &size_headers, sizeof(DWORD));
++        read_process_memory(dc->process, opt + FIELD_OFFSET(IMAGE_OPTIONAL_HEADER64, NumberOfRvaAndSizes), &num_dirs, sizeof(DWORD));
++        read_process_memory(dc->process, opt + FIELD_OFFSET(IMAGE_OPTIONAL_HEADER64, DataDirectory),
++                            dirs, min(num_dirs, 16) * sizeof(dirs[0]));
++    }
++    else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
++    {
++        read_process_memory(dc->process, opt + FIELD_OFFSET(IMAGE_OPTIONAL_HEADER32, SizeOfHeaders), &size_headers, sizeof(DWORD));
++        read_process_memory(dc->process, opt + FIELD_OFFSET(IMAGE_OPTIONAL_HEADER32, NumberOfRvaAndSizes), &num_dirs, sizeof(DWORD));
++        read_process_memory(dc->process, opt + FIELD_OFFSET(IMAGE_OPTIONAL_HEADER32, DataDirectory),
++                            dirs, min(num_dirs, 16) * sizeof(dirs[0]));
++    }
++    else return;
++    if (headers)
++    {
++        if (size_headers) add_memory_block_new(dc, base, min(size_headers, 0x10000));
++        if (dirs[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress)
++        {
++            IMAGE_DEBUG_DIRECTORY dbg;
++
++            add_memory_block_new(dc, base + dirs[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress,
++                                 dirs[IMAGE_DIRECTORY_ENTRY_DEBUG].Size);
++            for (i = 0; i < dirs[IMAGE_DIRECTORY_ENTRY_DEBUG].Size / sizeof(dbg) && i < 32; i++)
++                if (read_process_memory(dc->process, base + dirs[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress + i * sizeof(dbg),
++                                        &dbg, sizeof(dbg)) && dbg.AddressOfRawData && dbg.SizeOfData <= 0x10000)
++                    add_memory_block_new(dc, base + dbg.AddressOfRawData, dbg.SizeOfData);
++        }
++        if (fh.Machine == IMAGE_FILE_MACHINE_AMD64 && dirs[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress)
++            add_memory_block_new(dc, base + dirs[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress,
++                                 dirs[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size);
++    }
++    if (!characteristics) return;
++    for (i = 0; i < fh.NumberOfSections && i < 96; i++)
++    {
++        if (!read_process_memory(dc->process, opt + fh.SizeOfOptionalHeader + i * sizeof(sec), &sec, sizeof(sec))) return;
++        if ((sec.Characteristics & characteristics) && sec.Misc.VirtualSize)
++            add_memory_block_new(dc, base + sec.VirtualAddress, sec.Misc.VirtualSize);
++    }
++}
++
++/* a UNICODE_STRING's buffer in the target */
++static void add_unicode_string(struct dump_context* dc, const UNICODE_STRING* str)
++{
++    if (str->Buffer && str->MaximumLength)
++        add_memory_block_new(dc, (ULONG_PTR)str->Buffer, str->MaximumLength);
++}
++
++/* MiniDumpWithProcessThreadData: the PEB, the process parameters with their
++ * strings and environment, each written thread's TEB */
++static void add_process_thread_data(struct dump_context* dc)
++{
++    PROCESS_BASIC_INFORMATION       pbi;
++    RTL_USER_PROCESS_PARAMETERS     params;
++    PEB                             peb;
++    THREAD_BASIC_INFORMATION        tbi;
++    HANDLE                          thread;
++    unsigned                        i;
++
++    /* the structures are read in the dumper's layout */
++    if (dc->process->is_64bit != (sizeof(void*) == 8)) return;
++    if (!NtQueryInformationProcess(dc->process->handle, ProcessBasicInformation, &pbi, sizeof(pbi), NULL) &&
++        pbi.PebBaseAddress)
++    {
++        add_memory_block_new(dc, (ULONG_PTR)pbi.PebBaseAddress, sizeof(PEB));
++        if (read_process_memory(dc->process, (ULONG_PTR)pbi.PebBaseAddress, &peb, sizeof(peb)) && peb.ProcessParameters &&
++            read_process_memory(dc->process, (ULONG_PTR)peb.ProcessParameters, &params, sizeof(params)))
++        {
++            add_memory_block_new(dc, (ULONG_PTR)peb.ProcessParameters, max(params.Size, sizeof(params)));
++            add_unicode_string(dc, &params.CurrentDirectory.DosPath);
++            add_unicode_string(dc, &params.DllPath);
++            add_unicode_string(dc, &params.ImagePathName);
++            add_unicode_string(dc, &params.CommandLine);
++            add_unicode_string(dc, &params.WindowTitle);
++            add_unicode_string(dc, &params.Desktop);
++            add_unicode_string(dc, &params.ShellInfo);
++            add_unicode_string(dc, &params.RuntimeInfo);
++            if (params.Environment && params.EnvironmentSize)
++                add_memory_block_new(dc, (ULONG_PTR)params.Environment, params.EnvironmentSize);
++        }
++    }
++    for (i = 0; i < dc->num_threads; i++)
++    {
++        if (!(dc->threads[i].write_flags & ThreadWriteThreadData)) continue;
++        if (!(thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, dc->threads[i].tid))) continue;
++        if (!NtQueryInformationThread(thread, ThreadBasicInformation, &tbi, sizeof(tbi), NULL) && tbi.TebBaseAddress)
++            add_memory_block_new(dc, (ULONG_PTR)tbi.TebBaseAddress, sizeof(TEB));
++        CloseHandle(thread);
++    }
++}
++
++/* Stained Glass OS: the memory the dump type asks for beyond stacks and
++ * data segments */
++static void dump_type_memory(struct dump_context* dc)
++{
++    static const DWORD rw[] = {PAGE_READWRITE, PAGE_EXECUTE_READWRITE};
++    static const DWORD wc[] = {PAGE_WRITECOPY, PAGE_EXECUTE_WRITECOPY};
++    unsigned i;
++
++    if (dc->type & MiniDumpWithFullMemory) return;
++#ifndef SG_MUTANT_NO_PROCESS_THREAD_DATA
++    if (dc->type & MiniDumpWithProcessThreadData) add_process_thread_data(dc);
++#endif
++    for (i = 0; i < dc->num_modules; i++)
++    {
++        if (dc->modules[i].is_elf || !dc->modules[i].write_flags) continue;
++#ifndef SG_MUTANT_NO_CODE_SEGS
++        if ((dc->modules[i].write_flags & ModuleWriteCodeSegs) || (dc->type & MiniDumpWithModuleHeaders))
++            add_module_sections(dc, dc->modules[i].base,
++                                (dc->modules[i].write_flags & ModuleWriteCodeSegs) ? IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE : 0,
++                                (dc->type & MiniDumpWithModuleHeaders) != 0);
++#endif
++    }
++#ifndef SG_MUTANT_NO_INDIRECT_MEMORY
++    if (dc->type & MiniDumpWithIndirectlyReferencedMemory) add_referenced_memory(dc);
++#endif
++#ifndef SG_MUTANT_NO_PRIVATE_RW
++    if (dc->type & MiniDumpWithPrivateReadWriteMemory) add_private_regions(dc, MEM_PRIVATE, rw, ARRAY_SIZE(rw));
++#endif
++    if (dc->type & MiniDumpWithPrivateWriteCopyMemory) add_private_regions(dc, MEM_IMAGE | MEM_MAPPED, wc, ARRAY_SIZE(wc));
++}
++
+ /******************************************************************
+  *		dump_include_callbacks
+  *
+@@ -1310,7 +1565,7 @@ static void dump_memory_callbacks(struct dump_context* dc)
+         if (!dump_callback(dc, MemoryCallback, &cbin, &cbout) || !cbout.MemorySize) break;
+ #ifndef SG_MUTANT_NO_MEMORY_CALLBACK
+         if (!(dc->type & MiniDumpWithFullMemory))
+-            minidump_add_memory_block(dc, cbout.MemoryBase, cbout.MemorySize, 0);
++            add_memory_block_new(dc, cbout.MemoryBase, cbout.MemorySize);
+ #endif
+         if (dump_cancelled(dc)) return;
+     }
+@@ -1813,6 +2068,7 @@ static DWORD CALLBACK write_minidump(void *_args)
+ 
+     if (!(dc->type & MiniDumpWithFullMemory))
+     {
++        dump_type_memory(dc);
+         dump_memory_callbacks(dc);
+         dump_remove_memory_callbacks(dc);
+         dump_apply_removed(dc);

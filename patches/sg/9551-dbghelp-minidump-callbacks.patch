@@ -1,0 +1,643 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dbghelp: MiniDumpWriteDump makes the callbacks Windows makes (9551)
+
+MiniDumpWriteDump made only ThreadCallback and ModuleCallback. Windows
+makes the rest, and crash reporters drive their dumps through them --
+.NET's createdump hands the runtime's memory over in MemoryCallback,
+Breakpad's handler uses the include callbacks and CancelCallback:
+
+- IncludeThreadCallback for each thread and IncludeModuleCallback for
+  each module before anything is written: FALSE leaves it out of the
+  dump, the write flags it returns limit what is written for it;
+- MemoryCallback, asked until it returns FALSE or an empty range: the
+  ranges go to the memory list; RemoveMemoryCallback the same way, its
+  ranges are cut out of the memory lists (a thread stack keeps its
+  place; its bytes in a removed range are zeroed);
+- CancelCallback, asked again for as long as it sets CheckCancel; Cancel
+  fails the dump with HRESULT_FROM_WIN32(ERROR_CANCELLED) as the last
+  error (a failed dump's last error is an HRESULT, as on Windows);
+- IoStartCallback: when it returns S_OK every write goes to
+  IoWriteAllCallback (handle, offset, buffer) instead of the file, and
+  IoFinishCallback ends it;
+- SecondaryFlagsCallback, IsProcessSnapshotCallback, VmStartCallback and
+  WriteKernelMinidumpCallback are made with Windows' presets (no process
+  snapshot handles, no virtual memory callbacks, no kernel dump);
+- ReadMemoryFailureCallback when memory cannot be read; what cannot be
+  read is written as zeros (it was left as a hole, and at the end of a
+  file that made the dump shorter than its directory says);
+- ThreadCallback is given the thread's handle;
+- each callback names the process as Windows does (no process for the
+  I/O and kernel-dump callbacks, the handle only for the snapshot ones).
+
+The Wine-specific system information is written through the same path.
+
+Gate: test/dumpcb-gate.sh (64- and 32-bit; the types and presets are the
+ones Wine's own dbghelp conformance test records for Windows). Mutants
+SG_MUTANT_NO_CANCEL, SG_MUTANT_NO_IO_CALLBACK, SG_MUTANT_NO_INCLUDE_THREAD,
+SG_MUTANT_NO_INCLUDE_MODULE, SG_MUTANT_NO_MEMORY_CALLBACK,
+SG_MUTANT_NO_REMOVE_MEMORY (dbghelp/minidump.c).
+---
+diff --git a/dlls/dbghelp/dbghelp_private.h b/dlls/dbghelp/dbghelp_private.h
+--- a/dlls/dbghelp/dbghelp_private.h
++++ b/dlls/dbghelp/dbghelp_private.h
+@@ -600,6 +600,7 @@ struct dump_module
+     DWORD                               timestamp;
+     DWORD                               checksum;
+     WCHAR                               name[MAX_PATH];
++    ULONG                               include_flags; /* ModuleWriteFlags IncludeModuleCallback left */
+ };
+ 
+ struct dump_thread
+@@ -608,6 +609,7 @@ struct dump_thread
+     ULONG                               prio_class;
+     ULONG                               curr_prio;
+     ULONG                               write_flags; /* what dump_threads wrote for it, 0 when left out */
++    ULONG                               include_flags; /* ThreadWriteFlags IncludeThreadCallback left */
+ };
+ 
+ struct dump_context
+@@ -638,6 +640,11 @@ struct dump_context
+     unsigned                            alloc_mem64;
+     /* callback information */
+     MINIDUMP_CALLBACK_INFORMATION*      cb;
++    BOOL                                check_cancel;   /* CancelCallback asked to be called again */
++    BOOL                                io_callback;    /* IoStartCallback took the writes */
++    HRESULT                             status;         /* why the dump failed (the last error) */
++    struct dump_memory*                 removed;        /* RemoveMemoryCallback's ranges */
++    unsigned                            num_removed;
+ };
+ 
+ union ctx
+diff --git a/dlls/dbghelp/minidump.c b/dlls/dbghelp/minidump.c
+--- a/dlls/dbghelp/minidump.c
++++ b/dlls/dbghelp/minidump.c
+@@ -352,12 +352,121 @@ void minidump_add_memory_block(struct dump_context* dc, ULONG64 base, ULONG size
+  *
+  * Writes a chunk of data at a given position in the minidump
+  */
+-static void writeat(struct dump_context* dc, RVA rva, const void* data, unsigned size)
++/* Stained Glass OS: a MiniDumpWriteDump callback, with the process the way
++ * Windows names it for each type */
++static BOOL dump_callback(struct dump_context* dc, ULONG type, MINIDUMP_CALLBACK_INPUT* in, MINIDUMP_CALLBACK_OUTPUT* out)
++{
++    if (!dc->cb || !dc->cb->CallbackRoutine) return FALSE;
++    in->CallbackType = type;
++    switch (type)
++    {
++    case IoStartCallback:
++    case IoWriteAllCallback:
++    case IoFinishCallback:
++    case WriteKernelMinidumpCallback:
++        in->ProcessId = 0;
++        in->ProcessHandle = NULL;
++        break;
++    case IsProcessSnapshotCallback:
++    case VmStartCallback:
++        in->ProcessId = 0;
++        in->ProcessHandle = dc->process->handle;
++        break;
++    default:
++        in->ProcessId = dc->pid;
++        in->ProcessHandle = dc->process->handle;
++        break;
++    }
++    return dc->cb->CallbackRoutine(dc->cb->CallbackParam, in, out);
++}
++
++/* CancelCallback: TRUE when the caller cancelled the dump. It is asked
++ * until it stops asking to be (CheckCancel). */
++static BOOL dump_cancelled(struct dump_context* dc)
++{
++    MINIDUMP_CALLBACK_INPUT     cbin;
++    MINIDUMP_CALLBACK_OUTPUT    cbout;
++
++    if (dc->status) return TRUE;
++    if (!dc->check_cancel) return FALSE;
++    memset(&cbin, 0, sizeof(cbin));
++    memset(&cbout, 0, sizeof(cbout));
++    if (!dump_callback(dc, CancelCallback, &cbin, &cbout))
++    {
++        dc->check_cancel = FALSE;
++        return FALSE;
++    }
++    dc->check_cancel = cbout.CheckCancel;
++#ifndef SG_MUTANT_NO_CANCEL
++    if (cbout.Cancel) dc->status = HRESULT_FROM_WIN32(ERROR_CANCELLED);
++#endif
++    return dc->status != S_OK;
++}
++
++/* writes go to the file, or to IoWriteAllCallback when IoStartCallback
++ * took them */
++static void dump_write(struct dump_context* dc, ULONG64 offset, const void* data, unsigned size)
++{
++    DWORD           written;
++    LARGE_INTEGER   pos;
++
++    if (dc->io_callback)
++    {
++        MINIDUMP_CALLBACK_INPUT     cbin;
++        MINIDUMP_CALLBACK_OUTPUT    cbout;
++
++        if (dc->status) return;
++        memset(&cbin, 0, sizeof(cbin));
++        memset(&cbout, 0, sizeof(cbout));
++        cbin.Io.Handle = dc->hFile;
++        cbin.Io.Offset = offset;
++        cbin.Io.Buffer = (void*)data;
++        cbin.Io.BufferBytes = size;
++        if (!dump_callback(dc, IoWriteAllCallback, &cbin, &cbout)) dc->status = E_FAIL;
++        else if (FAILED(cbout.Status)) dc->status = cbout.Status;
++        return;
++    }
++    pos.QuadPart = offset;
++    SetFilePointerEx(dc->hFile, pos, NULL, FILE_BEGIN);
++    if (!WriteFile(dc->hFile, data, size, &written, NULL) && !dc->status)
++        dc->status = HRESULT_FROM_WIN32(GetLastError());
++}
++
++/* the process's memory, for a memory list: what cannot be read is zeros,
++ * after ReadMemoryFailureCallback is told */
++static void dump_read_memory(struct dump_context* dc, ULONG64 addr, void* buf, ULONG len)
++{
++    if (read_process_memory(dc->process, addr, buf, len)) return;
++    memset(buf, 0, len);
++    if (dc->cb)
++    {
++        MINIDUMP_CALLBACK_INPUT     cbin;
++        MINIDUMP_CALLBACK_OUTPUT    cbout;
++
++        memset(&cbin, 0, sizeof(cbin));
++        memset(&cbout, 0, sizeof(cbout));
++        cbin.ReadMemoryFailure.Offset = addr;
++        cbin.ReadMemoryFailure.Bytes = len;
++        cbin.ReadMemoryFailure.FailureStatus = HRESULT_FROM_NT(STATUS_PARTIAL_COPY);
++        dump_callback(dc, ReadMemoryFailureCallback, &cbin, &cbout);
++    }
++}
++
++/* the bytes of a thread stack that lie in a removed range are zeroed */
++static void dump_zero_removed(struct dump_context* dc, ULONG64 addr, char* buf, ULONG len)
+ {
+-    DWORD       written;
++    unsigned j;
++
++    for (j = 0; j < dc->num_removed; j++)
++    {
++        ULONG64 rb = max(dc->removed[j].base, addr), re = min(dc->removed[j].base + dc->removed[j].size, addr + len);
++        if (rb < re) memset(buf + (rb - addr), 0, re - rb);
++    }
++}
+ 
+-    SetFilePointer(dc->hFile, rva, NULL, FILE_BEGIN);
+-    WriteFile(dc->hFile, data, size, &written, NULL);
++static void writeat(struct dump_context* dc, RVA rva, const void* data, unsigned size)
++{
++    dump_write(dc, rva, data, size);
+ }
+ 
+ /******************************************************************
+@@ -598,13 +707,8 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
+             (!dc->modules[i].is_elf && dump_elf))
+             continue;
+ 
+-        flags_out = ModuleWriteModule | ModuleWriteMiscRecord | ModuleWriteCvRecord;
+-        if (dc->type & MiniDumpWithDataSegs)
+-            flags_out |= ModuleWriteDataSeg;
+-        if (dc->type & MiniDumpWithProcessThreadData)
+-            flags_out |= ModuleWriteTlsData;
+-        if (dc->type & MiniDumpWithCodeSegs)
+-            flags_out |= ModuleWriteCodeSegs;
++        flags_out = dc->modules[i].include_flags;
++        if (dump_cancelled(dc)) break;
+         if ((dc->type & MiniDumpScanMemory) && !dc->modules[i].is_elf &&
+             module_referenced_by_stacks(dc, dc->modules[i].base, dc->modules[i].size))
+             flags_out |= ModuleReferencedByMemory;
+@@ -634,7 +738,7 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
+             cbin.Module.SizeOfMiscRecord = 0;
+ 
+             cbout.ModuleWriteFlags = flags_out;
+-            if (!dc->cb->CallbackRoutine(dc->cb->CallbackParam, &cbin, &cbout))
++            if (!dump_callback(dc, ModuleCallback, &cbin, &cbout))
+                 continue;
+             flags_out &= cbout.ModuleWriteFlags;
+         }
+@@ -726,7 +830,6 @@ static  unsigned        dump_system_info(struct dump_context* dc)
+     MINIDUMP_SYSTEM_INFO        mdSysInfo;
+     SYSTEM_INFO                 sysInfo;
+     RTL_OSVERSIONINFOEXW        osInfo;
+-    DWORD                       written;
+     ULONG                       slen;
+     DWORD                       wine_extra = 0;
+ 
+@@ -808,29 +911,27 @@ static  unsigned        dump_system_info(struct dump_context* dc)
+     {
+         static const char code[] = {'W','I','N','E'};
+ 
+-        WriteFile(dc->hFile, code, 4, &written, NULL);
++        append(dc, code, 4);
+         /* number of sub-info, so that we can extend structure if needed */
+         slen = 3;
+-        WriteFile(dc->hFile, &slen, sizeof(slen), &written, NULL);
++        append(dc, &slen, sizeof(slen));
+         /* we store offsets from just after the WINE marker */
+         slen = 4 * sizeof(DWORD);
+-        WriteFile(dc->hFile, &slen, sizeof(slen), &written, NULL);
++        append(dc, &slen, sizeof(slen));
+         slen += strlen(build_id) + 1;
+-        WriteFile(dc->hFile, &slen, sizeof(slen), &written, NULL);
++        append(dc, &slen, sizeof(slen));
+         slen += strlen(sys_name) + 1;
+-        WriteFile(dc->hFile, &slen, sizeof(slen), &written, NULL);
+-        WriteFile(dc->hFile, build_id, strlen(build_id) + 1, &written, NULL);
+-        WriteFile(dc->hFile, sys_name, strlen(sys_name) + 1, &written, NULL);
+-        WriteFile(dc->hFile, release_name, strlen(release_name) + 1, &written, NULL);
+-        dc->rva += wine_extra;
++        append(dc, &slen, sizeof(slen));
++        append(dc, build_id, strlen(build_id) + 1);
++        append(dc, sys_name, strlen(sys_name) + 1);
++        append(dc, release_name, strlen(release_name) + 1);
+     }
+ 
+     /* write the service pack version string after this stream.  It is referenced within the
+        stream by its RVA in the file. */
+     slen = lstrlenW(osInfo.szCSDVersion) * sizeof(WCHAR);
+-    WriteFile(dc->hFile, &slen, sizeof(slen), &written, NULL);
+-    WriteFile(dc->hFile, osInfo.szCSDVersion, slen, &written, NULL);
+-    dc->rva += sizeof(ULONG) + slen;
++    append(dc, &slen, sizeof(slen));
++    append(dc, osInfo.szCSDVersion, slen);
+ 
+     return sizeof(mdSysInfo);
+ }
+@@ -848,6 +949,7 @@ static  unsigned        dump_threads(struct dump_context* dc)
+     RVA                         rva_base;
+     DWORD                       flags_out;
+     CONTEXT                     ctx;
++    BOOL                        ret;
+ 
+     mdThdList.NumberOfThreads = 0;
+ 
+@@ -858,12 +960,8 @@ static  unsigned        dump_threads(struct dump_context* dc)
+     {
+         fetch_thread_info(dc, i, &mdThd, &ctx);
+ 
+-        flags_out = ThreadWriteThread | ThreadWriteStack | ThreadWriteContext |
+-            ThreadWriteInstructionWindow;
+-        if (dc->type & MiniDumpWithProcessThreadData)
+-            flags_out |= ThreadWriteThreadData;
+-        if (dc->type & MiniDumpWithThreadInfo)
+-            flags_out |= ThreadWriteThreadInfo;
++        flags_out = dc->threads[i].include_flags;
++        if (dump_cancelled(dc)) break;
+ 
+         if (dc->cb)
+         {
+@@ -874,7 +972,7 @@ static  unsigned        dump_threads(struct dump_context* dc)
+             cbin.ProcessHandle = dc->process->handle;
+             cbin.CallbackType = ThreadCallback;
+             cbin.Thread.ThreadId = dc->threads[i].tid;
+-            cbin.Thread.ThreadHandle = 0; /* FIXME */
++            cbin.Thread.ThreadHandle = OpenThread(THREAD_ALL_ACCESS, FALSE, dc->threads[i].tid);
+             cbin.Thread.Context = ctx;
+             cbin.Thread.SizeOfContext = sizeof(CONTEXT);
+             cbin.Thread.StackBase = mdThd.Stack.StartOfMemoryRange;
+@@ -882,7 +980,9 @@ static  unsigned        dump_threads(struct dump_context* dc)
+                 mdThd.Stack.Memory.DataSize;
+ 
+             cbout.ThreadWriteFlags = flags_out;
+-            if (!dc->cb->CallbackRoutine(dc->cb->CallbackParam, &cbin, &cbout))
++            ret = dump_callback(dc, ThreadCallback, &cbin, &cbout);
++            if (cbin.Thread.ThreadHandle) CloseHandle(cbin.Thread.ThreadHandle);
++            if (!ret)
+             {
+                 dc->threads[i].write_flags = 0;
+                 continue;
+@@ -984,7 +1084,6 @@ static unsigned         dump_memory_info(struct dump_context* dc)
+ {
+     MINIDUMP_MEMORY_LIST        mdMemList;
+     MINIDUMP_MEMORY_DESCRIPTOR  mdMem;
+-    DWORD                       written;
+     unsigned                    i, pos, len, sz;
+     RVA                         rva_base;
+     char                        tmp[1024];
+@@ -1002,11 +1101,12 @@ static unsigned         dump_memory_info(struct dump_context* dc)
+         mdMem.StartOfMemoryRange = dc->mem[i].base;
+         mdMem.Memory.Rva = dc->rva;
+         mdMem.Memory.DataSize = dc->mem[i].size;
+-        SetFilePointer(dc->hFile, dc->rva, NULL, FILE_BEGIN);
++        if (dump_cancelled(dc)) break;
+         for (pos = 0; pos < dc->mem[i].size; pos += sizeof(tmp))
+         {
+             len = min(dc->mem[i].size - pos, sizeof(tmp));
+-            if (read_process_memory(dc->process, dc->mem[i].base + pos, tmp, len))
++            dump_read_memory(dc, dc->mem[i].base + pos, tmp, len);
++            dump_zero_removed(dc, dc->mem[i].base + pos, tmp, len);
+             {
+                 /* filtered stacks keep only what a stack trace needs */
+                 if ((dc->type & MiniDumpFilterMemory) && dc->mem[i].rva)
+@@ -1021,7 +1121,7 @@ static unsigned         dump_memory_info(struct dump_context* dc)
+                         if (!stack_value_needed(dc, value)) memset(tmp + j, 0, word);
+                     }
+                 }
+-                WriteFile(dc->hFile, tmp, len, &written, NULL);
++                dump_write(dc, dc->rva + pos, tmp, len);
+             }
+         }
+         dc->rva += mdMem.Memory.DataSize;
+@@ -1136,6 +1236,166 @@ static unsigned dump_handle_data(struct dump_context* dc)
+ }
+ 
+ 
++/******************************************************************
++ *		dump_include_callbacks
++ *
++ * Stained Glass OS: IncludeThreadCallback for each thread and
++ * IncludeModuleCallback for each module, before anything is written: a
++ * FALSE leaves the thread or module out of the dump, and the write flags
++ * they return limit what is written for it.
++ */
++static void dump_include_callbacks(struct dump_context* dc)
++{
++    MINIDUMP_CALLBACK_INPUT     cbin;
++    MINIDUMP_CALLBACK_OUTPUT    cbout;
++    ULONG                       flags;
++    unsigned                    i, n;
++
++    flags = ThreadWriteThread | ThreadWriteStack | ThreadWriteContext | ThreadWriteInstructionWindow;
++    if (dc->type & MiniDumpWithProcessThreadData) flags |= ThreadWriteThreadData;
++    if (dc->type & MiniDumpWithThreadInfo) flags |= ThreadWriteThreadInfo;
++    for (i = n = 0; i < dc->num_threads; i++)
++    {
++        dc->threads[i].include_flags = flags;
++        if (dc->cb)
++        {
++            memset(&cbin, 0, sizeof(cbin));
++            memset(&cbout, 0, sizeof(cbout));
++            cbin.IncludeThread.ThreadId = dc->threads[i].tid;
++            cbout.ThreadWriteFlags = flags;
++#ifndef SG_MUTANT_NO_INCLUDE_THREAD
++            if (!dump_callback(dc, IncludeThreadCallback, &cbin, &cbout)) continue;
++            dc->threads[i].include_flags &= cbout.ThreadWriteFlags;
++#endif
++        }
++        dc->threads[n++] = dc->threads[i];
++    }
++    dc->num_threads = n;
++
++    flags = ModuleWriteModule | ModuleWriteMiscRecord | ModuleWriteCvRecord;
++    if (dc->type & MiniDumpWithDataSegs) flags |= ModuleWriteDataSeg;
++    if (dc->type & MiniDumpWithProcessThreadData) flags |= ModuleWriteTlsData;
++    if (dc->type & MiniDumpWithCodeSegs) flags |= ModuleWriteCodeSegs;
++    for (i = n = 0; i < dc->num_modules; i++)
++    {
++        dc->modules[i].include_flags = flags;
++        if (dc->cb)
++        {
++            memset(&cbin, 0, sizeof(cbin));
++            memset(&cbout, 0, sizeof(cbout));
++            cbin.IncludeModule.BaseOfImage = dc->modules[i].base;
++            cbout.ModuleWriteFlags = flags;
++#ifndef SG_MUTANT_NO_INCLUDE_MODULE
++            if (!dump_callback(dc, IncludeModuleCallback, &cbin, &cbout)) continue;
++            dc->modules[i].include_flags &= cbout.ModuleWriteFlags;
++#endif
++        }
++        dc->modules[n++] = dc->modules[i];
++    }
++    dc->num_modules = n;
++}
++
++/* Stained Glass OS: MemoryCallback, asked until it returns FALSE or an
++ * empty range: the ranges it names go to the memory list */
++static void dump_memory_callbacks(struct dump_context* dc)
++{
++    MINIDUMP_CALLBACK_INPUT     cbin;
++    MINIDUMP_CALLBACK_OUTPUT    cbout;
++
++    if (!dc->cb) return;
++    for (;;)
++    {
++        memset(&cbin, 0, sizeof(cbin));
++        memset(&cbout, 0, sizeof(cbout));
++        if (!dump_callback(dc, MemoryCallback, &cbin, &cbout) || !cbout.MemorySize) break;
++#ifndef SG_MUTANT_NO_MEMORY_CALLBACK
++        if (!(dc->type & MiniDumpWithFullMemory))
++            minidump_add_memory_block(dc, cbout.MemoryBase, cbout.MemorySize, 0);
++#endif
++        if (dump_cancelled(dc)) return;
++    }
++}
++
++/* Stained Glass OS: RemoveMemoryCallback, asked the same way: the ranges it
++ * names are taken out of the memory lists (thread stacks keep their place in
++ * the file; their bytes there are zeroed) */
++static void dump_remove_memory_callbacks(struct dump_context* dc)
++{
++    MINIDUMP_CALLBACK_INPUT     cbin;
++    MINIDUMP_CALLBACK_OUTPUT    cbout;
++    struct dump_memory*         r;
++
++    if (!dc->cb) return;
++    for (;;)
++    {
++        memset(&cbin, 0, sizeof(cbin));
++        memset(&cbout, 0, sizeof(cbout));
++        if (!dump_callback(dc, RemoveMemoryCallback, &cbin, &cbout) || !cbout.MemorySize) break;
++        if (!(r = HeapReAlloc(GetProcessHeap(), 0, dc->removed ? dc->removed : HeapAlloc(GetProcessHeap(), 0, 0),
++                              (dc->num_removed + 1) * sizeof(*r)))) break;
++        dc->removed = r;
++        dc->removed[dc->num_removed].base = cbout.MemoryBase;
++        dc->removed[dc->num_removed].size = cbout.MemorySize;
++        dc->removed[dc->num_removed].rva = 0;
++        dc->num_removed++;
++        if (dump_cancelled(dc)) return;
++    }
++}
++
++/* cut the removed ranges out of a block list; a block whose descriptor
++ * a thread points to (rva) keeps its range */
++static void dump_apply_removed(struct dump_context* dc)
++{
++    unsigned i, j;
++
++#ifdef SG_MUTANT_NO_REMOVE_MEMORY
++    return;
++#endif
++
++    for (j = 0; j < dc->num_removed; j++)
++    {
++        ULONG64 rb = dc->removed[j].base, re = rb + dc->removed[j].size;
++
++        for (i = 0; i < dc->num_mem; i++)
++        {
++            ULONG64 b = dc->mem[i].base, e = b + dc->mem[i].size;
++
++            if (dc->mem[i].rva || re <= b || rb >= e) continue;
++            if (rb <= b && re >= e) dc->mem[i].size = 0;
++            else if (rb <= b) { dc->mem[i].base = re; dc->mem[i].size = e - re; }
++            else if (re >= e) dc->mem[i].size = rb - b;
++            else
++            {
++                /* split: the tail becomes a new block */
++                dc->mem[i].size = rb - b;
++                minidump_add_memory_block(dc, re, e - re, 0);
++            }
++        }
++        for (i = 0; i < dc->num_mem64; i++)
++        {
++            ULONG64 b = dc->mem64[i].base, e = b + dc->mem64[i].size;
++
++            if (re <= b || rb >= e) continue;
++            if (rb <= b && re >= e) dc->mem64[i].size = 0;
++            else if (rb <= b) { dc->mem64[i].base = re; dc->mem64[i].size = e - re; }
++            else if (re >= e) dc->mem64[i].size = rb - b;
++            else
++            {
++                ULONG64 tail = e - re;
++                dc->mem64[i].size = rb - b;
++                minidump_add_memory64_block(dc, re, tail);
++            }
++        }
++    }
++    /* drop the emptied blocks */
++    for (i = j = 0; i < dc->num_mem; i++)
++        if (dc->mem[i].size || dc->mem[i].rva) dc->mem[j++] = dc->mem[i];
++    dc->num_mem = j;
++    for (i = j = 0; i < dc->num_mem64; i++)
++        if (dc->mem64[i].size) dc->mem64[j++] = dc->mem64[i];
++    dc->num_mem64 = j;
++}
++
+ /******************************************************************
+  *		dump_thread_info_list
+  *
+@@ -1351,7 +1611,6 @@ static unsigned         dump_memory64_info(struct dump_context* dc)
+ {
+     MINIDUMP_MEMORY64_LIST          mdMem64List;
+     MINIDUMP_MEMORY_DESCRIPTOR64    mdMem64;
+-    DWORD                           written;
+     unsigned                        i, len, sz;
+     RVA                             rva_base;
+     char                            tmp[1024];
+@@ -1380,12 +1639,12 @@ static unsigned         dump_memory64_info(struct dump_context* dc)
+     {
+         mdMem64.StartOfMemoryRange = dc->mem64[i].base;
+         mdMem64.DataSize = dc->mem64[i].size;
+-        SetFilePointerEx(dc->hFile, filepos, NULL, FILE_BEGIN);
++        if (dump_cancelled(dc)) break;
+         for (pos = 0; pos < dc->mem64[i].size; pos += sizeof(tmp))
+         {
+             len = min(dc->mem64[i].size - pos, sizeof(tmp));
+-            if (read_process_memory(dc->process, dc->mem64[i].base + pos, tmp, len))
+-                WriteFile(dc->hFile, tmp, len, &written, NULL);
++            dump_read_memory(dc, dc->mem64[i].base + pos, tmp, len);
++            dump_write(dc, filepos.QuadPart + pos, tmp, len);
+         }
+         filepos.QuadPart += mdMem64.DataSize;
+         writeat(dc, rva_base + i * sizeof(mdMem64), &mdMem64, sizeof(mdMem64));
+@@ -1421,6 +1680,38 @@ static DWORD CALLBACK write_minidump(void *_args)
+     if (!fetch_process_info(dc)) return FALSE;
+     fetch_modules_info(dc);
+ 
++    /* Stained Glass OS: the callbacks Windows makes before it writes */
++    if (dc->cb)
++    {
++        MINIDUMP_CALLBACK_INPUT     cbin;
++        MINIDUMP_CALLBACK_OUTPUT    cbout;
++
++        /* not a process snapshot (PssCaptureSnapshot) handle, no virtual memory callbacks */
++        memset(&cbin, 0, sizeof(cbin));
++        memset(&cbout, 0, sizeof(cbout));
++        cbout.Status = S_FALSE;
++        dump_callback(dc, IsProcessSnapshotCallback, &cbin, &cbout);
++        memset(&cbout, 0, sizeof(cbout));
++        cbout.Status = S_FALSE;
++        dump_callback(dc, VmStartCallback, &cbin, &cbout);
++        memset(&cbout, 0, sizeof(cbout));
++        dump_callback(dc, SecondaryFlagsCallback, &cbin, &cbout);
++        /* the writes go to IoWriteAllCallback if the callback takes them */
++        memset(&cbin, 0, sizeof(cbin));
++        memset(&cbout, 0, sizeof(cbout));
++        cbin.Io.Handle = dc->hFile;
++        cbout.Status = E_NOTIMPL;
++#ifndef SG_MUTANT_NO_IO_CALLBACK
++        if (dump_callback(dc, IoStartCallback, &cbin, &cbout) && cbout.Status == S_OK)
++            dc->io_callback = TRUE;
++#endif
++        dc->check_cancel = TRUE;
++        if (dump_cancelled(dc)) return FALSE;
++        dump_include_callbacks(dc);
++    }
++    else
++        dump_include_callbacks(dc);
++
+     /* 1) init */
+     nStreams = 7 + (dc->except_param ? 1 : 0) + ((dc->type & MiniDumpWithHandleData) ? 1 : 0) +
+         ((dc->type & MiniDumpWithThreadInfo) ? 1 : 0) + ((dc->type & MiniDumpWithFullMemoryInfo) ? 1 : 0) +
+@@ -1522,6 +1813,9 @@ static DWORD CALLBACK write_minidump(void *_args)
+ 
+     if (!(dc->type & MiniDumpWithFullMemory))
+     {
++        dump_memory_callbacks(dc);
++        dump_remove_memory_callbacks(dc);
++        dump_apply_removed(dc);
+         mdDir.StreamType = MemoryListStream;
+         mdDir.Location.Rva = dc->rva;
+         mdDir.Location.DataSize = dump_memory_info(dc);
+@@ -1564,6 +1858,9 @@ static DWORD CALLBACK write_minidump(void *_args)
+     if (dc->type & MiniDumpWithFullMemory)
+     {
+         fetch_memory64_info(dc);
++        dump_memory_callbacks(dc);
++        dump_remove_memory_callbacks(dc);
++        dump_apply_removed(dc);
+ 
+         mdDir.StreamType = Memory64ListStream;
+         mdDir.Location.Rva = dc->rva;
+@@ -1577,7 +1874,25 @@ static DWORD CALLBACK write_minidump(void *_args)
+     for (i = idx_stream; i < nStreams; i++)
+         writeat(dc, mdHead.StreamDirectoryRva + i * sizeof(emptyDir), &emptyDir, sizeof(emptyDir));
+ 
+-    return TRUE;
++    if (dc->cb)
++    {
++        MINIDUMP_CALLBACK_INPUT     cbin;
++        MINIDUMP_CALLBACK_OUTPUT    cbout;
++
++        /* no kernel minidump is written beside a user one */
++        memset(&cbin, 0, sizeof(cbin));
++        memset(&cbout, 0, sizeof(cbout));
++        dump_callback(dc, WriteKernelMinidumpCallback, &cbin, &cbout);
++        if (dc->io_callback)
++        {
++            memset(&cbin, 0, sizeof(cbin));
++            memset(&cbout, 0, sizeof(cbout));
++            cbin.Io.Handle = dc->hFile;
++            if (!dump_callback(dc, IoFinishCallback, &cbin, &cbout) && !dc->status) dc->status = E_FAIL;
++            else if (FAILED(cbout.Status) && !dc->status) dc->status = cbout.Status;
++        }
++    }
++    return dc->status == S_OK;
+ }
+ 
+ /******************************************************************
+@@ -1590,7 +1905,7 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
+                               PMINIDUMP_USER_STREAM_INFORMATION UserStreamParam,
+                               PMINIDUMP_CALLBACK_INFORMATION CallbackParam)
+ {
+-    struct dump_context dc;
++    struct dump_context dc = {0};
+     BOOL                sym_initialized = FALSE;
+     BOOL                ret = FALSE;
+ 
+@@ -1647,6 +1962,9 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
+     if (sym_initialized)
+         SymCleanup(hProcess);
+ 
++    /* as on Windows, the last error of a failed dump is an HRESULT */
++    if (!ret && dc.status) SetLastError(dc.status);
++    HeapFree(GetProcessHeap(), 0, dc.removed);
+     HeapFree(GetProcessHeap(), 0, dc.mem);
+     HeapFree(GetProcessHeap(), 0, dc.mem64);
+     HeapFree(GetProcessHeap(), 0, dc.modules);
