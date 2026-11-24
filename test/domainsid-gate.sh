@@ -131,9 +131,10 @@ expect "$out" "Ace=$DOMSID-519" "a domain group the user is not in (a name-only 
 expect "$out" "Opened=5" "and the user may not open what only it may"
 
 # a key the domain user makes in shared HKLM state (as display setup does
-# in Enum\DISPLAY) is owned by the machine's Users group, which every
-# account holds -- not by the domain's Domain Users, which the greeter and
-# local accounts do not, and which left them unable ever to delete it
+# in Enum\DISPLAY) is owned by that user, as on Windows (9150) -- not by a
+# Users group every account holds, nor by the domain's Domain Users, which
+# the greeter and local accounts do not hold; what the others may do with
+# it is the DACL's (here: Users write)
 cat > "$W/share.c" <<'EOF2'
 #include <windows.h>
 #include <sddl.h>
@@ -156,7 +157,7 @@ EOF2
 out=$(me "$W/share.exe")
 expect "$out" "Shared=0" "(a shared HKLM key that Users may write)"
 out=$(other "$W/probe.exe" mkkey 'Software\StainedGlassShared\ByDomainUser')
-expect "$out" "KeyOwner=S-1-5-21-0-0-0-513" "a key the domain user creates in HKLM is owned by the machine's Users group"
+expect "$out" "KeyOwner=$DOMSID-1104" "a key the domain user creates in HKLM is owned by that user (as Windows, 9150)"
 out=$(other "$W/probe.exe" rmkey 'Software\StainedGlassShared\ByDomainUser')
 expect "$out" "Deleted=0" "and its creator may delete it"
 
