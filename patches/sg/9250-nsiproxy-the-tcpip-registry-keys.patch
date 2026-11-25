@@ -1,0 +1,1094 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] nsiproxy: keep the TCP/IP registry keys as Windows' TCP/IP driver and DHCP client do (9250)
+
+Windows keeps each adapter's IPv4 configuration under HKLM\System\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{adapter GUID} -- EnableDHCP, the fixed IPAddress/SubnetMask/DefaultGateway/NameServer, or the lease's DhcpIPAddress, DhcpSubnetMask(Opt), DhcpServer, DhcpDefaultGateway, DhcpNameServer, DhcpDomain, Lease, LeaseObtainedTime, LeaseTerminatesTime, T1, T2 -- and each adapter's device: Control\Network\{4D36E972-...}\{GUID}\Connection (Name, PnpInstanceID, MediaSubType), Enum\<instance ID> (ConfigFlags, Class, Driver, HardwareID) and Control\Class\{4D36E972-...}\NNNN (NetCfgInstanceId, DriverDesc, Characteristics, *IfType, NetLuidIndex). Nothing wrote any of it: dnspython (Electrum's DNS hack, many Python programs) failed with FileNotFoundError (ledger i0493).
+
+nsiproxy is the machine's TCP/IP driver here (one per prefix; SYSTEM in the shared prefix), so it keeps them: at start, after every netlink notification it already receives (addresses, routes, links; a burst settles 300 ms), and every two minutes. The adapters and GUIDs are GetAdaptersAddresses'; whether an address is leased, and the lease's server, times, name servers and domain, come from the Linux side (new unix call, dhcp.c): NetworkManager's /run/NetworkManager/devices/<ifindex> [dhcp4], else systemd-networkd's lease file, else the address's lifetime (IFA_F_PERMANENT = fixed). A fixed adapter's NameServer is what the system uses (behind systemd-resolved's stub, its upstream servers); a lease whose servers the system does not use (set by hand) gets them as NameServer, as on Windows. An adapter without an address keeps a fixed configuration and shows a released lease (0.0.0.0, 255.255.255.255). PCI/USB devices get PCI\VEN_..&DEV_.. / USB\VID_..&PID_.. instance IDs and NCF_PHYSICAL, others ROOT\NET\NNNN and NCF_VIRTUAL. Only changed values are written; keys of adapters that are gone are removed (only for nsiproxy's own GUIDs). Loopback has none, as on Windows. The keys get SYSTEM's machine descriptor: users read, only administrators and SYSTEM write.
+
+Gate: test-tcpipreg. Mutants SG_MUTANT_TCPIPREG_NO_FOLLOW, SG_MUTANT_TCPIPREG_NO_NM.
+---
+--- a/dlls/nsiproxy.sys/Makefile.in
++++ b/dlls/nsiproxy.sys/Makefile.in
+@@ -1,15 +1,18 @@
+ MODULE    = nsiproxy.sys
+ UNIXLIB   = nsiproxy.so
+-IMPORTS   = ntoskrnl
++IMPORTS   = ntoskrnl advapi32
++DELAYIMPORTS = iphlpapi
+ UNIX_LIBS = $(PROCSTAT_LIBS)
+ 
+ EXTRADLLFLAGS = -Wl,--subsystem,native
+ 
+ SOURCES = \
+ 	device.c \
++	dhcp.c \
+ 	icmp_echo.c \
+ 	ip.c \
+ 	ndis.c \
+ 	nsi.c \
+ 	tcp.c \
++	tcpipreg.c \
+ 	udp.c
+--- a/dlls/nsiproxy.sys/device.c
++++ b/dlls/nsiproxy.sys/device.c
+@@ -72,8 +72,15 @@
+     nsi_get_all_parameters_ex,
+     nsi_get_parameter_ex,
+     nsi_get_notification,
++    nsi_get_dhcp4_info,
+ };
+ 
++NTSTATUS nsiproxy_get_dhcp4_info( UINT if_index, struct nsi_dhcp4_info *info )
++{
++    struct nsi_get_dhcp4_info_params params = { if_index, info };
++    return nsiproxy_call( nsi_get_dhcp4_info, &params );
++}
++
+ static NTSTATUS nsiproxy_enumerate_all( IRP *irp )
+ {
+     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation( irp );
+@@ -497,6 +504,8 @@
+ 
+     while (!(status = nsiproxy_call( nsi_get_notification, &params )))
+     {
++        /* Stained Glass OS: an address, route or interface changed: the TCP/IP keys follow */
++        tcpip_registry_changed( &params.module, params.table );
+         EnterCriticalSection( &nsiproxy_cs );
+         for (entry = notification_queue.Flink; entry != &notification_queue; entry = next)
+         {
+@@ -546,6 +555,7 @@
+     CloseHandle( thread );
+     thread = CreateThread( NULL, 0, notification_thread_proc, NULL, 0, NULL );
+     CloseHandle( thread );
++    tcpip_registry_start();
+ 
+     return STATUS_SUCCESS;
+ }
+--- /dev/null
++++ b/dlls/nsiproxy.sys/dhcp.c
+@@ -0,0 +1,366 @@
++/*
++ * nsiproxy.sys: what the Linux side knows about an interface's IPv4 configuration -- its DHCP
++ * lease, the DNS servers in use and the hardware behind it -- for the TCP/IP registry keys
++ * (tcpipreg.c). Stained Glass OS.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <time.h>
++#include <limits.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <net/if.h>
++#ifdef HAVE_LINUX_RTNETLINK_H
++#include <linux/netlink.h>
++#include <linux/rtnetlink.h>
++#include <linux/if_addr.h>
++#endif
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "winioctl.h"
++#include "ddk/wdm.h"
++#include "ifdef.h"
++#define USE_WS_PREFIX
++#include "netiodef.h"
++#include "wine/nsi.h"
++#include "wine/debug.h"
++#include "wine/unixlib.h"
++#include "unix_private.h"
++#include "nsiproxy_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(nsi);
++
++static void add_addr( UINT *list, UINT *count, UINT max, const char *text )
++{
++    struct in_addr in;
++    UINT i;
++
++    if (*count >= max || inet_pton( AF_INET, text, &in ) != 1 || !in.s_addr) return;
++    for (i = 0; i < *count; i++) if (list[i] == in.s_addr) return;
++    list[(*count)++] = in.s_addr;
++}
++
++static void add_addr_list( UINT *list, UINT *count, UINT max, char *text )
++{
++    char *tok, *save = NULL;
++
++    for (tok = strtok_r( text, " ,\t", &save ); tok; tok = strtok_r( NULL, " ,\t", &save ))
++        add_addr( list, count, max, tok );
++}
++
++static void copy_str( char *dst, const char *src, size_t size )
++{
++    snprintf( dst, size, "%s", src );
++}
++
++static char *trim( char *s )
++{
++    char *end;
++
++    while (*s == ' ' || *s == '\t') s++;
++    end = s + strlen( s );
++    while (end > s && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
++    return s;
++}
++
++/* NetworkManager keeps each device's state, the DHCPv4 lease's options among it, in a file
++ * anyone may read: /run/NetworkManager/devices/<ifindex>, a [dhcp4] section with
++ * dhcp4.<option>=<value> lines. A device NetworkManager manages without that section has no
++ * lease: a fixed address, or none. */
++static BOOL read_nm_device( UINT index, struct nsi_dhcp4_info *info )
++{
++    char path[64], line[1024], *value;
++    BOOL in_dhcp4 = FALSE, managed = FALSE;
++    LONGLONG expiry = 0;
++    FILE *f;
++
++#ifdef SG_MUTANT_TCPIPREG_NO_NM
++    return FALSE;
++#endif
++    snprintf( path, sizeof(path), "/run/NetworkManager/devices/%u", index );
++    if (!(f = fopen( path, "r" ))) return FALSE;
++    while (fgets( line, sizeof(line), f ))
++    {
++        char *l = trim( line );
++
++        if (*l == '[')
++        {
++            in_dhcp4 = !strcmp( l, "[dhcp4]" );
++            if (in_dhcp4) info->dhcp = TRUE;
++            continue;
++        }
++        if (!(value = strchr( l, '=' ))) continue;
++        *value++ = 0;
++        value = trim( value );
++        if (!in_dhcp4)
++        {
++            if (!strcmp( l, "managed" )) managed = !strcmp( value, "true" );
++            continue;
++        }
++        if (!strcmp( l, "dhcp4.dhcp_server_identifier" ))
++        {
++            UINT count = 0;
++            add_addr( &info->server, &count, 1, value );
++        }
++        else if (!strcmp( l, "dhcp4.dhcp_lease_time" )) info->lease_time = strtoul( value, NULL, 10 );
++        else if (!strcmp( l, "dhcp4.expiry" )) expiry = strtoll( value, NULL, 10 );
++        else if (!strcmp( l, "dhcp4.domain_name_servers" ))
++            add_addr_list( info->dns, &info->dns_count, ARRAY_SIZE(info->dns), value );
++        else if (!strcmp( l, "dhcp4.domain_name" ))
++        {
++            char *sp = strpbrk( value, " \t" );
++            if (sp) *sp = 0;   /* Windows' DhcpDomain is one name (option 15) */
++            copy_str( info->domain, value, sizeof(info->domain) );
++        }
++    }
++    fclose( f );
++    if (!managed && !info->dhcp) return FALSE;
++    info->source = info->dhcp ? 1 : 2;
++    if (expiry)
++    {
++        info->expires = expiry;
++        if (info->lease_time) info->obtained = expiry - info->lease_time;
++    }
++    return TRUE;
++}
++
++/* systemd-networkd's lease of an interface it runs DHCP on: /run/systemd/netif/leases/<ifindex>,
++ * KEY=value lines; the file is (re)written when the lease is obtained or renewed */
++static BOOL read_networkd_lease( UINT index, struct nsi_dhcp4_info *info )
++{
++    char path[64], line[1024], *value;
++    struct stat st;
++    FILE *f;
++
++    snprintf( path, sizeof(path), "/run/systemd/netif/leases/%u", index );
++    if (!(f = fopen( path, "r" ))) return FALSE;
++    if (!fstat( fileno( f ), &st )) info->obtained = st.st_mtime;
++    while (fgets( line, sizeof(line), f ))
++    {
++        char *l = trim( line );
++
++        if (!(value = strchr( l, '=' ))) continue;
++        *value++ = 0;
++        if (!strcmp( l, "SERVER_ADDRESS" ))
++        {
++            UINT count = 0;
++            add_addr( &info->server, &count, 1, value );
++        }
++        else if (!strcmp( l, "LIFETIME" )) info->lease_time = strtoul( value, NULL, 10 );
++        else if (!strcmp( l, "DNS" )) add_addr_list( info->dns, &info->dns_count, ARRAY_SIZE(info->dns), value );
++        else if (!strcmp( l, "DOMAINNAME" )) copy_str( info->domain, value, sizeof(info->domain) );
++    }
++    fclose( f );
++    info->dhcp = TRUE;
++    info->source = 3;
++    if (info->obtained && info->lease_time) info->expires = info->obtained + info->lease_time;
++    return TRUE;
++}
++
++#ifdef HAVE_LINUX_RTNETLINK_H
++/* Without a DHCP client's own record, the kernel tells: a DHCP client gives the address it leased
++ * the lease's lifetime, a fixed address is permanent (IFA_F_PERMANENT, "valid_lft forever"). */
++static BOOL read_address_lifetimes( UINT index, struct nsi_dhcp4_info *info )
++{
++    struct
++    {
++        struct nlmsghdr hdr;
++        struct ifaddrmsg msg;
++    } req;
++    char buffer[16384];
++    BOOL found = FALSE, done = FALSE;
++    struct timespec now, mono;
++    int fd, len;
++
++    if ((fd = socket( AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE )) < 0) return FALSE;
++    memset( &req, 0, sizeof(req) );
++    req.hdr.nlmsg_len = NLMSG_LENGTH( sizeof(req.msg) );
++    req.hdr.nlmsg_type = RTM_GETADDR;
++    req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
++    req.msg.ifa_family = AF_INET;
++    if (send( fd, &req, req.hdr.nlmsg_len, 0 ) < 0)
++    {
++        close( fd );
++        return FALSE;
++    }
++    clock_gettime( CLOCK_REALTIME, &now );
++    clock_gettime( CLOCK_MONOTONIC, &mono );
++    while (!done && (len = recv( fd, buffer, sizeof(buffer), 0 )) > 0)
++    {
++        struct nlmsghdr *nlh;
++
++        for (nlh = (struct nlmsghdr *)buffer; NLMSG_OK( nlh, len ); nlh = NLMSG_NEXT( nlh, len ))
++        {
++            struct ifaddrmsg *ifa = NLMSG_DATA( nlh );
++            struct ifa_cacheinfo *ci = NULL;
++            UINT flags, attr_len;
++            LONGLONG elapsed;
++            struct rtattr *rta;
++
++            if (nlh->nlmsg_type == NLMSG_DONE || nlh->nlmsg_type == NLMSG_ERROR) { done = TRUE; break; }
++            if (nlh->nlmsg_type != RTM_NEWADDR || ifa->ifa_index != index || found) continue;
++            flags = ifa->ifa_flags;
++            attr_len = IFA_PAYLOAD( nlh );
++            for (rta = IFA_RTA( ifa ); RTA_OK( rta, attr_len ); rta = RTA_NEXT( rta, attr_len ))
++            {
++                if (rta->rta_type == IFA_FLAGS) flags = *(UINT *)RTA_DATA( rta );
++                else if (rta->rta_type == IFA_CACHEINFO) ci = RTA_DATA( rta );
++            }
++            if (ifa->ifa_scope != RT_SCOPE_UNIVERSE && ifa->ifa_scope != RT_SCOPE_SITE) continue;
++            found = TRUE;
++            if (flags & IFA_F_PERMANENT || !ci || ci->ifa_valid == ~0u) continue;
++            /* tstamp: when the address was last updated (the lease obtained or renewed), in hundredths
++             * of a second of the monotonic clock; its valid lifetime counts down from then */
++            elapsed = mono.tv_sec - (LONGLONG)ci->tstamp / 100;
++            if (elapsed < 0) elapsed = 0;
++            info->dhcp = TRUE;
++            info->obtained = now.tv_sec - elapsed;
++            info->expires = now.tv_sec + ci->ifa_valid;
++            info->lease_time = ci->ifa_valid + elapsed;
++        }
++    }
++    close( fd );
++    if (found) info->source = 4;
++    return found;
++}
++#else
++static BOOL read_address_lifetimes( UINT index, struct nsi_dhcp4_info *info )
++{
++    return FALSE;
++}
++#endif
++
++/* the name servers and search domains of a resolv.conf */
++static BOOL read_resolv_conf( const char *path, UINT *list, UINT *count, UINT max, char *search, UINT search_size )
++{
++    char line[1024];
++    FILE *f;
++
++    if (!(f = fopen( path, "r" ))) return FALSE;
++    *count = 0;
++    if (search) *search = 0;
++    while (fgets( line, sizeof(line), f ))
++    {
++        char *l = trim( line );
++
++        if (!strncmp( l, "nameserver", 10 ) && (l[10] == ' ' || l[10] == '\t'))
++            add_addr( list, count, max, trim( l + 11 ) );
++        else if (search && !strncmp( l, "search", 6 ) && (l[6] == ' ' || l[6] == '\t'))
++            copy_str( search, trim( l + 7 ), search_size );
++    }
++    fclose( f );
++    return TRUE;
++}
++
++/* The system's own name servers. Behind systemd-resolved's stub (127.0.0.53, 127.0.0.54) they are
++ * the ones resolved forwards to, which it lists in /run/systemd/resolve/resolv.conf. */
++static void read_system_dns( struct nsi_dhcp4_info *info )
++{
++    UINT i, stub = 0, list[ARRAY_SIZE(info->system_dns)], count = 0;
++    char search[sizeof(info->search)];
++
++    if (!read_resolv_conf( "/etc/resolv.conf", info->system_dns, &info->system_dns_count,
++                           ARRAY_SIZE(info->system_dns), info->search, sizeof(info->search) ))
++        return;
++    for (i = 0; i < info->system_dns_count; i++)
++        if (info->system_dns[i] == IPV4_ADDR( 127, 0, 0, 53 ) || info->system_dns[i] == IPV4_ADDR( 127, 0, 0, 54 ))
++            stub++;
++    if (stub && stub == info->system_dns_count &&
++        read_resolv_conf( "/run/systemd/resolve/resolv.conf", list, &count, ARRAY_SIZE(list), search, sizeof(search) ))
++    {
++        memcpy( info->system_dns, list, count * sizeof(*list) );
++        info->system_dns_count = count;
++        if (!info->search[0] || !strcmp( info->search, "." )) strcpy( info->search, search );
++    }
++    if (!strcmp( info->search, "." )) info->search[0] = 0;
++}
++
++static BOOL read_hex_file( const char *dir, const char *name, UINT *value )
++{
++    char path[PATH_MAX], buf[32];
++    FILE *f;
++    BOOL ret = FALSE;
++
++    snprintf( path, sizeof(path), "%s/%s", dir, name );
++    if (!(f = fopen( path, "r" ))) return FALSE;
++    if (fgets( buf, sizeof(buf), f )) { *value = strtoul( buf, NULL, 16 ); ret = TRUE; }
++    fclose( f );
++    return ret;
++}
++
++/* the bus device behind an interface, for its Plug and Play device instance ID */
++static void read_hardware( UINT index, struct nsi_dhcp4_info *info )
++{
++    char name[IF_NAMESIZE], dir[PATH_MAX], real[PATH_MAX], *base;
++    UINT value;
++
++    if (!if_indextoname( index, name )) return;
++    snprintf( dir, sizeof(dir), "/sys/class/net/%s/wireless", name );
++    info->wireless = !access( dir, F_OK );
++    snprintf( dir, sizeof(dir), "/sys/class/net/%s/device", name );
++    if (!realpath( dir, real )) return;
++    base = strrchr( real, '/' ) + 1;
++    if (read_hex_file( real, "vendor", &value ) && read_hex_file( real, "device", &info->hw_device ))
++    {
++        info->bus = 1; /* PCI */
++        info->hw_vendor = value;
++        read_hex_file( real, "subsystem_vendor", &info->hw_subvendor );
++        read_hex_file( real, "subsystem_device", &info->hw_subdevice );
++        read_hex_file( real, "revision", &info->hw_revision );
++        copy_str( info->hw_location, base, sizeof(info->hw_location) );
++        return;
++    }
++    /* a USB interface: the device's ids are one directory up */
++    if ((base = strrchr( real, '/' ))) *base = 0;
++    if (read_hex_file( real, "idVendor", &value ) && read_hex_file( real, "idProduct", &info->hw_device ))
++    {
++        info->bus = 2; /* USB */
++        info->hw_vendor = value;
++        copy_str( info->hw_location, strrchr( real, '/' ) + 1, sizeof(info->hw_location) );
++    }
++}
++
++NTSTATUS unix_nsi_get_dhcp4_info( void *args )
++{
++    struct nsi_get_dhcp4_info_params *params = args;
++    struct nsi_dhcp4_info *info = params->info;
++
++    memset( info, 0, sizeof(*info) );
++    if (!read_nm_device( params->if_index, info ) && !read_networkd_lease( params->if_index, info ))
++        read_address_lifetimes( params->if_index, info );
++    read_system_dns( info );
++    read_hardware( params->if_index, info );
++    TRACE( "if %u: source %u dhcp %u server %08x lease %u dns %u system dns %u bus %u\n", params->if_index,
++           info->source, info->dhcp, info->server, info->lease_time, info->dns_count, info->system_dns_count, info->bus );
++    return STATUS_SUCCESS;
++}
+--- a/dlls/nsiproxy.sys/nsi.c
++++ b/dlls/nsiproxy.sys/nsi.c
+@@ -294,4 +294,5 @@
+     unix_nsi_get_all_parameters_ex,
+     unix_nsi_get_parameter_ex,
+     unix_nsi_get_notification,
++    unix_nsi_get_dhcp4_info,
+ };
+--- a/dlls/nsiproxy.sys/nsiproxy_private.h
++++ b/dlls/nsiproxy.sys/nsiproxy_private.h
+@@ -91,3 +91,37 @@
+     NPI_MODULEID module;
+     UINT32 table;
+ };
++
++/* Stained Glass OS: an interface's IPv4 configuration as the Linux side has it (dhcp.c), for the
++ * TCP/IP registry keys (tcpipreg.c) */
++struct nsi_dhcp4_info
++{
++    UINT source;            /* 0 nothing known, 1 NetworkManager lease, 2 NetworkManager without one,
++                               3 networkd lease, 4 the address's lifetime */
++    BOOL dhcp;
++    UINT server;            /* the DHCP server, network order; 0 unknown */
++    UINT lease_time;        /* seconds */
++    LONGLONG obtained;      /* Unix times; 0 unknown */
++    LONGLONG expires;
++    UINT dns[4];            /* the lease's name servers */
++    UINT dns_count;
++    char domain[256];       /* the lease's domain name */
++    UINT system_dns[8];     /* the name servers the system uses (behind a local stub: its upstreams) */
++    UINT system_dns_count;
++    char search[512];       /* the system's search domains */
++    BOOL wireless;
++    UINT bus;               /* the device behind the interface: 0 none (virtual), 1 PCI, 2 USB */
++    UINT hw_vendor, hw_device, hw_subvendor, hw_subdevice, hw_revision;
++    char hw_location[64];   /* the bus address: PCI 0000:04:00.0, USB 1-2 */
++};
++
++struct nsi_get_dhcp4_info_params
++{
++    UINT if_index;
++    struct nsi_dhcp4_info *info;
++};
++
++/* PE side (device.c, tcpipreg.c) */
++NTSTATUS nsiproxy_get_dhcp4_info( UINT if_index, struct nsi_dhcp4_info *info );
++void tcpip_registry_start( void );
++void tcpip_registry_changed( const NPI_MODULEID *module, UINT table );
+--- /dev/null
++++ b/dlls/nsiproxy.sys/tcpipreg.c
+@@ -0,0 +1,598 @@
++/*
++ * nsiproxy.sys: the TCP/IP registry keys, as Windows' TCP/IP driver and DHCP client keep them.
++ * Stained Glass OS.
++ *
++ * Windows keeps each adapter's IPv4 configuration under
++ * HKLM\System\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{adapter GUID}: EnableDHCP,
++ * the fixed IPAddress/SubnetMask/DefaultGateway/NameServer or the lease's DhcpIPAddress,
++ * DhcpSubnetMask, DhcpServer, DhcpDefaultGateway, DhcpNameServer, DhcpDomain and lease times, and
++ * updates them whenever the network changes. Programs read them directly: dnspython (Electrum,
++ * many Python programs) takes its name servers from there, after checking that the adapter's
++ * device (Control\Network\{4D36E972-...}\{GUID}\Connection PnpInstanceID, then Enum\<id>
++ * ConfigFlags) is not disabled; others find the adapters' NetCfgInstanceId and characteristics
++ * under Control\Class\{4D36E972-...}. Nothing wrote any of it: dnspython failed with
++ * FileNotFoundError.
++ *
++ * nsiproxy is the machine's TCP/IP driver here (it runs once per prefix, for the shared prefix
++ * as SYSTEM), so it keeps the keys: at start, when an address, route or interface changes (its
++ * netlink notifications), and every two minutes. The adapters and their GUIDs are the ones
++ * GetAdaptersAddresses reports; whether an address is leased, and the lease's server, times,
++ * name servers and domain come from the Linux side (dhcp.c). Values are only written when they
++ * change, so a program that watches the keys (RegNotifyChangeKeyValue) hears of real changes.
++ * Keys of adapters that are gone are removed (only those of nsiproxy's own adapter GUIDs).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "winreg.h"
++#include "winsock2.h"
++#include "ws2ipdef.h"
++#include "iphlpapi.h"
++#include "netiodef.h"
++#include "wine/nsi.h"
++#include "wine/debug.h"
++
++#include "nsiproxy_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(nsi);
++
++static HANDLE changed_event;
++
++static const WCHAR params_path[] = L"System\\CurrentControlSet\\Services\\Tcpip\\Parameters";
++static const WCHAR interfaces_path[] = L"System\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces";
++static const WCHAR network_path[] = L"System\\CurrentControlSet\\Control\\Network\\{4D36E972-E325-11CE-BFC1-08002BE10318}";
++static const WCHAR class_path[] = L"System\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}";
++static const WCHAR enum_path[] = L"System\\CurrentControlSet\\Enum";
++static const WCHAR net_class_guid[] = L"{4d36e972-e325-11ce-bfc1-08002be10318}";
++/* nsiproxy's adapter GUIDs end in "NetDev" (ndis.c) */
++static const WCHAR netdev_guid_tail[] = L"-4E6574446576}";
++
++#define MAX_ADAPTERS 64
++
++/* a REG_MULTI_SZ or a separated list being built */
++struct text_list
++{
++    WCHAR buf[1024];
++    unsigned int len;
++    unsigned int count;
++};
++
++static void list_add( struct text_list *list, const WCHAR *str, WCHAR sep )
++{
++    unsigned int n = wcslen( str );
++
++    if (list->len + n + 2 >= ARRAY_SIZE(list->buf)) return;
++    if (sep && list->count) list->buf[list->len++] = sep;
++    memcpy( list->buf + list->len, str, n * sizeof(WCHAR) );
++    list->len += n;
++    if (!sep) list->len++;  /* REG_MULTI_SZ: keep the terminator */
++    list->buf[list->len] = 0;
++    list->count++;
++}
++
++static void ipv4_text( UINT addr, WCHAR *buf, unsigned int size )
++{
++    const BYTE *b = (const BYTE *)&addr;
++    swprintf( buf, size, L"%u.%u.%u.%u", b[0], b[1], b[2], b[3] );
++}
++
++static UINT prefix_mask( unsigned int len )
++{
++    return len ? RtlUlongByteSwap( ~0u << (32 - min( len, 32 )) ) : 0;
++}
++
++static void set_value( HKEY key, const WCHAR *name, DWORD type, const void *data, DWORD size )
++{
++    BYTE old[4096];
++    DWORD old_type, old_size = sizeof(old);
++
++    if (!RegQueryValueExW( key, name, NULL, &old_type, old, &old_size ) && old_type == type &&
++        old_size == size && !memcmp( old, data, size ))
++        return;
++    RegSetValueExW( key, name, 0, type, data, size );
++}
++
++static void set_sz( HKEY key, const WCHAR *name, const WCHAR *str )
++{
++    set_value( key, name, REG_SZ, str, (wcslen( str ) + 1) * sizeof(WCHAR) );
++}
++
++static void set_dword( HKEY key, const WCHAR *name, DWORD value )
++{
++    set_value( key, name, REG_DWORD, &value, sizeof(value) );
++}
++
++/* a time worked out from the address's lifetime moves by a second between two reads of the clocks:
++ * kept when it is that close, so that nothing changes when nothing did */
++static void set_dword_near( HKEY key, const WCHAR *name, DWORD value, BOOL near )
++{
++    DWORD old, type, size = sizeof(old);
++
++    if (near && !RegQueryValueExW( key, name, NULL, &type, (BYTE *)&old, &size ) && type == REG_DWORD &&
++        old - value + 2 <= 4)
++        return;
++    set_dword( key, name, value );
++}
++
++static void set_multi( HKEY key, const WCHAR *name, const struct text_list *list )
++{
++    if (!list->count) RegDeleteValueW( key, name );
++    else set_value( key, name, REG_MULTI_SZ, list->buf, (list->len + 1) * sizeof(WCHAR) );
++}
++
++static void set_multi1( HKEY key, const WCHAR *name, const WCHAR *str )
++{
++    struct text_list list = {{0}};
++    list_add( &list, str, 0 );
++    set_multi( key, name, &list );
++}
++
++static void delete_values( HKEY key, const WCHAR *const *names )
++{
++    for (; *names; names++) RegDeleteValueW( key, *names );
++}
++
++static BOOL get_dword( HKEY key, const WCHAR *name, DWORD *value )
++{
++    DWORD type, size = sizeof(*value);
++    return !RegQueryValueExW( key, name, NULL, &type, (BYTE *)value, &size ) && type == REG_DWORD;
++}
++
++static BOOL get_sz( HKEY key, const WCHAR *name, WCHAR *buf, DWORD len )
++{
++    DWORD type, size = len * sizeof(WCHAR);
++    if (RegQueryValueExW( key, name, NULL, &type, (BYTE *)buf, &size ) || type != REG_SZ) return FALSE;
++    buf[min( size / sizeof(WCHAR), len - 1 )] = 0;
++    return TRUE;
++}
++
++static HKEY create_key( HKEY root, const WCHAR *path )
++{
++    HKEY key;
++    if (RegCreateKeyExW( root, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL )) return NULL;
++    return key;
++}
++
++static BOOL is_netdev_guid( const WCHAR *name )
++{
++    unsigned int len = wcslen( name ), tail = wcslen( netdev_guid_tail );
++    return len == 38 && name[0] == '{' && !wcsicmp( name + len - tail, netdev_guid_tail );
++}
++
++static DWORD unix_time_dword( LONGLONG t )
++{
++    return t > 0 && t < 0xffffffff ? (DWORD)t : 0;
++}
++
++static const WCHAR *const static_values[] = { L"IPAddress", L"SubnetMask", L"DefaultGateway", NULL };
++static const WCHAR *const lease_values[] =
++{
++    L"DhcpIPAddress", L"DhcpSubnetMask", L"DhcpSubnetMaskOpt", L"DhcpServer", L"Lease", L"LeaseObtainedTime",
++    L"LeaseTerminatesTime", L"T1", L"T2", L"DhcpDefaultGateway", L"DhcpNameServer", L"DhcpDomain", NULL
++};
++
++/* an adapter on DHCP without a lease (no address, the cable out): what Windows shows after the
++ * lease is released */
++static void set_released( HKEY key )
++{
++    static const WCHAR *const gone[] =
++    {
++        L"DhcpSubnetMaskOpt", L"Lease", L"LeaseObtainedTime", L"LeaseTerminatesTime", L"T1", L"T2",
++        L"DhcpDefaultGateway", L"DhcpNameServer", L"DhcpDomain", NULL
++    };
++    set_dword( key, L"EnableDHCP", 1 );
++    set_sz( key, L"DhcpIPAddress", L"0.0.0.0" );
++    set_sz( key, L"DhcpSubnetMask", L"255.0.0.0" );
++    set_sz( key, L"DhcpServer", L"255.255.255.255" );
++    delete_values( key, gone );
++}
++
++static BOOL in_list( UINT addr, const UINT *list, UINT count )
++{
++    UINT i;
++    for (i = 0; i < count; i++) if (list[i] == addr) return TRUE;
++    return FALSE;
++}
++
++static void dns_text( const UINT *list, UINT count, WCHAR sep, struct text_list *out )
++{
++    WCHAR buf[16];
++    UINT i;
++
++    for (i = 0; i < count; i++)
++    {
++        ipv4_text( list[i], buf, ARRAY_SIZE(buf) );
++        list_add( out, buf, sep );
++    }
++}
++
++/* Tcpip\Parameters\Interfaces\{GUID} */
++static void update_interface( HKEY interfaces, const WCHAR *guid, IP_ADAPTER_ADDRESSES *aa,
++                              const struct nsi_dhcp4_info *info )
++{
++    struct text_list addrs = {{0}}, masks = {{0}}, gws = {{0}}, servers = {{0}};
++    IP_ADAPTER_UNICAST_ADDRESS *uni;
++    IP_ADAPTER_GATEWAY_ADDRESS *gw;
++    WCHAR buf[64], first_addr[16] = {0}, first_mask[16] = {0};
++    DWORD dhcp;
++    HKEY key;
++
++    if (!(key = create_key( interfaces, guid ))) return;
++
++    for (uni = aa->FirstUnicastAddress; uni; uni = uni->Next)
++    {
++        SOCKADDR_IN *sin = (SOCKADDR_IN *)uni->Address.lpSockaddr;
++
++        if (sin->sin_family != AF_INET) continue;
++        ipv4_text( sin->sin_addr.S_un.S_addr, buf, ARRAY_SIZE(buf) );
++        list_add( &addrs, buf, 0 );
++        if (addrs.count == 1) wcscpy( first_addr, buf );
++        ipv4_text( prefix_mask( uni->OnLinkPrefixLength ), buf, ARRAY_SIZE(buf) );
++        list_add( &masks, buf, 0 );
++        if (masks.count == 1) wcscpy( first_mask, buf );
++    }
++    for (gw = aa->FirstGatewayAddress; gw; gw = gw->Next)
++    {
++        SOCKADDR_IN *sin = (SOCKADDR_IN *)gw->Address.lpSockaddr;
++
++        if (sin->sin_family != AF_INET) continue;
++        ipv4_text( sin->sin_addr.S_un.S_addr, buf, ARRAY_SIZE(buf) );
++        list_add( &gws, buf, 0 );
++    }
++
++    if (!addrs.count)
++    {
++        /* no address now: an adapter on DHCP has lost its lease; a fixed configuration stays as
++         * it is, as Windows keeps it while the cable is out. A new adapter is on DHCP. */
++        if (!get_dword( key, L"EnableDHCP", &dhcp ) || dhcp) set_released( key );
++    }
++    else if (info->dhcp)
++    {
++        set_dword( key, L"EnableDHCP", 1 );
++        set_sz( key, L"DhcpIPAddress", first_addr );
++        set_sz( key, L"DhcpSubnetMask", first_mask );
++        set_multi1( key, L"DhcpSubnetMaskOpt", first_mask );
++        if (info->server) ipv4_text( info->server, buf, ARRAY_SIZE(buf) );
++        else wcscpy( buf, L"255.255.255.255" );
++        set_sz( key, L"DhcpServer", buf );
++        if (info->lease_time && info->obtained)
++        {
++            BOOL near = info->source == 4;
++
++            set_dword_near( key, L"Lease", info->lease_time, near );
++            set_dword_near( key, L"LeaseObtainedTime", unix_time_dword( info->obtained ), near );
++            set_dword_near( key, L"LeaseTerminatesTime", unix_time_dword( info->obtained + info->lease_time ), near );
++            set_dword_near( key, L"T1", unix_time_dword( info->obtained + info->lease_time / 2 ), near );
++            set_dword_near( key, L"T2", unix_time_dword( info->obtained + (LONGLONG)info->lease_time * 7 / 8 ), near );
++        }
++        set_multi( key, L"DhcpDefaultGateway", &gws );
++        /* the lease's name servers; when only the address's lifetime told of the lease, the ones
++         * the system uses */
++        if (info->dns_count) dns_text( info->dns, info->dns_count, ' ', &servers );
++        else if (info->source == 4) dns_text( info->system_dns, info->system_dns_count, ' ', &servers );
++        if (servers.count) set_sz( key, L"DhcpNameServer", servers.buf );
++        else RegDeleteValueW( key, L"DhcpNameServer" );
++        if (info->domain[0])
++        {
++            MultiByteToWideChar( CP_UTF8, 0, info->domain, -1, buf, ARRAY_SIZE(buf) );
++            set_sz( key, L"DhcpDomain", buf );
++        }
++        else RegDeleteValueW( key, L"DhcpDomain" );
++        /* name servers set by hand over a lease's (the system uses none of the lease's): the
++         * fixed NameServer, as on Windows */
++        servers.len = servers.count = 0;
++        servers.buf[0] = 0;
++        if (info->dns_count && info->system_dns_count)
++        {
++            UINT i;
++            for (i = 0; i < info->dns_count; i++) if (in_list( info->dns[i], info->system_dns, info->system_dns_count )) break;
++            if (i == info->dns_count) dns_text( info->system_dns, info->system_dns_count, ',', &servers );
++        }
++        set_sz( key, L"NameServer", servers.buf );
++        set_dword( key, L"AddressType", 0 );
++        delete_values( key, static_values );
++    }
++    else
++    {
++        set_dword( key, L"EnableDHCP", 0 );
++        set_multi( key, L"IPAddress", &addrs );
++        set_multi( key, L"SubnetMask", &masks );
++        set_multi( key, L"DefaultGateway", &gws );
++        dns_text( info->system_dns, info->system_dns_count, ',', &servers );
++        set_sz( key, L"NameServer", servers.buf );
++        delete_values( key, lease_values );
++    }
++    /* the connection-specific suffix an administrator sets; none by default */
++    if (RegQueryValueExW( key, L"Domain", NULL, NULL, NULL, NULL )) set_sz( key, L"Domain", L"" );
++    RegCloseKey( key );
++}
++
++/* the adapter's Control\Class\{4D36E972-...}\NNNN: the one naming its GUID, or the first free */
++static int find_class_index( HKEY class, const WCHAR *guid, BOOL *found )
++{
++    WCHAR name[16], value[64];
++    BYTE used[1000] = {0};
++    DWORD i, len;
++    HKEY key;
++
++    *found = FALSE;
++    for (i = 0; len = ARRAY_SIZE(name), !RegEnumKeyExW( class, i, name, &len, NULL, NULL, NULL, NULL ); i++)
++    {
++        WCHAR *end;
++        long n = wcstol( name, &end, 10 );
++
++        if (*end || len != 4 || n < 0 || n >= ARRAY_SIZE(used)) continue;
++        used[n] = 1;
++        if (RegOpenKeyExW( class, name, 0, KEY_QUERY_VALUE, &key )) continue;
++        if (get_sz( key, L"NetCfgInstanceId", value, ARRAY_SIZE(value) ) && !wcsicmp( value, guid ))
++        {
++            RegCloseKey( key );
++            *found = TRUE;
++            return n;
++        }
++        RegCloseKey( key );
++    }
++    for (i = 0; i < ARRAY_SIZE(used); i++) if (!used[i]) return i;
++    return -1;
++}
++
++/* the device behind the adapter: Enum\<instance ID>, Control\Class\{4D36E972-...}\NNNN and
++ * Control\Network\{4D36E972-...}\{GUID}\Connection */
++static void update_device( const WCHAR *guid, IP_ADAPTER_ADDRESSES *aa, const struct nsi_dhcp4_info *info )
++{
++    WCHAR id[200], hwid[160], location[64], path[300], driver[64];
++    struct text_list hwids = {{0}};
++    HKEY class, key;
++    BOOL found;
++    int index;
++    unsigned int i;
++
++    if (!(class = create_key( HKEY_LOCAL_MACHINE, class_path ))) return;
++    if ((index = find_class_index( class, guid, &found )) < 0)
++    {
++        RegCloseKey( class );
++        return;
++    }
++    MultiByteToWideChar( CP_UTF8, 0, info->hw_location, -1, location, ARRAY_SIZE(location) );
++    for (i = 0; location[i]; i++) if (location[i] == ':' || location[i] == '.' || location[i] == '-') location[i] = '_';
++    if (info->bus == 1)
++    {
++        swprintf( hwid, ARRAY_SIZE(hwid), L"PCI\\VEN_%04X&DEV_%04X&SUBSYS_%04X%04X&REV_%02X", info->hw_vendor,
++                  info->hw_device, info->hw_subdevice, info->hw_subvendor, info->hw_revision );
++        swprintf( id, ARRAY_SIZE(id), L"%s\\4&%s&0", hwid, location );
++        list_add( &hwids, hwid, 0 );
++        swprintf( hwid, ARRAY_SIZE(hwid), L"PCI\\VEN_%04X&DEV_%04X", info->hw_vendor, info->hw_device );
++        list_add( &hwids, hwid, 0 );
++    }
++    else if (info->bus == 2)
++    {
++        swprintf( hwid, ARRAY_SIZE(hwid), L"USB\\VID_%04X&PID_%04X", info->hw_vendor, info->hw_device );
++        swprintf( id, ARRAY_SIZE(id), L"%s\\5&%s&0", hwid, location );
++        list_add( &hwids, hwid, 0 );
++    }
++    else
++    {
++        wcscpy( hwid, L"ROOT\\NET" );
++        swprintf( id, ARRAY_SIZE(id), L"ROOT\\NET\\%04u", index );
++        list_add( &hwids, L"*SGNET", 0 );
++    }
++    swprintf( driver, ARRAY_SIZE(driver), L"%s\\%04u", net_class_guid, index );
++
++    swprintf( path, ARRAY_SIZE(path), L"%04u", index );
++    if ((key = create_key( class, path )))
++    {
++        WCHAR lower[160];
++
++        set_sz( key, L"NetCfgInstanceId", guid );
++        set_sz( key, L"DriverDesc", aa->Description );
++        set_sz( key, L"DeviceInstanceID", id );
++        for (i = 0; hwids.buf[i] && i < ARRAY_SIZE(lower) - 1; i++) lower[i] = towlower( hwids.buf[i] );
++        lower[i] = 0;
++        set_sz( key, L"ComponentId", lower );
++        set_sz( key, L"MatchingDeviceId", lower );
++        /* NCF_PHYSICAL | NCF_HAS_UI for a device on a bus, NCF_VIRTUAL otherwise */
++        set_dword( key, L"Characteristics", info->bus ? 0x84 : 0x1 );
++        set_dword( key, L"*IfType", aa->IfType );
++        set_dword( key, L"*MediaType", info->wireless ? 16 /* NdisMediumNative802_11 */ : 0 /* NdisMedium802_3 */ );
++        set_dword( key, L"*PhysicalMediaType", !info->bus ? 0 : info->wireless ? 9 /* Native802_11 */ : 14 /* 802_3 */ );
++        set_dword( key, L"NetLuidIndex", aa->Luid.Info.NetLuidIndex );
++        RegCloseKey( key );
++    }
++    RegCloseKey( class );
++
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", enum_path, id );
++    if ((key = create_key( HKEY_LOCAL_MACHINE, path )))
++    {
++        DWORD flags;
++
++        set_sz( key, L"Class", L"Net" );
++        set_sz( key, L"ClassGUID", net_class_guid );
++        set_sz( key, L"Driver", driver );
++        set_sz( key, L"DeviceDesc", aa->Description );
++        set_sz( key, L"Mfg", info->bus ? L"(Standard network adapters)" : L"Stained Glass OS" );
++        set_multi( key, L"HardwareID", &hwids );
++        /* an administrator may have disabled the device (CONFIGFLAG_DISABLED): kept */
++        if (!get_dword( key, L"ConfigFlags", &flags )) set_dword( key, L"ConfigFlags", 0 );
++        RegCloseKey( key );
++    }
++
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s\\Connection", network_path, guid );
++    if ((key = create_key( HKEY_LOCAL_MACHINE, path )))
++    {
++        set_sz( key, L"Name", aa->FriendlyName );
++        set_sz( key, L"PnpInstanceID", id );
++        set_dword( key, L"MediaSubType", info->wireless ? 2 : 1 );
++        RegCloseKey( key );
++    }
++}
++
++/* an adapter that is gone: its keys go too */
++static void remove_adapter( const WCHAR *guid )
++{
++    WCHAR path[300], name[16], value[200];
++    HKEY class, key;
++    DWORD i, len;
++
++    TRACE( "removing %s\n", debugstr_w( guid ) );
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", interfaces_path, guid );
++    RegDeleteTreeW( HKEY_LOCAL_MACHINE, path );
++    RegDeleteKeyW( HKEY_LOCAL_MACHINE, path );
++    swprintf( path, ARRAY_SIZE(path), L"%s\\%s", network_path, guid );
++    RegDeleteTreeW( HKEY_LOCAL_MACHINE, path );
++    RegDeleteKeyW( HKEY_LOCAL_MACHINE, path );
++
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, class_path, 0, KEY_ALL_ACCESS, &class )) return;
++    for (i = 0; len = ARRAY_SIZE(name), !RegEnumKeyExW( class, i, name, &len, NULL, NULL, NULL, NULL ); i++)
++    {
++        if (RegOpenKeyExW( class, name, 0, KEY_QUERY_VALUE, &key )) continue;
++        if (!get_sz( key, L"NetCfgInstanceId", value, ARRAY_SIZE(value) ) || wcsicmp( value, guid ))
++        {
++            RegCloseKey( key );
++            continue;
++        }
++        if (get_sz( key, L"DeviceInstanceID", value, ARRAY_SIZE(value) ) && value[0])
++        {
++            WCHAR *slash;
++
++            swprintf( path, ARRAY_SIZE(path), L"%s\\%s", enum_path, value );
++            RegDeleteTreeW( HKEY_LOCAL_MACHINE, path );
++            RegDeleteKeyW( HKEY_LOCAL_MACHINE, path );
++            /* and the hardware ID's key, when no other instance is left in it */
++            if ((slash = wcsrchr( path, '\\' )))
++            {
++                *slash = 0;
++                RegDeleteKeyW( HKEY_LOCAL_MACHINE, path );
++            }
++        }
++        RegCloseKey( key );
++        RegDeleteTreeW( class, name );
++        RegDeleteKeyW( class, name );
++        break;
++    }
++    RegCloseKey( class );
++}
++
++static void update_tcpip_registry(void)
++{
++    static const ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
++                               GAA_FLAG_INCLUDE_ALL_INTERFACES;
++    WCHAR present[MAX_ADAPTERS][40], name[64], dhcp_domain[256] = {0}, buf[512];
++    struct text_list search = {{0}};
++    struct nsi_dhcp4_info *info;
++    IP_ADAPTER_ADDRESSES *addrs = NULL, *aa;
++    unsigned int count = 0, i;
++    ULONG size = 0, err;
++    HKEY interfaces, params;
++    DWORD len;
++
++    for (;;)
++    {
++        err = GetAdaptersAddresses( AF_UNSPEC, flags, NULL, addrs, &size );
++        if (err != ERROR_BUFFER_OVERFLOW) break;
++        free( addrs );
++        if (!(addrs = malloc( size ))) return;
++    }
++    if (err && err != ERROR_NO_DATA)
++    {
++        WARN( "GetAdaptersAddresses failed: %lu\n", err );
++        free( addrs );
++        return;
++    }
++    if (!(info = calloc( 1, sizeof(*info) )) || !(interfaces = create_key( HKEY_LOCAL_MACHINE, interfaces_path )))
++    {
++        free( info );
++        free( addrs );
++        return;
++    }
++
++    for (aa = err ? NULL : addrs; aa; aa = aa->Next)
++    {
++        WCHAR guid[40];
++
++        if (aa->IfType == IF_TYPE_SOFTWARE_LOOPBACK || count == MAX_ADAPTERS) continue;
++        if (!MultiByteToWideChar( CP_ACP, 0, aa->AdapterName, -1, guid, ARRAY_SIZE(guid) )) continue;
++        if (nsiproxy_get_dhcp4_info( aa->IfIndex, info )) memset( info, 0, sizeof(*info) );
++        wcscpy( present[count++], guid );
++        update_interface( interfaces, guid, aa, info );
++        update_device( guid, aa, info );
++        if (info->dhcp && info->domain[0] && !dhcp_domain[0])
++            MultiByteToWideChar( CP_UTF8, 0, info->domain, -1, dhcp_domain, ARRAY_SIZE(dhcp_domain) );
++    }
++
++    for (i = 0; len = ARRAY_SIZE(name), !RegEnumKeyExW( interfaces, i, name, &len, NULL, NULL, NULL, NULL ); i++)
++    {
++        unsigned int j;
++
++        if (!is_netdev_guid( name )) continue;
++        for (j = 0; j < count; j++) if (!wcsicmp( present[j], name )) break;
++        if (j < count) continue;
++        remove_adapter( name );
++        i--;
++    }
++    RegCloseKey( interfaces );
++    /* the system's own settings, without an adapter */
++    if (!count && nsiproxy_get_dhcp4_info( 0, info )) memset( info, 0, sizeof(*info) );
++
++    if ((params = create_key( HKEY_LOCAL_MACHINE, params_path )))
++    {
++        WCHAR *tok, *ctx;
++
++        if (dhcp_domain[0]) set_sz( params, L"DhcpDomain", dhcp_domain );
++        else RegDeleteValueW( params, L"DhcpDomain" );
++        /* the search domains the system has beyond the leases' own domains */
++        MultiByteToWideChar( CP_UTF8, 0, info->search, -1, buf, ARRAY_SIZE(buf) );
++        for (tok = wcstok( buf, L" \t", &ctx ); tok; tok = wcstok( NULL, L" \t", &ctx ))
++            if (wcsicmp( tok, dhcp_domain ) && wcscmp( tok, L"." )) list_add( &search, tok, ',' );
++        set_sz( params, L"SearchList", search.buf );
++        RegCloseKey( params );
++    }
++    free( info );
++    free( addrs );
++}
++
++static DWORD WINAPI tcpip_registry_thread( void *arg )
++{
++    for (;;)
++    {
++        update_tcpip_registry();
++        /* a change comes as a burst of notifications (addresses, routes, the link): settle first */
++        if (!WaitForSingleObject( changed_event, 120 * 1000 ))
++            while (!WaitForSingleObject( changed_event, 300 )) ;
++    }
++    return 0;
++}
++
++void tcpip_registry_changed( const NPI_MODULEID *module, UINT table )
++{
++#ifndef SG_MUTANT_TCPIPREG_NO_FOLLOW
++    if (changed_event) SetEvent( changed_event );
++#endif
++}
++
++void tcpip_registry_start( void )
++{
++    HANDLE thread;
++
++    if (!(changed_event = CreateEventW( NULL, FALSE, FALSE, NULL ))) return;
++    if ((thread = CreateThread( NULL, 0, tcpip_registry_thread, NULL, 0, NULL ))) CloseHandle( thread );
++}
+--- a/dlls/nsiproxy.sys/unix_private.h
++++ b/dlls/nsiproxy.sys/unix_private.h
+@@ -27,6 +27,7 @@
+ NTSTATUS nsi_enumerate_all_ex( struct nsi_enumerate_all_ex *params );
+ NTSTATUS nsi_get_all_parameters_ex( struct nsi_get_all_parameters_ex *params );
+ NTSTATUS nsi_get_parameter_ex( struct nsi_get_parameter_ex *params );
++NTSTATUS unix_nsi_get_dhcp4_info( void *args );
+ 
+ static inline NTSTATUS nsi_enumerate_all( UINT unk, UINT unk2, const NPI_MODULEID *module, UINT table,
+                                           void *key_data, UINT key_size, void *rw_data, UINT rw_size,
