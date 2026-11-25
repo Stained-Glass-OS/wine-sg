@@ -2,6 +2,7 @@
  *   tcpipreg-probe dump          the adapters (GetAdaptersAddresses, GetAdaptersInfo) and their keys:
  *                                ADAPTER/INFO/VAL/PNP/CLASS/PARAM lines
  *   tcpipreg-probe wait MS       NOTIFY when Tcpip\Parameters\Interfaces changes within MS ms, else QUIET
+ *   tcpipreg-probe sleep MS      stays MS ms (keeps the prefix's drivers running)
  *   tcpipreg-probe write         READ ok|denied, WRITE ok|denied, CREATE ok|denied (as the caller)
  */
 #include <winsock2.h>
@@ -157,6 +158,7 @@ int main( int argc, char **argv )
     setvbuf( stdout, NULL, _IONBF, 0 );
     if (argc > 1 && !strcmp( argv[1], "dump" )) dump();
     else if (argc > 2 && !strcmp( argv[1], "wait" )) return wait_change( atoi( argv[2] ) );
+    else if (argc > 2 && !strcmp( argv[1], "sleep" )) Sleep( atoi( argv[2] ) );
     else if (argc > 1 && !strcmp( argv[1], "write" )) try_write();
     else { printf( "usage\n" ); return 2; }
     return 0;

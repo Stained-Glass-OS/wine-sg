@@ -1,6 +1,6 @@
 #!/bin/bash
 . "$(dirname "$0")/scratch-home.sh"
-# The TCP/IP registry keys as Windows keeps them (patches/sg/9250-9252, ledger i0493).
+# The TCP/IP registry keys as Windows keeps them (patches/sg/9250-9253, ledger i0493, i0084).
 #
 # Windows' TCP/IP driver and DHCP client keep HKLM\System\CurrentControlSet\Services\Tcpip\Parameters\
 # Interfaces\{adapter GUID} up to date (EnableDHCP, the fixed IPAddress/SubnetMask/DefaultGateway/
@@ -10,7 +10,8 @@
 # dnspython (Electrum) reads exactly these. 9250: nsiproxy keeps them from GetAdaptersAddresses and the
 # Linux side (NetworkManager's lease file, else the address's lifetime), and follows changes.
 # 9251: GetAdaptersInfo/GetAdaptersAddresses report DHCP, the DHCP server and lease from them (was
-# "DHCP enabled" for every adapter, no server). 9252: NV Hostname/NV Domain, SearchList.
+# "DHCP enabled" for every adapter, no server). 9252: NV Hostname/NV Domain, SearchList. 9253: an adapter's GUID
+# comes from its interface name (was the index), gone interfaces leave the table.
 #
 # In a private network and mount namespace of its own (dummy interfaces; /run a private tmpfs with a
 # NetworkManager device file and systemd-resolved's resolv.conf the gate writes; the host's network and
@@ -31,7 +32,8 @@
 #      and a dnspython wheel (dnspython-*.whl), else skipped
 #   WINE=... test/tcpipreg-gate.sh   (needs passwordless sudo; exit 77 otherwise)
 #   5. .NET (Wine Mono): NetworkInterface IsDhcpEnabled and DhcpServerAddresses (skipped without Wine Mono)
-# Mutants: nsiproxy SG_MUTANT_TCPIPREG_NO_FOLLOW (tcpipreg.c), SG_MUTANT_TCPIPREG_NO_NM (dhcp.c);
+# Mutants: nsiproxy SG_MUTANT_TCPIPREG_NO_FOLLOW (tcpipreg.c), SG_MUTANT_TCPIPREG_NO_NM (dhcp.c),
+#   SG_MUTANT_GUID_BY_INDEX (ndis.c, 9253);
 #   iphlpapi SG_MUTANT_GAI_DHCP_ALWAYS (iphlpapi_main.c).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -75,7 +77,6 @@ mkdir -p "$(dirname "$R")"; [ -e "$R" ] || : > "$R"
 mount --bind "$W/stub-resolv.conf" "$R" || { echo "FAIL resolv.conf bind"; exit 1; }
 ip link set lo up
 idx() { ip -o link show "$1" | cut -d: -f1; }
-guid() { printf '{%08X-0000-0000-0000-4E6574446576}' "$(idx "$1")"; }
 nm_lease() { # nm_lease DEV SERVER DNS DOMAIN LEASE EXPIRY
     printf '[device]\nmanaged=true\nconnection-uuid=00000000-0000-0000-0000-00000000000%s\n\n[dhcp4]\ndhcp4.dhcp_lease_time=%s\ndhcp4.dhcp_server_identifier=%s\ndhcp4.domain_name_servers=%s\ndhcp4.domain_name=%s\ndhcp4.expiry=%s\n' \
         "$(idx "$1")" "$5" "$2" "$3" "$4" "$6" > "/run/NetworkManager/devices/$(idx "$1")"; }
@@ -90,7 +91,6 @@ ip addr add 192.168.77.9/24 dev sgeth1
 ip addr add 10.88.0.7/16 dev sgeth3 valid_lft 1800 preferred_lft 1800
 ip route add default via 10.77.0.1 dev sgeth0 metric 100
 ip route add default via 192.168.77.1 dev sgeth1 metric 200
-A=$(guid sgeth0); B=$(guid sgeth1); D=$(guid sgeth3); L='{00000001-0000-0000-0000-4E6574446576}'
 
 asu() { local u=$1; shift; setpriv --reuid="$(id -u "$u")" --regid="$(id -g "$u")" --init-groups -- \
         env USER="$u" LOGNAME="$u" HOME="$W/home-$u" XDG_RUNTIME_DIR="$W/run-$u" "$@"; }
@@ -100,7 +100,7 @@ me mkdir -p "$WINEPREFIX"
 me timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 me cp "$W/probe.exe" "$WINEPREFIX/drive_c/probe.exe"
 # a Wine process that stays: nsiproxy keeps running between the probes
-me timeout -s KILL 900 "$WINE" 'C:\probe.exe' wait 880000 > "$W/keeper.out" 2>/dev/null &
+me timeout -s KILL 900 "$WINE" 'C:\probe.exe' sleep 880000 > "$W/keeper.out" 2>/dev/null &
 KEEPER=$!
 dump() { me timeout -s KILL 60 "$WINE" 'C:\probe.exe' dump 2>/dev/null | tr -d '\r' > "$W/dump"; }
 # until DUMP matches every pattern (up to 20 s)
@@ -109,7 +109,13 @@ await() { local t p ok; for t in $(seq 20); do dump; ok=1; for p in "$@"; do gre
 check() { local what=$1; shift; if await "$@"; then pass "$what"; else fail "$what"; for p in "$@"; do grep -qE -- "$p" "$W/dump" || echo "      missing: $p"; done; fi; }
 absent() { grep -qE -- "$2" "$W/dump" && fail "$1" || pass "$1"; }
 q() { printf '%s' "$1" | sed 's/[{}]/\\&/g'; }
+# an adapter's GUID, as GetAdaptersAddresses names it (up to 20 s for a new interface)
+guid() { local t g; for t in $(seq 20); do dump; g=$(sed -n "s/^ADAPTER \({[^ ]*}\) .* name $1 dhcpflag.*/\1/p" "$W/dump" | head -1)
+         [ -n "$g" ] && { printf '%s' "$g"; return; }; sleep 1; done; printf '{none-%s}' "$1"; }
+A=$(guid sgeth0); B=$(guid sgeth1); D=$(guid sgeth3); L=$(guid lo)
 qA=$(q "$A"); qB=$(q "$B"); qD=$(q "$D")
+case "$A$B$D" in *'{0000000'*) fail "adapter GUIDs are the interface index ($A $B $D)" ;; *none*) fail "no GUIDs ($A $B $D)" ;;
+*) pass "adapter GUIDs come from the interface (not its index)" ;; esac
 
 # 1. as written at start
 check "DHCP adapter (NetworkManager lease): EnableDHCP, address, mask, server, lease, gateway, name servers, domain" \
@@ -167,6 +173,14 @@ sleep 3
 dump
 absent "an interface gone: its Interfaces key goes" "^KEY $qC$"
 absent "an interface gone: its device and class keys go" "^(PNP|CLASS .*) $qC"
+# made again after another interface took the next index: the same adapter, the same GUID and keys
+ip link add sgeth9 type dummy; ip link add sgeth2 type dummy; ip link set sgeth2 up; ip addr add 172.30.0.2/16 dev sgeth2
+check "an interface made again (another index) keeps its GUID: GetAdaptersAddresses and its keys" \
+    "^ADAPTER $qC .* name sgeth2 " "^VAL $qC IPAddress multi \[172\.30\.0\.2\]$"
+[ "$(grep -c ' name sgeth2 ' "$W/dump")" = 1 ] && pass "one adapter for it, not the old one beside it" || fail "sgeth2 listed $(grep -c ' name sgeth2 ' "$W/dump") times"
+G9=$(q "$(guid sgeth9)")
+ip link del sgeth9
+for t in $(seq 20); do dump; grep -qE "^KEY $G9$" "$W/dump" || break; sleep 1; done
 waitnote 6000
 ip link set sgeth1 mtu 1400
 wait $WP
