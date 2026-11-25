@@ -123,6 +123,25 @@ def notepad(size):
     return body + band + rings + text_lines(size, 40, 86, left=26, right=74)
 
 
+def cube(cx, cy, r, sw):
+    """an isometric block, its top light and its sides in the accent's two shades"""
+    h = r * 0.58
+    top = f"M{cx} {cy - 2 * h} L{cx + r} {cy - h} L{cx} {cy} L{cx - r} {cy - h} Z"
+    left = f"M{cx - r} {cy - h} L{cx} {cy} L{cx} {cy + 2 * h} L{cx - r} {cy + h} Z"
+    right = f"M{cx + r} {cy - h} L{cx} {cy} L{cx} {cy + 2 * h} L{cx + r} {cy + h} Z"
+    edge = f'stroke="{KEY_DARK}" stroke-width="{sw:.2f}" stroke-linejoin="round"'
+    return (f'<path d="{top}" fill="{KEY_LIGHT}" {edge}/><path d="{left}" fill="{KEY}" {edge}/>'
+            f'<path d="{right}" fill="{KEY_DARK}" {edge}/>')
+
+
+def reg_file(size):
+    """Registration Entries (.reg, regedit's icon 1): a page with the registry's blocks"""
+    sw = px(size, 1.0 if size <= 48 else size / 48.0)
+    r = 13 if size >= 24 else 15
+    blocks = cube(51, 52, r, sw) + cube(37, 76, r, sw) + cube(65, 76, r, sw)
+    return page(size) + blocks
+
+
 SCREEN = KEY
 BEZEL = "#2B2B2B"
 
@@ -415,6 +434,7 @@ ICONS = {
     "dlls/shell32/resources/recent.svg": recent,
     "dlls/shell32/resources/favorites.svg": favorites,
     "programs/explorer/explorer.svg": file_explorer,
+    "programs/regedit/regfile.svg": reg_file,
     "dlls/user32/resources/oic_winlogo.svg": winlogo,
     "dlls/user32/resources/oic_sample.svg": application,
     **MSGBOX_ICONS,

@@ -1,0 +1,350 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] cmd: Tab completes file and directory names
+
+Issue #14 (live ISO): Tab in cmd put a tab character (^I) in the line. As
+Windows' cmd does, Tab now completes the word before the cursor to the
+first file or directory name that starts with it, Tab again to the next,
+Shift+Tab back; a name with spaces or special characters comes quoted, and
+a quoted word completes inside its quotes; after cd, chdir, pushd, rd and
+rmdir only directories are offered. The keys are
+HKCU/HKLM\Software\Microsoft\Command Processor CompletionChar and
+PathCompletionChar (Tab, 0x9, by default; a non-control value such as 0x40
+turns it off). The Windows way: ReadConsoleW with a
+CONSOLE_READCONSOLE_CONTROL wake-up mask (conhost hands the line back at
+the key), the completion, a redraw, and the next read with the completed
+text as its initial characters (programs/cmd/complete.c). Gate:
+test/cmdcomplete-gate.sh (make test-cmdcomplete), cmd on a pseudo console.
+Mutants: SG_MUTANT_NO_COMPLETION, SG_MUTANT_COMPLETE_ANY_AFTER_CD,
+SG_MUTANT_COMPLETE_NO_QUOTES.
+---
+--- /dev/null
++++ b/programs/cmd/complete.c
+@@ -0,0 +1,296 @@
++/*
++ * CMD - Wine-compatible command line interface: file and directory name completion
++ *
++ * Copyright (C) 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Stained Glass OS (issue #14): Tab completes file and directory names at the prompt,
++ * as Windows' cmd does. Tab gives the next name that starts with the word before the
++ * cursor, Shift+Tab the one before; names with spaces come quoted; after cd, chdir,
++ * pushd, rd and rmdir only directories are offered. The keys are
++ * HKCU/HKLM\Software\Microsoft\Command Processor's CompletionChar (files and
++ * directories) and PathCompletionChar (directories), both Tab (0x9) by default; a
++ * value that is no control character (0x40, as Windows sets to turn it off) turns
++ * that completion off. Done the Windows way: the console's line editor (conhost)
++ * hands the line back when one of those characters is typed (ReadConsoleW with a
++ * CONSOLE_READCONSOLE_CONTROL wake-up mask); cmd completes the word, redraws the line
++ * and reads on with the completed text as the line's first characters. */
++
++#include "wcmd.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(cmd);
++
++static DWORD completion_char = ~0u, path_completion_char = ~0u;
++
++/* a REG_DWORD (or decimal/hex REG_SZ) value of Command Processor, HKCU first */
++static BOOL read_char(const WCHAR *name, DWORD *out)
++{
++    static const HKEY roots[] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(roots); i++)
++    {
++        WCHAR str[32];
++        DWORD type, size = sizeof(str), value;
++        HKEY key;
++        LONG res;
++
++        if (RegOpenKeyExW(roots[i], L"Software\\Microsoft\\Command Processor", 0, KEY_READ, &key)) continue;
++        res = RegQueryValueExW(key, name, NULL, &type, (BYTE *)str, &size);
++        RegCloseKey(key);
++        if (res) continue;
++        if (type == REG_DWORD && size == sizeof(DWORD)) memcpy(&value, str, sizeof(value));
++        else if (type == REG_SZ && size >= sizeof(WCHAR))
++        {
++            str[min(size / sizeof(WCHAR), ARRAY_SIZE(str) - 1)] = 0;
++            value = wcstoul(str, NULL, 0);
++        }
++        else continue;
++        *out = value;
++        return TRUE;
++    }
++    return FALSE;
++}
++
++static void load_completion_chars(void)
++{
++    if (completion_char != ~0u) return;
++    completion_char = path_completion_char = 0x9;
++    read_char(L"CompletionChar", &completion_char);
++    read_char(L"PathCompletionChar", &path_completion_char);
++    /* only control characters complete; anything else (0x40, 0x0) is off */
++    if (!completion_char || completion_char >= 0x20) completion_char = 0;
++    if (!path_completion_char || path_completion_char >= 0x20) path_completion_char = 0;
++    TRACE("completion %#lx, path completion %#lx\n", completion_char, path_completion_char);
++}
++
++struct completion
++{
++    WCHAR *line;        /* the line this completion last produced: Tab again cycles */
++    WCHAR *head;        /* the text before the word */
++    WCHAR *dir;         /* the word's directory part, as typed (unquoted) */
++    WCHAR **names;
++    unsigned int count, index;
++    BOOL quoted;        /* the word began with a quote */
++};
++
++static void completion_reset(struct completion *c)
++{
++    unsigned int i;
++    for (i = 0; i < c->count; i++) free(c->names[i]);
++    free(c->names);
++    free(c->line);
++    free(c->head);
++    free(c->dir);
++    memset(c, 0, sizeof(*c));
++}
++
++static int __cdecl cmp_names(const void *a, const void *b)
++{
++    return lstrcmpiW(*(const WCHAR * const *)a, *(const WCHAR * const *)b);
++}
++
++/* does the line's command take only directories (cd, chdir, pushd, rd, rmdir)? */
++static BOOL dir_command(const WCHAR *line)
++{
++    static const WCHAR *cmds[] = { L"cd", L"chdir", L"pushd", L"rd", L"rmdir" };
++    unsigned int i, len = 0;
++
++    while (*line == ' ' || *line == '\t' || *line == '@') line++;
++    while (line[len] && line[len] != ' ' && line[len] != '\t' && line[len] != '\\' &&
++           line[len] != '.' && line[len] != '/' && line[len] != '"') len++;
++    for (i = 0; i < ARRAY_SIZE(cmds); i++)
++        if (len == wcslen(cmds[i]) && !wcsnicmp(line, cmds[i], len)) return TRUE;
++    return FALSE;
++}
++
++/* start a completion of the word that ends LINE */
++static BOOL completion_start(struct completion *c, const WCHAR *line, BOOL dirs_only)
++{
++    const WCHAR *word = line, *p;
++    WCHAR *pattern, *q, *slash;
++    WIN32_FIND_DATAW fd;
++    HANDLE find;
++    BOOL in_quote = FALSE;
++    unsigned int alloc = 0;
++
++    completion_reset(c);
++    /* the word starts after the last space outside quotes, at its quote if it has one */
++    for (p = line; *p; p++)
++    {
++        if (*p == '"') in_quote = !in_quote;
++        else if (!in_quote && (*p == ' ' || *p == '\t')) word = p + 1;
++    }
++    c->quoted = *word == '"';
++    c->head = xalloc((word - line + 1) * sizeof(WCHAR));
++    memcpy(c->head, line, (word - line) * sizeof(WCHAR));
++    c->head[word - line] = 0;
++
++    /* the word without its quotes, then "*" */
++    pattern = xalloc((wcslen(word) + 2) * sizeof(WCHAR));
++    for (p = word, q = pattern; *p; p++) if (*p != '"') *q++ = *p;
++    *q = 0;
++    slash = NULL;
++    for (q = pattern; *q; q++) if (*q == '\\' || *q == '/' || (*q == ':' && q == pattern + 1)) slash = q;
++    c->dir = xalloc(((slash ? slash - pattern + 1 : 0) + 1) * sizeof(WCHAR));
++    if (slash) memcpy(c->dir, pattern, (slash - pattern + 1) * sizeof(WCHAR));
++    c->dir[slash ? slash - pattern + 1 : 0] = 0;
++    wcscat(pattern, L"*");
++
++    find = FindFirstFileW(pattern, &fd);
++    free(pattern);
++    if (find == INVALID_HANDLE_VALUE) return FALSE;
++    do
++    {
++        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
++#ifndef SG_MUTANT_COMPLETE_ANY_AFTER_CD
++        if (dirs_only && !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
++#endif
++        if (c->count == alloc)
++        {
++            alloc = alloc ? alloc * 2 : 16;
++            c->names = realloc(c->names, alloc * sizeof(*c->names));
++        }
++        c->names[c->count++] = xstrdupW(fd.cFileName);
++    } while (FindNextFileW(find, &fd));
++    FindClose(find);
++    if (!c->count) return FALSE;
++    qsort(c->names, c->count, sizeof(*c->names), cmp_names);
++    return TRUE;
++}
++
++/* the line with the current name in place of the word; quoted when it has to be */
++static WCHAR *completion_line(struct completion *c)
++{
++    static const WCHAR special[] = L" &()[]{}^=;!'+,`~";
++    const WCHAR *name = c->names[c->index];
++    BOOL quote = c->quoted || wcspbrk(name, special) || wcspbrk(c->dir, special);
++    size_t len = wcslen(c->head) + wcslen(c->dir) + wcslen(name) + 3;
++    WCHAR *line = xalloc(len * sizeof(WCHAR));
++
++#ifdef SG_MUTANT_COMPLETE_NO_QUOTES
++    quote = FALSE;
++#endif
++    wcscpy(line, c->head);
++    if (quote) wcscat(line, L"\"");
++    wcscat(line, c->dir);
++    wcscat(line, name);
++    if (quote) wcscat(line, L"\"");
++    free(c->line);
++    c->line = xstrdupW(line);
++    return line;
++}
++
++/* LINE in place of the OLD_LEN characters at HOME; the cursor after it; HOME updated */
++static void redraw(HANDLE out, COORD *home, unsigned int old_len, const WCHAR *line)
++{
++    CONSOLE_SCREEN_BUFFER_INFO info;
++    unsigned int len = wcslen(line), pad = old_len > len ? old_len - len : 0, i;
++    WCHAR spaces[64];
++    DWORD written;
++    LONG end;
++
++    if (!GetConsoleScreenBufferInfo(out, &info)) return;
++    SetConsoleCursorPosition(out, *home);
++    WriteConsoleW(out, line, len, &written, NULL);
++    for (i = 0; i < ARRAY_SIZE(spaces); i++) spaces[i] = ' ';
++    for (i = pad; i; i -= min(i, ARRAY_SIZE(spaces)))
++        WriteConsoleW(out, spaces, min(i, ARRAY_SIZE(spaces)), &written, NULL);
++    if (!GetConsoleScreenBufferInfo(out, &info)) return;
++    /* where the text ends, and so where it begins, even if writing it scrolled */
++    end = info.dwCursorPosition.Y * info.dwSize.X + info.dwCursorPosition.X - pad;
++    if (end < 0) end = 0;
++    info.dwCursorPosition.Y = end / info.dwSize.X;
++    info.dwCursorPosition.X = end % info.dwSize.X;
++    SetConsoleCursorPosition(out, info.dwCursorPosition);
++    end -= len;
++    if (end < 0) end = 0;
++    home->Y = end / info.dwSize.X;
++    home->X = end % info.dwSize.X;
++}
++
++/* ReadConsoleW of one line at the prompt, completing names on the way */
++BOOL WCMD_ReadConsoleLine(HANDLE h, WCHAR *buf, DWORD size, DWORD *read)
++{
++    CONSOLE_READCONSOLE_CONTROL crc;
++    CONSOLE_SCREEN_BUFFER_INFO info;
++    struct completion c;
++    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
++    DWORD mask, initial = 0, i;
++    COORD home;
++
++    load_completion_chars();
++    mask = (completion_char ? 1u << completion_char : 0) | (path_completion_char ? 1u << path_completion_char : 0);
++#ifdef SG_MUTANT_NO_COMPLETION
++    mask = 0;
++#endif
++    if (!mask || !GetConsoleScreenBufferInfo(out, &info)) return ReadConsoleW(h, buf, size, read, NULL);
++    home = info.dwCursorPosition;
++    memset(&c, 0, sizeof(c));
++
++    for (;;)
++    {
++        WCHAR *line;
++        BOOL dirs_only, back, ok;
++        WCHAR ch;
++
++        memset(&crc, 0, sizeof(crc));
++        crc.nLength = sizeof(crc);
++        crc.nInitialChars = initial;
++        crc.dwCtrlWakeupMask = mask;
++        if (!ReadConsoleW(h, buf, size, read, &crc)) { completion_reset(&c); return FALSE; }
++        for (i = 0; i < *read; i++)
++            if (buf[i] < 0x20 && buf[i] != '\r' && buf[i] != '\n' && (mask & (1u << buf[i]))) break;
++        if (i == *read) break;
++
++        /* the character marks the cursor; what was after it is dropped, as Windows' cmd does */
++        ch = buf[i];
++        back = !!(crc.dwConsoleKeyState & SHIFT_PRESSED);
++        buf[i] = 0;
++        dirs_only = (ch == path_completion_char && ch != completion_char) ||
++                    (completion_char == path_completion_char && dir_command(buf));
++        if (c.line && !wcscmp(buf, c.line) && c.count)
++        {
++            c.index = back ? (c.index + c.count - 1) % c.count : (c.index + 1) % c.count;
++            ok = TRUE;
++        }
++        else if ((ok = completion_start(&c, buf, dirs_only)))
++            c.index = back ? c.count - 1 : 0;
++
++        if (ok)
++        {
++            line = completion_line(&c);
++            if (wcslen(line) >= size) line[size - 1] = 0;
++        }
++        else
++        {
++            /* nothing matches: the line stays as it was, the cursor at its end */
++            completion_reset(&c);
++            line = xalloc((*read + 1) * sizeof(WCHAR));
++            memcpy(line, buf, i * sizeof(WCHAR));
++            memcpy(line + i, buf + i + 1, (*read - i - 1) * sizeof(WCHAR));
++            line[*read - 1] = 0;
++        }
++        redraw(out, &home, *read - 1, line);
++        initial = wcslen(line);
++        memcpy(buf, line, (initial + 1) * sizeof(WCHAR));
++        free(line);
++    }
++    completion_reset(&c);
++    return TRUE;
++}
+--- a/programs/cmd/batch.c
++++ b/programs/cmd/batch.c
+@@ -227,7 +227,8 @@
+   /* We can't use the native f* functions because of the filename syntax differences
+      between DOS and Unix. Also need to lose the LF (or CRLF) from the line. */
+ 
+-  if (VerifyConsoleIoHandle(h) && ReadConsoleW(h, buf, noChars, &charsRead, NULL) && charsRead) {
++  /* Stained Glass OS: a line typed at the console completes names on Tab (complete.c) */
++  if (VerifyConsoleIoHandle(h) && WCMD_ReadConsoleLine(h, buf, noChars, &charsRead) && charsRead) {
+       if (!charsRead) return NULL;
+ 
+       /* Find first EOL */
+--- a/programs/cmd/wcmd.h
++++ b/programs/cmd/wcmd.h
+@@ -200,6 +200,7 @@
+ RETURN_CODE WCMD_change_drive(WCHAR drive);
+ 
+ WCHAR *WCMD_fgets (WCHAR *buf, DWORD n, HANDLE stream);
++BOOL WCMD_ReadConsoleLine(HANDLE h, WCHAR *buf, DWORD size, DWORD *read);
+ WCHAR *WCMD_parameter (WCHAR *s, int n, WCHAR **start, BOOL raw, BOOL wholecmdline);
+ WCHAR *WCMD_parameter_with_delims (WCHAR *s, int n, WCHAR **start, BOOL raw,
+                                    BOOL wholecmdline, const WCHAR *delims);
+--- a/programs/cmd/Makefile.in
++++ b/programs/cmd/Makefile.in
+@@ -7,6 +7,7 @@
+ 	batch.c \
+ 	builtins.c \
+ 	cmd.rc \
++	complete.c \
+ 	directory.c \
+ 	wcmd.svg \
+ 	wcmdmain.c
