@@ -1,0 +1,281 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winewayland: the session's layouts, switching them, and a program activating one (9158)
+
+What 9154 and 9156 gave winex11, for Wine's Wayland driver (sg-session's
+SG_DISPLAY_PATH=wayland, and any Wayland desktop). It already built a
+layout per group of the compositor's keymap, named from the group names
+(rxkb descriptions, as 9153), and posted WM_INPUTLANGCHANGEREQUEST when the
+group changed; but:
+
+- GetKeyboardLayoutList listed only the locale's layout and the default
+  HKL was the locale's, whatever the keyboard typed: GetKeyboardLayoutDevice
+  now gives the session's layout n (the keymap's group n) and the one typing
+  now (KBD_DEVICE_CURRENT), so win32u lists them in the person's order and
+  the default layout follows the keyboard (WINE_GDI_DRIVER_VERSION 104).
+- The request's wParam was 0: it is INPUTLANGCHANGE_SYSCHARSET with
+  FORWARD or BACKWARD, as Windows' hotkey posts it.
+- ActivateKeyboardLayout of one of them by the foreground window's thread
+  switches the keyboard, as on Windows (the input method is the person's):
+  a Wayland client cannot change the group, so the compositor is asked on
+  its control socket, "LAYOUT n" (sg-compositor; SG_LOCK_CONTROL, else the
+  session's socket for this user). A background thread changes its own
+  layout only, and the person's own switch (and the request posted when the
+  keyboard enters a window) is not sent back.
+
+Gate test/kbdcompositor-gate.sh wayland (sg-compositor's test build, headless, with
+its test keyboard). Mutants SG_MUTANT_KBD_WL_ONE_GROUP,
+SG_MUTANT_KBD_WL_ACTIVATE_LOCAL.
+---
+ dlls/winewayland.drv/wayland_keyboard.c | 175 +++++++++++++++++++++++++++++++-
+ dlls/winewayland.drv/waylanddrv.h       |   2 +
+ dlls/winewayland.drv/waylanddrv_main.c  |   2 +
+ 3 files changed, 177 insertions(+), 2 deletions(-)
+
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -28,7 +28,12 @@
+ 
+ #include <linux/input.h>
+ #undef SW_MAX /* Also defined in winuser.rh */
++#include <stdio.h>
++#include <string.h>
+ #include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <sys/un.h>
+ #include <unistd.h>
+ 
+ #include "waylanddrv.h"
+@@ -75,6 +80,53 @@ static struct list xkb_layouts = LIST_INIT(xkb_layouts);
+ /* These are only used from the wayland event thread and don't need locking */
+ static struct rxkb_context *rxkb_context;
+ static HKL keyboard_hkl; /* the HKL matching the currently active xkb group */
++static xkb_layout_index_t current_group; /* (Stained Glass OS 9158) the group typing now, under xkb_layouts_mutex */
++
++/* (9158) WM_INPUTLANGCHANGEREQUEST's wParam */
++#ifndef INPUTLANGCHANGE_SYSCHARSET
++#define INPUTLANGCHANGE_SYSCHARSET 0x0001
++#define INPUTLANGCHANGE_FORWARD    0x0002
++#define INPUTLANGCHANGE_BACKWARD   0x0004
++#endif
++
++/* (9158) the layouts of the input language changes posted for the person's own switch (and for a window
++ * the keyboard entered), and when: DefWindowProc activating one is not a program's switch */
++static pthread_mutex_t request_mutex = PTHREAD_MUTEX_INITIALIZER;
++static HKL requests[4];
++static DWORD request_times[4];
++static HKL program_switch;   /* (9158) the layout a program switched the keyboard to: no request for it */
++
++static void note_layout_request(HKL layout)
++{
++    UINT i, oldest = 0;
++
++    pthread_mutex_lock(&request_mutex);
++    for (i = 0; i < ARRAY_SIZE(requests); i++)
++    {
++        if (!requests[i]) { oldest = i; break; }
++        if ((int)(request_times[i] - request_times[oldest]) < 0) oldest = i;
++    }
++    requests[oldest] = layout;
++    request_times[oldest] = NtGetTickCount();
++    pthread_mutex_unlock(&request_mutex);
++}
++
++static BOOL take_layout_request(HKL layout)
++{
++    BOOL ret = FALSE;
++    UINT i;
++
++    pthread_mutex_lock(&request_mutex);
++    for (i = 0; i < ARRAY_SIZE(requests); i++)
++    {
++        if (requests[i] != layout) continue;
++        requests[i] = 0;
++        if (NtGetTickCount() - request_times[i] < 5000) ret = TRUE;
++        break;
++    }
++    pthread_mutex_unlock(&request_mutex);
++    return ret;
++}
+ 
+ static void xkb_layout_addref(struct layout *layout)
+ {
+@@ -576,6 +628,7 @@ static void set_current_xkb_group(xkb_layout_index_t xkb_group)
+     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+     LCID locale = LOWORD(NtUserGetKeyboardLayout(0));
+     struct layout *layout;
++    xkb_layout_index_t old_group = 0;
+     HKL hkl;
+ 
+     pthread_mutex_lock(&xkb_layouts_mutex);
+@@ -583,7 +636,11 @@ static void set_current_xkb_group(xkb_layout_index_t xkb_group)
+     LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
+         if (layout->xkb_group == xkb_group) break;
+     if (&layout->entry != &xkb_layouts)
++    {
+         hkl = get_layout_hkl(layout, locale);
++        old_group = current_group;
++        current_group = xkb_group;
++    }
+     else
+     {
+         ERR("Failed to find Xkb Layout for group %d\n", xkb_group);
+@@ -595,8 +652,22 @@ static void set_current_xkb_group(xkb_layout_index_t xkb_group)
+     if (hkl == keyboard_hkl) return;
+     keyboard_hkl = hkl;
+ 
++    /* Stained Glass OS (9158): the person switched the keyboard (Windows logo key + Space): an input
++     * language change, forward or backward through the session's layouts, as Windows' hotkey posts it */
+     TRACE("Changing keyboard layout to %p\n", hkl);
+-    NtUserPostMessage(keyboard->focused_hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/,
++    pthread_mutex_lock(&request_mutex);
++    if (program_switch == hkl)
++    {
++        /* the compositor did what a program asked: the program has the layout already */
++        program_switch = 0;
++        pthread_mutex_unlock(&request_mutex);
++        return;
++    }
++    program_switch = 0;
++    pthread_mutex_unlock(&request_mutex);
++    note_layout_request(hkl);
++    NtUserPostMessage(keyboard->focused_hwnd, WM_INPUTLANGCHANGEREQUEST,
++                      INPUTLANGCHANGE_SYSCHARSET | (xkb_group >= old_group ? INPUTLANGCHANGE_FORWARD : INPUTLANGCHANGE_BACKWARD),
+                       (LPARAM)keyboard_hkl);
+ }
+ 
+@@ -756,7 +827,8 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
+     keyboard->focused_hwnd = hwnd;
+     pthread_mutex_unlock(&keyboard->mutex);
+ 
+-    NtUserPostMessage(keyboard->focused_hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/,
++    note_layout_request(keyboard_hkl);
++    NtUserPostMessage(keyboard->focused_hwnd, WM_INPUTLANGCHANGEREQUEST, INPUTLANGCHANGE_SYSCHARSET,
+                       (LPARAM)keyboard_hkl);
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+@@ -981,3 +1053,102 @@ void WAYLAND_ReleaseKbdTables(const KBDTABLES *tables)
+     struct layout *layout = CONTAINING_RECORD(tables, struct layout, tables);
+     xkb_layout_release(layout);
+ }
++
++/***********************************************************************
++ *    GetKeyboardLayoutDevice (WAYLANDDRV.@)
++ *
++ * Stained Glass OS (9158): the high word of the session's layout index (the compositor keymap's group), or
++ * of the one typing now (KBD_DEVICE_CURRENT, win32u's default HKL); 0 past the last. win32u lists them as
++ * the loaded layouts (GetKeyboardLayoutList), in the order the person put them, as winex11 does (9154).
++ */
++UINT WAYLAND_GetKeyboardLayoutDevice(UINT index)
++{
++    struct layout *layout;
++    UINT device = 0;
++    xkb_layout_index_t group;
++
++#ifdef SG_MUTANT_KBD_WL_ONE_GROUP
++    return 0;
++#endif
++    pthread_mutex_lock(&xkb_layouts_mutex);
++    group = index == KBD_DEVICE_CURRENT ? current_group : index;
++    LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
++    {
++        if (layout->xkb_group != group) continue;
++        device = layout->layout_id ? 0xf000 | layout->layout_id : layout->lang;
++        break;
++    }
++    pthread_mutex_unlock(&xkb_layouts_mutex);
++    return device;
++}
++
++/* (9158) ask the session's compositor, which owns the keyboard, to type with layout group, on its control
++ * socket: SG_LOCK_CONTROL, which sg-session exports, else where the session puts it for this user (as
++ * wtsapi32's session state). A Wayland client cannot change the group itself. */
++static void compositor_layout(int group)
++{
++    struct sockaddr_un addr = { .sun_family = AF_UNIX };
++    struct timeval tv = { .tv_sec = 1 };
++    const char *path = getenv("SG_LOCK_CONTROL");
++    char cmd[32], reply[64] = "";
++    int fd, len;
++    ssize_t got = -1;
++
++    if (path && *path)
++    {
++        if (strlen(path) >= sizeof(addr.sun_path)) return;
++        strcpy(addr.sun_path, path);
++    }
++    else snprintf(addr.sun_path, sizeof(addr.sun_path), "/run/stained-glass-seat/seat0/%u/control.sock",
++                  (unsigned int)getuid());
++    if ((fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) return;
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++    len = snprintf(cmd, sizeof(cmd), "LAYOUT %d\n", group);
++    if (!connect(fd, (struct sockaddr *)&addr, sizeof(addr)) && send(fd, cmd, len, MSG_NOSIGNAL) == len)
++        got = recv(fd, reply, sizeof(reply) - 1, 0);
++    close(fd);
++    if (got > 0) reply[got] = 0;
++    TRACE("compositor %s: LAYOUT %d -> %s\n", debugstr_a(addr.sun_path), group, debugstr_a(reply));
++    if (got <= 0 || strncmp(reply, "OK", 2)) WARN("the compositor did not switch to layout %d\n", group);
++}
++
++/***********************************************************************
++ *    ActivateKeyboardLayout (WAYLANDDRV.@)
++ *
++ * Stained Glass OS (9158): as winex11's (9156) -- on Windows the input method is the person's: a program in
++ * the foreground that activates one of the session's layouts switches the keyboard to it (the keys type in
++ * it, the input indicator shows it); a thread in the background changes its own layout only; the person's
++ * own switch, posted as WM_INPUTLANGCHANGEREQUEST, is already the keyboard's.
++ */
++BOOL WAYLAND_ActivateKeyboardLayout(HKL hkl, UINT flags)
++{
++    struct layout *layout;
++    HWND foreground = NtUserGetForegroundWindow();
++    int group = -1;
++    xkb_layout_index_t now;
++
++    TRACE("%p, %04x\n", hkl, flags);
++
++    pthread_mutex_lock(&xkb_layouts_mutex);
++    LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
++    {
++        if (hkl != get_layout_hkl(layout, LOWORD(hkl))) continue;
++        group = layout->xkb_group;
++        break;
++    }
++    now = current_group;
++    pthread_mutex_unlock(&xkb_layouts_mutex);
++
++    if (group < 0) return TRUE;
++    /* taken even when the keyboard is there already: DefWindowProc activating the person's switch */
++    if (take_layout_request(hkl) || group == now) return TRUE;
++    if (!foreground || NtUserGetWindowThread(foreground, NULL) != GetCurrentThreadId()) return TRUE;
++#ifndef SG_MUTANT_KBD_WL_ACTIVATE_LOCAL
++    pthread_mutex_lock(&request_mutex);
++    program_switch = hkl;
++    pthread_mutex_unlock(&request_mutex);
++    compositor_layout(group);
++#endif
++    return TRUE;
++}
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -331,6 +331,8 @@ void wayland_keyboard_init(struct wl_keyboard *wl_keyboard);
+ void wayland_keyboard_deinit(void);
+ const KBDTABLES *WAYLAND_KbdLayerDescriptor(HKL hkl);
+ void WAYLAND_ReleaseKbdTables(const KBDTABLES *);
++UINT WAYLAND_GetKeyboardLayoutDevice(UINT index);
++BOOL WAYLAND_ActivateKeyboardLayout(HKL hkl, UINT flags);
+ 
+ /**********************************************************************
+  *          Wayland pointer
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -40,6 +40,8 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pDestroyWindow = WAYLAND_DestroyWindow,
+     .pKbdLayerDescriptor = WAYLAND_KbdLayerDescriptor,
+     .pReleaseKbdTables = WAYLAND_ReleaseKbdTables,
++    .pGetKeyboardLayoutDevice = WAYLAND_GetKeyboardLayoutDevice,
++    .pActivateKeyboardLayout = WAYLAND_ActivateKeyboardLayout,
+     .pSetCursor = WAYLAND_SetCursor,
+     .pSetWindowText = WAYLAND_SetWindowText,
+     .pSysCommand = WAYLAND_SysCommand,
