@@ -225,6 +225,12 @@ fi
 log "building with $JOBS jobs (this takes roughly 12 minutes on 12 cores)"
 make -C "$OBJ_DIR" -j"$JOBS"
 
+# curl.exe and tar.exe, as Windows ships them in System32 (issue #16): built
+# from upstream curl and libarchive (tools/build-addons.sh, tools/addons-version)
+if [[ -z "${SG_MUTANT_NO_ADDONS:-}" ]]; then
+    JOBS="$JOBS" "$HERE/tools/build-addons.sh" "$SRC_DIR" "$OBJ_DIR"
+fi
+
 log "build complete"
 
 if [[ -n "${DO_INSTALL:-}" ]]; then
@@ -238,6 +244,15 @@ if [[ -n "${DO_INSTALL:-}" ]]; then
         > "${DESTDIR}${PREFIX}/share/wine/sg-server-protocol"
     [[ -s "${DESTDIR}${PREFIX}/share/wine/sg-server-protocol" ]] || { echo "no SERVER_PROTOCOL_VERSION" >&2; exit 1; }
     install -D -m 755 "$(dirname "$0")/tools/wine-sg-redirect" "${DESTDIR}${PREFIX}/lib/wine-sg/wine-sg-redirect"
+
+    # curl.exe and tar.exe beside Wine's own programs: wineboot copies them into system32/syswow64
+    for prog in curl tar; do
+        for arch in x86_64 i386; do
+            exe="$OBJ_DIR/programs/$prog/$arch-windows/$prog.exe"
+            [[ -f "$exe" ]] || { [[ -n "${SG_MUTANT_NO_ADDONS:-}" ]] && continue; echo "missing $exe" >&2; exit 1; }
+            install -D -m 644 "$exe" "${DESTDIR}${PREFIX}/lib/wine/$arch-windows/$prog.exe"
+        done
+    done
 
     # Strip debug info unless asked not to. Wine builds with -g by default and
     # the result is enormous: 1.5G installed, of which about 1.1G is DWARF.
