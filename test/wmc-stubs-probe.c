@@ -551,9 +551,13 @@ static void check_smtc(void *interop)
     if (weak)
     {
         typedef HRESULT (WINAPI *f_resolve)(void *, REFIID, void **);
-        void *res = (void *)1;
+        void *res = NULL;
+        /* released by the program, the window's controls live on while the window does (6536: the
+         * system keeps them, as on Windows; a second GetForWindow gets the same ones), so the weak
+         * reference still resolves to them */
         hr = ((f_resolve)VT(weak)[3])(weak, &IID_ISMTC, &res);
-        CHECKF(hr == S_OK && !res, "once released, its weak reference resolves to nothing (%#lx)", hr);
+        CHECKF(hr == S_OK && res, "released by the program, its weak reference still resolves while the window lives (%#lx)", hr);
+        if (res) IUnknown_Release((IUnknown *)res);
         IUnknown_Release((IUnknown *)weak);
     }
     DestroyWindow(window);
