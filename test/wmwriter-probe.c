@@ -156,6 +156,7 @@ static DWORD current_packet;
 static struct object_out audio_objects[CHUNKS + 4], video_objects[FRAMES + 4];
 static int audio_count, video_count;
 static BOOL bad_payload;
+static DWORD multi_payloads;
 
 static void payload( BYTE stream, BYTE number, DWORD offset, DWORD object_size, DWORD presentation, const BYTE *data, DWORD size )
 {
@@ -340,9 +341,34 @@ int main( void )
             if (p[q] & 0x80) q += 1 + (p[q] & 0x0f);
             flags = p[q++];
             props = p[q++];
-            if (flags & 1 || props != 0x5d) { bad_payload = TRUE; break; }   /* the probe reads the one layout */
+            /* the probe reads the two layouts the writer writes: one payload, or several (wine-sg 9111)
+             * with WORD payload lengths; padding a WORD, fields as 0x5d says */
+            if ((flags & ~1) != 0x10 || props != 0x5d) { bad_payload = TRUE; break; }
             memcpy( &padding, p + q, 2 ); q += 2;
             q += 6;    /* send time, duration */
+            current_packet = (DWORD)((pos - header_size - 50) / packet_size);
+            if (flags & 1)
+            {
+                BYTE count = p[q] & 0x3f, k;
+                if ((p[q++] >> 6) != 2) { bad_payload = TRUE; break; }
+                for (k = 0; k < count && q < packet_size; k++)
+                {
+                    WORD length;
+                    stream = p[q++];
+                    number = p[q++];
+                    memcpy( &offset, p + q, 4 ); q += 4;
+                    rlen = p[q++];
+                    memcpy( &object_size, p + q, 4 );
+                    memcpy( &presentation, p + q + 4, 4 );
+                    q += rlen;
+                    memcpy( &length, p + q, 2 ); q += 2;
+                    if (q + length > packet_size - padding) { bad_payload = TRUE; break; }
+                    payload( stream, number, offset, object_size, presentation, p + q, length );
+                    q += length;
+                    multi_payloads += count > 1;
+                }
+                continue;
+            }
             stream = p[q++];
             number = p[q++];
             memcpy( &offset, p + q, 4 ); q += 4;
@@ -350,13 +376,13 @@ int main( void )
             memcpy( &object_size, p + q, 4 );
             memcpy( &presentation, p + q + 4, 4 );
             q += rlen;
-            current_packet = (DWORD)((pos - header_size - 50) / packet_size);
             payload( stream, number, offset, object_size, presentation, p + q, packet_size - q - padding );
         }
         ok = !bad_payload && audio_count == CHUNKS;
         for (i = 0; ok && i < CHUNKS; i++)
             ok = audio_objects[i].size == CHUNK && audio_objects[i].filled == CHUNK && !memcmp( audio_objects[i].data, audio + i * CHUNK, CHUNK );
         printf( "audio_data=%d objects=%d bad=%d\n", ok, audio_count, bad_payload );
+        printf( "packing=%d payloads=%lu\n", multi_payloads > 0, multi_payloads );
         ok = !bad_payload && video_count == FRAMES + 1;
         for (i = 0; ok && i <= FRAMES; i++)
             ok = video_objects[i].filled == FRAME && !memcmp( video_objects[i].data, video[i], FRAME ) &&

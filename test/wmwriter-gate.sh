@@ -4,7 +4,7 @@
 # profile's PCM audio and RGB24 video streams through WriteSample and WriteStreamSample, read back
 # as the ASF specification lays the file out (test/wmwriter-probe.c).
 #   WINE=/opt/wine-sg/bin/wine test/wmwriter-gate.sh
-# Mutants: SG_MUTANT_WMVW_NO_PAYLOAD, SG_MUTANT_WMVW_NO_DESCRIPTIONS (wmvcore asfmux.c).
+# Mutants: SG_MUTANT_WMVW_NO_PAYLOAD, SG_MUTANT_WMVW_NO_DESCRIPTIONS, SG_MUTANT_WMVW_ONE_PAYLOAD (wmvcore asfmux.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -45,6 +45,7 @@ check durations           "the play duration and the preroll"
 check packets             "the data object's packets, counted in the file properties"
 check audio_data          "every audio sample comes back from the packets, byte for byte"
 check video_data          "every video frame too, with its clean point"
+check packing             "packets carry several payloads (9111)"
 check times               "presentation times in milliseconds after the preroll"
 check index               "a simple index for the video stream"
 check file_size           "the file properties carry the file's size"

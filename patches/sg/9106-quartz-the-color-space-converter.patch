@@ -1,0 +1,712 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] quartz: the Color Space Converter filter (9106)
+
+Wine had no Color Space Converter (CLSID_Colour), the filter Windows' Intelligent
+Connect puts between two RGB pins of different depths. OpenCV's DirectShow capture
+(videoInput: a Sample Grabber set to RGB24 behind the capture pin) and other
+grabber programs failed with VFW_E_CANNOT_CONNECT whenever the source gave RGB32
+(a screen capture source, a virtual camera). Converts between RGB32, ARGB32, RGB24,
+RGB565, RGB555 and (input only) palettized RGB8, either orientation, honouring the
+output stride and dynamic format changes; registered as on Windows: "Color Space
+Converter", DirectShow filters category, merit 0x00400001.
+---
+--- /dev/null
++++ b/dlls/quartz/colour.c
+@@ -0,0 +1,596 @@
++/*
++ * Color Space Converter filter
++ *
++ * Copyright 2026 Stained Glass OS contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Stained Glass OS (wine-sg 9106): Wine had no Color Space Converter (CLSID_Colour), the filter
++ * Windows' Intelligent Connect puts between two RGB pins of different depths. OpenCV's DirectShow
++ * capture (videoInput: a Sample Grabber set to RGB24 after a capture pin) and other grabber
++ * programs failed with VFW_E_CANNOT_CONNECT whenever the source gave RGB32 -- a screen capture
++ * source, a virtual camera. This one converts between RGB32, ARGB32, RGB24, RGB565, RGB555 and
++ * (input only) palettized RGB8, either orientation (a negative biHeight is top-down), the
++ * output's stride its own biWidth; registered as Windows registers it, "Color Space Converter"
++ * in the DirectShow filters category with merit 0x00400001 (just above MERIT_UNLIKELY, so it is
++ * only tried when nothing connects directly).
++ */
++
++#include "quartz_private.h"
++
++#include "uuids.h"
++#include "amvideo.h"
++#include "dshow.h"
++#include "vfwmsgs.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(quartz);
++
++static const struct rgb_format
++{
++    const GUID *subtype;
++    WORD bpp;
++    DWORD compression;
++    BOOL output;
++}
++rgb_formats[] =
++{
++    {&MEDIASUBTYPE_RGB32,  32, BI_RGB, TRUE},
++    {&MEDIASUBTYPE_RGB24,  24, BI_RGB, TRUE},
++    {&MEDIASUBTYPE_RGB565, 16, BI_BITFIELDS, TRUE},
++    {&MEDIASUBTYPE_RGB555, 16, BI_RGB, TRUE},
++    {&MEDIASUBTYPE_ARGB32, 32, BI_RGB, TRUE},
++    {&MEDIASUBTYPE_RGB8,    8, BI_RGB, FALSE},
++};
++
++struct colour_converter
++{
++    struct strmbase_filter filter;
++    struct strmbase_source source;
++    IQualityControl source_IQualityControl_iface;
++    struct strmbase_passthrough passthrough;
++    struct strmbase_sink sink;
++
++    const struct rgb_format *in, *out;
++    RGBQUAD palette[256];
++};
++
++static struct colour_converter *impl_from_strmbase_filter(struct strmbase_filter *iface)
++{
++    return CONTAINING_RECORD(iface, struct colour_converter, filter);
++}
++
++static const struct rgb_format *find_format(const GUID *subtype)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(rgb_formats); i++)
++        if (IsEqualGUID(subtype, rgb_formats[i].subtype)) return &rgb_formats[i];
++    return NULL;
++}
++
++static const BITMAPINFOHEADER *get_bih(const AM_MEDIA_TYPE *mt)
++{
++    if (IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo) && mt->pbFormat
++            && mt->cbFormat >= sizeof(VIDEOINFOHEADER))
++        return &((const VIDEOINFOHEADER *)mt->pbFormat)->bmiHeader;
++    return NULL;
++}
++
++/* the RGB formats this filter takes: a video type of a known subtype with a matching header */
++static const struct rgb_format *check_type(const AM_MEDIA_TYPE *mt, BOOL output)
++{
++    const struct rgb_format *format;
++    const BITMAPINFOHEADER *bih;
++
++    if (!IsEqualGUID(&mt->majortype, &MEDIATYPE_Video)) return NULL;
++    if (!(format = find_format(&mt->subtype)) || (output && !format->output)) return NULL;
++    if (!(bih = get_bih(mt))) return NULL;
++    if (bih->biBitCount != format->bpp || !bih->biWidth || !bih->biHeight) return NULL;
++    if (bih->biCompression != BI_RGB && bih->biCompression != BI_BITFIELDS) return NULL;
++    return format;
++}
++
++static DWORD stride(LONG width, WORD bpp)
++{
++    return ((width * bpp + 31) / 8) & ~3;
++}
++
++static HRESULT colour_sink_query_interface(struct strmbase_pin *iface, REFIID iid, void **out)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface->filter);
++
++    if (IsEqualGUID(iid, &IID_IMemInputPin))
++        *out = &filter->sink.IMemInputPin_iface;
++    else
++        return E_NOINTERFACE;
++    IUnknown_AddRef((IUnknown *)*out);
++    return S_OK;
++}
++
++static HRESULT colour_sink_query_accept(struct strmbase_pin *iface, const AM_MEDIA_TYPE *mt)
++{
++    return check_type(mt, FALSE) ? S_OK : S_FALSE;
++}
++
++static HRESULT colour_sink_get_media_type(struct strmbase_pin *iface, unsigned int index, AM_MEDIA_TYPE *mt)
++{
++    return VFW_S_NO_MORE_ITEMS;
++}
++
++/* one pixel as 0xAARRGGBB */
++static inline DWORD read_pixel(const struct colour_converter *filter, const BYTE *row, LONG x)
++{
++    const struct rgb_format *in = filter->in;
++    WORD v;
++
++    switch (in->bpp)
++    {
++    case 32:
++        return *(const DWORD *)(row + x * 4) | (in->subtype == &MEDIASUBTYPE_ARGB32 ? 0 : 0xff000000);
++    case 24:
++        return 0xff000000 | (row[x * 3 + 2] << 16) | (row[x * 3 + 1] << 8) | row[x * 3];
++    case 16:
++        v = *(const WORD *)(row + x * 2);
++        if (in->subtype == &MEDIASUBTYPE_RGB565)
++            return 0xff000000 | ((((v >> 11) & 0x1f) * 255 / 31) << 16) | ((((v >> 5) & 0x3f) * 255 / 63) << 8)
++                    | ((v & 0x1f) * 255 / 31);
++        return 0xff000000 | ((((v >> 10) & 0x1f) * 255 / 31) << 16) | ((((v >> 5) & 0x1f) * 255 / 31) << 8)
++                | ((v & 0x1f) * 255 / 31);
++    default:
++        {
++            const RGBQUAD *c = &filter->palette[row[x]];
++            return 0xff000000 | (c->rgbRed << 16) | (c->rgbGreen << 8) | c->rgbBlue;
++        }
++    }
++}
++
++static inline void write_pixel(const struct rgb_format *out, BYTE *row, LONG x, DWORD argb)
++{
++    BYTE r = argb >> 16, g = argb >> 8, b = argb;
++
++    switch (out->bpp)
++    {
++    case 32:
++        *(DWORD *)(row + x * 4) = out->subtype == &MEDIASUBTYPE_ARGB32 ? argb : argb & 0xffffff;
++        break;
++    case 24:
++        row[x * 3] = b;
++        row[x * 3 + 1] = g;
++        row[x * 3 + 2] = r;
++        break;
++    default:
++        if (out->subtype == &MEDIASUBTYPE_RGB565)
++            *(WORD *)(row + x * 2) = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
++        else
++            *(WORD *)(row + x * 2) = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
++        break;
++    }
++}
++
++static void convert(const struct colour_converter *filter, const BITMAPINFOHEADER *src_bih, const BYTE *src,
++        DWORD src_size, const BITMAPINFOHEADER *dst_bih, BYTE *dst)
++{
++    LONG width = min(src_bih->biWidth, dst_bih->biWidth);
++    LONG height = min(abs(src_bih->biHeight), abs(dst_bih->biHeight)), y, x;
++    DWORD src_stride = stride(src_bih->biWidth, src_bih->biBitCount);
++    DWORD dst_stride = stride(dst_bih->biWidth, dst_bih->biBitCount);
++    /* top-down when the two differ in orientation: the rows go in the other order */
++#ifdef SG_MUTANT_COLOUR_NO_FLIP
++    BOOL flip = FALSE;
++#else
++    BOOL flip = (src_bih->biHeight < 0) != (dst_bih->biHeight < 0);
++#endif
++
++    if ((UINT64)src_stride * height > src_size) height = src_stride ? src_size / src_stride : 0;
++
++    for (y = 0; y < height; y++)
++    {
++        const BYTE *in = src + (SIZE_T)y * src_stride;
++        BYTE *out = dst + (SIZE_T)(flip ? height - 1 - y : y) * dst_stride;
++
++        if (filter->in == filter->out)
++            memcpy(out, in, width * src_bih->biBitCount / 8);
++        else if (filter->in->bpp == 32 && filter->out->bpp == 24)
++        {
++            for (x = 0; x < width; x++)
++            {
++                out[x * 3] = in[x * 4];
++                out[x * 3 + 1] = in[x * 4 + 1];
++                out[x * 3 + 2] = in[x * 4 + 2];
++            }
++        }
++        else
++        {
++            for (x = 0; x < width; x++)
++                write_pixel(filter->out, out, x, read_pixel(filter, in, x));
++        }
++    }
++}
++
++static HRESULT WINAPI colour_sink_Receive(struct strmbase_sink *iface, IMediaSample *sample)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface->pin.filter);
++    const BITMAPINFOHEADER *src_bih, *dst_bih;
++    IMediaSample *out_sample = NULL;
++    REFERENCE_TIME start, stop;
++    AM_MEDIA_TYPE *new_mt;
++    BYTE *src, *dst;
++    LONG src_size;
++    HRESULT hr;
++
++    if (!filter->source.pMemInputPin) return VFW_E_NOT_CONNECTED;
++    if (filter->filter.state == State_Stopped) return VFW_E_WRONG_STATE;
++    if (filter->sink.flushing) return S_FALSE;
++
++    /* a sample may carry a new input type (a dynamic format change upstream) */
++    if (IMediaSample_GetMediaType(sample, &new_mt) == S_OK)
++    {
++        const struct rgb_format *format = check_type(new_mt, FALSE);
++        if (format)
++        {
++            FreeMediaType(&filter->sink.pin.mt);
++            CopyMediaType(&filter->sink.pin.mt, new_mt);
++            filter->in = format;
++        }
++        DeleteMediaType(new_mt);
++        if (!format) return VFW_E_INVALIDMEDIATYPE;
++    }
++
++    if (FAILED(hr = IMediaSample_GetPointer(sample, &src))) return hr;
++    src_size = IMediaSample_GetActualDataLength(sample);
++
++    if (FAILED(hr = IMemAllocator_GetBuffer(filter->source.pAllocator, &out_sample, NULL, NULL, 0)))
++    {
++        ERR("Failed to get a sample, hr %#lx.\n", hr);
++        return hr;
++    }
++    /* the renderer may ask for a new output type with the buffer (a stride of its own) */
++    if (IMediaSample_GetMediaType(out_sample, &new_mt) == S_OK)
++    {
++        if (check_type(new_mt, TRUE))
++        {
++            FreeMediaType(&filter->source.pin.mt);
++            CopyMediaType(&filter->source.pin.mt, new_mt);
++        }
++        DeleteMediaType(new_mt);
++    }
++    if (!(filter->out = check_type(&filter->source.pin.mt, TRUE)))
++    {
++        hr = VFW_E_INVALIDMEDIATYPE;
++        goto done;
++    }
++    src_bih = get_bih(&filter->sink.pin.mt);
++    dst_bih = get_bih(&filter->source.pin.mt);
++
++    if (FAILED(hr = IMediaSample_GetPointer(out_sample, &dst)))
++        goto done;
++    if (IMediaSample_GetSize(out_sample) < (LONG)(stride(dst_bih->biWidth, dst_bih->biBitCount) * abs(dst_bih->biHeight)))
++    {
++        ERR("Output buffer too small.\n");
++        hr = E_FAIL;
++        goto done;
++    }
++    convert(filter, src_bih, src, src_size, dst_bih, dst);
++    IMediaSample_SetActualDataLength(out_sample, stride(dst_bih->biWidth, dst_bih->biBitCount) * abs(dst_bih->biHeight));
++
++    IMediaSample_SetPreroll(out_sample, IMediaSample_IsPreroll(sample) == S_OK);
++    IMediaSample_SetDiscontinuity(out_sample, IMediaSample_IsDiscontinuity(sample) == S_OK);
++    IMediaSample_SetSyncPoint(out_sample, IMediaSample_IsSyncPoint(sample) == S_OK);
++    hr = IMediaSample_GetTime(sample, &start, &stop);
++    if (hr == S_OK)
++        IMediaSample_SetTime(out_sample, &start, &stop);
++    else if (hr == VFW_S_NO_STOP_TIME)
++        IMediaSample_SetTime(out_sample, &start, NULL);
++    else
++        IMediaSample_SetTime(out_sample, NULL, NULL);
++    if (IMediaSample_GetMediaTime(sample, &start, &stop) == S_OK)
++        IMediaSample_SetMediaTime(out_sample, &start, &stop);
++
++    hr = IMemInputPin_Receive(filter->source.pMemInputPin, out_sample);
++
++done:
++    IMediaSample_Release(out_sample);
++    return hr;
++}
++
++static HRESULT colour_sink_connect(struct strmbase_sink *iface, IPin *peer, const AM_MEDIA_TYPE *mt)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface->pin.filter);
++    const struct rgb_format *format;
++
++    if (!(format = check_type(mt, FALSE))) return VFW_E_TYPE_NOT_ACCEPTED;
++    filter->in = format;
++    memset(filter->palette, 0, sizeof(filter->palette));
++    if (format->bpp == 8)
++    {
++        const BITMAPINFOHEADER *bih = get_bih(mt);
++        DWORD colours = bih->biClrUsed ? min(bih->biClrUsed, 256) : 256;
++        DWORD offset = offsetof(VIDEOINFOHEADER, bmiHeader) + bih->biSize;
++
++        if (mt->cbFormat < offset) return VFW_E_TYPE_NOT_ACCEPTED;
++        colours = min(colours, (mt->cbFormat - offset) / sizeof(RGBQUAD));
++        memcpy(filter->palette, mt->pbFormat + offset, colours * sizeof(RGBQUAD));
++    }
++    return S_OK;
++}
++
++static void colour_sink_disconnect(struct strmbase_sink *iface)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface->pin.filter);
++    filter->in = NULL;
++}
++
++static HRESULT colour_sink_end_flush(struct strmbase_sink *iface)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface->pin.filter);
++
++    if (filter->source.pin.peer) return IPin_EndFlush(filter->source.pin.peer);
++    return S_OK;
++}
++
++static const struct strmbase_sink_ops sink_ops =
++{
++    .base.pin_query_interface = colour_sink_query_interface,
++    .base.pin_query_accept = colour_sink_query_accept,
++    .base.pin_get_media_type = colour_sink_get_media_type,
++    .pfnReceive = colour_sink_Receive,
++    .sink_connect = colour_sink_connect,
++    .sink_disconnect = colour_sink_disconnect,
++    .sink_end_flush = colour_sink_end_flush,
++};
++
++static HRESULT colour_source_query_interface(struct strmbase_pin *iface, REFIID iid, void **out)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface->filter);
++
++    if (IsEqualGUID(iid, &IID_IQualityControl))
++        *out = &filter->source_IQualityControl_iface;
++    else if (IsEqualGUID(iid, &IID_IMediaSeeking))
++        *out = &filter->passthrough.IMediaSeeking_iface;
++    else
++        return E_NOINTERFACE;
++    IUnknown_AddRef((IUnknown *)*out);
++    return S_OK;
++}
++
++static HRESULT colour_source_query_accept(struct strmbase_pin *iface, const AM_MEDIA_TYPE *mt)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface->filter);
++    const BITMAPINFOHEADER *in, *out;
++
++    if (!filter->sink.pin.peer || !check_type(mt, TRUE)) return S_FALSE;
++    in = get_bih(&filter->sink.pin.mt);
++    out = get_bih(mt);
++    /* the same picture; the stride (biWidth) may be wider than the picture */
++    if (abs(out->biHeight) != abs(in->biHeight) || out->biWidth < in->biWidth) return S_FALSE;
++    if (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB565) && out->biCompression == BI_BITFIELDS
++            && mt->cbFormat >= offsetof(VIDEOINFO, dwBitMasks[3]))
++    {
++        const VIDEOINFO *vi = (const VIDEOINFO *)mt->pbFormat;
++        if (vi->dwBitMasks[iRED] != 0xf800 || vi->dwBitMasks[iGREEN] != 0x07e0 || vi->dwBitMasks[iBLUE] != 0x001f)
++            return S_FALSE;
++    }
++    return S_OK;
++}
++
++static HRESULT colour_source_get_media_type(struct strmbase_pin *iface, unsigned int index, AM_MEDIA_TYPE *mt)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface->filter);
++    const struct rgb_format *list[ARRAY_SIZE(rgb_formats)], *format;
++    const VIDEOINFOHEADER *in;
++    unsigned int count = 0, i;
++    VIDEOINFO *vi;
++
++    if (!filter->sink.pin.peer) return VFW_S_NO_MORE_ITEMS;
++
++    /* the input's own format first, then the others */
++    if (filter->in->output) list[count++] = filter->in;
++    for (i = 0; i < ARRAY_SIZE(rgb_formats); i++)
++        if (rgb_formats[i].output && &rgb_formats[i] != filter->in
++                && (rgb_formats[i].subtype != &MEDIASUBTYPE_ARGB32 || filter->in->subtype == &MEDIASUBTYPE_ARGB32))
++            list[count++] = &rgb_formats[i];
++    if (index >= count) return VFW_S_NO_MORE_ITEMS;
++    format = list[index];
++
++    in = (const VIDEOINFOHEADER *)filter->sink.pin.mt.pbFormat;
++    if (!(vi = CoTaskMemAlloc(sizeof(*vi)))) return E_OUTOFMEMORY;
++    memset(vi, 0, sizeof(*vi));
++    vi->rcSource = in->rcSource;
++    vi->rcTarget = in->rcTarget;
++    vi->dwBitRate = in->dwBitRate;
++    vi->dwBitErrorRate = in->dwBitErrorRate;
++    vi->AvgTimePerFrame = in->AvgTimePerFrame;
++    vi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
++    vi->bmiHeader.biWidth = in->bmiHeader.biWidth;
++    vi->bmiHeader.biHeight = in->bmiHeader.biHeight;
++    vi->bmiHeader.biPlanes = 1;
++    vi->bmiHeader.biBitCount = format->bpp;
++    vi->bmiHeader.biCompression = format->compression;
++    vi->bmiHeader.biSizeImage = stride(vi->bmiHeader.biWidth, format->bpp) * abs(vi->bmiHeader.biHeight);
++
++    memset(mt, 0, sizeof(*mt));
++    if (format->compression == BI_BITFIELDS)
++    {
++        vi->dwBitMasks[iRED] = 0xf800;
++        vi->dwBitMasks[iGREEN] = 0x07e0;
++        vi->dwBitMasks[iBLUE] = 0x001f;
++        mt->cbFormat = offsetof(VIDEOINFO, dwBitMasks[3]);
++    }
++    else
++        mt->cbFormat = sizeof(VIDEOINFOHEADER);
++    mt->majortype = MEDIATYPE_Video;
++    mt->subtype = *format->subtype;
++    mt->bFixedSizeSamples = TRUE;
++    mt->lSampleSize = vi->bmiHeader.biSizeImage;
++    mt->formattype = FORMAT_VideoInfo;
++    mt->pbFormat = (BYTE *)vi;
++    return S_OK;
++}
++
++static HRESULT WINAPI colour_source_DecideBufferSize(struct strmbase_source *iface,
++        IMemAllocator *allocator, ALLOCATOR_PROPERTIES *props)
++{
++    const BITMAPINFOHEADER *bih = get_bih(&iface->pin.mt);
++    ALLOCATOR_PROPERTIES actual;
++    DWORD size = stride(bih->biWidth, bih->biBitCount) * abs(bih->biHeight);
++
++    if (!props->cbAlign) props->cbAlign = 1;
++    if (props->cbBuffer < size) props->cbBuffer = size;
++    if (!props->cBuffers) props->cBuffers = 1;
++    return IMemAllocator_SetProperties(allocator, props, &actual);
++}
++
++static const struct strmbase_source_ops source_ops =
++{
++    .base.pin_query_interface = colour_source_query_interface,
++    .base.pin_query_accept = colour_source_query_accept,
++    .base.pin_get_media_type = colour_source_get_media_type,
++    .pfnAttemptConnection = BaseOutputPinImpl_AttemptConnection,
++    .pfnDecideAllocator = BaseOutputPinImpl_DecideAllocator,
++    .pfnDecideBufferSize = colour_source_DecideBufferSize,
++};
++
++static struct colour_converter *impl_from_source_IQualityControl(IQualityControl *iface)
++{
++    return CONTAINING_RECORD(iface, struct colour_converter, source_IQualityControl_iface);
++}
++
++static HRESULT WINAPI colour_qc_QueryInterface(IQualityControl *iface, REFIID iid, void **out)
++{
++    struct colour_converter *filter = impl_from_source_IQualityControl(iface);
++    return IPin_QueryInterface(&filter->source.pin.IPin_iface, iid, out);
++}
++
++static ULONG WINAPI colour_qc_AddRef(IQualityControl *iface)
++{
++    struct colour_converter *filter = impl_from_source_IQualityControl(iface);
++    return IPin_AddRef(&filter->source.pin.IPin_iface);
++}
++
++static ULONG WINAPI colour_qc_Release(IQualityControl *iface)
++{
++    struct colour_converter *filter = impl_from_source_IQualityControl(iface);
++    return IPin_Release(&filter->source.pin.IPin_iface);
++}
++
++static HRESULT WINAPI colour_qc_Notify(IQualityControl *iface, IBaseFilter *sender, Quality q)
++{
++    struct colour_converter *filter = impl_from_source_IQualityControl(iface);
++    IQualityControl *upstream = NULL;
++    HRESULT hr = S_OK;
++
++    TRACE("filter %p, sender %p, type %#x, proportion %ld, late %s, timestamp %s.\n",
++            filter, sender, q.Type, q.Proportion, debugstr_time(q.Late), debugstr_time(q.TimeStamp));
++
++    /* a converter drops nothing itself: the message goes on upstream */
++    if (filter->sink.pin.peer
++            && SUCCEEDED(IPin_QueryInterface(filter->sink.pin.peer, &IID_IQualityControl, (void **)&upstream)))
++    {
++        hr = IQualityControl_Notify(upstream, &filter->filter.IBaseFilter_iface, q);
++        IQualityControl_Release(upstream);
++    }
++    return hr;
++}
++
++static HRESULT WINAPI colour_qc_SetSink(IQualityControl *iface, IQualityControl *sink)
++{
++    TRACE("iface %p, sink %p.\n", iface, sink);
++    return S_OK;
++}
++
++static const IQualityControlVtbl source_qc_vtbl =
++{
++    colour_qc_QueryInterface,
++    colour_qc_AddRef,
++    colour_qc_Release,
++    colour_qc_Notify,
++    colour_qc_SetSink,
++};
++
++static struct strmbase_pin *colour_get_pin(struct strmbase_filter *iface, unsigned int index)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface);
++
++    if (index == 0) return &filter->sink.pin;
++    if (index == 1) return &filter->source.pin;
++    return NULL;
++}
++
++static void colour_destroy(struct strmbase_filter *iface)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface);
++
++    if (filter->sink.pin.peer) IPin_Disconnect(filter->sink.pin.peer);
++    IPin_Disconnect(&filter->sink.pin.IPin_iface);
++    if (filter->source.pin.peer) IPin_Disconnect(filter->source.pin.peer);
++    IPin_Disconnect(&filter->source.pin.IPin_iface);
++
++    strmbase_sink_cleanup(&filter->sink);
++    strmbase_source_cleanup(&filter->source);
++    strmbase_passthrough_cleanup(&filter->passthrough);
++    strmbase_filter_cleanup(&filter->filter);
++    free(filter);
++}
++
++static HRESULT colour_init_stream(struct strmbase_filter *iface)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface);
++    HRESULT hr;
++
++    if (filter->source.pin.peer && FAILED(hr = IMemAllocator_Commit(filter->source.pAllocator)))
++        ERR("Failed to commit allocator, hr %#lx.\n", hr);
++    return S_OK;
++}
++
++static HRESULT colour_cleanup_stream(struct strmbase_filter *iface)
++{
++    struct colour_converter *filter = impl_from_strmbase_filter(iface);
++
++    if (filter->source.pin.peer) IMemAllocator_Decommit(filter->source.pAllocator);
++    return S_OK;
++}
++
++static const struct strmbase_filter_ops filter_ops =
++{
++    .filter_get_pin = colour_get_pin,
++    .filter_destroy = colour_destroy,
++    .filter_init_stream = colour_init_stream,
++    .filter_cleanup_stream = colour_cleanup_stream,
++};
++
++HRESULT colour_converter_create(IUnknown *outer, IUnknown **out)
++{
++    struct colour_converter *object;
++
++    if (!(object = calloc(1, sizeof(*object)))) return E_OUTOFMEMORY;
++
++    strmbase_filter_init(&object->filter, outer, &CLSID_Colour, &filter_ops);
++    strmbase_sink_init(&object->sink, &object->filter, L"In", &sink_ops, NULL);
++    wcscpy(object->sink.pin.name, L"Input");
++    strmbase_source_init(&object->source, &object->filter, L"Out", &source_ops);
++    wcscpy(object->source.pin.name, L"XForm Out");
++
++    object->source_IQualityControl_iface.lpVtbl = &source_qc_vtbl;
++    strmbase_passthrough_init(&object->passthrough, (IUnknown *)&object->source.pin.IPin_iface);
++    ISeekingPassThru_Init(&object->passthrough.ISeekingPassThru_iface, FALSE, &object->sink.pin.IPin_iface);
++
++    TRACE("Created colour space converter %p.\n", object);
++    *out = &object->filter.IUnknown_inner;
++    return S_OK;
++}
+--- a/dlls/quartz/main.c
++++ b/dlls/quartz/main.c
+@@ -99,6 +99,7 @@
+     { &CLSID_AviSplitter, avi_splitter_create },
+     { &CLSID_CMpegAudioCodec, mpeg_audio_codec_create },
+     { &CLSID_CMpegVideoCodec, mpeg_video_codec_create },
++    { &CLSID_Colour, colour_converter_create },
+     { &CLSID_DSoundRender, dsound_render_create },
+     { &CLSID_FilterGraph, filter_graph_create },
+     { &CLSID_FilterGraphNoThread, filter_graph_no_thread_create },
+@@ -301,6 +302,35 @@
+             .dwFlags = REG_PINFLAG_B_OUTPUT,
+         },
+     };
++    /* wine-sg 9106: the Color Space Converter, as Windows registers it */
++    static const REGPINTYPES colour_types[] =
++    {
++        {&MEDIATYPE_Video, &MEDIASUBTYPE_RGB32},
++        {&MEDIATYPE_Video, &MEDIASUBTYPE_RGB24},
++        {&MEDIATYPE_Video, &MEDIASUBTYPE_RGB565},
++        {&MEDIATYPE_Video, &MEDIASUBTYPE_RGB555},
++        {&MEDIATYPE_Video, &MEDIASUBTYPE_ARGB32},
++        {&MEDIATYPE_Video, &MEDIASUBTYPE_RGB8},
++    };
++    static const REGFILTERPINS2 colour_pins[] =
++    {
++        {
++            .nMediaTypes = ARRAY_SIZE(colour_types),
++            .lpMediaType = colour_types,
++        },
++        {
++            .nMediaTypes = ARRAY_SIZE(colour_types) - 1,
++            .lpMediaType = colour_types,
++            .dwFlags = REG_PINFLAG_B_OUTPUT,
++        },
++    };
++    static const REGFILTER2 colour_reg =
++    {
++        .dwVersion = 2,
++        .dwMerit = 0x00400001,
++        .cPins2 = ARRAY_SIZE(colour_pins),
++        .rgPins2 = colour_pins,
++    };
+     static const REGFILTER2 avi_decompressor_reg =
+     {
+         .dwVersion = 2,
+@@ -540,6 +570,9 @@
+     if (FAILED(hr = IFilterMapper2_RegisterFilter(mapper, &CLSID_AVIDec, L"AVI Decompressor", NULL,
+             &CLSID_LegacyAmFilterCategory, NULL, &avi_decompressor_reg)))
+         goto done;
++    if (FAILED(hr = IFilterMapper2_RegisterFilter(mapper, &CLSID_Colour, L"Color Space Converter", NULL,
++            &CLSID_LegacyAmFilterCategory, NULL, &colour_reg)))
++        goto done;
+     if (FAILED(hr = IFilterMapper2_RegisterFilter(mapper, &CLSID_AsyncReader, L"File Source (Async.)", NULL,
+             &CLSID_LegacyAmFilterCategory, NULL, &async_reader_reg)))
+         goto done;
+@@ -589,6 +622,8 @@
+         goto done;
+     if (FAILED(hr = IFilterMapper2_UnregisterFilter(mapper, &CLSID_LegacyAmFilterCategory, NULL, &CLSID_AVIDec)))
+         goto done;
++    if (FAILED(hr = IFilterMapper2_UnregisterFilter(mapper, &CLSID_LegacyAmFilterCategory, NULL, &CLSID_Colour)))
++        goto done;
+     if (FAILED(hr = IFilterMapper2_UnregisterFilter(mapper, &CLSID_LegacyAmFilterCategory, NULL, &CLSID_AsyncReader)))
+         goto done;
+     if (FAILED(hr = IFilterMapper2_UnregisterFilter(mapper, &CLSID_LegacyAmFilterCategory, NULL, &CLSID_ACMWrapper)))
+--- a/dlls/quartz/quartz_private.h
++++ b/dlls/quartz/quartz_private.h
+@@ -59,6 +59,7 @@
+ HRESULT acm_wrapper_create(IUnknown *outer, IUnknown **out);
+ HRESULT async_reader_create(IUnknown *outer, IUnknown **out);
+ HRESULT avi_dec_create(IUnknown *outer, IUnknown **out);
++HRESULT colour_converter_create(IUnknown *outer, IUnknown **out);
+ HRESULT avi_splitter_create(IUnknown *outer, IUnknown **out);
+ HRESULT dsound_render_create(IUnknown *outer, IUnknown **out);
+ HRESULT filter_graph_create(IUnknown *outer, IUnknown **out);
+--- a/dlls/quartz/Makefile.in
++++ b/dlls/quartz/Makefile.in
+@@ -6,6 +6,7 @@
+ SOURCES = \
+ 	acmwrapper.c \
+ 	avidec.c \
++	colour.c \
+ 	control_tlb.idl \
+ 	decoder.c \
+ 	dsoundrender.c \
+--- a/dlls/quartz/quartz_strmif.idl
++++ b/dlls/quartz/quartz_strmif.idl
+@@ -92,6 +92,13 @@
+ coclass AVIDec { interface IBaseFilter; }
+ 
+ [
++    helpstring("Color Space Converter"),
++    threading(both),
++    uuid(1643e180-90f5-11ce-97d5-00aa0055595a)
++]
++coclass Colour { interface IBaseFilter; }
++
++[
+     helpstring("DirectSound Audio Renderer"),
+     threading(both),
+     uuid(79376820-07d0-11cf-a24d-0020afd79767)
