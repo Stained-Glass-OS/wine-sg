@@ -7,7 +7,8 @@
 # against its one wineserver at once, each in a session of its own (1706)
 # (test/winstasd-probe.c):
 #  1. a user's WinSta0 and desktop belong to the user: owner the user, full
-#     access for the user and SYSTEM, read for Administrators, nobody else
+#     access for the user (and the user's logon SID, 9060) and SYSTEM, read for
+#     Administrators, nobody else
 #  2. the other user cannot open the first's WinSta0 by its \Sessions path,
 #     not even to read it, nor for its clipboard
 #  3. SYSTEM can; the user's own second process can
@@ -100,7 +101,8 @@ u1=$(v "$out" USER)
 [ -n "$u1" ] && printf '%s\n' "$out" | grep -q "^WINSTA OWNER $u1\$" && printf '%s\n' "$out" | grep -q "^DESKTOP OWNER $u1\$" \
     && pass "$SG_USER1 owns its window station and desktop" || fail "owners: $(printf '%s\n' "$out" | grep OWNER | tr '\n' ' ')"
 for o in WINSTA DESKTOP; do
-    aces=$(printf '%s\n' "$out" | sed -n "s/^$o ACE 0 //p" | awk '{print $1}' | sort | tr '\n' ' ')
+    # (and the user's logon SID, 9060: test/logondesk-users-gate.sh)
+    aces=$(printf '%s\n' "$out" | sed -n "s/^$o ACE 0 //p" | awk '{print $1}' | grep -v '^S-1-5-5-' | sort | tr '\n' ' ')
     [ "$aces" = "$(printf '%s\n' S-1-5-18 S-1-5-32-544 "$u1" | sort | tr '\n' ' ')" ] \
         && pass "$o: SYSTEM, Administrators and $SG_USER1 only" || fail "$o ACEs: $aces"
 done
