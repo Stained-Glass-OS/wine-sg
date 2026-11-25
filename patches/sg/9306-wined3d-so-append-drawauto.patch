@@ -1,0 +1,535 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] wined3d, d3d11: stream output appends at the buffer's filled size; DrawAuto
+
+A Direct3D stream output buffer has a filled size (BufferFilledSize):
+SOSetTargets with an offset of -1 goes on where the buffer's last stream
+output stopped -- also after the buffer was unbound -- and DrawAuto draws as
+many vertices as that size holds at the vertex buffer's stride. wined3d's
+OpenGL renderer wrote every append from the start of the buffer
+("Appending to stream output buffers not implemented") and DrawAuto, of
+both d3d10 and d3d11, was a stub that drew nothing: GPU particle systems and
+other multi-pass stream output rendered nothing or garbage when Vulkan (and
+so DXVK) is not there and wined3d's OpenGL path is the fallback.
+
+Each transform feedback session counts what it writes per stream
+(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, indexed per stream); the buffers
+written keep the count with where the writes started and the bytes per
+primitive (stride times the primitive's vertices), and the filled size is
+resolved only when asked for: binding with -1, or a draw with
+wined3d_device_context_draw_auto() (new), whose vertex count is taken when
+the draw runs from the buffer at vertex input slot 0 (filled size less the
+binding offset, over the stride). An application's own primitives-written
+query on the same stream cannot run beside it: that session is then not
+counted (FIXME). wined3d's Vulkan renderer: DrawAuto and appending are not
+done (FIXME); Vulkan machines use DXVK. Multiple vertex streams stay
+unsupported (d3d11 refuses them: "Streams not implemented yet").
+
+Gate: test/d3d11soauto-gate.sh (mutant SG_MUTANT_SO_NO_FILLED_SIZE).
+---
+--- a/include/wine/wined3d.h
++++ b/include/wine/wined3d.h
+@@ -2486,6 +2486,7 @@
+         unsigned int start_index, unsigned int index_count, unsigned int start_instance, unsigned int instance_count);
+ void __cdecl wined3d_device_context_draw_indirect(struct wined3d_device_context *context,
+         struct wined3d_buffer *buffer, unsigned int offset, bool indexed);
++void __cdecl wined3d_device_context_draw_auto(struct wined3d_device_context *context);
+ void __cdecl wined3d_device_context_execute_command_list(struct wined3d_device_context *context,
+         struct wined3d_command_list *list, bool restore_state);
+ void __cdecl wined3d_device_context_flush(struct wined3d_device_context *context);
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -1695,6 +1695,8 @@
+ struct wined3d_draw_parameters
+ {
+     BOOL indirect;
++    /* DrawAuto: the vertex count is the filled size of the buffer at vertex input slot 0 */
++    BOOL auto_count;
+     union
+     {
+         struct wined3d_direct_draw_parameters direct;
+--- a/dlls/wined3d/wined3d_gl.h
++++ b/dlls/wined3d/wined3d_gl.h
+@@ -498,6 +498,18 @@
+     uint64_t timestamp;
+ };
+ 
++/* How many primitives one transform feedback session wrote to a stream: the buffers it wrote to keep
++ * it until their filled size is asked for (Direct3D's BufferFilledSize: appending, DrawAuto). */
++struct wined3d_so_counter_gl
++{
++    GLuint id;
++    unsigned int refcount;
++    struct wined3d_context_gl *context_gl;
++    bool active;
++    bool resolved;
++    GLuint primitives;
++};
++
+ union wined3d_gl_so_statistics_query
+ {
+     GLuint id[2];
+@@ -664,6 +676,12 @@
+     SIZE_T free_timestamp_query_size;
+     unsigned int free_timestamp_query_count;
+ 
++    /* stream output: where each slot's writes start, the session's counter per stream, the
++     * application's own primitives-written queries per stream */
++    unsigned int so_start[WINED3D_MAX_STREAM_OUTPUT_BUFFERS];
++    struct wined3d_so_counter_gl *so_counters[WINED3D_MAX_STREAM_OUTPUT_BUFFERS];
++    unsigned int so_app_queries[WINED3D_MAX_STREAM_OUTPUT_BUFFERS];
++
+     union wined3d_gl_so_statistics_query *free_so_statistics_queries;
+     SIZE_T free_so_statistics_query_size;
+     unsigned int free_so_statistics_query_count;
+@@ -743,6 +761,12 @@
+         enum wined3d_texture_filter_type filter);
+ void wined3d_context_gl_enable_clip_distances(struct wined3d_context_gl *context_gl, uint32_t mask);
+ void wined3d_context_gl_end_transform_feedback(struct wined3d_context_gl *context_gl);
++struct wined3d_buffer_gl;
++unsigned int wined3d_buffer_gl_so_filled_size(struct wined3d_buffer_gl *buffer_gl,
++        struct wined3d_context_gl *context_gl);
++void wined3d_buffer_gl_so_counter_release(struct wined3d_buffer_gl *buffer_gl,
++        struct wined3d_context_gl *context_gl);
++void wined3d_context_gl_so_app_query_begin(struct wined3d_context_gl *context_gl, unsigned int stream_idx);
+ void wined3d_context_gl_flush_bo_address(struct wined3d_context_gl *context_gl,
+         const struct wined3d_const_bo_address *data, size_t size);
+ void wined3d_context_gl_free_fence(struct wined3d_fence *fence);
+@@ -1049,6 +1073,13 @@
+ struct wined3d_buffer_gl
+ {
+     struct wined3d_buffer b;
++
++    /* Direct3D's BufferFilledSize: so_filled_size, or, while so_counter is set, so_start plus
++     * what the counter's session wrote (so_primitive_bytes per primitive). */
++    struct wined3d_so_counter_gl *so_counter;
++    unsigned int so_start;
++    unsigned int so_primitive_bytes;
++    unsigned int so_filled_size;
+ };
+ 
+ static inline struct wined3d_buffer_gl *wined3d_buffer_gl(struct wined3d_buffer *buffer)
+--- a/dlls/wined3d/context_gl.c
++++ b/dlls/wined3d/context_gl.c
+@@ -4256,9 +4256,178 @@
+     context_gl->c.shader_update_mask &= ~(1u << WINED3D_SHADER_TYPE_COMPUTE);
+ }
+ 
++static void wined3d_so_counter_gl_end(struct wined3d_so_counter_gl *counter, unsigned int stream_idx)
++{
++    const struct wined3d_gl_info *gl_info = counter->context_gl->gl_info;
++
++    if (!counter->active)
++        return;
++    if (gl_info->supported[ARB_TRANSFORM_FEEDBACK3])
++        GL_EXTCALL(glEndQueryIndexed(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, stream_idx));
++    else
++        GL_EXTCALL(glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN));
++    checkGLcall("end stream output counter");
++    counter->active = false;
++}
++
++static void wined3d_so_counter_gl_release(struct wined3d_so_counter_gl *counter,
++        struct wined3d_context_gl *context_gl)
++{
++    const struct wined3d_gl_info *gl_info;
++
++    if (--counter->refcount)
++        return;
++    if (counter->context_gl == context_gl)
++    {
++        gl_info = context_gl->gl_info;
++        GL_EXTCALL(glDeleteQueries(1, &counter->id));
++        checkGLcall("delete stream output counter");
++    }
++    else
++    {
++        WARN("Leaking query %u of context %p.\n", counter->id, counter->context_gl);
++    }
++    free(counter);
++}
++
++void wined3d_buffer_gl_so_counter_release(struct wined3d_buffer_gl *buffer_gl,
++        struct wined3d_context_gl *context_gl)
++{
++    if (!buffer_gl->so_counter)
++        return;
++    wined3d_so_counter_gl_release(buffer_gl->so_counter, context_gl);
++    buffer_gl->so_counter = NULL;
++}
++
++/* Direct3D's BufferFilledSize of a stream output buffer: where appending (an SOSetTargets offset of
++ * -1) goes on and how many vertices DrawAuto draws. The buffer keeps it across being unbound. */
++unsigned int wined3d_buffer_gl_so_filled_size(struct wined3d_buffer_gl *buffer_gl,
++        struct wined3d_context_gl *context_gl)
++{
++    struct wined3d_so_counter_gl *counter;
++    const struct wined3d_gl_info *gl_info;
++    uint64_t size;
++
++    if (!(counter = buffer_gl->so_counter))
++        return buffer_gl->so_filled_size;
++
++    if (counter->active)
++    {
++        /* Still capturing into it (bound for stream output and read in the same session). */
++        WARN("Buffer %p is still a stream output target, ending transform feedback.\n", buffer_gl);
++        wined3d_context_gl_end_transform_feedback(counter->context_gl);
++    }
++    if (!counter->resolved)
++    {
++        if (counter->context_gl == context_gl)
++        {
++            gl_info = context_gl->gl_info;
++            GL_EXTCALL(glGetQueryObjectuiv(counter->id, GL_QUERY_RESULT, &counter->primitives));
++            checkGLcall("stream output counter result");
++        }
++        else
++        {
++            FIXME("Stream output counter of another context %p.\n", counter->context_gl);
++            counter->primitives = 0;
++        }
++        counter->resolved = true;
++    }
++    size = buffer_gl->so_start + (uint64_t)counter->primitives * buffer_gl->so_primitive_bytes;
++    buffer_gl->so_filled_size = min(size, buffer_gl->b.resource.size);
++    TRACE("Buffer %p: %u primitives of %u bytes from %u, filled size %u.\n", buffer_gl, counter->primitives,
++            buffer_gl->so_primitive_bytes, buffer_gl->so_start, buffer_gl->so_filled_size);
++    wined3d_buffer_gl_so_counter_release(buffer_gl, context_gl);
++    return buffer_gl->so_filled_size;
++}
++
++/* An application's own primitives-written query cannot run beside ours on the same stream. */
++void wined3d_context_gl_so_app_query_begin(struct wined3d_context_gl *context_gl, unsigned int stream_idx)
++{
++    struct wined3d_so_counter_gl *counter;
++
++    if (stream_idx >= ARRAY_SIZE(context_gl->so_counters) || !(counter = context_gl->so_counters[stream_idx]))
++        return;
++    if (counter->active)
++        FIXME("Stream %u's filled size is lost to a query begun during stream output.\n", stream_idx);
++    wined3d_so_counter_gl_end(counter, stream_idx);
++}
++
++/* A transform feedback session begins: count what each bound stream writes. */
++static void wined3d_context_gl_begin_so_counters(struct wined3d_context_gl *context_gl,
++        const struct wined3d_state *state, GLenum mode)
++{
++    const struct wined3d_shader *shader = state->shader[WINED3D_SHADER_TYPE_GEOMETRY];
++    const struct wined3d_stream_output_desc *so_desc = shader ? shader->u.gs.so_desc : NULL;
++    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
++    unsigned int i, j, stream_idx, stride, vertex_count;
++    struct wined3d_so_counter_gl *counter;
++    struct wined3d_buffer_gl *buffer_gl;
++
++    vertex_count = mode == GL_POINTS ? 1 : mode == GL_LINES ? 2 : 3;
++
++    for (i = 0; i < ARRAY_SIZE(state->stream_output); ++i)
++    {
++        if (!state->stream_output[i].buffer)
++            continue;
++        buffer_gl = wined3d_buffer_gl(state->stream_output[i].buffer);
++
++        stream_idx = 0;
++        stride = 0;
++        if (so_desc)
++        {
++            for (j = 0; j < so_desc->element_count; ++j)
++            {
++                if (so_desc->elements[j].output_slot != i)
++                    continue;
++                stream_idx = so_desc->elements[j].stream_idx;
++                stride += so_desc->elements[j].component_count * sizeof(float);
++            }
++            if (i < so_desc->buffer_stride_count && so_desc->buffer_strides[i])
++                stride = so_desc->buffer_strides[i];
++        }
++        if (stream_idx >= ARRAY_SIZE(context_gl->so_counters))
++            stream_idx = 0;
++
++        if (!(counter = context_gl->so_counters[stream_idx])
++                && !context_gl->so_app_queries[stream_idx]
++                && (!stream_idx || gl_info->supported[ARB_TRANSFORM_FEEDBACK3])
++                && (counter = calloc(1, sizeof(*counter))))
++        {
++            counter->refcount = 1;
++            counter->context_gl = context_gl;
++            GL_EXTCALL(glGenQueries(1, &counter->id));
++            if (gl_info->supported[ARB_TRANSFORM_FEEDBACK3])
++                GL_EXTCALL(glBeginQueryIndexed(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, stream_idx, counter->id));
++            else
++                GL_EXTCALL(glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, counter->id));
++            checkGLcall("begin stream output counter");
++            counter->active = true;
++            context_gl->so_counters[stream_idx] = counter;
++        }
++
++        wined3d_buffer_gl_so_counter_release(buffer_gl, context_gl);
++        buffer_gl->so_start = context_gl->so_start[i];
++        buffer_gl->so_primitive_bytes = stride * vertex_count;
++        buffer_gl->so_filled_size = buffer_gl->so_start;
++#ifndef SG_MUTANT_SO_NO_FILLED_SIZE
++        if (counter)
++        {
++            ++counter->refcount;
++            buffer_gl->so_counter = counter;
++        }
++        else
++#endif
++        {
++            FIXME("Not counting what stream %u writes to buffer %p.\n", stream_idx, buffer_gl);
++        }
++    }
++}
++
+ void wined3d_context_gl_end_transform_feedback(struct wined3d_context_gl *context_gl)
+ {
+     const struct wined3d_gl_info *gl_info = context_gl->gl_info;
++    struct wined3d_so_counter_gl *counter;
++    unsigned int i;
+ 
+     if (context_gl->c.transform_feedback_active)
+     {
+@@ -4267,6 +4436,14 @@
+         context_gl->c.transform_feedback_active = 0;
+         context_gl->c.transform_feedback_paused = 0;
+     }
++    for (i = 0; i < ARRAY_SIZE(context_gl->so_counters); ++i)
++    {
++        if (!(counter = context_gl->so_counters[i]))
++            continue;
++        wined3d_so_counter_gl_end(counter, i);
++        context_gl->so_counters[i] = NULL;
++        wined3d_so_counter_gl_release(counter, context_gl);
++    }
+ }
+ 
+ static void wined3d_context_gl_pause_transform_feedback(struct wined3d_context_gl *context_gl, BOOL force)
+@@ -4693,6 +4870,7 @@
+     struct wined3d_rendertarget_view *dsv, *rtv;
+     const struct wined3d_gl_info *gl_info;
+     struct wined3d_context_gl *context_gl;
++    struct wined3d_draw_parameters auto_parameters;
+     struct wined3d_context *context;
+     bool rasterizer_discard = false;
+     unsigned int i, idx_size = 0;
+@@ -4700,7 +4878,7 @@
+ 
+     TRACE("device %p, state %p, parameters %p.\n", device, state, parameters);
+ 
+-    if (!parameters->indirect && !parameters->u.direct.index_count)
++    if (!parameters->indirect && !parameters->auto_count && !parameters->u.direct.index_count)
+         return;
+ 
+     if (!parameters->indirect)
+@@ -4731,6 +4909,36 @@
+     }
+     gl_info = context_gl->gl_info;
+ 
++    if (parameters->auto_count)
++    {
++        /* DrawAuto: as many vertices as stream output put in the buffer at vertex input slot 0. */
++        const struct wined3d_stream_state *stream = &state->streams[0];
++        unsigned int filled = 0, count = 0;
++
++        if (stream->buffer && stream->stride)
++        {
++            filled = wined3d_buffer_gl_so_filled_size(wined3d_buffer_gl(stream->buffer), context_gl);
++            if (filled > stream->offset)
++                count = (filled - stream->offset) / stream->stride;
++        }
++        TRACE("DrawAuto: buffer %p, filled size %u, offset %u, stride %u: %u vertices.\n",
++                stream->buffer, filled, stream->offset, stream->stride, count);
++        if (!count)
++        {
++            context_release(context);
++            return;
++        }
++        auto_parameters = *parameters;
++        auto_parameters.auto_count = FALSE;
++        auto_parameters.indexed = FALSE;
++        auto_parameters.u.direct.base_vertex_idx = 0;
++        auto_parameters.u.direct.start_idx = 0;
++        auto_parameters.u.direct.index_count = count;
++        auto_parameters.u.direct.start_instance = 0;
++        auto_parameters.u.direct.instance_count = 1;
++        parameters = &auto_parameters;
++    }
++
+     if (!use_transform_feedback(state))
+         wined3d_context_gl_pause_transform_feedback(context_gl, TRUE);
+ 
+@@ -4826,6 +5034,7 @@
+             GL_EXTCALL(glBeginTransformFeedback(mode));
+             checkGLcall("glBeginTransformFeedback");
+             context->transform_feedback_active = 1;
++            wined3d_context_gl_begin_so_counters(context_gl, state, mode);
+         }
+     }
+ 
+--- a/dlls/wined3d/ffp_gl.c
++++ b/dlls/wined3d/ffp_gl.c
+@@ -1459,10 +1459,15 @@
+         buffer = state->stream_output[i].buffer;
+         offset = state->stream_output[i].offset;
+         bo_gl = wined3d_bo_gl(buffer->buffer_object);
++        /* -1 goes on where the buffer's last stream output stopped. */
+         if (offset == ~0u)
++            offset = wined3d_buffer_gl_so_filled_size(wined3d_buffer_gl(buffer), context_gl);
++        context_gl->so_start[i] = offset;
++        if (offset >= buffer->resource.size)
+         {
+-            FIXME("Appending to stream output buffers not implemented.\n");
+-            offset = 0;
++            WARN("Stream output buffer %p is full.\n", buffer);
++            offset = buffer->resource.size - 4;
++            context_gl->so_start[i] = buffer->resource.size;
+         }
+         size = buffer->resource.size - offset;
+         GL_EXTCALL(glBindBufferRange(GL_TRANSFORM_FEEDBACK_BUFFER, i,
+--- a/dlls/wined3d/query.c
++++ b/dlls/wined3d/query.c
+@@ -843,6 +843,10 @@
+         }
+         gl_info = context_gl->gl_info;
+ 
++        wined3d_context_gl_so_app_query_begin(context_gl, pq->stream_idx);
++        if (!pq->started)
++            ++context_gl->so_app_queries[pq->stream_idx];
++
+         if (gl_info->supported[ARB_TRANSFORM_FEEDBACK3])
+         {
+             GL_EXTCALL(glBeginQueryIndexed(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN,
+@@ -869,6 +873,8 @@
+             if ((context_gl = wined3d_context_gl_reacquire(pq->context_gl)))
+             {
+                 wined3d_so_statistics_query_end(pq, context_gl);
++                if (context_gl->so_app_queries[pq->stream_idx])
++                    --context_gl->so_app_queries[pq->stream_idx];
+ 
+                 context_release(&context_gl->c);
+                 poll = TRUE;
+@@ -1209,6 +1215,8 @@
+ {
+     struct wined3d_so_statistics_query *pq = wined3d_so_statistics_query_from_query(query);
+ 
++    if (pq->started && pq->context_gl && pq->context_gl->so_app_queries[pq->stream_idx])
++        --pq->context_gl->so_app_queries[pq->stream_idx];
+     if (pq->context_gl)
+         wined3d_context_gl_free_so_statistics_query(pq);
+     free(pq);
+--- a/dlls/wined3d/buffer.c
++++ b/dlls/wined3d/buffer.c
+@@ -172,6 +172,7 @@
+     struct wined3d_resource *resource = &buffer_gl->b.resource;
+     struct wined3d_bo_gl *bo_gl;
+ 
++    wined3d_buffer_gl_so_counter_release(buffer_gl, context_gl);
+     if (!buffer_gl->b.buffer_object)
+         return;
+     bo_gl = wined3d_bo_gl(buffer_gl->b.buffer_object);
+--- a/dlls/wined3d/cs.c
++++ b/dlls/wined3d/cs.c
+@@ -1254,6 +1254,7 @@
+     op->primitive_type = primitive_type;
+     op->patch_vertex_count = patch_vertex_count;
+     op->parameters.indirect = FALSE;
++    op->parameters.auto_count = FALSE;
+     op->parameters.u.direct.base_vertex_idx = base_vertex_idx;
+     op->parameters.u.direct.start_idx = start_idx;
+     op->parameters.u.direct.index_count = index_count;
+@@ -1279,6 +1280,7 @@
+     op->primitive_type = state->primitive_type;
+     op->patch_vertex_count = state->patch_vertex_count;
+     op->parameters.indirect = TRUE;
++    op->parameters.auto_count = FALSE;
+     op->parameters.u.indirect.buffer = buffer;
+     op->parameters.u.indirect.offset = offset;
+     op->parameters.indexed = indexed;
+@@ -1288,6 +1290,34 @@
+ 
+     wined3d_device_context_submit(context, WINED3D_CS_QUEUE_DEFAULT);
+     wined3d_device_context_unlock(context);
++}
++
++/* DrawAuto: the vertex count is decided when the draw runs, from the filled size stream output
++ * left in the buffer at vertex input slot 0. */
++void CDECL wined3d_device_context_draw_auto(struct wined3d_device_context *context)
++{
++    const struct wined3d_d3d_info *d3d_info = &context->device->adapter->d3d_info;
++    const struct wined3d_state *state = context->state;
++    struct wined3d_cs_draw *op;
++
++    wined3d_device_context_lock(context);
++    op = wined3d_device_context_require_space(context, sizeof(*op), WINED3D_CS_QUEUE_DEFAULT);
++    op->opcode = WINED3D_CS_OP_DRAW;
++    op->primitive_type = state->primitive_type;
++    op->patch_vertex_count = state->patch_vertex_count;
++    op->parameters.indirect = FALSE;
++    op->parameters.auto_count = TRUE;
++    op->parameters.u.direct.base_vertex_idx = 0;
++    op->parameters.u.direct.start_idx = 0;
++    op->parameters.u.direct.index_count = 0;
++    op->parameters.u.direct.start_instance = 0;
++    op->parameters.u.direct.instance_count = 1;
++    op->parameters.indexed = FALSE;
++
++    reference_graphics_pipeline_resources(context, FALSE, d3d_info);
++
++    wined3d_device_context_submit(context, WINED3D_CS_QUEUE_DEFAULT);
++    wined3d_device_context_unlock(context);
+ }
+ 
+ static void wined3d_cs_exec_flush(struct wined3d_cs *cs, const void *data)
+--- a/dlls/wined3d/wined3d.spec
++++ b/dlls/wined3d/wined3d.spec
+@@ -102,6 +102,7 @@
+ @ cdecl wined3d_device_context_draw(ptr long long long long)
+ @ cdecl wined3d_device_context_draw_indexed(ptr long long long long long)
+ @ cdecl wined3d_device_context_draw_indirect(ptr ptr long long)
++@ cdecl wined3d_device_context_draw_auto(ptr)
+ @ cdecl wined3d_device_context_execute_command_list(ptr ptr long)
+ @ cdecl wined3d_device_context_flush(ptr)
+ @ cdecl wined3d_device_context_flush_mapped_buffer(ptr ptr)
+--- a/dlls/wined3d/adapter_vk.c
++++ b/dlls/wined3d/adapter_vk.c
+@@ -1739,6 +1739,12 @@
+ 
+     TRACE("device %p, state %p, parameters %p.\n", device, state, parameters);
+ 
++    if (parameters->auto_count)
++    {
++        FIXME("DrawAuto is not implemented for Vulkan.\n");
++        return;
++    }
++
+     context_vk = wined3d_context_vk(context_acquire(device, NULL, 0));
+     vk_info = context_vk->vk_info;
+ 
+--- a/dlls/d3d11/device.c
++++ b/dlls/d3d11/device.c
+@@ -1231,7 +1231,11 @@
+ 
+ static void STDMETHODCALLTYPE d3d11_device_context_DrawAuto(ID3D11DeviceContext1 *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    struct d3d11_device_context *context = impl_from_ID3D11DeviceContext1(iface);
++
++    TRACE("iface %p.\n", iface);
++
++    wined3d_device_context_draw_auto(context->wined3d_context);
+ }
+ 
+ static void STDMETHODCALLTYPE d3d11_device_context_DrawIndexedInstancedIndirect(ID3D11DeviceContext1 *iface,
+@@ -6305,7 +6309,11 @@
+ 
+ static void STDMETHODCALLTYPE d3d10_device_DrawAuto(ID3D10Device1 *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
++    struct d3d_device *device = impl_from_ID3D10Device(iface);
++
++    TRACE("iface %p.\n", iface);
++
++    wined3d_device_context_draw_auto(device->immediate_context.wined3d_context);
+ }
+ 
+ static void STDMETHODCALLTYPE d3d10_device_RSSetState(ID3D10Device1 *iface, ID3D10RasterizerState *rasterizer_state)
