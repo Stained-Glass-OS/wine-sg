@@ -41,6 +41,14 @@ interface ID2D1AnalysisTransform : public IUnknown
 };
 __CRT_UUID_DECL(ID2D1AnalysisTransform, 0x0359dc30,0x95e6,0x4568,0x90,0x55,0x27,0x72,0x0d,0x13,0x0e,0x93);
 
+interface ID2D1SourceTransform : public ID2D1Transform
+{
+    STDMETHOD(SetRenderInfo)(ID2D1RenderInfo *info) PURE;
+    STDMETHOD(Draw)(ID2D1Bitmap1 *target, CONST D2D1_RECT_L *rect, D2D1_POINT_2U origin) PURE;
+};
+__CRT_UUID_DECL(ID2D1SourceTransform, 0xdb1800dd,0x0c34,0x4cf9,0xbe,0x90,0x31,0xcc,0x0a,0x56,0x53,0xe1);
+
+DEFINE_GUID(CLSID_ProbeSource, 0x7b2e31e4,0x66c2,0x4a1f,0x9b,0x33,0x2d,0xa4,0x38,0x52,0xe1,0x05);
 DEFINE_GUID(CLSID_ProbeAnalysis, 0x7b2e31e4,0x66c2,0x4a1f,0x9b,0x33,0x2d,0xa4,0x38,0x52,0xe1,0x03);
 DEFINE_GUID(probe_analysis_cs, 0x7b2e31e4,0x66c2,0x4a1f,0x9b,0x33,0x2d,0xa4,0x38,0x52,0xe1,0x04);
 DEFINE_GUID(CLSID_ProbeCompute, 0x7b2e31e4,0x66c2,0x4a1f,0x9b,0x33,0x2d,0xa4,0x38,0x52,0xe1,0x01);
@@ -245,6 +253,77 @@ static HRESULT WINAPI analysis_factory(IUnknown **effect)
     return S_OK;
 }
 
+/* a source effect: its transform fills the bitmap Direct2D hands it (ID2D1SourceTransform::Draw) with an
+ * 8x8 image, yellow on the left, cyan on the right */
+static int source_info_set, source_draws, source_use_map;
+static D2D1_RECT_L source_rect;
+
+class SourceTransform : public ID2D1SourceTransform
+{
+public:
+    LONG ref = 1;
+    STDMETHOD(QueryInterface)(REFIID iid, void **out)
+    {
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(ID2D1TransformNode) || iid == __uuidof(ID2D1Transform)
+                || iid == __uuidof(ID2D1SourceTransform)) { *out = this; AddRef(); return S_OK; }
+        *out = NULL; return E_NOINTERFACE;
+    }
+    STDMETHOD_(ULONG, AddRef)() { return InterlockedIncrement(&ref); }
+    STDMETHOD_(ULONG, Release)() { return InterlockedDecrement(&ref); }
+    STDMETHOD_(UINT32, GetInputCount)() CONST { return 0; }
+    STDMETHOD(MapOutputRectToInputRects)(CONST D2D1_RECT_L *out, D2D1_RECT_L *in, UINT32 count) CONST { return S_OK; }
+    STDMETHOD(MapInputRectsToOutputRect)(CONST D2D1_RECT_L *in, CONST D2D1_RECT_L *opaque_in, UINT32 count,
+            D2D1_RECT_L *out, D2D1_RECT_L *opaque_out)
+    { *out = D2D1_RECT_L{ 0, 0, 8, 8 }; *opaque_out = *out; return S_OK; }
+    STDMETHOD(MapInvalidRect)(UINT32 index, D2D1_RECT_L in, D2D1_RECT_L *out) CONST { *out = in; return S_OK; }
+    STDMETHOD(SetRenderInfo)(ID2D1RenderInfo *info) { source_info_set = info != NULL; return S_OK; }
+    STDMETHOD(Draw)(ID2D1Bitmap1 *target, CONST D2D1_RECT_L *rect, D2D1_POINT_2U origin)
+    {
+        UINT32 px[64];
+        source_draws++;
+        source_rect = *rect;
+        for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) px[y * 8 + x] = x < 4 ? 0xffffff00 : 0xff00ffff;
+        UINT32 w = rect->right - rect->left, h = rect->bottom - rect->top;
+        if (source_use_map)
+        {
+            /* as Paint.NET's Bitmap Source does: the target mapped for writing */
+            D2D1_MAPPED_RECT m;
+            HRESULT hr = target->Map(D2D1_MAP_OPTIONS_WRITE | D2D1_MAP_OPTIONS_DISCARD, &m);
+            if (FAILED(hr)) return hr;
+            for (UINT32 y = 0; y < h; y++)
+                memcpy(m.bits + (origin.y + y) * m.pitch + origin.x * 4, px + (rect->top + y) * 8 + rect->left, w * 4);
+            return target->Unmap();
+        }
+        D2D1_RECT_U dst = { origin.x, origin.y, origin.x + w, origin.y + h };
+        return target->CopyFromMemory(&dst, px + rect->top * 8 + rect->left, 8 * 4);
+    }
+};
+
+static SourceTransform source_transform;
+
+class SourceEffect : public ID2D1EffectImpl
+{
+public:
+    LONG ref = 1;
+    STDMETHOD(QueryInterface)(REFIID iid, void **out)
+    {
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(ID2D1EffectImpl)) { *out = this; AddRef(); return S_OK; }
+        *out = NULL; return E_NOINTERFACE;
+    }
+    STDMETHOD_(ULONG, AddRef)() { return InterlockedIncrement(&ref); }
+    STDMETHOD_(ULONG, Release)() { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    STDMETHOD(Initialize)(ID2D1EffectContext *context, ID2D1TransformGraph *graph)
+    { return graph->SetSingleTransformNode(&source_transform); }
+    STDMETHOD(PrepareForRender)(D2D1_CHANGE_TYPE) { return S_OK; }
+    STDMETHOD(SetGraph)(ID2D1TransformGraph *) { return E_NOTIMPL; }
+};
+
+static HRESULT WINAPI source_factory(IUnknown **effect)
+{
+    *effect = static_cast<ID2D1EffectImpl *>(new SourceEffect);
+    return S_OK;
+}
+
 static HRESULT WINAPI swap_factory(IUnknown **effect)
 {
     *effect = static_cast<ID2D1EffectImpl *>(new SwapEffect);
@@ -360,6 +439,49 @@ int main()
             ax->Release();
         }
         else printf("analysis_called=0 not created\n");
+    }
+    /* the source effect, and the compute effect on top of it */
+    static const WCHAR sxml[] =
+        L"<?xml version='1.0'?><Effect><Property name='DisplayName' type='string' value='Probe Source'/>"
+        L"<Property name='Author' type='string' value='probe'/><Property name='Category' type='string' value='probe'/>"
+        L"<Property name='Description' type='string' value='probe'/><Inputs/></Effect>";
+    if (SUCCEEDED(factory->RegisterEffectFromString(CLSID_ProbeSource, sxml, NULL, 0, source_factory)))
+    {
+        ID2D1Effect *sx = NULL, *top = NULL;
+        if (SUCCEEDED(dc->CreateEffect(CLSID_ProbeSource, &sx)))
+        {
+            dc->BeginDraw(); dc->Clear(D2D1::ColorF(0, 0.0f)); dc->DrawImage(sx); hr = dc->EndDraw();
+            UINT32 l = pixel(1, 1), rr = pixel(6, 6), o = pixel(10, 10);
+            printf("source_info=%d\n", source_info_set);
+            printf("source_drawn=%d %d draws rect %ld,%ld-%ld,%ld (1,1) %08x (6,6) %08x (10,10) %08x hr %#lx\n",
+                    source_draws >= 1 && l == 0xffffff00 && rr == 0xff00ffff && o == 0, source_draws,
+                    source_rect.left, source_rect.top, source_rect.right, source_rect.bottom, l, rr, o, hr);
+            swap_transform.scale[0] = swap_transform.scale[1] = swap_transform.scale[2] = swap_transform.scale[3] = 1.0f;
+            if (SUCCEEDED(dc->CreateEffect(CLSID_ProbeCompute, &top)))
+            {
+                ID2D1Image *img = NULL;
+                sx->GetOutput(&img);
+                top->SetInput(0, img);
+                dc->BeginDraw(); dc->Clear(D2D1::ColorF(0, 0.0f)); dc->DrawImage(top); dc->EndDraw();
+                l = pixel(1, 1);
+                /* yellow (r g) swapped stays yellow; cyan (g b) becomes magenta-ish: r=g, g=r */
+                rr = pixel(6, 6);
+                printf("source_chained=%d (1,1) %08x (6,6) %08x\n", l == 0xffffff00 && rr == 0xffff00ff, l, rr);
+                img->Release();
+                top->Release();
+            }
+            sx->Release();
+        }
+        source_use_map = 1;
+        source_draws = 0;
+        if (SUCCEEDED(dc->CreateEffect(CLSID_ProbeSource, &sx)))
+        {
+            dc->BeginDraw(); dc->Clear(D2D1::ColorF(0, 0.0f)); dc->DrawImage(sx); hr = dc->EndDraw();
+            UINT32 l = pixel(1, 1), rr = pixel(6, 6);
+            printf("source_mapped=%d %d draws (1,1) %08x (6,6) %08x hr %#lx\n",
+                    source_draws >= 1 && l == 0xffffff00 && rr == 0xff00ffff, source_draws, l, rr, hr);
+            sx->Release();
+        }
     }
     printf("done=1\n");
     return 0;

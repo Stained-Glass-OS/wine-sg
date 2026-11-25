@@ -8,8 +8,11 @@
 # for an output rectangle that does not start at 0 (through a crop). 9206: an analysis transform
 # (ID2D1AnalysisTransform) is handed its output on the CPU after drawing (ProcessAnalysisResults), in the
 # buffer precision it asked for -- Paint.NET's own Histogram effect reads its counts so (Auto-Level, Levels).
+# 9208: a source transform (ID2D1SourceTransform) is told its render info and Draw()s into a bitmap Direct2D
+# hands it, which is its output (Paint.NET's "Bitmap Source 2" feeding Auto-Level: the result was transparent).
 #   WINE=/opt/wine-sg/bin/wine test/d2dcompute-gate.sh
-# Mutants: SG_MUTANT_D2D_NO_COMPUTE (dlls/d2d1/effect.c), SG_MUTANT_D2D_NO_ANALYSIS (dlls/d2d1/effect_render.c).
+# Mutants: SG_MUTANT_D2D_NO_COMPUTE (dlls/d2d1/effect.c), SG_MUTANT_D2D_NO_ANALYSIS, SG_MUTANT_D2D_NO_SOURCE
+# (dlls/d2d1/effect_render.c).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
@@ -45,6 +48,10 @@ check offset_outside  "outside the rectangle is transparent"
 check constants_b1    "the effect's own constants reach b1"
 check analysis_called "an analysis transform is handed its output after drawing (ProcessAnalysisResults)"
 check analysis_data   "as the 32-bit floats it asked for, row by row"
+check source_info     "a source transform is told its render info"
+check source_drawn    "it fills the bitmap Direct2D hands it (Draw), which is drawn"
+check source_chained  "and feeds the next effect"
+check source_mapped   "the bitmap can be mapped for writing (WRITE | DISCARD), as Paint.NET does"
 check done            "the probe ran to the end"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
