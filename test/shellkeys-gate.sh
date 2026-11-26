@@ -41,10 +41,14 @@ timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
 cp "$T/vdesk-probe.exe" "$T/control-probe.exe" "$WINEPREFIX/drive_c/"
 cp "$T/control-probe.exe" "$WINEPREFIX/drive_c/wtprobe.exe"
+cp "$T/control-probe.exe" "$WINEPREFIX/drive_c/emojiprobe.exe"
+cp "$T/control-probe.exe" "$WINEPREFIX/drive_c/emojisemi.exe"
 # the terminal (0133): a stand-in registered as wt.exe
 "$WINE" reg add 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\wt.exe' /ve /d 'C:\wtprobe.exe' /f >/dev/null 2>&1
 # voice typing: a stand-in for sg-dictate.exe that records how it was started
 "$WINE" reg add 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\sg-dictate.exe' /ve /d 'C:\control-probe.exe' /f >/dev/null 2>&1
+# the emoji panel (9412, issue #15): Win+. runs sg-emoji.exe /toggle; Win+; too (re-registered between the two)
+"$WINE" reg add 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\sg-emoji.exe' /ve /d 'C:\emojiprobe.exe' /f >/dev/null 2>&1
 # Settings (0130): a stand-in registered for the ms-settings: protocol
 "$WINE" reg add 'HKLM\Software\Classes\ms-settings' /v 'URL Protocol' /d '' /f >/dev/null 2>&1
 "$WINE" reg add 'HKLM\Software\Classes\ms-settings\shell\open\command' /ve /d 'C:\control-probe.exe settings "%1"' /f >/dev/null 2>&1
@@ -115,6 +119,9 @@ K super+e
 i=0; while [ \$i -lt 20 ] && ! "$WINE" vdesk-probe.exe find ExplorerWClass 2>/dev/null | grep -q found=1; do sleep 0.5; i=\$((i + 1)); done
 P find ExplorerWClass
 K super+h; sleep 1
+K super+period; sleep 1
+"$WINE" reg add 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\sg-emoji.exe' /ve /d 'C:\emojisemi.exe' /f >/dev/null 2>&1
+K super+semicolon; sleep 1
 K super+i; sleep 1
 K super+x; K t; sleep 1
 EOF
@@ -178,6 +185,11 @@ else fail "dragged off its half: $(after 'rect Gamma' 3), size before the snap $
 [ "$(after 'find ExplorerWClass')" = "found=1" ] && pass "Win+E opens File Explorer" || fail "File Explorer: $(after 'find ExplorerWClass')"
 
 grep -q '/toggle' "$WINEPREFIX/drive_c/standin.log" 2>/dev/null && pass "Win+H starts voice typing (sg-dictate.exe /toggle)" || fail "Win+H: $(cat "$WINEPREFIX/drive_c/standin.log" 2>/dev/null)"
+
+grep -qi 'emojiprobe.* /toggle' "$WINEPREFIX/drive_c/standin.log" 2>/dev/null && pass "Win+. opens the emoji panel (sg-emoji.exe /toggle)" \
+    || fail "Win+.: $(grep -i emoji "$WINEPREFIX/drive_c/standin.log" 2>/dev/null)"
+grep -qi 'emojisemi.* /toggle' "$WINEPREFIX/drive_c/standin.log" 2>/dev/null && pass "Win+; opens it too" \
+    || fail "Win+;: $(grep -i emoji "$WINEPREFIX/drive_c/standin.log" 2>/dev/null)"
 
 grep -q 'settings "\{0,1\}ms-settings:' "$WINEPREFIX/drive_c/standin.log" 2>/dev/null && pass "Win+I opens Settings (ms-settings:)" \
     || fail "Win+I: $(cat "$WINEPREFIX/drive_c/standin.log" 2>/dev/null)"
