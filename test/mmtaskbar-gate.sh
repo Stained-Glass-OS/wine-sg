@@ -15,7 +15,7 @@
 #   SG_COMPOSITOR_BUILD=<dir with sg-compositor>, or SG_COMPOSITOR_SRC=<checkout> to build one
 # Mutants: SG_MUTANT_NO_SECOND_BARS, SG_MUTANT_MM_MAIN_SHOWS_ALL (explorer/systray.c),
 # SG_MUTANT_SECOND_NO_PINS, SG_MUTANT_SECOND_NO_AUTOHIDE, SG_MUTANT_SECOND_NO_THUMBNAILS (7761),
-# SG_MUTANT_SECOND_SYSTEM_MENU (7762, explorer/systray.c),
+# SG_MUTANT_SECOND_SYSTEM_MENU (7762, explorer/systray.c), SG_MUTANT_SECOND_CLOCK_DEAD (9950),
 # SG_MUTANT_ICONS_AT_DESKTOP_ORIGIN (explorer/desktop.c), SG_MUTANT_DISPLAYCHANGE_DESKTOP_ONLY
 # (win32u/sysparams.c).
 set -u
@@ -50,6 +50,8 @@ else
 fi
 TMPDIR=/var/tmp "$MINGW" -O2 -o "$T/mmtaskbar-probe.exe" "$HERE/mmtaskbar-probe.c" -luser32 ||
     { fail "probe did not build"; exit 1; }
+TMPDIR=/var/tmp "$MINGW" -O2 -o "$T/clockcal-probe.exe" "$HERE/clockcal-probe.c" -luser32 ||
+    { fail "clockcal probe did not build"; exit 1; }
 
 unset DISPLAY WAYLAND_DISPLAY XAUTHORITY
 mkdir -p "$T/prefix" "$T/comp-xdg" "$T/wine-xdg"
@@ -72,6 +74,7 @@ case "$(xwininfo -root 2>/dev/null | awk '/Width:/ {w=$2} /Height:/ {h=$2} END {
     *) echo "SKIP: the compositor did not make three 1280x720 outputs"; exit 77 ;;
 esac
 cp "$T/mmtaskbar-probe.exe" "$WINEPREFIX/drive_c/"
+cp "$T/clockcal-probe.exe" "$WINEPREFIX/drive_c/"
 ADV='HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
 R() { "$WINE" reg add "$1" /v "$2" /t REG_DWORD /d "$3" /f >/dev/null 2>&1; }
 "$WINE" reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d x11 /f >/dev/null 2>&1
@@ -119,6 +122,19 @@ n=$(convert "$T/bar2.png" -fx '(b-g)>0.25 ? 1 : 0' -format '%[fx:int(mean*w*h)]\
     fail "the windows' buttons on another display's bar: no icons (${n:-?} icon pixels)"
 [ "$(grep -c '^mainbutton' "$T/default.txt")" = 2 ] &&
     pass "Show taskbar buttons on all taskbars: the main bar has both windows" || fail "main bar buttons (all): $(grep '^mainbutton' "$T/default.txt" | tr '\n' ' ')"
+
+# each display's clock opens the calendar under it (9950): the bar it names is that display's
+# (a stand-in calendar, test/clockcal-probe.c, records SgCalendarToggle's bar)
+"$WINE" 'C:\clockcal-probe.exe' >/dev/null 2>&1 &
+CC="$WINEPREFIX/drive_c/clockcal.count"
+i=0; while [ ! -s "$CC" ] && [ $i -lt 40 ]; do sleep 0.25; i=$((i + 1)); done
+clockbar() { xdotool mousemove "$1" 700; sleep 0.3; xdotool click 1; sleep 1.2; tr -d '\r' < "$CC" 2>/dev/null | sed -n 's/^bar=//p'; }
+b2=$(clockbar 2550); b3=$(clockbar 3830); b1=$(clockbar 1270)
+[ "$b2" = "Shell_SecondaryTrayWnd 1280 680 2560 720" ] && [ "$b3" = "Shell_SecondaryTrayWnd 2560 680 3840 720" ] &&
+    pass "a click on another display's clock opens the calendar at that display's bar ($b2; $b3)" ||
+    fail "other displays' clocks: '$b2' '$b3'"
+[ "$b1" = "Shell_TrayWnd 0 680 1280 720" ] && pass "...and the main display's at the main bar ($b1)" || fail "main clock: '$b1'"
+xdotool mousemove 1900 300; sleep 0.5
 
 R "$ADV" MMTaskbarMode 2; P apply; sleep 2
 state where

@@ -4,11 +4,13 @@
 # 2026-10-28: "the taskbar time/date does not come up with a calendar when you click
 # on it"). Under Xvfb: the shell's taskbar, a stand-in for sg-shell's calendar
 # (SgCalendarHost) counting the SgCalendarToggle messages, xdotool's pointer.
-#   1. a click on the clock: the calendar is asked to open
+#   1. a click on the clock: the calendar is asked to open, under that bar's clock (9950:
+#      SgCalendarToggle's lparam is the bar, Shell_TrayWnd here)
 #   2. a second click: asked again (it closes itself on that)
 #   3. a click on the bar's empty middle: nothing
 #   WINE=... test/clockcal-gate.sh
-# Mutant: SG_MUTANT_CLOCK_NO_CALENDAR (programs/explorer/systray.c) fails 1.
+# Mutants: SG_MUTANT_CLOCK_NO_CALENDAR, SG_MUTANT_CALENDAR_NO_BAR (programs/explorer/systray.c) fail 1.
+# (The other displays' clocks: test/mmtaskbar-gate.sh, 9950.)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 WINE=${WINE:-/opt/wine-sg/bin/wine}
@@ -41,6 +43,8 @@ wait_n() { i=0; while [ "$(n)" != "$1" ] && [ $i -lt 20 ]; do sleep 0.25; i=$((i
 # the clock: the bar's right end, at the bottom (40 px at 96 dpi)
 xdotool mousemove 990 748; sleep 0.3; xdotool click 1; wait_n 1
 [ "$(n)" = 1 ] && pass "a click on the clock asks the calendar to open" || fail "clock click: toggles=$(n)"
+b=$(tr -d '\r' < "$C" 2>/dev/null | sed -n 's/^bar=//p')
+case "$b" in Shell_TrayWnd*) pass "...under this bar's clock (the bar named: $b)" ;; *) fail "the bar named: '$b'" ;; esac
 sleep 0.5; xdotool click 1; wait_n 2
 [ "$(n)" = 2 ] && pass "a second click asks again (the calendar closes on it)" || fail "second click: toggles=$(n)"
 xdotool mousemove 600 748; sleep 0.3; xdotool click 1; sleep 1.5
