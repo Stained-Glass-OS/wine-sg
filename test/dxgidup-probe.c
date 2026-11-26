@@ -205,7 +205,9 @@ static void test_duplication(void)
     check(info.AccumulatedFrames == 1, "AccumulatedFrames = %u", info.AccumulatedFrames);
     check(info.LastPresentTime.QuadPart != 0, "LastPresentTime is set");
     check(info.PointerShapeBufferSize == 0 && !info.PointerPosition.Visible, "no pointer shape or position");
-    check(info.TotalMetadataBufferSize == 0 || info.TotalMetadataBufferSize == 16, "metadata size %u", info.TotalMetadataBufferSize);
+    /* the move and dirty rectangles' bytes: one dirty RECT (9656); programs
+     * read the rectangles -- and copy the picture -- only when it is not 0 */
+    check(info.TotalMetadataBufferSize == sizeof(RECT), "metadata size %u (one dirty rectangle)", info.TotalMetadataBufferSize);
 
     hr = IDXGIResource_QueryInterface(resource, &iid_tex2d, (void **)&tex);
     check(hr == S_OK, "the frame is a Direct3D 11 texture (%#lx)", hr);

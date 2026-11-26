@@ -13,7 +13,8 @@
 # (output_dup.c, the dirty rectangle is empty), SG_MUTANT_DUP_FORMATS_IGNORED
 # (output_dup.c, DuplicateOutput1 ignores the format list), SG_MUTANT_DISPSURF_NO_SIZE_CHECK
 # (output.c, GetDisplaySurfaceData accepts any surface size), SG_MUTANT_GAMMA_SCALE
-# (output.c, GetGammaControl reports scale 0).
+# (output.c, GetGammaControl reports scale 0), SG_MUTANT_DUP_NO_METADATA (output_dup.c,
+# a frame's TotalMetadataBufferSize stays 0: TightVNC copied nothing, 9656).
 set -u
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
 WINESERVER="${WINESERVER:-$(dirname "$WINE")/wineserver}"
