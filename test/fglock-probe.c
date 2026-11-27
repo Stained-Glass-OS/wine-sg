@@ -2,12 +2,14 @@
  *   fglock-probe win NAME [X Y [DELAY]] a top-level window (made after DELAY ms) titled NAME with an edit box; runs until closed.
  *                              Commands come as WM_APP messages (fglock-probe cmd); each one's result
  *                              is the window property "fgres" (the value + 1).
+ *   fglock-probe bridge NAME X Y        a Unix sh starts "win NAME X Y" again (Setup's bridge), this one gone
  *   fglock-probe launch NAME X Y DELAY   "win NAME X Y DELAY" in a process of its own, this one gone at once
  *   fglock-probe cmd NAME CMD [ARG]
  *        setfg       SetForegroundWindow on its own window
  *        allow PID   AllowSetForegroundWindow(PID); "allow any" is ASFW_ANY; "allow NAME2" NAME2's process
  *        lock|unlock LockSetForegroundWindow
- *        spawn NAME2 CreateProcess "fglock-probe win NAME2" (its child)
+ *        spawn NAME2 CreateProcess "fglock-probe win NAME2" (its child); "bridge:NAME2": through a Unix sh;
+ *                    "stub:NAME2": through a launcher that is gone before the window shows
  *        timeout MS  SPI_SETFOREGROUNDLOCKTIMEOUT (written to the registry)
  *        menu        open its window menu (TrackPopupMenu) until "cmd NAME endmenu"
  *        endmenu     close it
@@ -77,7 +79,11 @@ static LRESULT CALLBACK proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
             STARTUPINFOA si = { sizeof(si) };
             PROCESS_INFORMATION pi;
             GetModuleFileNameA( NULL, self, sizeof(self) );
-            snprintf( cmd, sizeof(cmd), "\"%s\" win %s", self, spawn_name );
+            if (!strncmp( spawn_name, "bridge:", 7 ))
+                snprintf( cmd, sizeof(cmd), "\"%s\" bridge %s 640 440", self, spawn_name + 7 );
+            else if (!strncmp( spawn_name, "stub:", 5 ))
+                snprintf( cmd, sizeof(cmd), "\"%s\" launch %s 640 440 2000", self, spawn_name + 5 );
+            else snprintf( cmd, sizeof(cmd), "\"%s\" win %s", self, spawn_name );
             if (CreateProcessA( NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
             {
                 CloseHandle( pi.hThread );
@@ -226,6 +232,21 @@ int main( int argc, char **argv )
     {
         if (argc >= 6) Sleep( atoi( argv[5] ) );   /* its window only after DELAY ms */
         return run_window( argv[2], argc >= 4 ? atoi( argv[3] ) : 100, argc >= 5 ? atoi( argv[4] ) : 80 );
+    }
+
+    if (argc >= 5 && !strcmp( argv[1], "bridge" ))
+    {
+        /* as Setup does: a Unix program (sh, here) starts the real window's program again, and this one
+         * is gone at once */
+        char cmd[1024];
+        STARTUPINFOA si = { sizeof(si) };
+        PROCESS_INFORMATION pi;
+        snprintf( cmd, sizeof(cmd), "\\\\?\\unix\\bin\\sh -c \"sleep 2; exec \\\"$WINE\\\" "
+                  "'C:\\fglock-probe.exe' win %s %s %s\"", argv[2], argv[3], argv[4] );
+        if (!CreateProcessA( NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi )) return 1;
+        CloseHandle( pi.hThread );
+        CloseHandle( pi.hProcess );
+        return 0;
     }
 
     if (argc >= 6 && !strcmp( argv[1], "launch" ))

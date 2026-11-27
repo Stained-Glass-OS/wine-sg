@@ -9,14 +9,16 @@
 #     when a compositor exposes all of it
 #   - AllowSetForegroundWindow from the foreground process lets FgB come forward; a grant ends when
 #     the person clicks another program (FgE) first
-#   - a program the foreground one starts comes forward (FgC); LockSetForegroundWindow keeps even
+#   - a program the foreground one starts comes forward (FgC), also through a Unix bridge that starts it
+#     again (FgH, as Setup's) or a launcher gone by then (FgI); LockSetForegroundWindow keeps even
 #     that one back (FgD) until unlocked; an open menu keeps the last input's program (FgE) back
 #   - a program in the background cannot turn the lock off (SPI_SETFOREGROUNDLOCKTIMEOUT); after
 #     ForegroundLockTimeout without input a new program comes forward (FgF)
 #   - Alt+Tab (the shell's hotkey) and a click on a taskbar button still bring a window forward, and
 #     the click ends the button's flash
 #   WINE=/opt/wine-sg/bin/wine test/fglock-gate.sh   (WINESERVER=... for a build tree; ARTIFACTS=DIR)
-# Mutants: SG_MUTANT_FG_NO_LOCK, SG_MUTANT_FG_GRANTS_KEPT, SG_MUTANT_FG_EXPOSE_RAISE (server),
+# Mutants: SG_MUTANT_FG_NO_LOCK, SG_MUTANT_FG_GRANTS_KEPT, SG_MUTANT_FG_EXPOSE_RAISE, SG_MUTANT_FG_NO_TOKEN (with NO_INHERIT),
+# SG_MUTANT_FG_NO_INHERIT (server),
 # SG_MUTANT_FG_ON_TOP, SG_MUTANT_FG_NO_FLASH, SG_MUTANT_FG_CLICK_ACTIVE (win32u), SG_MUTANT_FG_X_ON_TOP,
 # SG_MUTANT_FG_MAP_FOCUS (winex11), SG_MUTANT_TASKBAR_NO_FLASH (explorer). (The probe's windows take the
 # focus before they are shown, as Firefox's does.)
@@ -163,12 +165,21 @@ r=$(C FgF allow any)
 "$WINE" fglock-probe.exe launch FgG 700 200 3000 >/dev/null 2>&1; sleep 6; Q FgF FgG
 case "$r $q" in "1 fg=FgG"*) pass "with ASFW_ANY a program whose parent is gone comes forward ($q)" ;;
     *) fail "FgG (its parent gone, under ASFW_ANY): $r $q" ;; esac
+# a program the person may bring forward starts the real window's program through a Unix program (as
+# Setup does through its bridge) and is gone: the window comes forward all the same
+r=$(C FgG spawn bridge:FgH); sleep 6; Q FgG FgH
+case "$q" in "fg=FgH"*) pass "a window started through a Unix bridge by a program in front comes forward ($q)" ;;
+    *) fail "FgH, started through a Unix bridge by FgG (in front): $q" ;; esac
+# ... and through a launcher that is gone before the window shows (an installer's stub, a .lnk's helper)
+r=$(C FgH spawn stub:FgI); sleep 5; Q FgH FgI
+case "$q" in "fg=FgI"*) pass "a window started through a launcher that already exited comes forward ($q)" ;;
+    *) fail "FgI, started by FgH (in front) through a launcher gone since: $q" ;; esac
 
 # --- the person's own ways still work: Alt+Tab, a taskbar button ---
 click 310 600; Q FgE
 xdotool keydown alt; sleep 0.2; xdotool key Tab; sleep 0.4; xdotool keyup alt; sleep 1.5; Q FgE FgF
 case "$q" in "fg=FgE"*) fail "Alt+Tab from FgE left FgE in front ($q)" ;;
-    "fg=Fg"[A-F]" "*) pass "Alt+Tab (the shell's switcher) brings another window forward ($q)" ;;
+    "fg=Fg"[A-I]" "*) pass "Alt+Tab (the shell's switcher) brings another window forward ($q)" ;;
     *) fail "Alt+Tab from FgE: $q" ;; esac
 bp=$(bpoint)
 if [ -n "$bp" ]; then
