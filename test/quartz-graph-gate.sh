@@ -5,12 +5,13 @@
 # available, IMediaPosition preroll and CanSeek*, IMediaFilter::GetClassID, the
 # IGraphConfig methods (filter cache, filter flags, start time, Reconnect, PushThroughData,
 # RemoveFilterEx), IVideoFrameStep forwarding and the IMediaControl collections. The
-# run's log is also checked: none of those may log a FIXME any more (the collections
-# keep theirs on purpose).
+# run's log is also checked: none of those may log a FIXME any more. (2026-11-27: Step with
+# no stepping filter is VFW_E_FRAME_STEP_UNSUPPORTED since 4578 and the collections are
+# objects since 2934; the expectations followed.)
 #
 #   WINE=/opt/wine-sg/bin/wine test/quartz-graph-gate.sh
 # Mutants (quartz, -DSG_MUTANT_x): SEEK_RATE, SEEK_PREROLL, SEEK_AVAIL, CANSEEK,
-# CLASSID, CACHE, FLAGS, RECONNECT, REMOVEEX, STEP.
+# CLASSID, CACHE, FLAGS, RECONNECT, REMOVEEX, STEP; STEP_NOTIMPL (4578).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"

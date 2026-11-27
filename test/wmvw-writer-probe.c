@@ -1,8 +1,8 @@
 /* wmvcore writer with a profile (patch 2865), run by test/wmvw-writer-gate.sh:
  * IWMWriter SetProfile, SetOutputFilename, the inputs (count, formats,
  * properties, SetInputProps), the state errors of an unconfigured writer, and
- * what BeginWriting checks before it needs an encoder (which is not available
- * here: it then returns E_NOTIMPL).
+ * what BeginWriting checks before it needs an encoder (2026-11-27: the writer writes since
+ * 6517 and script streams since 9261, so BeginWriting only may fail for a missing encoder).
  *
  *   wmvw-writer-probe.exe */
 #define COBJMACROS
@@ -293,8 +293,17 @@ int main(void)
     IWMWriter_GetInputFormat(writer, 2, 0, &props2);
     CHECK_HR(IWMWriter_SetInputProps(writer, 2, props2), S_OK, "SetInputProps(2, script)");
     IWMInputMediaProps_Release(props2);
-    CHECK_HR(IWMWriter_BeginWriting(writer), E_NOTIMPL, "BeginWriting (everything set; no encoder here)");
-    CHECK_HR(IWMWriter_EndWriting(writer), NS_E_INVALID_REQUEST, "EndWriting (never started)");
+    /* since 6517 the writer writes (BeginWriting was E_NOTIMPL here). This writer's copy of
+     * the profile still has the image stream, which has no format and is not written (its
+     * FIXME is allowed); the second writer below, without it, gets past the script stream */
+    {
+        HRESULT hr = IWMWriter_BeginWriting(writer);
+        CHECKF(hr != E_NOTIMPL, "BeginWriting (everything set) is no longer E_NOTIMPL (%08lx)", (unsigned long)hr);
+        if (hr == S_OK)
+            CHECK_HR(IWMWriter_EndWriting(writer), S_OK, "EndWriting after BeginWriting");
+        else
+            CHECK_HR(IWMWriter_EndWriting(writer), NS_E_INVALID_REQUEST, "EndWriting (never started)");
+    }
     CHECK_HR(IWMWriter_WriteSample(writer, 0, 0, 0, NULL), E_INVALIDARG, "WriteSample(NULL sample)");
 
     /* AllocateSample and WriteSample */
@@ -332,7 +341,14 @@ int main(void)
         }
         CHECK_HR(IWMWriter_BeginWriting(w2), E_NOT_CONFIGURED, "second writer: BeginWriting (no output)");
         IWMWriterAdvanced_AddSink(a2, &the_sink.iface);
-        CHECK_HR(IWMWriter_BeginWriting(w2), E_NOTIMPL, "second writer: BeginWriting with a sink only (no encoder here)");
+        {
+            HRESULT hr = IWMWriter_BeginWriting(w2);
+            /* audio, video and script: the script stream is written since 9261 (it was
+             * NS_E_INVALID_STREAM); it succeeds, or fails only for an encoder this machine
+             * lacks (WMA/VC-1 from GStreamer) */
+            CHECKF(hr != E_NOTIMPL && hr != NS_E_INVALID_STREAM, "second writer: BeginWriting with a sink only gets past the script stream (%08lx)", (unsigned long)hr);
+            if (hr == S_OK) IWMWriter_EndWriting(w2);
+        }
         IWMWriterAdvanced_RemoveSink(a2, &the_sink.iface);
         IWMWriterAdvanced_Release(a2);
         IWMWriter_Release(w2);

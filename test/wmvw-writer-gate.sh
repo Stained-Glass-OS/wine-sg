@@ -1,8 +1,8 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# wmvcore writer with a profile (patches/sg/2865): SetProfile, SetOutputFilename, input count/formats/props, SetInputProps, the unconfigured writer's state errors, BeginWriting checks (the encoder itself is not implemented: E_NOTIMPL, with a FIXME that this gate allows).
+# wmvcore writer with a profile (patches/sg/2865): SetProfile, SetOutputFilename, input count/formats/props, SetInputProps, the unconfigured writer's state errors, BeginWriting checks (2026-11-27: since 6517 the writer writes and since 9261 a script stream too, so BeginWriting gets past the streams and may fail only for a missing encoder; its 'no encoder' FIXME is allowed).
 # Stderr is checked: none of the implemented functions may log a FIXME.
-# Mutants (wmvcore, -DSG_MUTANT_x): WMVW_NOFORMATCHECK, WMVW_NOOUTPUTCHECK, WMVW_NOCHOSEN
+# Mutants (wmvcore, -DSG_MUTANT_x): WMVW_NOFORMATCHECK, WMVW_NOOUTPUTCHECK, WMVW_NOCHOSEN, WMVW_NO_SCRIPT (9261)
 #
 #   WINE=/opt/wine-sg/bin/wine test/wmvw-writer-gate.sh
 #   WINESERVER=... when it is not beside $WINE (a build tree)
@@ -34,7 +34,9 @@ EOR
 chmod +x "$T/run.sh"
 timeout -s KILL 300 xvfb-run -a -s '-screen 0 1024x768x24' "$T/run.sh"
 cat "$T/probe.out"
-if grep -E 'fixme:wmvcore:' "$T/stderr.log" | grep -Ev 'no encoder'; then
+# allowed: 'no encoder' (an encoder this machine lacks) and the image stream's 'not written'
+# (WMMEDIATYPE_Image {34a50fd8-...}: ASF image streams are not written)
+if grep -E 'fixme:wmvcore:' "$T/stderr.log" | grep -Ev 'no encoder|major type \{34a50fd8-8aa5-4386-81fe-a0efe0488e31\}.* not written'; then
     echo "FAIL  a function logged a FIXME"
     exit 1
 fi

@@ -652,7 +652,8 @@ static void test_frame_step(void)
     hr = IVideoFrameStep_CanStep(step, 0, NULL);
     CHECKF(hr == S_FALSE, "CanStep without a stepping filter is S_FALSE (%#lx)", hr);
     hr = IVideoFrameStep_Step(step, 1, NULL);
-    CHECKF(hr == E_NOTIMPL, "Step without a stepping filter is E_NOTIMPL (%#lx)", hr);
+    /* VFW_E_FRAME_STEP_UNSUPPORTED, the documented error (patches/sg/4578; it was E_NOTIMPL) */
+    CHECKF(hr == (HRESULT)0x8004028e, "Step without a stepping filter is VFW_E_FRAME_STEP_UNSUPPORTED (%#lx)", hr);
     hr = IVideoFrameStep_CancelStep(step);
     CHECKF(hr == S_OK, "CancelStep with nothing to cancel is S_OK (%#lx)", hr);
 
@@ -675,7 +676,7 @@ static void test_frame_step(void)
     hr = IVideoFrameStep_Step(step, 2, (IUnknown *)&f2.pins[0].IPin_iface);
     CHECKF(hr == 0x1234 && f2.steps_forwarded == 3, "Step with an explicit pin (%#lx)", hr);
     hr = IVideoFrameStep_Step(step, 2, (IUnknown *)&f1.IBaseFilter_iface);
-    CHECKF(hr == E_NOTIMPL && f2.steps_forwarded == 3, "Step with a filter that cannot step (%#lx)", hr);
+    CHECKF(hr == (HRESULT)0x8004028e && f2.steps_forwarded == 3, "Step with a filter that cannot step (%#lx)", hr);
 
     IVideoFrameStep_Release(step);
     IGraphBuilder_Release(graph);
@@ -690,15 +691,19 @@ static void test_control_collections(void)
     BSTR name = SysAllocString(L"nothing.avi");
 
     IGraphBuilder_QueryInterface(graph, &IID_IMediaControl, (void **)&control);
+    /* the collections are real objects since patches/sg/2934 (they were E_NOTIMPL); a file
+     * that is not there fails with no object */
     disp = (IDispatch *)0xdeadbeef;
     hr = IMediaControl_get_FilterCollection(control, &disp);
-    CHECKF(hr == E_NOTIMPL && !disp, "FilterCollection: no objects, no fake success (%#lx, %p)", hr, disp);
+    CHECKF(hr == S_OK && disp && disp != (IDispatch *)0xdeadbeef, "FilterCollection is an object (%#lx, %p)", hr, disp);
+    if (hr == S_OK && disp && disp != (IDispatch *)0xdeadbeef) IDispatch_Release(disp);
     disp = (IDispatch *)0xdeadbeef;
     hr = IMediaControl_get_RegFilterCollection(control, &disp);
-    CHECKF(hr == E_NOTIMPL && !disp, "RegFilterCollection: no objects, no fake success (%#lx, %p)", hr, disp);
+    CHECKF(hr == S_OK && disp && disp != (IDispatch *)0xdeadbeef, "RegFilterCollection is an object (%#lx, %p)", hr, disp);
+    if (hr == S_OK && disp && disp != (IDispatch *)0xdeadbeef) IDispatch_Release(disp);
     disp = (IDispatch *)0xdeadbeef;
     hr = IMediaControl_AddSourceFilter(control, name, &disp);
-    CHECKF(hr == E_NOTIMPL && !disp, "AddSourceFilter: no objects, no fake success (%#lx, %p)", hr, disp);
+    CHECKF(FAILED(hr) && !disp, "AddSourceFilter of a missing file fails, no object (%#lx, %p)", hr, disp);
     hr = IMediaControl_AddSourceFilter(control, name, NULL);
     CHECKF(hr == E_POINTER, "AddSourceFilter(NULL out) is E_POINTER (%#lx)", hr);
     SysFreeString(name);
