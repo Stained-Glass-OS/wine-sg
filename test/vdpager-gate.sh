@@ -91,16 +91,17 @@ vr=$(echo "$V" | cut -d, -f3)
 [ "$vr" = "$pl" ] && pass "the Task View button is just left of it ($V)" || fail "Task View button at $V, pager at $P"
 my=$(( (pt + pb) / 2 )); bw=$(( (pr - pl) / 4 ))
 # box 0 holds Alpha's outline at its left; its right is the desktop in the accent
+# (a new user's accent: wine.inf's DWM AccentColor 7B2FBE, 9756; before it 8A2BE2)
 x0=$(( pl + bw - 5 )); x1=$(( pl + bw + bw / 2 ))
-[ "$(px start $x0 $my)" = "138,43,226" ] && pass "the current desktop's box is in the accent colour" || fail "box 0 at $x0,$my: $(px start $x0 $my)"
-[ "$(px start $x1 $my)" != "138,43,226" ] && pass "and the others are not" || fail "box 1 is in the accent too"
+[ "$(px start $x0 $my)" = "123,47,190" ] && pass "the current desktop's box is in the accent colour" || fail "box 0 at $x0,$my: $(px start $x0 $my)"
+[ "$(px start $x1 $my)" != "123,47,190" ] && pass "and the others are not" || fail "box 1 is in the accent too"
 ax=$(( pl + 11 )); ay=$(( pt + 13 ))  # Alpha (60,60 360x260 of 1024x700), in a 35x24 box at +4,+8
 [ "$(px start $ax $ay)" = "244,244,244" ] && pass "Alpha is drawn in box 1" || fail "no outline of Alpha at $ax,$ay: $(px start $ax $ay)"
 
 [ "$(after query 2)" = "desktops=4 current=2" ] && pass "clicking the third box goes to desktop 3" || fail "click: $(after query 2)"
 case "$(after 'state Alpha' 1)" in "visible=1 cloaked=0x2 desktop=0") pass "and Alpha stays behind on desktop 1" ;; *) fail "Alpha: $(after 'state Alpha' 1)" ;; esac
 x2=$(( pl + 2 * bw + bw / 2 ))
-[ "$(px third $x2 $my)" = "138,43,226" ] && pass "box 3 is now the accented one" || fail "box 3: $(px third $x2 $my)"
+[ "$(px third $x2 $my)" = "123,47,190" ] && pass "box 3 is now the accented one" || fail "box 3: $(px third $x2 $my)"
 [ "$(px green $x2 $my)" = "16,137,62" ] && pass "the accent follows Personalization (green)" || fail "accent: $(px green $x2 $my)"
 [ "$(after query 3)" = "desktops=4 current=3" ] && pass "the wheel steps to the next desktop" || fail "wheel: $(after query 3)"
 [ "$(after query 4)" = "desktops=5 current=3" ] && pass "right button > New desktop adds one" || fail "menu: $(after query 4)"

@@ -67,8 +67,10 @@ S started
 # the button now in the pin's place is notepad's: its menu, Unpin from taskbar
 set -- \$(mid "\$P")
 xdotool mousemove \$1 \$2 click 3; sleep 1.5; import -window root "$T/menu.png"
-# the menu stands on the pointer: its name, Unpin from taskbar, a line, Close window
-xdotool mousemove \$((\$1 + 50)) \$((\$2 - 57)) click 1; sleep 2
+# the menu stands on the pointer: its name, Unpin from tas&kbar, a line, then
+# Report a problem... where sg-bugreport is installed and Close window -- its
+# height depends on the machine, so the item is taken by its key, as Pin was
+xdotool key k; sleep 2
 ls "$PINS" > "$T/unpinned.out" 2>&1
 "$WINE" taskkill /im notepad.exe >/dev/null 2>&1; sleep 3
 S gone

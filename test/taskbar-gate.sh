@@ -157,7 +157,10 @@ case "$(v hidden appbar)" in "3 "*) [ "$(v hidden autohidebar)" = 1 ] && pass "S
 [ "$(px cdark 600 690)" = "31,31,31" ] && pass "taskbar color Dark: #1F1F1F" || fail "dark: $(px cdark 600 690)"
 [ "$(px clight 600 690)" = "238,238,238" ] && pass "taskbar color Light" || fail "light: $(px clight 600 690)"
 [ "$(px cblue 600 690)" = "233,238,246" ] && pass "taskbar color Light blue (whitish blue)" || fail "light blue: $(px cblue 600 690)"
-[ "$(px caccent 600 690)" = "75,23,124" ] && pass "taskbar color Accent: the accent darkened" || fail "accent: $(px caccent 600 690)"
+# a new user's accent is wine.inf's DWM AccentColor, Stained Glass purple 7B2FBE
+# (9756, as Settings, dwmapi and uxtheme; before it the bar fell back to 8A2BE2),
+# darkened to 55%: 67,25,104
+[ "$(px caccent 600 690)" = "67,25,104" ] && pass "taskbar color Accent: the accent darkened" || fail "accent: $(px caccent 600 690)"
 [ "$(v rounded bar)" = "0,652,1024,700 topmost=1" ] && [ "$(v rounded work)" = "0,0,1024,652" ] \
     && pass "the Rounded style: a 48 px bar, its space reserved" || fail "rounded bar: $(v rounded bar) / $(v rounded work)"
 b=$(v rounded button); bx=$(( ($(echo "$b" | cut -d, -f1) + $(echo "$b" | cut -d, -f3)) / 2 ))

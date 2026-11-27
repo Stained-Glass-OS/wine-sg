@@ -8,7 +8,9 @@
 # edge snaps it (with a preview), into a corner to a quarter (0451), and to
 # the top maximizes it; Win+Up/Down turn a half into a quarter and back (the move/size
 # WinEvents, 0073), the Windows key alone opens Start, Win+H voice typing,
-# Win+R the Run dialog, Win+E File Explorer, Win+I Settings (0130), Win+X > Terminal (0133).
+# Win+R the Run dialog, Win+E File Explorer, Win+I Settings (0130), Win+X > Terminal (0133),
+# its T reaching the menu with the pointer over another program's window (9115; mutant
+# SG_MUTANT_KEYS_UNDER_POINTER).
 #
 #   WINE=/opt/wine-sg/bin/wine test/shellkeys-gate.sh     (ARTIFACTS=DIR keeps logs)
 set -u
@@ -128,6 +130,9 @@ K super+period; sleep 1
 "$WINE" reg add 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\sg-emoji.exe' /ve /d 'C:\emojisemi.exe' /f >/dev/null 2>&1
 K super+semicolon; sleep 1
 K super+i; sleep 1
+# the person's pointer rests over File Explorer: the menu's key still goes to the menu, the
+# foreground's, not to the window under the pointer (wine-sg 9115)
+xdotool mousemove 600 300; sleep 0.5
 K super+x; K t; sleep 1
 EOF
 chmod +x "$T/session.sh"
