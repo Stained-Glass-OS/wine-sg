@@ -166,6 +166,9 @@ rm -f "$DESK/pasteme.txt"
 xdotool mousemove 946 396 click 1; wait_for 10 gone SgVdeskProbe Away
 "$WINE" notepad >/dev/null 2>&1 &
 wait_for 30 visible Notepad; sleep 2
+# started from outside after the person's clicks it opens behind (wine-sg 9930's foreground lock): the
+# person brings it forward first (X gives it the keyboard, as a click on it does)
+xdotool windowfocus "$(xdotool search --name ' - Notepad$' 2>/dev/null | head -1)" 2>/dev/null; sleep 1
 xdotool key alt+F4; wait_for 15 gone Notepad; sleep 2
 xdotool key alt+F4
 wait_for 10 visible '#32770' 'Shut Down' && pass "Alt+F4 after the last window closed asks" || fail "no dialog after the last window closed"

@@ -3456,6 +3456,24 @@ ShellAbout keeps Wine's credits and license, allowlisted as attribution.
   A container with a hidden `/proc` will fail step 5 with "could not find the
   running process", which is a false negative rather than a real failure.
 
+## `patches/sg/9930`-`9932`: the foreground lock (gates: click before you type)
+
+Since 9930 Wine follows Windows' SetForegroundWindow rules: a program comes to
+the front only when nothing is in front, it is (or was started by) the
+foreground program or the program that got the person's last key or click, it
+was granted (AllowSetForegroundWindow), or there was no input for
+ForegroundLockTimeout (200000 ms; 0 = off). Otherwise its window goes under the
+window in front and its taskbar button turns orange (explorer, 9931). Programs
+started from outside Wine (a gate's `"$WINE" foo.exe &`, ssh, a Linux launcher)
+have no Wine parent: after the gate's xdotool/QMP input they open BEHIND.
+A gate that starts a program after typing elsewhere must do what a person does
+-- click the new window or its taskbar button, or start it from Start / Run /
+the desktop -- never weaken the lock. The drivers' own foreground changes (the
+window manager's, the compositor's) use NtUserSetForegroundWindowInput and are
+not held. Shell pieces in other processes get the right from explorer
+(sg_pass_foreground, ASFW_ANY in run()). Gates: test-fglock, test-fgshell,
+test-fglockupgrade.
+
 ## License
 
 **LGPL-2.1+ — Wine's license, not ours to choose.**

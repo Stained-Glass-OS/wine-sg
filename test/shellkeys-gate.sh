@@ -35,11 +35,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 "$MINGW" -O2 -o "$T/vdesk-probe.exe" "$HERE/vdesk-probe.c" -ldwmapi -lgdi32 -lole32 &&
+"$MINGW" -O2 -o "$T/fglock-probe.exe" "$HERE/fglock-probe.c" -lgdi32 &&
 "$MINGW" -municode -O2 -o "$T/control-probe.exe" "$HERE/control-probe.c" || { fail "probe did not build"; exit 1; }
 mkdir -p "$WINEPREFIX"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
-cp "$T/vdesk-probe.exe" "$T/control-probe.exe" "$WINEPREFIX/drive_c/"
+cp "$T/vdesk-probe.exe" "$T/control-probe.exe" "$T/fglock-probe.exe" "$WINEPREFIX/drive_c/"
 cp "$T/control-probe.exe" "$WINEPREFIX/drive_c/wtprobe.exe"
 cp "$T/control-probe.exe" "$WINEPREFIX/drive_c/emojiprobe.exe"
 cp "$T/control-probe.exe" "$WINEPREFIX/drive_c/emojisemi.exe"
@@ -106,6 +107,10 @@ xdotool mousemove 300 8 mousedown 1; sleep 0.3; xdotool mousemove 305 60; sleep 
 # before the snap, under the pointer (0983)
 "$WINE" vdesk-probe.exe window Gamma 520 160 >/dev/null 2>&1 &
 sleep 3
+# started from outside after the person's input, it opens behind (wine-sg 9930's foreground lock): a
+# person clicks its taskbar button first
+set -- \$("$WINE" fglock-probe.exe button Gamma 2>/dev/null | tr -d '\r')
+[ \$# = 4 ] && xdotool mousemove \$(( \$1 + \$3 / 2 )) \$(( \$2 + \$4 / 2 )) click 1; sleep 1
 P rect Gamma
 K super+Left; P rect Gamma
 xdotool mousemove 200 12 mousedown 1; sleep 0.3; xdotool mousemove 210 30; sleep 0.3; xdotool mousemove 600 300; sleep 0.8; xdotool mouseup 1; sleep 1.5; P rect Gamma

@@ -8,8 +8,12 @@
 # server ignored the request: Wine said the window had the focus, X kept the
 # keyboard elsewhere.
 #
-# Bravo is typed in, then Alpha is clicked and typed in; another process activates
-# Bravo as the taskbar does; a key typed at the X level must reach Bravo.
+# Bravo is typed in, then Alpha is clicked and typed in; Bravo's taskbar button is clicked
+# while Bravo is held; a key typed at the X level must reach Bravo.
+#
+# Since wine-sg 9930 (the foreground lock) Alpha, started after Bravo was typed in, opens behind it and
+# is clicked to the front (it set its focus before it was shown: activated late, it still gets the
+# keyboard -- mutant SG_MUTANT_FG_NO_LATE_FOCUS), and Bravo is brought forward by its taskbar button.
 #
 #   WINE=/opt/wine-sg/bin/wine test/focus-activate-gate.sh
 set -u
@@ -28,11 +32,12 @@ T=$(mktemp -d /var/tmp/sg-focusact.XXXXXX); XP=
 export WINEPREFIX="$T/prefix" WINEDEBUG=${WINEDEBUG:--all} WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
 trap '"$WINESERVER" -k 2>/dev/null; [ -n "$XP" ] && kill "$XP" 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 "$MINGW" -O2 -o "$T/focus-probe.exe" "$HERE/focus-probe.c" || { fail "probe did not build"; exit 1; }
+"$MINGW" -O2 -o "$T/fglock-probe.exe" "$HERE/fglock-probe.c" -lgdi32 || { fail "probe did not build"; exit 1; }
 Xvfb -displayfd 3 -screen 0 1024x700x24 -nolisten tcp 3>"$T/display" >/dev/null 2>&1 & XP=$!
 i=0; while [ ! -s "$T/display" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 export DISPLAY=":$(cat "$T/display")"
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
-cp "$T/focus-probe.exe" "$WINEPREFIX/drive_c/"
+cp "$T/focus-probe.exe" "$T/fglock-probe.exe" "$WINEPREFIX/drive_c/"
 "$WINE" reg add 'HKCU\Software\Wine\Explorer' /v Desktop /d shell /f >/dev/null 2>&1
 "$WINE" reg add 'HKCU\Software\Wine\Explorer\Desktops' /v shell /d 1024x700 /f >/dev/null 2>&1
 "$WINESERVER" -w
@@ -57,10 +62,15 @@ xdotool type --delay 50 a; sleep 1
 # that message's time the server ignores it (older than the last focus change);
 # with CurrentTime it is granted. On Xwayland the click's time comes from the
 # compositor's clock and is later without any holding.
+# The activation is the taskbar's own, on a click of Bravo's button (wine-sg 9930: a program the person
+# did not click cannot bring a window forward, as on Windows)
+set -- $("$WINE" fglock-probe.exe button Bravo 2>/dev/null | tr -d '\r')
+[ $# = 4 ] || { fail "no taskbar button for Bravo"; exit 1; }
 kill -STOP "$BP"
-"$WINE" focus-probe.exe activate Bravo > "$T/act.out" 2>/dev/null
+xdotool mousemove $(( $1 + $3 / 2 )) $(( $2 + $4 / 2 )) click 1
+echo "activated=taskbar" > "$T/act.out"
 sleep 0.5
-xdotool windowfocus --sync "$(xdotool search --name '^Alpha$' | head -1)" 2>/dev/null
+xdotool windowfocus --sync "$(xdotool search --name 'shell - Wine Desktop' | head -1)" 2>/dev/null   # the desktop's X window, as the taskbar click leaves it
 sleep 0.3
 kill -CONT "$BP"
 act=$(tr -d '\r' < "$T/act.out")

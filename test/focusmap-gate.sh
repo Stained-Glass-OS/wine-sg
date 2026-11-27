@@ -35,7 +35,9 @@ cat > "$T/session.sh" <<EOF
 #!/bin/sh
 "$WINE" explorer /desktop=shell,1024x700 > "$T/explorer.out" 2>&1 &
 sleep 8
-xdotool mousemove 700 500 click 1; sleep 1
+# (no click on the desktop first: since wine-sg 9930 a program started from outside after the person's
+# click opens behind -- the foreground lock -- and the desktop's X window has the keyboard anyway)
+xdotool mousemove 700 500; sleep 1
 "$WINE" "$T/focusmap-probe.exe" >/dev/null 2>&1 &
 sleep 5
 xdotool type --delay 80 abc; sleep 2

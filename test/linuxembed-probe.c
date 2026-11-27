@@ -38,6 +38,32 @@ static BOOL CALLBACK list_window( HWND hwnd, LPARAM lp )
     return TRUE;
 }
 
+/* the person's way to bring a window forward: a click on its taskbar button (since wine-sg 9930 a
+ * program the person did not click may not bring another program's window forward); the click is
+ * input, as xdotool's is. A window in front already is left alone (a click would minimize it), unless minimized. */
+static BOOL click_taskbar_button( HWND hwnd )
+{
+    HWND tray = FindWindowA( "Shell_TrayWnd", NULL ), b;
+    INPUT in[2] = { { INPUT_MOUSE }, { INPUT_MOUSE } };
+    POINT old;
+    RECT r;
+
+    if (GetAncestor( GetForegroundWindow(), GA_ROOTOWNER ) == hwnd && !IsIconic( hwnd )) return TRUE;
+    for (b = tray ? GetWindow( tray, GW_CHILD ) : NULL; b; b = GetWindow( b, GW_HWNDNEXT ))
+        if ((HWND)(ULONG_PTR)GetDlgCtrlID( b ) == hwnd && IsWindowVisible( b )) break;
+    if (!b) return FALSE;
+    GetWindowRect( b, &r );
+    GetCursorPos( &old );
+    SetCursorPos( (r.left + r.right) / 2, (r.top + r.bottom) / 2 );
+    Sleep( 100 );
+    in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput( 2, in, sizeof(INPUT) );
+    Sleep( 300 );
+    SetCursorPos( old.x, old.y );
+    return TRUE;
+}
+
 int main( int argc, char **argv )
 {
     HWND hwnd;
@@ -96,8 +122,11 @@ int main( int argc, char **argv )
     if (!hwnd) { printf( "none\n" ); return 1; }
     if (!strcmp( argv[1], "activate" ))
     {
-        if (IsIconic( hwnd )) ShowWindow( hwnd, SW_RESTORE );
-        SetForegroundWindow( hwnd );
+        if (!click_taskbar_button( hwnd ))
+        {
+            if (IsIconic( hwnd )) ShowWindow( hwnd, SW_RESTORE );
+            SetForegroundWindow( hwnd );
+        }
     }
     else if (!strcmp( argv[1], "move" ) && argc == 8)
         SetWindowPos( hwnd, 0, atoi( argv[4] ), atoi( argv[5] ), atoi( argv[6] ), atoi( argv[7] ), SWP_NOZORDER | SWP_NOACTIVATE );
