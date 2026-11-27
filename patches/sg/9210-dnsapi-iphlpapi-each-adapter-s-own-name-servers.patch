@@ -1,0 +1,255 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] dnsapi, iphlpapi: each adapter's own name servers, as Windows reports them (9210)
+
+GetAdaptersAddresses and so ipconfig /all and .NET's IPInterfaceProperties.DnsAddresses gave every adapter the name servers of resolv.conf -- behind systemd-resolved, 127.0.0.53 for every adapter (ledger i0510). Windows' DNS client keeps each adapter's servers: its fixed NameServer, else the lease's DhcpNameServer (Tcpip\Parameters\Interfaces\{GUID}) and, for IPv6, NameServer else Dhcpv6DNSServers (Tcpip6). nsiproxy keeps those keys from the Linux side (9250: NetworkManager's or networkd's lease, the system's upstream servers for a fixed adapter; 9211: the DHCPv6 lease). DnsQueryConfig now answers DnsConfigDnsServers{Unspec,Ipv4,Ipv6} and DnsConfigDnsServerList for an adapter from them (IPv6 first for Unspec; an adapter without IPv6 servers of its own gets the system's); an adapter without the key, and the system-wide question (no adapter: GetNetworkParams), still get the resolver's servers. An adapter with no name servers lists none (GetAdaptersAddresses failed with DNS_ERROR_NO_DNS_SERVERS, and read the first DnsQueryConfig's size uninitialised), loopback none (it got the stub's 127.0.0.53). GetPerAdapterInfo still gives the system's list: Wine Mono's IPv4InterfaceProperties passes GetPerAdapterInfo a one-server structure whatever size it was told, and an adapter's two or more servers overran it (NullReferenceException); per adapter there once Mono allocates the size asked for (ledger i0690). An adapter without name servers no longer underflows GetPerAdapterInfo's size.
+
+Gate: test-tcpipreg (GetAdaptersAddresses, ipconfig /all, .NET DnsAddresses per adapter; .NET's GetIPv4Properties still works). Mutant SG_MUTANT_DNS_SYSTEM_ONLY.
+---
+--- a/dlls/dnsapi/query.c
++++ b/dlls/dnsapi/query.c
+@@ -28,6 +28,7 @@
+ #include "windns.h"
+ #include "nb30.h"
+ #include "ws2def.h"
++#include "ws2ipdef.h"
+ #include "in6addr.h"
+ #include "inaddr.h"
+ #include "ip2string.h"
+@@ -570,6 +571,167 @@
+     wcscat( key, adapter );
+ }
+ 
++/* Stained Glass OS (i0510): an adapter's own name servers, as Windows' DNS client keeps them per
++ * adapter -- the fixed NameServer, else the lease's: DhcpNameServer (IPv4, Tcpip) and
++ * Dhcpv6DNSServers (IPv6, Tcpip6). nsiproxy keeps those keys (9250, 9211). An adapter without
++ * its key is not known to them: the caller answers with the system's servers. */
++#define MAX_ADAPTER_SERVERS 16
++
++struct adapter_servers
++{
++    SOCKADDR_INET addr[MAX_ADAPTER_SERVERS];
++    DWORD count;
++};
++
++static void add_server_text( struct adapter_servers *out, const WCHAR *text, int family )
++{
++    SOCKADDR_INET sa;
++    DWORD i;
++
++    if (out->count == MAX_ADAPTER_SERVERS) return;
++    memset( &sa, 0, sizeof(sa) );
++    if (family == AF_INET)
++    {
++        USHORT port;
++        if (RtlIpv4StringToAddressExW( text, TRUE, &sa.Ipv4.sin_addr, &port ) || !sa.Ipv4.sin_addr.s_addr) return;
++        sa.Ipv4.sin_family = AF_INET;
++    }
++    else
++    {
++        ULONG scope;
++        USHORT port;
++        if (RtlIpv6StringToAddressExW( text, &sa.Ipv6.sin6_addr, &scope, &port )) return;
++        sa.Ipv6.sin6_family = AF_INET6;
++        sa.Ipv6.sin6_scope_id = scope;
++    }
++    for (i = 0; i < out->count; i++) if (!memcmp( &out->addr[i], &sa, sizeof(sa) )) return;
++    out->addr[out->count++] = sa;
++}
++
++/* NAME's addresses: REG_SZ separated by spaces or commas, REG_MULTI_SZ, or (IPv6) REG_BINARY
++ * of 16-byte addresses. FALSE when the value is not there or holds none. */
++static BOOL read_server_value( HKEY key, const WCHAR *name, int family, struct adapter_servers *out )
++{
++    WCHAR buf[1024], *p, *end;
++    DWORD type, size = sizeof(buf) - 2 * sizeof(WCHAR), before = out->count;
++
++    if (RegQueryValueExW( key, name, NULL, &type, (BYTE *)buf, &size )) return FALSE;
++    if (type == REG_BINARY && family == AF_INET6)
++    {
++        DWORD i;
++        for (i = 0; i + 16 <= size && out->count < MAX_ADAPTER_SERVERS; i += 16)
++        {
++            SOCKADDR_INET sa;
++            memset( &sa, 0, sizeof(sa) );
++            sa.Ipv6.sin6_family = AF_INET6;
++            memcpy( &sa.Ipv6.sin6_addr, (BYTE *)buf + i, 16 );
++            out->addr[out->count++] = sa;
++        }
++        return out->count > before;
++    }
++    if (type != REG_SZ && type != REG_MULTI_SZ) return FALSE;
++    end = buf + size / sizeof(WCHAR);
++    end[0] = end[1] = 0;
++    for (p = buf; p < end; p++) if (*p == ' ' || *p == ',' || *p == '\t' || *p == ';' || (!*p && type == REG_MULTI_SZ)) *p = '\n';
++    for (p = buf; *p; )
++    {
++        WCHAR *tok = p;
++        while (*p && *p != '\n') p++;
++        if (*p) *p++ = 0;
++        if (*tok) add_server_text( out, tok, family );
++    }
++    return out->count > before;
++}
++
++/* TRUE when the adapter has the key of that family; its servers (maybe none) appended */
++static BOOL adapter_family_servers( const WCHAR *adapter, int family, struct adapter_servers *out )
++{
++    static const WCHAR v4_key[] = L"System\\CurrentControlSet\\Services\\Tcpip\\Parameters";
++    static const WCHAR v6_key[] = L"System\\CurrentControlSet\\Services\\Tcpip6\\Parameters";
++    WCHAR path[256];
++    HKEY key;
++
++    make_adapter_key( path, ARRAY_SIZE(path), family == AF_INET ? v4_key : v6_key, adapter );
++    if (!path[0] || RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE, &key )) return FALSE;
++    if (!read_server_value( key, L"NameServer", family, out ))
++        read_server_value( key, family == AF_INET ? L"DhcpNameServer" : L"Dhcpv6DNSServers", family, out );
++    RegCloseKey( key );
++    return TRUE;
++}
++
++/* FAMILY's servers of ADAPTER into a DNS_ADDR_ARRAY (IPv6 first for AF_UNSPEC, as Windows lists
++ * them). -1: the adapter is not known; the caller asks the resolver. */
++static LONG get_adapter_serverlist( const WCHAR *adapter, int family, DNS_ADDR_ARRAY *addrs, DWORD *len )
++{
++    struct adapter_servers servers = { .count = 0 };
++    BOOL known = FALSE;
++    DWORD i, needed;
++
++#ifdef SG_MUTANT_DNS_SYSTEM_ONLY
++    return -1;
++#endif
++    if (!adapter || !*adapter) return -1;
++    if (family != AF_INET) known |= adapter_family_servers( adapter, AF_INET6, &servers );
++    if (family != AF_INET && !servers.count)
++    {
++        /* no IPv6 servers of its own (no DHCPv6 lease): the system's, as a fixed adapter has */
++        char buf[FIELD_OFFSET(DNS_ADDR_ARRAY, AddrArray[MAX_ADAPTER_SERVERS])];
++        DNS_ADDR_ARRAY *sys = (DNS_ADDR_ARRAY *)buf;
++        DWORD sys_len = sizeof(buf);
++        struct get_serverlist_params params = { AF_INET6, sys, &sys_len };
++
++        if (!RESOLV_CALL( get_serverlist, &params ))
++            for (i = 0; i < sys->AddrCount && servers.count < MAX_ADAPTER_SERVERS; i++)
++            {
++                memset( &servers.addr[servers.count], 0, sizeof(servers.addr[0]) );
++                memcpy( &servers.addr[servers.count++], sys->AddrArray[i].MaxSa, sizeof(SOCKADDR_IN6) );
++            }
++    }
++    if (family != AF_INET6) known |= adapter_family_servers( adapter, AF_INET, &servers );
++    if (!known) return -1;
++    if (!servers.count) return DNS_ERROR_NO_DNS_SERVERS;
++
++    needed = FIELD_OFFSET(DNS_ADDR_ARRAY, AddrArray[servers.count]);
++    if (!addrs || *len < needed)
++    {
++        *len = needed;
++        return !addrs ? ERROR_SUCCESS : ERROR_MORE_DATA;
++    }
++    *len = needed;
++    memset( addrs, 0, needed );
++    addrs->MaxCount = addrs->AddrCount = servers.count;
++    addrs->Family = family;
++    for (i = 0; i < servers.count; i++)
++    {
++        DWORD salen = servers.addr[i].si_family == AF_INET6 ? sizeof(SOCKADDR_IN6) : sizeof(SOCKADDR_IN);
++        memcpy( addrs->AddrArray[i].MaxSa, &servers.addr[i], salen );
++        addrs->AddrArray[i].Data.DnsAddrUserDword[0] = salen;
++    }
++    return ERROR_SUCCESS;
++}
++
++/* DnsConfigDnsServerList for ADAPTER: its IPv4 servers as an IP4_ARRAY; -1 when not known */
++static LONG get_adapter_ip4_list( const WCHAR *adapter, IP4_ARRAY *out, DWORD *len )
++{
++    struct adapter_servers servers = { .count = 0 };
++    DWORD i, needed;
++
++#ifdef SG_MUTANT_DNS_SYSTEM_ONLY
++    return -1;
++#endif
++    if (!adapter || !*adapter || !adapter_family_servers( adapter, AF_INET, &servers )) return -1;
++    needed = FIELD_OFFSET(IP4_ARRAY, AddrArray[servers.count]);
++    if (!out || *len < needed)
++    {
++        *len = needed;
++        return !out ? ERROR_SUCCESS : ERROR_MORE_DATA;
++    }
++    out->AddrCount = servers.count;
++    for (i = 0; i < servers.count; i++) out->AddrArray[i] = servers.addr[i].Ipv4.sin_addr.s_addr;
++    *len = needed;
++    return ERROR_SUCCESS;
++}
++
+ /******************************************************************************
+  * DnsQueryConfig          [DNSAPI.@]
+  *
+@@ -586,7 +748,11 @@
+     switch (config)
+     {
+     case DnsConfigDnsServerList:
++    {
++        LONG adapter_ret = get_adapter_ip4_list( adapter, buffer, len );
++        if (adapter_ret != -1) return adapter_ret;
+         return get_dns_server_list( buffer, len );
++    }
+ 
+     case DnsConfigHostName_A:
+     case DnsConfigHostName_UTF8:
+@@ -678,16 +844,22 @@
+     case DnsConfigDnsServersUnspec:
+     {
+         struct get_serverlist_params params = { AF_UNSPEC, buffer, len };
++        LONG adapter_ret = get_adapter_serverlist( adapter, AF_UNSPEC, buffer, len );
++        if (adapter_ret != -1) return adapter_ret;
+         return RESOLV_CALL( get_serverlist, &params );
+     }
+     case DnsConfigDnsServersIpv4:
+     {
+         struct get_serverlist_params params = { AF_INET, buffer, len };
++        LONG adapter_ret = get_adapter_serverlist( adapter, AF_INET, buffer, len );
++        if (adapter_ret != -1) return adapter_ret;
+         return RESOLV_CALL( get_serverlist, &params );
+     }
+     case DnsConfigDnsServersIpv6:
+     {
+         struct get_serverlist_params params = { AF_INET6, buffer, len };
++        LONG adapter_ret = get_adapter_serverlist( adapter, AF_INET6, buffer, len );
++        if (adapter_ret != -1) return adapter_ret;
+         return RESOLV_CALL( get_serverlist, &params );
+     }
+     /* Windows does not implement this, but we need it in iphlpapi. */
+--- a/dlls/iphlpapi/iphlpapi_main.c
++++ b/dlls/iphlpapi/iphlpapi_main.c
+@@ -1384,9 +1384,12 @@
+     while (aa)
+     {
+         MultiByteToWideChar( CP_ACP, 0, aa->AdapterName, -1, name, ARRAY_SIZE(name) );
+-        if (!(flags & GAA_FLAG_SKIP_DNS_SERVER))
++        /* Stained Glass OS (i0510): loopback has no name servers of its own (GetPerAdapterInfo
++         * says the same); the resolver's would be the stub's 127.0.0.53 */
++        if (!(flags & GAA_FLAG_SKIP_DNS_SERVER) && aa->IfType != IF_TYPE_SOFTWARE_LOOPBACK)
+         {
+             servers = (DNS_ADDR_ARRAY *)buf;
++            size = sizeof(buf);
+             for (attempt = 0; attempt < 5; attempt++)
+             {
+                 err = DnsQueryConfig( query, 0, name, NULL, servers, &size );
+@@ -1422,6 +1425,8 @@
+                 }
+             }
+             if (servers != (DNS_ADDR_ARRAY *)buf) heap_free( servers );
++            /* Stained Glass OS (i0510): an adapter without name servers lists none, as on Windows */
++            if (err == DNS_ERROR_NO_DNS_SERVERS) err = ERROR_SUCCESS;
+             if (err) return err;
+         }
+ 
+@@ -3009,7 +3014,8 @@
+     if (!size) return ERROR_INVALID_PARAMETER;
+     if (ConvertInterfaceIndexToLuid( index, &luid )) return ERROR_NO_DATA;
+ 
+-    if (get_dns_server_list( &luid, NULL, NULL, &dns_size ) == ERROR_BUFFER_OVERFLOW)
++    if (get_dns_server_list( &luid, NULL, NULL, &dns_size ) == ERROR_BUFFER_OVERFLOW &&
++        dns_size >= sizeof(IP_ADDR_STRING)) /* none: an adapter without name servers */
+         needed += dns_size - sizeof(IP_ADDR_STRING);
+ 
+     if (!info || *size < needed)

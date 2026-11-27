@@ -1,6 +1,7 @@
 /* tcpipreg-probe: what Windows programs see of the TCP/IP registry keys (patches/sg/9250).
  *   tcpipreg-probe dump          the adapters (GetAdaptersAddresses, GetAdaptersInfo) and their keys:
- *                                ADAPTER/INFO/VAL/PNP/CLASS/PARAM lines
+ *                                ADAPTER/INFO/VAL/PNP/CLASS/PARAM lines; DNS (GetAdaptersAddresses' name
+ *                                servers), PERADAPTER (GetPerAdapterInfo's), VAL6/PARAM6 (Tcpip6) -- 9210/9211
  *   tcpipreg-probe wait MS       NOTIFY when Tcpip\Parameters\Interfaces changes within MS ms, else QUIET
  *   tcpipreg-probe sleep MS      stays MS ms (keeps the prefix's drivers running)
  *   tcpipreg-probe write         READ ok|denied, WRITE ok|denied, CREATE ok|denied (as the caller)
@@ -33,6 +34,13 @@ static void dump_values( const char *tag, const char *path )
             char *p;
             printf( "%s %s multi [", tag, name );
             for (p = (char *)data; *p; p += strlen( p ) + 1) printf( "%s%s", p == (char *)data ? "" : "|", p );
+            printf( "]\n" );
+        }
+        else if (type == REG_BINARY)
+        {
+            DWORD k;
+            printf( "%s %s binary [", tag, name );
+            for (k = 0; k < dlen; k++) printf( "%02x", data[k] );
             printf( "]\n" );
         }
         else printf( "%s %s type%lu\n", tag, name, type );
@@ -70,6 +78,32 @@ static void dump(void)
         WideCharToMultiByte( CP_UTF8, 0, a->FriendlyName, -1, friendly, sizeof(friendly), NULL, NULL );
         printf( "ADAPTER %s type %lu name %s dhcpflag %d\n", a->AdapterName, a->IfType, friendly,
                 !!(a->Flags & IP_ADAPTER_DHCP_ENABLED) );
+    }
+    for (a = aa; a; a = a->Next)
+    {
+        IP_ADAPTER_DNS_SERVER_ADDRESS *d;
+        IP_PER_ADAPTER_INFO *per;
+        IP_ADDR_STRING *s;
+        ULONG psize = 0;
+
+        printf( "DNS %s [", a->AdapterName );
+        for (d = a->FirstDnsServerAddress; d; d = d->Next)
+        {
+            char text[INET6_ADDRSTRLEN] = "?";
+            void *addr = d->Address.lpSockaddr->sa_family == AF_INET6 ? (void *)&((SOCKADDR_IN6 *)d->Address.lpSockaddr)->sin6_addr
+                                                                       : (void *)&((SOCKADDR_IN *)d->Address.lpSockaddr)->sin_addr;
+            inet_ntop( d->Address.lpSockaddr->sa_family, addr, text, sizeof(text) );
+            printf( "%s%s", d == a->FirstDnsServerAddress ? "" : " ", text );
+        }
+        printf( "]\n" );
+        if (GetPerAdapterInfo( a->IfIndex, NULL, &psize ) != ERROR_BUFFER_OVERFLOW) { printf( "PERADAPTER %s none\n", a->AdapterName ); continue; }
+        per = malloc( psize );
+        if (GetPerAdapterInfo( a->IfIndex, per, &psize )) { printf( "PERADAPTER %s failed\n", a->AdapterName ); free( per ); continue; }
+        printf( "PERADAPTER %s [", a->AdapterName );
+        for (s = &per->DnsServerList; s; s = s->Next)
+            if (s->IpAddress.String[0]) printf( "%s%s", s == &per->DnsServerList ? "" : " ", s->IpAddress.String );
+        printf( "]\n" );
+        free( per );
     }
     size = 0;
     GetAdaptersInfo( NULL, &size );
@@ -117,6 +151,18 @@ static void dump(void)
         RegCloseKey( key );
     }
     dump_values( "PARAM", "System\\CurrentControlSet\\Services\\Tcpip\\Parameters" );
+    dump_values( "PARAM6", "System\\CurrentControlSet\\Services\\Tcpip6\\Parameters" );
+    if (!RegOpenKeyExA( HKEY_LOCAL_MACHINE, "System\\CurrentControlSet\\Services\\Tcpip6\\Parameters\\Interfaces", 0, KEY_READ, &key ))
+    {
+        for (n = 0; len = sizeof(name), !RegEnumKeyExA( key, n, name, &len, NULL, NULL, NULL, NULL ); n++)
+        {
+            printf( "KEY6 %s\n", name );
+            snprintf( path, sizeof(path), "System\\CurrentControlSet\\Services\\Tcpip6\\Parameters\\Interfaces\\%s", name );
+            snprintf( tag, sizeof(tag), "VAL6 %s", name );
+            dump_values( tag, path );
+        }
+        RegCloseKey( key );
+    }
 }
 
 static int wait_change( DWORD ms )

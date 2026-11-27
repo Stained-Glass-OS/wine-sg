@@ -1,4 +1,5 @@
 // tcpipreg-gate.sh: what .NET's NetworkInterface reports of the adapters' DHCP state (patches/sg/9251)
+// and name servers (9210)
 using System;
 using System.Net.NetworkInformation;
 class P {
@@ -10,6 +11,9 @@ class P {
             try { dhcp = p.GetIPv4Properties().IsDhcpEnabled ? "1" : "0"; } catch (Exception e) { dhcp = "E:" + e.GetType().Name; }
             try { foreach (var a in p.DhcpServerAddresses) servers += a + " "; } catch (Exception e) { servers = "E:" + e.GetType().Name; }
             Console.WriteLine("NET " + ni.Id + " dhcp " + dhcp + " servers [" + servers.Trim() + "]");
+            string dns = "";
+            try { foreach (var a in p.DnsAddresses) dns += a + " "; } catch (Exception e) { dns = "E:" + e.GetType().Name; }
+            Console.WriteLine("NETDNS " + ni.Id + " [" + dns.Trim() + "]");
         }
     }
 }

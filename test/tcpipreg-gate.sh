@@ -32,9 +32,16 @@
 #      and a dnspython wheel (dnspython-*.whl), else skipped
 #   WINE=... test/tcpipreg-gate.sh   (needs passwordless sudo; exit 77 otherwise)
 #   5. .NET (Wine Mono): NetworkInterface IsDhcpEnabled and DhcpServerAddresses (skipped without Wine Mono)
+#   6. (9210, i0510) each adapter's own name servers: GetAdaptersAddresses (IPv6 first), ipconfig /all,
+#      .NET DnsAddresses -- not the stub's 127.0.0.53; a released adapter lists none. (GetPerAdapterInfo
+#      keeps the system's list: Wine Mono's IPv4InterfaceProperties overruns its buffer with more than one.)
+#   7. (9211, i0511) eth A also has a NetworkManager DHCPv6 lease: Tcpip6\Parameters\Interfaces\{GUID}
+#      Dhcpv6Iaid, Dhcpv6DNSServers, Dhcpv6DomainSearchList, Tcpip6\Parameters\Dhcpv6DUID; every adapter
+#      has its Tcpip6 key; the lease gone, its values go
 # Mutants: nsiproxy SG_MUTANT_TCPIPREG_NO_FOLLOW (tcpipreg.c), SG_MUTANT_TCPIPREG_NO_NM (dhcp.c),
 #   SG_MUTANT_GUID_BY_INDEX (ndis.c, 9253);
-#   iphlpapi SG_MUTANT_GAI_DHCP_ALWAYS (iphlpapi_main.c).
+#   iphlpapi SG_MUTANT_GAI_DHCP_ALWAYS (iphlpapi_main.c); dnsapi SG_MUTANT_DNS_SYSTEM_ONLY (query.c, 9210);
+#   nsiproxy SG_MUTANT_TCPIP6_NO_DHCP6 (dhcp.c, 9211).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 WINE=${WINE:-/opt/wine-sg/bin/wine}
@@ -84,6 +91,9 @@ nm_nolease() { printf '[device]\nmanaged=true\n' > "/run/NetworkManager/devices/
 ip link add sgeth0 type dummy && ip link add sgeth1 type dummy && ip link add sgeth3 type dummy || { echo "FAIL dummy interfaces"; exit 1; }
 NOW=$(date +%s); EXP=$((NOW + 3000))
 nm_lease sgeth0 10.77.0.1 "10.77.0.53 10.77.0.54" lan.example 3600 $EXP
+# and a DHCPv6 lease (9211)
+printf '\n[dhcp6]\ndhcp6.dhcp6_client_id=00:04:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00\ndhcp6.dhcp6_name_servers=fd77::53\ndhcp6.dhcp6_domain_search=v6.example\ndhcp6.iaid=0x0a0b0c0d\ndhcp6.ip6_address=fd77::5\n' \
+    >> "/run/NetworkManager/devices/$(idx sgeth0)"
 nm_nolease sgeth1
 ip link set sgeth0 up; ip link set sgeth1 up; ip link set sgeth3 up
 ip addr add 10.77.0.5/24 dev sgeth0 valid_lft 3000 preferred_lft 3000
@@ -143,7 +153,21 @@ check "GetAdaptersInfo: DhcpEnabled, DHCP server and lease times from the keys" 
     "^INFO $qA dhcp 1 server \[10\.77\.0\.1\] obtained $((EXP - 3600)) expires $EXP$" "^INFO $qB dhcp 0 "
 check "GetAdaptersAddresses: IP_ADAPTER_DHCP_ENABLED for the DHCP adapters only" \
     "^ADAPTER $qA .* dhcpflag 1$" "^ADAPTER $qB .* dhcpflag 0$" "^ADAPTER $qD .* dhcpflag 1$"
+# 7. the Tcpip6 keys (9211)
+check "DHCPv6 lease: Tcpip6 Interfaces key with Dhcpv6Iaid, Dhcpv6DNSServers, Dhcpv6DomainSearchList; the machine's Dhcpv6DUID" \
+    "^VAL6 $qA Dhcpv6Iaid dword 168496141$" "^VAL6 $qA Dhcpv6DNSServers binary \[fd770000000000000000000000000053\]$" \
+    "^VAL6 $qA Dhcpv6DomainSearchList sz \[v6\.example\]$" "^PARAM6 Dhcpv6DUID binary \[0004112233445566778899aabbccddeeff00\]$" \
+    "^KEY6 $qB$" "^KEY6 $qD$"
+absent "no DHCPv6 lease: no DHCPv6 values" "^VAL6 ($qB|$qD) Dhcpv6"
+# 6. each adapter's own name servers (9210)
+check "GetAdaptersAddresses: each adapter's own name servers (the DHCPv6 lease's first), not the stub's" \
+    "^DNS $qA \[fd77::53 10\.77\.0\.53 10\.77\.0\.54\]$" "^DNS $qB \[10\.77\.0\.53 10\.77\.0\.54 192\.168\.77\.53\]$" \
+    "^DNS $qD \[10\.77\.0\.53 10\.77\.0\.54 192\.168\.77\.53\]$"
+absent "no adapter lists the stub resolver (127.0.0.53), loopback neither" "^DNS .*127\.0\.0\.53"
 me timeout -s KILL 60 "$WINE" ipconfig /all 2>/dev/null | tr -d '\r' > "$W/ipconfig"
+if grep -A20 'sgeth0' "$W/ipconfig" | grep -qE 'DNS servers.*fd77::53' && grep -A20 'sgeth1' "$W/ipconfig" | grep -qE '192\.168\.77\.53' &&
+   ! grep -q '127\.0\.0\.53' "$W/ipconfig"; then pass "ipconfig /all: DNS servers per adapter"
+else fail "ipconfig /all: DNS servers per adapter"; grep -E 'adapter|DNS|^ +[0-9a-f.:]+$' "$W/ipconfig" | sed 's/^/      /' | head -30; fi
 if grep -A12 'sgeth0' "$W/ipconfig" | grep -qE 'DHCP enabled.*Yes' && grep -A12 'sgeth0' "$W/ipconfig" | grep -qE 'DHCP server.*10\.77\.0\.1' &&
    grep -A12 'sgeth1' "$W/ipconfig" | grep -qE 'DHCP enabled.*No'; then pass "ipconfig /all: DHCP enabled and server per adapter"
 else fail "ipconfig /all"; sed 's/^/      /' "$W/ipconfig" | head -60; fi
@@ -162,6 +186,8 @@ nm_nolease sgeth0; ip addr flush dev sgeth0; ip link set sgeth0 down
 check "the cable out (no address, no lease): released as Windows shows it" \
     "^VAL $qA EnableDHCP dword 1$" "^VAL $qA DhcpIPAddress sz \[0\.0\.0\.0\]$" "^VAL $qA DhcpServer sz \[255\.255\.255\.255\]$"
 absent "released: no lease name servers" "^VAL $qA DhcpNameServer "
+check "released: GetAdaptersAddresses lists no name servers for it" "^DNS $qA \[\]$"
+absent "the DHCPv6 lease gone: its Tcpip6 values go" "^VAL6 $qA Dhcpv6(Iaid|DNSServers|DomainSearchList) "
 EXP2=$(( $(date +%s) + 7000 ))
 nm_lease sgeth0 10.77.0.2 10.77.0.53 lan.example 7200 $EXP2
 ip link set sgeth0 up; ip addr add 10.77.0.6/24 dev sgeth0 valid_lft 7000 preferred_lft 7000
@@ -206,6 +232,9 @@ if [ -n "$MCS" ]; then
     if grep -qE "^NET $qA dhcp 1 servers \[10\.77\.0\.2\]$" "$W/net.out" && grep -qE "^NET $qB dhcp 0 " "$W/net.out"; then
         pass ".NET NetworkInterface: IsDhcpEnabled and DhcpServerAddresses per adapter"
     else fail ".NET: $(tr '\n' ' ' < "$W/net.out")"; fi
+    if grep -qE "^NETDNS $qA \[10\.77\.0\.53\]$" "$W/net.out" && grep -qE "^NETDNS $qB \[10\.77\.0\.53 10\.77\.0\.54 192\.168\.77\.53\]$" "$W/net.out"; then
+        pass ".NET IPInterfaceProperties.DnsAddresses: each adapter's own"
+    else fail ".NET DnsAddresses: $(grep NETDNS "$W/net.out" | tr '\n' ' ')"; fi
 else
     echo "SKIP  .NET (no Wine Mono)"
 fi
