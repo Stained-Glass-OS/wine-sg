@@ -1,0 +1,487 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] nsiproxy, netprofm: the Network Connectivity Status Indicator's active probes decide whether a network reaches the internet
+
+A network's internet connectivity was its default route: a hotel's network
+before sign-in, a router with its line down, a VM with no way out all showed
+"Internet access" to every program (INetworkListManager, Windows.Networking.
+Connectivity, the taskbar). Windows' Network Connectivity Status Indicator
+asks instead, and so does nsiproxy now:
+
+- each address family with a default route is probed when the network
+  changes, and again every two minutes while it finds no internet: an HTTP
+  GET of http://<ActiveWebProbeHost>/<ActiveWebProbePath> must answer
+  ActiveWebProbeContent (NlaSvc\Parameters\Internet, Windows' values:
+  www.msftconnecttest.com/connecttest.txt "Microsoft Connect Test",
+  ipv6.msftconnecttest.com for IPv6; wine.inf writes them, administrators may
+  change them). Nothing answering is no internet, another page or a redirect a
+  captive portal. EnableActiveProbing 0, or the policy
+  NetworkConnectivityStatusIndicator\NoActiveProbe 1, turn probing off, as on
+  Windows; then the default route decides as before.
+- the answer is kept beside the configuration (SgActiveProbeResultV4/V6:
+  0 not probed, 1 none, 2 a portal, 3 the internet), written by the
+  machine's nsiproxy; netprofm reads it in every program, a family without
+  internet reaches only its local network, and it watches the key, so a
+  running program's manager changes its connectivity and tells its sinks
+  (ConnectivityChanged and kin) when a portal is signed in to or a line
+  goes down.
+
+Gate: test/ncsi-gate.sh (a private network namespace, the probe page from
+test/ncsi-server.py, test/ncsi-probe.c holding one manager through the page,
+a portal, the page, nothing, probing off). Mutants SG_MUTANT_NO_NCSI,
+SG_MUTANT_NCSI_ALWAYS_INTERNET, SG_MUTANT_NLM_IGNORE_NCSI.
+---
+--- a/dlls/nsiproxy.sys/Makefile.in
++++ b/dlls/nsiproxy.sys/Makefile.in
+@@ -11,6 +11,7 @@
+ 	dhcp.c \
+ 	icmp_echo.c \
+ 	ip.c \
++	ncsi.c \
+ 	ndis.c \
+ 	nsi.c \
+ 	tcp.c \
+--- /dev/null
++++ b/dlls/nsiproxy.sys/ncsi.c
+@@ -0,0 +1,138 @@
++/*
++ * Stained Glass OS: the Network Connectivity Status Indicator's active probes (wine-sg 9661)
++ *
++ * Windows' NCSI decides whether a network reaches the internet by asking: an HTTP GET of
++ * http://<ActiveWebProbeHost>/<ActiveWebProbePath> must answer ActiveWebProbeContent
++ * (www.msftconnecttest.com/connecttest.txt, "Microsoft Connect Test"; ipv6.msftconnecttest.com
++ * for IPv6). A network whose probe gets no answer has no internet ("No internet access"); one
++ * whose probe gets another page or a redirect is behind a captive portal (a hotel's sign-in
++ * page: NLM_INTERNET_CONNECTIVITY_WEBHIJACK). This is the Unix side: one probe over one address
++ * family, with the host's own resolver and sockets.
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <unistd.h>
++#include <time.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <netdb.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "winioctl.h"
++#include "ddk/wdm.h"
++#include "ifdef.h"
++#define USE_WS_PREFIX
++#include "netiodef.h"
++#include "wine/nsi.h"
++#include "wine/debug.h"
++#include "wine/unixlib.h"
++#include "unix_private.h"
++#include "nsiproxy_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(nsi);
++
++static int ms_left( struct timespec *end )
++{
++    struct timespec now;
++    clock_gettime( CLOCK_MONOTONIC, &now );
++    return (end->tv_sec - now.tv_sec) * 1000 + (end->tv_nsec - now.tv_nsec) / 1000000;
++}
++
++/* connect to one of host's addresses of the family, port 80, before the deadline */
++static int probe_connect( const char *host, int family, struct timespec *end )
++{
++    struct addrinfo hints = { .ai_family = family, .ai_socktype = SOCK_STREAM }, *res, *ai;
++    int fd = -1;
++
++    if (getaddrinfo( host, "80", &hints, &res )) return -2;   /* the name is not known */
++    for (ai = res; ai && fd < 0; ai = ai->ai_next)
++    {
++        struct pollfd pfd;
++        int err = 0, left;
++        socklen_t len = sizeof(err);
++
++        if ((fd = socket( ai->ai_family, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0 )) < 0) continue;
++        if (connect( fd, ai->ai_addr, ai->ai_addrlen ) && errno != EINPROGRESS) { close( fd ); fd = -1; continue; }
++        pfd.fd = fd; pfd.events = POLLOUT;
++        if ((left = ms_left( end )) <= 0 || poll( &pfd, 1, left ) != 1 ||
++            getsockopt( fd, SOL_SOCKET, SO_ERROR, &err, &len ) || err)
++        {
++            close( fd );
++            fd = -1;
++        }
++    }
++    freeaddrinfo( res );
++    return fd;
++}
++
++NTSTATUS unix_nsi_ncsi_probe( void *args )
++{
++    struct nsi_ncsi_probe_params *params = args;
++    int family = params->family == 6 ? AF_INET6 : AF_INET;
++    struct timespec end;
++    char req[1024], buf[4096], *body;
++    size_t got = 0;
++    ssize_t r;
++    int fd, status = 0;
++
++    clock_gettime( CLOCK_MONOTONIC, &end );
++    end.tv_sec += params->timeout_ms / 1000;
++    end.tv_nsec += (params->timeout_ms % 1000) * 1000000;
++    if (end.tv_nsec >= 1000000000) { end.tv_sec++; end.tv_nsec -= 1000000000; }
++
++    params->result = NCSI_NONE;
++    if ((fd = probe_connect( params->host, family, &end )) < 0)
++    {
++        TRACE( "%s over IPv%u: no answer (%d)\n", debugstr_a(params->host), params->family, fd );
++        return STATUS_SUCCESS;
++    }
++    snprintf( req, sizeof(req), "GET /%s HTTP/1.1\r\nConnection: Close\r\nUser-Agent: Microsoft NCSI\r\nHost: %s\r\n\r\n",
++              params->path[0] == '/' ? params->path + 1 : params->path, params->host );
++    if (send( fd, req, strlen(req), MSG_NOSIGNAL ) != (ssize_t)strlen(req)) { close( fd ); return STATUS_SUCCESS; }
++    for (;;)
++    {
++        struct pollfd pfd = { fd, POLLIN };
++        int left = ms_left( &end );
++        if (left <= 0 || poll( &pfd, 1, left ) != 1) break;
++        if ((r = recv( fd, buf + got, sizeof(buf) - 1 - got, 0 )) <= 0) break;
++        if ((got += r) >= sizeof(buf) - 1) break;
++    }
++    close( fd );
++    buf[got] = 0;
++    if (!got)
++    {
++        TRACE( "%s over IPv%u: connected, no reply\n", debugstr_a(params->host), params->family );
++        return STATUS_SUCCESS;
++    }
++    /* something answered: the expected page is the internet, anything else (a redirect, a sign-in
++     * page) a captive portal */
++    sscanf( buf, "HTTP/%*s %d", &status );
++    body = strstr( buf, "\r\n\r\n" );
++    if (status == 200 && body && !strncmp( body + 4, params->content, strlen(params->content) ))
++        params->result = NCSI_INTERNET;
++    else
++        params->result = NCSI_PORTAL;
++#ifdef SG_MUTANT_NCSI_ALWAYS_INTERNET
++    params->result = NCSI_INTERNET;
++#endif
++    TRACE( "%s over IPv%u: HTTP %d -> %u\n", debugstr_a(params->host), params->family, status, params->result );
++    return STATUS_SUCCESS;
++}
+--- a/dlls/nsiproxy.sys/nsi.c
++++ b/dlls/nsiproxy.sys/nsi.c
+@@ -295,4 +295,5 @@
+     unix_nsi_get_parameter_ex,
+     unix_nsi_get_notification,
+     unix_nsi_get_dhcp4_info,
++    unix_nsi_ncsi_probe,
+ };
+--- a/dlls/nsiproxy.sys/device.c
++++ b/dlls/nsiproxy.sys/device.c
+@@ -73,6 +73,7 @@
+     nsi_get_parameter_ex,
+     nsi_get_notification,
+     nsi_get_dhcp4_info,
++    nsi_ncsi_probe,
+ };
+ 
+ NTSTATUS nsiproxy_get_dhcp4_info( UINT if_index, struct nsi_dhcp4_info *info )
+@@ -81,6 +82,11 @@
+     return nsiproxy_call( nsi_get_dhcp4_info, &params );
+ }
+ 
++NTSTATUS nsiproxy_ncsi_probe( struct nsi_ncsi_probe_params *params )
++{
++    return nsiproxy_call( nsi_ncsi_probe, params );
++}
++
+ static NTSTATUS nsiproxy_enumerate_all( IRP *irp )
+ {
+     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation( irp );
+--- a/dlls/nsiproxy.sys/nsiproxy_private.h
++++ b/dlls/nsiproxy.sys/nsiproxy_private.h
+@@ -130,7 +130,27 @@
+     struct nsi_dhcp4_info *info;
+ };
+ 
++/* Stained Glass OS: one NCSI active probe (ncsi.c, wine-sg 9661) */
++enum ncsi_result
++{
++    NCSI_UNKNOWN = 0,   /* not probed (no default route, probing off) */
++    NCSI_NONE = 1,      /* nothing answered: no internet */
++    NCSI_PORTAL = 2,    /* another page answered: a captive portal */
++    NCSI_INTERNET = 3,  /* the expected page: the internet */
++};
++
++struct nsi_ncsi_probe_params
++{
++    UINT family;            /* 4 or 6 */
++    UINT timeout_ms;
++    char host[256];
++    char path[256];
++    char content[256];
++    UINT result;            /* enum ncsi_result */
++};
++
+ /* PE side (device.c, tcpipreg.c) */
++NTSTATUS nsiproxy_ncsi_probe( struct nsi_ncsi_probe_params *params );
+ NTSTATUS nsiproxy_get_dhcp4_info( UINT if_index, struct nsi_dhcp4_info *info );
+ void tcpip_registry_start( void );
+ void tcpip_registry_changed( const NPI_MODULEID *module, UINT table );
+--- a/dlls/nsiproxy.sys/unix_private.h
++++ b/dlls/nsiproxy.sys/unix_private.h
+@@ -28,6 +28,7 @@
+ NTSTATUS nsi_get_all_parameters_ex( struct nsi_get_all_parameters_ex *params );
+ NTSTATUS nsi_get_parameter_ex( struct nsi_get_parameter_ex *params );
+ NTSTATUS unix_nsi_get_dhcp4_info( void *args );
++NTSTATUS unix_nsi_ncsi_probe( void *args );
+ 
+ static inline NTSTATUS nsi_enumerate_all( UINT unk, UINT unk2, const NPI_MODULEID *module, UINT table,
+                                           void *key_data, UINT key_size, void *rw_data, UINT rw_size,
+--- a/dlls/nsiproxy.sys/tcpipreg.c
++++ b/dlls/nsiproxy.sys/tcpipreg.c
+@@ -625,14 +625,112 @@
+     free( addrs );
+ }
+ 
++/* Stained Glass OS: the Network Connectivity Status Indicator (wine-sg 9661). Windows' NCSI
++ * probes each address family that has a default route -- an HTTP GET of ActiveWebProbeHost/
++ * ActiveWebProbePath that must answer ActiveWebProbeContent, configured under NlaSvc\Parameters\
++ * Internet (EnableActiveProbing, and the policy NetworkConnectivityStatusIndicator\NoActiveProbe,
++ * turn it off) -- when the network changes, and again while it finds no internet (a captive
++ * portal signed in to). The answer is kept beside the configuration, where the Network List
++ * Manager (netprofm) reads it in every program and watches for changes: SgActiveProbeResultV4/V6,
++ * enum ncsi_result. Without it a default route was "the internet": a network with a gateway and
++ * no way out (a hotel's before sign-in, a router with its line down) showed "Internet access". */
++static const WCHAR ncsi_path[] = L"System\\CurrentControlSet\\Services\\NlaSvc\\Parameters\\Internet";
++static const WCHAR ncsi_policy_path[] = L"Software\\Policies\\Microsoft\\Windows\\NetworkConnectivityStatusIndicator";
++
++static void ncsi_config_a( HKEY key, const WCHAR *name, const char *def, char *buf, DWORD size )
++{
++    WCHAR value[256];
++
++    if (key && get_sz( key, name, value, ARRAY_SIZE(value) ) && value[0])
++        WideCharToMultiByte( CP_UTF8, 0, value, -1, buf, size, NULL, NULL );
++    else
++        lstrcpynA( buf, def, size );
++}
++
++static UINT ncsi_probe_family( HKEY key, UINT family )
++{
++    struct nsi_ncsi_probe_params params = { 0 };
++    BOOL v6 = family == 6;
++
++    params.family = family;
++    params.timeout_ms = 5000;
++    ncsi_config_a( key, v6 ? L"ActiveWebProbeHostV6" : L"ActiveWebProbeHost",
++                   v6 ? "ipv6.msftconnecttest.com" : "www.msftconnecttest.com", params.host, sizeof(params.host) );
++    ncsi_config_a( key, v6 ? L"ActiveWebProbePathV6" : L"ActiveWebProbePath", "connecttest.txt",
++                   params.path, sizeof(params.path) );
++    ncsi_config_a( key, v6 ? L"ActiveWebProbeContentV6" : L"ActiveWebProbeContent", "Microsoft Connect Test",
++                   params.content, sizeof(params.content) );
++    if (nsiproxy_ncsi_probe( &params )) return NCSI_UNKNOWN;
++    TRACE( "IPv%u probe of %s: %u\n", family, debugstr_a(params.host), params.result );
++    return params.result;
++}
++
++/* probes the families with a default route; force: all of them, else only those not on the internet */
++static void update_ncsi( BOOL force )
++{
++    static const UINT families[2] = { 4, 6 };
++    static const WCHAR *const names[2] = { L"SgActiveProbeResultV4", L"SgActiveProbeResultV6" };
++    IP_ADAPTER_ADDRESSES *addrs = NULL, *aa;
++    IP_ADAPTER_GATEWAY_ADDRESS *gw;
++    BOOL route[2] = { FALSE, FALSE };
++    DWORD enabled = 1, off = 0, old;
++    ULONG size = 0, err;
++    HKEY key, policy;
++    unsigned int i;
++
++    if (!(key = create_key( HKEY_LOCAL_MACHINE, ncsi_path ))) return;
++    get_dword( key, L"EnableActiveProbing", &enabled );
++    if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, ncsi_policy_path, 0, KEY_QUERY_VALUE, &policy ))
++    {
++        get_dword( policy, L"NoActiveProbe", &off );
++        RegCloseKey( policy );
++    }
++    for (;;)
++    {
++        err = GetAdaptersAddresses( AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST |
++                                    GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, addrs, &size );
++        if (err != ERROR_BUFFER_OVERFLOW) break;
++        free( addrs );
++        if (!(addrs = malloc( size ))) { RegCloseKey( key ); return; }
++    }
++    for (aa = err ? NULL : addrs; aa; aa = aa->Next)
++    {
++        if (aa->OperStatus != IfOperStatusUp || aa->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
++        for (gw = aa->FirstGatewayAddress; gw; gw = gw->Next)
++        {
++            if (gw->Address.lpSockaddr->sa_family == AF_INET) route[0] = TRUE;
++            else if (gw->Address.lpSockaddr->sa_family == AF_INET6) route[1] = TRUE;
++        }
++    }
++    free( addrs );
++    for (i = 0; i < 2; i++)
++    {
++        UINT result = NCSI_UNKNOWN;
++
++        if (!get_dword( key, names[i], &old )) old = NCSI_UNKNOWN;
++        if (route[i] && enabled && !off)
++        {
++            if (!force && old == NCSI_INTERNET) continue;
++            result = ncsi_probe_family( key, families[i] );
++        }
++        if (result != old) set_dword( key, names[i], result );
++    }
++    RegCloseKey( key );
++}
++
+ static DWORD WINAPI tcpip_registry_thread( void *arg )
+ {
++    BOOL changed = TRUE;
++
+     for (;;)
+     {
+         update_tcpip_registry();
++#ifndef SG_MUTANT_NO_NCSI
++        update_ncsi( changed );
++#endif
+         /* a change comes as a burst of notifications (addresses, routes, the link): settle first */
+-        if (!WaitForSingleObject( changed_event, 120 * 1000 ))
+-            while (!WaitForSingleObject( changed_event, 300 )) ;
++        changed = !WaitForSingleObject( changed_event, 120 * 1000 );
++        if (changed) while (!WaitForSingleObject( changed_event, 300 )) ;
+     }
+     return 0;
+ }
+--- a/dlls/netprofm/list.c
++++ b/dlls/netprofm/list.c
+@@ -103,6 +103,9 @@
+     HANDLE              notify_if, notify_addr, notify_route;
+     NLM_CONNECTIVITY    connectivity;
+     DWORD               cost;
++    /* Stained Glass OS 9661: the NCSI probes' answers, watched */
++    HKEY                ncsi_key;
++    HANDLE              ncsi_event, ncsi_wait;
+ };
+ 
+ struct sink_entry
+@@ -939,6 +942,23 @@
+     return TRUE;
+ }
+ 
++/* Stained Glass OS 9661: what the Network Connectivity Status Indicator's probes found (nsiproxy
++ * keeps it under NlaSvc\Parameters\Internet): a family whose probe got no answer, or a captive
++ * portal's page, reaches the local network only, as on Windows ("No internet access"). Not
++ * probed (probing off, not yet): the default route decides, as before. */
++#define NCSI_KEY L"System\\CurrentControlSet\\Services\\NlaSvc\\Parameters\\Internet"
++static BOOL ncsi_no_internet( int family )
++{
++    DWORD value = 0, size = sizeof(value);
++
++#ifdef SG_MUTANT_NLM_IGNORE_NCSI
++    return FALSE;
++#endif
++    if (RegGetValueW( HKEY_LOCAL_MACHINE, NCSI_KEY, family == AF_INET6 ? L"SgActiveProbeResultV6" : L"SgActiveProbeResultV4",
++                      RRF_RT_REG_DWORD, NULL, &value, &size )) return FALSE;
++    return value == 1 /* nothing answered */ || value == 2 /* a captive portal */;
++}
++
+ /* an adapter's connectivity: addresses for the local network, a gateway
+  * (a default route) for the internet, IPv4 and IPv6 apart */
+ static NLM_CONNECTIVITY adapter_connectivity( const IP_ADAPTER_ADDRESSES *aa )
+@@ -964,6 +984,10 @@
+         else if (gw->Address.lpSockaddr->sa_family == AF_INET6 && v6)
+             ret = (ret & ~NLM_CONNECTIVITY_IPV6_LOCALNETWORK) | NLM_CONNECTIVITY_IPV6_INTERNET;
+     }
++    if ((ret & NLM_CONNECTIVITY_IPV4_INTERNET) && ncsi_no_internet( AF_INET ))
++        ret = (ret & ~NLM_CONNECTIVITY_IPV4_INTERNET) | NLM_CONNECTIVITY_IPV4_LOCALNETWORK;
++    if ((ret & NLM_CONNECTIVITY_IPV6_INTERNET) && ncsi_no_internet( AF_INET6 ))
++        ret = (ret & ~NLM_CONNECTIVITY_IPV6_INTERNET) | NLM_CONNECTIVITY_IPV6_LOCALNETWORK;
+     return ret;
+ }
+ 
+@@ -1742,6 +1766,9 @@
+         if (mgr->notify_if) CancelMibChangeNotify2( mgr->notify_if );
+         if (mgr->notify_addr) CancelMibChangeNotify2( mgr->notify_addr );
+         if (mgr->notify_route) CancelMibChangeNotify2( mgr->notify_route );
++        if (mgr->ncsi_wait) UnregisterWaitEx( mgr->ncsi_wait, INVALID_HANDLE_VALUE );
++        if (mgr->ncsi_event) CloseHandle( mgr->ncsi_event );
++        if (mgr->ncsi_key) RegCloseKey( mgr->ncsi_key );
+ 
+         connection_point_release( &mgr->events_cp );
+         connection_point_release( &mgr->conn_mgr_cp );
+@@ -2715,6 +2742,31 @@
+     if (type != MibInitialNotification) refresh_networks( ctx );
+ }
+ 
++/* Stained Glass OS 9661: the NCSI probes answered again (their key changed) */
++static void CALLBACK ncsi_changed( void *ctx, BOOLEAN timeout )
++{
++    struct list_manager *mgr = ctx;
++
++    RegNotifyChangeKeyValue( mgr->ncsi_key, FALSE, REG_NOTIFY_CHANGE_LAST_SET, mgr->ncsi_event, TRUE );
++    refresh_networks( mgr );
++}
++
++static void watch_ncsi( struct list_manager *mgr )
++{
++#ifdef SG_MUTANT_NLM_IGNORE_NCSI
++    return;
++#endif
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, NCSI_KEY, 0, KEY_NOTIFY | KEY_QUERY_VALUE, &mgr->ncsi_key ))
++    {
++        mgr->ncsi_key = NULL;
++        return;
++    }
++    if (!(mgr->ncsi_event = CreateEventW( NULL, FALSE, FALSE, NULL )) ||
++        RegNotifyChangeKeyValue( mgr->ncsi_key, FALSE, REG_NOTIFY_CHANGE_LAST_SET, mgr->ncsi_event, TRUE ) ||
++        !RegisterWaitForSingleObject( &mgr->ncsi_wait, mgr->ncsi_event, ncsi_changed, mgr, INFINITE, 0 ))
++        mgr->ncsi_wait = NULL;
++}
++
+ HRESULT list_manager_create( void **obj )
+ {
+     struct list_manager *mgr;
+@@ -2742,6 +2794,7 @@
+     NotifyIpInterfaceChange( AF_UNSPEC, interface_changed, mgr, FALSE, &mgr->notify_if );
+     NotifyUnicastIpAddressChange( AF_UNSPEC, address_changed, mgr, FALSE, &mgr->notify_addr );
+     NotifyRouteChange2( AF_UNSPEC, route_changed, mgr, FALSE, &mgr->notify_route );
++    watch_ncsi( mgr );
+ 
+     *obj = &mgr->INetworkListManager_iface;
+     TRACE( "returning iface %p\n", *obj );
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -2910,6 +2910,17 @@
+ HKLM,"System\CurrentControlSet\Services\Tcpip\Parameters\Interfaces",,16
+ HKLM,"System\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces",,16
+ HKLM,"System\CurrentControlSet\Services\Dnscache\Parameters",,16
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","EnableActiveProbing",0x10003,1
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveWebProbeHost",2,"www.msftconnecttest.com"
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveWebProbePath",2,"connecttest.txt"
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveWebProbeContent",2,"Microsoft Connect Test"
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveWebProbeHostV6",2,"ipv6.msftconnecttest.com"
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveWebProbePathV6",2,"connecttest.txt"
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveWebProbeContentV6",2,"Microsoft Connect Test"
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveDnsProbeHost",2,"dns.msftncsi.com"
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveDnsProbeContent",2,"131.107.255.255"
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveDnsProbeHostV6",2,"dns.msftncsi.com"
++HKLM,"System\CurrentControlSet\Services\NlaSvc\Parameters\Internet","ActiveDnsProbeContentV6",2,"fd3e:4f5a:5b81::1"
+ HKLM,"System\CurrentControlSet\Services\VxD\MSTCP",,16
+ HKLM,"System\CurrentControlSet\Services\Winsock\Parameters",,16
+ HKLM,"System\CurrentControlSet\Services\Winsock2\Parameters\Protocol_Catalog9\Catalog_Entries",,16
