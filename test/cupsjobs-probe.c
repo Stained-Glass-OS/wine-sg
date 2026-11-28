@@ -8,6 +8,7 @@
  * Prints "PASS ..." / "FAIL ..." lines and "RESULT: PASS" when all held. */
 #include <windows.h>
 #include <winspool.h>
+#include <commdlg.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <stdio.h>
@@ -331,6 +332,34 @@ static int status_test(const WCHAR *queue)
     return 0;
 }
 
+/* 9213: a user with printers but no default printer of their own is given one
+ * -- the CUPS default -- as Windows gives every user a default printer; the
+ * classic Print dialog then lists the printers (WordPad's listed none) */
+static int default_test(const WCHAR *queue)
+{
+    WCHAR name[256];
+    DWORD size = ARRAYSIZE(name);
+    PRINTDLGW pd = { sizeof(pd) };
+    HKEY key;
+
+    if (!RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows", 0, KEY_SET_VALUE, &key))
+    {
+        RegDeleteValueW(key, L"Device");
+        RegCloseKey(key);
+    }
+    CHECK(GetDefaultPrinterW(name, &size), "a default printer though the user had none (%lu)", GetLastError());
+    CHECK(!wcscmp(name, queue), "it is the CUPS default (%ls)", name);
+    pd.Flags = PD_RETURNDEFAULT;
+    CHECK(PrintDlgW(&pd) && pd.hDevNames, "the Print dialog has a printer (%#lx)", CommDlgExtendedError());
+    if (pd.hDevNames)
+    {
+        DEVNAMES *dn = GlobalLock(pd.hDevNames);
+        CHECK(!wcscmp((WCHAR *)dn + dn->wDeviceOffset, queue), "the dialog's printer is it (%ls)", (WCHAR *)dn + dn->wDeviceOffset);
+        GlobalUnlock(pd.hDevNames);
+    }
+    return 0;
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     if (argc < 3) return 2;
@@ -338,6 +367,7 @@ int wmain(int argc, WCHAR **argv)
     else if (!wcscmp(argv[1], L"printer")) printer_test(argv[2]);
     else if (!wcscmp(argv[1], L"window")) window_test(argv[2]);
     else if (!wcscmp(argv[1], L"status")) status_test(argv[2]);
+    else if (!wcscmp(argv[1], L"default")) default_test(argv[2]);
     else return 2;
     printf(failures ? "RESULT: FAIL\n" : "RESULT: PASS\n");
     return failures ? 1 : 0;
