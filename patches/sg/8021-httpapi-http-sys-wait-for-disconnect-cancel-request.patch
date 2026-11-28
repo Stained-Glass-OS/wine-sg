@@ -1,0 +1,256 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] httpapi, http.sys: HttpWaitForDisconnect(Ex) and HttpCancelHttpRequest
+
+Spec stubs before; .NET's HttpListener calls them (HttpWaitForDisconnect for connection-based authentication, HttpCancelHttpRequest when a request is aborted). Two http.sys ioctls: IOCTL_HTTP_WAIT_DISCONNECT pends on the connection (the HTTP_REQUEST's ConnectionId) until it closes, by the client or the server, and is cancellable; IOCTL_HTTP_CANCEL_REQUEST closes the connection of a request of this queue, so the client sees it end, its waits complete and no response can follow (ERROR_CONNECTION_INVALID). An id that names no open connection or request is ERROR_CONNECTION_INVALID, HTTP_NULL_ID and a non-zero Reserved ERROR_INVALID_PARAMETER; without an OVERLAPPED the call waits. http.h gains the prototypes.
+---
+--- a/include/http.h
++++ b/include/http.h
+@@ -488,6 +488,9 @@
+ HTTPAPI_LINKAGE ULONG WINAPI HttpQueryServiceConfiguration(HANDLE,HTTP_SERVICE_CONFIG_ID,PVOID,ULONG,PVOID,ULONG,PULONG,LPOVERLAPPED);
+ HTTPAPI_LINKAGE ULONG WINAPI HttpReceiveHttpRequest(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags, HTTP_REQUEST *request, ULONG size, ULONG *ret_size, OVERLAPPED *ovl);
+ HTTPAPI_LINKAGE ULONG WINAPI HttpReceiveRequestEntityBody(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags, void *buffer, ULONG size, ULONG *ret_size, OVERLAPPED *ovl);
++HTTPAPI_LINKAGE ULONG WINAPI HttpCancelHttpRequest(HANDLE queue, HTTP_REQUEST_ID id, OVERLAPPED *ovl);
++HTTPAPI_LINKAGE ULONG WINAPI HttpWaitForDisconnect(HANDLE queue, HTTP_CONNECTION_ID id, OVERLAPPED *ovl);
++HTTPAPI_LINKAGE ULONG WINAPI HttpWaitForDisconnectEx(HANDLE queue, HTTP_CONNECTION_ID id, ULONG reserved, OVERLAPPED *ovl);
+ HTTPAPI_LINKAGE ULONG WINAPI HttpRemoveUrl(HANDLE queue, const WCHAR *url);
+ HTTPAPI_LINKAGE ULONG WINAPI HttpRemoveUrlFromUrlGroup(HTTP_URL_GROUP_ID id, const WCHAR *url, ULONG flags);
+ HTTPAPI_LINKAGE ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags, HTTP_RESPONSE *response, HTTP_CACHE_POLICY *cache_policy, ULONG *ret_size, void *reserved1, ULONG reserved2, OVERLAPPED *ovl, HTTP_LOG_DATA *log_data);
+--- a/include/wine/http.h
++++ b/include/wine/http.h
+@@ -28,6 +28,9 @@
+ #define IOCTL_HTTP_RECEIVE_REQUEST  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, 0)
+ #define IOCTL_HTTP_SEND_RESPONSE    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, 0)
+ #define IOCTL_HTTP_RECEIVE_BODY     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, 0)
++/* wine-sg 8021: the input is an HTTP_CONNECTION_ID / an HTTP_REQUEST_ID */
++#define IOCTL_HTTP_WAIT_DISCONNECT  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, 0)
++#define IOCTL_HTTP_CANCEL_REQUEST   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, 0)
+ 
+ struct http_add_url_params
+ {
+--- a/dlls/http.sys/http.c
++++ b/dlls/http.sys/http.c
+@@ -52,6 +52,7 @@
+     struct list entry; /* in "connections" below */
+ 
+     SOCKET socket;
++    LIST_ENTRY disconnect_irps; /* IOCTL_HTTP_WAIT_DISCONNECT, completed when it closes (wine-sg 8021) */
+ 
+     char *buffer;
+     unsigned int len, size;
+@@ -140,6 +141,7 @@
+         return;
+     }
+     conn->size = 8192;
++    InitializeListHead(&conn->disconnect_irps);
+     WSAEventSelect(peer, request_event, FD_READ | FD_CLOSE);
+     ioctlsocket(peer, FIONBIO, &one);
+     conn->socket = peer;
+@@ -155,8 +157,22 @@
+ 
+ static void close_connection(struct connection *conn)
+ {
++    LIST_ENTRY *entry;
++
+     if (!conn->shutdown)
+         shutdown_connection(conn);
++    /* the waits for its disconnection end */
++    while ((entry = RemoveHeadList(&conn->disconnect_irps)) != &conn->disconnect_irps)
++    {
++        IRP *irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
++        if (IoSetCancelRoutine(irp, NULL))
++        {
++            irp->IoStatus.Status = STATUS_SUCCESS;
++            irp->IoStatus.Information = 0;
++            IoCompleteRequest(irp, IO_NO_INCREMENT);
++        }
++        else InitializeListHead(&irp->Tail.Overlay.ListEntry);   /* its cancel routine runs */
++    }
+     closesocket(conn->socket);
+     list_remove(&conn->entry);
+     free(conn);
+@@ -1156,6 +1172,81 @@
+     return ret;
+ }
+ 
++static void WINAPI http_wait_disconnect_cancel(DEVICE_OBJECT *device, IRP *irp)
++{
++    TRACE("device %p, irp %p.\n", device, irp);
++
++    IoReleaseCancelSpinLock(irp->CancelIrql);
++
++    EnterCriticalSection(&http_cs);
++    RemoveEntryList(&irp->Tail.Overlay.ListEntry);
++    LeaveCriticalSection(&http_cs);
++
++    irp->IoStatus.Status = STATUS_CANCELLED;
++    IoCompleteRequest(irp, IO_NO_INCREMENT);
++}
++
++/* (wine-sg 8021) HttpWaitForDisconnect: pending until the connection is closed, by either side */
++static NTSTATUS http_wait_disconnect(struct request_queue *queue, IRP *irp)
++{
++    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
++    struct connection *conn, *found = NULL;
++    HTTP_CONNECTION_ID id;
++    NTSTATUS ret;
++
++    if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(id)) return STATUS_INVALID_PARAMETER;
++    id = *(HTTP_CONNECTION_ID *)irp->AssociatedIrp.SystemBuffer;
++    TRACE("connection %s.\n", wine_dbgstr_longlong(id));
++
++    EnterCriticalSection(&http_cs);
++    LIST_FOR_EACH_ENTRY(conn, &connections, struct connection, entry)
++        if ((ULONG_PTR)conn == id) { found = conn; break; }
++#ifndef SG_MUTANT_NO_HTTP_DISCONNECT
++    if (!found || found->shutdown)
++        ret = STATUS_CONNECTION_INVALID;
++    else
++    {
++        IoSetCancelRoutine(irp, http_wait_disconnect_cancel);
++        if (irp->Cancel && !IoSetCancelRoutine(irp, NULL))
++            ret = STATUS_CANCELLED;
++        else
++        {
++            IoMarkIrpPending(irp);
++            InsertTailList(&found->disconnect_irps, &irp->Tail.Overlay.ListEntry);
++            ret = STATUS_PENDING;
++        }
++    }
++#else
++    ret = found ? STATUS_SUCCESS : STATUS_CONNECTION_INVALID;
++#endif
++    LeaveCriticalSection(&http_cs);
++    return ret;
++}
++
++/* (wine-sg 8021) HttpCancelHttpRequest: the request's connection is closed -- the client sees a reset,
++ * and the request's waits for a disconnection end */
++static NTSTATUS http_cancel_request(struct request_queue *queue, IRP *irp)
++{
++    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
++    struct connection *conn;
++    HTTP_REQUEST_ID id;
++    NTSTATUS ret = STATUS_CONNECTION_INVALID;
++
++    if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(id)) return STATUS_INVALID_PARAMETER;
++    id = *(HTTP_REQUEST_ID *)irp->AssociatedIrp.SystemBuffer;
++    TRACE("request %s.\n", wine_dbgstr_longlong(id));
++    if (id == HTTP_NULL_ID) return STATUS_INVALID_PARAMETER;
++
++    EnterCriticalSection(&http_cs);
++    if ((conn = get_connection(id)) && conn->queue == queue)
++    {
++        close_connection(conn);
++        ret = STATUS_SUCCESS;
++    }
++    LeaveCriticalSection(&http_cs);
++    return ret;
++}
++
+ static NTSTATUS http_send_response(struct request_queue *queue, IRP *irp)
+ {
+     const struct http_response *response = irp->AssociatedIrp.SystemBuffer;
+@@ -1277,6 +1368,12 @@
+     case IOCTL_HTTP_RECEIVE_BODY:
+         ret = http_receive_body(queue, irp);
+         break;
++    case IOCTL_HTTP_WAIT_DISCONNECT:
++        ret = http_wait_disconnect(queue, irp);
++        break;
++    case IOCTL_HTTP_CANCEL_REQUEST:
++        ret = http_cancel_request(queue, irp);
++        break;
+     default:
+         FIXME("Unhandled ioctl %#lx.\n", stack->Parameters.DeviceIoControl.IoControlCode);
+         ret = STATUS_NOT_IMPLEMENTED;
+--- a/dlls/httpapi/httpapi_main.c
++++ b/dlls/httpapi/httpapi_main.c
+@@ -643,6 +643,69 @@
+     return remove_url(queue, url);
+ }
+ 
++/* (wine-sg 8021) an ioctl on the queue, waited for when there is no OVERLAPPED */
++static ULONG queue_ioctl(HANDLE queue, DWORD code, void *in, DWORD in_size, OVERLAPPED *ovl)
++{
++    OVERLAPPED sync_ovl;
++    ULONG ret = ERROR_SUCCESS;
++    DWORD size;
++
++    if (!ovl)
++    {
++        memset(&sync_ovl, 0, sizeof(sync_ovl));
++        sync_ovl.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
++        ovl = &sync_ovl;
++    }
++    if (!DeviceIoControl(queue, code, in, in_size, NULL, 0, &size, ovl))
++        ret = GetLastError();
++    if (ovl == &sync_ovl)
++    {
++        if (ret == ERROR_IO_PENDING)
++        {
++            ret = ERROR_SUCCESS;
++            if (!GetOverlappedResult(queue, ovl, &size, TRUE))
++                ret = GetLastError();
++        }
++        CloseHandle(sync_ovl.hEvent);
++    }
++    return ret;
++}
++
++/***********************************************************************
++ *        HttpCancelHttpRequest     (HTTPAPI.@)
++ *
++ * (wine-sg 8021) The request is cancelled: its connection is closed.
++ */
++ULONG WINAPI HttpCancelHttpRequest(HANDLE queue, HTTP_REQUEST_ID id, OVERLAPPED *ovl)
++{
++    TRACE("queue %p, id %s, ovl %p.\n", queue, wine_dbgstr_longlong(id), ovl);
++
++    if (!id) return ERROR_INVALID_PARAMETER;
++    return queue_ioctl(queue, IOCTL_HTTP_CANCEL_REQUEST, &id, sizeof(id), ovl);
++}
++
++/***********************************************************************
++ *        HttpWaitForDisconnectEx     (HTTPAPI.@)
++ *
++ * (wine-sg 8021) Completes when the connection closes (ERROR_IO_PENDING until then with an OVERLAPPED);
++ * ERROR_CONNECTION_INVALID for a connection that is not open.
++ */
++ULONG WINAPI HttpWaitForDisconnectEx(HANDLE queue, HTTP_CONNECTION_ID id, ULONG reserved, OVERLAPPED *ovl)
++{
++    TRACE("queue %p, id %s, reserved %#lx, ovl %p.\n", queue, wine_dbgstr_longlong(id), reserved, ovl);
++
++    if (reserved || !id) return ERROR_INVALID_PARAMETER;
++    return queue_ioctl(queue, IOCTL_HTTP_WAIT_DISCONNECT, &id, sizeof(id), ovl);
++}
++
++/***********************************************************************
++ *        HttpWaitForDisconnect     (HTTPAPI.@)
++ */
++ULONG WINAPI HttpWaitForDisconnect(HANDLE queue, HTTP_CONNECTION_ID id, OVERLAPPED *ovl)
++{
++    return HttpWaitForDisconnectEx(queue, id, 0, ovl);
++}
++
+ /***********************************************************************
+  *        HttpReceiveRequestEntityBody     (HTTPAPI.@)
+  */
+--- a/dlls/httpapi/httpapi.spec
++++ b/dlls/httpapi/httpapi.spec
+@@ -1,7 +1,7 @@
+ @ stdcall HttpAddFragmentToCache(ptr wstr ptr ptr ptr)
+ @ stdcall HttpAddUrl(ptr wstr ptr)
+ @ stdcall HttpAddUrlToUrlGroup(int64 wstr int64 long)
+-@ stub HttpCancelHttpRequest
++@ stdcall HttpCancelHttpRequest(ptr int64 ptr)
+ @ stdcall HttpCloseRequestQueue(ptr)
+ @ stdcall HttpCloseServerSession(int64)
+ @ stdcall HttpCloseUrlGroup(int64)
+@@ -33,5 +33,5 @@
+ @ stdcall HttpShutdownRequestQueue(ptr)
+ @ stdcall HttpTerminate(long ptr)
+ @ stub HttpWaitForDemandStart
+-@ stub HttpWaitForDisconnect
+-@ stub HttpWaitForDisconnectEx
++@ stdcall HttpWaitForDisconnect(ptr int64 ptr)
++@ stdcall HttpWaitForDisconnectEx(ptr int64 long ptr)
