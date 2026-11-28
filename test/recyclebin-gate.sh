@@ -116,6 +116,16 @@ echo "$out" | grep -q '^sheet' && pass "the bin's Properties open its sheet ('Re
     || fail "no Recycle Bin Properties: $out"
 echo "$out" | grep -q '^location .*(C:) | ' && pass "its locations list the drives, with their size" \
     || fail "locations: $(echo "$out" | grep location)"
+# one location per volume (9066): C: is a folder of the Linux file system Z: is
+# the root of; when they are the same file system it is listed once, as C:
+if [ "$(stat -c %d "$C")" = "$(stat -c %d /)" ]; then
+    [ "$(echo "$out" | grep -c '^location ')" = 1 ] && ! echo "$out" | grep -q '^location .*(Z:)' \
+        && pass "C: and Z: on one file system: one location (C:), as Windows lists volumes" \
+        || fail "C: and Z: are one file system, listed: $(echo "$out" | grep '^location' | tr '\n' ' ')"
+else
+    echo "$out" | grep -q '^location .*(Z:)' && pass "C: and Z: on two file systems: both listed" \
+        || fail "C: and Z: are two file systems, listed: $(echo "$out" | grep '^location' | tr '\n' ' ')"
+fi
 st=$(echo "$out" | grep '^maxsize')
 max=$(field "$st" maxsize)
 [ -n "$max" ] && [ "$max" -gt 0 ] 2>/dev/null && [ "$(field "$st" custom)" = 1 ] && [ "$(field "$st" nuke)" = 0 ] \

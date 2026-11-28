@@ -8,9 +8,10 @@
  *   multimon-probe.exe OUT TRIGGER   then, once the file TRIGGER is there (the main display
  *     changed while it ran), writes to OUT.after:
  *     monitor ... as above, as this running program now sees them
+ *     before L T R B   where the window from before the change now is
  *     ready
  *   and shows a window "mmafter" at 10,10 for a few seconds; a window "mmbefore", also at
- *   10,10, is there from before the change
+ *   10,10, is there from before the change (and stays on its display, as Windows keeps it)
  */
 #include <windows.h>
 #include <stdio.h>
@@ -89,6 +90,11 @@ int main(int argc, char **argv)
         if (!(out = fopen(after, "w"))) return 2;
         nmons = 0;
         EnumDisplayMonitors(NULL, NULL, each, 0);
+        {
+            RECT rb;
+            GetWindowRect(before, &rb);
+            fprintf(out, "before %ld %ld %ld %ld\n", rb.left, rb.top, rb.right, rb.bottom);
+        }
         w = CreateWindowA("multimon", "mmafter", WS_POPUP | WS_VISIBLE, 10, 10, 200, 100, NULL, NULL, wc.hInstance, NULL);
         start = GetTickCount();
         while (GetTickCount() - start < 1500)

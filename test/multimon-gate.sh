@@ -15,7 +15,8 @@
 #   - without HostMonitors, one virtual monitor (Wine's own virtual desktop)
 #
 #   WINE=/opt/wine-sg/bin/wine test/multimon-gate.sh
-#   SG_COMPOSITOR_BUILD=<dir with sg-compositor>, or SG_COMPOSITOR_SRC=<checkout> to build one
+#   SG_COMPOSITOR_BUILD=<dir with sg-compositor>, or SG_COMPOSITOR_SRC=<checkout> to build one;
+#   SG_PREBUILT=<dir with multimon-probe.exe> where there is no mingw-w64 (a QA VM)
 # Mutants: SG_MUTANT_ONE_VIRTUAL_MONITOR, SG_MUTANT_SPAN_CLIPPED (win32u/sysparams.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -26,7 +27,9 @@ MINGW="${MINGW:-x86_64-w64-mingw32-gcc}"
 RC=0; CP=""
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
-command -v "$MINGW" >/dev/null && command -v xwininfo >/dev/null || { echo "SKIP: needs mingw-w64 and xwininfo"; exit 77; }
+# SG_PREBUILT=<dir with multimon-probe.exe>: in a QA VM, which has no mingw-w64
+if [ -n "${SG_PREBUILT:-}" ]; then command -v xwininfo >/dev/null || { echo "SKIP: needs xwininfo"; exit 77; }
+else command -v "$MINGW" >/dev/null && command -v xwininfo >/dev/null || { echo "SKIP: needs mingw-w64 and xwininfo"; exit 77; }; fi
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 SRC="${SG_COMPOSITOR_SRC:-$HERE/../../sg-compositor}"
 [ -d "$SRC" ] || SRC="${SG_REAL_HOME:-$HOME}/Stained-Glass-OS/sg-compositor"
@@ -34,7 +37,7 @@ SRC="${SG_COMPOSITOR_SRC:-$HERE/../../sg-compositor}"
 T=$(mktemp -d /var/tmp/sg-multimon.XXXXXX)
 # (the compositor waits for its child, the sleep, before it goes)
 stop() { [ -n "$CP" ] && { pkill -P "$CP" 2>/dev/null; kill "$CP" 2>/dev/null; wait "$CP" 2>/dev/null; }; CP=""; }
-cleanup() { "$WINESERVER" -k 2>/dev/null; stop; [ -n "${KEEP:-}" ] && echo "kept $T" || rm -rf "$T" "$SG_GATE_HOME"; }
+cleanup() { "$WINESERVER" -k 2>/dev/null; sg_kill_prefix "${WINEPREFIX:-}"; stop; [ -n "${KEEP:-}" ] && echo "kept $T" || rm -rf "$T" "$SG_GATE_HOME"; }
 trap cleanup EXIT INT TERM
 
 if [ -n "${SG_COMPOSITOR_BUILD:-}" ] && [ -x "$SG_COMPOSITOR_BUILD/sg-compositor" ]; then
@@ -46,8 +49,12 @@ elif [ -d "$SRC" ]; then
 else
     echo "SKIP: no sg-compositor (SG_COMPOSITOR_BUILD or SG_COMPOSITOR_SRC)"; exit 77
 fi
-TMPDIR=/var/tmp "$MINGW" -O2 -o "$T/multimon-probe.exe" "$HERE/multimon-probe.c" -luser32 -lgdi32 ||
-    { fail "probe did not build"; exit 1; }
+if [ -n "${SG_PREBUILT:-}" ]; then
+    cp "$SG_PREBUILT/multimon-probe.exe" "$T/" || { fail "no prebuilt multimon-probe.exe"; exit 1; }
+else
+    TMPDIR=/var/tmp "$MINGW" -O2 -o "$T/multimon-probe.exe" "$HERE/multimon-probe.c" -luser32 -lgdi32 ||
+        { fail "probe did not build"; exit 1; }
+fi
 
 unset DISPLAY WAYLAND_DISPLAY XAUTHORITY
 mkdir -p "$T/prefix" "$T/comp-xdg" "$T/wine-xdg"
@@ -154,8 +161,14 @@ grep -q '^monitor [^ ]* 0 0 1280 720 primary' "$T/live.after" && grep -q '^monit
     fail "a running program after the main display changed: $(grep '^monitor' "$T/live.after" | tr '\n' ' ')"
 echo "$mm" | grep -q '+1290+10' && pass "and its window at 0,0 is on the main display, now the right one ($(echo "$mm" | sed 's/.*) *//'))" ||
     fail "its window at 10,10: '$mm'"
-echo "$mb" | grep -q '+1290+10' && pass "and its window from before moved with the main display ($(echo "$mb" | sed 's/.*) *//'))" ||
-    fail "its window from before the change: '$mb'"
+# Windows keeps a window on its display when another display is made the main
+# one (wine-sg 9972): the window from before stays on the left display, where it
+# was (X +10+10), its rectangle now left of the main display's 0,0. This check
+# wanted it moved with the main display (7752), which 9972 (10.0-1178) undid on
+# purpose as Windows has it (ledger i0707)
+echo "$mb" | grep -q '+10+10' && grep -q '^before -1270 10 -1120 90$' "$T/live.after" &&
+    pass "and its window from before stays on its display, now left of the main one ($(echo "$mb" | sed 's/.*) *//'), $(grep '^before' "$T/live.after"))" ||
+    fail "its window from before the change: '$mb' $(grep '^before' "$T/live.after")"
 # the desktop's window is over both displays again, from the new origin, and
 # the mouse's points in it are where they are: a rubber band dragged out on the
 # main display (now the right one) is drawn there -- it kept its old place, so
