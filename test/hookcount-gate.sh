@@ -29,7 +29,7 @@ sg_gate_display || exit $?
 
 T=$(mktemp -d "${TMPDIR:-/var/tmp}/sg-hookcount.XXXXXX")
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;$WINEDLLOVERRIDES" WINESERVER
-cleanup() { "$WINESERVER" -k 2>/dev/null; rm -rf "$T"; }
+cleanup() { "$WINESERVER" -k 2>/dev/null; sg_kill_prefix "$WINEPREFIX"; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 
 "$MINGW" -O2 -shared -o "$T/hookcount-dll.dll" "$HERE/hookcount-dll.c" -luser32 || { fail "dll did not build"; exit 1; }

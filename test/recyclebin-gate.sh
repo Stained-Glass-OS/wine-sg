@@ -136,7 +136,7 @@ out=$(probe props-bin); st=$(echo "$out" | grep '^maxsize'); echo "      $st"
 # ---- the settings work -----------------------------------------------------
 mkfile "$C/nuke.txt" 10
 out=$(probe trashask 'C:\nuke.txt' no); echo "$out" | sed 's/^/      /'
-echo "$out" | grep -q 'asked: .*Are you sure you want to delete' && [ -f "$C/nuke.txt" ] \
+echo "$out" | grep -q 'asked: .*Are you sure you want to permanently delete this file' && [ -f "$C/nuke.txt" ] \
     && pass "'Don't move files to the Recycle Bin': Delete asks to delete for good (No keeps it)" || fail "nuke + No: $out"
 probe trash 'C:\nuke.txt' >/dev/null
 [ ! -f "$C/nuke.txt" ] && [ "$(items)" = 0 ] && pass "... and deletes it for good, nothing in the bin" \
@@ -144,7 +144,7 @@ probe trash 'C:\nuke.txt' >/dev/null
 probe props-bin 1 0 1 >/dev/null
 mkfile "$C/ask.txt" 10
 out=$(probe trashask 'C:\ask.txt' yes); echo "$out" | sed 's/^/      /'
-echo "$out" | grep -q "asked: .*send .*to the Recycle Bin" && [ "$(items)" = 1 ] \
+echo "$out" | grep -q "asked: .*move this file to the Recycle Bin" && [ "$(items)" = 1 ] \
     && pass "'Display delete confirmation dialog' on: a move to the bin asks first" || fail "confirmation on: $out"
 probe props-bin 1 0 0 >/dev/null
 mkfile "$C/noask.txt" 10
