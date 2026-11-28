@@ -10,7 +10,8 @@
  * Plays a tone in two streams of one session, then: SetMasterVolume(0.5) reaches both sound
  * server streams (-6 dB); the mixer (pactl) sets one stream to 30%: the session's volume becomes
  * that (0.3^3 = 0.027, the server's volume is cubic), the program is told, and the other stream
- * follows; the mixer mutes it: GetMute, told, the other follows.
+ * follows; the mixer mutes it: GetMute, told, the other follows. A fast fade (40 steps at once) ends
+ * where the program left it, its own changes not taken for the mixer's (patches/sg/9421).
  * pactl runs through start /unix; MIXERVOL_OUT names a scratch file (a Unix path).
  *
  * Prints name=value lines; see test/mixervol-gate.sh.
@@ -94,8 +95,15 @@ static ULONG WINAPI se_AddRef(IAudioSessionEvents *iface) { return 2; }
 static ULONG WINAPI se_Release(IAudioSessionEvents *iface) { return 1; }
 static HRESULT WINAPI se_OnDisplayNameChanged(IAudioSessionEvents *iface, LPCWSTR n, LPCGUID c) { return S_OK; }
 static HRESULT WINAPI se_OnIconPathChanged(IAudioSessionEvents *iface, LPCWSTR n, LPCGUID c) { return S_OK; }
+static volatile LONG foreign_events;
+static const GUID session_guid;
 static HRESULT WINAPI se_OnSimpleVolumeChanged(IAudioSessionEvents *iface, float v, BOOL m, LPCGUID c)
-{ event_level = v; event_mute = m; InterlockedIncrement(&events); return S_OK; }
+{
+    event_level = v; event_mute = m; InterlockedIncrement(&events);
+    /* the probe's own changes carry its session GUID as their context */
+    if (!c || !IsEqualGUID(c, &session_guid)) InterlockedIncrement(&foreign_events);
+    return S_OK;
+}
 static HRESULT WINAPI se_OnChannelVolumeChanged(IAudioSessionEvents *iface, DWORD n, float *v, DWORD ch, LPCGUID c) { return S_OK; }
 static HRESULT WINAPI se_OnGroupingParamChanged(IAudioSessionEvents *iface, LPCGUID g, LPCGUID c) { return S_OK; }
 static HRESULT WINAPI se_OnStateChanged(IAudioSessionEvents *iface, AudioSessionState s) { return S_OK; }
@@ -237,6 +245,32 @@ int main(void)
     n = streams(index, volume, mute, 8);
     say("restore", n == 2 && !mute[0] && !mute[1] && abs((int)volume[0] - 65536) < 700 && abs((int)volume[1] - 65536) < 700,
             "unmuted at 100%%: %u/%d %u/%d", n > 0 ? volume[0] : 0, n > 0 ? mute[0] : -1, n > 1 ? volume[1] : 0, n > 1 ? mute[1] : -1);
+
+    /* a fade, as players and games do it: 40 steps from 100% to 20% at once; five times. The
+     * server's answers to the older steps come back after the newer ones were sent: they are the
+     * program's own, not the mixer's (wine-sg 9421) */
+    {
+        int k, round, good = 0;
+        for (round = 0; round < 5; round++)
+        {
+            foreign_events = 0;
+            for (k = 1; k <= 40; k++)
+            {
+                ISimpleAudioVolume_SetMasterVolume(sav, 1.0f - 0.02f * k, &session_guid);
+                if (k % 8 == 0) Sleep(1);
+            }
+            Sleep(800);
+            ISimpleAudioVolume_GetMasterVolume(sav, &level);
+            n = streams(index, volume, mute, 8);
+            if (fabsf(level - 0.2f) < 0.001f && !foreign_events && n == 2
+                    && abs((int)volume[0] - 38320) < 700 && abs((int)volume[1] - 38320) < 700) good++;
+            else printf("  fade %d: GetMasterVolume %.4f, streams %u %u, %ld event(s) not the program's\n", round, level,
+                    n > 0 ? volume[0] : 0, n > 1 ? volume[1] : 0, foreign_events);
+            ISimpleAudioVolume_SetMasterVolume(sav, 1.0f, &session_guid);
+            Sleep(300);
+        }
+        say("fade", good == 5, "a fast fade ends where the program left it, 5 of 5 times (%d)", good);
+    }
 done:
     fflush(stdout);
     TerminateProcess(GetCurrentProcess(), 0);

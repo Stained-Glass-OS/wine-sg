@@ -14,10 +14,12 @@
 # runtime directory; test/mixervol-probe.c plays in two streams of one session:
 # SetMasterVolume(0.5) shows at the sound server (-6 dB on both streams); the
 # mixer (pactl) sets one stream to 30% and mutes it: the program's GetMasterVolume
-# and GetMute say so, it is told, and its other stream follows.
+# and GetMute say so, it is told, and its other stream follows. A fast fade (40
+# SetMasterVolume steps at once, five times) ends where the program left it: the
+# server's answers to its older steps are not taken for the mixer's (9421).
 #
 #   WINE=/opt/wine-sg/bin/wine test/mixervol-gate.sh
-# Mutant: SG_MUTANT_PULSE_NO_MIXER_VOLUME (winepulse.drv pulse.c)
+# Mutants: SG_MUTANT_PULSE_NO_MIXER_VOLUME, SG_MUTANT_PULSE_ECHO_IS_EXTERNAL (9421; winepulse.drv pulse.c)
 # Skips (77) without PipeWire, WirePlumber, pactl or mingw.
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -107,5 +109,6 @@ check told         "the program is told (OnSimpleVolumeChanged)"
 check follows      "the session's other stream follows"
 check mute         "a mute at the sound server is the session's, told, followed"
 check restore      "the program's own unmute and volume reach the sound server"
+check fade         "a fast fade ends where the program left it (9421)"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
