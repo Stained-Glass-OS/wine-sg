@@ -15,7 +15,8 @@
 # next GetPrinter asks CUPS again: status and cJobs follow at once.
 # Mutant (winspool): SG_MUTANT_STATUS_STALE. And (9213) a user with printers
 # but no default printer of their own (made by the system or another account)
-# is given the CUPS default (mutant SG_MUTANT_NO_DEFAULT_CHOICE).
+# is given the CUPS default (mutant SG_MUTANT_NO_DEFAULT_CHOICE); (9214) a
+# location changed in CUPS reaches the printer (mutant SG_MUTANT_STALE_LOCATION).
 #
 #   WINE=/opt/wine-sg/bin/wine test/cupsjobs-gate.sh
 set -u
@@ -105,6 +106,11 @@ for b in 64 32; do
     if run "C:\\probe$b.exe" default SG_Window; then pass "$b-bit: a user with no default printer is given the CUPS default; the Print dialog has it (9213)"
     else fail "$b-bit: a user with no default printer has none (the classic Print dialog lists no printer)"; fi
 done
+# (9214) a location changed in CUPS after the printer was added is the printer's location
+"$LPADMIN" -p SG_Status_64 -L "Second floor" 2>/dev/null
+i=0; while ! grep -q 'Second floor' "$T/root/printers.conf" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+if run 'C:\probe64.exe' location SG_Status_64 "Second floor"; then pass "a printer's location changed in CUPS is its new location (9214)"
+else fail "a printer's location changed in CUPS stays the old one"; fi
 # the window needs a display: the server (and its desktop) started without one goes first
 "$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null
 cat > "$T/window.sh" <<EOS

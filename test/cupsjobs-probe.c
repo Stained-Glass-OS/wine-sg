@@ -360,6 +360,25 @@ static int default_test(const WCHAR *queue)
     return 0;
 }
 
+/* 9214: a printer's location and description are what CUPS says now */
+static int location_test(const WCHAR *queue, const WCHAR *want)
+{
+    PRINTER_INFO_2W *pi;
+    DWORD needed = 0;
+    HANDLE h;
+
+    if (!OpenPrinterW((WCHAR *)queue, &h, NULL)) { CHECK(0, "OpenPrinter %ls: %lu", queue, GetLastError()); return 1; }
+    GetPrinterW(h, 2, NULL, 0, &needed);
+    if (needed && (pi = malloc(needed)) && GetPrinterW(h, 2, (BYTE *)pi, needed, &needed))
+    {
+        CHECK(pi->pLocation && !wcscmp(pi->pLocation, want), "the location is CUPS's new one (%ls)", pi->pLocation);
+        free(pi);
+    }
+    else CHECK(0, "GetPrinter %lu", GetLastError());
+    ClosePrinter(h);
+    return 0;
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     if (argc < 3) return 2;
@@ -368,6 +387,7 @@ int wmain(int argc, WCHAR **argv)
     else if (!wcscmp(argv[1], L"window")) window_test(argv[2]);
     else if (!wcscmp(argv[1], L"status")) status_test(argv[2]);
     else if (!wcscmp(argv[1], L"default")) default_test(argv[2]);
+    else if (!wcscmp(argv[1], L"location") && argc > 3) location_test(argv[2], argv[3]);
     else return 2;
     printf(failures ? "RESULT: FAIL\n" : "RESULT: PASS\n");
     return failures ? 1 : 0;
