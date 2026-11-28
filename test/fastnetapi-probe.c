@@ -230,13 +230,16 @@ static void test_dc_and_groups(void)
     CHECK(NetGetAnyDCName(NULL, NULL, NULL) == ERROR_INVALID_PARAMETER, "NetGetAnyDCName without buffer");
 
     buf = (LPBYTE)0x1234;
+    /* a computer that is not a domain controller has one global group, "None" (wine-sg 8011) */
     ret = NetGroupEnum(NULL, 0, &buf, MAX_PREFERRED_LENGTH, &read, &total, NULL);
-    CHECK(ret == NERR_InvalidComputer && buf == NULL && read == 0 && total == 0, "NetGroupEnum %lu", ret);
+    CHECK(ret == NERR_Success && buf && read == 1 && total == 1, "NetGroupEnum %lu", ret);
+    if (ret == NERR_Success) NetApiBufferFree(buf);
     CHECK(NetGroupEnum(NULL, 4, &buf, MAX_PREFERRED_LENGTH, &read, &total, NULL) == ERROR_INVALID_LEVEL, "NetGroupEnum level 4");
     CHECK(NetGroupEnum(L"\\\\nosuchhost", 0, &buf, MAX_PREFERRED_LENGTH, &read, &total, NULL) == ERROR_BAD_NETPATH, "NetGroupEnum, another computer");
     CHECK(NetGroupEnum(NULL, 0, NULL, MAX_PREFERRED_LENGTH, &read, &total, NULL) == ERROR_INVALID_PARAMETER, "NetGroupEnum without buffer");
     ret = NetGroupGetInfo(NULL, L"None", 1, &buf);
-    CHECK(ret == NERR_InvalidComputer, "NetGroupGetInfo %lu", ret);
+    CHECK(ret == NERR_Success, "NetGroupGetInfo %lu", ret);
+    if (ret == NERR_Success) NetApiBufferFree(buf);
     CHECK(NetGroupGetInfo(NULL, L"None", 9, &buf) == ERROR_INVALID_LEVEL, "NetGroupGetInfo level 9");
     CHECK(NetGroupGetInfo(L"\\\\nosuchhost", L"None", 1, &buf) == ERROR_BAD_NETPATH, "NetGroupGetInfo, another computer");
     CHECK(NetGroupGetInfo(NULL, NULL, 1, &buf) == ERROR_INVALID_PARAMETER, "NetGroupGetInfo without name");
