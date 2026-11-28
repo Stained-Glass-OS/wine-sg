@@ -5,6 +5,12 @@
  *   withtoken USER          LogonUserW, then CreateProcessWithTokenW
  *   asuser SESSION          WTSQueryUserToken (SYSTEM), then
  *                           CreateProcessAsUserW
+ *   inherit SESSION MODE    (i1010) as asuser, with an inheritable pipe and an inheritable
+ *                           event: MODE "list" passes the pipe alone in
+ *                           PROC_THREAD_ATTRIBUTE_HANDLE_LIST, "all" bInheritHandles
+ *                           alone, "none" neither; prints "INHERIT <exit> <pipe text>"
+ *   handles PIPE EVENT      (the started program) writes "inherited" to PIPE when it
+ *                           can; exits 10 + 1 (it could) + 2 (EVENT is a handle)
  *   report OUT              (the started program) write to OUT: its user's
  *                           SID, its session, USERNAME's, USERPROFILE's and SG_PROBE_SECRET's
  *                           values; exit 7
@@ -63,6 +69,57 @@ int main( int argc, char **argv )
         fprintf( f, "SECRET %s\n", val );
         fclose( f );
         return 7;
+    }
+    if (argc > 3 && !strcmp( argv[1], "handles" ))
+    {
+        HANDLE pipe = (HANDLE)(ULONG_PTR)strtoul( argv[2], NULL, 0 ), event = (HANDLE)(ULONG_PTR)strtoul( argv[3], NULL, 0 );
+        DWORD written = 0, flags, code = 10, len = 64;
+        char text[80] = "inherited:";
+        GetUserNameA( text + 10, &len );
+        if (argc > 4) CloseHandle( CreateFileA( argv[4], GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL ) );
+        if (WriteFile( pipe, text, strlen( text ), &written, NULL ) && written == strlen( text )) code += 1;
+        if (GetHandleInformation( event, &flags )) code += 2;
+        return code;
+    }
+    if (argc > 3 && !strcmp( argv[1], "inherit" ))
+    {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+        STARTUPINFOEXW six = {{ sizeof(six) }};
+        HANDLE rd, wr, event, list[1];
+        SIZE_T size = 0;
+        DWORD code = 0xdeadbeef, got = 0;
+        char text[96] = "";
+        BOOL inherit = strcmp( argv[3], "none" ) != 0, ok;
+
+        int i;
+
+        if (!WTSQueryUserToken( atoi( argv[2] ), &token )) { printf( "TOKEN 0 %lu\n", GetLastError() ); return 0; }
+        /* high values, which the new program's own handles do not reach */
+        for (i = 0; i < 400; i++) CreateEventW( NULL, TRUE, FALSE, NULL );
+        CreatePipe( &rd, &wr, &sa, 0 );
+        SetHandleInformation( rd, HANDLE_FLAG_INHERIT, 0 );
+        event = CreateEventW( &sa, TRUE, FALSE, NULL );
+        swprintf( cmd, ARRAYSIZE(cmd), L"C:\\runasuser-probe.exe handles %lu %lu C:\\out\\inherit-%hs",
+                  (unsigned long)(ULONG_PTR)wr, (unsigned long)(ULONG_PTR)event, argv[3] );
+        if (!strcmp( argv[3], "list" ))
+        {
+            list[0] = wr;
+            InitializeProcThreadAttributeList( NULL, 1, 0, &size );
+            six.lpAttributeList = HeapAlloc( GetProcessHeap(), 0, size );
+            InitializeProcThreadAttributeList( six.lpAttributeList, 1, 0, &size );
+            UpdateProcThreadAttribute( six.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list, sizeof(list), NULL, NULL );
+            ok = CreateProcessAsUserW( token, NULL, cmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT, NULL, L"C:\\",
+                                       &six.StartupInfo, &pi );
+        }
+        else ok = CreateProcessAsUserW( token, NULL, cmd, NULL, NULL, inherit, 0, NULL, L"C:\\", &si, &pi );
+        CloseHandle( wr );
+        if (!ok) { printf( "STARTED 0 %lu\n", GetLastError() ); return 0; }
+        WaitForSingleObject( pi.hProcess, 90000 );
+        GetExitCodeProcess( pi.hProcess, &code );
+        if (!ReadFile( rd, text, sizeof(text) - 1, &got, NULL )) got = 0;
+        text[got] = 0;
+        printf( "INHERIT %lu %s\n", code, got ? text : "-" );
+        return 0;
     }
     if (argc < 4) return 1;
     swprintf( cmd, ARRAYSIZE(cmd), L"C:\\runasuser-probe.exe report %hs", argv[3] );

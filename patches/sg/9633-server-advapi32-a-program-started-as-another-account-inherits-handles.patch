@@ -1,0 +1,314 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] server, advapi32: a program started as another account inherits its starter's handles
+
+A program started as another account inherited none of its starter's
+handles. A service starts its helper on a person's desktop with
+WTSQueryUserToken's token and CreateProcessAsUser, passing pipes whose values
+it puts on the helper's command line; in a shared prefix the elevation broker
+starts such a program as the person (1711), and it ignored bInheritHandles.
+WireGuard for Windows' tray window ("wireguard.exe /ui 356 352 368 380",
+started by its manager service) found no pipes there and ended at once, over
+and over (i1010).
+
+Now, as on Windows: with bInheritHandles the program inherits every
+inheritable handle, or, with a PROC_THREAD_ATTRIBUTE_HANDLE_LIST (STARTUPINFOEX),
+only the inheritable handles listed -- at the same values. advapi32 sends the
+handles with the launch ticket (make_launch_ticket's optional request data: the
+values, or ~0 alone for all; not declared as a VARARG, so the protocol is
+unchanged), the server keeps their objects and puts them into the new
+process's table when it names its ticket, before it opens anything.
+
+Test: test/launchinherit-gate.sh (QA VM, as SYSTEM into a signed-in person's
+session; test/runasuser-probe.c's new "inherit" mode): handle list, all, none,
+the program running as the person. Fails with the old server; mutant
+SG_MUTANT_LAUNCH_NO_INHERIT (server/token.c) fails it.
+---
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -3901,7 +3901,9 @@
+ @END
+ 
+ 
+-/* Stained Glass OS (1711): a launch ticket for running a program as a token's account */
++/* Stained Glass OS (1711): a launch ticket for running a program as a token's account.
++ * (i1010) The request may carry data: the handles the program inherits (the values, or ~0 alone
++ * for every inheritable one); it is not declared as a VARARG so that the protocol stays as it is. */
+ @REQ(make_launch_ticket)
+     obj_handle_t token;           /* the account's token */
+ @REPLY
+--- a/server/handle.h
++++ b/server/handle.h
+@@ -59,6 +59,10 @@
+ extern unsigned int get_obj_handle_count( struct process *process, const struct object *obj );
+ extern void close_process_handles( struct process *process );
+ extern struct handle_table *alloc_handle_table( struct process *process, int count );
++/* Stained Glass OS (i1010): handles inherited by a program started as another account */
++extern unsigned int sg_inheritable_handles( struct process *process, obj_handle_t *handles, unsigned int max );
++extern struct object *sg_inheritable_object( struct process *process, obj_handle_t handle, unsigned int *access );
++extern int sg_put_handle_at( struct process *process, obj_handle_t handle, struct object *obj, unsigned int access );
+ extern struct handle_table *copy_handle_table( struct process *process, struct process *parent,
+                                                const obj_handle_t *handles, unsigned int handle_count,
+                                                const obj_handle_t *std_handles );
+--- a/server/handle.c
++++ b/server/handle.c
+@@ -368,6 +368,49 @@
+     table->last = max( table->last, index );
+ }
+ 
++/* Stained Glass OS (i1010): a program started as another account (CreateProcessAsUser with a
++ * person's token: the elevation broker starts it) inherits its starter's handles as a child
++ * does, at the same values: the starter's inheritable handles (all of them, or those it listed),
++ * kept with their object at the request, put into the new process's table as it starts. */
++unsigned int sg_inheritable_handles( struct process *process, obj_handle_t *handles, unsigned int max )
++{
++    struct handle_table *table = process->handles;
++    unsigned int n = 0;
++    int i;
++
++    if (!table) return 0;
++    for (i = 0; i <= table->last && n < max; i++)
++        if (table->entries[i].ptr && (table->entries[i].access & RESERVED_INHERIT)) handles[n++] = index_to_handle( i );
++    return n;
++}
++
++/* the object of an inheritable handle, referenced; its access with the inherit flag */
++struct object *sg_inheritable_object( struct process *process, obj_handle_t handle, unsigned int *access )
++{
++    struct handle_entry *entry;
++
++    if (handle_is_global( handle ) || !(entry = get_handle( process, handle ))) return NULL;
++    if (!(entry->access & RESERVED_INHERIT)) return NULL;
++    *access = entry->access & ~RESERVED_CLOSE_PROTECT;
++    return grab_object( entry->ptr );
++}
++
++/* put obj into process's table at handle, which must be free */
++int sg_put_handle_at( struct process *process, obj_handle_t handle, struct object *obj, unsigned int access )
++{
++    struct handle_table *table = process->handles;
++    int index = handle_to_index( handle ), i;
++
++    if (!table || handle_is_global( handle ) || index < 0 || index >= MAX_HANDLE_ENTRIES) return 0;
++    while (index >= table->count) if (!grow_handle_table( table )) return 0;
++    if (index <= table->last && table->entries[index].ptr) return 0;
++    for (i = table->last + 1; i < index; i++) table->entries[i].ptr = NULL;
++    if (index > table->last) table->last = index;
++    table->entries[index].ptr = grab_object_for_handle( obj );
++    table->entries[index].access = access;
++    return 1;
++}
++
+ /* copy the handle table of the parent process */
+ /* return 1 if OK, 0 on error */
+ struct handle_table *copy_handle_table( struct process *process, struct process *parent,
+--- a/server/token.c
++++ b/server/token.c
+@@ -3465,8 +3465,64 @@
+     process_id_t    requester_id;
+     struct process *process;     /* the started process, referenced */
+     time_t          expires;
++    unsigned int    inherit_count; /* i1010: the requester's handles the process inherits */
++    obj_handle_t   *inherit_handles;
++    struct object **inherit_objs;  /* referenced until the process has them */
++    unsigned int   *inherit_access;
+ } sg_launches[SG_LAUNCH_MAX];
+ 
++static void sg_launch_drop_inherit( struct sg_launch *l )
++{
++    unsigned int i;
++
++    for (i = 0; i < l->inherit_count; i++) release_object( l->inherit_objs[i] );
++    free( l->inherit_handles );
++    free( l->inherit_objs );
++    free( l->inherit_access );
++    l->inherit_handles = NULL;
++    l->inherit_objs = NULL;
++    l->inherit_access = NULL;
++    l->inherit_count = 0;
++}
++
++/* the handles the requester asks the process to inherit (optional request data: the handle
++ * values, or the one value ~0 for every inheritable handle, as CreateProcess with bInheritHandles
++ * and no handle list); only inheritable ones are taken, as Windows requires */
++static void sg_launch_take_inherit( struct sg_launch *l, const obj_handle_t *want, data_size_t size )
++{
++    unsigned int count = size / sizeof(obj_handle_t), i, n = 0, access;
++    obj_handle_t *all = NULL;
++    struct object *obj;
++
++#ifdef SG_MUTANT_LAUNCH_NO_INHERIT
++    return;
++#endif
++    if (!count) return;
++    if (count == 1 && want[0] == ~0u)
++    {
++        if (!(all = mem_alloc( 4096 * sizeof(*all) ))) return;
++        count = sg_inheritable_handles( current->process, all, 4096 );
++        want = all;
++    }
++    if (count > 4096) count = 4096;
++    if (count && (l->inherit_handles = mem_alloc( count * sizeof(*l->inherit_handles) )) &&
++        (l->inherit_objs = mem_alloc( count * sizeof(*l->inherit_objs) )) &&
++        (l->inherit_access = mem_alloc( count * sizeof(*l->inherit_access) )))
++    {
++        for (i = 0; i < count; i++)
++        {
++            if (!(obj = sg_inheritable_object( current->process, want[i], &access ))) continue;
++            l->inherit_handles[n] = want[i];
++            l->inherit_objs[n] = obj;
++            l->inherit_access[n] = access;
++            n++;
++        }
++    }
++    l->inherit_count = n;
++    free( all );
++    clear_error();
++}
++
+ static const char *sg_ticket_dir(void)
+ {
+     static const char *dir;
+@@ -3476,6 +3532,7 @@
+ 
+ static void sg_launch_free( struct sg_launch *l )
+ {
++    sg_launch_drop_inherit( l );
+     if (l->process) release_object( l->process );
+     memset( l, 0, sizeof(*l) );
+ }
+@@ -3539,6 +3596,7 @@
+         return;
+     }
+     close( fd );
++    sg_launch_take_inherit( l, get_req_data(), get_req_data_size() );
+     set_reply_data( l->name, 32 );
+ }
+ 
+@@ -3548,8 +3606,15 @@
+ {
+     struct sg_launch *l = sg_launch_find( get_req_data(), get_req_data_size() );
+ 
++    unsigned int i;
++
+     if (!l || l->process || l->uid != current->process->peer_uid) { set_error( STATUS_ACCESS_DENIED ); return; }
+     l->process = (struct process *)grab_object( current->process );
++    /* it has opened nothing yet: the inherited handles take their own values */
++    for (i = 0; i < l->inherit_count; i++)
++        if (!sg_put_handle_at( current->process, l->inherit_handles[i], l->inherit_objs[i], l->inherit_access[i] ))
++            fprintf( stderr, "wineserver: launch: handle %04x not inherited (taken)\n", l->inherit_handles[i] );
++    sg_launch_drop_inherit( l );
+ }
+ 
+ /* the requester gets the started process and its first thread, with full
+--- a/dlls/advapi32/security.c
++++ b/dlls/advapi32/security.c
+@@ -3698,9 +3698,64 @@
+     return TRUE;
+ }
+ 
++/* kernelbase's attribute list (InitializeProcThreadAttributeList), for the handle list */
++struct sg_proc_thread_attr
++{
++    DWORD_PTR attr;
++    SIZE_T size;
++    void *value;
++};
++struct sg_proc_thread_attr_list
++{
++    DWORD mask;
++    DWORD size;
++    DWORD count;
++    DWORD pad;
++    DWORD_PTR unk;
++    struct sg_proc_thread_attr attrs[1];
++};
++
++/* Stained Glass OS (i1010): the handles a program started as another account inherits, as
++ * CreateProcessAsUser's child does: with bInheritHandles, every inheritable handle, or only
++ * those of PROC_THREAD_ATTRIBUTE_HANDLE_LIST (STARTUPINFOEX). The server keeps them with the
++ * launch ticket and gives them to the program, at the same values, as it starts: a service's
++ * helper in a person's session finds its pipes where its command line says (WireGuard's tray
++ * window, started by its manager service, ended at once without them). */
++static obj_handle_t *launch_inherit( BOOL inherit, DWORD flags, const STARTUPINFOW *startup, unsigned int *count )
++{
++    static obj_handle_t all = ~0u;
++    obj_handle_t *list;
++    unsigned int i, j;
++
++    *count = 0;
++    if (!inherit) return NULL;
++    if ((flags & EXTENDED_STARTUPINFO_PRESENT) && startup && startup->cb >= sizeof(STARTUPINFOEXW))
++    {
++        const struct sg_proc_thread_attr_list *attrs = (void *)((const STARTUPINFOEXW *)startup)->lpAttributeList;
++
++        for (i = 0; attrs && i < attrs->count; i++)
++        {
++            const HANDLE *handles;
++            unsigned int n;
++
++            if (attrs->attrs[i].attr != PROC_THREAD_ATTRIBUTE_HANDLE_LIST) continue;
++            handles = attrs->attrs[i].value;
++            n = attrs->attrs[i].size / sizeof(HANDLE);
++            if (!(list = malloc( (n + 1) * sizeof(*list) ))) return NULL;
++            for (j = 0; j < n; j++) list[j] = wine_server_obj_handle( handles[j] );
++            *count = n;
++            return list;
++        }
++    }
++    *count = 1;
++    return &all;
++}
++
+ static BOOL launch_as( HANDLE token, const WCHAR *app, const WCHAR *cmdline, const WCHAR *dir,
+-                       PROCESS_INFORMATION *info )
++                       PROCESS_INFORMATION *info, BOOL inherit, DWORD flags, const STARTUPINFOW *startup )
+ {
++    unsigned int inherit_count;
++    obj_handle_t *inherit_list;
+     struct launch_request_params *params;
+     WCHAR arg[MAX_PATH * 2], cwd[MAX_PATH];
+     const WCHAR *p = cmdline;
+@@ -3710,13 +3765,16 @@
+     DWORD i;
+ 
+     if (!(params = calloc( 1, sizeof(*params) ))) { SetLastError( ERROR_NOT_ENOUGH_MEMORY ); return FALSE; }
++    inherit_list = launch_inherit( inherit, flags, startup, &inherit_count );
+     SERVER_START_REQ( make_launch_ticket )
+     {
+         req->token = wine_server_obj_handle( token );
++        if (inherit_count) wine_server_add_data( req, inherit_list, inherit_count * sizeof(*inherit_list) );
+         wine_server_set_reply( req, params->ticket, sizeof(params->ticket) - 1 );
+         status = wine_server_call( req );
+     }
+     SERVER_END_REQ;
++    if (inherit_list && !(inherit_count == 1 && *inherit_list == ~0u)) free( inherit_list );
+     if (status) { free( params ); SetLastError( RtlNtStatusToDosError( status ) ); return FALSE; }
+ 
+     /* the program, then its arguments */
+@@ -3789,7 +3847,7 @@
+ {
+     TRACE( "%p %s %s %#lx\n", token, debugstr_w(app), debugstr_w(cmdline), flags );
+ 
+-    if (token_is_other_account( token )) return launch_as( token, app, cmdline, dir, info );
++    if (token_is_other_account( token )) return launch_as( token, app, cmdline, dir, info, inherit, flags, startup );
+     return CreateProcessInternalW( token, app, cmdline, process_attr, thread_attr, inherit, flags, env,
+                                    dir, startup, info, NULL );
+ }
+@@ -3814,7 +3872,7 @@
+                      LOGON32_PROVIDER_DEFAULT, &token ))
+         return FALSE;
+     if (token_is_other_account( token ))
+-        ret = launch_as( token, lpApplicationName, lpCommandLine, lpCurrentDirectory, lpProcessInformation );
++        ret = launch_as( token, lpApplicationName, lpCommandLine, lpCurrentDirectory, lpProcessInformation, FALSE, 0, NULL );
+     else
+         ret = CreateProcessW( lpApplicationName, lpCommandLine, NULL, NULL, FALSE, dwCreationFlags, lpEnvironment,
+                               lpCurrentDirectory, lpStartupInfo, lpProcessInformation );
+@@ -3830,7 +3888,7 @@
+            creation_flags );
+ 
+     if (token_is_other_account( token ))
+-        return launch_as( token, application_name, command_line, current_directory, process_information );
++        return launch_as( token, application_name, command_line, current_directory, process_information, FALSE, 0, NULL );
+     /* FIXME: check if handles should be inherited */
+     return CreateProcessAsUserW( token, application_name, command_line, NULL, NULL, FALSE, creation_flags,
+                                  environment, current_directory, startup_info, process_information );
