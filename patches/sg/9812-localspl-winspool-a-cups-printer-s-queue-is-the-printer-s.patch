@@ -1,0 +1,974 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stained Glass OS <ke7oxh@gmail.com>
+Date: Sat, 28 Nov 2026 00:05:46 -0800
+Subject: [PATCH] localspl, winspool: a CUPS printer's queue is the printer's: its documents are listed, paused and cancelled (9812)
+
+Wine's spooler runs in the program that prints, and a job ends when the
+CUPS port has handed the data to CUPS: the document then waits in CUPS's
+queue, where no Windows program could see it. EnumJobs from any other
+process (a queue window, Settings, a program watching its document) was
+always empty, PRINTER_INFO_2's cJobs was 0, SetJob found no job to pause
+or cancel, and SetPrinter's pause set a registry flag nothing read -- a
+jammed printer's stuck document could not be cancelled from Windows.
+
+A CUPS printer's queue is now CUPS's, as a network printer's queue is its
+server's on Windows:
+- localspl: EnumJobs and GetJob list the CUPS queue's not-completed jobs
+  after the ones being spooled here (IPP Get-Jobs as the user: name,
+  owner, state, size, pages, priority, time submitted; another user's
+  document keeps CUPS's privacy). SetJob's pause, resume, restart and
+  cancel are IPP Hold-Job, Release-Job, Restart-Job and Cancel-Job, which
+  CUPS allows the document's owner and administrators. A new fpSetPrinter
+  pauses, resumes and purges the CUPS queue (IPP Pause-Printer,
+  Resume-Printer, Purge-Jobs: administrators, as CUPS decides).
+- winspool: SetPrinter's commands go to the provider first (other printers
+  keep the registry flag); cJobs counts the queue's documents (one
+  cupsGetJobs2 in the two-second status cache).
+- A Windows program has no terminal for CUPS to ask a password at: the
+  calling thread's password callback answers none (access denied).
+- The document title given to CUPS was converted into len + 3 + 1 bytes
+  instead of len * 3 + 1, so a title with accented or CJK characters was
+  cut short in CUPS's queue.
+
+Gate test/cupsjobs-gate.sh (a CUPS server of its own).
+
+--- a/dlls/localspl/cups.c
++++ b/dlls/localspl/cups.c
+@@ -64,12 +64,35 @@
+ #define CUPS_OPT_FUNCS \
+     DO_FUNC(cupsGetNamedDest); \
+     DO_FUNC(cupsLastErrorString)
++/* Stained Glass OS (9812): a queue's jobs, and controlling them */
++#define CUPS_JOB_FUNCS \
++    DO_FUNC(cupsDoRequest); \
++    DO_FUNC(cupsLastError); \
++    DO_FUNC(cupsSetPasswordCB2); \
++    DO_FUNC(cupsUser); \
++    DO_FUNC(httpAssembleURIf); \
++    DO_FUNC(ippAddInteger); \
++    DO_FUNC(ippAddString); \
++    DO_FUNC(ippAddStrings); \
++    DO_FUNC(ippDelete); \
++    DO_FUNC(ippFirstAttribute); \
++    DO_FUNC(ippGetCount); \
++    DO_FUNC(ippGetGroupTag); \
++    DO_FUNC(ippGetInteger); \
++    DO_FUNC(ippGetName); \
++    DO_FUNC(ippGetString); \
++    DO_FUNC(ippNewRequest); \
++    DO_FUNC(ippNextAttribute)
+ 
+ #define DO_FUNC(f) static typeof(f) *p##f
+ CUPS_FUNCS;
+ #undef DO_FUNC
+ static cups_dest_t * (*pcupsGetNamedDest)(http_t *, const char *, const char *);
+ static const char *  (*pcupsLastErrorString)(void);
++#define DO_FUNC(f) static typeof(f) *p##f
++CUPS_JOB_FUNCS;
++#undef DO_FUNC
++static BOOL cups_jobs_ok;
+ 
+ #endif /* SONAME_LIBCUPS */
+ 
+@@ -447,7 +470,13 @@
+ 
+         len = wcslen(document_title);
+         doc->cups.doc_title = malloc(len * 3 + 1);
++#ifdef SG_MUTANT_CUPS_TITLE_SHORT
+         ntdll_wcstoumbs(document_title, len + 1, doc->cups.doc_title, len + 3 + 1, FALSE);
++#else
++        /* Stained Glass OS (9812): room for every character's UTF-8 (a title of
++         * accented or CJK characters was cut, or the job had no name) */
++        ntdll_wcstoumbs(document_title, len + 1, doc->cups.doc_title, len * 3 + 1, FALSE);
++#endif
+ 
+         return TRUE;
+     }
+@@ -456,6 +485,200 @@
+     return lpr_start_doc(doc, printer_name);
+ }
+ 
++#ifdef SONAME_LIBCUPS
++static const char *no_password(const char *prompt, http_t *http, const char *method,
++                               const char *resource, void *data)
++{
++    return NULL;
++}
++
++/* the queue's name in UTF-8, NULL if too long */
++static BOOL queue_name(const WCHAR *queue, char *name, size_t size)
++{
++    return ntdll_wcstoumbs(queue, wcslen(queue) + 1, name, size, FALSE) > 0;
++}
++
++static void utf8_to_wstr(const char *str, WCHAR *out, unsigned int count)
++{
++    DWORD len;
++
++    out[0] = 0;
++    if (!str) return;
++    len = ntdll_umbstowcs(str, strlen(str), out, count - 1);
++    out[min(len, count - 1)] = 0;
++}
++
++static NTSTATUS status_from_ipp(int status)
++{
++    if (status <= 0x00ff) return STATUS_SUCCESS;          /* successful-ok-* */
++    switch (status)
++    {
++    case IPP_STATUS_ERROR_FORBIDDEN:
++    case IPP_STATUS_ERROR_NOT_AUTHENTICATED:
++    case IPP_STATUS_ERROR_NOT_AUTHORIZED:
++    case IPP_STATUS_ERROR_CUPS_AUTHENTICATION_CANCELED:
++        return STATUS_ACCESS_DENIED;
++    case IPP_STATUS_ERROR_NOT_FOUND:
++    case IPP_STATUS_ERROR_GONE:
++        return STATUS_NOT_FOUND;
++    case IPP_STATUS_ERROR_NOT_POSSIBLE:
++        return STATUS_INVALID_DEVICE_STATE;
++    case IPP_STATUS_ERROR_SERVICE_UNAVAILABLE:
++    case IPP_STATUS_ERROR_INTERNAL:
++        return STATUS_DEVICE_NOT_READY;
++    default:
++        return STATUS_UNSUCCESSFUL;
++    }
++}
++#endif
++
++static NTSTATUS get_cups_jobs(void *args)
++{
++#ifdef SONAME_LIBCUPS
++    static const char *const wanted[] =
++    {
++        "job-id", "job-name", "job-originating-user-name", "job-state", "job-state-reasons",
++        "job-k-octets", "job-impressions", "job-impressions-completed", "job-priority",
++        "time-at-creation",
++    };
++    const struct get_cups_jobs_params *params = args;
++    char name[512], uri[1024];
++    ipp_t *request, *response;
++    ipp_attribute_t *attr;
++    unsigned int n = 0;
++    NTSTATUS ret;
++
++    *params->total = 0;
++    if (!cups_jobs_ok) return STATUS_NOT_SUPPORTED;
++    if (!queue_name(params->queue, name, sizeof(name))) return STATUS_INVALID_PARAMETER;
++    if (phttpAssembleURIf(HTTP_URI_CODING_ALL, uri, sizeof(uri), "ipp", NULL, "localhost", 0,
++                          "/printers/%s", name) < HTTP_URI_STATUS_OK)
++        return STATUS_INVALID_PARAMETER;
++
++    /* a Windows program has no terminal to type a CUPS password at: an
++     * operation CUPS wants a password for fails instead (access denied);
++     * the callback is the calling thread's */
++    pcupsSetPasswordCB2(no_password, NULL);
++    request = pippNewRequest(IPP_OP_GET_JOBS);
++    pippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI, "printer-uri", NULL, uri);
++    pippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "requesting-user-name", NULL, pcupsUser());
++    pippAddString(request, IPP_TAG_OPERATION, IPP_TAG_KEYWORD, "which-jobs", NULL, "not-completed");
++    pippAddStrings(request, IPP_TAG_OPERATION, IPP_TAG_KEYWORD, "requested-attributes",
++                   ARRAY_SIZE(wanted), NULL, wanted);
++    response = pcupsDoRequest(CUPS_HTTP_DEFAULT, request, "/");
++    ret = status_from_ipp(pcupsLastError());
++    if (!response) return ret ? ret : STATUS_DEVICE_NOT_READY;
++    if (ret)
++    {
++        pippDelete(response);
++        return ret;
++    }
++
++    for (attr = pippFirstAttribute(response); attr; attr = pippNextAttribute(response))
++    {
++        struct cups_job job;
++
++        while (attr && pippGetGroupTag(attr) != IPP_TAG_JOB) attr = pippNextAttribute(response);
++        if (!attr) break;
++        memset(&job, 0, sizeof(job));
++        job.priority = 50;
++        for (; attr && pippGetGroupTag(attr) == IPP_TAG_JOB; attr = pippNextAttribute(response))
++        {
++            const char *aname = pippGetName(attr);
++            int i;
++
++            if (!aname) continue;
++            if (!strcmp(aname, "job-id")) job.id = pippGetInteger(attr, 0);
++            else if (!strcmp(aname, "job-name")) utf8_to_wstr(pippGetString(attr, 0, NULL), job.title, ARRAY_SIZE(job.title));
++            else if (!strcmp(aname, "job-originating-user-name"))
++                utf8_to_wstr(pippGetString(attr, 0, NULL), job.user, ARRAY_SIZE(job.user));
++            else if (!strcmp(aname, "job-state")) job.state = pippGetInteger(attr, 0);
++            else if (!strcmp(aname, "job-k-octets")) job.size = min(pippGetInteger(attr, 0), 0x3fffff) * 1024;
++            else if (!strcmp(aname, "job-impressions")) job.pages = pippGetInteger(attr, 0);
++            else if (!strcmp(aname, "job-impressions-completed")) job.pages_done = pippGetInteger(attr, 0);
++            else if (!strcmp(aname, "job-priority")) job.priority = pippGetInteger(attr, 0);
++            else if (!strcmp(aname, "time-at-creation")) job.created = pippGetInteger(attr, 0);
++            else if (!strcmp(aname, "job-state-reasons"))
++                for (i = 0; i < pippGetCount(attr); i++)
++                {
++                    const char *r = pippGetString(attr, i, NULL);
++                    size_t len = r ? strlen(r) : 0;
++
++                    if (len > 6 && !strcmp(r + len - 6, "-error")) job.reasons |= CUPS_JOB_ERROR;
++                    if (r && !strcmp(r, "printer-stopped")) job.reasons |= CUPS_JOB_PRINTER_STOPPED;
++                }
++        }
++        if (job.id)
++        {
++            if (n < params->count) params->jobs[n] = job;
++            n++;
++        }
++        if (!attr) break;
++    }
++    pippDelete(response);
++    *params->total = n;
++    return STATUS_SUCCESS;
++#else
++    return STATUS_NOT_SUPPORTED;
++#endif
++}
++
++/* JOB_CONTROL_* and PRINTER_CONTROL_* (winspool.h) */
++#define CJ_PAUSE   1
++#define CJ_RESUME  2
++#define CJ_CANCEL  3
++#define CJ_RESTART 4
++#define CJ_DELETE  5
++#define CJ_QUEUE   0x100
++
++static NTSTATUS control_cups_job(void *args)
++{
++#ifdef SONAME_LIBCUPS
++    const struct control_cups_job_params *params = args;
++    char name[512], uri[1024];
++    ipp_t *request, *response;
++    ipp_op_t op;
++    NTSTATUS ret;
++
++    if (!cups_jobs_ok) return STATUS_NOT_SUPPORTED;
++    if (!queue_name(params->queue, name, sizeof(name))) return STATUS_INVALID_PARAMETER;
++    switch (params->command)
++    {
++    case CJ_PAUSE:   op = IPP_OP_HOLD_JOB; break;
++    case CJ_RESUME:  op = IPP_OP_RELEASE_JOB; break;
++    case CJ_RESTART: op = IPP_OP_RESTART_JOB; break;
++    case CJ_CANCEL:
++    case CJ_DELETE:  op = IPP_OP_CANCEL_JOB; break;
++    case CJ_QUEUE | CJ_PAUSE:  op = IPP_OP_PAUSE_PRINTER; break;
++    case CJ_QUEUE | CJ_RESUME: op = IPP_OP_RESUME_PRINTER; break;
++    case CJ_QUEUE | 3:         op = IPP_OP_PURGE_JOBS; break;   /* PRINTER_CONTROL_PURGE */
++    default: return STATUS_INVALID_PARAMETER;
++    }
++    if (params->command & CJ_QUEUE)
++        ret = phttpAssembleURIf(HTTP_URI_CODING_ALL, uri, sizeof(uri), "ipp", NULL, "localhost", 0,
++                                "/printers/%s", name) < HTTP_URI_STATUS_OK;
++    else
++        ret = phttpAssembleURIf(HTTP_URI_CODING_ALL, uri, sizeof(uri), "ipp", NULL, "localhost", 0,
++                                "/jobs/%u", params->id) < HTTP_URI_STATUS_OK;
++    if (ret) return STATUS_INVALID_PARAMETER;
++
++    pcupsSetPasswordCB2(no_password, NULL);
++    request = pippNewRequest(op);
++    pippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI,
++                  (params->command & CJ_QUEUE) ? "printer-uri" : "job-uri", NULL, uri);
++    pippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, "requesting-user-name", NULL, pcupsUser());
++    response = pcupsDoRequest(CUPS_HTTP_DEFAULT, request,
++                              (params->command & CJ_QUEUE) ? "/admin/" : "/jobs/");
++    ret = status_from_ipp(pcupsLastError());
++    if (response) pippDelete(response);
++    TRACE("%s job %u command %#x: %#x (%s)\n", debugstr_a(name), params->id, params->command, (int)ret,
++          pcupsLastErrorString ? debugstr_a(pcupsLastErrorString()) : "");
++    return ret;
++#else
++    return STATUS_NOT_SUPPORTED;
++#endif
++}
++
+ static NTSTATUS process_attach(void *args)
+ {
+ #ifdef SONAME_LIBCUPS
+@@ -476,6 +699,10 @@
+ #define DO_FUNC(x) p##x = dlsym(libcups_handle, #x)
+     CUPS_OPT_FUNCS;
+ #undef DO_FUNC
++    cups_jobs_ok = TRUE;
++#define DO_FUNC(x) if (!(p##x = dlsym(libcups_handle, #x))) cups_jobs_ok = FALSE
++    CUPS_JOB_FUNCS;
++#undef DO_FUNC
+     return STATUS_SUCCESS;
+ #else /* SONAME_LIBCUPS */
+     return STATUS_NOT_SUPPORTED;
+@@ -532,6 +759,8 @@
+     start_doc,
+     write_doc,
+     end_doc,
++    get_cups_jobs,
++    control_cups_job,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+@@ -580,12 +809,54 @@
+     return write_doc(&params);
+ }
+ 
++static NTSTATUS wow64_get_cups_jobs(void *args)
++{
++    struct
++    {
++        PTR32 queue;
++        PTR32 jobs;
++        unsigned int count;
++        PTR32 total;
++    } const *params32 = args;
++
++    struct get_cups_jobs_params params =
++    {
++        ULongToPtr(params32->queue),
++        ULongToPtr(params32->jobs),
++        params32->count,
++        ULongToPtr(params32->total),
++    };
++
++    return get_cups_jobs(&params);
++}
++
++static NTSTATUS wow64_control_cups_job(void *args)
++{
++    struct
++    {
++        PTR32 queue;
++        unsigned int id;
++        unsigned int command;
++    } const *params32 = args;
++
++    struct control_cups_job_params params =
++    {
++        ULongToPtr(params32->queue),
++        params32->id,
++        params32->command,
++    };
++
++    return control_cups_job(&params);
++}
++
+ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+     process_attach,
+     wow64_start_doc,
+     wow64_write_doc,
+     end_doc,
++    wow64_get_cups_jobs,
++    wow64_control_cups_job,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
+--- a/dlls/localspl/localspl_private.h
++++ b/dlls/localspl/localspl_private.h
+@@ -187,6 +187,42 @@
+     INT64 doc;
+ };
+ 
++/* Stained Glass OS (9812): the jobs of a CUPS queue (a CUPS: port's
++ * printer), which is where a Windows program's document waits once it is
++ * spooled: listed as the printer's jobs, and paused, resumed, restarted or
++ * cancelled from them */
++struct cups_job
++{
++    unsigned int id;
++    unsigned int state;         /* IPP job-state: 3 pending, 4 held, 5 processing, 6 stopped */
++    unsigned int reasons;       /* CUPS_JOB_* below */
++    unsigned int size;          /* bytes */
++    unsigned int pages;         /* job-impressions, 0 unknown */
++    unsigned int pages_done;    /* job-impressions-completed */
++    unsigned int priority;      /* 1..100 */
++    unsigned int pad;
++    INT64 created;              /* time-at-creation, seconds since 1970 */
++    WCHAR title[256];
++    WCHAR user[128];
++};
++#define CUPS_JOB_ERROR    1     /* a job-state-reason ending in -error */
++#define CUPS_JOB_PRINTER_STOPPED 2
++
++struct get_cups_jobs_params
++{
++    const WCHAR *queue;
++    struct cups_job *jobs;
++    unsigned int count;         /* room in jobs */
++    unsigned int *total;        /* the queue's not-completed jobs */
++};
++
++struct control_cups_job_params
++{
++    const WCHAR *queue;
++    unsigned int id;            /* 0: the queue itself */
++    unsigned int command;       /* JOB_CONTROL_*, or PRINTER_CONTROL_* | 0x100 for the queue */
++};
++
+ #define UNIX_CALL(func, params) WINE_UNIX_CALL(unix_ ## func, params)
+ 
+ enum cups_funcs
+@@ -195,6 +231,8 @@
+     unix_start_doc,
+     unix_write_doc,
+     unix_end_doc,
++    unix_get_cups_jobs,
++    unix_control_cups_job,
+     unix_funcs_count
+ };
+ 
+--- a/dlls/localspl/provider.c
++++ b/dlls/localspl/provider.c
+@@ -23,6 +23,8 @@
+ 
+ #define COBJMACROS
+ 
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
+ #include "wingdi.h"
+@@ -4142,6 +4144,10 @@
+ }
+ 
+ static BOOL WINAPI fpScheduleJob(HANDLE hprinter, DWORD job_id);
++static const WCHAR *cups_queue(const printer_info_t *info);
++static struct cups_job *cups_jobs(const printer_info_t *info, unsigned int *count);
++static const struct cups_job *find_cups_job(const struct cups_job *jobs, unsigned int count, DWORD id);
++static BOOL control_cups_job(const printer_info_t *info, const struct cups_job *job, DWORD command);
+ 
+ static BOOL WINAPI fpSetJob(HANDLE hprinter, DWORD job_id,
+         DWORD level, BYTE *data, DWORD command)
+@@ -4176,7 +4182,23 @@
+     job = get_job(printer->info, job_id);
+     if (!job)
+     {
++        const struct cups_job *cj;
++        struct cups_job *list;
++        unsigned int count;
++
+         LeaveCriticalSection(&printer->info->jobs_cs);
++        /* a document waiting in the CUPS queue: only the commands reach it */
++        if (cups_queue(printer->info) && (list = cups_jobs(printer->info, &count)))
++        {
++            if ((cj = find_cups_job(list, count, job_id)))
++            {
++                if (level > 3) SetLastError(ERROR_INVALID_LEVEL);
++                else ret = control_cups_job(printer->info, cj, command);
++                free(list);
++                return ret;
++            }
++            free(list);
++        }
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return FALSE;
+     }
+@@ -4340,6 +4362,186 @@
+     return ret;
+ }
+ 
++/* Stained Glass OS (9812): a CUPS printer's documents wait in CUPS once they
++ * are spooled (the program's own job ends when CUPS has the data), so its
++ * queue is CUPS's: listed after the jobs being spooled here, and paused,
++ * resumed, restarted and cancelled with IPP as their owner. Another user's
++ * documents keep CUPS's privacy (their names are not shown) and CUPS decides
++ * who may control them. */
++static const WCHAR *cups_queue(const printer_info_t *info)
++{
++#ifdef SG_MUTANT_CUPSJOBS_NONE
++    return NULL;
++#endif
++    if (info->port && !wcsnicmp(info->port, L"CUPS:", 5) && info->port[5]) return info->port + 5;
++    return NULL;
++}
++
++/* the CUPS queue's jobs (count of them), NULL without any */
++static struct cups_job *cups_jobs(const printer_info_t *info, unsigned int *count)
++{
++    const WCHAR *queue = cups_queue(info);
++    struct get_cups_jobs_params params;
++    struct cups_job *jobs = NULL, *more;
++    unsigned int room = 8, total = 0;
++
++    *count = 0;
++    if (!queue) return NULL;
++    for (;;)
++    {
++        if (!(more = realloc(jobs, room * sizeof(*jobs))))
++        {
++            free(jobs);
++            return NULL;
++        }
++        jobs = more;
++        params.queue = queue;
++        params.jobs = jobs;
++        params.count = room;
++        params.total = &total;
++        if (UNIX_CALL(get_cups_jobs, &params) || !total)
++        {
++            free(jobs);
++            return NULL;
++        }
++        if (total <= room) break;
++        room = total + 8;
++    }
++    *count = total;
++    return jobs;
++}
++
++static const struct cups_job *find_cups_job(const struct cups_job *jobs, unsigned int count, DWORD id)
++{
++    unsigned int i;
++
++    for (i = 0; i < count; i++) if (jobs[i].id == id) return &jobs[i];
++    return NULL;
++}
++
++static DWORD cups_job_status(const struct cups_job *job)
++{
++    DWORD status = 0;
++
++    switch (job->state)
++    {
++    case 4: status = JOB_STATUS_PAUSED; break;              /* held */
++    case 5: status = JOB_STATUS_PRINTING; break;            /* processing */
++    case 6: status = JOB_STATUS_ERROR; break;               /* stopped while printing */
++    }
++    if (job->reasons & CUPS_JOB_ERROR) status |= JOB_STATUS_ERROR;
++    return status;
++}
++
++/* a CUPS job's JOB_INFO, laid out as fill_job_info lays out a job of ours */
++static void fill_cups_job_info(printer_t *printer, const struct cups_job *job, DWORD level, DWORD position,
++        DWORD next_id, BYTE *info_ptr, BYTE *data, DWORD *s, BOOL fill, const WCHAR *machine)
++{
++    WCHAR *p = (WCHAR *)(data + *s), *str;
++    const WCHAR *user = job->user[0] ? job->user : NULL;
++    const WCHAR *title = job->title[0] ? job->title : NULL;
++    SYSTEMTIME submitted;
++    LARGE_INTEGER time;
++    FILETIME ft;
++
++    memset(&submitted, 0, sizeof(submitted));
++    if (job->created > 0)
++    {
++        RtlSecondsSince1970ToTime((DWORD)job->created, &time);
++        ft.dwLowDateTime = time.u.LowPart;
++        ft.dwHighDateTime = time.u.HighPart;
++        FileTimeToSystemTime(&ft, &submitted);
++    }
++    switch (level)
++    {
++    case 1:
++    {
++        JOB_INFO_1W *info = (JOB_INFO_1W *)info_ptr;
++
++        if (fill) memset(info, 0, sizeof(*info));
++        str = job_string(title, &p, s, fill); if (fill) info->pDocument = str;
++        str = job_string(printer->info->name, &p, s, fill); if (fill) info->pPrinterName = str;
++        str = job_string(L"RAW", &p, s, fill); if (fill) info->pDatatype = str;
++        str = job_string(user, &p, s, fill); if (fill) info->pUserName = str;
++        str = job_string(machine[0] ? machine : NULL, &p, s, fill); if (fill) info->pMachineName = str;
++        if (fill)
++        {
++            info->JobId = job->id;
++            info->Status = cups_job_status(job);
++            info->Priority = min(max(job->priority, MIN_PRIORITY), MAX_PRIORITY);
++            info->Position = position;
++            info->TotalPages = job->pages;
++            info->PagesPrinted = job->pages_done;
++            info->Submitted = submitted;
++        }
++        break;
++    }
++    case 2:
++    {
++        JOB_INFO_2W *info = (JOB_INFO_2W *)info_ptr;
++
++        if (fill) memset(info, 0, sizeof(*info));
++        str = job_string(title, &p, s, fill); if (fill) info->pDocument = str;
++        str = job_string(printer->info->name, &p, s, fill); if (fill) info->pPrinterName = str;
++        str = job_string(L"RAW", &p, s, fill); if (fill) info->pDatatype = str;
++        str = job_string(user, &p, s, fill); if (fill) info->pUserName = str;
++        str = job_string(user, &p, s, fill); if (fill) info->pNotifyName = str;
++        str = job_string(machine[0] ? machine : NULL, &p, s, fill); if (fill) info->pMachineName = str;
++        str = job_string(printer->info->print_proc, &p, s, fill); if (fill) info->pPrintProcessor = str;
++        if (fill)
++        {
++            info->JobId = job->id;
++            info->Status = cups_job_status(job);
++            info->Priority = min(max(job->priority, MIN_PRIORITY), MAX_PRIORITY);
++            info->Position = position;
++            info->TotalPages = job->pages;
++            info->PagesPrinted = job->pages_done;
++            info->Size = job->size;
++            info->Submitted = submitted;
++        }
++        break;
++    }
++    case 3:
++        if (fill)
++        {
++            JOB_INFO_3 *info = (JOB_INFO_3 *)info_ptr;
++            memset(info, 0, sizeof(*info));
++            info->JobId = job->id;
++            info->NextJobId = next_id;
++        }
++        break;
++    }
++}
++
++/* SetJob's command on a CUPS job: TRUE when CUPS did it */
++static BOOL control_cups_job(const printer_info_t *info, const struct cups_job *job, DWORD command)
++{
++    struct control_cups_job_params params;
++    NTSTATUS status;
++
++    params.queue = cups_queue(info);
++    params.id = job->id;
++    params.command = command;
++    switch (command)
++    {
++    case 0:
++    case JOB_CONTROL_SENT_TO_PRINTER: case JOB_CONTROL_LAST_PAGE_EJECTED:
++    case JOB_CONTROL_RETAIN: case JOB_CONTROL_RELEASE:
++        return TRUE;    /* CUPS keeps and releases its jobs itself */
++    }
++    status = UNIX_CALL(control_cups_job, &params);
++    /* Restart of a document that has not started printing: it prints from its start
++     * anyway (a held one once released) */
++    if (status == STATUS_INVALID_DEVICE_STATE && command == JOB_CONTROL_RESTART && job->state != 5)
++    {
++        params.command = JOB_CONTROL_RESUME;
++        status = job->state == 4 ? UNIX_CALL(control_cups_job, &params) : STATUS_SUCCESS;
++    }
++    if (status == STATUS_NOT_FOUND) status = STATUS_INVALID_PARAMETER;  /* it has just finished */
++    if (status) SetLastError(RtlNtStatusToDosError(status));
++    return !status;
++}
++
+ static BOOL WINAPI fpGetJob(HANDLE hprinter, DWORD job_id, DWORD level,
+         BYTE *data, DWORD size, DWORD *needed)
+ {
+@@ -4376,9 +4578,40 @@
+     job = get_job(printer->info, job_id);
+     if (!job)
+     {
++        const struct cups_job *cj = NULL;
++        struct cups_job *list = NULL;
++        unsigned int count;
++
+         LeaveCriticalSection(&printer->info->jobs_cs);
+-        SetLastError(ERROR_INVALID_PARAMETER);
+-        return FALSE;
++        if (cups_queue(printer->info) && (list = cups_jobs(printer->info, &count)))
++            cj = find_cups_job(list, count, job_id);
++        if (!cj)
++        {
++            free(list);
++            SetLastError(ERROR_INVALID_PARAMETER);
++            return FALSE;
++        }
++        if (level < 1 || level > 3)
++        {
++            free(list);
++            SetLastError(ERROR_INVALID_LEVEL);
++            return FALSE;
++        }
++        s = level == 1 ? sizeof(JOB_INFO_1W) : level == 2 ? sizeof(JOB_INFO_2W) : sizeof(JOB_INFO_3);
++        fill_cups_job_info(printer, cj, level, cj - list + 1, cj + 1 < list + count ? cj[1].id : 0,
++                           data, data, &s, FALSE, machine);
++        *needed = s;
++        if (size < s)
++        {
++            free(list);
++            SetLastError(ERROR_INSUFFICIENT_BUFFER);
++            return FALSE;
++        }
++        s = level == 1 ? sizeof(JOB_INFO_1W) : level == 2 ? sizeof(JOB_INFO_2W) : sizeof(JOB_INFO_3);
++        fill_cups_job_info(printer, cj, level, cj - list + 1, cj + 1 < list + count ? cj[1].id : 0,
++                           data, data, &s, TRUE, machine);
++        free(list);
++        return TRUE;
+     }
+ 
+     switch(level)
+@@ -4566,9 +4799,10 @@
+ {
+     printer_t *printer = (printer_t *)hprinter;
+     WCHAR user[257], machine[MAX_COMPUTERNAME_LENGTH + 3];
+-    DWORD struct_size, n = 0, i, s, len;
++    DWORD struct_size, n = 0, i, s, len, nlocal;
+     job_info_t *job, *next;
+-    struct list *cursor;
++    struct cups_job *cjobs;
++    unsigned int ncups, c;
+     int pass;
+ 
+     TRACE("%p %ld %ld %ld %p %ld %p %p\n", hprinter, first, count, level, data, size, needed, returned);
+@@ -4599,37 +4833,55 @@
+     len = ARRAY_SIZE(machine) - 2;
+     if (!GetComputerNameW(machine + 2, &len)) machine[0] = 0;
+ 
++    cjobs = cups_jobs(printer->info, &ncups);
++
+     EnterCriticalSection(&printer->info->jobs_cs);
++    /* ours first, then CUPS's (one with the id of one of ours is that one, being sent) */
++    nlocal = list_count(&printer->info->jobs);
++    for (c = 0; c < ncups; c++)
++        if (get_job(printer->info, cjobs[c].id)) cjobs[c].id = 0;
+     for (pass = 0, s = 0; pass < 2; pass++)
+     {
+         BOOL fill = pass;
++        DWORD total = 0;
+ 
+         if (pass && size < s) break;
+-        i = 0;
+-        n = 0;
+-        LIST_FOR_EACH(cursor, &printer->info->jobs)
+-        {
+-            if (i++ < first) continue;
+-            if (n >= count) break;
+-            n++;
+-        }
++        /* the structures first, every job's strings after them */
++        total = nlocal;
++        for (c = 0; c < ncups; c++) if (cjobs[c].id) total++;
++        n = total > first ? min(total - first, count) : 0;
+         s = n * struct_size;
+         i = 0;
+         n = 0;
+         LIST_FOR_EACH_ENTRY(job, &printer->info->jobs, job_info_t, entry)
+         {
+             struct list *after;
++            DWORD next_id = 0;
+ 
+             if (i++ < first) continue;
+             if (n >= count) break;
+             after = list_next(&printer->info->jobs, &job->entry);
+             next = after ? LIST_ENTRY(after, job_info_t, entry) : NULL;
+-            fill_job_info(printer, job, level, i, next ? next->id : 0, data + n * struct_size, data, &s, fill,
++            if (next) next_id = next->id;
++            else for (c = 0; c < ncups; c++) if (cjobs[c].id) { next_id = cjobs[c].id; break; }
++            fill_job_info(printer, job, level, i, next_id, data + n * struct_size, data, &s, fill,
+                           user, machine);
+             n++;
+         }
++        for (c = 0; c < ncups && n < count; c++)
++        {
++            DWORD next_id = 0, k;
++
++            if (!cjobs[c].id) continue;
++            if (i++ < first) continue;
++            for (k = c + 1; k < ncups; k++) if (cjobs[k].id) { next_id = cjobs[k].id; break; }
++            fill_cups_job_info(printer, &cjobs[c], level, i, next_id, data + n * struct_size, data, &s, fill,
++                               machine);
++            n++;
++        }
+     }
+     LeaveCriticalSection(&printer->info->jobs_cs);
++    free(cjobs);
+ 
+     *needed = s;
+     if (size < s)
+@@ -5169,6 +5421,41 @@
+     return SetFilePointerEx(job->hf, distance, pos, method);
+ }
+ 
++/* Stained Glass OS (9812): pausing, resuming and purging a CUPS printer is
++ * its CUPS queue's (an administrator's, as CUPS decides); other printers and
++ * commands stay winspool's own (ERROR_NOT_SUPPORTED) */
++static BOOL WINAPI fpSetPrinter(HANDLE hprinter, DWORD level, BYTE *data, DWORD command)
++{
++    printer_t *printer = (printer_t *)hprinter;
++    struct control_cups_job_params params;
++    NTSTATUS status;
++
++    TRACE("%p %ld %p %ld\n", hprinter, level, data, command);
++
++    if (!printer || printer->header.type != HANDLE_PRINTER)
++    {
++        SetLastError(ERROR_INVALID_HANDLE);
++        return FALSE;
++    }
++    if (!cups_queue(printer->info) ||
++        (command != PRINTER_CONTROL_PAUSE && command != PRINTER_CONTROL_RESUME && command != PRINTER_CONTROL_PURGE))
++    {
++        SetLastError(ERROR_NOT_SUPPORTED);
++        return FALSE;
++    }
++    params.queue = cups_queue(printer->info);
++    params.id = 0;
++    params.command = 0x100 | command;
++    status = UNIX_CALL(control_cups_job, &params);
++    if (status == STATUS_NOT_SUPPORTED)
++    {
++        SetLastError(ERROR_NOT_SUPPORTED);
++        return FALSE;
++    }
++    if (status) SetLastError(RtlNtStatusToDosError(status));
++    return !status;
++}
++
+ static const PRINTPROVIDOR backend = {
+         fpOpenPrinter,
+         fpSetJob,
+@@ -5180,7 +5467,7 @@
+ #endif
+         NULL,   /* fpAddPrinter */
+         NULL,   /* fpDeletePrinter */
+-        NULL,   /* fpSetPrinter */
++        fpSetPrinter,
+         NULL,   /* fpGetPrinter */
+         NULL,   /* fpEnumPrinters */
+         NULL,   /* fpAddPrinterDriver */
+--- a/dlls/winspool.drv/cups.c
++++ b/dlls/winspool.drv/cups.c
+@@ -137,6 +137,8 @@
+ #undef DO_FUNC
+ static const char *  (*pcupsGetPPD)(const char *);
+ static http_status_t (*pcupsGetPPD3)(http_t *, const char *, time_t *, char *, size_t);
++static int (*pcupsGetJobs2)(http_t *, cups_job_t **, const char *, int, int);
++static void (*pcupsFreeJobs)(int, cups_job_t *);
+ 
+ #endif /* SONAME_LIBCUPS */
+ 
+@@ -159,6 +161,8 @@
+ #undef DO_FUNC
+ #define DO_FUNC(x) p##x = dlsym( libcups_handle, #x )
+     CUPS_OPT_FUNCS;
++    DO_FUNC(cupsGetJobs2);
++    DO_FUNC(cupsFreeJobs);
+ #undef DO_FUNC
+     return STATUS_SUCCESS;
+ #else /* SONAME_LIBCUPS */
+@@ -577,7 +581,7 @@
+     const struct get_printer_status_params *params = args;
+ #ifdef SONAME_LIBCUPS
+     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+-    static struct { char name[256]; DWORD status; } *cache;
++    static struct { char name[256]; DWORD status; DWORD jobs; } *cache;
+     static int cache_count;
+     static time_t cache_time;
+     char name[512];
+@@ -608,12 +612,30 @@
+             cache_count++;
+         }
+         pcupsFreeDests( num, dests );
++#ifndef SG_MUTANT_CUPS_CJOBS
++        /* every queue's documents still to print, counted (cJobs) */
++        if (cache && pcupsGetJobs2 && pcupsFreeJobs)
++        {
++            cups_job_t *jobs;
++            int j, k, count = pcupsGetJobs2( CUPS_HTTP_DEFAULT, &jobs, NULL, 0, CUPS_WHICHJOBS_ACTIVE );
++
++            for (j = 0; j < count; j++)
++                for (k = 0; k < cache_count; k++)
++                    if (jobs[j].dest && !strcmp( jobs[j].dest, cache[k].name ))
++                    {
++                        cache[k].jobs++;
++                        break;
++                    }
++            if (count > 0) pcupsFreeJobs( count, jobs );
++        }
++#endif
+         cache_time = now;
+     }
+     for (i = 0; i < cache_count; i++)
+         if (!strcmp( cache[i].name, name ))
+         {
+             *params->status = cache[i].status;
++            if (params->jobs) *params->jobs = cache[i].jobs;
+             ret = STATUS_SUCCESS;
+             break;
+         }
+@@ -751,8 +773,10 @@
+     {
+         PTR32 printer;
+         PTR32 status;
++        PTR32 jobs;
+     } const *params32 = args;
+-    struct get_printer_status_params params = { ULongToPtr( params32->printer ), ULongToPtr( params32->status ) };
++    struct get_printer_status_params params = { ULongToPtr( params32->printer ), ULongToPtr( params32->status ),
++                                                ULongToPtr( params32->jobs ) };
+ 
+     return get_printer_status( &params );
+ }
+--- a/dlls/winspool.drv/info.c
++++ b/dlls/winspool.drv/info.c
+@@ -3782,6 +3782,30 @@
+     if (WINSPOOL_GetOpenedPrinterRegKey( printer, &key ))
+         return FALSE;
+ 
++#ifndef SG_MUTANT_CUPS_PAUSE
++    /* Stained Glass OS (9812): a CUPS printer is paused, resumed and purged
++     * in CUPS, where its documents wait (the provider says ERROR_NOT_SUPPORTED
++     * for any other printer) */
++    if (command && backend && backend->fpSetPrinter)
++    {
++        HANDLE handle = get_backend_handle( printer );
++
++        if (handle)
++        {
++            if (backend->fpSetPrinter( handle, level, data, command ))
++            {
++                RegCloseKey( key );
++                return TRUE;
++            }
++            if (GetLastError() != ERROR_NOT_SUPPORTED)
++            {
++                RegCloseKey( key );
++                return FALSE;
++            }
++        }
++    }
++#endif
++
+     if (command)
+     {
+         DWORD status = get_dword_from_reg( key, L"Status" );
+@@ -4573,7 +4597,7 @@
+     return value < ARRAY_SIZE(map) ? map[value] : 0;
+ }
+ 
+-static DWORD printer_status( HKEY printer_key )
++static DWORD printer_status_jobs( HKEY printer_key, DWORD *jobs )
+ {
+     DWORD status = get_dword_from_reg( printer_key, L"Status" ), live = 0;
+     struct get_printer_status_params params;
+@@ -4589,12 +4613,18 @@
+     {
+         params.printer = port + 5;
+         params.status = &live;
++        params.jobs = jobs;
+         if (UNIX_CALL( get_printer_status, &params )) live = 0;
+     }
+ #endif
+     return status | live;
+ }
+ 
++static DWORD printer_status( HKEY printer_key )
++{
++    return printer_status_jobs( printer_key, NULL );
++}
++
+ static BOOL WINSPOOL_GetPrinter_2(HKEY hkeyPrinter, PRINTER_INFO_2W *pi2,
+ 				  LPBYTE buf, DWORD cbBuf, LPDWORD pcbNeeded)
+ {
+@@ -4728,7 +4758,8 @@
+     if (pi2)
+     {
+         pi2->Attributes = get_dword_from_reg( hkeyPrinter, L"Attributes" );
+-        pi2->Status = printer_status( hkeyPrinter );
++        pi2->cJobs = 0;
++        pi2->Status = printer_status_jobs( hkeyPrinter, &pi2->cJobs );
+         pi2->Priority = get_dword_from_reg( hkeyPrinter, L"Priority" );
+         pi2->DefaultPriority = get_dword_from_reg( hkeyPrinter, L"Default Priority" );
+         pi2->StartTime = get_dword_from_reg( hkeyPrinter, L"StartTime" );
+--- a/dlls/winspool.drv/wspool.h
++++ b/dlls/winspool.drv/wspool.h
+@@ -84,6 +84,7 @@
+ {
+     const WCHAR *printer;
+     DWORD *status;
++    DWORD *jobs;        /* Stained Glass OS (9812): the documents waiting in the queue, or NULL */
+ };
+ 
+ #define UNIX_CALL( func, params ) WINE_UNIX_CALL( unix_ ## func, params )
