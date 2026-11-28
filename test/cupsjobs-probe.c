@@ -15,7 +15,7 @@
 
 static int failures;
 #define CHECK(c, ...) do { int ok_ = !!(c); printf(ok_ ? "PASS  " : "FAIL  "); printf(__VA_ARGS__); printf("\n"); \
-                           if (!ok_) failures++; fflush(stdout); } while (0)
+                           failures += !ok_; fflush(stdout); } while (0)
 
 /* a title with accented and CJK characters: CUPS got it cut short before 9812 */
 static const WCHAR title[] = L"R\x00e9sum\x00e9 \x5c65\x6b74\x66f8 report.txt";
