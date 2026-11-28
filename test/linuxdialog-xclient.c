@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Xatom.h>
 int main( void )
 {
     Display *d = XOpenDisplay( NULL );
@@ -21,6 +22,21 @@ int main( void )
     XStoreName( d, dialog, "Gate Dialog" );
     XSetClassHint( d, dialog, &hint );
     XSetTransientForHint( d, dialog, main );
+    {
+        /* as Qt's message box: a dialog, its size fixed, no minimize or maximize (_MOTIF_WM_HINTS
+         * functions resize | move | close, decorations border | title | menu) */
+        XSizeHints size = { 0 };
+        long motif[5] = { 3, 0x26, 0x1a, 0, 0 };
+        Atom type = XInternAtom( d, "_NET_WM_WINDOW_TYPE_DIALOG", False );
+        size.flags = PMinSize | PMaxSize;
+        size.min_width = size.max_width = 260;
+        size.min_height = size.max_height = 160;
+        XSetWMNormalHints( d, dialog, &size );
+        XChangeProperty( d, dialog, XInternAtom( d, "_MOTIF_WM_HINTS", False ), XInternAtom( d, "_MOTIF_WM_HINTS", False ),
+                         32, PropModeReplace, (unsigned char *)motif, 5 );
+        XChangeProperty( d, dialog, XInternAtom( d, "_NET_WM_WINDOW_TYPE", False ), XA_ATOM, 32, PropModeReplace,
+                         (unsigned char *)&type, 1 );
+    }
     XMapWindow( d, dialog );
     XSync( d, False );
     for (;;) XNextEvent( d, &ev );

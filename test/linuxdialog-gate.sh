@@ -10,7 +10,10 @@
 #   - its window minimized, the dialog goes with it, and comes back with it.
 #
 #   WINE=/opt/wine-sg/bin/wine test/linuxdialog-gate.sh
-#   mutant: SG_MUTANT_EMBED_DIALOG_UNOWNED (programs/explorer/systray.c)
+#   - (9518) the dialog asking for no minimize or maximize and a fixed size (as Qt's message boxes)
+#     has its close button only; the window all of them.
+#   mutants: SG_MUTANT_EMBED_DIALOG_UNOWNED, SG_MUTANT_EMBED_ALL_BUTTONS (programs/explorer/systray.c),
+#   SG_MUTANT_FOCUS_OVER_OWNED (dlls/winex11.drv/event.c)
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -59,6 +62,13 @@ cd "$WINEPREFIX/drive_c"
 P() { "$WINE" probe.exe "$@" 2>/dev/null | tr -d '\r'; }
 framed() { case "$(xwininfo -id "$1" -tree 2>/dev/null | sed -n 's/.*Parent window id: [^ ]* //p')" in ""|"(the root window)"*) return 1 ;; esac; return 0; }
 framed "$MAIN" && framed "$DLG" && pass "the window and its dialog are framed" || fail "framed: main $(framed "$MAIN" && echo yes || echo no), dialog $(framed "$DLG" && echo yes || echo no)"
+# its caption buttons as it asks (patches/sg/9518): the dialog, a fixed size and no minimize or
+# maximize (_MOTIF_WM_HINTS, a dialog's type, as Qt's message boxes): close only, no sizing edges;
+# the window, all of them
+ds=$(P style SgLinuxWindow 'Gate Dialog' | sed -n 's/^style=\([^ ]*\).*/\1/p'); ms=$(P style SgLinuxWindow 'Gate Main' | sed -n 's/^style=\([^ ]*\).*/\1/p')
+[ -n "$ds" ] && [ $(( ds & 0x20000 )) = 0 ] && [ $(( ds & 0x10000 )) = 0 ] && [ $(( ds & 0x40000 )) = 0 ] && [ $(( ds & 0x80000 )) != 0 ] \
+    && pass "the dialog's frame has its close button only, no minimize, maximize or sizing edges ($ds)" || fail "dialog style: $ds"
+[ -n "$ms" ] && [ $(( ms & 0x70000 )) = $(( 0x70000 )) ] && pass "the window's frame has them all ($ms)" || fail "window style: $ms"
 b1=$("$WINE" fglock-probe.exe button 'Gate Main' 2>/dev/null | tr -d '\r')
 b2=$("$WINE" fglock-probe.exe button 'Gate Dialog' 2>/dev/null | tr -d '\r')
 [ -n "$b1" ] && [ "$b1" != none ] && [ "$b2" = none ] && pass "one taskbar button, the window's (the dialog has none of its own)" || fail "buttons: main '$b1' dialog '$b2'"
