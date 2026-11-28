@@ -1,11 +1,11 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
 # wlanapi: WlanGetProfileList, WlanConnect, WlanDisconnect, WlanDeleteProfile, WlanReasonCodeToString
-# (patches/sg/8017; test/nocode3-probe.c). Spec stubs before. Against a fake sg-netctl (SG_NETCTL): one
+# (patches/sg/8017), WlanSetInterface and the radio state (8022; test/nocode3-probe.c). Spec stubs before. Against a fake sg-netctl (SG_NETCTL): one
 # adapter, saved networks MyNet and Cafe; the commands it is given are logged and checked here -- the key of
 # a temporary profile reaches it on standard input, never on its command line.
 #   WINE=/opt/wine-sg/bin/wine test/nocode3-gate.sh
-# Mutants: SG_MUTANT_NO_WLAN_CONNECT, SG_MUTANT_NO_WLAN_PROFILES (wlanapi/main.c).
+# Mutants: SG_MUTANT_NO_WLAN_CONNECT, SG_MUTANT_NO_WLAN_PROFILES, SG_MUTANT_NO_WLAN_RADIO (wlanapi/main.c).
 set -u
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 WINE="${WINE:-/opt/wine-sg/bin/wine}"
@@ -35,6 +35,9 @@ case "\$1 \$2" in
                        *) printf 'CONNECTED wlan0\nOK\n' ;; esac ;;
     "wifi disconnect") printf 'DISCONNECTED wlan0\nOK\n' ;;
     "wifi forget") printf 'FORGOTTEN 1\nOK\n' ;;
+    "wifi radio")
+        case "\$3" in on|off) echo "\$3" > "$T/radio" ;; esac
+        [ "\$(cat "$T/radio" 2>/dev/null)" = off ] && printf 'RADIO disabled\nOK\n' || printf 'RADIO enabled\nOK\n' ;;
     *) printf 'ERROR unsupported no\n' ;;
 esac
 EOS
@@ -61,5 +64,6 @@ grep -q '^ARGS wifi connect --ssid-hex 4f70656e --device wlan0 --security open -
     pass "an open network by its SSID" || fail "an open network: $(grep -m1 4f70656e "$L")"
 grep -q '^ARGS wifi disconnect wlan0$' "$L" && pass "WlanDisconnect: wifi disconnect wlan0" || fail "no wifi disconnect"
 grep -q '^ARGS wifi forget --ssid-hex 43616665$' "$L" && pass "WlanDeleteProfile: wifi forget Cafe" || fail "no wifi forget"
+grep -q '^ARGS wifi radio off$' "$L" && grep -q '^ARGS wifi radio on$' "$L" && pass "WlanSetInterface: wifi radio off, on" || fail "no wifi radio off/on"
 [ $RC = 0 ] && echo "nocode3-gate: all passed"
 exit $RC

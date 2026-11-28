@@ -129,6 +129,32 @@ int main(void)
     CHECK(ret == 0 && text[0], "WlanReasonCodeToString: %ls", text);
     CHECK(WlanReasonCodeToString(0, 0, text, NULL) == ERROR_INVALID_PARAMETER, "no buffer size");
 
+    /* 8022: the radio's software switch */
+    {
+        WLAN_RADIO_STATE *radio = NULL;
+        WLAN_PHY_RADIO_STATE set = { 0, dot11_radio_state_off, dot11_radio_state_on };
+        WLAN_OPCODE_VALUE_TYPE vt;
+        DWORD size = 0;
+        BOOL off = FALSE;
+
+        ret = WlanQueryInterface(h, &g, wlan_intf_opcode_radio_state, NULL, &size, (void **)&radio, &vt);
+        CHECK(ret == 0 && size == sizeof(*radio) && radio->dwNumberOfPhys == 1 &&
+              radio->PhyRadioState[0].dot11SoftwareRadioState == dot11_radio_state_on, "the radio is on (%lu)", ret);
+        if (!ret) WlanFreeMemory(radio);
+        ret = WlanSetInterface(h, &g, wlan_intf_opcode_radio_state, sizeof(set), &set, NULL);
+        CHECK(ret == 0, "WlanSetInterface radio off: %lu", ret);
+        ret = WlanQueryInterface(h, &g, wlan_intf_opcode_radio_state, NULL, &size, (void **)&radio, &vt);
+        CHECK(ret == 0 && radio->PhyRadioState[0].dot11SoftwareRadioState == dot11_radio_state_off, "now off (%lu)", ret);
+        if (!ret) WlanFreeMemory(radio);
+        set.dwPhyIndex = 1;
+        CHECK(WlanSetInterface(h, &g, wlan_intf_opcode_radio_state, sizeof(set), &set, NULL) == ERROR_INVALID_PARAMETER, "PHY 1");
+        set.dwPhyIndex = 0; set.dot11SoftwareRadioState = dot11_radio_state_on;
+        CHECK(WlanSetInterface(h, &g, wlan_intf_opcode_radio_state, sizeof(set), &set, NULL) == 0, "on again");
+        CHECK(WlanSetInterface(h, &g, wlan_intf_opcode_autoconf_enabled, sizeof(off), &off, NULL) == ERROR_NOT_SUPPORTED,
+              "automatic configuration cannot be turned off");
+        CHECK(WlanSetInterface(h, &bad, wlan_intf_opcode_radio_state, sizeof(set), &set, NULL) == ERROR_NOT_FOUND, "another interface");
+    }
+
     WlanCloseHandle(h, NULL);
     printf("RESULT: %s\n", failures ? "FAIL" : "PASS");
     return failures != 0;
