@@ -3,10 +3,12 @@
  * ready for typing), which write what they were told to OUT, one line each, for 60 s.
  *
  *   taskkeys-probe.exe OUT
+ *   taskkeys-probe.exe menus      how many popup menus are open (menus=N)
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 static const char *out;
 static UINT toggle;
@@ -25,6 +27,13 @@ static LRESULT CALLBACK proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
     return DefWindowProcA( hwnd, msg, wp, lp );
 }
 
+static BOOL CALLBACK count_menu( HWND hwnd, LPARAM lp )
+{
+    char cls[16];
+    if (IsWindowVisible( hwnd ) && GetClassNameA( hwnd, cls, sizeof(cls) ) && !strcmp( cls, "#32768" )) (*(int *)lp)++;
+    return TRUE;
+}
+
 int main( int argc, char **argv )
 {
     WNDCLASSA wc = { 0 };
@@ -32,6 +41,13 @@ int main( int argc, char **argv )
     MSG msg;
 
     if (argc < 2) return 2;
+    if (!strcmp( argv[1], "menus" ))
+    {
+        int n = 0;
+        EnumWindows( count_menu, (LPARAM)&n );
+        printf( "menus=%d\n", n );
+        return 0;
+    }
     out = argv[1];
     toggle = RegisterWindowMessageA( "SgCalendarToggle" );
     wc.lpfnWndProc = proc;
