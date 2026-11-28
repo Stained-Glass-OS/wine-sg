@@ -290,12 +290,54 @@ static int window_test(const WCHAR *queue)
     return 0;
 }
 
+/* 9212: what GetPrinter says follows this process's own changes at once (the
+ * CUPS state is kept for 2 s; a pause, a new document, a purge showed late) */
+static DWORD status_soon(HANDLE h, DWORD *cjobs, DWORD mask, DWORD want, DWORD jobs)
+{
+    DWORD status = 0, count = 0;
+    int i;
+
+    for (i = 0; i < 8; i++)
+    {
+        status = printer_status(h, &count);
+        if ((status & mask) == want && (jobs == ~0u || count == jobs)) break;
+        Sleep(100);
+    }
+    if (cjobs) *cjobs = count;
+    return status;
+}
+
+static int status_test(const WCHAR *queue)
+{
+    PRINTER_DEFAULTSW defaults = { NULL, NULL, PRINTER_ALL_ACCESS };
+    HANDLE h;
+    DWORD count, status;
+
+    if (!OpenPrinterW((WCHAR *)queue, &h, &defaults)) { CHECK(0, "OpenPrinter %ls: %lu", queue, GetLastError()); return 1; }
+    status = printer_status(h, &count);     /* what CUPS says now is kept */
+    CHECK(SetPrinterW(h, 0, NULL, PRINTER_CONTROL_RESUME), "Resume printing (%lu)", GetLastError());
+    status = status_soon(h, NULL, PRINTER_STATUS_PAUSED, 0, ~0u);
+    CHECK(!(status & PRINTER_STATUS_PAUSED), "resumed, the printer is not paused at once (%#lx)", status);
+    CHECK(SetPrinterW(h, 0, NULL, PRINTER_CONTROL_PAUSE), "Pause printing (%lu)", GetLastError());
+    status = status_soon(h, NULL, PRINTER_STATUS_PAUSED, PRINTER_STATUS_PAUSED, ~0u);
+    CHECK(status & PRINTER_STATUS_PAUSED, "paused, the printer is paused at once (%#lx)", status);
+    print_doc(h, L"status document");
+    status_soon(h, &count, 0, 0, 1);
+    CHECK(count == 1, "a document just printed is counted at once (cJobs %lu)", count);
+    CHECK(SetPrinterW(h, 0, NULL, PRINTER_CONTROL_PURGE), "Cancel all documents (%lu)", GetLastError());
+    status_soon(h, &count, 0, 0, 0);
+    CHECK(count == 0, "purged, no document is counted at once (cJobs %lu)", count);
+    ClosePrinter(h);
+    return 0;
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     if (argc < 3) return 2;
     if (!wcscmp(argv[1], L"jobs")) jobs_test(argv[2]);
     else if (!wcscmp(argv[1], L"printer")) printer_test(argv[2]);
     else if (!wcscmp(argv[1], L"window")) window_test(argv[2]);
+    else if (!wcscmp(argv[1], L"status")) status_test(argv[2]);
     else return 2;
     printf(failures ? "RESULT: FAIL\n" : "RESULT: PASS\n");
     return failures ? 1 : 0;

@@ -10,7 +10,10 @@
 # document there and lists, pauses, resumes, restarts and cancels it
 # (EnumJobs, GetJob, SetJob), counts it (cJobs); resumes, pauses and purges
 # the printer (SetPrinter); and opens the queue window (printui /o), which
-# lists the document and pauses it from its Document menu.
+# lists the document and pauses it from its Document menu. And (9212) after
+# the process pauses, resumes or purges a printer, or prints a document, the
+# next GetPrinter asks CUPS again: status and cJobs follow at once.
+# Mutant (winspool): SG_MUTANT_STATUS_STALE.
 #
 #   WINE=/opt/wine-sg/bin/wine test/cupsjobs-gate.sh
 set -u
@@ -81,7 +84,7 @@ queue() {
     lpstat -p "$1" 2>/dev/null | grep -q disabled || { echo "SKIP: the gate's CUPS server did not take queue $1"; exit 77; }
 }
 # the queues, made before Wine first lists the printers; stopped so documents wait
-for q in SG_Jobs_64 SG_Printer_64 SG_Jobs_32 SG_Printer_32 SG_Window; do queue "$q"; done
+for q in SG_Jobs_64 SG_Printer_64 SG_Jobs_32 SG_Printer_32 SG_Window SG_Status_64 SG_Status_32; do queue "$q"; done
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
 cp "$T/probe64.exe" "$T/probe32.exe" "$WINEPREFIX/drive_c/"
 run() {
@@ -94,6 +97,8 @@ for b in 64 32; do
     else fail "$b-bit: the CUPS queue's documents are not the printer's jobs"; fi
     if run "C:\\probe$b.exe" printer "SG_Printer_$b"; then pass "$b-bit: the printer pauses, resumes and purges in CUPS"
     else fail "$b-bit: pausing, resuming or purging the printer does not reach CUPS"; fi
+    if run "C:\\probe$b.exe" status "SG_Status_$b"; then pass "$b-bit: GetPrinter shows the process's own pause, document and purge at once (9212)"
+    else fail "$b-bit: GetPrinter shows the process's own changes late (CUPS state kept 2 s)"; fi
 done
 # the window needs a display: the server (and its desktop) started without one goes first
 "$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null
