@@ -195,10 +195,31 @@ int wmain( int argc, WCHAR **argv )
         }
         printf( "write_went_user=%d\n", !RegGetValueW( HKEY_CURRENT_USER, L"Software\\Classes\\.sgtest", L"SgWritten",
                                                        RRF_RT_REG_SZ, NULL, NULL, NULL ) );
-        /* a key a user cannot create in the machine's classes is theirs */
-        if (!RegCreateKeyExW( HKEY_CLASSES_ROOT, L"SgNew.ByUser", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL ))
-            RegCloseKey( key );
-        printf( "create_somewhere=%d\n", !RegOpenKeyExW( HKEY_CLASSES_ROOT, L"SgNew.ByUser", 0, KEY_READ, &key ) );
+        /* a new key the machine's classes refuse this (64-bit, manifest-less but not virtualized) program
+         * is refused, as on Windows (9263; it went to the user's before, and gvim then asked to register) */
+        {
+            LSTATUS r = RegCreateKeyExW( HKEY_CLASSES_ROOT, L"SgNew.ByUser", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL );
+            if (!r) RegCloseKey( key );
+            printf( "create_refused=%d\n", r == ERROR_ACCESS_DENIED &&
+                    RegOpenKeyExW( HKEY_CLASSES_ROOT, L"SgNew.ByUser", 0, KEY_READ, &key ) );
+        }
+        /* RegOverridePredefKey: HKCR is the user's classes alone while overridden (per-user registration) */
+        {
+            HKEY user, k2;
+            LSTATUS r = ERROR_GEN_FAILURE;
+            if (!RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\Classes", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &user, NULL ))
+            {
+                RegOverridePredefKey( HKEY_CLASSES_ROOT, user );
+                r = RegCreateKeyExW( HKEY_CLASSES_ROOT, L"SgOverride.ByUser\\CLSID", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &k2, NULL );
+                if (!r) RegCloseKey( k2 );
+                RegOverridePredefKey( HKEY_CLASSES_ROOT, NULL );
+                RegCloseKey( user );
+            }
+            printf( "override_create=%d\n", !r && !RegOpenKeyExW( HKEY_CURRENT_USER,
+                    L"Software\\Classes\\SgOverride.ByUser\\CLSID", 0, KEY_READ, &k2 ) );
+            printf( "override_undone=%d\n", !RegOpenKeyExW( HKEY_CLASSES_ROOT, L".sgtest", 0, KEY_READ, &k2 ) &&
+                    !RegGetValueW( HKEY_CLASSES_ROOT, L".sgtest", NULL, RRF_RT_REG_SZ, NULL, NULL, NULL ) );
+        }
         check_view();
         return 0;
     }

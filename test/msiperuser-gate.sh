@@ -11,7 +11,8 @@
 #   boot; still installed, uninstalls (entry gone), installs a second; $SG_USER2 cannot write
 #   $SG_USER1's UserData.
 #   WINE=... WINESERVER=... test/msiperuser-gate.sh
-# Mutants: server SG_MUTANT_USERDATA_READONLY, msi SG_MUTANT_MSI_NO_USER_ARP.
+# The per-user package's file type goes to the user's classes (9264).
+# Mutants: server SG_MUTANT_USERDATA_READONLY, msi SG_MUTANT_MSI_NO_USER_ARP, SG_MUTANT_MSI_USER_CLASSES_MACHINE.
 # Needs passwordless sudo, wixl and the accounts of usersessions-gate.sh; exit 77 otherwise.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -51,6 +52,20 @@ C1="{$G1}" C2="{$G2}"
      -o pu1.msi "$HERE/msiperuser.wxs" 2>/dev/null &&
  wixl -D Code="$G2" -D N=2 -D Upgrade=7A1E5C3B-1F2D-4E6A-9B8C-0D1E2F3A4B62 -D Comp=7A1E5C3B-1F2D-4E6A-9B8C-0D1E2F3A4B63 \
      -o pu2.msi "$HERE/msiperuser.wxs" 2>/dev/null) || { echo "FAIL  the test packages did not build"; exit 1; }
+# pu1 also registers a file type (an extension, its ProgId and verb; 9264): wixl writes no such tables,
+# msibuild (msitools) adds them and the standard Register/Unregister actions
+CLASSES=0
+if command -v msibuild >/dev/null; then
+    (cd "$W" &&
+     printf 'Extension\tComponent_\tProgId_\tMIME_\tFeature_\ns255\ts72\tS255\tS64\ts38\nExtension\tExtension\tComponent_\nsgpu1\tMain\tSgPerUser.File1\t\tAll\n' > Extension.idt &&
+     printf 'ProgId\tProgId_Parent\tClass_\tDescription\tIcon_\tIconIndex\ns255\tS255\tS38\tL255\tS72\tI2\nProgId\tProgId\nSgPerUser.File1\t\t\tSG per user file\t\t\n' > ProgId.idt &&
+     printf 'Extension_\tVerb\tSequence\tCommand\tArgument\ns255\ts32\tI2\tL255\tL255\nVerb\tExtension_\tVerb\nsgpu1\topen\t\tOpen\t"%%1"\n' > Verb.idt &&
+     msiinfo export pu1.msi InstallExecuteSequence > seq.idt &&
+     printf 'UnregisterExtensionInfo\t\t2650\nUnregisterProgIdInfo\t\t2700\nRegisterExtensionInfo\t\t4700\nRegisterProgIdInfo\t\t4800\n' >> seq.idt &&
+     mv seq.idt InstallExecuteSequence.idt &&
+     msibuild pu1.msi -i Extension.idt ProgId.idt Verb.idt InstallExecuteSequence.idt) && CLASSES=1
+fi
+[ $CLASSES = 1 ] || echo "info  no msibuild: the file type checks are skipped"
 x86_64-w64-mingw32-gcc -O1 -municode -o "$W/probe.exe" "$HERE/msiperuser-probe.c" -lmsi -ladvapi32 || { echo "FAIL build"; exit 1; }
 
 for u in "$SG_SYSTEM" "$SG_USER1" "$SG_USER2"; do sudo -n install -d -o "$u" -m 700 "$W/home-$u" "$W/run-$u"; done
@@ -91,6 +106,15 @@ out=$(run "$SG_USER1" 'C:\probe.exe' "$C1")
 sudo -n test -f "$PFX/drive_c/users/$SG_USER1/AppData/Local/SGPerUser1/hello.txt" \
     && pass "...its file is in the user's AppData\\Local" || fail "no file in $SG_USER1's AppData\\Local"
 
+if [ $CLASSES = 1 ]; then
+    hku=$(as "$SG_USER1" timeout -s KILL 120 "$WINE" reg query 'HKCU\Software\Classes\.sgpu1' /ve 2>/dev/null | tr -d '\r')
+    hkuv=$(as "$SG_USER1" timeout -s KILL 120 "$WINE" reg query 'HKCU\Software\Classes\SgPerUser.File1\shell\open\command' /ve 2>/dev/null | tr -d '\r')
+    as "$SG_USER1" timeout -s KILL 120 "$WINE" reg query 'HKLM\Software\Classes\.sgpu1' >/dev/null 2>&1; hklm=$?
+    { printf '%s' "$hku" | grep -q 'SgPerUser.File1' && printf '%s' "$hkuv" | grep -q '"%1"' && [ $hklm != 0 ]; } \
+        && pass "...its file type is registered in the user's classes (HKCU\\Software\\Classes), not the machine's (9264)" \
+        || fail "file type: HKCU '$(printf '%s' "$hku" | tr '\n' ' ')' verb '$(printf '%s' "$hkuv" | tr '\n' ' ')' HKLM rc $hklm"
+fi
+
 # --- after a restart: its registration reloaded without descriptors
 restart
 out=$(run "$SG_USER1" 'C:\probe.exe' "$C1")
@@ -100,6 +124,10 @@ out=$(run "$SG_USER1" 'C:\probe.exe' "$C1")
 { [ "$rc" = 0 ] && [ "$(v "$out" STATE)" = -1 ] && [ "$(v "$out" ARP_HKCU)" = 2 ]; } \
     && pass "...the user uninstalls it (msiexec $rc): unknown, its entry gone" \
     || fail "uninstall after restart: msiexec $rc, $(printf '%s' "$out" | tr '\n' ' ')"
+if [ $CLASSES = 1 ]; then
+    as "$SG_USER1" timeout -s KILL 120 "$WINE" reg query 'HKCU\Software\Classes\.sgpu1' >/dev/null 2>&1 \
+        && fail "...its file type stayed in the user's classes" || pass "...and its file type is gone from the user's classes"
+fi
 rc=$(msi "$SG_USER1" /i 'C:\pu2.msi')
 out=$(run "$SG_USER1" 'C:\probe.exe' "$C2")
 { [ "$rc" = 0 ] && [ "$(v "$out" STATE)" = 5 ]; } && pass "...and installs another per-user package (msiexec $rc)" \

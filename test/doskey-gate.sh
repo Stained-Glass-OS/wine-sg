@@ -21,6 +21,7 @@ for need in Xvfb xdpyinfo "$MINGW"; do command -v "$need" >/dev/null || { echo "
 T=$(mktemp -d /var/tmp/sg-doskey.XXXXXX)
 cleanup() {
     "$WINESERVER" -k 2>/dev/null
+    sg_kill_prefix "$WINEPREFIX"
     [ -n "$XP" ] && kill "$XP" 2>/dev/null
     rm -rf "$T"
 }

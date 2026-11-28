@@ -19,7 +19,7 @@ fail() { printf 'FAIL  %s\n' "$*"; RC=1; }
 command -v "$MINGW" >/dev/null || { echo "SKIP: $MINGW missing"; exit 77; }
 [ -x "$WINE" ] || { echo "SKIP: no wine at $WINE"; exit 77; }
 T=$(mktemp -d /var/tmp/sg-decoder-order.XXXXXX)
-trap 'WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null; rm -rf "$T"' EXIT INT TERM
+trap 'WINEPREFIX="$T/prefix" "$WINESERVER" -k 2>/dev/null; sg_kill_prefix "$T/prefix"; rm -rf "$T"' EXIT INT TERM
 TMPDIR=/var/tmp "$MINGW" -O1 -o "$T/probe.exe" "$HERE/decoder-order-probe.c" -lole32 -luuid -lstrmiids || { fail "probe did not build"; exit 1; }
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINESERVER WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d"
 unset DISPLAY WAYLAND_DISPLAY

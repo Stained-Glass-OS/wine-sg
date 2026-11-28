@@ -7,7 +7,8 @@
 # administrator) registers the machine's classes; the second Unix user SG_OTHER
 # (default sgconf, in SG_GROUP) registers their own and their choices and checks
 # the merged view, AssocQueryString, QueryCurrentDefault and ShellExecute; then
-# the owner checks none of it leaked to them. Without that user: one prefix,
+# the owner checks none of it leaked to them. A new key a standard user's program creates through
+# HKCR is refused (9263, as on Windows), unless HKCR is overridden to the user's classes. Without that user: one prefix,
 # one user (no separation checks).
 #   WINE=... WINESERVER=... test/hkcr-gate.sh
 set -u
@@ -29,7 +30,7 @@ export WINEPREFIX=$PFX WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
 unset DISPLAY
 MULTI=0
 id "$SG_OTHER" >/dev/null 2>&1 && sudo -n -u "$SG_OTHER" true 2>/dev/null && MULTI=1
-cleanup() { set +e; "$WINESERVER" -k 2>/dev/null; sleep 1; chmod -R u+w "$W" 2>/dev/null; if [ $MULTI = 1 ]; then sudo -n rm -rf "$W"; else rm -rf "$W"; fi; }
+cleanup() { set +e; "$WINESERVER" -k 2>/dev/null; sg_kill_prefix "$PFX"; sleep 1; chmod -R u+w "$W" 2>/dev/null; if [ $MULTI = 1 ]; then sudo -n rm -rf "$W"; else rm -rf "$W"; fi; }
 trap cleanup EXIT INT TERM
 TMPDIR=/var/tmp "$MINGW" -municode -O2 -o "$W/hkcr-probe.exe" "$HERE/hkcr-probe.c" -lshlwapi -lshell32 -lole32 -luuid -ladvapi32 \
     || { fail "probe did not build"; exit 1; }
@@ -66,7 +67,11 @@ expect 'user_progid="*[^"]*hkcr-probe.exe" mark user "%1"' "a ProgId registered 
 expect "root_has_user_key=1" "HKCR's own enumeration has the user's keys"
 expect "root_has_machine_key=1" "and the machine's"
 expect "write_went_user=1" "a value written through HKCR to a key the user has goes to the user's"
-expect "create_somewhere=1" "a key a standard user creates through HKCR exists afterwards"
+if [ $MULTI = 1 ]; then
+    expect "create_refused=1" "a new key a standard user's (not virtualized) program creates through HKCR is refused, as on Windows (9263)"
+    expect "override_create=1" "with RegOverridePredefKey(HKCR, HKCU\\Software\\Classes) it is created in the user's classes"
+    expect "override_undone=1" "the merged view is back once the override is undone"
+fi
 expect 'assoc_nochoice=machine "%1"' "AssocQueryString: the class the extension names"
 expect 'assoc_choice=choice "%1"' "AssocQueryString: the user's UserChoice wins"
 expect 'assoc_protocol=protochoice "%1"' "a URL protocol's UserChoice wins"
