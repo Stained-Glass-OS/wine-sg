@@ -1,0 +1,483 @@
+From: Stained Glass OS <ke7oxh@gmail.com>
+Subject: [PATCH] winepulse, mmdevapi: A program's session volume is its volume in the sound server's mixer (9416)
+
+Windows' Volume Mixer shows each program's audio session: its slider is
+the session's volume (ISimpleAudioVolume), a program that changes it
+moves the slider, and a slider moved there is the program's volume, told
+to it (IAudioSessionEvents::OnSimpleVolumeChanged). Wine applied the
+session volume to the samples and left the sound server's per-program
+volume at 100%: a mixer showed nothing, and a volume set there was never
+the program's.
+
+A render stream's session volume and mute are now its sink-input's volume
+and mute (the stream's and the session's channel volumes stay in Wine).
+winepulse watches its sink-inputs; a change made at the sound server
+becomes the session's volume and mute, the session's other streams follow,
+and the program is told: a mmdevapi thread waits in a new driver call,
+session_volume_wait, which the other drivers answer as not implemented
+(they keep the session volume in the samples, as before). A volume the
+sound server restores for the program when it starts is its session's, as
+Windows keeps a program's mixer volume from one run to the next.
+---
+--- a/dlls/mmdevapi/unixlib.h
++++ b/dlls/mmdevapi/unixlib.h
+@@ -216,6 +216,21 @@
+     float master_volume;
+     const float *volumes;
+     const float *session_volumes;
++    /* Stained Glass OS (wine-sg 9416): the session's own volume and mute, apart: a
++     * driver that has a mixer of its own (the sound server's per-program volume)
++     * carries them there instead of in master_volume */
++    float session_level;
++    BOOL session_mute;
++};
++
++/* Stained Glass OS (wine-sg 9416): waits until the sound server's mixer changes a
++ * stream's volume or mute (a per-program volume slider), or the process ends */
++struct session_volume_wait_params
++{
++    stream_handle stream;
++    float level;
++    BOOL mute;
++    HRESULT result;
+ };
+ 
+ struct set_event_handle_params
+@@ -350,5 +365,6 @@
+     midi_in_message,
+     midi_notify_wait,
+     aux_message,
++    session_volume_wait,
+     funcs_count
+ };
+--- a/dlls/mmdevapi/session.c
++++ b/dlls/mmdevapi/session.c
+@@ -144,6 +144,70 @@
+     release_sinks(&set);
+ }
+ 
++/* Stained Glass OS (wine-sg 9416): the sound server's mixer set a stream's
++ * volume or mute (a per-program volume slider): that is its session's, as the
++ * Windows Volume Mixer's slider is the session's volume. The session's other
++ * streams follow and the program hears it (IAudioSessionEvents). */
++static void session_external_volume(stream_handle stream, float level, BOOL mute)
++{
++    struct audio_session *session, *found = NULL;
++    struct audio_client *client;
++
++    sessions_lock();
++    LIST_FOR_EACH_ENTRY(session, &sessions, struct audio_session, entry)
++    {
++        LIST_FOR_EACH_ENTRY(client, &session->clients, struct audio_client, entry)
++            if (client->stream == stream) { found = session; break; }
++        if (found) break;
++    }
++    if (found && (found->master_vol != level || !found->mute != !mute))
++    {
++        found->master_vol = level;
++        found->mute = mute;
++        LIST_FOR_EACH_ENTRY(client, &found->clients, struct audio_client, entry)
++            set_stream_volumes(client);
++    }
++    else
++        found = NULL;
++    sessions_unlock();
++
++    if (found)
++        notify_simple_volume(found, &GUID_NULL);
++}
++
++static DWORD WINAPI session_volume_thread(void *arg)
++{
++    struct session_volume_wait_params params;
++
++    SetThreadDescription(GetCurrentThread(), L"wine_mmdevapi_session_volume");
++    for (;;)
++    {
++        params.result = E_NOTIMPL;
++        if (__wine_unix_call(drvs.module_unixlib, session_volume_wait, &params) || params.result != S_OK)
++            break;
++        session_external_volume(params.stream, params.level, params.mute);
++    }
++    return 0;
++}
++
++void session_volume_watch(void)
++{
++    static LONG started;
++    HMODULE module;
++    HANDLE thread;
++
++#ifdef SG_MUTANT_PULSE_NO_MIXER_VOLUME
++    return;
++#endif
++    if (InterlockedCompareExchange(&started, 1, 0))
++        return;
++    /* the thread waits in the driver for good: the module stays */
++    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++            (const WCHAR *)session_volume_watch, &module);
++    if ((thread = CreateThread(NULL, 0, session_volume_thread, NULL, 0, NULL)))
++        CloseHandle(thread);
++}
++
+ static void notify_channel_volume(struct audio_session *session, DWORD changed, const GUID *context)
+ {
+     float levels[32];
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -46,6 +46,7 @@
+ extern void sessions_lock(void);
+ extern void session_announce(struct audio_session *session);
+ extern void session_state_changed(struct audio_session *session);
++extern void session_volume_watch(void);
+ extern void sessions_unlock(void);
+ 
+ extern HRESULT get_audio_session(const GUID *sessionguid, IMMDevice *device, UINT channels,
+@@ -70,6 +71,8 @@
+     params.master_volume   = (This->session->mute ? 0.0f : This->session->master_vol);
+     params.volumes         = This->vols;
+     params.session_volumes = This->session->channel_vols;
++    params.session_level   = This->session->master_vol;
++    params.session_mute    = This->session->mute;
+ 
+     wine_unix_call(set_volumes, &params);
+ }
+@@ -497,6 +500,7 @@
+     if (SUCCEEDED(params.result)) {
+         session_announce(client->session);
+         session_state_changed(client->session);
++        session_volume_watch();
+     }
+ 
+     return params.result;
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -85,6 +85,15 @@
+ 
+     struct list packet_free_head;
+     struct list packet_filled_head;
++
++    /* Stained Glass OS (wine-sg 9416): a render stream's session volume and
++     * mute are the sound server's volume and mute of its stream (the per-program
++     * volume a mixer shows), as Windows' Volume Mixer shows the session's */
++    struct list volume_entry;
++    BOOL volume_listed, volume_known, volume_pending;
++    uint32_t sink_input;
++    float want_level, pa_level;
++    BOOL want_mute, pa_mute;
+ };
+ 
+ typedef struct _ACPacket
+@@ -117,6 +126,11 @@
+ static pthread_mutex_t pulse_mutex;
+ static pthread_cond_t pulse_cond = PTHREAD_COND_INITIALIZER;
+ 
++/* wine-sg 9416: the render streams whose volume follows the sound server's */
++static struct list g_volume_streams = LIST_INIT(g_volume_streams);
++static pthread_cond_t volume_cond = PTHREAD_COND_INITIALIZER;
++static BOOL volume_quit;
++
+ static ULONG_PTR zero_bits = 0;
+ 
+ static NTSTATUS pulse_not_implemented(void *args)
+@@ -263,6 +277,10 @@
+ 
+ static NTSTATUS pulse_process_detach(void *args)
+ {
++    pulse_lock();
++    volume_quit = TRUE;
++    pthread_cond_broadcast(&volume_cond);
++    pulse_unlock();
+     free_phys_device_lists();
+     if (pulse_ctx)
+     {
+@@ -394,6 +412,94 @@
+     return pa_stream_get_state(stream->stream) == PA_STREAM_READY;
+ }
+ 
++static struct pulse_stream *volume_stream_by_sink_input(uint32_t index)
++{
++    struct pulse_stream *stream;
++
++    LIST_FOR_EACH_ENTRY(stream, &g_volume_streams, struct pulse_stream, volume_entry)
++        if (stream->sink_input == index)
++            return stream;
++    return NULL;
++}
++
++/* the session's volume and mute to the sound server's stream */
++static void volume_push(struct pulse_stream *stream)
++{
++    pa_operation *o;
++    pa_cvolume cv;
++
++    if (!stream->volume_known || stream->sink_input == PA_INVALID_INDEX)
++        return;
++    if (fabsf(stream->want_level - stream->pa_level) >= 0.0005f)
++    {
++        pa_cvolume_set(&cv, stream->ss.channels, pa_sw_volume_from_linear(stream->want_level));
++        if ((o = pa_context_set_sink_input_volume(pulse_ctx, stream->sink_input, &cv, NULL, NULL)))
++            pa_operation_unref(o);
++        stream->pa_level = stream->want_level;
++    }
++    if (!stream->want_mute != !stream->pa_mute)
++    {
++        if ((o = pa_context_set_sink_input_mute(pulse_ctx, stream->sink_input, stream->want_mute, NULL, NULL)))
++            pa_operation_unref(o);
++        stream->pa_mute = stream->want_mute;
++    }
++}
++
++static void pulse_sink_input_info_cb(pa_context *c, const pa_sink_input_info *info, int eol, void *user)
++{
++    struct pulse_stream *stream;
++    float level;
++
++    if (eol || !info || !(stream = volume_stream_by_sink_input(info->index)))
++        return;
++    /* a session's volume goes from silence to full; the sound server's to 150% */
++    level = pa_sw_volume_to_linear(pa_cvolume_max(&info->volume));
++    if (level > 1.f) level = 1.f;
++
++    if (!stream->volume_known)
++    {
++        stream->volume_known = TRUE;
++        stream->pa_level = level;
++        stream->pa_mute = !!info->mute;
++        if (stream->want_level != 1.f || stream->want_mute)
++        {
++            /* the program set its session's volume before the server answered */
++            volume_push(stream);
++            return;
++        }
++        /* else the volume the server keeps for this program (stream restore), as
++         * Windows' mixer keeps a program's volume from one run to the next */
++        stream->want_level = level;
++        stream->want_mute = stream->pa_mute;
++        if (level != 1.f || stream->pa_mute)
++        {
++            stream->volume_pending = TRUE;
++            pthread_cond_broadcast(&volume_cond);
++        }
++        return;
++    }
++
++    if (fabsf(level - stream->pa_level) < 0.002f && !info->mute == !stream->pa_mute)
++        return;   /* ours, coming back */
++    TRACE("stream %p: the mixer set volume %.3f mute %d\n", stream, level, info->mute);
++    stream->pa_level = stream->want_level = level;
++    stream->pa_mute = stream->want_mute = !!info->mute;
++    stream->volume_pending = TRUE;
++    pthread_cond_broadcast(&volume_cond);
++}
++
++static void pulse_subscribe_cb(pa_context *c, pa_subscription_event_type_t t, uint32_t index, void *user)
++{
++    pa_operation *o;
++
++    if ((t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK) != PA_SUBSCRIPTION_EVENT_SINK_INPUT
++            || (t & PA_SUBSCRIPTION_EVENT_TYPE_MASK) != PA_SUBSCRIPTION_EVENT_CHANGE
++            || !volume_stream_by_sink_input(index))
++        return;
++    if ((o = pa_context_get_sink_input_info(c, index, pulse_sink_input_info_cb, NULL)))
++        pa_operation_unref(o);
++}
++
+ static HRESULT pulse_connect(const char *name)
+ {
+     pa_context_state_t state;
+@@ -426,6 +532,15 @@
+     TRACE("Connected to server %s with protocol version: %i.\n",
+         pa_context_get_server(pulse_ctx),
+         pa_context_get_server_protocol_version(pulse_ctx));
++#ifndef SG_MUTANT_PULSE_NO_MIXER_VOLUME
++    {
++        pa_operation *o;
++
++        pa_context_set_subscribe_callback(pulse_ctx, pulse_subscribe_cb, NULL);
++        if ((o = pa_context_subscribe(pulse_ctx, PA_SUBSCRIPTION_MASK_SINK_INPUT, NULL, NULL)))
++            pa_operation_unref(o);
++    }
++#endif
+     return S_OK;
+ 
+ fail:
+@@ -1110,6 +1225,18 @@
+     if (stream->dataflow == eRender) {
+         pa_stream_set_underflow_callback(stream->stream, pulse_underflow_callback, stream);
+         pa_stream_set_started_callback(stream->stream, pulse_started_callback, stream);
++#ifndef SG_MUTANT_PULSE_NO_MIXER_VOLUME
++        {
++            pa_operation *o;
++
++            stream->sink_input = pa_stream_get_index(stream->stream);
++            stream->want_level = stream->pa_level = 1.f;
++            list_add_tail(&g_volume_streams, &stream->volume_entry);
++            stream->volume_listed = TRUE;
++            if ((o = pa_context_get_sink_input_info(pulse_ctx, stream->sink_input, pulse_sink_input_info_cb, NULL)))
++                pa_operation_unref(o);
++        }
++#endif
+     }
+     return S_OK;
+ }
+@@ -1241,6 +1368,8 @@
+ 
+ exit:
+     if (FAILED(params->result = hr)) {
++        if (stream->volume_listed)
++            list_remove(&stream->volume_entry);
+         free(stream->local_buffer);
+         if (stream->stream) {
+             pa_stream_disconnect(stream->stream);
+@@ -1266,6 +1395,8 @@
+     }
+ 
+     pulse_lock();
++    if (stream->volume_listed)
++        list_remove(&stream->volume_entry);
+     if (PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream))) {
+         pa_stream_disconnect(stream->stream);
+         while (PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream)))
+@@ -2484,12 +2615,53 @@
+     struct pulse_stream *stream = handle_get_stream(params->stream);
+     unsigned int i;
+ 
++    if (stream->volume_listed)
++    {
++        /* the session's volume and mute at the sound server, the rest here */
++        for (i = 0; i < stream->ss.channels; i++)
++            stream->vol[i] = params->volumes[i] * params->session_volumes[i];
++        pulse_lock();
++        stream->want_level = min(max(params->session_level, 0.f), 1.f);
++        stream->want_mute = params->session_mute;
++        volume_push(stream);
++        pulse_unlock();
++        return STATUS_SUCCESS;
++    }
++
+     for (i = 0; i < stream->ss.channels; i++)
+         stream->vol[i] = params->volumes[i] * params->master_volume * params->session_volumes[i];
+ 
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pulse_session_volume_wait(void *args)
++{
++    struct session_volume_wait_params *params = args;
++    struct pulse_stream *stream;
++
++    pulse_lock();
++    for (;;)
++    {
++        LIST_FOR_EACH_ENTRY(stream, &g_volume_streams, struct pulse_stream, volume_entry)
++        {
++            if (!stream->volume_pending) continue;
++            stream->volume_pending = FALSE;
++            params->stream = (stream_handle)(UINT_PTR)stream;
++            params->level = stream->want_level;
++            params->mute = stream->want_mute;
++            params->result = S_OK;
++            pulse_unlock();
++            return STATUS_SUCCESS;
++        }
++        if (volume_quit)
++            break;
++        pthread_cond_wait(&volume_cond, &pulse_mutex);
++    }
++    pulse_unlock();
++    params->result = S_FALSE;
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS pulse_set_event_handle(void *args)
+ {
+     struct set_event_handle_params *params = args;
+@@ -2693,6 +2865,7 @@
+     pulse_not_implemented,
+     pulse_not_implemented,
+     pulse_not_implemented,
++    pulse_session_volume_wait,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -3052,6 +3225,8 @@
+         float master_volume;
+         PTR32 volumes;
+         PTR32 session_volumes;
++        float session_level;
++        BOOL session_mute;
+     } *params32 = args;
+     struct set_volumes_params params =
+     {
+@@ -3059,6 +3234,8 @@
+         .master_volume = params32->master_volume,
+         .volumes = ULongToPtr(params32->volumes),
+         .session_volumes = ULongToPtr(params32->session_volumes),
++        .session_level = params32->session_level,
++        .session_mute = params32->session_mute,
+     };
+     return pulse_set_volumes(&params);
+ }
+@@ -3191,6 +3368,7 @@
+     pulse_not_implemented,
+     pulse_not_implemented,
+     pulse_not_implemented,
++    pulse_session_volume_wait,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+--- a/dlls/winealsa.drv/alsa.c
++++ b/dlls/winealsa.drv/alsa.c
+@@ -2508,6 +2508,7 @@
+     alsa_midi_in_message,
+     alsa_midi_notify_wait,
+     alsa_not_implemented,
++    alsa_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -2966,6 +2967,7 @@
+     alsa_wow64_midi_in_message,
+     alsa_wow64_midi_notify_wait,
+     alsa_not_implemented,
++    alsa_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+--- a/dlls/wineoss.drv/oss.c
++++ b/dlls/wineoss.drv/oss.c
+@@ -1712,6 +1712,7 @@
+     oss_midi_in_message,
+     oss_midi_notify_wait,
+     oss_aux_message,
++    oss_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -2209,6 +2210,7 @@
+     oss_wow64_midi_in_message,
+     oss_wow64_midi_notify_wait,
+     oss_wow64_aux_message,
++    oss_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -1858,6 +1858,7 @@
+     unix_midi_in_message,
+     unix_midi_notify_wait,
+     unix_not_implemented,
++    unix_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -2315,6 +2316,7 @@
+     unix_wow64_midi_in_message,
+     unix_wow64_midi_notify_wait,
+     unix_not_implemented,
++    unix_not_implemented,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
