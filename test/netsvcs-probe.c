@@ -43,6 +43,8 @@ int main(int argc, char **argv)
         { L"iphlpsvc", L"IP Helper", SERVICE_AUTO_START },
         { L"netprofm", L"Network List Service", SERVICE_DEMAND_START },
         { L"WinHttpAutoProxySvc", L"WinHTTP Web Proxy Auto-Discovery Service", SERVICE_DEMAND_START },
+        /* (8421, i1014) OpenVPN's Interactive Service depends on it */
+        { L"Dhcp", L"DHCP Client", SERVICE_AUTO_START },
     };
     SERVICE_TABLE_ENTRYW table[] = { { (WCHAR *)L"SgNetDepTest", service_main }, { NULL, NULL } };
     WCHAR exe[MAX_PATH], path[MAX_PATH + 8];
@@ -53,7 +55,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "svc")) return !StartServiceCtrlDispatcherW(table);
     setvbuf(stdout, NULL, _IONBF, 0);
     scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-    for (i = 0; i < 4; i++)
+    for (i = 0; i < ARRAYSIZE(wanted); i++)
     {
         BYTE buf[4096];
         QUERY_SERVICE_CONFIGW *cfgw = (void *)buf;
@@ -66,19 +68,19 @@ int main(int argc, char **argv)
         if (svc) CloseServiceHandle(svc);
     }
 
-    /* a service depending on all four: the service manager starts them first */
+    /* a service depending on all of them: the service manager starts them first */
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     swprintf(path, ARRAYSIZE(path), L"\"%ls\" svc", exe);
     svc = CreateServiceW(scm, L"SgNetDepTest", L"SgNetDepTest", SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
                          SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, path, NULL, NULL,
-                         L"Dnscache\0iphlpsvc\0netprofm\0WinHttpAutoProxySvc\0\0", NULL, NULL);
+                         L"Dnscache\0iphlpsvc\0netprofm\0WinHttpAutoProxySvc\0Dhcp\0\0", NULL, NULL);
     printf("created=%d\n", svc != NULL);
     if (svc)
     {
         SERVICE_STATUS st;
         printf("started=%d\n", StartServiceW(svc, 0, NULL));
         for (i = 0; i < 50 && state_of(scm, L"SgNetDepTest") != SERVICE_RUNNING; i++) Sleep(100);
-        for (i = 0; i < 4; i++) running += state_of(scm, wanted[i].name) == SERVICE_RUNNING;
+        for (i = 0; i < ARRAYSIZE(wanted); i++) running += state_of(scm, wanted[i].name) == SERVICE_RUNNING;
         printf("running=%d,%d\n", state_of(scm, L"SgNetDepTest") == SERVICE_RUNNING, running);
         ControlService(svc, SERVICE_CONTROL_STOP, &st);
         Sleep(500);

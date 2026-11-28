@@ -1,9 +1,9 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# Network services Windows has running (patches/sg/6266): DNS Client (Dnscache), IP Helper (iphlpsvc), Network List
-# Service (netprofm) and WinHTTP Web Proxy Auto-Discovery Service (WinHttpAutoProxySvc), with Windows' display names
-# and start types, shared-process services of svchost; a service depending on all four is started after them, and
-# they run. Tailscale's installer stopped at its CheckServiceDependencies (Dnscache missing, 1060), and its service
+# Network services Windows has running (patches/sg/6266, 8421): DNS Client (Dnscache), IP Helper (iphlpsvc), Network List
+# Service (netprofm), WinHTTP Web Proxy Auto-Discovery Service (WinHttpAutoProxySvc) and DHCP Client (Dhcp; OpenVPN's
+# Interactive Service depends on it and failed with 1075 without it, i1014), with Windows' display names and start
+# types, shared-process services of svchost; a service depending on all five is started after them, and they run. Tailscale's installer stopped at its CheckServiceDependencies (Dnscache missing, 1060), and its service
 # names the four as dependencies. The service manager starts a service's dependencies first, as Windows does (it
 # did not), and fails with ERROR_SERVICE_DEPENDENCY_FAIL when one cannot start. cfgmgr32's SwDeviceCreate and DevCreateObjectQuery fail cleanly (Wintun's delay
 # loads of them ended tailscaled.exe). test/netsvcs-probe.c.
@@ -35,8 +35,9 @@ chk '^Dnscache=1,1,1$' "DNS Client: display name, automatic start, a shared-proc
 chk '^iphlpsvc=1,1,1$' "IP Helper"
 chk '^netprofm=1,1,1$' "Network List Service, started on demand"
 chk '^WinHttpAutoProxySvc=1,1,1$' "WinHTTP Web Proxy Auto-Discovery Service, started on demand"
-chk '^started=1$' "a service depending on the four starts"
-chk '^running=1,4$' "it runs, and so do the four"
+chk '^Dhcp=1,1,1$' "DHCP Client, automatic start"
+chk '^started=1$' "a service depending on the five starts"
+chk '^running=1,5$' "it runs, and so do the five"
 chk '^depfail=1,0,1068$' "a dependency that cannot start (disabled): the service is not started, ERROR_SERVICE_DEPENDENCY_FAIL"
 chk '^swdevice=1,1,80070032,1$' "SwDeviceCreate and DevCreateObjectQuery exist and fail cleanly"
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"

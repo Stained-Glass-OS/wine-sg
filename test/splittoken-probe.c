@@ -53,6 +53,20 @@ int main(int argc, char **argv)
         fflush(stdout);
         return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "droppriv"))
+    {
+        /* WireGuard's elevate.DropAllPrivileges: every privilege of its own token removed */
+        BYTE pbuf[4096]; TOKEN_PRIVILEGES *privs = (TOKEN_PRIVILEGES *)pbuf;
+        BOOL ok = OpenProcessToken(GetCurrentProcess(), TOKEN_READ | TOKEN_WRITE, &token) &&
+                  GetTokenInformation(token, TokenPrivileges, privs, sizeof(pbuf), &len);
+        DWORD n = ok ? privs->PrivilegeCount : 0;
+        for (i = 0; ok && i < privs->PrivilegeCount; i++) privs->Privileges[i].Attributes = SE_PRIVILEGE_REMOVED;
+        ok = ok && AdjustTokenPrivileges(token, FALSE, privs, 0, NULL, NULL) && GetLastError() == ERROR_SUCCESS;
+        if (ok) ok = GetTokenInformation(token, TokenPrivileges, privs, sizeof(pbuf), &len);
+        printf("DROPPRIV %d had %lu left %lu\n", ok, n, ok ? privs->PrivilegeCount : 0);
+        fflush(stdout);
+        return 0;
+    }
     OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token);
     AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0,0,0,0,0,0, &admins);
     GetTokenInformation(token, TokenElevationType, &type, sizeof(type), &len);
@@ -75,6 +89,25 @@ int main(int argc, char **argv)
         printf("LINKED_IMPERSONATE %d\n", SetThreadToken(NULL, linked.LinkedToken));
         printf("LINKED_DUPLICATE %d\n", DuplicateTokenEx(linked.LinkedToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &dup));
         RevertToSelf();
+        /* WireGuard's tray window (elevate.TokenIsElevatedOrElevatable): an identification-level copy
+         * of the linked token, then CheckTokenMembership -- as Windows allows; the copy identifies
+         * only: no impersonation, no process token, no higher level (i1013) */
+        {
+            HANDLE ident = NULL, d2 = NULL, d3 = NULL;
+            BOOL dmember = FALSE, ok = DuplicateTokenEx(linked.LinkedToken, TOKEN_QUERY | TOKEN_IMPERSONATE, NULL,
+                                                        SecurityIdentification, TokenImpersonation, &ident);
+            DWORD err = ok ? 0 : GetLastError();
+            if (ok) CheckTokenMembership(ident, admins, &dmember);
+            printf("LINKED_IDENTIFY %d err %lu admins %d\n", ok, err, dmember);
+            if (ok)
+            {
+                BOOL imp = SetThreadToken(NULL, ident);
+                RevertToSelf();
+                printf("IDENTIFY_USE impersonate %d primary %d raise %d\n", imp,
+                       DuplicateTokenEx(ident, TOKEN_ALL_ACCESS, NULL, SecurityIdentification, TokenPrimary, &d2),
+                       DuplicateTokenEx(ident, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenImpersonation, &d3));
+            }
+        }
     }
     else printf("LINKED none %lu\n", GetLastError());
     fflush(stdout);

@@ -8,7 +8,9 @@
 #  1. a standard user: elevation Default, no Administrators, no linked token
 #  2. an unelevated administrator: Limited, not elevated, Administrators present only for deny
 #     (CheckTokenMembership and IsUserAnAdmin say no), linked token Full and elevated, which may be
-#     read but not used (no impersonation, no process token)
+#     read but not used (no impersonation, no process token); an identification-level copy of it
+#     (DuplicateTokenEx, as WireGuard's tray window makes to ask CheckTokenMembership) says
+#     Administrators and only identifies (i1013); a program removes its own privileges
 #     and "Run as administrator" (ShellExecuteEx runas) reaches the elevation broker (a stand-in
 #     sg-elevate here) instead of failing with ACCESS_DENIED on that linked token
 #     and a program whose manifest says requireAdministrator is refused with ERROR_ELEVATION_REQUIRED
@@ -17,7 +19,8 @@
 #     enabled, linked token Limited
 # Exit 77 without the accounts or passwordless sudo.
 # Mutants (server/token.c): SG_MUTANT_ADMIN_NOT_SPLIT, SG_MUTANT_ADMINS_NOT_DENY_ONLY,
-#          SG_MUTANT_NO_LINKED_TOKEN; (dlls/shell32/shellord.c) SG_MUTANT_ADMIN_BY_PRESENCE;
+#          SG_MUTANT_NO_LINKED_TOKEN, SG_MUTANT_LINKED_NO_DUPLICATE, SG_MUTANT_IDENTIFY_TOKEN_PRIMARY,
+#          SG_MUTANT_IDENTIFY_TOKEN_IMPERSONATE; (dlls/shell32/shellord.c) SG_MUTANT_ADMIN_BY_PRESENCE;
 #          (patch 7740) SG_MUTANT_RUNAS_IDENTIFY_TOKEN (dlls/shell32/shlexec.c),
 #          SG_MUTANT_LOADER_LIMITED_ANY (dlls/kernelbase/process.c).
 #   WINE=... WINESERVER=... test/splittoken-gate.sh
@@ -120,6 +123,13 @@ echo "$out" | sed 's/^/      admin: /'
 [ "$(v "$out" MEMBER)" = 0 ] && [ "$(v "$out" ISADMIN)" = 0 ] && pass "unelevated administrator: CheckTokenMembership and IsUserAnAdmin say no" || fail "unelevated administrator: member $(v "$out" MEMBER) IsUserAnAdmin $(v "$out" ISADMIN)"
 case "$(v "$out" LINKED)" in "2 1 level 1 admins 1") pass "unelevated administrator: linked token Full, elevated, identification level" ;; *) fail "unelevated administrator: linked $(v "$out" LINKED)" ;; esac
 [ "$(v "$out" LINKED_IMPERSONATE)" = 0 ] && [ "$(v "$out" LINKED_DUPLICATE)" = 0 ] && pass "unelevated administrator: the linked token cannot be used (no impersonation, no process token)" || fail "the linked token is usable: impersonate $(v "$out" LINKED_IMPERSONATE) duplicate $(v "$out" LINKED_DUPLICATE)"
+[ "$(v "$out" LINKED_IDENTIFY)" = "1 err 0 admins 1" ] && pass "unelevated administrator: an identification-level copy of the linked token says Administrators (WireGuard's admin check)" \
+    || fail "identification copy of the linked token: $(v "$out" LINKED_IDENTIFY), want 1 err 0 admins 1"
+[ "$(v "$out" IDENTIFY_USE)" = "impersonate 0 primary 0 raise 0" ] && pass "...and that copy only identifies: no impersonation, no process token, no higher level" \
+    || fail "the identification copy is usable: $(v "$out" IDENTIFY_USE)"
+out=$(as "$SG_USER1" timeout -s KILL 120 "$WINE" 'C:\splittoken-probe.exe' droppriv 2>/dev/null | tr -d '\r')
+case "$(v "$out" DROPPRIV)" in "1 had "*" left 0") pass "a program removes every privilege of its own token (WireGuard's DropAllPrivileges)" ;;
+    *) fail "dropping its privileges: $(v "$out" DROPPRIV)" ;; esac
 
 out=$(probe_runas)
 echo "$out" | sed 's/^/      admin runas: /'

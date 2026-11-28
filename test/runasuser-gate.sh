@@ -16,11 +16,19 @@
 #  2. a wrong password starts nothing (ERROR_LOGON_FAILURE)
 #  3. SYSTEM (a service) starts a program on a logged-on user's session with
 #     WTSQueryUserToken's token and CreateProcessAsUser
+#  3b. (i1010) the program inherits SYSTEM's handles as CreateProcessAsUser says:
+#     a PROC_THREAD_ATTRIBUTE_HANDLE_LIST's alone, every inheritable one, or none
 #  4. the broker starts nothing for a launch ticket made for another
 #     requester, nor as a system account (below 1000)
+# The build named is the one tested: every account must be able to run WINE and
+# WINESERVER (a server in a directory only the caller can enter -- /root, a 700
+# home -- cannot be started by the other accounts, and Wine then quietly starts
+# the server installed beside its loader: net4 2026-11-28, a mutant server
+# "passed"), and the prefix's one server must be WINESERVER, from the start to
+# the end of the run.
 # Exit 77 without the accounts, passwordless sudo or the broker's source.
-# Mutants: SG_MUTANT_LAUNCH_ANY_REQUESTER, SG_MUTANT_SPAWN_SYSTEM_ACCOUNTS
-# (sg-session's broker/sg-brokerd.c, built with SG_BROKER_CFLAGS).
+# Mutants: SG_MUTANT_LAUNCH_NO_INHERIT (server/token.c), SG_MUTANT_LAUNCH_ANY_REQUESTER,
+# SG_MUTANT_SPAWN_SYSTEM_ACCOUNTS (sg-session's broker/sg-brokerd.c, built with SG_BROKER_CFLAGS).
 #   WINE=... WINESERVER=... [SG_SESSION_SRC=...] test/runasuser-gate.sh
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -39,6 +47,13 @@ for u in "$SG_SYSTEM" "$SG_USER1" "$SG_USER2"; do
     id "$u" >/dev/null 2>&1 && sudo -n -u "$u" true 2>/dev/null || { echo "SKIP: no $u or no sudo"; exit 77; }
 done
 command -v "$MINGW" >/dev/null || { echo "SKIP: no mingw"; exit 77; }
+# each account runs the Wine named here, not one it falls back to
+for u in "$SG_SYSTEM" "$SG_USER1" "$SG_USER2"; do
+    for f in "$WINE" "$WINESERVER"; do
+        sudo -n -u "$u" test -x "$f" || { echo "FAIL: $u cannot run $f (put the build where every account can reach it)"; exit 1; }
+    done
+done
+WINESERVER=$(readlink -f "$WINESERVER")
 SG_SESSION_SRC=${SG_SESSION_SRC:-$HERE/../../sg-session}
 [ -f "$SG_SESSION_SRC/broker/sg-brokerd.c" ] && grep -q '"@launch"' "$SG_SESSION_SRC/broker/sg-brokerd.c" \
     || { echo "SKIP: no sg-brokerd with @launch in SG_SESSION_SRC ($SG_SESSION_SRC)"; exit 77; }
@@ -59,6 +74,10 @@ cleanup() {
     [ -n "${BROKER_PID:-}" ] && sudo -n kill "$BROKER_PID" 2>/dev/null
     as "$SG_SYSTEM" "$WINESERVER" -k 2>/dev/null
     sleep 1
+    # "-k" kills nothing once the server is gone: every account's processes in the prefix
+    for u in "$SG_SYSTEM" "$SG_USER1" "$SG_USER2"; do
+        sudo -n -u "$u" bash -c "$(declare -f sg_kill_prefix); sg_kill_prefix '$PFX'" 2>/dev/null
+    done
     [ -n "${KEEP:-}" ] || sudo -n rm -rf "$W"
 }
 trap cleanup EXIT
@@ -81,6 +100,27 @@ for k in 'HKLM\System\CurrentControlSet\Control\Video' 'HKLM\System\CurrentContr
     as "$SG_SYSTEM" sh -c "umask 002; timeout -s KILL 120 '$WINE' reg add '$k' /f" >/dev/null 2>&1
 done
 sudo -n chmod -R g+rwX "$PFX" 2>/dev/null
+# the prefix's server: it works in the prefix directory, or in the shared
+# prefix's server directory (ntdll's init_server_dir): the executable it runs
+server_exe() {
+    local p dir sdir dev ino
+    dir=$(readlink -f "$PFX")
+    read -r dev ino < <(sudo -n stat -c '%d %i' "$PFX")
+    sdir=$(printf '/tmp/.wine-sg-%x-%x/server-%x-%x' "$dev" "$ino" "$dev" "$ino")
+    for p in $(pgrep -x wineserver); do
+        case "$(sudo -n readlink "/proc/$p/cwd" 2>/dev/null)" in
+        "$dir"|"$sdir") sudo -n readlink "/proc/$p/exe"; return ;;
+        esac
+    done
+}
+check_server() {
+    local exe; exe=$(server_exe)
+    [ "$exe" = "$WINESERVER" ] && return 0
+    echo "FAIL: the prefix's wineserver is '${exe:-none}', not $WINESERVER ($1): this run does not test the build named"
+    for p in $(pgrep -x wineserver); do echo "  wineserver $p: $(sudo -n readlink /proc/$p/exe) in $(sudo -n readlink /proc/$p/cwd)"; done
+    exit 1
+}
+check_server "after the restart"
 # no display here: the null graphics driver, so windows can be made
 for u in "$SG_USER1" "$SG_USER2"; do
     as "$u" timeout -s KILL 120 "$WINE" reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d null /f >/dev/null 2>&1
@@ -145,6 +185,19 @@ r=$(report asuser)
     && pass "SYSTEM starts a program as $SG_USER2 in its session $s2 (WTSQueryUserToken, CreateProcessAsUser)" \
     || fail "asuser: $out / $r / owner $(owner asuser)"
 
+# (i1010) the handles CreateProcessAsUser's program inherits: listed ones alone, all
+# inheritable ones, or none -- at the values its command line names
+for mode in list all none; do
+    out=$(probe "$SG_SYSTEM" inherit "$s2" "$mode")
+    case "$mode" in
+    list) want="INHERIT 11 inherited:$SG_USER2"; what="with a handle list it inherits the pipe listed, not the event left out" ;;
+    all)  want="INHERIT 13 inherited:$SG_USER2"; what="with bInheritHandles it inherits every inheritable handle (pipe and event)" ;;
+    none) want="INHERIT 10 -"; what="without bInheritHandles it inherits nothing" ;;
+    esac
+    [ "$(printf '%s\n' "$out" | grep '^INHERIT')" = "$want" ] && [ "$(owner "inherit-$mode")" = "$SG_USER2" ] && pass "$what" \
+        || fail "inherit $mode: $out (want $want), owner $(owner "inherit-$mode")"
+done
+
 # the broker itself: a launch ticket for another requester; a system account
 cat > "$W/client.py" <<'PY'
 import socket, struct, sys
@@ -166,6 +219,7 @@ plant bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2 "$(id -u daemon)" "$uid1"
 [ "$(raw bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2 'C:\out\daemon')" = "STATUS 1" ] && sleep 3 && [ -z "$(report daemon)" ] \
     && pass "...nor as a system account" || fail "a program was started as a system account"
 
+check_server "at the end"
 sudo -n kill "$BROKER_PID" 2>/dev/null; BROKER_PID=
 as "$SG_USER1" "$WINESERVER" -k 2>/dev/null; wait
 echo
