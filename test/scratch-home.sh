@@ -141,7 +141,12 @@ sg_gate_display() {
     command -v Xvfb >/dev/null || { echo "SKIP: no display (SG_GATE_DISPLAY) and no Xvfb"; return 77; }
     _sg_n=${SG_GATE_XVFB_FIRST:-720}
     while [ "$_sg_n" -lt $(( ${SG_GATE_XVFB_FIRST:-720} + 30 )) ]; do
-        if [ ! -e "/tmp/.X$_sg_n-lock" ] && [ ! -e "/tmp/.X11-unix/X$_sg_n" ]; then
+        # a lock whose X server is gone (killed by a timeout or a memory cap) is
+        # free: Xvfb removes a stale lock and socket itself, as every X server does
+        # (29 stale locks once filled the range and every gate said "no free display")
+        _sg_lp=$(tr -dc 0-9 < "/tmp/.X$_sg_n-lock" 2>/dev/null)
+        if { [ ! -e "/tmp/.X$_sg_n-lock" ] && [ ! -e "/tmp/.X11-unix/X$_sg_n" ]; } || \
+           { [ -n "$_sg_lp" ] && ! kill -0 "$_sg_lp" 2>/dev/null && [ ! -d "/proc/$_sg_lp" ]; }; then
             Xvfb ":$_sg_n" -screen 0 1280x1024x24 -nolisten tcp >/dev/null 2>&1 &
             _sg_x=$!
             _sg_i=0
