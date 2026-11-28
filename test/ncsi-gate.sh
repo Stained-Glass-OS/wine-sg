@@ -41,6 +41,8 @@ export WINEPREFIX="$W/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;w
 me timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1
 K='HKLM\System\CurrentControlSet\Services\NlaSvc\Parameters\Internet'
 me "$WINE" reg add "$K" /v ActiveWebProbeHost /d 127.0.0.1 /f >/dev/null 2>&1
+# active probing is off by default until the probe host is decided (main, 2026-11-28): on for the gate
+me "$WINE" reg add "$K" /v EnableActiveProbing /t REG_DWORD /d 1 /f >/dev/null 2>&1
 me "$WINESERVER" -k; me "$WINESERVER" -w
 cp "$W/probe.exe" "$WINEPREFIX/drive_c/"
 poke() { ip addr add 10.55.0.$1/24 dev sgeth0; }   # a network change: nsiproxy probes again
