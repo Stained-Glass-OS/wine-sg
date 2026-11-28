@@ -52,7 +52,7 @@ toasts() { probe toasts | sed -n 's/^toasts=//p'; }
 mkfifo "$T/in"
 timeout -s KILL 240 "$WINE" rundll32.exe windows.ui.dll,SgLinuxNotifications < "$T/in" > "$T/out" 2>/dev/null &
 HP=$!
-exec 3> "$T/in"
+exec 3<> "$T/in"   # read-write: never blocks, even if the host is gone
 i=0; while ! grep -q READY "$T/out" 2>/dev/null && [ $i -lt 60 ]; do sleep 0.5; i=$((i + 1)); done
 grep -q READY "$T/out" && pass "the host starts (READY)" || fail "no READY: $(cat "$T/out")"
 TAB=$(printf '\t')
