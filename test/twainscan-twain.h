@@ -45,6 +45,16 @@ typedef struct
     TW_MEMORY Memory;
 } TW_IMAGEMEMXFER;
 typedef struct { TW_UINT32 MinBufSize, MaxBufSize, Preferred; } TW_SETUPMEMXFER;
+typedef struct { TW_MEMREF CallBackProc; UINT_PTR RefCon; TW_INT16 Message; } TW_CALLBACK2;
+typedef struct
+{
+    TW_UINT32 Size;
+    void *DSM_Entry;
+    HANDLE (WINAPI *DSM_MemAllocate)(TW_UINT32);
+    void (WINAPI *DSM_MemFree)(HANDLE);
+    void *(WINAPI *DSM_MemLock)(HANDLE);
+    void (WINAPI *DSM_MemUnlock)(HANDLE);
+} TW_ENTRYPOINT;
 #pragma pack(pop)
 
 typedef TW_UINT16 (WINAPI *DSMENTRYPROC)(pTW_IDENTITY, pTW_IDENTITY, TW_UINT32, TW_UINT16, TW_UINT16, TW_MEMREF);
@@ -69,6 +79,12 @@ typedef TW_UINT16 (WINAPI *DSMENTRYPROC)(pTW_IDENTITY, pTW_IDENTITY, TW_UINT32, 
 #define DAT_SETUPMEMXFER   0x0006
 #define ICAP_XFERMECH      0x0103
 #define CAP_FEEDERENABLED  0x1002
+#define DAT_NULL           0x0000
+#define DAT_ENTRYPOINT     0x0403
+#define DAT_CALLBACK2      0x0012
+#define MSG_REGISTER_CALLBACK 0x0902
+#define DF_DSM2            0x10000000
+#define DF_APP2            0x20000000
 #define TWTY_BOOL          0x0006
 #define TWSX_MEMORY        2
 #define TWMF_APPOWNS       0x0001

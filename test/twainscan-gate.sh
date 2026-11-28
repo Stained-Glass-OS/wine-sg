@@ -1,6 +1,6 @@
 #!/bin/sh
 . "$(dirname "$0")/scratch-home.sh"
-# Scanning through TWAIN (patches/sg/9815): a Windows program -- IrfanView's
+# Scanning through TWAIN (patches/sg/9815, 9817, 9818): a Windows program -- IrfanView's
 # Acquire, NAPS2's TWAIN driver -- opens the source manager, picks a source
 # (sane.ds: one per SANE device), scans a page without the source's own window
 # and takes it as a DIB (native transfer). TWAIN 2 passes that DIB's handle
@@ -8,7 +8,11 @@
 # cut or half-garbage handle (a GlobalAlloc pointer above 4 GB). The gate uses
 # SANE's "test" device through a SANE configuration of its own
 # (SANE_CONFIG_DIR: no other backend, nothing on the network), 64- and
-# 32-bit, under Xvfb (the source shows its progress window).
+# 32-bit, under Xvfb (the source shows its progress window). 9817: strips of a
+# memory transfer, one page from the flatbed, interleaved RGB, the resolution
+# asked for. 9818: the source's own window (its option pages; it crashed or
+# came up empty) and TWAIN 2 through twaindsm.dll (64-bit programs load
+# TWAINDSM.DLL: IrfanView 64-bit), entry points and callbacks.
 #
 #   WINE=/opt/wine-sg/bin/wine test/twainscan-gate.sh
 set -u
@@ -76,15 +80,25 @@ cat > "$T/run.sh" <<EOS
 #!/bin/sh
 cd "$WINEPREFIX/drive_c"
 for b in 64 32; do
-    timeout -s KILL 120 "$WINE" "C:\\\\probe\$b.exe" 2>/dev/null </dev/null | tr -d '\r' > "$T/probe\$b.out"
+    for m in plain dsm ui; do
+        a=; [ \$m = plain ] || a=\$m
+        timeout -s KILL 120 "$WINE" "C:\\\\probe\$b.exe" \$a 2>/dev/null </dev/null | tr -d '\r' > "$T/probe\$b-\$m.out"
+    done
 done
 EOS
 chmod +x "$T/run.sh"
-timeout -s KILL 300 xvfb-run -a -s '-screen 0 1024x768x24' "$T/run.sh"
+timeout -s KILL 600 xvfb-run -a -s '-screen 0 1024x768x24' "$T/run.sh"
 for b in 64 32; do
-    sed 's/^/      /' "$T/probe$b.out"
-    if grep -q '^RESULT: PASS' "$T/probe$b.out"; then printf 'PASS  %s-bit: a page scanned through TWAIN arrives as a DIB\n' $b
-    else printf 'FAIL  %s-bit: scanning through TWAIN\n' $b; RC=1; fi
+    for m in plain dsm ui; do
+        sed 's/^/      /' "$T/probe$b-$m.out"
+        case $m in
+        plain) what="a page scanned through TWAIN arrives as a DIB and in strips" ;;
+        dsm) what="a TWAIN 2 program scans through twaindsm.dll, its events by callback" ;;
+        ui) what="the source's own window has its pages and scans" ;;
+        esac
+        if grep -q '^RESULT: PASS' "$T/probe$b-$m.out"; then printf 'PASS  %s-bit: %s\n' $b "$what"
+        else printf 'FAIL  %s-bit: %s\n' $b "$what"; RC=1; fi
+    done
 done
 [ $RC = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $RC
