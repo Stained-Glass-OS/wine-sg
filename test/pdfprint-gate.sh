@@ -83,6 +83,8 @@ i=0; while [ ! -S "$T/cups.sock" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1));
 "$LPADMIN" -p SG_Print_to_PDF -E -v cups-pdf:/ -P /usr/share/ppd/cups-pdf/CUPS-PDF_opt.ppd -D "Print to PDF" 2>/dev/null
 "$LPADMIN" -p SG_Laser -E -v file:///dev/null -P /usr/share/ppd/cups-pdf/CUPS-PDF_opt.ppd -D "Laser" 2>/dev/null
 lpstat -v SG_Print_to_PDF 2>/dev/null | grep -q cups-pdf || { echo "SKIP: the gate's CUPS server did not take the PDF queue"; exit 77; }
+# stopped: a document that wrongly went to CUPS stays there, to be counted
+cupsdisable SG_Print_to_PDF 2>/dev/null
 lpstat -v SG_Laser >/dev/null 2>&1 || { echo "SKIP: the gate's CUPS server did not take the PostScript queue"; exit 77; }
 timeout -s KILL 300 "$WINE" wineboot -i >/dev/null 2>&1; "$WINESERVER" -w
 cp "$T/probe.exe" "$WINEPREFIX/drive_c/"

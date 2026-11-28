@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <winspool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <wchar.h>
 
 static int failures;
@@ -110,8 +111,17 @@ static DWORD queue_jobs(const WCHAR *printer)
     DWORD needed = 0, count = 0;
     HANDLE h;
 
+    BYTE *buf;
+
     if (!OpenPrinterW((WCHAR *)printer, &h, NULL)) return ~0u;
+    /* sized first: without room EnumJobs returns no jobs, only the size */
     EnumJobsW(h, 0, 100, 1, NULL, 0, &needed, &count);
+    count = 0;
+    if (needed && (buf = malloc(needed)))
+    {
+        if (!EnumJobsW(h, 0, 100, 1, buf, needed, &needed, &count)) count = 0;
+        free(buf);
+    }
     ClosePrinter(h);
     return count;
 }
