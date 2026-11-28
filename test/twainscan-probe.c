@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "twainscan-twain.h"
 
 static int failures;
@@ -34,6 +35,31 @@ static TW_UINT16 set_one(TW_IDENTITY *src, TW_UINT16 cap, TW_UINT16 type, TW_UIN
     return rc;
 }
 
+/* the source's events until a page is ready (1) or it asks to be closed (0) */
+static int wait_ready(TW_IDENTITY *src)
+{
+    DWORD start = GetTickCount();
+    MSG msg;
+
+    while (GetTickCount() - start < 60000)
+    {
+        TW_EVENT ev;
+
+        if (!PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) { Sleep(20); continue; }
+        ev.pEvent = &msg;
+        ev.TWMessage = MSG_NULL;
+        if (dsm(&app, src, DG_CONTROL, DAT_EVENT, MSG_PROCESSEVENT, &ev) == TWRC_DSEVENT)
+        {
+            if (ev.TWMessage == MSG_XFERREADY) return 1;
+            if (ev.TWMessage == MSG_CLOSEDSREQ) return 0;
+            continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     HMODULE twain = LoadLibraryA("twain_32.dll");
@@ -46,9 +72,7 @@ int main(int argc, char **argv)
     HANDLE handle = (HANDLE)(ULONG_PTR)0xa5a5a5a5a5a5a5a5ull;
     TW_UINT16 rc;
     HWND hwnd;
-    MSG msg;
     int found = 0, nsrc = 0, ready = 0;
-    DWORD start;
     BOOL show = argc > 1 && !strcmp(argv[1], "ui");
 
     dsm = twain ? (DSMENTRYPROC)GetProcAddress(twain, "DSM_Entry") : NULL;
@@ -81,6 +105,9 @@ int main(int argc, char **argv)
     rc = dsm(&app, NULL, DG_CONTROL, DAT_IDENTITY, MSG_OPENDS, &test);
     CHECK(rc == TWRC_SUCCESS, "it opens (%u)", rc);
     if (rc) goto close_dsm;
+    /* the glass, as a program scanning one page chooses it (the source starts on its feeder) */
+    rc = set_one(&test, CAP_FEEDERENABLED, TWTY_BOOL, FALSE);
+    CHECK(rc == TWRC_SUCCESS || rc == TWRC_CHECKSTATUS, "the flatbed is chosen (%u)", rc);
     rc = set_one(&test, ICAP_PIXELTYPE, TWTY_UINT16, TWPT_RGB);
     CHECK(rc == TWRC_SUCCESS || rc == TWRC_CHECKSTATUS, "colour is chosen (%u)", rc);
     rc = set_one(&test, ICAP_XRESOLUTION, TWTY_FIX32, 75);
@@ -91,28 +118,16 @@ int main(int argc, char **argv)
     ui.hParent = hwnd;
     rc = dsm(&app, &test, DG_CONTROL, DAT_USERINTERFACE, MSG_ENABLEDS, &ui);
     CHECK(rc == TWRC_SUCCESS || rc == TWRC_CHECKSTATUS, "the scan starts (%u)", rc);
-    start = GetTickCount();
-    while (!ready && GetTickCount() - start < 60000)
-    {
-        if (!PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) { Sleep(20); continue; }
-        {
-            TW_EVENT ev = { &msg, MSG_NULL };
-            if (dsm(&app, &test, DG_CONTROL, DAT_EVENT, MSG_PROCESSEVENT, &ev) == TWRC_DSEVENT)
-            {
-                if (ev.TWMessage == MSG_XFERREADY) ready = 1;
-                else if (ev.TWMessage == MSG_CLOSEDSREQ) break;
-                continue;
-            }
-        }
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
-    }
+    ready = wait_ready(&test);
     CHECK(ready, "the source says a page is ready");
     if (ready)
     {
         rc = dsm(&app, &test, DG_IMAGE, DAT_IMAGEINFO, MSG_GET, &info);
-        CHECK(rc == TWRC_SUCCESS && info.ImageWidth > 0 && info.ImageLength > 0,
-              "the page's size (%ldx%ld, %d bits)", (long)info.ImageWidth, (long)info.ImageLength, info.BitsPerPixel);
+        /* 80 x 100 mm (the gate's test.conf) at the 75 dpi asked for */
+        CHECK(rc == TWRC_SUCCESS && info.ImageWidth == 236 && info.ImageLength == 295,
+              "the page's size is the 75 dpi asked for (%ldx%ld, %d bits)", (long)info.ImageWidth,
+              (long)info.ImageLength, info.BitsPerPixel);
+        CHECK(!info.Planar, "its colour is interleaved per pixel, not planar (%u)", info.Planar);
         rc = dsm(&app, &test, DG_IMAGE, DAT_IMAGENATIVEXFER, MSG_GET, &handle);
         CHECK(rc == TWRC_XFERDONE && handle, "the page arrives as a picture (%u)", rc);
         if (rc == TWRC_XFERDONE)
@@ -123,8 +138,62 @@ int main(int argc, char **argv)
             GlobalUnlock(handle);
             GlobalFree(handle);
         }
-        dsm(&app, &test, DG_CONTROL, DAT_PENDINGXFERS, MSG_ENDXFER, &pend);
+        memset(&pend, 0, sizeof(pend));
+        rc = dsm(&app, &test, DG_CONTROL, DAT_PENDINGXFERS, MSG_ENDXFER, &pend);
+        CHECK(rc == TWRC_SUCCESS && pend.Count == 0, "a flatbed has no more pages (%u, count %d)", rc, (short)pend.Count);
     }
+    dsm(&app, &test, DG_CONTROL, DAT_USERINTERFACE, MSG_DISABLEDS, &ui);
+
+    /* again, in strips (a memory transfer, as NAPS2 scans): each strip's rows are what it holds, below
+     * the ones before; together the page */
+    {
+        /* the first scan's close request, handled */
+        DWORD t = GetTickCount();
+        MSG m;
+        while (GetTickCount() - t < 500)
+        {
+            TW_EVENT ev;
+            if (!PeekMessageA(&m, NULL, 0, 0, PM_REMOVE)) { Sleep(20); continue; }
+            ev.pEvent = &m;
+            ev.TWMessage = MSG_NULL;
+            if (dsm(&app, &test, DG_CONTROL, DAT_EVENT, MSG_PROCESSEVENT, &ev) == TWRC_DSEVENT) continue;
+            TranslateMessage(&m);
+            DispatchMessageA(&m);
+        }
+    }
+    rc = set_one(&test, ICAP_XFERMECH, TWTY_UINT16, TWSX_MEMORY);
+    rc = dsm(&app, &test, DG_CONTROL, DAT_USERINTERFACE, MSG_ENABLEDS, &ui);
+    if (wait_ready(&test))
+    {
+        TW_IMAGEMEMXFER mx;
+        DWORD bpr, rows = 0, strips = 0, bad = 0, size;
+        BYTE *buf;
+
+        dsm(&app, &test, DG_IMAGE, DAT_IMAGEINFO, MSG_GET, &info);
+        bpr = info.ImageWidth * 3;
+        size = bpr * 10 + bpr / 2;      /* ten and a half rows: the last strip is short */
+        buf = malloc(size);
+        do
+        {
+            memset(&mx, 0, sizeof(mx));
+            mx.Memory.Flags = TWMF_APPOWNS | TWMF_POINTER;
+            mx.Memory.Length = size;
+            mx.Memory.TheMem = buf;
+            rc = dsm(&app, &test, DG_IMAGE, DAT_IMAGEMEMXFER, MSG_GET, &mx);
+            if (rc != TWRC_SUCCESS && rc != TWRC_XFERDONE) break;
+            strips++;
+            if (mx.YOffset != rows || mx.BytesWritten != mx.Rows * mx.BytesPerRow) bad++;
+            rows += mx.Rows;
+        } while (rc == TWRC_SUCCESS && strips < 1000);
+        free(buf);
+        CHECK(rc == TWRC_XFERDONE, "the strips end with the page (%u, %lu strips)", rc, strips);
+        CHECK(!bad, "each strip's rows are the bytes it holds, placed below the strips before (%lu bad)", bad);
+        CHECK(rows == (DWORD)info.ImageLength, "the strips make the page (%lu of %ld rows)", rows, (long)info.ImageLength);
+        memset(&pend, 0, sizeof(pend));
+        dsm(&app, &test, DG_CONTROL, DAT_PENDINGXFERS, MSG_ENDXFER, &pend);
+        CHECK(pend.Count == 0, "one page (count %d)", (short)pend.Count);
+    }
+    else CHECK(0, "the memory transfer's page is ready");
     dsm(&app, &test, DG_CONTROL, DAT_USERINTERFACE, MSG_DISABLEDS, &ui);
     dsm(&app, NULL, DG_CONTROL, DAT_IDENTITY, MSG_CLOSEDS, &test);
 close_dsm:

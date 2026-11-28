@@ -37,6 +37,14 @@ typedef struct
     TW_UINT16 Compression;
 } TW_IMAGEINFO;
 typedef struct { TW_UINT16 Count; TW_UINT32 EOJ; } TW_PENDINGXFERS;
+typedef struct { TW_UINT32 Flags, Length; TW_MEMREF TheMem; } TW_MEMORY;
+typedef struct
+{
+    TW_UINT16 Compression;
+    TW_UINT32 BytesPerRow, Columns, Rows, XOffset, YOffset, BytesWritten;
+    TW_MEMORY Memory;
+} TW_IMAGEMEMXFER;
+typedef struct { TW_UINT32 MinBufSize, MaxBufSize, Preferred; } TW_SETUPMEMXFER;
 #pragma pack(pop)
 
 typedef TW_UINT16 (WINAPI *DSMENTRYPROC)(pTW_IDENTITY, pTW_IDENTITY, TW_UINT32, TW_UINT16, TW_UINT16, TW_MEMREF);
@@ -57,6 +65,14 @@ typedef TW_UINT16 (WINAPI *DSMENTRYPROC)(pTW_IDENTITY, pTW_IDENTITY, TW_UINT32, 
 #define DAT_USERINTERFACE  0x0009
 #define DAT_IMAGEINFO      0x0101
 #define DAT_IMAGENATIVEXFER 0x0104
+#define DAT_IMAGEMEMXFER   0x0103
+#define DAT_SETUPMEMXFER   0x0006
+#define ICAP_XFERMECH      0x0103
+#define CAP_FEEDERENABLED  0x1002
+#define TWTY_BOOL          0x0006
+#define TWSX_MEMORY        2
+#define TWMF_APPOWNS       0x0001
+#define TWMF_POINTER       0x0008
 #define MSG_NULL           0x0000
 #define MSG_GET            0x0001
 #define MSG_GETFIRST       0x0004
