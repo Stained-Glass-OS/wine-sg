@@ -33,15 +33,20 @@
 #   WINE=... test/tcpipreg-gate.sh   (needs passwordless sudo; exit 77 otherwise)
 #   5. .NET (Wine Mono): NetworkInterface IsDhcpEnabled and DhcpServerAddresses (skipped without Wine Mono)
 #   6. (9210, i0510) each adapter's own name servers: GetAdaptersAddresses (IPv6 first), ipconfig /all,
-#      .NET DnsAddresses -- not the stub's 127.0.0.53; a released adapter lists none. (GetPerAdapterInfo
-#      keeps the system's list: Wine Mono's IPv4InterfaceProperties overruns its buffer with more than one.)
+#      .NET DnsAddresses -- not the stub's 127.0.0.53; a released adapter lists none.
+#   8. (9462, i0690) GetPerAdapterInfo lists each adapter's own IPv4 name servers too (the system's only for
+#      GetNetworkParams), and .NET's GetIPv4Properties works for every adapter with two or more of them:
+#      that needs Wine Mono sg37 (mono-0035), whose IPv4InterfaceProperties allocates the size asked for --
+#      sg36's fixed one-server structure was overrun (NullReferenceException). SG_MONO_DIR=<wine-mono-*>
+#      runs the .NET sections on that Wine Mono (HKCU\Software\Wine\Mono RuntimePath).
 #   7. (9211, i0511) eth A also has a NetworkManager DHCPv6 lease: Tcpip6\Parameters\Interfaces\{GUID}
 #      Dhcpv6Iaid, Dhcpv6DNSServers, Dhcpv6DomainSearchList, Tcpip6\Parameters\Dhcpv6DUID; every adapter
 #      has its Tcpip6 key; the lease gone, its values go
 # Mutants: nsiproxy SG_MUTANT_TCPIPREG_NO_FOLLOW (tcpipreg.c), SG_MUTANT_TCPIPREG_NO_NM (dhcp.c),
 #   SG_MUTANT_GUID_BY_INDEX (ndis.c, 9253);
 #   iphlpapi SG_MUTANT_GAI_DHCP_ALWAYS (iphlpapi_main.c); dnsapi SG_MUTANT_DNS_SYSTEM_ONLY (query.c, 9210);
-#   nsiproxy SG_MUTANT_TCPIP6_NO_DHCP6 (dhcp.c, 9211).
+#   nsiproxy SG_MUTANT_TCPIP6_NO_DHCP6 (dhcp.c, 9211); iphlpapi SG_MUTANT_PERADAPTER_SYSTEM_SERVERS
+#   (iphlpapi_main.c, 9462); Wine Mono -d:SG_MUTANT_PERADAPTER_FIXED_BUFFER (System.dll, mono-0035).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 WINE=${WINE:-/opt/wine-sg/bin/wine}
@@ -62,7 +67,9 @@ MULTI=1
 for u in "$SG_SYSTEM" "$SG_USER1"; do id "$u" >/dev/null 2>&1 || MULTI=0; done
 getent group "$SG_GROUP" >/dev/null || MULTI=0
 MCS=""
-for d in "$(dirname "$WINE")/../share/wine/mono" /opt/wine-sg/share/wine/mono /usr/share/wine/mono; do
+MONO_RT=${SG_MONO_DIR:-}
+[ -n "$MONO_RT" ] && [ -f "$MONO_RT/lib/mono/4.5/mcs.exe" ] && MCS=$MONO_RT/lib/mono/4.5/mcs.exe
+[ -n "$MCS" ] || for d in "$(dirname "$WINE")/../share/wine/mono" /opt/wine-sg/share/wine/mono /usr/share/wine/mono; do
     for m in "$d" "$d"/wine-mono-*; do [ -f "$m/lib/mono/4.5/mcs.exe" ] && { MCS=$m/lib/mono/4.5/mcs.exe; break 2; }; done
 done
 cp "$HERE/tcpipreg-net.cs" "$W/net.cs"
@@ -70,7 +77,7 @@ cp "$HERE/tcpipreg-net.cs" "$W/net.cs"
 cat > "$W/inner.sh" <<'INNER'
 # runs as root in the private network and mount namespace
 set -u
-W=$1; WINE=$2; WINESERVER=$3; U=$4; G=$5; N=$6; MULTI=$7; SG_SYSTEM=$8; SG_USER1=$9; SG_GROUP=${10}; CACHE=${11}; MCS=${12}
+W=$1; WINE=$2; WINESERVER=$3; U=$4; G=$5; N=$6; MULTI=$7; SG_SYSTEM=$8; SG_USER1=$9; SG_GROUP=${10}; CACHE=${11}; MCS=${12}; MONO_RT=${13}
 fails=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails + 1)); }
@@ -164,6 +171,11 @@ check "GetAdaptersAddresses: each adapter's own name servers (the DHCPv6 lease's
     "^DNS $qA \[fd77::53 10\.77\.0\.53 10\.77\.0\.54\]$" "^DNS $qB \[10\.77\.0\.53 10\.77\.0\.54 192\.168\.77\.53\]$" \
     "^DNS $qD \[10\.77\.0\.53 10\.77\.0\.54 192\.168\.77\.53\]$"
 absent "no adapter lists the stub resolver (127.0.0.53), loopback neither" "^DNS .*127\.0\.0\.53"
+# 8. GetPerAdapterInfo per adapter (9462)
+check "GetPerAdapterInfo: each adapter's own IPv4 name servers (the lease's two for A, not the system's three)" \
+    "^PERADAPTER $qA \[10\.77\.0\.53 10\.77\.0\.54\]$" "^PERADAPTER $qB \[10\.77\.0\.53 10\.77\.0\.54 192\.168\.77\.53\]$" \
+    "^PERADAPTER $qD \[10\.77\.0\.53 10\.77\.0\.54 192\.168\.77\.53\]$"
+absent "GetPerAdapterInfo: no adapter lists the stub resolver (127.0.0.53)" "^PERADAPTER .*127\.0\.0\.53"
 me timeout -s KILL 60 "$WINE" ipconfig /all 2>/dev/null | tr -d '\r' > "$W/ipconfig"
 if grep -A20 'sgeth0' "$W/ipconfig" | grep -qE 'DNS servers.*fd77::53' && grep -A20 'sgeth1' "$W/ipconfig" | grep -qE '192\.168\.77\.53' &&
    ! grep -q '127\.0\.0\.53' "$W/ipconfig"; then pass "ipconfig /all: DNS servers per adapter"
@@ -187,13 +199,15 @@ check "the cable out (no address, no lease): released as Windows shows it" \
     "^VAL $qA EnableDHCP dword 1$" "^VAL $qA DhcpIPAddress sz \[0\.0\.0\.0\]$" "^VAL $qA DhcpServer sz \[255\.255\.255\.255\]$"
 absent "released: no lease name servers" "^VAL $qA DhcpNameServer "
 check "released: GetAdaptersAddresses lists no name servers for it" "^DNS $qA \[\]$"
+check "released: GetPerAdapterInfo lists none for it either" "^PERADAPTER $qA \[\]$"
 absent "the DHCPv6 lease gone: its Tcpip6 values go" "^VAL6 $qA Dhcpv6(Iaid|DNSServers|DomainSearchList) "
 EXP2=$(( $(date +%s) + 7000 ))
 nm_lease sgeth0 10.77.0.2 10.77.0.53 lan.example 7200 $EXP2
 ip link set sgeth0 up; ip addr add 10.77.0.6/24 dev sgeth0 valid_lft 7000 preferred_lft 7000
 check "a new lease: the new address, server, lease and name servers" \
     "^VAL $qA DhcpIPAddress sz \[10\.77\.0\.6\]$" "^VAL $qA DhcpServer sz \[10\.77\.0\.2\]$" "^VAL $qA Lease dword 7200$" \
-    "^VAL $qA DhcpNameServer sz \[10\.77\.0\.53\]$" "^INFO $qA dhcp 1 server \[10\.77\.0\.2\] "
+    "^VAL $qA DhcpNameServer sz \[10\.77\.0\.53\]$" "^INFO $qA dhcp 1 server \[10\.77\.0\.2\] " \
+    "^PERADAPTER $qA \[10\.77\.0\.53\]$"
 ip link del sgeth2
 sleep 3
 dump
@@ -227,6 +241,7 @@ else
 fi
 # 5. .NET
 if [ -n "$MCS" ]; then
+    [ -n "$MONO_RT" ] && me "$WINE" reg add 'HKCU\Software\Wine\Mono' /v RuntimePath /d "$(me "$WINE" winepath -w "$MONO_RT" | tr -d '\r')" /f >/dev/null 2>&1
     me sh -c "cd '$W' && timeout -s KILL 300 '$WINE' '$MCS' -out:net.exe net.cs" >/dev/null 2>&1
     me timeout -s KILL 120 "$WINE" "$W/net.exe" 2>/dev/null | tr -d '\r' > "$W/net.out"
     if grep -qE "^NET $qA dhcp 1 servers \[10\.77\.0\.2\]$" "$W/net.out" && grep -qE "^NET $qB dhcp 0 " "$W/net.out"; then
@@ -235,6 +250,11 @@ if [ -n "$MCS" ]; then
     if grep -qE "^NETDNS $qA \[10\.77\.0\.53\]$" "$W/net.out" && grep -qE "^NETDNS $qB \[10\.77\.0\.53 10\.77\.0\.54 192\.168\.77\.53\]$" "$W/net.out"; then
         pass ".NET IPInterfaceProperties.DnsAddresses: each adapter's own"
     else fail ".NET DnsAddresses: $(grep NETDNS "$W/net.out" | tr '\n' ' ')"; fi
+    # B and D have three name servers, A one: GetIPv4Properties of each, many times (the overrun was heap
+    # corruption, not always at the first call)
+    if grep -qE "^NETV4 rounds 200 ok [0-9]+ errors 0$" "$W/net.out" && ! grep -qE "^NETV4 rounds 200 ok 0 " "$W/net.out"; then
+        pass ".NET GetIPv4Properties for adapters with several name servers, 200 rounds ($(grep ^NETV4 "$W/net.out"))"
+    else fail ".NET GetIPv4Properties with several name servers: '$(grep -E '^NETV4' "$W/net.out")' $(grep -c . "$W/net.out") lines (Wine Mono sg36: NullReferenceException)"; fi
 else
     echo "SKIP  .NET (no Wine Mono)"
 fi
@@ -270,7 +290,7 @@ exit $((fails > 0))
 INNER
 
 sudo -n -E unshare -n -m --propagation private -- bash "$W/inner.sh" "$W" "$WINE" "$WINESERVER" "$(id -u)" "$(id -g)" "$(id -un)" \
-    "$MULTI" "$SG_SYSTEM" "$SG_USER1" "$SG_GROUP" "$CACHE" "$MCS"
+    "$MULTI" "$SG_SYSTEM" "$SG_USER1" "$SG_GROUP" "$CACHE" "$MCS" "$MONO_RT"
 rc=$?
 [ $rc = 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
 exit $rc
