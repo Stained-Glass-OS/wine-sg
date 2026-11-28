@@ -24,17 +24,25 @@ WORK=$OBJ_DIR/addons
 JOBS=${JOBS:-$(nproc)}
 log() { echo "[wine-sg addons] $*"; }
 
-fetch() {   # URL SHA256
-    local f="$DL/${1##*/}"
+fetch() {   # URL SHA256 [MIRROR...]: the first download whose checksum is right; a
+            # wrong one is never kept (it was, and every later build failed on it)
+    local url=$1 sum=$2 f="$DL/${1##*/}" u
+    shift 2
     mkdir -p "$DL"
-    if [[ ! -f "$f" ]]; then
-        log "fetching ${1##*/}"
-        curl -fsSL -o "$f.tmp" "$1"
-        mv "$f.tmp" "$f"
-    fi
-    echo "$2  $f" | sha256sum -c - >/dev/null || { echo "checksum mismatch: $f" >&2; exit 1; }
+    if [[ -f "$f" ]] && echo "$sum  $f" | sha256sum -c - >/dev/null 2>&1; then return 0; fi
+    rm -f "$f"
+    for u in "$url" "$@"; do
+        log "fetching ${u##*/} from ${u#https://}"
+        if curl -fsSL --retry 3 --connect-timeout 20 -o "$f.tmp" "$u" &&
+           echo "$sum  $f.tmp" | sha256sum -c - >/dev/null 2>&1; then
+            mv "$f.tmp" "$f"; return 0
+        fi
+        log "checksum mismatch or download failed: $u"
+        rm -f "$f.tmp"
+    done
+    echo "checksum mismatch: $f" >&2; exit 1
 }
-fetch "$ZLIB_URL" "$ZLIB_SHA256"
+fetch "$ZLIB_URL" "$ZLIB_SHA256" "$ZLIB_URL_MIRROR"
 fetch "$CURL_URL" "$CURL_SHA256"
 fetch "$LIBARCHIVE_URL" "$LIBARCHIVE_SHA256"
 
