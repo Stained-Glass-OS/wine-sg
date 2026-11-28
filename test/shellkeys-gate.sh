@@ -31,6 +31,7 @@ T=$(mktemp -d /var/tmp/sg-shellkeys.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" WINESERVER
 cleanup() {
     "$WINESERVER" -k 2>/dev/null
+    sg_kill_prefix "$WINEPREFIX"
     [ -n "${ARTIFACTS:-}" ] && mkdir -p "$ARTIFACTS" && cp "$T"/*.out "$ARTIFACTS"/ 2>/dev/null
     rm -rf "$T"
 }

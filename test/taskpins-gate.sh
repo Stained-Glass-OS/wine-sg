@@ -25,7 +25,7 @@ command -v xvfb-run >/dev/null && command -v xdotool >/dev/null || { echo "SKIP:
 
 T=$(mktemp -d /var/tmp/sg-taskpins.XXXXXX)
 export WINEPREFIX="$T/prefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" WINESERVER
-trap '"$WINESERVER" -k 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$T"' EXIT INT TERM
+trap '"$WINESERVER" -k 2>/dev/null; sg_kill_prefix "$WINEPREFIX"; [ -n "${KEEP:-}" ] || rm -rf "$T"' EXIT INT TERM
 "$MINGW" -O2 -municode -o "$T/taskbar-probe.exe" "$HERE/taskbar-probe.c" -lshell32 -lgdi32 -luser32 || { fail "probe did not build"; exit 1; }
 timeout -s KILL 300 env DISPLAY= "$WINE" wineboot -i >/dev/null 2>&1
 "$WINESERVER" -w
